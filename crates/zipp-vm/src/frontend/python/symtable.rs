@@ -55,6 +55,12 @@ pub(super) struct Scope {
     /// The scope defines `super`/`__class__` uses (methods) — needs the
     /// implicit `__class__` cell from the enclosing class body.
     pub uses_class_cell: bool,
+    /// In a list, set or dict comprehension using `super`: the first
+    /// parameter of the code it runs in (PEP 709: CPython runs it in that
+    /// code, so a zero-argument `super()` there takes that parameter). The
+    /// comprehension uses the name, so it reaches it as any other (a local
+    /// of that code when it is compiled inline, else through a cell).
+    pub super_self: Option<String>,
     /// Names a walrus in this scope's own code binds. A read of such a local
     /// is copied out of its register, so an operand already evaluated keeps
     /// its value when a later operand of the same expression rebinds it.
@@ -71,7 +77,8 @@ pub(super) struct Scope {
     /// A list, set or dict comprehension the emitter compiles inline in
     /// the enclosing function or module code (PEP 709) rather than as a
     /// code object of its own: not a generator expression, not in a class
-    /// body, with no nested scopes and no `super`. The enclosing code's
+    /// body, with no nested scopes, and no `super` or `__class__` unless
+    /// it has a `super_self`. The enclosing code's
     /// locals it uses are [`SymKind::Outer`], not cells.
     pub inline: bool,
     /// Source range (start, end) of the defining node, the emitter's key
@@ -105,6 +112,7 @@ struct Raw {
     is_comprehension: bool,
     deleted: BTreeSet<String>,
     uses_class_cell: bool,
+    super_self: Option<String>,
     walrus_targets: BTreeSet<String>,
     imports: BTreeSet<String>,
     has_loop: bool,
@@ -148,6 +156,7 @@ impl Raw {
             is_comprehension: false,
             deleted: BTreeSet::new(),
             uses_class_cell: false,
+            super_self: None,
             walrus_targets: BTreeSet::new(),
             has_loop: false,
             imports: BTreeSet::new(),
@@ -501,6 +510,30 @@ impl Builder {
         }
         Ok(())
     }
+    /// `super` named in a list, set or dict comprehension: the first
+    /// parameter of the function code it runs in (through any enclosing
+    /// comprehensions of those kinds) is its `super_self`, and used.
+    fn comprehension_super(&mut self) {
+        let is_inlinable = |r: &Raw| r.is_comprehension && r.name != "<genexpr>";
+        if !is_inlinable(&self.raws[self.current]) || self.raws[self.current].super_self.is_some() {
+            return;
+        }
+        let mut cur = self.raws[self.current].parent;
+        while let Some(p) = cur {
+            if !is_inlinable(&self.raws[p]) {
+                break;
+            }
+            cur = self.raws[p].parent;
+        }
+        let Some(p) = cur.filter(|&p| self.raws[p].kind == ScopeKind::Function) else {
+            return;
+        };
+        let Some(first) = self.raws[p].params.first().cloned() else {
+            return;
+        };
+        self.use_(&first);
+        self.raws[self.current].super_self = Some(first);
+    }
     fn comprehension(
         &mut self,
         kind: &str,
@@ -541,6 +574,9 @@ impl Builder {
             ast::Expr::Name(n) => {
                 if n.id.as_str() == "super" || n.id.as_str() == "__class__" {
                     self.raws[self.current].uses_class_cell = true;
+                }
+                if n.id.as_str() == "super" {
+                    self.comprehension_super();
                 }
                 self.use_(n.id.as_str());
             }
@@ -805,7 +841,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             fast && raw.is_comprehension
                 && raw.name != "<genexpr>"
                 && raw.children.is_empty()
-                && !raw.uses_class_cell
+                && (!raw.uses_class_cell || raw.super_self.is_some())
                 && raw.parent.is_some_and(|p| raws[p].kind != ScopeKind::Class)
         })
         .collect();
@@ -934,6 +970,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             is_generator: raw.is_generator,
             deleted: std::mem::take(&mut deleted[id]),
             uses_class_cell: raw.uses_class_cell,
+            super_self: raw.super_self,
             walrus_targets: raw.walrus_targets,
             declares_global: !raw.globals.is_empty(),
             has_loop: raw.has_loop,

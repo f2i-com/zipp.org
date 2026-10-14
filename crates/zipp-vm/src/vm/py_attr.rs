@@ -22,6 +22,63 @@ use crate::value::Value;
 /// `BUILTIN` entry): the key is the site's cached constant, never freed.
 pub(super) const KEY_ROOTED: u32 = u32::MAX;
 
+/// Most attribute stores a store body ([`py_store_body_scan`]) is made of.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(super) const STORE_BODY_MAX: u8 = 8;
+
+/// Whether a store body's call may be made without its frame
+/// (`Vm::py_store_call`). On unless `ZIPP_NO_PY_STORE_CALLS` is set (the
+/// same-binary A/B). Read once per process.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+fn py_store_calls_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_STORE_CALLS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The number of stores (1 to [`STORE_BODY_MAX`]) when the code object
+/// `p`'s main code is exactly a store body: the runtime's load (which
+/// changes nothing but its register, past the parameters'), then
+/// `PySetAttr`s of parameters into attributes of the first parameter, then
+/// `return None`. Its out-of-line code (the stores' slow paths, the frame
+/// guard) runs only from those, so a call whose every store takes its
+/// fast path runs nothing else (see `Vm::py_store_call`). Plain functions
+/// only: no generator, coroutine, rest parameter or `arguments`.
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+pub(super) fn py_store_body_scan(p: &crate::bytecode::FuncProto) -> Option<u8> {
+    use crate::bytecode::Instr;
+    if !py_store_calls_enabled() || p.is_generator || p.is_async || p.rest_reg.is_some() || p.arguments_reg.is_some() || p.param_count == 0 {
+        return None;
+    }
+    let params = p.param_count;
+    let code = p.code.as_slice();
+    let Some(&Instr::LoadGlobal { dst: g, .. }) = code.first() else {
+        return None;
+    };
+    if g <= params {
+        return None;
+    }
+    let mut k = 0usize;
+    while let Some(&Instr::PySetAttr { obj: 1, val, .. }) = code.get(1 + k) {
+        if val == 0 || val > params || k >= STORE_BODY_MAX as usize {
+            return None;
+        }
+        k += 1;
+    }
+    match (code.get(1 + k), code.get(2 + k)) {
+        (Some(&Instr::LoadNull { dst }), Some(&Instr::Return { src })) if k > 0 && src == dst => Some(k as u8),
+        _ => None,
+    }
+}
+
 /// A property's Python getter or setter as `PyGetAttr` / `PySetAttr` calls
 /// it: the function record `f` (the callee's `this`), its positional entry
 /// `entry` (`f.c1` / `f.c2`), and that entry's code object and closure.
@@ -274,6 +331,153 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A call of a store body ([`py_store_body_scan`]: `self.a = a; self.b
+    /// = b` and nothing else, the commonest `__init__` there is) made
+    /// without its frame: each store as its own site's cache entry makes it
+    /// (`Vm::py_attr_set_hit`), when every one of the entries holds for the
+    /// instance as the stores before it leave it, which is checked for all of
+    /// them before the first store is made. `false`, with nothing done, for
+    /// anything else (a site not run yet, another class or layout, a dict
+    /// that is not layout-mode storage), whereupon the frame is pushed as
+    /// before, and under `ZIPP_PY_PROF`, which counts the frame's call.
+    /// `args` are the callee's parameters, the instance first.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline(always)]
+    pub(super) fn py_store_call(&mut self, fid: u32, stores: usize, args: &[Value]) -> bool {
+        use crate::bytecode::Instr;
+        const MAX: usize = STORE_BODY_MAX as usize;
+        if stores == 0 || stores > MAX || super::prof_py::on() {
+            return false;
+        }
+        let code = self.func(fid as usize).code.as_slice();
+        let Some(&o) = args.first() else {
+            return false;
+        };
+        let Some((cls, dict)) = self.py_inst_parts(o) else {
+            return false;
+        };
+        if !cls.is_heap() {
+            return false;
+        }
+        let Some((mut l, mut n)) = self.py_attrs_of(dict) else {
+            return false;
+        };
+        let mut ents = [PyIc::default(); MAX];
+        // The stores' entries, their sites' in a row (one look-up of the
+        // code object's table).
+        if !self.py_ic_run(fid, 1, &mut ents[..stores]) {
+            return false;
+        }
+        let mut vals = [Value::UNDEFINED; MAX];
+        let mut stamp: Option<(u32, u64)> = None;
+        for i in 0..stores {
+            let Some(&Instr::PySetAttr { val, .. }) = code.get(1 + i) else {
+                return false;
+            };
+            let Some(&v) = (val as usize).checked_sub(1).and_then(|at| args.get(at)) else {
+                return false;
+            };
+            let e = ents[i];
+            if e.a != cls.bits() {
+                return false;
+            }
+            if stamp != Some((e.hver, e.c)) {
+                if !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+                    return false;
+                }
+                stamp = Some((e.hver, e.c));
+            }
+            match e.kind {
+                ic::ATTR_SET_L if l == e.d && (e.pos as usize) < n => {}
+                ic::ATTR_APPEND_L if (l, n) == (e.d, e.pos as usize) => {
+                    l = e.b as u32;
+                    n += 1;
+                }
+                _ => return false,
+            }
+            vals[i] = v;
+        }
+        // The stores, as `py_attrs_put` / `py_attrs_push` make them, with
+        // the storage's mirror republished once, after the last append (no
+        // code runs between them).
+        let di = dict.heap_index();
+        let mut appended = false;
+        for (e, &v) in ents[..stores].iter().zip(&vals[..stores]) {
+            self.heap.write_barrier_val(di, v);
+            if let HeapObj::PyAttrs { layout, vals } = self.heap.get_mut(di) {
+                if e.kind == ic::ATTR_SET_L {
+                    if let Some(x) = vals.get_mut(e.pos as usize) {
+                        *x = v;
+                    }
+                } else {
+                    vals.push(v);
+                    *layout = e.b as u32;
+                    appended = true;
+                }
+            }
+        }
+        if appended {
+            self.heap.refresh_mirror(di);
+        }
+        true
+    }
+
+    /// [`Vm::py_store_call`] for the `PyCall` whose site's cache entry is
+    /// `e`, of the record `f` with `argc` arguments in the caller's
+    /// registers `arg_base..` (at `base`), when the entry records a plain
+    /// callee the record still holds (as `Vm::py_lean_hit` reads it) whose
+    /// code object is a store body taking exactly those. For compiled
+    /// code's `jit_py_call`: the interpreter's call step is left as it was.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline(never)]
+    pub(super) fn py_store_call_site(&mut self, e: &PyIc, f: Value, base: usize, arg_base: u16, argc: u16) -> bool {
+        if e.kind != ic::CALL_ENTRY || e.c == 0 || e.a != f.bits() || !f.is_heap() {
+            return false;
+        }
+        // The entry's `c`: the code object's id, register count and
+        // parameter count (`Vm::py_call_target`). Whether that code object
+        // is a store body first: every other plain call from compiled code
+        // asks, and is answered by one read.
+        let (fid, params) = (e.c as u32, (e.c >> 48) as u16);
+        if argc != params {
+            return false;
+        }
+        let Some(stores) = self.py_store_body(fid) else {
+            return false;
+        };
+        let fi = f.heap_index();
+        if self.heap.version_of(fi) != e.hver {
+            return false;
+        }
+        let pos = e.pos as usize;
+        match self.heap.get(fi) {
+            HeapObj::Object(m) if pos < m.len() && !m.is_accessor_at(pos) && m.val_at(pos).bits() == e.b => {}
+            _ => return false,
+        }
+        self.with_argv(base, arg_base, argc, |vm, argv| vm.py_store_call(fid, stores, argv))
+    }
+
+    /// The store count of the code object `fid` when it is a store body
+    /// ([`py_store_body_scan`]), found once per code object.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    fn py_store_body(&mut self, fid: u32) -> Option<usize> {
+        let f = fid as usize;
+        let known = self.py_rt.as_deref()?.store_bodies.get(f).copied().unwrap_or(0);
+        let s = if known != 0 {
+            known
+        } else {
+            let s = py_store_body_scan(self.func(f)).map_or(1, |k| k + 1);
+            let p = self.py_rt.as_deref_mut()?;
+            if p.store_bodies.len() <= f {
+                p.store_bodies.resize(f + 1, 0);
+            }
+            p.store_bodies[f] = s;
+            s
+        };
+        (s > 1).then(|| (s - 1) as usize)
+    }
+
     /// Whether `name` is, for `cls`, a property with a Python accessor a
     /// frame is pushed for (`table` / `table_key`: the class's `gp` or
     /// `sp`; `entry_key`: `c1` or `c2`, taking `argc` values): this site's
@@ -336,6 +540,38 @@ impl<'p> Vm<'p> {
     // (which asks the full function, whose own first tests these are) when
     // one declines.
 
+    /// What the hit functions below read of the registry once: the
+    /// instance and exception templates' shapes and a class record's `ver`
+    /// slot.
+    #[inline(always)]
+    fn py_hit_keys(&self) -> Option<(u32, u32, usize)> {
+        let p = self.py_rt.as_deref()?;
+        Some((p.inst_shape, p.exc_shape, p.ty?.ver))
+    }
+
+    /// [`Vm::py_inst_parts`] for the hit functions, in their own code: a
+    /// record of the instance or exception template's shape read where it
+    /// is (as `py_inst_parts` reads it), any other through that function.
+    /// `o` is a heap value.
+    #[inline(always)]
+    fn py_hit_parts(&self, k: (u32, u32, usize), o: Value) -> Option<(Value, Value)> {
+        if let HeapObj::Object(m) = self.heap.get(o.heap_index()) {
+            let shape = m.shape();
+            if !m.is_ctor && shape != crate::shape::DICT && (shape == k.0 || shape == k.1) {
+                return Some((m.val_at(0), m.val_at(1)));
+            }
+        }
+        self.py_inst_parts(o)
+    }
+
+    /// [`Vm::py_cls_stamp_ok`] for the hit functions, in their own code
+    /// (`k.2` the class records' `ver` slot).
+    #[inline(always)]
+    fn py_hit_stamp(&self, k: (u32, u32, usize), cls: Value, hver: u32, ver: u64) -> bool {
+        let ci = cls.heap_index();
+        self.heap.version_of(ci) == hver && matches!(self.heap.get(ci), HeapObj::Object(m) if k.2 < m.len() && m.val_at(k.2).bits() == ver)
+    }
+
     /// [`Vm::py_attr_get`] at a site holding a layout-mode entry
     /// ([`ic::ATTR_GET_L`]) for the instance's class and layout.
     #[inline(never)]
@@ -343,15 +579,16 @@ impl<'p> Vm<'p> {
         // The entry's kind first: a site of another kind (a property, a
         // class attribute) declines before the instance is looked at.
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::ATTR_GET_L {
+        if e.kind != ic::ATTR_GET_L || !o.is_heap() {
             return None;
         }
-        let (cls, dict) = self.py_inst_parts(o)?;
+        let k = self.py_hit_keys()?;
+        let (cls, dict) = self.py_hit_parts(k, o)?;
         if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
             return None;
         }
         let v = self.py_attrs_at(dict, e.d, e.pos as usize)?;
-        self.py_cls_stamp_ok(cls, e.hver, e.c).then_some(v)
+        self.py_hit_stamp(k, cls, e.hver, e.c).then_some(v)
     }
 
     /// [`Vm::py_attr_set`] at a site holding a layout-mode entry: a value
@@ -361,10 +598,13 @@ impl<'p> Vm<'p> {
     pub(super) fn py_attr_set_hit(&mut self, func_id: u32, ip: usize, o: Value, v: Value) -> bool {
         // The entry's kind first, as `py_attr_get_hit`.
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::ATTR_SET_L && e.kind != ic::ATTR_APPEND_L {
+        if (e.kind != ic::ATTR_SET_L && e.kind != ic::ATTR_APPEND_L) || !o.is_heap() {
             return false;
         }
-        let Some((cls, dict)) = self.py_inst_parts(o) else {
+        let Some(k) = self.py_hit_keys() else {
+            return false;
+        };
+        let Some((cls, dict)) = self.py_hit_parts(k, o) else {
             return false;
         };
         if cls.bits() != e.a || !cls.is_heap() || !dict.is_heap() {
@@ -372,11 +612,11 @@ impl<'p> Vm<'p> {
         }
         let di = dict.heap_index();
         match e.kind {
-            ic::ATTR_SET_L if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+            ic::ATTR_SET_L if self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) && self.py_hit_stamp(k, cls, e.hver, e.c) => {
                 self.py_attrs_put(di, e.pos as usize, v);
                 true
             }
-            ic::ATTR_APPEND_L if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_cls_stamp_ok(cls, e.hver, e.c) => {
+            ic::ATTR_APPEND_L if self.py_attrs_of(dict) == Some((e.d, e.pos as usize)) && self.py_hit_stamp(k, cls, e.hver, e.c) => {
                 self.py_attrs_push(di, e.b as u32, v);
                 true
             }
@@ -395,16 +635,17 @@ impl<'p> Vm<'p> {
         }
         let p = self.py_rt_for(rt)?;
         let (ty, t_str) = (p.ty?, p.t_str);
+        let k = self.py_hit_keys()?;
         let (cls, dict) = if self.heap.is_str_like(o.heap_index()) {
             (t_str, Value::UNDEFINED)
         } else {
-            self.py_inst_parts(o)?
+            self.py_hit_parts(k, o)?
         };
         if !cls.is_heap() {
             return None;
         }
         let e = self.py_ic(func_id, ip);
-        if e.a != cls.bits() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+        if e.a != cls.bits() || !self.py_hit_stamp(k, cls, e.hver, e.c) {
             return None;
         }
         if e.kind == ic::METHOD {
@@ -426,7 +667,7 @@ impl<'p> Vm<'p> {
     pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, call: &mut Option<PyAccessor>) -> Option<Value> {
         let (cls, dict) = self.py_inst_parts(o)?;
         let ty = self.py_rt.as_deref()?.ty?;
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if cls.bits() == e.a && cls.is_heap() {
             match e.kind {
                 // The instance's layout puts the name at `pos`.
@@ -561,7 +802,7 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         let di = dict.heap_index();
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         // Layout mode: a value replaced at its slot, or appended.
         if cls.bits() == e.a && cls.is_heap() {
             match e.kind {
@@ -828,7 +1069,7 @@ impl<'p> Vm<'p> {
         if !cls.is_heap() {
             return None;
         }
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if e.a == cls.bits() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if e.kind == ic::METHOD {
                 if let Some(f) = self.py_table_at(cls, ty.gm, e.b, e.pos) {
@@ -883,6 +1124,48 @@ impl<'p> Vm<'p> {
         Some(b)
     }
 
+    /// For the JIT's inline `PyMethod` (`codegen::py_attr_inline`): what the
+    /// site's cache entry `e` answers while the receiver's class keeps the
+    /// entry's stamp, when it holds now: a user class's function (`gm`) for
+    /// an instance of the instance template's shape whose storage has the
+    /// layout the entry proved to lack the name, or a builtin method (`gb`)
+    /// of a list, tuple or dict record of the runtime's template shapes
+    /// (dict-less). `(receiver shape, method, layout or 0)`. The class's
+    /// tables only gain entries while its stamp holds (the runtime replaces
+    /// or clears them with a `ver` bump, see core.js `forgetName`), so the
+    /// method found now is the one the step finds for as long as the stamp
+    /// holds.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(super) fn py_method_plan(&self, e: &PyIc) -> Option<(u32, Value, u32)> {
+        let p = self.py_rt.as_deref()?;
+        let ty = p.ty?;
+        let cls = Value::from_bits(e.a);
+        if !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
+            return None;
+        }
+        match e.kind {
+            ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => {
+                let f = self.py_table_at(cls, ty.gm, e.b, e.pos)?;
+                self.py_plain_rec(f).then_some((p.inst_shape, f, e.d))
+            }
+            ic::BUILTIN_METHOD => {
+                let shape = if cls.bits() == p.t_list.bits() || cls.bits() == p.t_tuple.bits() {
+                    p.seq_shape
+                } else if cls.bits() == p.t_dict.bits() {
+                    p.dict_shape
+                } else {
+                    return None;
+                };
+                if shape == crate::shape::DICT {
+                    return None;
+                }
+                let b = self.py_table_at(cls, ty.gb, e.b, e.pos)?;
+                self.py_plain_rec(b).then_some((shape, b, 0))
+            }
+            _ => None,
+        }
+    }
+
     /// The value for [`Instr::PyClassAttr`]: a plain class attribute
     /// (`gv[name]`) of an instance whose dict lacks the name (and whose
     /// class's `ga[name]` is `true`).
@@ -893,7 +1176,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let ty = self.py_rt.as_deref()?.ty?;
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
         if self.py_not_plain(&e, cls, ty.ga) {
             return None;
         }
@@ -940,6 +1223,7 @@ impl<'p> Vm<'p> {
         }
         let ty = self.py_rt.as_deref()?.ty?;
         let (fn_slot, fn_key, plain_slot, plain_key) = if set { (ty.sp, "sp", ty.sa, "sa") } else { (ty.gp, "gp", ty.ga, "ga") };
+        self.py_ic_class(func_id, ip, cls.bits());
         if let Some(e) = self.py_cls_ic(func_id, ip, ic::ATTR_FN, cls) {
             if let Some(f) = self.py_table_at(cls, fn_slot, e.b, e.pos) {
                 if self.py_plain_rec(f) {
@@ -969,6 +1253,23 @@ impl<'p> Vm<'p> {
 /// The positional entry names a class and its `__init__` carry (`c<n>`).
 const ENTRY_NAMES: [&str; 8] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"];
 
+/// Whether a `PyNew` site's [`ic::NEW`] entry is asked first
+/// (`Vm::py_new_hit`). On unless `ZIPP_NO_PY_NEW_HIT` is set (the
+/// same-binary A/B). Read once per process.
+fn py_new_hits_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_NEW_HIT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// An own data property `name` of the plain object `idx`, tried at the
     /// slot `hint` first; the slot it is found at.
@@ -994,7 +1295,14 @@ impl<'p> Vm<'p> {
         // class, a factory function, a class with `__new__`, or one not
         // constructed yet, whose entry the runtime writes on its first
         // construction), with the same entry still there: declined at once.
-        let e = self.py_ic(func_id, ip);
+        let e = self.py_ic_class(func_id, ip, cls.bits());
+        // The class this site constructed last, its keys as they were then:
+        // its entries read at the slots found then (`py_new_hit`).
+        if e.kind == ic::NEW && e.a == cls.bits() && self.heap.version_of(ci) == e.hver && py_new_hits_enabled() {
+            if let Some(r) = self.py_new_hit(func_id, ip, &e, cls, rt, n) {
+                return Some(r);
+            }
+        }
         if e.kind == ic::NEW_NO && e.a == cls.bits() && self.heap.version_of(ci) == e.hver {
             let same = e.pos == u32::MAX
                 || matches!(self.heap.get(ci), HeapObj::Object(m) if (e.pos as usize) < m.len() && m.val_at(e.pos as usize).bits() == e.b);
@@ -1013,7 +1321,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         // Where this site found the two entries last time (hints only).
-        let (entry_hint, init_hint) = if e.kind == ic::NEW { (e.pos as usize, e.hver as usize) } else { (0, 0) };
+        let (entry_hint, init_hint) = if e.kind == ic::NEW { (e.pos as usize, (e.c >> 32) as u16 as usize) } else { (0, 0) };
         let found = self.py_own_hinted(ci, entry_name, entry_hint);
         let Some((_, entry_slot)) = found.filter(|&(have, _)| want.is_heap() && have.bits() == want.bits()) else {
             // Keys unchanged and the entry (or its absence) the same: the
@@ -1027,7 +1335,7 @@ impl<'p> Vm<'p> {
             self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW_NO, pos, hver, a: cls.bits(), b, ..PyIc::default() });
             return None;
         };
-        let init = self.py_hint_field(hint::CTOR_INIT, ci, "ctorInit")?;
+        let (init, ctor_init_slot) = self.py_hint_slot(hint::CTOR_INIT, ci, "ctorInit")?;
         let (entry, init_slot) = if init == Value::NULL {
             if n != 0 {
                 return None;
@@ -1051,11 +1359,86 @@ impl<'p> Vm<'p> {
         let cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls));
         let map = self.py_attrs_new(cap);
         let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
-        if (entry_slot, init_slot) != (entry_hint, init_hint) {
-            if let (Ok(pos), Ok(hver)) = (u32::try_from(entry_slot), u32::try_from(init_slot)) {
-                self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, ..PyIc::default() });
+        // What a later construction at this site checks first (`py_new_hit`):
+        // the class and its heap version, the slots of its entry and its
+        // `ctorInit`, the `__init__` record, its heap version and its entry's
+        // slot, and the storage's presize.
+        let iver = if init.is_heap() { self.heap.version_of(init.heap_index()) } else { 0 };
+        if let (Ok(pos), Ok(d), Ok(islot)) = (u32::try_from(entry_slot), u32::try_from(ctor_init_slot), u16::try_from(init_slot)) {
+            let c = u64::from(iver) | (u64::from(islot) << 32) | ((cap.min(255) as u64) << 48);
+            let hver = self.heap.version_of(ci);
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::NEW, pos, hver, a: cls.bits(), b: init.bits(), c, d });
+        }
+        Some((obj, entry, init))
+    }
+
+    /// [`Vm::py_new`] at a site whose [`ic::NEW`] entry `e` names `cls`
+    /// with the heap version it has now (so its keys, and the slots the
+    /// entry names, are as they were): what the full step answers, with
+    /// nothing found by name. The class's entry for the count at its slot
+    /// is still the runtime's plain one (read afresh), its `ctorInit` still
+    /// the record the entry names, whose own heap version is the entry's
+    /// and whose entry for `n + 1` (at its slot) is callable now. `None`,
+    /// with nothing done, for anything else: the full step then decides.
+    #[inline]
+    fn py_new_hit(&mut self, func_id: u32, ip: usize, e: &PyIc, cls: Value, rt: Value, n: usize) -> Option<(Value, Value, Value)> {
+        let p = self.py_rt_for(rt)?;
+        let (ctors, tmpl, inst_shape) = (p.ctors, p.inst_tmpl, p.inst_shape);
+        let want = match ctors.is_heap().then(|| self.heap.get(ctors.heap_index())) {
+            Some(HeapObj::Array(items)) => *items.get(n)?,
+            _ => return None,
+        };
+        let (pos, islot) = (e.pos as usize, e.d as usize);
+        let init = match self.heap.get(cls.heap_index()) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && pos < m.len()
+                    && islot < m.len()
+                    && !m.is_accessor_at(pos)
+                    && !m.is_accessor_at(islot)
+                    && want.is_heap()
+                    && m.val_at(pos).bits() == want.bits()
+                    && m.val_at(islot).bits() == e.b =>
+            {
+                Value::from_bits(e.b)
+            }
+            _ => return None,
+        };
+        let entry = if init == Value::NULL {
+            if n != 0 {
+                return None;
+            }
+            Value::NULL
+        } else {
+            if !init.is_heap() || self.heap.version_of(init.heap_index()) != e.c as u32 {
+                return None;
+            }
+            let s = (e.c >> 32) as u16 as usize;
+            let v = match self.heap.get(init.heap_index()) {
+                HeapObj::Object(m) if !m.is_ctor && s < m.len() && !m.is_accessor_at(s) => m.val_at(s),
+                _ => return None,
+            };
+            if !self.py_callable_fn(v) {
+                return None;
+            }
+            v
+        };
+        if inst_shape == crate::shape::DICT || !self.py_alloc_like_ok(tmpl, inst_shape) {
+            return None;
+        }
+        // The storage presized as the entry says; until an instance of the
+        // class has grown (the first constructions), as the class says now,
+        // which the entry then keeps.
+        let mut cap = (e.c >> 48) as u8 as usize;
+        if cap == 0 {
+            cap = self.py_rt.as_deref().map_or(0, |p| p.layouts.presize(cls)).min(255);
+            if cap != 0 {
+                let c = (e.c & !(0xFF << 48)) | ((cap as u64) << 48);
+                self.py_ic_put(func_id, ip, PyIc { c, ..*e });
             }
         }
+        let map = self.py_attrs_new(cap);
+        let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
         Some((obj, entry, init))
     }
 

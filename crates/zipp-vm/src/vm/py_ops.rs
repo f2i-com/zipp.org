@@ -57,6 +57,30 @@ enum OrdRef {
 /// Instruction steps charged per key and per comparison of a native sort.
 const ORD_STEPS_PER_UNIT: u64 = 8;
 
+/// The most items (columns) of a tuple key `Vm::py_ord_sort_columns`
+/// sorts by columns, nested tuples' items counted.
+const ORD_COLUMNS_MAX: usize = 6;
+
+/// How deep a tuple key `Vm::py_ord_sort_columns` sorts by columns nests.
+const ORD_COLUMNS_DEPTH: usize = 4;
+
+/// Whether a native sort may compare its keys by columns
+/// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
+/// (the same-binary A/B). Read once per process.
+fn py_sort_columns_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_SORT_COLUMNS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// One operand, classified.
 #[derive(Clone, Copy)]
 enum Num {
@@ -375,56 +399,7 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            Instr::PyRaise { e, rt, slow, catch } => {
-                let (ev, rv) = (self.get(base, e), self.get(base, rt));
-                let Some((ctx_slot, tb_slot, cur)) = self.py_raise_plan(ev, rv) else {
-                    return Ok(slow as usize);
-                };
-                let idx = ev.heap_index();
-                // Raising an exception some frame caught (its `tbfn` set):
-                // `R.raise` first records that frame's traceback entry.
-                if self.py_exc_caught(idx) {
-                    return Ok(slow as usize);
-                }
-                if let Some(cur) = cur {
-                    if cur.bits() != ev.bits() {
-                        if cur.is_heap() {
-                            self.heap.write_barrier_val(idx, cur);
-                        }
-                        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                            m.set_val_at(ctx_slot, cur);
-                        }
-                    }
-                }
-                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.set_val_at(tb_slot, Value::int(-1));
-                }
-                // As `Throw`: the frame's ip kept coherent, the value thrown.
-                // The message is left empty: `run_loop` builds it from the
-                // pending value, which nothing changes before then, when the
-                // throw leaves the loop uncaught (a caught one never reads it).
-                let top = self.frames.len() - 1;
-                self.frames[top].ip = ip;
-                // The frame's own innermost handler is the catch handler the
-                // instruction names: caught here, as `unwind_to_handler`
-                // catches a throw in the frame that raised it (the handler
-                // popped, the frame's line noted, the exception in the
-                // handler's register), without leaving the dispatch loop.
-                if let Some(&Handler::Catch { target, reg }) = self.frames[top].handlers.last() {
-                    if target == catch {
-                        self.frames[top].handlers.pop();
-                        if self.py_unwind_candidate(top) {
-                            self.py_unwind_frame(top, true, ev, true);
-                        }
-                        let fbase = self.frames[top].base;
-                        self.regs[fbase + reg as usize] = ev;
-                        self.frames[top].ip = target as usize;
-                        return Ok(target as usize);
-                    }
-                }
-                self.pending_throw = Some(ev);
-                return Err(Thrown(String::new()));
-            }
+            Instr::PyRaise { e, rt, slow, catch } => return self.py_raise_step(base, ip, e, rt, slow, catch),
             Instr::PyCaught { dst, e, line, rt, slow } => {
                 let (ev, lv, rv) = (self.get(base, e), self.get(base, line), self.get(base, rt));
                 if !self.py_caught(ev, lv, rv) {
@@ -1401,6 +1376,10 @@ impl<'p> Vm<'p> {
             return None;
         }
         let tdict = self.py_rt_for(rt)?.t_dict;
+        // A dict record of the template's shape: its `map` read with it.
+        if let Some((_, map, _)) = self.py_dict_rec_fast(d, tdict) {
+            return self.py_table_get(map, k);
+        }
         if self.py_cls_of(d)?.bits() != tdict.bits() {
             return None;
         }
@@ -1465,6 +1444,62 @@ impl<'p> Vm<'p> {
         slot.is_none_or(|s| m.val_at(s) != Value::NULL)
     }
 
+    /// [`Instr::PyRaise`] (see the instruction): its step, for the
+    /// interpreter's `py_step_ext` and compiled code's `jit_py_raise`. The
+    /// next ip (`slow`, or `catch` when the frame's own innermost handler is
+    /// that catch handler), or the throw (pending).
+    #[inline(never)]
+    pub(super) fn py_raise_step(&mut self, base: usize, ip: usize, e: u16, rt: u16, slow: u32, catch: u32) -> Result<usize, Thrown> {
+        let (ev, rv) = (self.get(base, e), self.get(base, rt));
+        let Some((ctx_slot, tb_slot, cur)) = self.py_raise_plan(ev, rv) else {
+            return Ok(slow as usize);
+        };
+        let idx = ev.heap_index();
+        // Raising an exception some frame caught (its `tbfn` set):
+        // `R.raise` first records that frame's traceback entry.
+        if self.py_exc_caught(idx) {
+            return Ok(slow as usize);
+        }
+        if let Some(cur) = cur {
+            if cur.bits() != ev.bits() {
+                if cur.is_heap() {
+                    self.heap.write_barrier_val(idx, cur);
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.set_val_at(ctx_slot, cur);
+                }
+            }
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(tb_slot, Value::int(-1));
+        }
+        // As `Throw`: the frame's ip kept coherent, the value thrown.
+        // The message is left empty: `run_loop` builds it from the
+        // pending value, which nothing changes before then, when the
+        // throw leaves the loop uncaught (a caught one never reads it).
+        let top = self.frames.len() - 1;
+        self.frames[top].ip = ip;
+        // The frame's own innermost handler is the catch handler the
+        // instruction names: caught here, as `unwind_to_handler`
+        // catches a throw in the frame that raised it (the handler
+        // popped, the frame's line noted, the exception in the
+        // handler's register), without leaving the dispatch loop.
+        if let Some(&Handler::Catch { target, reg }) = self.frames[top].handlers.last() {
+            if target == catch {
+                self.frames[top].handlers.pop();
+                if self.py_unwind_candidate(top) {
+                    self.py_unwind_frame(top, true, ev, true);
+                }
+                let fbase = self.frames[top].base;
+                self.regs[fbase + reg as usize] = ev;
+                self.frames[top].ip = target as usize;
+                return Ok(target as usize);
+            }
+        }
+        self.pending_throw = Some(ev);
+        return Err(Thrown(String::new()));
+    }
+
     /// For [`Instr::PyRaise`]: the slots to write and the current exception
     /// (`None` when `rt.EXCSTACK` is empty).
     fn py_raise_plan(&self, e: Value, rt: Value) -> Option<(usize, usize, Option<Value>)> {
@@ -1504,6 +1539,34 @@ impl<'p> Vm<'p> {
         }
         let p = self.py_rt_for(rt)?;
         let (tl, tt, td, ts) = (p.t_list.bits(), p.t_tuple.bits(), p.t_dict.bits(), p.t_set.bits());
+        // A record of the sequence or dict template's shape, read once (its
+        // class, then its items or its `size`, at their slots), as the
+        // general code below reads it in three passes.
+        let (seq_shape, dict_shape, size_slot) = (p.seq_shape, p.dict_shape, p.dict_slots[1]);
+        if let HeapObj::Object(m) = self.heap.get(v.heap_index()) {
+            let shape = m.shape();
+            if !m.is_ctor && shape != crate::shape::DICT {
+                let cls = m.val_at(0).bits();
+                if shape == seq_shape && (cls == tl || cls == tt) {
+                    let items = m.val_at(1);
+                    if !items.is_heap() {
+                        return None;
+                    }
+                    return match self.heap.get(items.heap_index()) {
+                        HeapObj::Array(a) => Some(a.len()),
+                        _ => None,
+                    };
+                }
+                if shape == dict_shape && (cls == td || cls == ts) {
+                    let size = m.val_at(size_slot);
+                    if !size.is_number() {
+                        return None;
+                    }
+                    let n = size.as_f64();
+                    return (n >= 0.0 && n.fract() == 0.0 && n < 9_007_199_254_740_992.0).then_some(n as usize);
+                }
+            }
+        }
         let cls = self.py_cls_of(v)?.bits();
         if cls == tl || cls == tt {
             let (_, items) = self.py_seq_parts(v)?;
@@ -1793,20 +1856,148 @@ impl<'p> Vm<'p> {
             }
         }
         let mut order: Vec<usize> = (0..n).collect();
-        let undecided = std::cell::Cell::new(false);
-        order.sort_by(|&i, &j| match self.py_ord_cmp(&keys[i], &keys[j]) {
-            Some(o) => o,
-            None => {
-                undecided.set(true);
-                std::cmp::Ordering::Equal
+        if !self.py_ord_sort_columns(&keys, &mut order) {
+            let undecided = std::cell::Cell::new(false);
+            order.sort_by(|&i, &j| match self.py_ord_cmp(&keys[i], &keys[j]) {
+                Some(o) => o,
+                None => {
+                    undecided.set(true);
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if undecided.get() {
+                return Ok(Value::UNDEFINED);
             }
-        });
-        if undecided.get() {
-            return Ok(Value::UNDEFINED);
         }
         self.charge_steps(i64::try_from(cost).unwrap_or(i64::MAX));
         let out: Vec<Value> = order.into_iter().map(|i| Value::int(i as i32)).collect();
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// Sort `order` (the identity) by `keys` as [`Vm::py_ord_cmp`] orders
+    /// them, stably, when every key is of one form whose order needs no
+    /// case analysis per comparison: all ints of the fast tier, all floats
+    /// with no NaN, all strs, or all tuples of one shape (the same lengths,
+    /// nested the same way, at most [`ORD_COLUMNS_MAX`] items in all, at
+    /// most [`ORD_COLUMNS_DEPTH`] deep) whose items at each place are all of
+    /// one of those kinds. The keys are then read once into columns (the
+    /// items in order, nested tuples' items in their place) and compared
+    /// column by column, which is what `py_ord_cmp` answers for such pairs
+    /// (two items of one kind compare as that kind, the first unequal pair
+    /// decides, at whatever depth, and equal tuples of one shape are
+    /// equal), without its match on two keys of every kind for every
+    /// comparison. `false`, with `order` untouched, for any other set of
+    /// keys.
+    fn py_ord_sort_columns(&self, keys: &[OrdKey], order: &mut [usize]) -> bool {
+        use super::bigint::BigVal;
+        enum Col<'h> {
+            Int(Vec<i128>),
+            Float(Vec<f64>),
+            Str(Vec<&'h [u8]>),
+        }
+        // A place in a key: the item indices from the top, with the length
+        // the tuple at each step must have.
+        type Path = Vec<(usize, usize)>;
+        // The places of `k`'s items (`k` itself when it is no tuple), in
+        // order; `None` past the bounds.
+        fn places(k: &OrdKey, at: &mut Path, out: &mut Vec<Path>) -> Option<()> {
+            match k {
+                OrdKey::Seq(items) => {
+                    if at.len() >= ORD_COLUMNS_DEPTH || items.is_empty() {
+                        return None;
+                    }
+                    for (i, x) in items.iter().enumerate() {
+                        at.push((i, items.len()));
+                        places(x, at, out)?;
+                        at.pop();
+                    }
+                }
+                _ => {
+                    if out.len() >= ORD_COLUMNS_MAX {
+                        return None;
+                    }
+                    out.push(at.clone());
+                }
+            }
+            Some(())
+        }
+        // `k`'s item at `path` when `k` has that shape there (a tuple of the
+        // length at each step, and no tuple at the end).
+        fn item_at<'k>(k: &'k OrdKey, path: &[(usize, usize)]) -> Option<&'k OrdKey> {
+            let mut node = k;
+            for &(i, len) in path {
+                match node {
+                    OrdKey::Seq(items) if items.len() == len => node = &items[i],
+                    _ => return None,
+                }
+            }
+            (!matches!(node, OrdKey::Seq(_))).then_some(node)
+        }
+        if !py_sort_columns_enabled() {
+            return false;
+        }
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        let mut paths: Vec<Path> = Vec::new();
+        if places(first, &mut Vec::new(), &mut paths).is_none() {
+            return false;
+        }
+        let mut cols: Vec<Col<'_>> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let item = |k| item_at(k, path);
+            let col = match item(first) {
+                Some(OrdKey::Int(BigVal::Small(_))) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k) {
+                            Some(OrdKey::Int(BigVal::Small(x))) => v.push(*x),
+                            _ => return false,
+                        }
+                    }
+                    Col::Int(v)
+                }
+                Some(OrdKey::Float(_)) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k) {
+                            Some(OrdKey::Float(x)) if !x.is_nan() => v.push(*x),
+                            _ => return false,
+                        }
+                    }
+                    Col::Float(v)
+                }
+                Some(OrdKey::Str(_)) => {
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        match item(k) {
+                            Some(OrdKey::Str(s)) => match self.heap.get(*s) {
+                                HeapObj::Str(st) => v.push(st.as_bytes()),
+                                _ => return false,
+                            },
+                            _ => return false,
+                        }
+                    }
+                    Col::Str(v)
+                }
+                _ => return false,
+            };
+            cols.push(col);
+        }
+        order.sort_by(|&i, &j| {
+            for col in &cols {
+                let o = match col {
+                    Col::Int(v) => v[i].cmp(&v[j]),
+                    Col::Float(v) => v[i].partial_cmp(&v[j]).unwrap_or(std::cmp::Ordering::Equal),
+                    Col::Str(v) => v[i].cmp(v[j]),
+                };
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        true
     }
 
     fn py_ord_key(&mut self, v: Value, depth: u32) -> Option<OrdKey> {
@@ -2111,6 +2302,56 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// For [`Instr::PyGetItem`] / [`Instr::PySetItem`]: `o.items` and the
+    /// index when `o` is a record of the sequence template's shape whose
+    /// `cls` is `seq` and `k` an immediate int within its items: what
+    /// `py_item_kind` and `py_seq_slot` find for such a pair, read in one
+    /// pass (they read the record twice, the items once each). `None` for
+    /// anything else, which those then decide.
+    #[inline(always)]
+    fn py_seq_index_fast(&self, o: Value, k: Value, seq: Value) -> Option<(u32, usize)> {
+        let n = k.small_bigint_val()?;
+        if !o.is_heap() {
+            return None;
+        }
+        let shape = self.py_rt.as_deref()?.seq_shape;
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape || m.val_at(0).bits() != seq.bits() {
+            return None;
+        }
+        let items = m.val_at(1);
+        if !items.is_heap() {
+            return None;
+        }
+        let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
+            return None;
+        };
+        let i = usize::try_from(n).ok().filter(|&i| i < vals.len())?;
+        Some((items.heap_index(), i))
+    }
+
+    /// For [`Instr::PyGetItem`] / [`Instr::PySetItem`]: a `dict` record of
+    /// the dict template's shape, its `map` and the slot of its `size`, read
+    /// in one pass (`py_item_kind` and `py_dict_field` read the record once
+    /// each). `None` for anything else, which those then decide.
+    #[inline(always)]
+    fn py_dict_rec_fast(&self, o: Value, dict: Value) -> Option<(u32, Value, usize)> {
+        if !o.is_heap() {
+            return None;
+        }
+        let p = self.py_rt.as_deref()?;
+        let (shape, slots) = (p.dict_shape, p.dict_slots);
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape || m.val_at(0).bits() != dict.bits() {
+            return None;
+        }
+        Some((o.heap_index(), m.val_at(slots[0]), slots[1]))
+    }
+
     /// `o.items` and a valid index into it for `k`.
     fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
         let (_, items) = self.py_seq_parts(o)?;
@@ -2128,6 +2369,19 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
     /// the dict's table finds missing, `None` for the slow edge.
     pub(super) fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
+        // The commonest case first, in one pass: a `seq` record of the
+        // sequence template's shape and a fast-tier int within its items.
+        if let Some((items, i)) = self.py_seq_index_fast(o, k, seq) {
+            let HeapObj::Array(vals) = self.heap.get(items) else {
+                return Ok(None);
+            };
+            let v = vals[i];
+            return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
+        }
+        // A dict record of the template's shape: its `map`, read with it.
+        if let Some((_, map, _)) = self.py_dict_rec_fast(o, dict) {
+            return Ok(self.py_table_get(map, k));
+        }
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
         };
@@ -2148,11 +2402,20 @@ impl<'p> Vm<'p> {
     }
 
     pub(super) fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
-        let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
-            return Ok(false);
+        // As `py_get_item`: the commonest cases' records first (a dict
+        // record's `map` and `size` slot read with it).
+        let fast = self.py_seq_index_fast(o, k, seq);
+        let dict_fast = if fast.is_none() { self.py_dict_rec_fast(o, dict) } else { None };
+        let (idx, is_seq) = match (fast, dict_fast) {
+            (Some((items, _)), _) => (items, true),
+            (None, Some((rec, _, _))) => (rec, false),
+            (None, None) => match self.py_item_kind(o, seq, dict) {
+                Some(kind) => kind,
+                None => return Ok(false),
+            },
         };
         if is_seq {
-            let Some((items, i)) = self.py_seq_slot(o, k) else {
+            let Some((items, i)) = fast.or_else(|| self.py_seq_slot(o, k)) else {
                 return Ok(false);
             };
             // An element present in a plain Array (no side table: nothing
@@ -2171,8 +2434,12 @@ impl<'p> Vm<'p> {
             self.set_index(Value::heap(items), Value::int(i as i32), v, true)?;
             return Ok(true);
         }
-        let (Some((_, map)), Some((size_slot, _))) = (self.py_dict_field(idx, 0), self.py_dict_field(idx, 1)) else {
-            return Ok(false);
+        let (map, size_slot) = match dict_fast {
+            Some((_, map, size_slot)) => (map, size_slot),
+            None => match (self.py_dict_field(idx, 0), self.py_dict_field(idx, 1)) {
+                (Some((_, map)), Some((size_slot, _))) => (map, size_slot),
+                _ => return Ok(false),
+            },
         };
         // A key needing guest code, or a full table: the runtime's path.
         let Some(Ok(n)) = self.py_table_set(map, k, v) else {

@@ -148,6 +148,49 @@ pub(super) mod ic {
     pub const MOD_GET: u8 = 21;
 }
 
+/// Alternate entries a site keeps (see `Vm::py_ic_class`).
+const ALT_WAYS: usize = 3;
+
+/// Whether entries of `kind` name, in `a`, the class they hold for: the
+/// kinds a site meeting several classes in turn keeps alternates of.
+fn keyed_by_a(kind: u8) -> bool {
+    matches!(
+        kind,
+        ic::ATTR_GET
+            | ic::ATTR_SET
+            | ic::ATTR_APPEND
+            | ic::METHOD
+            | ic::CLASS_ATTR
+            | ic::ATTR_FN
+            | ic::BUILTIN_METHOD
+            | ic::NEW
+            | ic::NOT_PLAIN
+            | ic::ATTR_GET_L
+            | ic::ATTR_SET_L
+            | ic::ATTR_APPEND_L
+            | ic::GET_CLASS_L
+            | ic::ATTR_PROP
+            | ic::NOT_PLAIN_ASKED
+            | ic::NEW_NO
+    )
+}
+
+/// Whether sites keep alternate entries (`Vm::py_ic_class`). On unless
+/// `ZIPP_NO_PY_IC_ALTS` is set (the same-binary A/B). Read once per process.
+fn py_ic_alts_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_IC_ALTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// One per-site cache entry (see the module comment); kind 0 is empty.
 #[derive(Clone, Copy, Default)]
 pub(super) struct PyIc {
@@ -164,6 +207,10 @@ pub(super) struct PyIc {
 pub(super) struct FnIc {
     slot_of: Box<[u16]>,
     ents: Box<[PyIc]>,
+    /// Each site's alternates: the entries it held before its current one,
+    /// for a site that meets several classes (see [`Vm::py_ic_class`]),
+    /// the most recent first. Made when a site first needs them.
+    alts: Option<Box<[[PyIc; ALT_WAYS]]>>,
 }
 
 /// The slots of a class record's fields (`makeType`'s literal).
@@ -244,6 +291,9 @@ pub(crate) struct PyRt {
     pub(super) pins: Value,
     /// Instance attribute layouts (`vm::py_table::layout`).
     pub(crate) layouts: super::py_table::layout::Layouts,
+    /// Per code object: 0 not looked at yet, 1 not a store body, `k + 1` a
+    /// store body of `k` stores (`Vm::py_store_call`).
+    pub(super) store_bodies: Vec<u8>,
     /// The static key plans of the templates `Vm::py_alloc_like` has
     /// copied (a few), matched to a template's own plan by pointer: a
     /// record is then allocated from this reference, where a clone of the
@@ -369,6 +419,7 @@ impl PyRt {
             frames: Vec::new(),
             pins: Value::UNDEFINED,
             layouts: Default::default(),
+            store_bodies: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             plans: Vec::new(),
         }
@@ -1034,6 +1085,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The cache entries of the sites at `ip`, `ip + 1`, ... (one per
+    /// element of `out`), each as [`Vm::py_ic`] answers it; `false` when the
+    /// function has no table yet or one of those ips is not a site.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(super) fn py_ic_run(&self, func_id: u32, ip: usize, out: &mut [PyIc]) -> bool {
+        let Some(Some(f)) = self.py_rt.as_deref().and_then(|p| p.ics.get(func_id as usize)) else {
+            return false;
+        };
+        for (i, slot) in out.iter_mut().enumerate() {
+            match f.slot_of.get(ip + i) {
+                Some(&s) if s != u16::MAX => *slot = f.ents[s as usize],
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Record this site's cache entry.
     pub(super) fn py_ic_put(&mut self, func_id: u32, ip: usize, e: PyIc) {
         let code = &self.func(func_id as usize).code;
@@ -1053,13 +1122,65 @@ impl<'p> Vm<'p> {
                     n += 1;
                 }
             }
-            Box::new(FnIc { slot_of, ents: vec![PyIc::default(); n].into_boxed_slice() })
+            Box::new(FnIc { slot_of, ents: vec![PyIc::default(); n].into_boxed_slice(), alts: None })
         });
-        if let Some(&s) = fic.slot_of.get(ip) {
-            if s != u16::MAX {
-                fic.ents[s as usize] = e;
-            }
+        let Some(&s) = fic.slot_of.get(ip) else {
+            return;
+        };
+        if s == u16::MAX {
+            return;
         }
+        let n_sites = fic.ents.len();
+        let old = std::mem::replace(&mut fic.ents[s as usize], e);
+        // An entry for another class (or record) keeps its place among the
+        // site's alternates (see `Vm::py_ic_class`), the most recent first.
+        if old.kind != 0 && old.a != e.a && keyed_by_a(old.kind) && py_ic_alts_enabled() {
+            let all = fic.alts.get_or_insert_with(|| vec![[PyIc::default(); ALT_WAYS]; n_sites].into_boxed_slice());
+            let Some(ents) = all.get_mut(s as usize) else {
+                return;
+            };
+            let mut kept = [PyIc::default(); ALT_WAYS];
+            kept[0] = old;
+            let mut n = 1;
+            for a in ents.iter() {
+                if n < ALT_WAYS && a.kind != 0 && a.a != old.a && a.a != e.a {
+                    kept[n] = *a;
+                    n += 1;
+                }
+            }
+            *ents = kept;
+        }
+    }
+
+    /// This site's cache entry for the class (or record) whose bits are
+    /// `key`: the current entry when it names it (or none), else one of the
+    /// site's alternates naming it, made the current entry (the current one
+    /// becoming an alternate), so that a site meeting a few classes in turn
+    /// finds each one's entry again instead of learning it again by name.
+    /// What the entry says is checked by its user as before.
+    #[inline]
+    pub(super) fn py_ic_class(&mut self, func_id: u32, ip: usize, key: u64) -> PyIc {
+        let e = self.py_ic(func_id, ip);
+        if e.a == key || e.kind == 0 {
+            return e;
+        }
+        self.py_ic_swap(func_id, ip, key).unwrap_or(e)
+    }
+
+    /// [`Vm::py_ic_class`] past the current entry: the alternate naming
+    /// `key` exchanged with the current entry in place.
+    #[inline(never)]
+    fn py_ic_swap(&mut self, func_id: u32, ip: usize, key: u64) -> Option<PyIc> {
+        let p = self.py_rt.as_deref_mut()?;
+        let fic = p.ics.get_mut(func_id as usize)?.as_deref_mut()?;
+        let s = *fic.slot_of.get(ip)? as usize;
+        let ents = fic.alts.as_deref_mut()?.get_mut(s)?;
+        let i = ents.iter().position(|a| a.kind != 0 && a.a == key)?;
+        let cur = fic.ents.get_mut(s)?;
+        let alt = ents[i];
+        ents[i] = *cur;
+        *cur = alt;
+        Some(alt)
     }
 
     /// The per-VM copy of a name: the first heap string made for `text` in

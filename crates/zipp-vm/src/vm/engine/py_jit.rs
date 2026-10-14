@@ -162,9 +162,58 @@ impl<'p> Vm<'p> {
                         }
                     };
                 }
+                // A plain callee whose body only stores its parameters into
+                // attributes of the first: the call made without its frame
+                // (`Vm::py_store_call`) when every store's site holds. No
+                // guest code runs.
+                if v.py_store_call_site(&e, fv, base, arg_base, argc) {
+                    v.set(base, dst, Value::NULL);
+                    return PY_NEXT;
+                }
             }
         }
         Self::jit_py_op(vm, regs, packed)
+    }
+
+    /// `PyRaise` from compiled code: the step's own `py_raise_step` over the
+    /// operands packed in `ops` (`e | rt << 16 | catch << 32`; `slow` comes
+    /// back as `PY_SLOW`), without the instruction found and decoded again
+    /// and routed through `py_exec`: `PY_SLOW`, `PY_TAKEN` for the catch
+    /// target (the frame's own innermost handler caught it), `PY_THREW` (the
+    /// throw pending), as `jit_py_op` answers for it. A GC safe point, as
+    /// `jit_py_op` is.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_raise(vm: *mut core::ffi::c_void, regs: *const u64, packed: u64, ops: u64) -> u64 {
+        use crate::codegen::{PY_BAIL, PY_SLOW, PY_TAKEN, PY_THREW};
+        if vm.is_null() {
+            return PY_BAIL;
+        }
+        let v = unsafe { &mut *(vm as *mut Vm) };
+        let (e, rt, catch) = (ops as u16, (ops >> 16) as u16, (ops >> 32) as u32);
+        let start = v.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr < start || (addr - start) % 8 != 0 {
+            return PY_BAIL;
+        }
+        let base = (addr - start) / 8;
+        if base + (e.max(rt) as usize) >= v.regs.len() {
+            return PY_BAIL;
+        }
+        v.maybe_gc();
+        let ip = packed as u32 as usize;
+        // `u32::MAX - 1` stands for the slow edge (never an ip a catch
+        // target can be: the catch, when there is one, is a real ip).
+        const SLOW: u32 = u32::MAX - 1;
+        match v.py_raise_step(base, ip, e, rt, SLOW, catch) {
+            Ok(next) if next == SLOW as usize => PY_SLOW,
+            Ok(next) if catch != u32::MAX && next == catch as usize => PY_TAKEN,
+            Ok(_) => PY_BAIL,
+            Err(t) => {
+                v.py_step_failed(ip);
+                v.jit_thrown_to_sentinel(t);
+                PY_THREW
+            }
+        }
     }
 
     /// Before a loop of `func_id` compiles: hand the JIT the function's
@@ -412,6 +461,12 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) extern "win64" fn jit_py_method(vm: *mut core::ffi::c_void, o: u64, rt: u64, packed: u64, keys: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        // An inline site's guard found the receiver's class's mirror
+        // cleared (`codegen::emit_py_method_inline`): settled first.
+        if keys & crate::codegen::PY_METHOD_SETTLE != 0 {
+            vm.py_settle_class_of(Value::from_bits(o));
+        }
+        let keys = keys & !crate::codegen::PY_METHOD_SETTLE;
         vm.maybe_gc();
         match vm.py_method((packed >> 32) as u32, packed as u32 as usize, Value::from_bits(o), Value::from_bits(rt), keys as u32, (keys >> 32) as u32) {
             Some(f) => f.bits(),

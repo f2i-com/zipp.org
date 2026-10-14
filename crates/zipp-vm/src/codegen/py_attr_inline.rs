@@ -37,7 +37,9 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PyAttrInline {
     pub set: bool,
-    /// `PyRt::inst_shape`.
+    /// The receiver's shape: `PyRt::inst_shape` (an attribute site, a user
+    /// class's method), or a builtin container's record shape (a builtin
+    /// method site).
     pub inst_shape: u32,
     pub cls_bits: u64,
     /// The class record's shape when planned.
@@ -47,11 +49,17 @@ pub(crate) struct PyAttrInline {
     pub ver_bits: u64,
     /// The class record's heap version (the stamp's `hver`).
     pub hver: u32,
-    /// The storage's layout and the attribute's slot in it.
+    /// The storage's layout and the attribute's slot in it. For a method
+    /// site: the layout proven to lack the method's name (a user class's
+    /// instance), 0 for a dict-less builtin container.
     pub layout: u32,
     pub slot: u32,
     /// A store may use the generation bytes (see the module comment).
     pub store_lane: bool,
+    /// A `PyMethod` site's answer: the method record the class's table held
+    /// for the name when planned (0: an attribute site). See
+    /// [`emit_py_method_inline`].
+    pub method: u64,
 }
 
 thread_local! {
@@ -119,6 +127,10 @@ fn mirror_of_rax(ops: &mut dynasmrt::x64::Assembler, miss: dynasmrt::DynamicLabe
 /// settle the class record's mirror first (see the module comment).
 pub(crate) const PY_ATTR_SETTLE: u64 = 1 << 63;
 
+/// The flag in `Vm::jit_py_method`'s `keys` operand asking it to settle the
+/// receiver's class's mirror first (a method site's guard found it cleared).
+pub(crate) const PY_METHOD_SETTLE: u64 = 1 << 63;
+
 /// A planned site: the inline path, then its step (`miss`: the plain step;
 /// `settle`: the step after settling the class's mirror), both through
 /// `Vm::jit_py_attr_miss`, which runs the step exactly as `Vm::jit_py_op`
@@ -163,6 +175,94 @@ pub(crate) fn emit_py_attr_site(
         ; je => labels.slow
         ; jmp => labels.bail
         ; => cont
+    );
+    true
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_PY_METHOD_INLINE=1` plans no `PyMethod` site (every one
+    /// calls `Vm::jit_py_method`, as before): the same-binary A/B for
+    /// [`emit_py_method_inline`].
+    fn py_method_inline_enabled() = "ZIPP_NO_PY_METHOD_INLINE"
+}
+
+/// Emit the inline path of the `PyMethod` at `ip` when the body's plan has
+/// one (`Vm::py_method_plan`): the receiver a record of the planned shape
+/// (its `cls` then at `vals[0]`, a user class's instance's storage at
+/// `vals[1]`) whose class has the planned bits and still the planned stamp
+/// (as an attribute site checks it), and, for a user class's instance, whose
+/// storage has the layout the plan proved to lack the name; then `dst` takes
+/// the planned method, the one the class's table holds for as long as the
+/// stamp holds. On success it jumps to `done`; a cleared class mirror jumps
+/// to `settle`, any other failed guard to `miss`. `false` (nothing emitted)
+/// without a method plan for the site.
+pub(crate) fn emit_py_method_inline(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    instr: &Instr,
+    miss: dynasmrt::DynamicLabel,
+    settle: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) -> bool {
+    use crate::vm::host_api::{JIT_HOT_VALS_OFF, JIT_VERSIONS_RAW_OFFSET};
+    let Some(p) = plan_at(ip) else {
+        return false;
+    };
+    let Instr::PyMethod { dst, obj, .. } = *instr else {
+        return false;
+    };
+    if p.method == 0 {
+        return false;
+    }
+    let vals_off = JIT_HOT_VALS_OFF as i32;
+    let ver_off = (p.ver_slot as i32) * 8;
+    // 1. The receiver: the planned shape; r8 = its vals, `cls` = vals[0].
+    dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+    mirror_of_rax(ops, miss);
+    dynasm!(ops
+        ; cmp DWORD [r9 + r10 * 8], p.inst_shape as i32
+        ; jne => miss
+        ; mov r8, [r9 + r10 * 8 + vals_off]
+        ; mov rax, [r8]
+        ; mov rcx, QWORD p.cls_bits as i64
+        ; cmp rax, rcx
+        ; jne => miss
+    );
+    // 2. The class: shape, `ver`, heap version (as an attribute site).
+    mirror_of_rax(ops, miss);
+    let cls_off = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov edx, DWORD [r9 + r10 * 8]
+        ; cmp edx, p.cls_shape as i32
+        ; jne => cls_off
+        ; mov rcx, [r9 + r10 * 8 + vals_off]
+        ; mov rdx, [rcx + ver_off]
+        ; mov rcx, QWORD p.ver_bits as i64
+        ; cmp rdx, rcx
+        ; jne => miss
+        ; mov rcx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [rcx + r10 * 4], p.hver as i32
+        ; jne => miss
+    );
+    // 3. A user class's instance: its storage lacks the name (the layout).
+    if p.layout != 0 {
+        dynasm!(ops ; mov rax, [r8 + 8]);
+        mirror_of_rax(ops, miss);
+        dynasm!(ops
+            ; cmp DWORD [r9 + r10 * 8], layout_shape(p.layout) as i32
+            ; jne => miss
+        );
+    }
+    // 4. The method.
+    dynasm!(ops
+        ; mov rax, QWORD p.method as i64
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        // The class's mirror is not the planned shape: settle it when cleared.
+        ; => cls_off
+        ; cmp edx, crate::shape::DICT as i32
+        ; je => settle
+        ; jmp => miss
     );
     true
 }

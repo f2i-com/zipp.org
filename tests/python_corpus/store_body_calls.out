@@ -1,0 +1,16 @@
+total 76058000 8000 ['x', 'y', 'x', 'y']
+[['x', 'y'], ['x', 'y', 'z'], ['a', 'b'], ['a'], ['x', 'y'], ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']]
+['b', 'a'] ['x', 'y', 'z'] ['me', 'other']
+Vec([997], 997) 1994 2991 4
+True True
+Vec(2999, 5998) Vec(8997, 2999) ['y', 'x']
+changed 153049000
+replaced 5627250 Vec(2999, -2999) ['a', 'b']
+guarded 60 2
+<module> 182
+__init__ 90
+y 99
+TypeError Vec.__init__
+TypeError Vec.__init__
+TypeError Vec.__init__
+late TypeError
