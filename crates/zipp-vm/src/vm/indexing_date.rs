@@ -235,6 +235,126 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// `o[i]` for an array index `i` on the plain object `idx`: its own data
+    /// property, else what a chain of plain objects answers (a data property
+    /// or nothing), each level found through the map's numeric side index.
+    /// `None` leaves it to the general path: another kind of receiver, an
+    /// accessor, an uninitialised slot, the global, a namespace, a class
+    /// instance's or a constructor's miss, an exotic link. The general path
+    /// spelled `i` as a fresh `String` for `get_prop`; `counts[n]` and
+    /// `groups[k]` paid that on every read, and compiled code left the
+    /// region for it.
+    #[inline]
+    pub(crate) fn plain_index_key_get(&self, idx: u32, i: usize) -> Option<Value> {
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if !index_key_fast_enabled()
+            || (idx == self.global_this && self.global_this != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || !self.deferred_ns_state.is_empty()
+            || !self.realm_global_objs.is_empty()
+        {
+            return None;
+        }
+        if let Some(s) = m.element_pos(i) {
+            if m.attr_at(s).accessor {
+                return None; // the getter is user code
+            }
+            let v = m.val_at(s);
+            return (!v.is_uninitialized()).then_some(v);
+        }
+        // A miss: the walk of `plain_string_key_miss`, link for link.
+        if !self.ic_obj_ok(idx) || m.class.is_some() || m.is_ctor {
+            return None;
+        }
+        let mut cur = idx;
+        for _ in 0..64 {
+            let next = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                // Explicit null prototype: a true chain miss.
+                Some(_) => return Some(Value::UNDEFINED),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(Value::UNDEFINED);
+                    }
+                    self.obj_proto
+                }
+            };
+            if !self.ic_obj_ok(next) {
+                return None;
+            }
+            match self.heap.get(next) {
+                HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                    if let Some(s) = m2.element_pos(i) {
+                        if m2.attr_at(s).accessor {
+                            return None;
+                        }
+                        let v = m2.val_at(s);
+                        return (!v.is_uninitialized()).then_some(v);
+                    }
+                }
+                _ => return None, // exotic link
+            }
+            cur = next;
+        }
+        None
+    }
+
+    /// `o[i] = v` for an array index `i` on the plain object `idx`: a store
+    /// into its own writable data property, or the append of `i` when the
+    /// object is extensible and class-less and no level of its chain holds an
+    /// accessor or a non-writable data property at `i`
+    /// (`plain_add_chain_clear`). `false` means nothing was written and the
+    /// general path decides. Object.prototype and Array.prototype always take
+    /// that path (an index key on them retires the indexed-prototype
+    /// protector), as do a class prototype, the global and the namespaces.
+    /// The caller has run the store barrier.
+    pub(crate) fn plain_index_key_set(&mut self, idx: u32, i: usize, val: Value) -> bool {
+        if !matches!(self.heap.get(idx), HeapObj::Object(_))
+            || !index_key_fast_enabled()
+            || (idx == self.global_this && self.global_this != 0)
+            || self.is_indexed_proto_anchor(idx)
+            || !self.realm_global_objs.is_empty()
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || !self.deferred_ns_state.is_empty()
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+        {
+            return false;
+        }
+        let (hit, add) = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.class_proto => match m.element_pos(i) {
+                Some(s) => {
+                    let a = m.attr_at(s);
+                    let ok = !a.accessor && a.writable && !m.val_at(s).is_uninitialized();
+                    (ok.then_some(s), false)
+                }
+                None => (None, m.extensible && m.class.is_none() && !m.is_ctor),
+            },
+            _ => (None, false),
+        };
+        if let Some(s) = hit {
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.set_val_at(s, val);
+                return true;
+            }
+            return false;
+        }
+        if add {
+            let mut buf = [0u8; 20];
+            let k = crate::heap::index_key(&mut buf, i);
+            if self.plain_add_chain_clear(idx, k) {
+                let ks = k.to_string();
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.push_data(ks, val);
+                    self.heap.bump_version(idx); // a key add reallocs `vals` (IC)
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
         // RequireObjectCoercible(base) precedes ToPropertyKey(key): `null[k]` must
         // throw TypeError BEFORE evaluating k's toString (sec-evaluate-property-
@@ -319,6 +439,12 @@ impl<'p> Vm<'p> {
                     self.keyed_memo_put(oidx, kidx, i);
                     return Ok(v);
                 }
+            }
+        }
+        // FAST PATH: an array-index number on a plain object (`counts[n]`).
+        if let Some(i) = array_index(key) {
+            if let Some(v) = self.plain_index_key_get(obj.heap_index(), i) {
+                return Ok(v);
             }
         }
         // A boxed String indexes its wrapped string (chars / length); a boxed
@@ -749,6 +875,12 @@ impl<'p> Vm<'p> {
                         return Ok(());
                     }
                 }
+            }
+        }
+        // FAST PATH: an array-index number on a plain object (`counts[n] = c`).
+        if let Some(i) = array_index(key) {
+            if self.plain_index_key_set(idx, i, val) {
+                return Ok(());
             }
         }
         // A TypedArray: a canonical numeric index writes the element (coerced +

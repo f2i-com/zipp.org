@@ -1760,6 +1760,10 @@ pub(crate) extern "win64" fn jit_get_index(
             },
             None => crate::codegen::SELF_CALL_DEOPT,
         },
+        // `o[n]` on a plain object: the interpreter's lane, shared.
+        HeapObj::Object(_) => array_index(key)
+            .and_then(|i| vm.plain_index_key_get(arr.heap_index(), i))
+            .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits),
         _ => crate::codegen::SELF_CALL_DEOPT, // non-ASCII str / rope / other → interpreter
     }
 }
@@ -1892,6 +1896,15 @@ pub(crate) extern "win64" fn jit_set_index(
     // the fractional case → deopt) defers to the interpreter.
     if matches!(vm.heap.get(arr.heap_index()), HeapObj::TypedArray { .. }) {
         return ta_fast_set(vm, arr.heap_index(), i, Value::from_bits(val_bits));
+    }
+    // `o[n] = v` on a plain object: the interpreter's lane, shared. It
+    // allocates no heap object (a new key's `String` is not one).
+    if matches!(vm.heap.get(arr.heap_index()), HeapObj::Object(_)) {
+        return if vm.plain_index_key_set(arr.heap_index(), i, Value::from_bits(val_bits)) {
+            0
+        } else {
+            crate::codegen::SELF_CALL_DEOPT
+        };
     }
     // A side table may hold a special index (accessor / non-writable / arr_props
     // value) — deopt to the interpreter's override-aware set_prop for parity.

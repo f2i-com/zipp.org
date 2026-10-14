@@ -318,6 +318,29 @@ pub(crate) fn canonical_u32_key(k: &str) -> Option<u32> {
     (n < u32::MAX as u64).then_some(n as u32)
 }
 
+/// Same-binary switch for the ordinary-object array-index lane
+/// (`Vm::plain_index_key_get` / `plain_index_key_set`):
+/// `ZIPP_NO_INDEX_KEY_FAST=1` sends `o[3]` on a plain object back through
+/// `key_of` and `get_prop` / `set_prop`, and compiled code back to the
+/// interpreter.
+#[inline]
+pub(crate) fn index_key_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_INDEX_KEY_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_NO_ARRKEY_FAST=1` restores the allocating string-key paths on the
 /// array element machinery: the `key_of` + `parse::<u32>` + `to_string`
 /// canonicality re-derivation in `[[HasProperty]]`, and the `key_of` +
