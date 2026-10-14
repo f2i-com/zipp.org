@@ -119,7 +119,7 @@ def both(label, fn):
 
 
 seed = 0
-for op in ["add", "sub", "mul", "div", "pow", "max", "min", "eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor", "floordiv", "mod", "atan2", "fmod"]:
+for op in ["add", "sub", "mul", "div", "pow", "max", "min", "eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor", "floordiv", "mod", "atan2", "fmod", "relu_bw"]:
     for dta in ["float32", "float64", "int64", "bool"]:
         for dtb in ["float32", "int64"]:
             for sa, sb in [((96,), (96,)), ((12, 8), (8,)), ((12, 8), (12, 1)), ((70,), ()), ((), (66,)), ((4, 1, 6), (1, 5, 6))]:
@@ -967,4 +967,69 @@ fn unbroadcast_sum_gives_the_composites_bytes() {
     let out = run.output.expect("runs");
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("cases 54 mismatches 0 []"), "{}", out[0]);
+}
+
+/// ReLU's backward as one kernel (`relu_bw`) against the composite it
+/// replaces, `where(o <= 0, 0.0, g)`: the same bytes for float32 and float64
+/// at sizes on both sides of the native threshold, with signed zeros,
+/// infinities and NaN in the output and the gradient; and the gradient
+/// nn.ReLU / F.relu / Tensor.relu hand back through backward (also under
+/// create_graph, which keeps the composite).
+const RELU_BW: &str = r#"
+import torch
+
+INF = float("inf")
+NAN = float("nan")
+SPECIAL = [0.0, -0.0, 1.0, -1.0, 2.5, -1e-40, 1e-40, INF, -INF, NAN, 3e38, -3e38]
+
+
+def vals(n, seed):
+    out = []
+    for i in range(n):
+        j = (i * 5 + seed * 3) % 29
+        out.append(SPECIAL[j] if j < len(SPECIAL) else ((i * 37 + seed * 11) % 23 - 11) / 4.0)
+    return out
+
+
+bad = []
+cases = 0
+for dt in (torch.float32, torch.float64):
+    for shape in ((5,), (4, 12), (100,), (3, 5, 7)):
+        n = 1
+        for d in shape:
+            n *= d
+        for seed in range(3):
+            o = torch.tensor(vals(n, seed), dtype=dt).reshape(shape)
+            g = torch.tensor(vals(n, seed + 7), dtype=dt).reshape(shape)
+            for native in (False, True):
+                torch._k._native(native)
+                cases += 1
+                ref = torch.where(o <= 0, 0.0, g)
+                got = torch._bw_relu(g, None, o)
+                if got.dtype is not ref.dtype or tuple(got.shape) != tuple(ref.shape) or torch._k.tobytes(got._s) != torch._k.tobytes(ref._s):
+                    bad.append("%s %s %d %s" % (dt, shape, seed, native))
+torch._k._native(True)
+x = torch.tensor(vals(48, 2), dtype=torch.float32).reshape(4, 12).requires_grad_()
+w = torch.tensor(vals(48, 5), dtype=torch.float32).reshape(4, 12)
+(torch.relu(x) * w).sum().backward()
+ref = torch.where(torch.relu(x).detach() <= 0, 0.0, w)
+cases += 1
+if torch._k.tobytes(x.grad._s) != torch._k.tobytes(ref._s):
+    bad.append("backward")
+x.grad = None
+y = torch.relu(x)
+w2 = w.clone().requires_grad_()
+(gx,) = torch.autograd.grad((y * w2).sum(), [x], create_graph=True)
+cases += 1
+if torch._k.tobytes(gx._s) != torch._k.tobytes(ref._s) or gx.grad_fn is None:
+    bad.append("create_graph")
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn relu_backward_kernel_gives_the_composites_bytes() {
+    let run = run(RELU_BW, 2_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 50 mismatches 0 []"), "{}", out[0]);
 }

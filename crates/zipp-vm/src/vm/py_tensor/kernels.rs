@@ -214,6 +214,7 @@ fn binary_fn(op: u32) -> Option<fn(f64, f64) -> f64> {
         17 => |x: f64, y: f64| math_unary(M::Floor, x / y),
         18 => |x: f64, y: f64| x - math_unary(M::Floor, x / y) * y,
         19 => |x: f64, y: f64| x.atan2(y),
+        20 => |g: f64, o: f64| if o <= 0.0 { 0.0 } else { g },
         _ => return None,
     })
 }

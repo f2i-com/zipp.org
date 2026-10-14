@@ -48,7 +48,7 @@
     let NATIVE_SMALL = NATIVE_MIN;
     try { if (NATIVE_FN !== null && NATIVE_FN(N_LOCAL) === true) NATIVE_SMALL = 16; } catch (e) { NATIVE_SMALL = NATIVE_MIN; }
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
-        and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19 };
+        and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19, relu_bw: 20 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
         gelu: 12, gelu_grad: 13, reciprocal: 14, rsqrt: 15, log1p: 16, expm1: 17, softplus: 18, sin: 19, cos: 20, floor: 21,
         ceil: 22, trunc: 23, isfinite: 24, isnan: 25, not: 26, clamp: 27, frac: 28, tan: 29, atan: 30, log2: 31, log10: 32,
@@ -294,6 +294,9 @@
         bitand: (x, y) => bitwise(x, y, 0), bitor: (x, y) => bitwise(x, y, 1), bitxor: (x, y) => bitwise(x, y, 2),
         lshift: (x, y) => x * Math.pow(2, y), rshift: (x, y) => Math.floor(x / Math.pow(2, y)),
         atan2: Math.atan2, ipow: intPow,
+        // ReLU's gradient `g` where the output `o` is above 0, else 0:
+        // `where(o <= 0, 0.0, g)` element for element (a NaN output passes g).
+        relu_bw: (g, o) => (o <= 0 ? 0 : g),
         xlogy: (x, y) => xlogy(x, y), xlog1py: (x, y) => xlog1py(x, y), zeta: (x, y) => zeta(x, y), igamma: (x, y) => igamma(x, y), igammac: (x, y) => igammac(x, y),
     };
     // Integer bitwise ops on the float64 storage of int64 values: 32-bit JS

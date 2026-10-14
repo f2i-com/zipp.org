@@ -3870,6 +3870,11 @@ def _silu_grad(x):
 
 
 def _bw_relu(g, x, o):
+    if not _grad_enabled and g.__class__ is Tensor and o.__class__ is Tensor and g.dtype is o.dtype and (g.dtype is float32 or g.dtype is float64) and _shape_eq(g.shape, o.shape):
+        # `where(o <= 0, 0.0, g)` as one kernel (relu_bw), outside
+        # create_graph: the same values without the mask tensor.
+        storage, shape = _k.binary("relu_bw", g._s, g.shape, o._s, o.shape)
+        return Tensor(storage, g.shape, g.dtype)
     return where(o <= 0, 0.0, g)
 
 
