@@ -462,6 +462,21 @@ impl PropIndex {
         }
     }
 
+    /// About what one more entry for a key of `key_len` bytes adds to
+    /// [`Self::resident_bytes`]: the tree's per-entry charge and the clone,
+    /// or a flat table's two buckets at its load factor.
+    #[inline]
+    fn entry_bytes(&self, key_len: usize) -> usize {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => 128 + key_len,
+            PropIndex::Inter { .. } | PropIndex::Split { .. } => {
+                let _ = key_len;
+                2 * std::mem::size_of::<(u32, u32)>()
+            }
+        }
+    }
+
     /// Record `slot` under `key`. The caller guarantees the key is absent
     /// (every insertion path misses in `pos()` first).
     fn insert(&mut self, key: &str, slot: u32) {
@@ -1970,9 +1985,18 @@ impl ObjMap {
     /// append materialized, into `key_bytes`.
     fn push_key(&mut self, key: String) {
         let n = key.capacity();
+        let index_entry = self
+            .index
+            .as_ref()
+            .map_or(0, |index| index.entry_bytes(key.len()));
         let (keys, cloned) = self.keys.make_owned();
         keys.push(key);
         key_bytes_add(&mut self.key_bytes, cloned.saturating_add(n));
+        // About what an audit would charge the property: its key, its slots
+        // in the key and value columns, and its index entry.
+        note_grown_in_place(
+            n + std::mem::size_of::<String>() + std::mem::size_of::<Value>() + index_entry,
+        );
     }
 
     /// Remove the key at `i`, keeping `key_bytes` in step.
@@ -6568,6 +6592,23 @@ pub fn note_every_block(old_size: usize, new_size: usize) {
 static ALLOCATOR_REPORTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+thread_local! {
+    /// Payload that grew in place since the heap last looked, counted only
+    /// while no allocator reports (`ALLOCATOR_REPORTS`): what an object that
+    /// is born empty and then given its properties carries, which the birth
+    /// payload never saw. Per thread, as a VM is; the next allocation folds
+    /// it into `Heap::payload_since_gc`.
+    static GROWN_IN_PLACE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Count `bytes` of payload grown in place (see `GROWN_IN_PLACE`).
+#[inline]
+fn note_grown_in_place(bytes: usize) {
+    if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
+        GROWN_IN_PLACE.with(|grown| grown.set(grown.get().saturating_add(bytes)));
+    }
+}
+
 /// Whether the reports cover every block ([`note_every_block`]): then the
 /// figure is all the memory there is, and its not having risen means nothing
 /// grew.
@@ -7799,7 +7840,11 @@ impl Heap {
         // With no allocator reporting, weigh every payload: a minor once a
         // footprint step of it has been allocated since the last collection.
         if !ALLOCATOR_REPORTS.load(Ordering::Relaxed) {
-            self.payload_since_gc = self.payload_since_gc.saturating_add(big);
+            let grown = GROWN_IN_PLACE.with(|grown| grown.replace(0));
+            self.payload_since_gc = self
+                .payload_since_gc
+                .saturating_add(big)
+                .saturating_add(grown);
             if self.payload_since_gc >= FOOTPRINT_STEP {
                 self.payload_since_gc = 0;
                 self.gc_requested = true;
