@@ -481,7 +481,7 @@ impl<'p> Vm<'p> {
                             _ => true,
                         });
                         if !globals_ok {
-                            self.jit.compile_defer(func_id);
+                            self.jit.compile_defer_globals(func_id);
                         } else {
                             // The self-function's current global Value (a heap Func),
                             // stable since hoist_functions ran at startup. Embedded so a
@@ -4213,9 +4213,9 @@ impl<'p> Vm<'p> {
                             // A global op whose slot is still UNINITIALIZED may
                             // be own-prop-backed (eval-created / `this.x` bindings):
                             // raw JIT slot accesses would bypass the own property.
-                            // Don't compile yet — once the slot holds a real value
-                            // it can never go back, so a later attempt is safe
-                            // (region_defer re-arms the threshold). Checked ONLY
+                            // Don't compile yet; a later attempt re-checks
+                            // (`region_defer_globals` re-arms the threshold a
+                            // bounded number of times). Checked ONLY
                             // when the back-edge counter trips, so a rejected /
                             // still-counting loop never pays the body scan.
                             if self.jit.record_region(func_id, t as u32) {
@@ -4270,9 +4270,10 @@ impl<'p> Vm<'p> {
                                     })
                                 };
                                 if !region_globals_ok {
-                                    // Re-arm: a later back-edge re-checks once
-                                    // the global slot is initialized.
-                                    self.jit.region_defer(func_id, t as u32);
+                                    // Re-arm (bounded): a later threshold
+                                    // re-checks in case the slot was
+                                    // initialized meanwhile.
+                                    self.jit.region_defer_globals(func_id, t as u32);
                                     ip = t;
                                     continue;
                                 }
@@ -9304,6 +9305,7 @@ impl<'p> Vm<'p> {
                 || obj.heap_index() != p.obj_idx
                 || self.heap.version_of(p.obj_idx) != p.obj_version
             {
+                self.jit.note_region_entry_refused(func_id, entry_ip);
                 return None;
             }
             for &(name_idx, slot) in &p.fields {

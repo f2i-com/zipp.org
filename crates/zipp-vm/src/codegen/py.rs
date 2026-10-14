@@ -1331,6 +1331,7 @@ impl Jit {
                         end,
                         deopts: 0,
                         ok_runs: 0,
+                        entry_refusals: 0,
                         is_int: false,
                         is_mem: true,
                         field_plan: None,

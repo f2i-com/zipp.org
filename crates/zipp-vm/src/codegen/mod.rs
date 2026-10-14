@@ -94,6 +94,13 @@ pub const JIT_THRESHOLD: u32 = 8;
 /// Number of times a loop back-edge must fire before the loop region is offered
 /// to the OSR (on-stack-replacement) compiler. Low so hot loops promote fast.
 pub const OSR_THRESHOLD: u32 = 8;
+/// Compile offers a loop or function may defer waiting for a global slot to
+/// become directly routable before it stays interpreted (see
+/// [`Jit::region_defer_globals`]).
+pub const GLOBAL_DEFER_TRIES: u8 = 4;
+/// Entries a region's entry guard may refuse in a row before the region is
+/// evicted for a recompile (see [`Jit::note_region_entry_refused`]).
+pub const ENTRY_REFUSAL_LIMIT: u32 = 64;
 
 /// `Jit::interp_only` flags: the function never compiles whole.
 const INTERP_NO_FN: u8 = 1;
@@ -2962,6 +2969,9 @@ pub struct Region {
     /// Successful (non-bailing) exits since the last decay. `deopts` is a RATE
     /// budget, not a lifetime total — see `note_region_resume`.
     ok_runs: u32,
+    /// Entries refused in a row by the entry guard — see
+    /// [`Jit::note_region_entry_refused`]. Reset by every run.
+    entry_refusals: u32,
     /// True if compiled by the integer path. On eviction an int region falls
     /// back to the double path (rather than full-blacklisting the loop).
     is_int: bool,
@@ -3496,6 +3506,10 @@ pub struct Jit {
     /// entry — capped so a callee that never compiles (blacklisted) cannot
     /// keep a region interpreting forever.
     cross_defer_spent: FxHashMap<(u32, u32), u16>,
+    /// Deferrals spent per loop / per function waiting for a global slot to
+    /// become directly routable — see [`Jit::region_defer_globals`].
+    region_global_defers: FxHashMap<(u32, u32), u8>,
+    fn_global_defers: FxHashMap<u32, u8>,
     region_counts: FxHashMap<(u32, u32), u32>,
     region_blacklist: FxHashSet<(u32, u32)>,
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
@@ -4654,6 +4668,53 @@ impl Jit {
         }
     }
 
+    /// The region-compile offer found a global op whose slot is not directly
+    /// routable (uninitialized, or shadowed by a real own property of the
+    /// global object). Re-offer after another full threshold, at most
+    /// [`GLOBAL_DEFER_TRIES`] times, then leave the loop interpreted for good.
+    ///
+    /// `region_defer`'s one-step re-arm made the very next back-edge trip the
+    /// threshold again, and a binding that lives as an own property of the
+    /// global object never becomes a slot: every iteration of such a loop
+    /// re-ran the offer (the region-end search over the function, the body
+    /// scan, three hash probes). A loop reading `globalThis.d` ran 30% slower
+    /// with the JIT on than with `ZIPP_NOJIT=1`, and every script an embedder
+    /// runs through `eval_in_context` declares its `var`s that way.
+    pub fn region_defer_globals(&mut self, func_id: u32, entry_ip: u32) {
+        let key = (func_id, entry_ip);
+        let spent = self.region_global_defers.entry(key).or_insert(0);
+        *spent += 1;
+        if *spent >= GLOBAL_DEFER_TRIES {
+            if crate::jitlog_enabled() {
+                eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (global not routable)");
+            }
+            self.region_blacklist.insert(key);
+            self.set_region_dead(func_id, entry_ip);
+            self.region_counts.remove(&key);
+        } else if let Some(c) = self.region_counts.get_mut(&key) {
+            *c = 0;
+        }
+    }
+
+    /// The whole-function sibling of [`Jit::region_defer_globals`]: re-offer
+    /// after another full threshold of calls, at most [`GLOBAL_DEFER_TRIES`]
+    /// times, then leave the function to the interpreter (and its loops to
+    /// the region tier, which decides for itself).
+    pub fn compile_defer_globals(&mut self, func_id: u32) {
+        let spent = self.fn_global_defers.entry(func_id).or_insert(0);
+        *spent += 1;
+        if *spent >= GLOBAL_DEFER_TRIES {
+            if crate::jitlog_enabled() {
+                eprintln!("[jit] fn{func_id} DECLINED (global not routable)");
+            }
+            self.blacklist.insert(func_id);
+            self.set_fn_state(func_id, FN_DEAD);
+            self.counts.remove(&func_id);
+        } else if let Some(c) = self.counts.get_mut(&func_id) {
+            *c = 0;
+        }
+    }
+
     /// Attempt to compile the loop region `[start, end]` of `func_id` (entered at
     /// `start`). `globals_base_helper` is the address of the win64 helper that
     /// returns `vm.globals.as_mut_ptr()` (the region pins it for direct global
@@ -4788,6 +4849,7 @@ impl Jit {
                             end,
                             deopts: 0,
                             ok_runs: 0,
+                            entry_refusals: 0,
                             is_int: false,
                             is_mem,
                             field_plan: None,
@@ -4863,6 +4925,7 @@ impl Jit {
                                 end,
                                 deopts: 0,
                                 ok_runs: 0,
+                                entry_refusals: 0,
                                 is_int,
                                 is_mem: false,
                                 field_plan: Some(plan),
@@ -4934,6 +4997,7 @@ impl Jit {
                         end,
                         deopts: 0,
                         ok_runs: 0,
+                        entry_refusals: 0,
                         is_int: true,
                         is_mem: false,
                         field_plan: None,
@@ -5006,6 +5070,7 @@ impl Jit {
                         end,
                         deopts: 0,
                         ok_runs: 0,
+                        entry_refusals: 0,
                         is_int: false,
                         is_mem,
                         field_plan: None,
@@ -5036,6 +5101,7 @@ impl Jit {
         let key = (func_id, entry_ip);
         let mut boxref_evicted = false;
         let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
+            r.entry_refusals = 0;
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
                 if crate::jitlog_enabled() {
@@ -5105,6 +5171,38 @@ impl Jit {
                 self.region_blacklist.insert(key);
                 self.set_region_dead(key.0, key.1);
             }
+        }
+    }
+
+    /// The entry guard refused this region: an SROA region whose promoted
+    /// object's global now holds another object, or whose object changed
+    /// shape. The region stays for the original object's return, but a loop
+    /// that keeps meeting the new one paid the guard plus an interpreted
+    /// iteration on every back-edge for the rest of the run (a loop reading
+    /// `g.x` ran at 28 ns an iteration after one `g = {x: 2}`, against 14
+    /// interpreted and under 1 compiled). After [`ENTRY_REFUSAL_LIMIT`]
+    /// refusals with no run between them, evict it as a deopting SROA region
+    /// is evicted, so the next threshold recompiles the loop on the general
+    /// path, which reads the field through its inline cache.
+    pub fn note_region_entry_refused(&mut self, func_id: u32, entry_ip: u32) {
+        let key = (func_id, entry_ip);
+        let evict = match self.regions.get_mut(&key) {
+            Some(r) => {
+                r.entry_refusals += 1;
+                r.entry_refusals >= ENTRY_REFUSAL_LIMIT
+            }
+            None => false,
+        };
+        if evict {
+            if crate::jitlog_enabled() {
+                eprintln!("[jit] region fn{func_id} [{entry_ip}] EVICTED (entry guard)");
+            }
+            if let Some(r) = self.regions.remove(&key) {
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+            }
+            self.region_int_blacklist.insert(key);
+            self.region_counts.remove(&key);
         }
     }
 
