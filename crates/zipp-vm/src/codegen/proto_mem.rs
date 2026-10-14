@@ -963,6 +963,24 @@ fn emit_tierc_xorshift_registers(
     }
 }
 
+/// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
+/// uses `arguments` out of Tier C again (it then runs interpreted, as every
+/// such function did).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_arguments_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_ARGUMENTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
 /// parameter out of Tier C again (and so out of every frame-free entry).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -997,14 +1015,20 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         return false;
     }
     // The `arguments` object is built by the interpreter's call setup, not by
-    // emitted code — a frame-free entry would skip it. Stay interpreted. A rest
+    // emitted code, so such a body is compiled without a cross entry (see
+    // `Jit::compile`): every call reaches it through a call setup and the
+    // frame's `try_run_jit`, and every frame-free entry declines it already
+    // (CROSS3 plans, `call_compiled_windowed`, `native_cb_entry`, the leaf
+    // and method inliners; an arrow has no `arguments` of its own). A rest
     // parameter's array is built by every entry: the call setups that push a
     // frame, and the generic frame-free cross call (`jit_cross_call_impl`)
     // from the arguments past the parameters; every other frame-free entry
     // declines a rest body (CROSS3 plans, the same-prototype arrow lane,
     // `call_compiled_windowed`, `native_cb_entry`, the leaf and method
     // inliners).
-    if proto.arguments_reg.is_some() || (proto.rest_reg.is_some() && !tierc_rest_enabled()) {
+    if (proto.arguments_reg.is_some() && !tierc_arguments_enabled())
+        || (proto.rest_reg.is_some() && !tierc_rest_enabled())
+    {
         if crate::jitlog_enabled() {
             eprintln!("[tierC-reject] rest/arguments");
         }

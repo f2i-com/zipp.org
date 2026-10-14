@@ -1704,11 +1704,27 @@ pub(crate) extern "win64" fn jit_get_index(
             // answers `undefined` where the interpreter walks the chain is exactly
             // the wrong-answer class the tier-differential fuzzer exists to catch.
             Some(i) => {
-                // Mapped arguments are represented as Arrays but a live index
-                // aliases a formal register, not necessarily either backing
-                // store. They are never eligible for this read-only shortcut.
+                // An arguments object: the interpreter's read (`get_index`) —
+                // a live mapped index is its formal's register, then an
+                // override in the side table, then a present dense element.
+                // An accessor and a miss (the chain) keep the interpreter's
+                // path.
                 if sparse_get && vm.arguments_objs.contains_key(&arr.heap_index()) {
-                    return crate::codegen::SELF_CALL_DEOPT;
+                    let aidx = arr.heap_index();
+                    if let Some(v) = vm.args_mapped_get(aidx, i) {
+                        return v.bits();
+                    }
+                    if let Some((attr, raw)) = vm.array_index_override(aidx, i) {
+                        return if attr.accessor {
+                            crate::codegen::SELF_CALL_DEOPT
+                        } else {
+                            raw.bits()
+                        };
+                    }
+                    return match items.get(i) {
+                        Some(v) if !v.is_hole() => v.bits(),
+                        _ => crate::codegen::SELF_CALL_DEOPT,
+                    };
                 }
                 if sparse_get {
                     if let Some((attr, raw)) = vm.array_index_override(arr.heap_index(), i) {
@@ -2912,7 +2928,15 @@ pub(crate) extern "win64" fn jit_quick_len(vm: *mut core::ffi::c_void, obj_bits:
         HeapObj::Cons { len, .. } => len_value(*len).bits(),
         HeapObj::Array(items) => {
             if !vm.arguments_objs.is_empty() && vm.arguments_objs.contains_key(&idx) {
-                return crate::codegen::SELF_CALL_DEOPT;
+                // An arguments object's `length` is an ordinary own data
+                // property in its side table (any value, deletable); an
+                // accessor or a deleted one keeps the interpreter's path.
+                return match vm.arr_props.get(&idx).map(|m| (m, m.pos("length"))) {
+                    Some((m, Some(s))) if !m.attr_at(s).accessor && !m.val_at(s).is_uninitialized() => {
+                        m.val_at(s).bits()
+                    }
+                    _ => crate::codegen::SELF_CALL_DEOPT,
+                };
             }
             let n = if vm.array_js_len.is_empty() {
                 items.len()

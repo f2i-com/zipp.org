@@ -4298,9 +4298,11 @@ impl Jit {
                     );
                 }
                 // Cross-call entry (B83): a Tier C body never bakes a
-                // self-binding assumption and Tier C rejects generators/async/
-                // rest/`arguments`, so its entry is safe to dispatch to from
-                // another compiled function's Call site.
+                // self-binding assumption and Tier C rejects generators/async;
+                // a rest body's array is built by the generic cross call, and
+                // an `arguments` body takes no cross entry (below), so the
+                // entry is safe to dispatch to from another compiled
+                // function's Call site.
                 debug_assert!(f.self_binding().is_none());
                 let entry = f.entry();
                 // W7 window-fill mask: which registers a cross call must zero
@@ -4335,6 +4337,13 @@ impl Jit {
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
+                // An `arguments` body takes no cross entry, framed or not:
+                // only a call setup builds its arguments object, so every
+                // call reaches it through one and `try_run_jit`.
+                if proto.arguments_reg.is_some() {
+                    self.clear_cross_entry(func_id);
+                    return;
+                }
                 let json_walk = meter
                     .is_none()
                     .then(|| json_walk_plan(proto, const_strs))
