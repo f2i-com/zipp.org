@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::cell::UnsafeCell;
 #[cfg(feature = "safe-sandbox")]
 use std::collections::BTreeMap;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Whether two property keys are the same text, compared here.
@@ -294,8 +294,13 @@ pub enum PropIndex {
     /// logarithmic lookup bound even when wasm32 cannot supply secret hash
     /// entropy. Keys are cloned only after the map crosses the index threshold;
     /// the authoritative insertion-ordered vectors remain unchanged.
+    /// `key_bytes` is the capacity of the cloned keys (each its length), kept
+    /// in step so a heap audit does not walk the tree to size it.
     #[cfg(feature = "safe-sandbox")]
-    Tree { entries: BTreeMap<String, u32> },
+    Tree {
+        entries: BTreeMap<String, u32>,
+        key_bytes: usize,
+    },
     /// Pre-W19: one flat `Vec<(tag, slot)>`.
     Inter {
         table: Vec<(u32, u32)>,
@@ -320,6 +325,7 @@ impl PropIndex {
             let _ = n;
             return PropIndex::Tree {
                 entries: BTreeMap::new(),
+                key_bytes: 0,
             };
         }
         #[cfg(not(feature = "safe-sandbox"))]
@@ -374,7 +380,7 @@ impl PropIndex {
     #[inline]
     fn find_tagged(&self, keys: &[String], key: &str, tag: u32) -> Option<usize> {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::Tree { entries, .. } = self {
             let _ = tag;
             return entries.get(key).copied().map(|slot| slot as usize);
         }
@@ -417,7 +423,7 @@ impl PropIndex {
     fn cap(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => entries.len(),
+            PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { mask, .. } | PropIndex::Split { mask, .. } => mask + 1,
         }
     }
@@ -426,7 +432,7 @@ impl PropIndex {
     fn len(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => entries.len(),
+            PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len,
         }
     }
@@ -434,17 +440,20 @@ impl PropIndex {
     fn resident_bytes(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { entries } => {
+            PropIndex::Tree { entries, key_bytes } => {
                 // std's B-tree node fanout/layout is private. 128 bytes per
                 // entry plus owned string capacity deliberately overcounts its
                 // current node overhead while keeping heap audits stable.
+                debug_assert_eq!(
+                    *key_bytes,
+                    entries
+                        .keys()
+                        .fold(0usize, |n, key| n.saturating_add(key.capacity())),
+                    "the tree's key_bytes drifted from its keys"
+                );
                 std::mem::size_of::<Self>()
                     .saturating_add(entries.len().saturating_mul(128))
-                    .saturating_add(
-                        entries
-                            .keys()
-                            .fold(0usize, |n, key| n.saturating_add(key.capacity())),
-                    )
+                    .saturating_add(*key_bytes)
             }
             PropIndex::Inter { table, .. } => vec_capacity_bytes(table),
             PropIndex::Split { tags, slots, .. } => {
@@ -463,12 +472,14 @@ impl PropIndex {
     /// `find_tagged` for why a wrong tag cannot corrupt a lookup).
     fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::Tree { entries, key_bytes } = self {
             let _ = tag;
             // The mutation must not live inside `debug_assert!`: its argument
             // is removed in release builds, which would leave every production
             // safe-profile index empty.
-            let previous = entries.insert(key.to_owned(), slot);
+            let key = key.to_owned();
+            *key_bytes = key_bytes.saturating_add(key.capacity());
+            let previous = entries.insert(key, slot);
             debug_assert!(previous.is_none());
             return;
         }
@@ -610,10 +621,13 @@ impl PropIndex {
     /// down in either representation.
     fn remove(&mut self, key: &str, slot: u32) {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::Tree { entries, key_bytes } = self {
             // As above, perform the state change outside the debug-only check.
-            let removed = entries.remove(key);
-            debug_assert_eq!(removed, Some(slot));
+            let removed = entries.remove_entry(key);
+            debug_assert_eq!(removed.as_ref().map(|(_, s)| *s), Some(slot));
+            if let Some((key, _)) = removed {
+                *key_bytes = key_bytes.saturating_sub(key.capacity());
+            }
             for value in entries.values_mut() {
                 if *value > slot {
                     *value -= 1;
@@ -664,7 +678,7 @@ impl PropIndex {
     #[cfg(test)]
     fn verify(&self, keys: &[String]) {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries } = self {
+        if let PropIndex::Tree { entries, .. } = self {
             assert_eq!(entries.len(), keys.len());
             for (slot, key) in keys.iter().enumerate() {
                 assert_eq!(entries.get(key), Some(&(slot as u32)));
@@ -1131,12 +1145,6 @@ impl Deref for PropKeys {
     }
 }
 
-impl DerefMut for PropKeys {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.make_owned().as_mut_slice()
-    }
-}
-
 impl<'a> IntoIterator for &'a PropKeys {
     type Item = &'a String;
     type IntoIter = std::slice::Iter<'a, String>;
@@ -1146,27 +1154,25 @@ impl<'a> IntoIterator for &'a PropKeys {
     }
 }
 
-impl<'a> IntoIterator for &'a mut PropKeys {
-    type Item = &'a mut String;
-    type IntoIter = std::slice::IterMut<'a, String>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.make_owned().iter_mut()
-    }
-}
-
 impl PropKeys {
+    /// The list's own buffer plus `string_bytes`, the caller's count of the
+    /// key strings it owns (see [`ObjMap::key_bytes`]).
     #[inline]
-    fn resident_bytes(&self) -> usize {
+    fn resident_bytes(&self, string_bytes: usize) -> usize {
         match self {
             // A planned list is compiler-owned and shared by every object made
             // from that literal; charging it per object would multiply the same
             // allocation. It is covered by the separate source/code limits.
             Self::Planned { .. } => 0,
-            Self::Owned(keys) => vec_capacity_bytes(keys).saturating_add(
-                keys.iter()
-                    .fold(0usize, |n, key| n.saturating_add(key.capacity())),
-            ),
+            Self::Owned(keys) => vec_capacity_bytes(keys).saturating_add(string_bytes),
+        }
+    }
+
+    /// The capacity of the key strings this list owns, counted. O(keys).
+    fn owned_string_bytes(&self) -> usize {
+        match self {
+            Self::Planned { .. } => 0,
+            Self::Owned(keys) => string_capacity_sum(keys),
         }
     }
 
@@ -1177,31 +1183,23 @@ impl PropKeys {
         }
     }
 
-    fn make_owned(&mut self) -> &mut Vec<String> {
+    /// The owned list, materializing a planned prefix first, and the
+    /// capacity of the strings that materializing cloned (0 if none).
+    fn make_owned(&mut self) -> (&mut Vec<String>, usize) {
         let materialized = match self {
             Self::Owned(_) => None,
             Self::Planned { all, visible_len } => Some(all.keys()[..*visible_len].to_vec()),
         };
+        let mut cloned = 0;
         if let Some(keys) = materialized {
+            cloned = string_capacity_sum(&keys);
             *self = Self::Owned(keys);
             static_key_stats::materialize();
         }
         let Self::Owned(keys) = self else {
             unreachable!("planned keys were materialized")
         };
-        keys
-    }
-
-    fn reserve_exact(&mut self, additional: usize) {
-        self.make_owned().reserve_exact(additional);
-    }
-
-    fn push(&mut self, key: String) {
-        self.make_owned().push(key);
-    }
-
-    fn remove(&mut self, i: usize) -> String {
-        self.make_owned().remove(i)
+        (keys, cloned)
     }
 
     /// Advance an exact compiler-planned key. A mismatch leaves the plan
@@ -1223,8 +1221,35 @@ impl PropKeys {
     }
 }
 
+fn string_capacity_sum(keys: &[String]) -> usize {
+    keys.iter()
+        .fold(0usize, |n, key| n.saturating_add(key.capacity()))
+}
+
+/// [`ObjMap::key_bytes`] for a count of `n`.
+fn key_bytes_count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Add `n` bytes to a [`ObjMap::key_bytes`] count; `u32::MAX` sticks.
+#[inline]
+fn key_bytes_add(count: &mut u32, n: usize) {
+    if *count != u32::MAX {
+        *count = key_bytes_count((*count as usize).saturating_add(n));
+    }
+}
+
+/// Take `n` bytes off a [`ObjMap::key_bytes`] count; `u32::MAX` sticks.
+#[inline]
+fn key_bytes_sub(count: &mut u32, n: usize) {
+    if *count != u32::MAX {
+        debug_assert!(n <= *count as usize, "key_bytes undercounted");
+        *count = count.saturating_sub(key_bytes_count(n));
+    }
+}
+
 /// A JS object: insertion-ordered string-keyed properties.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct ObjMap {
     pub keys: PropKeys,
     /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
@@ -1314,6 +1339,81 @@ pub struct ObjMap {
     /// was deleted, or an existing property's attributes were redefined. Nothing
     /// depends on a shape being present, only on it being correct when it is.
     shape: u32,
+    /// The capacity of the key strings `keys` owns, kept in step by every
+    /// change to the list, so a heap audit sizes the map without visiting
+    /// each key. That visit was most of an audit: a sandbox embedding with
+    /// a heap ceiling spent a quarter of a dictionary-heavy run summing the
+    /// keys of 60-property objects. `u32::MAX` means at least that much,
+    /// and is counted afresh when asked. Fits existing padding.
+    key_bytes: u32,
+}
+
+impl Clone for ObjMap {
+    /// Field by field, except `key_bytes`, which is counted again: a cloned
+    /// `String`'s capacity is its length, not the original's capacity.
+    fn clone(&self) -> Self {
+        let keys = self.keys.clone();
+        ObjMap {
+            key_bytes: key_bytes_count(keys.owned_string_bytes()),
+            keys,
+            vals: self.vals.clone(),
+            attrs: self.attrs.clone(),
+            class: self.class,
+            extensible: self.extensible,
+            is_ctor: self.is_ctor,
+            is_raw_json: self.is_raw_json,
+            sealed: self.sealed,
+            frozen: self.frozen,
+            index: self.index.clone(),
+            numeric_index: self.numeric_index.clone(),
+            has_element_key: self.has_element_key,
+            planned_append_failed: self.planned_append_failed,
+            class_proto: self.class_proto,
+            shape: self.shape,
+        }
+    }
+}
+
+impl std::fmt::Debug for ObjMap {
+    /// Every field but `key_bytes`: two maps with the same properties can
+    /// hold different counts, since a planned key list owns no strings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ObjMap {
+            keys,
+            vals,
+            attrs,
+            class,
+            extensible,
+            is_ctor,
+            is_raw_json,
+            sealed,
+            frozen,
+            index,
+            numeric_index,
+            has_element_key,
+            planned_append_failed,
+            class_proto,
+            shape,
+            key_bytes: _,
+        } = self;
+        f.debug_struct("ObjMap")
+            .field("keys", keys)
+            .field("vals", vals)
+            .field("attrs", attrs)
+            .field("class", class)
+            .field("extensible", extensible)
+            .field("is_ctor", is_ctor)
+            .field("is_raw_json", is_raw_json)
+            .field("sealed", sealed)
+            .field("frozen", frozen)
+            .field("index", index)
+            .field("numeric_index", numeric_index)
+            .field("has_element_key", has_element_key)
+            .field("planned_append_failed", planned_append_failed)
+            .field("class_proto", class_proto)
+            .field("shape", shape)
+            .finish()
+    }
 }
 
 /// The VALUE column of an [`ObjMap`] (B187 stage 2). Ordinary objects own a
@@ -1836,9 +1936,19 @@ impl PropAttr {
 impl ObjMap {
     #[inline]
     pub(crate) fn resident_bytes(&self) -> usize {
+        let key_bytes = if self.key_bytes == u32::MAX {
+            self.keys.owned_string_bytes()
+        } else {
+            self.key_bytes as usize
+        };
+        debug_assert_eq!(
+            key_bytes,
+            self.keys.owned_string_bytes(),
+            "key_bytes drifted from the keys it counts"
+        );
         let mut n = self
             .keys
-            .resident_bytes()
+            .resident_bytes(key_bytes)
             .saturating_add(self.vals.capacity_bytes())
             .saturating_add(self.attrs.capacity_bytes());
         if let Some(index) = &self.index {
@@ -1854,6 +1964,36 @@ impl ObjMap {
             );
         }
         n
+    }
+
+    /// Append an owned key, counting its string, and any planned prefix the
+    /// append materialized, into `key_bytes`.
+    fn push_key(&mut self, key: String) {
+        let n = key.capacity();
+        let (keys, cloned) = self.keys.make_owned();
+        keys.push(key);
+        key_bytes_add(&mut self.key_bytes, cloned.saturating_add(n));
+    }
+
+    /// Remove the key at `i`, keeping `key_bytes` in step.
+    fn remove_key(&mut self, i: usize) -> String {
+        let (keys, cloned) = self.keys.make_owned();
+        let key = keys.remove(i);
+        key_bytes_add(&mut self.key_bytes, cloned);
+        key_bytes_sub(&mut self.key_bytes, key.capacity());
+        key
+    }
+
+    fn reserve_keys(&mut self, additional: usize) {
+        let (keys, cloned) = self.keys.make_owned();
+        keys.reserve_exact(additional);
+        key_bytes_add(&mut self.key_bytes, cloned);
+    }
+
+    /// Replace the whole key list, counting what the new one owns.
+    fn set_keys(&mut self, keys: PropKeys) {
+        self.key_bytes = key_bytes_count(keys.owned_string_bytes());
+        self.keys = keys;
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -2156,7 +2296,7 @@ impl ObjMap {
     pub fn with_capacity(n: usize) -> ObjMap {
         let mut m = ObjMap::new();
         if n > 0 {
-            m.keys.reserve_exact(n);
+            m.reserve_keys(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
                 let ValStore::Vec(v) = &mut m.vals
@@ -2185,7 +2325,7 @@ impl ObjMap {
             return None;
         }
         let mut m = ObjMap::new();
-        m.keys = self.keys.clone();
+        m.set_keys(self.keys.clone());
         m.vals = ValStore::Vec(self.vals_slice().to_vec());
         m.attrs = PropAttrs::AllData {
             len: self.keys.len() as u32,
@@ -2242,7 +2382,7 @@ impl ObjMap {
             return ObjMap::with_capacity(n);
         }
         let mut m = ObjMap::new();
-        m.keys = PropKeys::planned(plan);
+        m.set_keys(PropKeys::planned(plan));
         if n > 0 {
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
@@ -2331,7 +2471,10 @@ impl ObjMap {
             planned_append_failed,
             class_proto,
             shape: shape_slot,
+            key_bytes,
         } = self;
+        // Whatever the list was, it is the plan's below, which owns no strings.
+        *key_bytes = 0;
         match keys {
             PropKeys::Planned { all, visible_len } if StaticKeyPlan::ptr_eq(all, plan) => {
                 *visible_len = n;
@@ -2398,10 +2541,10 @@ impl ObjMap {
         let n = plan.len();
         let has_element_key = plan.has_element_key();
         let mut m = ObjMap::new();
-        m.keys = PropKeys::Planned {
+        m.set_keys(PropKeys::Planned {
             all: plan,
             visible_len: n,
-        };
+        });
         m.vals = vals;
         m.attrs = PropAttrs::AllData { len: n as u32 };
         m.shape = shape;
@@ -2469,10 +2612,10 @@ impl ObjMap {
             setter: Value::UNDEFINED,
         };
         let mut m = ObjMap::new_side_table();
-        m.keys = PropKeys::Planned {
+        m.set_keys(PropKeys::Planned {
             all: plan.clone(),
             visible_len: 3,
-        };
+        });
         m.vals = ValStore::Vec(vec![length, iterator, callee]);
         m.attrs = PropAttrs::Mixed(vec![hidden, hidden, callee_attr]);
         // `length` counts as an element-shadowing key (`key_names_element`),
@@ -2491,7 +2634,7 @@ impl ObjMap {
     pub fn side_table_with_capacity(n: usize) -> ObjMap {
         let mut m = ObjMap::new_side_table();
         if n > 0 {
-            m.keys.reserve_exact(n);
+            m.reserve_keys(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
                 let ValStore::Vec(v) = &mut m.vals
@@ -2526,6 +2669,7 @@ impl ObjMap {
             planned_append_failed: false,
             class_proto: false,
             shape: crate::shape::EMPTY,
+            key_bytes: 0,
         }
     }
 
@@ -2715,7 +2859,7 @@ impl ObjMap {
             self.vals[i] = val;
             false
         } else {
-            self.keys.push(key.to_string());
+            self.push_key(key.to_string());
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
             self.shape_pushed(key, &PropAttr::data());
@@ -2757,14 +2901,14 @@ impl ObjMap {
         match plan {
             Some(all) if all.len() == n + 1 => {
                 debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
-                self.keys = PropKeys::Planned {
+                self.set_keys(PropKeys::Planned {
                     all,
                     visible_len: n + 1,
-                };
+                });
             }
             _ => {
                 self.planned_append_failed |= self.keys.is_planned();
-                self.keys.push(key.to_string());
+                self.push_key(key.to_string());
             }
         }
         self.vals.push(val);
@@ -2825,7 +2969,7 @@ impl ObjMap {
             }
             false
         } else {
-            self.keys.push(key.to_string());
+            self.push_key(key.to_string());
             self.vals.push(val);
             self.attrs.push(attr);
             self.shape_pushed(key, &attr);
@@ -2855,7 +2999,7 @@ impl ObjMap {
         self.planned_append_failed |= self.keys.is_planned();
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
-        self.keys.push(key);
+        self.push_key(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
         self.index_appended_tagged(tag);
@@ -2914,7 +3058,7 @@ impl ObjMap {
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
         self.planned_append_failed |= self.keys.is_planned();
-        let key = self.keys.remove(i);
+        let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
         // Removing the last element-naming key must clear the bit, or a
@@ -8634,6 +8778,7 @@ impl Heap {
                                 self.key_pool.push(k);
                             }
                         }
+                        m.key_bytes = 0;
                     }
                 }
                 // B187 stage 3: recycle a drop-cheap shell instead of
@@ -11646,6 +11791,7 @@ pub fn bench_append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
                     pool.push(k);
                 }
             }
+            m.key_bytes = 0;
         }
     }
     let pooled = t.elapsed();
@@ -11662,7 +11808,7 @@ pub fn bench_append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
     let t = Instant::now();
     for _ in 0..objs {
         let mut m = ObjMap::new();
-        m.keys = PropKeys::planned(plan.clone());
+        m.set_keys(PropKeys::planned(plan.clone()));
         for nm in &names {
             m.push_static_data(nm, Value::int(1));
         }
