@@ -41,6 +41,15 @@ use crate::parse::ast::{
 /// it", so nothing needs owning until a result leaves the module.
 type Names<'a> = FxHashSet<&'a str>;
 
+/// What the reference walk records, beside the names, for a call whose callee
+/// is the bare identifier `eval` (`eval(src)`, `(eval)(src)`, a locally rebound
+/// `eval`): the only shape that can be a direct eval (13.3.6.1). A NUL byte
+/// keeps it apart from every identifier. "May this body direct-eval?" asks for
+/// it rather than for the name: a body that only mentions `eval`
+/// (`const indirect = eval`) used to compile as if it called it, with every
+/// local boxed and every global access dynamic (f2i-com/zipp.org#52).
+pub const DIRECT_EVAL_CALL: &str = "\0eval-call";
+
 fn owned(set: Names<'_>) -> HashSet<String> {
     set.into_iter().map(str::to_string).collect()
 }
@@ -909,6 +918,11 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
             expr_refs(alt, out);
         }
         Expr::Call(c) => {
+            // A call through the bare identifier `eval` is the one shape the
+            // compiler emits a DirectEval for (`compile/calls.rs`).
+            if matches!(&c.callee, Expr::Ident(id) if &**id == "eval") {
+                out.insert(DIRECT_EVAL_CALL);
+            }
             expr_refs(&c.callee, out);
             for arg in &c.args {
                 // The SPREAD operand counts too (`f(...xs)`): skipping it would

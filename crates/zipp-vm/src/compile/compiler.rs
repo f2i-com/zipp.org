@@ -389,15 +389,19 @@ impl Compiler {
         } else {
             self_name
         };
-        // A body that references `eval` may direct-eval: box EVERY param and
-        // function-scoped local so the eval program can close over the caller
-        // scope (cells outlive the frame for closures the eval creates). The
-        // reference scan must ALSO see a LOCALLY-bound `eval` (`var eval = f`)
-        // — a call through it is still a direct eval when its value is %eval%.
+        // A body that CALLS `eval` (here or in a nested function) may
+        // direct-eval: box EVERY param and function-scoped local so the eval
+        // program can close over the caller scope (cells outlive the frame for
+        // closures the eval creates). The scan must ALSO see a call through a
+        // LOCALLY-bound `eval` (`var eval = f`) — still a direct eval when its
+        // value is %eval% — which is why it is not a free-name scan. A body
+        // that only mentions `eval` cannot direct-eval (`capture::
+        // DIRECT_EVAL_CALL`).
         let mut captured = captured;
         let body_refs_eval = !is_script
-            && (capture::stmts_refs_all(body).contains("eval")
-                || params_ast.is_some_and(|pa| capture::params_reference("eval", pa)));
+            && (capture::stmts_refs_all(body).contains(capture::DIRECT_EVAL_CALL)
+                || params_ast
+                    .is_some_and(|pa| capture::params_reference(capture::DIRECT_EVAL_CALL, pa)));
         let saved_dyn_zone = self.dyn_global_zone;
         if body_refs_eval {
             self.dyn_global_zone = true;
@@ -437,10 +441,10 @@ impl Compiler {
         if is_script && !fc.cx.eval_dynamic_names.is_empty() {
             fc.box_all_locals = true;
         }
-        // A SCRIPT whose program references `eval`: box block-level lexicals
+        // A SCRIPT whose program calls `eval`: box block-level lexicals
         // and record eval-site maps so a direct eval sees them (the script's
         // globals keep their fast paths — only true block locals are boxed).
-        if is_script && capture::free_vars(&[], body).contains("eval") {
+        if is_script && capture::free_vars(&[], body).contains(capture::DIRECT_EVAL_CALL) {
             fc.script_eval_lexicals = true;
         }
         // A FUNCTION-context eval root compiles its global accesses through
@@ -1166,8 +1170,9 @@ impl Compiler {
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let mut captured = capture::captured_locals(&names, params_ast, body);
-        let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval")
-            || params_ast.is_some_and(|pa| capture::params_reference("eval", pa));
+        let cls_body_refs_eval = capture::free_vars(&[], body).contains(capture::DIRECT_EVAL_CALL)
+            || params_ast
+                .is_some_and(|pa| capture::params_reference(capture::DIRECT_EVAL_CALL, pa));
         let saved_dyn_zone_cls = self.dyn_global_zone;
         if cls_body_refs_eval {
             self.dyn_global_zone = true;
@@ -1500,11 +1505,11 @@ impl Compiler {
                 ast::ArrowBody::Block(b) => has_use_strict(&b.directives),
                 ast::ArrowBody::Expr(_) => false,
             };
-        // An arrow that references `eval` (incl. in its parameter defaults)
+        // An arrow that calls `eval` (incl. in its parameter defaults)
         // boxes its locals and records DirectEval sites like a function.
         let mut captured = captured;
-        let arrow_refs_eval = capture::free_vars_arrow(&[], &a.body).contains("eval")
-            || capture::params_reference("eval", &a.params);
+        let arrow_refs_eval = capture::free_vars_arrow(&[], &a.body).contains(capture::DIRECT_EVAL_CALL)
+            || capture::params_reference(capture::DIRECT_EVAL_CALL, &a.params);
         if arrow_refs_eval {
             let mut all: Vec<String> = params.to_vec();
             if let Some(r) = rest {
