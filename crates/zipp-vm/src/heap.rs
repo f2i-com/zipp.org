@@ -94,6 +94,11 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// What a heap audit charges a `PropIndex::HashTree` entry: its 12 bytes in
+/// a B-tree node and the node overhead around it, overcounted.
+#[cfg(feature = "safe-sandbox")]
+const HASH_TREE_ENTRY_BYTES: usize = 48;
+
 /// [`Heap`]'s fid-mirror sentinel for "not a plain callable": no real
 /// FuncProto id reaches `u32::MAX` (function tables are bounds-checked far
 /// below it), so the emitted guard can compare against a baked id blindly.
@@ -290,12 +295,21 @@ fn split_propindex_enabled() -> bool {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 pub enum PropIndex {
-    /// Hostile-code profile: exact string ordering gives a deterministic
+    /// Hostile-code profile: an exact ordering gives a deterministic
     /// logarithmic lookup bound even when wasm32 cannot supply secret hash
-    /// entropy. Keys are cloned only after the map crosses the index threshold;
-    /// the authoritative insertion-ordered vectors remain unchanged.
-    /// `key_bytes` is the capacity of the cloned keys (each its length), kept
-    /// in step so a heap audit does not walk the tree to size it.
+    /// entropy. This one orders the keys' seeded 64-bit hashes
+    /// ([`seeded_bytes_hash`]): a lookup compares integers and confirms one
+    /// key, and nothing is cloned. The ordering is exact while no two keys
+    /// share a hash, so the first insert that would make two share one
+    /// reports it and the map rebuilds as [`PropIndex::Tree`]; the bound holds
+    /// either way. Keys of up to eight bytes and one length never share one.
+    #[cfg(feature = "safe-sandbox")]
+    HashTree { entries: BTreeMap<u64, u32> },
+    /// The hostile-code fallback: exact string ordering. Keys are cloned
+    /// only after the map crosses the index threshold; the authoritative
+    /// insertion-ordered vectors remain unchanged. `key_bytes` is the
+    /// capacity of the cloned keys (each its length), kept in step so a heap
+    /// audit does not walk the tree to size it.
     #[cfg(feature = "safe-sandbox")]
     Tree {
         entries: BTreeMap<String, u32>,
@@ -323,9 +337,8 @@ impl PropIndex {
         #[cfg(feature = "safe-sandbox")]
         {
             let _ = n;
-            return PropIndex::Tree {
+            return PropIndex::HashTree {
                 entries: BTreeMap::new(),
-                key_bytes: 0,
             };
         }
         #[cfg(not(feature = "safe-sandbox"))]
@@ -360,9 +373,32 @@ impl PropIndex {
     fn build(keys: &[String]) -> Box<PropIndex> {
         let mut ix = PropIndex::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
-            ix.insert(k, i as u32);
+            if !ix.insert(k, i as u32) {
+                return Self::collided(keys);
+            }
         }
         Box::new(ix)
+    }
+
+    /// The index for `keys` once two of them have shared a hash: the
+    /// string-ordered tree, which has no hash to share. Only the hash-ordered
+    /// tree ever reports a collision.
+    #[cfg_attr(not(feature = "safe-sandbox"), allow(unused_variables))]
+    fn collided(keys: &[String]) -> Box<PropIndex> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let mut ix = PropIndex::Tree {
+                entries: BTreeMap::new(),
+                key_bytes: 0,
+            };
+            for (i, k) in keys.iter().enumerate() {
+                let inserted = ix.insert(k, i as u32);
+                debug_assert!(inserted, "the string tree has no collisions");
+            }
+            Box::new(ix)
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        unreachable!("only the safe profile's hash-ordered tree collides")
     }
 
     /// Position in `keys` of the entry equal to `key`, confirmed by compare.
@@ -380,14 +416,24 @@ impl PropIndex {
     #[inline]
     fn find_tagged(&self, keys: &[String], key: &str, tag: u32) -> Option<usize> {
         #[cfg(feature = "safe-sandbox")]
-        if let PropIndex::Tree { entries, .. } = self {
-            let _ = tag;
-            return entries.get(key).copied().map(|slot| slot as usize);
+        match self {
+            PropIndex::HashTree { entries } => {
+                let _ = tag;
+                // No two keys share a hash, so a key that is here is the one
+                // its hash names; any other key that hashes alike is absent.
+                let slot = *entries.get(&seeded_bytes_hash(key.as_bytes()))? as usize;
+                return key_eq(&keys[slot], key).then_some(slot);
+            }
+            PropIndex::Tree { entries, .. } => {
+                let _ = tag;
+                return entries.get(key).copied().map(|slot| slot as usize);
+            }
+            _ => {}
         }
         debug_assert_eq!(tag, prop_tag(key), "find_tagged: caller's tag is wrong");
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & mask;
                 loop {
@@ -423,6 +469,8 @@ impl PropIndex {
     fn cap(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { entries } => entries.len(),
+            #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { mask, .. } | PropIndex::Split { mask, .. } => mask + 1,
         }
@@ -432,6 +480,8 @@ impl PropIndex {
     fn len(&self) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { entries } => entries.len(),
+            #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { entries, .. } => entries.len(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len,
         }
@@ -439,6 +489,11 @@ impl PropIndex {
 
     fn resident_bytes(&self) -> usize {
         match self {
+            // As for the string tree, below: an overcount of the node
+            // overhead of a 12-byte entry.
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { entries } => std::mem::size_of::<Self>()
+                .saturating_add(entries.len().saturating_mul(HASH_TREE_ENTRY_BYTES)),
             #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { entries, key_bytes } => {
                 // std's B-tree node fanout/layout is private. 128 bytes per
@@ -469,6 +524,11 @@ impl PropIndex {
     fn entry_bytes(&self, key_len: usize) -> usize {
         match self {
             #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } => {
+                let _ = key_len;
+                HASH_TREE_ENTRY_BYTES
+            }
+            #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { .. } => 128 + key_len,
             PropIndex::Inter { .. } | PropIndex::Split { .. } => {
                 let _ = key_len;
@@ -478,14 +538,29 @@ impl PropIndex {
     }
 
     /// Record `slot` under `key`. The caller guarantees the key is absent
-    /// (every insertion path misses in `pos()` first).
-    fn insert(&mut self, key: &str, slot: u32) {
-        self.insert_tagged(key, slot, prop_tag(key));
+    /// (every insertion path misses in `pos()` first). `false`: the key was
+    /// not recorded because another key has its hash (see `HashTree`), and
+    /// the caller rebuilds the index with `collided`.
+    #[must_use]
+    fn insert(&mut self, key: &str, slot: u32) -> bool {
+        self.insert_tagged(key, slot, prop_tag(key))
     }
 
     /// B219: `insert` with the key's tag supplied by the caller (see
     /// `find_tagged` for why a wrong tag cannot corrupt a lookup).
-    fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) {
+    #[must_use]
+    fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) -> bool {
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::HashTree { entries } = self {
+            let _ = tag;
+            return match entries.entry(seeded_bytes_hash(key.as_bytes())) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(slot);
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            };
+        }
         #[cfg(feature = "safe-sandbox")]
         if let PropIndex::Tree { entries, key_bytes } = self {
             let _ = tag;
@@ -496,7 +571,7 @@ impl PropIndex {
             *key_bytes = key_bytes.saturating_add(key.capacity());
             let previous = entries.insert(key, slot);
             debug_assert!(previous.is_none());
-            return;
+            return true;
         }
         if (self.len() + 1) * 4 >= self.cap() * 3 {
             self.grow();
@@ -505,15 +580,16 @@ impl PropIndex {
         self.insert_raw(tag, slot);
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len += 1,
         }
+        true
     }
 
     fn insert_raw(&mut self, tag: u32, slot: u32) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & *mask;
                 while table[i].1 != PROP_EMPTY {
@@ -545,7 +621,7 @@ impl PropIndex {
     fn remove_slot(&mut self, tag: u32, slot: u32) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter {
                 table, mask, len, ..
             } => {
@@ -636,6 +712,17 @@ impl PropIndex {
     /// down in either representation.
     fn remove(&mut self, key: &str, slot: u32) {
         #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::HashTree { entries } = self {
+            let removed = entries.remove(&seeded_bytes_hash(key.as_bytes()));
+            debug_assert_eq!(removed, Some(slot));
+            for value in entries.values_mut() {
+                if *value > slot {
+                    *value -= 1;
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "safe-sandbox")]
         if let PropIndex::Tree { entries, key_bytes } = self {
             // As above, perform the state change outside the debug-only check.
             let removed = entries.remove_entry(key);
@@ -658,7 +745,7 @@ impl PropIndex {
     fn grow(&mut self) {
         match self {
             #[cfg(feature = "safe-sandbox")]
-            PropIndex::Tree { .. } => return,
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => return,
             PropIndex::Inter { table, mask, .. } => {
                 let cap = table.len() * 2;
                 let old = std::mem::replace(table, vec![(0, PROP_EMPTY); cap]);
@@ -693,6 +780,18 @@ impl PropIndex {
     #[cfg(test)]
     fn verify(&self, keys: &[String]) {
         #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::HashTree { entries } = self {
+            assert_eq!(entries.len(), keys.len());
+            for (slot, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    entries.get(&seeded_bytes_hash(key.as_bytes())),
+                    Some(&(slot as u32))
+                );
+                assert_eq!(self.find(keys, key), Some(slot));
+            }
+            return;
+        }
+        #[cfg(feature = "safe-sandbox")]
         if let PropIndex::Tree { entries, .. } = self {
             assert_eq!(entries.len(), keys.len());
             for (slot, key) in keys.iter().enumerate() {
@@ -713,7 +812,7 @@ impl PropIndex {
         for i in 0..cap {
             let (t, sl) = match self {
                 #[cfg(feature = "safe-sandbox")]
-                PropIndex::Tree { .. } => unreachable!(),
+                PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
                 PropIndex::Inter { table, .. } => table[i],
                 PropIndex::Split { tags, slots, .. } => (tags[i], slots[i]),
             };
@@ -2860,7 +2959,9 @@ impl ObjMap {
             }
         }
         if let Some(ix) = &mut self.index {
-            ix.insert_tagged(&self.keys[slot], slot as u32, tag);
+            if !ix.insert_tagged(&self.keys[slot], slot as u32, tag) {
+                self.index = Some(PropIndex::collided(&self.keys));
+            }
         } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
@@ -10835,8 +10936,8 @@ mod tests {
                     }
                     keys.push(k);
                     let slot = (keys.len() - 1) as u32;
-                    inter.insert(&keys[slot as usize], slot);
-                    split.insert(&keys[slot as usize], slot);
+                    assert!(inter.insert(&keys[slot as usize], slot));
+                    assert!(split.insert(&keys[slot as usize], slot));
                 } else {
                     let i = rng.below(keys.len());
                     let k = keys.remove(i);
@@ -10898,7 +10999,7 @@ mod tests {
         }
 
         let index = PropIndex::build(&keys);
-        assert!(matches!(&*index, PropIndex::Tree { .. }));
+        assert!(matches!(&*index, PropIndex::HashTree { .. }));
         for (slot, key) in keys.iter().enumerate() {
             assert_eq!(index.find(&keys, key), Some(slot));
         }
@@ -10908,6 +11009,32 @@ mod tests {
         for (slot, key) in keys.iter().enumerate() {
             assert_eq!(cloned.find(&keys, key), Some(slot));
         }
+    }
+
+    /// Two keys sharing a seeded hash cannot be made without the seed, so
+    /// this plants one: `prop_0`'s entry under `prop_1`'s hash.
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn safe_propindex_hash_tree_falls_back_to_strings_on_a_shared_hash() {
+        let keys: Vec<String> = (0..20).map(|i| format!("prop_{i}")).collect();
+        let mut planted = PropIndex::HashTree {
+            entries: BTreeMap::new(),
+        };
+        if let PropIndex::HashTree { entries } = &mut planted {
+            entries.insert(seeded_bytes_hash(keys[1].as_bytes()), 0);
+        }
+        // A hit on another key's entry is confirmed against the key itself.
+        assert_eq!(planted.find(&keys, &keys[1]), None);
+        // An insert that would share a hash reports it rather than record it.
+        assert!(!planted.insert(&keys[1], 1));
+        let rebuilt = PropIndex::collided(&keys);
+        assert!(matches!(&*rebuilt, PropIndex::Tree { .. }));
+        rebuilt.verify(&keys);
+
+        // And the ordinary path never collides on honest keys.
+        let built = PropIndex::build(&keys);
+        assert!(matches!(&*built, PropIndex::HashTree { .. }));
+        built.verify(&keys);
     }
 
     /// `remove_at` is `remove` with the slot pre-resolved (W19 M2 uses it to
