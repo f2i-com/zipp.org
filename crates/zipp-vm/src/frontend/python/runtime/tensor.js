@@ -3444,6 +3444,18 @@
     }
     rt.defineModule("_zipp_tensor", (g) => {
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
+        // The builtins every tensor op calls take their arguments positionally
+        // too: `f` is also each count's entry (`c<n>`, which the emitter's
+        // call sites reach a builtin through), so such a call builds no
+        // argument array and runs no trampoline frame (core.js's
+        // BUILTIN_ENTRY). `f` reads its parameters as the array form reads
+        // `a[i]` (undefined when not passed); a plain strict function, not
+        // an arrow, which the engine's call sites cache and push directly.
+        const fnp = (name, arity, f, min) => {
+            fn(name, arity, (a) => f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]), min);
+            const b = g.get(name);
+            for (let n = min === undefined ? arity : min; n <= arity; n++) b["c" + n] = f;
+        };
         const num = (v) => jsNumber(v);
         // fround(x): the float32 nearest a Python float (PyTorch's float(x)).
         fn("fround", 1, (a) => Math.fround(num(a[0])));
@@ -3489,8 +3501,8 @@
         fn("sp_search", 2, (a) => spSearch(needS(a[0]), needS(a[1])));
         fn("sp_pool", 4, (a) => spPool(num(a[0]), needS(a[1]), needS(a[2]), num(a[3])));
         fn("sp_index_select", 3, (a) => spIndexSelect(needS(a[0]), needS(a[1]), num(a[2])));
-        fn("zeros", 2, (a) => { const d = rt.needStr(a[0]); return d.length > 8 ? calloc(d, num(a[1])) : alloc(d, num(a[1])); });
-        fn("full", 3, (a) => { const d = rt.needStr(a[0]); if (d.length > 8) { const c = calloc(d, num(a[1])); fillPair(c, num(a[2]), 0); return c; } const s = alloc(d, num(a[1])); s.data.fill(enc(s.dtype, num(a[2]))); return s; });
+        fnp("zeros", 2, function (a0, a1) { const d = rt.needStr(a0); return d.length > 8 ? calloc(d, num(a1)) : alloc(d, num(a1)); });
+        fnp("full", 3, function (a0, a1, a2) { const d = rt.needStr(a0); if (d.length > 8) { const c = calloc(d, num(a1)); fillPair(c, num(a2), 0); return c; } const s = alloc(d, num(a1)); s.data.fill(enc(s.dtype, num(a2))); return s; });
         // arange(dtype, start, step, n): element i is castValue(start + i * step),
         // what from_flat gives for the list torch builds (torch.arange checks
         // that the double arithmetic is exact or is Python's float arithmetic).
@@ -3511,8 +3523,8 @@
         fn("_set_size_type", 1, (a) => { SIZE = a[0]; return null; });
         // _shape_eq(a, b): tuple equality of two shapes (tuples or Sizes of
         // ints), without the rich-comparison dispatch of a tuple subclass.
-        fn("_shape_eq", 2, (a) => {
-            const x = a[0], y = a[1];
+        fnp("_shape_eq", 2, function (a0, a1) {
+            const x = a0, y = a1;
             if (x === y) return true;
             if (x === null || y === null || typeof x !== "object" || typeof y !== "object"
                 || (x.cls !== T.tuple && (SIZE === null || x.cls !== SIZE)) || (y.cls !== T.tuple && (SIZE === null || y.cls !== SIZE))) return rt.eq(x, y);
@@ -3528,7 +3540,7 @@
         });
         // _size(t): torch.Size(t) for a tuple t, as the tuple constructor
         // builds a subclass instance (`rt.allocInstance`, then its items).
-        fn("_size", 1, (a) => { const v = a[0]; if (SIZE === null || v === null || typeof v !== "object" || v.cls !== T.tuple) fail(E.TypeError, "_size expects a tuple"); return { cls: SIZE, items: v.items.slice(), dict: new Map() }; });
+        fnp("_size", 1, function (a0) { const v = a0; if (SIZE === null || v === null || typeof v !== "object" || v.cls !== T.tuple) fail(E.TypeError, "_size expects a tuple"); return { cls: SIZE, items: v.items.slice(), dict: new Map() }; });
         fn("from_flat", 2, (a) => {
             const items = a[1].items, s = anyAlloc(rt.needStr(a[0]), items.length), cv = encoder(s.dtype);
             // A complex dtype takes real values (zero imaginary parts).
@@ -3557,24 +3569,24 @@
             else { for (let i = 0; i < out.length; i++) out[i] = pyNumber(s.dtype, d[i]); }
             return list(out);
         });
-        fn("item", 2, (a) => { const s = needS(a[0]), i = num(a[1]); return pyNumber(s.dtype, s.dtype === "bfloat16" && s.data[i] !== undefined ? bfValue(s.data[i]) : s.data[i]); });
+        fnp("item", 2, function (a0, a1) { const s = needS(a0), i = num(a1); return pyNumber(s.dtype, s.dtype === "bfloat16" && s.data[i] !== undefined ? bfValue(s.data[i]) : s.data[i]); });
         fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = enc(s.dtype, num(a[2])); written(s); return null; });
-        fn("copy", 1, (a) => { const s = a[0]; if (isStorage(s)) return make(s.dtype, s.data.slice()); needC(s); return cmake(s.dtype, s.data.slice()); });
-        fn("astype", 2, (a) => { const s = a[0], d = rt.needStr(a[1]); return isStorage(s) && d.length <= 8 ? astype(s, d) : castPair(needC(s), d); });
-        fn("dtype", 1, (a) => needSC(a[0]).dtype);
-        fn("size", 1, (a) => { const s = a[0]; return BigInt(isStorage(s) ? s.data.length : count(needC(s))); });
+        fnp("copy", 1, function (a0) { const s = a0; if (isStorage(s)) return make(s.dtype, s.data.slice()); needC(s); return cmake(s.dtype, s.data.slice()); });
+        fnp("astype", 2, function (a0, a1) { const s = a0, d = rt.needStr(a1); return isStorage(s) && d.length <= 8 ? astype(s, d) : castPair(needC(s), d); });
+        fnp("dtype", 1, function (a0) { return needSC(a0).dtype; });
+        fnp("size", 1, function (a0) { const s = a0; return BigInt(isStorage(s) ? s.data.length : count(needC(s))); });
         fn("version", 1, (a) => BigInt(root(needSC(a[0])).version));
         // Autograd's view of the version: writes made through `.data` (which
         // PyTorch gives a version counter of its own) are not counted, the
         // total `version` above still is.
-        fn("aversion", 1, (a) => { const s = root(needSC(a[0])); return BigInt(s.version - s.untracked); });
-        fn("untrack", 1, (a) => { root(needSC(a[0])).untracked++; return null; });
+        fnp("aversion", 1, function (a0) { const s = root(needSC(a0)); return BigInt(s.version - s.untracked); });
+        fnp("untrack", 1, function (a0) { root(needSC(a0)).untracked++; return null; });
         // aversions_ok(saved): whether every (storage, version, tensor) entry
         // of an autograd node's saved list still has that version (what
         // `aversion` would answer), in one call; false for anything else,
         // and the caller then checks entry by entry.
-        fn("aversions_ok", 1, (a) => {
-            const list = a[0];
+        fnp("aversions_ok", 1, function (a0) {
+            const list = a0;
             if (list === null || typeof list !== "object" || list.items === undefined) return false;
             const items = list.items;
             for (let i = 0; i < items.length; i++) {
@@ -3594,12 +3606,12 @@
         // path builds, element for element), or null when a target is
         // ignore_index or outside [0, c), or anything else is unusual: the
         // caller's general path then masks, raises or handles it.
-        fn("nll_pick", 4, (a) => {
-            const lp = a[0], t = a[2];
+        fnp("nll_pick", 4, function (a0, a1, a2, a3) {
+            const lp = a0, t = a2;
             if (!isStorage(lp) || !isStorage(t) || (lp.dtype !== "float32" && lp.dtype !== "float64") || t.dtype !== "int64") return null;
-            const sh = shapeOf(a[1]);
+            const sh = shapeOf(a1);
             if (sh.length !== 2) return null;
-            const n = sh[0], c = sh[1], ig = a[3];
+            const n = sh[0], c = sh[1], ig = a3;
             if (typeof ig !== "bigint" || t.data.length !== n || lp.data.length !== n * c || n === 0) return null;
             const igv = Number(ig), out = alloc(lp.dtype, n), O = out.data, L = lp.data, Td = t.data;
             for (let i = 0; i < n; i++) {
@@ -3612,8 +3624,8 @@
         // _unbroadcast_dims(gshape, shape): for two tuples/Sizes of ints, the
         // dims `_unbroadcast` sums (the leading ones, then each dim `shape`
         // has as 1 where `gshape` has not) as a list; null for anything else.
-        fn("_unbroadcast_dims", 2, (a) => {
-            const g = a[0], t = a[1];
+        fnp("_unbroadcast_dims", 2, function (a0, a1) {
+            const g = a0, t = a1;
             if (g === null || t === null || typeof g !== "object" || typeof t !== "object" || g.items === undefined || t.items === undefined) return null;
             if ((g.cls !== SIZE && g.cls !== T.tuple) || (t.cls !== SIZE && t.cls !== T.tuple)) return null;
             const p = g.items, q = t.items, extra = p.length - q.length;
@@ -3628,8 +3640,8 @@
         // _shape_args(args): torch's `_shape_args` for its common forms, a
         // tuple of plain ints or one tuple/list/Size of them (as a tuple, the
         // argument itself when it already is one); null for anything else.
-        fn("_shape_args", 1, (a) => {
-            let v = a[0];
+        fnp("_shape_args", 1, function (a0) {
+            let v = a0;
             if (v === null || typeof v !== "object" || v.items === undefined || v.cls !== T.tuple) return null;
             if (v.items.length === 1) {
                 const s0 = v.items[0];
@@ -3666,8 +3678,8 @@
         });
         // _numel(shape): the product of a tuple's or list's ints (Python
         // ints, exact), or null for anything else (the caller multiplies).
-        fn("_numel", 1, (a) => {
-            const v = a[0];
+        fnp("_numel", 1, function (a0) {
+            const v = a0;
             if (v === null || typeof v !== "object" || v.items === undefined) return null;
             const items = v.items;
             let n = 1n;
@@ -3700,8 +3712,8 @@
         fn("graph_scatter_add", 6, (a) => graphScatterAdd(needS(a[0]), needS(a[1]), needS(a[2]), graphInts(a[3]), graphInts(a[4]), num(a[5])));
         fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
         fn("fill", 2, (a) => { const s = a[0]; if (isStorage(s)) s.data.fill(enc(s.dtype, num(a[1]))); else fillPair(needC(s), num(a[1]), 0); written(s); return null; });
-        fn("copy_into", 2, (a) => {
-            const d = a[0], s = a[1];
+        fnp("copy_into", 2, function (a0, a1) {
+            const d = a0, s = a1;
             if (!isStorage(d) || !isStorage(s)) {
                 needC(d); needC(s);
                 // Into a complex storage: a real source's values with zero
@@ -3726,59 +3738,59 @@
         // a Python number for one operand, held in a 1-element `sdtype`
         // storage exactly as `full` stores it (`flip`: the number is the
         // left operand), so no 0-d tensor has to be built for it.
-        fn("binary_scalar", 7, (a) => {
-            const fast = typeof a[0] === "string" && typeof a[4] === "string" && (a[5] === null || typeof a[5] === "string")
-                && typeof a[6] === "boolean" ? binaryScalarFast(a[0], a[1], a[2], a[3], a[6], a[4], a[5]) : undefined;
+        fnp("binary_scalar", 7, function (a0, a1, a2, a3, a4, a5, a6) {
+            const fast = typeof a0 === "string" && typeof a4 === "string" && (a5 === null || typeof a5 === "string")
+                && typeof a6 === "boolean" ? binaryScalarFast(a0, a1, a2, a3, a6, a4, a5) : undefined;
             if (fast !== undefined) return fast;
-            const sd = rt.needStr(a[4]), t = a[1], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
+            const sd = rt.needStr(a4), t = a1, want = a5 === undefined || a5 === null ? null : rt.needStr(a5);
             if (sd.length <= 8 && isStorage(t)) {
                 const s = alloc(sd, 1);
-                s.data[0] = enc(s.dtype, num(a[3]));
-                return rt.truth(a[6]) ? binary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), undefined, a[2], want)
-                    : binary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], a[2], undefined, want);
+                s.data[0] = enc(s.dtype, num(a3));
+                return rt.truth(a6) ? binary(rt.needStr(a0), s, [], t, shapeOf(a2), undefined, a2, want)
+                    : binary(rt.needStr(a0), t, shapeOf(a2), s, [], a2, undefined, want);
             }
             const s = anyAlloc(sd, 1);
-            s.data[0] = enc(s.dtype, num(a[3]));
+            s.data[0] = enc(s.dtype, num(a3));
             needC(t);
-            return rt.truth(a[6]) ? cbinary(rt.needStr(a[0]), s, [], t, shapeOf(a[2]), want) : cbinary(rt.needStr(a[0]), t, shapeOf(a[2]), s, [], want);
+            return rt.truth(a6) ? cbinary(rt.needStr(a0), s, [], t, shapeOf(a2), want) : cbinary(rt.needStr(a0), t, shapeOf(a2), s, [], want);
         });
-        fn("binary", 6, (a) => {
-            const fast = typeof a[0] === "string" && (a[5] === undefined || a[5] === null || typeof a[5] === "string")
-                ? binaryFast(a[0], a[1], a[2], a[3], a[4], a[5] === undefined ? null : a[5]) : undefined;
+        fnp("binary", 6, function (a0, a1, a2, a3, a4, a5) {
+            const fast = typeof a0 === "string" && (a5 === undefined || a5 === null || typeof a5 === "string")
+                ? binaryFast(a0, a1, a2, a3, a4, a5 === undefined ? null : a5) : undefined;
             if (fast !== undefined) return fast;
-            const x = a[1], y = a[3], want = a[5] === undefined || a[5] === null ? null : rt.needStr(a[5]);
-            if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8)) return binary(rt.needStr(a[0]), x, shapeOf(a[2]), y, shapeOf(a[4]), a[2], a[4], want);
-            return cbinary(rt.needStr(a[0]), needC(x), shapeOf(a[2]), needC(y), shapeOf(a[4]), want);
+            const x = a1, y = a3, want = a5 === undefined || a5 === null ? null : rt.needStr(a5);
+            if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8)) return binary(rt.needStr(a0), x, shapeOf(a2), y, shapeOf(a4), a2, a4, want);
+            return cbinary(rt.needStr(a0), needC(x), shapeOf(a2), needC(y), shapeOf(a4), want);
         }, 5);
-        fn("unary", 4, (a) => {
-            const x = a[1], op = a[0];
-            if (typeof op === "string" && x !== null && typeof x === "object" && x.cls === Storage) return unary(op, x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]);
-            return isStorage(x) ? unary(rt.needStr(a[0]), x, a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]) : cunary(rt.needStr(a[0]), needC(x));
+        fnp("unary", 4, function (a0, a1, a2, a3) {
+            const x = a1, op = a0;
+            if (typeof op === "string" && x !== null && typeof x === "object" && x.cls === Storage) return unary(op, x, a2 === undefined ? null : a2, a3 === undefined ? null : a3);
+            return isStorage(x) ? unary(rt.needStr(a0), x, a2 === undefined ? null : a2, a3 === undefined ? null : a3) : cunary(rt.needStr(a0), needC(x));
         }, 2);
-        fn("reduce", 6, (a) => { const x = a[1]; return isStorage(x) ? reduce(rt.needStr(a[0]), x, shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])) : creduce(rt.needStr(a[0]), needC(x), shapeOf(a[2]), a[3], rt.truth(a[4]), a[5] !== undefined && rt.truth(a[5])); }, 5);
+        fnp("reduce", 6, function (a0, a1, a2, a3, a4, a5) { const x = a1; return isStorage(x) ? reduce(rt.needStr(a0), x, shapeOf(a2), a3, rt.truth(a4), a5 !== undefined && rt.truth(a5)) : creduce(rt.needStr(a0), needC(x), shapeOf(a2), a3, rt.truth(a4), a5 !== undefined && rt.truth(a5)); }, 5);
         // The copying kernels on a complex storage: the same kernel over
         // its real memory with a trailing dimension of 2.
-        fn("permute", 3, (a) => {
-            const x = a[0];
-            if (isStorage(x)) { const sh = shapeOf(a[1]); return permute(x, sh, a[2]); }
+        fnp("permute", 3, function (a0, a1, a2) {
+            const x = a0;
+            if (isStorage(x)) { const sh = shapeOf(a1); return permute(x, sh, a2); }
             needC(x);
-            const sh = shapeOf(a[1]);
-            const p = ints(a[2]); p.push(sh.length);
+            const sh = shapeOf(a1);
+            const p = ints(a2); p.push(sh.length);
             return lowered(permute(realOf(x), sh.concat([2]), pyInts(p)), x.dtype);
         });
-        fn("expand", 3, (a) => {
-            const x = a[0];
-            if (isStorage(x)) { const sh = shapeOf(a[1]); return expand(x, sh, a[2]); }
+        fnp("expand", 3, function (a0, a1, a2) {
+            const x = a0;
+            if (isStorage(x)) { const sh = shapeOf(a1); return expand(x, sh, a2); }
             needC(x);
-            const sh = shapeOf(a[1]);
-            return asPair(expand(realOf(x), sh.concat([2]), pyInts(ints(a[2]).concat([2]))), x.dtype);
+            const sh = shapeOf(a1);
+            return asPair(expand(realOf(x), sh.concat([2]), pyInts(ints(a2).concat([2]))), x.dtype);
         });
-        fn("slice", 3, (a) => {
-            const x = a[0];
-            if (isStorage(x)) { const sh = shapeOf(a[1]); return slice(x, sh, a[2]); }
+        fnp("slice", 3, function (a0, a1, a2) {
+            const x = a0;
+            if (isStorage(x)) { const sh = shapeOf(a1); return slice(x, sh, a2); }
             needC(x);
-            const sh = shapeOf(a[1]);
-            return lowered(slice(realOf(x), sh.concat([2]), a[2]), x.dtype);
+            const sh = shapeOf(a1);
+            return lowered(slice(realOf(x), sh.concat([2]), a2), x.dtype);
         });
         fn("setslice", 5, (a) => {
             const x = a[0];
@@ -3807,12 +3819,12 @@
         };
         fn("scatter", 6, scatterC(scatter));
         fn("scatter_add", 6, scatterC(scatterAdd));
-        fn("index_select", 4, (a) => {
-            const x = a[0], d = num(a[2]);
-            if (isStorage(x)) { const sh = shapeOf(a[1]); return indexSelect(x, sh, d, needS(a[3])); }
+        fnp("index_select", 4, function (a0, a1, a2, a3) {
+            const x = a0, d = num(a2);
+            if (isStorage(x)) { const sh = shapeOf(a1); return indexSelect(x, sh, d, needS(a3)); }
             needC(x);
-            const sh = shapeOf(a[1]);
-            return lowered(indexSelect(realOf(x), sh.concat([2]), d < 0 ? d + sh.length : d, needS(a[3])), x.dtype);
+            const sh = shapeOf(a1);
+            return lowered(indexSelect(realOf(x), sh.concat([2]), d < 0 ? d + sh.length : d, needS(a3)), x.dtype);
         });
         fn("cat", 2, (a) => {
             const items = a[0].items;
@@ -3833,14 +3845,14 @@
             return asPair(roll(realOf(x), sh.concat([2]), num(a[2]), d < 0 ? d + sh.length : d), x.dtype);
         });
         fn("pad_last", 5, (a) => padLast(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3]), num(a[4])));
-        fn("matmul", 6, (a) => {
-            const x = a[0], y = a[2], transB = a[4] !== undefined && a[4] !== null && rt.truth(a[4]), transA = a[5] !== undefined && a[5] !== null && rt.truth(a[5]);
+        fnp("matmul", 6, function (a0, a1, a2, a3, a4, a5) {
+            const x = a0, y = a2, transB = a4 !== undefined && a4 !== null && rt.truth(a4), transA = a5 !== undefined && a5 !== null && rt.truth(a5);
             if (!isStorage(x) || !isStorage(y)) {
                 needC(x); needC(y);
                 if (transB || transA) fail(E.RuntimeError, "matmul: a transposed complex operand is not supported");
-                return cmatmul(x, shapeOf(a[1]), y, shapeOf(a[3]));
+                return cmatmul(x, shapeOf(a1), y, shapeOf(a3));
             }
-            return matmul(x, shapeOf(a[1]), y, shapeOf(a[3]), transB, transA);
+            return matmul(x, shapeOf(a1), y, shapeOf(a3), transB, transA);
         }, 4);
         fn("max_pool2d", 3, (a) => maxPool2d(needS(a[0]), shapeOf(a[1]), ints(a[2])));
         fn("max_pool2d_backward", 4, (a) => maxPool2dBackward(needS(a[0]), needS(a[1]), shapeOf(a[2]), ints(a[3])));
@@ -3848,16 +3860,16 @@
         fn("conv1d_backward", 5, (a) => conv1dBackward(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4])));
         fn("conv2d", 9, (a) => conv2d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4]), shapeOf(a[5]), shapeOf(a[6]), shapeOf(a[7]), num(a[8])));
         fn("conv2d_backward", 9, (a) => conv2d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), null, shapeOf(a[5]), shapeOf(a[6]), shapeOf(a[7]), num(a[8]), needS(a[4])));
-        fn("softmax", 4, (a) => softmax(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
+        fnp("softmax", 4, function (a0, a1, a2, a3) { return softmax(needS(a0), shapeOf(a1), num(a2), rt.truth(a3)); });
         fn("argsort", 4, (a) => argsort(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("one_hot", 2, (a) => oneHot(needS(a[0]), num(a[1])));
-        fn("where", 7, (a) => {
-            const x = a[2], y = a[4], want = a[6] === undefined || a[6] === null ? null : rt.needStr(a[6]);
+        fnp("where", 7, function (a0, a1, a2, a3, a4, a5, a6) {
+            const x = a2, y = a4, want = a6 === undefined || a6 === null ? null : rt.needStr(a6);
             if (isStorage(x) && isStorage(y) && (want === null || want.length <= 8))
-                return where(needS(a[0]), shapeOf(a[1]), x, shapeOf(a[3]), y, shapeOf(a[5]), want);
+                return where(needS(a0), shapeOf(a1), x, shapeOf(a3), y, shapeOf(a5), want);
             needC(x); needC(y);
             const cdt = want !== null && PAIR[want] !== undefined ? want : promote(x.dtype, y.dtype);
-            return lowered(where(needS(a[0]), shapeOf(a[1]).concat([1]), realOf(toPair(x, cdt)), shapeOf(a[3]).concat([2]), realOf(toPair(y, cdt)), shapeOf(a[5]).concat([2]), PAIR[cdt]), cdt);
+            return lowered(where(needS(a0), shapeOf(a1).concat([1]), realOf(toPair(x, cdt)), shapeOf(a3).concat([2]), realOf(toPair(y, cdt)), shapeOf(a5).concat([2]), PAIR[cdt]), cdt);
         }, 6);
         fn("scan", 4, (a) => { const x = a[1]; return isStorage(x) ? scan(rt.needStr(a[0]), x, shapeOf(a[2]), num(a[3])) : cscan(rt.needStr(a[0]), needC(x), shapeOf(a[2]), num(a[3])); });
         fn("strided", 4, (a) => {
@@ -3894,13 +3906,13 @@
         fn("dot_sum", 2, (a) => { const x = vals(needS(a[0])), y = vals(needS(a[1])); let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
         // optim_step(kind, flags, P, G, M, V, W, scalars): `optimStep`; the
         // new state storages, or None when it did not run (nothing written).
-        fn("optim_step", 8, (a) => optimStep(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]));
+        fnp("optim_step", 8, function (a0, a1, a2, a3, a4, a5, a6, a7) { return optimStep(a0, a1, a2, a3, a4, a5, a6, a7); });
         // The fused recurrent cells (`lstmCell`, `gruCell` and their backward):
         // each answers its storages, or None (the caller runs the composite).
-        fn("lstm_cell", 3, (a) => lstmCell(a[0], a[1], a[2]));
-        fn("lstm_cell_bw", 6, (a) => lstmCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
-        fn("gru_cell", 3, (a) => gruCell(a[0], a[1], a[2]));
-        fn("gru_cell_bw", 6, (a) => gruCellBw(a[0], a[1], a[2], a[3], a[4], a[5]));
+        fnp("lstm_cell", 3, function (a0, a1, a2) { return lstmCell(a0, a1, a2); });
+        fnp("lstm_cell_bw", 6, function (a0, a1, a2, a3, a4, a5) { return lstmCellBw(a0, a1, a2, a3, a4, a5); });
+        fnp("gru_cell", 3, function (a0, a1, a2) { return gruCell(a0, a1, a2); });
+        fnp("gru_cell_bw", 6, function (a0, a1, a2, a3, a4, a5) { return gruCellBw(a0, a1, a2, a3, a4, a5); });
         fn("axpy", 3, (a) => {
             const alpha = num(a[0]), xs = a[1], ys = a[2];
             if (!isStorage(xs) || !isStorage(ys)) {
