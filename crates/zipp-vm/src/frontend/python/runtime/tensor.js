@@ -47,6 +47,10 @@
     // keeps NATIVE_MIN.
     let NATIVE_SMALL = NATIVE_MIN;
     try { if (NATIVE_FN !== null && NATIVE_FN(N_LOCAL) === true) NATIVE_SMALL = 16; } catch (e) { NATIVE_SMALL = NATIVE_MIN; }
+    // An optimizer update runs a dozen operations per element, so in the
+    // engine's process its native loop pays from 4 elements (a bias, a
+    // LayerNorm's scale).
+    const NATIVE_OPTIM = NATIVE_SMALL < NATIVE_MIN ? 4 : NATIVE_MIN;
     const BIN_CODE = { add: 1, sub: 2, mul: 3, div: 4, pow: 5, max: 6, min: 7, eq: 8, ne: 9, lt: 10, le: 11, gt: 12, ge: 13,
         and: 14, or: 15, xor: 16, floordiv: 17, mod: 18, atan2: 19, relu_bw: 20 };
     const UN_CODE = { neg: 1, relu: 2, exp: 3, log: 4, tanh: 5, sigmoid: 6, sqrt: 7, square: 8, abs: 9, sign: 10, silu: 11,
@@ -554,7 +558,7 @@
         const M2 = useM ? alloc(dt, n) : null, V2 = adam ? alloc(dt, n) : null, W2 = useW ? alloc(dt, n) : null;
         const Pd = P.data, Gd = G.data, Md = M === null ? null : M.data, Vd = adam ? V.data : null, Wd = useW ? W.data : null;
         const Nm = M2 === null ? null : M2.data, Nv = V2 === null ? null : V2.data, Nw = W2 === null ? null : W2.data;
-        if (!(n >= NATIVE_MIN && NATIVE !== null && NATIVE(N_OPTIM, Number(kind), fl, Pd, Gd, Md, Vd, Wd, Nm, Nv, Nw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))) {
+        if (!(n >= NATIVE_OPTIM && NATIVE !== null && NATIVE(N_OPTIM, Number(kind), fl, Pd, Gd, Md, Vd, Wd, Nm, Nv, Nw, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))) {
             const neg = (fl & 1) !== 0;
             if (!adam) {
                 const lr = s[0], mom = s[1], damp1 = s[2], wd = s[3], decay = (fl & 2) !== 0, nest = (fl & 16) !== 0;

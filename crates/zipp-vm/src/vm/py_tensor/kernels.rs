@@ -581,6 +581,69 @@ fn normal_block64(d: &mut [f64], mean: f64, std: f64) {
     }
 }
 
+/// `pt_optim`'s options: the flags, which state it uses, and the scalars.
+struct OptimState {
+    flags: usize,
+    use_m: bool,
+    use_w: bool,
+    first: bool,
+    s: [f64; 8],
+}
+
+/// `pt_optim`'s element loop (tensor.js's `optimStep`), every operation in
+/// its order, `q` rounding where a store into the parameter's kind rounds.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn optim_loop(q: impl Fn(f64) -> f64, st: &OptimState, adam: bool, p: &mut [f64], g: &[f64], m: &[f64], v: &[f64], w: &[f64], m2: &mut [f64], v2: &mut [f64], w2: &mut [f64]) {
+    let (flags, s) = (st.flags, st.s);
+    let neg = flags & 1 != 0;
+    let n = p.len();
+    if !adam {
+        let (lr, mom, damp1, wd) = (s[0], s[1], s[2], s[3]);
+        let (decay, nest) = (flags & 2 != 0, flags & 16 != 0);
+        for i in 0..n {
+            let pv = p[i];
+            let mut gv = if neg { -g[i] } else { g[i] };
+            if decay {
+                gv = q(gv + q(pv * wd));
+            }
+            if st.use_m {
+                // (the first step's buffer is the gradient's clone)
+                let b = if st.first { gv } else { q(q(m[i] * mom) + q(gv * damp1)) };
+                m2[i] = b;
+                gv = if nest { q(gv + q(b * mom)) } else { b };
+            }
+            p[i] = pv - q(gv * lr);
+        }
+    } else {
+        let (b1, ob1, b2, ob2, bc2, eps, ss, wd) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+        let decay = flags & 2 != 0;
+        let (coupled, decoupled) = (decay && flags & 4 == 0, decay && flags & 4 != 0);
+        for i in 0..n {
+            let pv = p[i];
+            let mut gv = if neg { -g[i] } else { g[i] };
+            let mut value = pv;
+            if coupled {
+                gv = q(gv + q(pv * wd));
+            } else if decoupled {
+                value = q(pv * wd);
+            }
+            let mv = q(q(m[i] * b1) + q(gv * ob1));
+            let vq = q(q(v[i] * b2) + q(q(gv * gv) * ob2));
+            m2[i] = mv;
+            v2[i] = vq;
+            let mut d = vq;
+            if st.use_w {
+                let wv = w[i];
+                d = if wv.is_nan() || vq.is_nan() { f64::NAN } else { js_max(wv, vq) };
+                w2[i] = d;
+            }
+            // (Math.sqrt is the correctly rounded square root, `M::Sqrt`)
+            p[i] = value - q(q(mv / q(q(q(d.sqrt()) / bc2) + eps)) * ss);
+        }
+    }
+}
+
 /// A zeroed `Vec` of `n`, or `None` when it cannot be allocated.
 fn zeroed(n: usize) -> Option<Vec<f64>> {
     let mut v = Vec::new();
@@ -1379,51 +1442,13 @@ pub(crate) trait Kernels: Host {
         };
         let (m, v, w) = (read(vm)?, read(vv)?, read(vw)?);
         let (mut m2, mut v2, mut w2) = (zeroed(if use_m { n } else { 0 })?, zeroed(if adam { n } else { 0 })?, zeroed(if use_w { n } else { 0 })?);
-        let kd = vp.kind;
-        let q = |x: f64| stored(kd, x);
-        let neg = flags & 1 != 0;
-        if !adam {
-            let (lr, mom, damp1, wd) = (s[0], s[1], s[2], s[3]);
-            let (decay, nest) = (flags & 2 != 0, flags & 16 != 0);
-            for i in 0..n {
-                let pv = p[i];
-                let mut gv = if neg { -g[i] } else { g[i] };
-                if decay {
-                    gv = q(gv + q(pv * wd));
-                }
-                if use_m {
-                    // (the first step's buffer is the gradient's clone)
-                    let b = if first { gv } else { q(q(m[i] * mom) + q(gv * damp1)) };
-                    m2[i] = b;
-                    gv = if nest { q(gv + q(b * mom)) } else { b };
-                }
-                p[i] = pv - q(gv * lr);
-            }
+        // The update's loop for the parameter's kind: `q` rounds as a store
+        // into it does (`stored`), chosen once so the loop inlines it.
+        let st = OptimState { flags, use_m, use_w, first, s };
+        if vp.kind == KIND_F32 {
+            optim_loop(|x: f64| x as f32 as f64, &st, adam, &mut p, &g, &m, &v, &w, &mut m2, &mut v2, &mut w2);
         } else {
-            let (b1, ob1, b2, ob2, bc2, eps, ss, wd) = (s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
-            let decay = flags & 2 != 0;
-            let (coupled, decoupled) = (decay && flags & 4 == 0, decay && flags & 4 != 0);
-            for i in 0..n {
-                let pv = p[i];
-                let mut gv = if neg { -g[i] } else { g[i] };
-                let mut value = pv;
-                if coupled {
-                    gv = q(gv + q(pv * wd));
-                } else if decoupled {
-                    value = q(pv * wd);
-                }
-                let mv = q(q(m[i] * b1) + q(gv * ob1));
-                let vq = q(q(v[i] * b2) + q(q(gv * gv) * ob2));
-                m2[i] = mv;
-                v2[i] = vq;
-                let mut d = vq;
-                if use_w {
-                    let wv = w[i];
-                    d = if wv.is_nan() || vq.is_nan() { f64::NAN } else { js_max(wv, vq) };
-                    w2[i] = d;
-                }
-                p[i] = value - q(q(mv / q(q(q(math_unary(M::Sqrt, d)) / bc2) + eps)) * ss);
-            }
+            optim_loop(|x: f64| x, &st, adam, &mut p, &g, &m, &v, &w, &mut m2, &mut v2, &mut w2);
         }
         self.pt_write(vp, 0, &p)?;
         for (view, vals) in [(vm2, &m2), (vv2, &v2), (vw2, &w2)] {
