@@ -1480,6 +1480,12 @@ pub struct Vm<'p> {
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.
     eval_global_map: std::collections::HashMap<String, u32>,
+    /// The inverse of `eval_global_map` (slot -> name), kept beside it so that
+    /// naming an eval-introduced slot is one lookup: a read of a global that
+    /// lives on the global object names its slot on every execution, and
+    /// scanning the whole map made it linear in the globals earlier scripts
+    /// introduced.
+    eval_global_names: rustc_hash::FxHashMap<u32, String>,
     /// Pool slots that deliberately have NO `eval_global_map` entry, by what
     /// they bind: a loaded module's own declarations (per-module, so two
     /// modules' same-named bindings never collide) and ShadowRealm names.
