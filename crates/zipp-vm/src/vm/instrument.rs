@@ -468,6 +468,13 @@ pub(crate) struct Recorder {
     truncated: bool,
     #[cfg(not(feature = "meter-only"))]
     pending: Option<Pending>,
+    /// Whether the dispatch hook must take its full path: a trace is being
+    /// recorded or a row is open, an abort flag is installed, or a terminal
+    /// state is set. One test on the common edge instead of five; every
+    /// writer of those fields calls [`Self::refresh_slow`] (`exhaust` sets it
+    /// directly, a terminal state being sticky).
+    #[cfg(not(feature = "meter-only"))]
+    slow: bool,
     /// The call depth the emitted rows imply. The prover recomputes this from
     /// the opcodes, so the two must agree — never emit a RETURN at depth 0.
     #[cfg(not(feature = "meter-only"))]
@@ -558,6 +565,8 @@ impl Recorder {
             #[cfg(not(feature = "meter-only"))]
             tracing: false,
             #[cfg(not(feature = "meter-only"))]
+            slow: false,
+            #[cfg(not(feature = "meter-only"))]
             max_steps: usize::MAX,
             #[cfg(not(feature = "meter-only"))]
             truncated: false,
@@ -566,6 +575,19 @@ impl Recorder {
             #[cfg(not(feature = "meter-only"))]
             depth: 0,
             ticks: 0,
+        }
+    }
+
+    /// Recompute [`Self::slow`] from the fields it summarises.
+    #[inline]
+    pub(crate) fn refresh_slow(&mut self) {
+        #[cfg(not(feature = "meter-only"))]
+        {
+            self.slow = self.tracing
+                || self.pending.is_some()
+                || self.abort.is_some()
+                || self.exhaustion.is_some()
+                || self.output_exhausted;
         }
     }
 
@@ -580,6 +602,7 @@ impl Recorder {
         self.truncated = false;
         self.pending = None;
         self.depth = 0;
+        self.refresh_slow();
     }
 
     #[cfg(not(feature = "meter-only"))]
@@ -635,6 +658,10 @@ impl Recorder {
     fn exhaust(&mut self, cause: ResourceExhaustion) -> &'static str {
         // A terminal state is sticky: make the very next dispatch stop.
         self.stop = i64::MAX;
+        #[cfg(not(feature = "meter-only"))]
+        {
+            self.slow = true;
+        }
         self.exhaustion.get_or_insert(cause).message()
     }
 
@@ -743,6 +770,7 @@ impl Recorder {
         if let Some(p) = self.pending.take() {
             blank(&mut self.steps[p.row]);
         }
+        self.refresh_slow();
         if self.truncated || self.steps.len() < 2 {
             self.steps.clear();
             return None;
@@ -1858,19 +1886,13 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
 
-        // The production wasm engine meters without tracing or an abort flag.
-        // Keep that overwhelmingly common path small enough to live beside the
-        // opcode dispatch; trace completion, atomics, and row construction stay
-        // in the out-of-line path below. `pending` is checked independently so
-        // ending a trace can never strand its final row.
-        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() {
+        // Keep the overwhelmingly common path -- metering without a trace, an
+        // abort flag or a terminal state -- small enough to live beside the
+        // opcode dispatch. The out-of-line path below handles every one of
+        // those (it checks the terminal states first); `slow` says whether
+        // any is present, so the common edge tests one flag, not five.
+        if rec.slow {
             return self.instrument_step_slow(base, ip, instr);
-        }
-        if let Some(message) = rec.terminal_message() {
-            return Err(message);
-        }
-        if rec.output_exhausted {
-            return Err(rec.exhaust(ResourceExhaustion::Output));
         }
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
@@ -1971,6 +1993,7 @@ impl super::Vm<'_> {
         if rec.steps.len() >= rec.max_steps {
             rec.truncated = true;
             rec.tracing = false;
+            rec.refresh_slow();
             return Ok(());
         }
         self.instrument_open(base, ip, instr);
@@ -2170,6 +2193,7 @@ impl super::Vm<'_> {
 
         let rec = self.instr_rec.as_mut().expect("checked above");
         rec.pending = None;
+        rec.refresh_slow();
         let depth_before = rec.depth;
         let row = &mut rec.steps[row_idx];
         let dst_u64 = dst_val.map(enc).unwrap_or(0);
@@ -2313,6 +2337,7 @@ impl super::Vm<'_> {
             frames,
             claim,
         });
+        rec.refresh_slow();
     }
 
     #[cfg(not(feature = "meter-only"))]

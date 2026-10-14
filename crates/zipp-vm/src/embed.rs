@@ -820,6 +820,7 @@ impl ScriptState {
                 rec.output_limit = bytes;
                 rec.output_used = 0;
                 rec.output_exhausted = false;
+                rec.refresh_slow();
             }
         });
     }
@@ -923,6 +924,7 @@ impl ScriptState {
             let mut rec = crate::vm::instrument::Recorder::new();
             rec.set_step_limit(max_steps);
             rec.abort = abort;
+            rec.refresh_slow();
             vm.set_instrumentation(rec);
         });
     }

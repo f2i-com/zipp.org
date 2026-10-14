@@ -1032,7 +1032,10 @@ impl<'p> Vm<'p> {
     /// actually goes off: a trace has to be a complete instruction-by-instruction
     /// record, and native code produces no rows at all.
     #[cfg(feature = "instrument")]
-    pub(crate) fn set_instrumentation(&mut self, rec: super::super::instrument::Recorder) {
+    pub(crate) fn set_instrumentation(&mut self, mut rec: super::super::instrument::Recorder) {
+        // Whatever was set on the recorder before it was installed decides
+        // whether the dispatch hook may take its short path.
+        rec.refresh_slow();
         self.instr_rec = Some(Box::new(rec));
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
