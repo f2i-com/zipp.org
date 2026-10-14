@@ -3933,6 +3933,11 @@ impl<'p> Vm<'p> {
                             if id == OBJ_FREEZE && m.class_proto {
                                 self.note_class_proto_mutation(idx, None);
                             }
+                            // The global object's slot-backed bindings get real
+                            // properties first, so the walk below reaches them.
+                            if id != OBJ_PREVENT_EXT && idx == self.global_this && idx != 0 {
+                                self.materialize_global_slot_bindings();
+                            }
                             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                                 match id {
                                     OBJ_FREEZE => m.freeze(),

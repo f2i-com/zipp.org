@@ -891,17 +891,12 @@ impl<'p> Vm<'p> {
                 if let Some(i) = m.pos(key) {
                     m.attr_at(i).enumerable
                 } else if obj.heap_index() == self.global_this && self.global_this != 0 {
-                    // Slot-backed SCRIPT-declared var/function globals are
-                    // enumerable bindings of the global object.
-                    self.program
-                        .global_names
-                        .iter()
-                        .position(|n| n == key)
-                        .is_some_and(|i| {
-                            (self.program.hoisted_globals.contains(&(i as u32))
-                                || self.program.decl_globals.contains(&(i as u32)))
-                                && !self.globals[i].is_uninitialized()
-                        })
+                    // A slot-backed binding is as enumerable as the
+                    // descriptor it presents: var/function declarations and
+                    // implicit globals are, builtins and NaN/Infinity/
+                    // undefined are not.
+                    self.global_slot_binding_descriptor(key)
+                        .is_some_and(|(_, a)| a.enumerable)
                 } else {
                     false
                 }

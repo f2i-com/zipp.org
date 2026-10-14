@@ -470,22 +470,40 @@ impl<'p> Vm<'p> {
                     .map(|i| m.keys[i].clone())
                     .filter(|k| !is_hidden_key(k))
                     .collect();
-                // The global object's SCRIPT-declared var/function bindings are
-                // enumerable slot-backed own properties (builtins stay
+                // The global object's slot-backed var/function bindings and
+                // implicit globals are enumerable own properties, the main
+                // program's and later scripts' alike (builtins stay
                 // non-enumerable and excluded).
                 let mut slot_names: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    let listed: std::collections::HashSet<&str> =
+                        names.iter().map(String::as_str).collect();
+                    let mut add: Vec<String> = Vec::new();
                     for (i, n) in self.program.global_names.iter().enumerate() {
                         let iu = i as u32;
-                        if (self.program.hoisted_globals.contains(&iu)
-                            || self.program.decl_globals.contains(&iu))
-                            && !self.globals[i].is_uninitialized()
+                        if !self.globals[i].is_uninitialized()
+                            && !self.program.lexical_globals.contains(&iu)
+                            && !self.builtin_globals.contains_key(n.as_str())
+                            && !self.deleted_globals.contains(n.as_str())
+                            && !is_hidden_key(n)
+                            && n != crate::vm::native::ANNEXB_REF_ERROR_NAME
+                            && n != crate::vm::native::HOST_CALL_NAME
+                            && n != crate::vm::native::PY_TENSOR_NAME
                             && m.pos(n).is_none()
-                            && !names.iter().any(|k| k == n)
+                            && !listed.contains(n.as_str())
                         {
-                            names.push(n.clone());
-                            slot_names.insert(n.clone());
+                            add.push(n.clone());
+                        }
+                    }
+                    for n in self.eval_pool_property_names() {
+                        if m.pos(n).is_none() && !listed.contains(n) {
+                            add.push(n.to_string());
+                        }
+                    }
+                    for n in add {
+                        if slot_names.insert(n.clone()) {
+                            names.push(n);
                         }
                     }
                 }

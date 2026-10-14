@@ -529,6 +529,18 @@ impl<'p> Vm<'p> {
                                 keys.push(name.clone());
                             }
                         }
+                        // Slot-backed properties later scripts created (eval
+                        // `var`s and functions, implicit globals).
+                        let pool: Vec<String> = self
+                            .eval_pool_property_names()
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect();
+                        for name in pool {
+                            if seen.insert(name.clone()) {
+                                keys.push(name);
+                            }
+                        }
                         // Builtins the program never referenced (no slot). The
                         // Annex-B internal helper is reserved, not a spec
                         // global — it never reflects.

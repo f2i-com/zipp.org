@@ -475,17 +475,20 @@ impl<'p> Vm<'p> {
                 return Value::bool(false);
             }
             // SCRIPT-declared var/function globals are non-configurable
-            // bindings — `delete` returns false and removes nothing.
-            if self
-                .program
-                .global_names
-                .iter()
-                .position(|n| n == key)
-                .is_some_and(|i| {
+            // bindings — `delete` returns false and removes nothing. (An
+            // eval `var` is configurable; a later SCRIPT's, which
+            // `eval_var_globals` records, is not.)
+            let script_decl = match self.main_global_pos(key) {
+                Some(i) => {
                     self.program.hoisted_globals.contains(&(i as u32))
                         || self.program.decl_globals.contains(&(i as u32))
-                })
-            {
+                }
+                None => self
+                    .eval_global_map
+                    .get(key)
+                    .is_some_and(|s| self.eval_var_globals.contains(s)),
+            };
+            if script_decl {
                 return Value::bool(false);
             }
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
@@ -1245,10 +1248,22 @@ impl<'p> Vm<'p> {
                 return Ok(true);
             }
         }
-        // `globalThis.x = v` for a name that is ALSO a slot-backed binding adds a real
-        // own property to the global object, after which `global_real_own_route` sends
-        // every bare `x = …` through [[Set]]. Compiled code emitted a raw slot write
-        // before that was true, so tell the route protector.
+        // `globalThis.x = v` where `x` is, or can become, a plain slot-backed
+        // binding writes the slot (see `global_slot_set`).
+        if self.global_this != 0
+            && obj.heap_index() == self.global_this
+            && self.active_realm.is_none()
+            && !key.starts_with("@@")
+        {
+            if let Some(done) = self.global_slot_set(key, val) {
+                return Ok(done);
+            }
+        }
+        // Otherwise `globalThis.x = v` for a name that is ALSO a slot-backed binding
+        // adds a real own property to the global object, after which
+        // `global_real_own_route` sends every bare `x = …` through [[Set]]. Compiled
+        // code emitted a raw slot write before that was true, so tell the route
+        // protector.
         if self.global_this != 0 && obj.heap_index() == self.global_this {
             self.note_global_own_property_change(obj.heap_index(), key);
         }

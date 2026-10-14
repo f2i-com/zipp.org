@@ -46,11 +46,12 @@ const SOURCE: &str = r#"
 
     // Concrete persistent-script slot reuse: the first sloppy evalScript
     // initializes a referenced-but-undeclared main-program slot without adding
-    // a var/lexical declaration registry entry. A later script GDI can therefore
-    // register a const on that same live slot. Its initializer correctly throws
-    // in this VM model because the slot is already initialized; registration is
-    // nevertheless persistent, so the already-compiled method's next store must
-    // fall back and throw without changing the value.
+    // a var/lexical declaration registry entry. That implicit global is a
+    // configurable property, so a later script GDI may declare a const of the
+    // same name (node agrees): the property keeps its value on the global object
+    // and the slot passes to the const, whose initializer then succeeds. The
+    // already-compiled method's next store must fall back and throw without
+    // changing the const.
     $262.evalScript("lateReuse = 10;");
     function lateRandom() {
         lateReuse = (lateReuse + 1) | 0;
@@ -170,7 +171,7 @@ fn expected() -> Vec<String> {
     vec![
         "stable 2057774018 1120112305".into(),
         "late 8x 8 8".into(),
-        "evalconst true true 74 74".into(),
+        "evalconst false true 74 500".into(),
         "replace 0.25 1".into(),
         "transition true 0.25 1 2".into(),
         "same 3".into(),

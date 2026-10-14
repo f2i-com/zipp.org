@@ -776,7 +776,9 @@ impl<'p> Vm<'p> {
                         let v = self.globals[idx as usize];
                         if v.is_uninitialized() {
                             let name = self.global_slot_name(idx).unwrap_or_default();
-                            let has_own = self.global_this != 0
+                            let lexical = self.global_name_is_lexical(&name);
+                            let has_own = !lexical
+                                && self.global_this != 0
                                 && matches!(
                                     self.heap.get(self.global_this),
                                     HeapObj::Object(m) if m.pos(&name).is_some()
@@ -791,7 +793,7 @@ impl<'p> Vm<'p> {
                                 } else {
                                     Value::NULL
                                 };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                if !lexical && proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
                                     let val = self.get_prop(gobj, &name)?;
                                     self.set(base, dst, val);
                                     ip += 1;
@@ -883,7 +885,15 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         if self.globals[idx as usize].is_uninitialized() {
-                            if let Some(name) = self.global_slot_name(idx) {
+                            // A script lexical's slot is in its TDZ: this store is
+                            // its initialization, which a same-named own property
+                            // of the global object (a configurable global the
+                            // lexical shadows) or the global's chain must not
+                            // absorb.
+                            if let Some(name) = self
+                                .global_slot_name(idx)
+                                .filter(|n| !self.global_name_is_lexical(n))
+                            {
                                 let has_own = self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
@@ -955,8 +965,13 @@ impl<'p> Vm<'p> {
                         if self.globals[idx as usize].is_uninitialized() {
                             // An own-prop-backed binding (eval-created /
                             // `this.x = v`) is the live binding: write through
-                            // it and leave the slot uninitialized.
-                            if let Some(name) = self.global_slot_name(idx) {
+                            // it and leave the slot uninitialized. Not for a
+                            // script lexical's slot, whose TDZ store is its
+                            // initialization (see StoreGlobalDyn).
+                            if let Some(name) = self
+                                .global_slot_name(idx)
+                                .filter(|n| !self.global_name_is_lexical(n))
+                            {
                                 let has_own = self.global_this != 0
                                     && matches!(
                                         self.heap.get(self.global_this),
@@ -6266,6 +6281,10 @@ impl<'p> Vm<'p> {
                             || self.program.hoisted_globals.contains(&slot)
                             || self.program.decl_globals.contains(&slot)
                             || self.program.lexical_globals.contains(&slot)
+                            // A later SCRIPT's var/function declaration is as
+                            // non-configurable as the main program's (an eval
+                            // `var` is not recorded here, and deletes).
+                            || self.eval_var_globals.contains(&slot)
                             // An evalScript-created LEXICAL binding lives in the
                             // declarative record — DeleteBinding returns false
                             // and the binding persists (only eval VARs delete).
@@ -10681,7 +10700,12 @@ impl<'p> Vm<'p> {
             // resolves to it. Slot-only names (`global_by_name`)
             // are excluded by checking the ObjMap directly,
             // preserving their uninitialized ReferenceError.
-            let has_own = self.global_this != 0
+            // A script lexical's uninitialized slot is in its TDZ: neither a
+            // same-named own property of the global object (a configurable
+            // global it shadows) nor the global's chain resolves it.
+            let lexical = self.global_name_is_lexical(&name);
+            let has_own = !lexical
+                && self.global_this != 0
                 && matches!(
                     self.heap.get(self.global_this),
                     HeapObj::Object(m) if m.pos(&name).is_some()
@@ -10701,7 +10725,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::NULL
                 };
-                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                if !lexical && proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
                     let val = self.get_prop(gobj, &name)?;
                     return Ok(val);
                 }

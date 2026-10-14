@@ -396,10 +396,24 @@ impl<'p> Vm<'p> {
         if var_env_global {
             for local in start..count {
                 if let Some(slot) = self.eval_funcs[local].name_global {
-                    if (slot as usize) >= self.globals.len()
-                        || self.globals[slot as usize].bits() != Value::UNINITIALIZED.bits()
-                    {
+                    if (slot as usize) >= self.globals.len() {
                         continue;
+                    }
+                    // A live slot-backed binding is a writable, enumerable data
+                    // property (or a configurable builtin): always definable —
+                    // unless a REAL own property now carries its attributes (a
+                    // frozen global object, a defineProperty), checked below.
+                    if self.globals[slot as usize].bits() != Value::UNINITIALIZED.bits() {
+                        let shadowed = self.global_this != 0
+                            && self.global_slot_name_ref(slot as u32).is_some_and(|n| {
+                                matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.pos(n).is_some()
+                                )
+                            });
+                        if !shadowed {
+                            continue;
+                        }
                     }
                     if let Some(name) = self.global_slot_name(slot as u32) {
                         if matches!(name.as_str(), "NaN" | "Infinity" | "undefined") {
@@ -443,7 +457,41 @@ impl<'p> Vm<'p> {
         if script_gdi && var_env_global {
             let mut route_changed = false;
             for &slot in &eval_prog.lexical_globals {
-                route_changed |= self.eval_lexical_globals.insert(gmap[slot as usize]);
+                let rs = gmap[slot as usize];
+                // A configurable global-object PROPERTY may live in this slot
+                // (an eval `var` or function, an implicit or published global):
+                // the collision checks above let a script declare a lexical of
+                // its name, which shadows it for bare references while the
+                // property stays on the global object with its value
+                // (language/global-code/script-decl-lex-var-declared-via-eval).
+                // Give the property a real own entry and hand the slot to the
+                // lexical, which initializes it from UNINITIALIZED. A builtin
+                // keeps its table entry, as before.
+                if !self.program.lexical_globals.contains(&rs)
+                    && !self.eval_lexical_globals.contains(&rs)
+                    && self.globals.get(rs as usize).is_some_and(|v| !v.is_uninitialized())
+                {
+                    if let Some(name) = self.global_slot_name(rs) {
+                        if !self.builtin_globals.contains_key(name.as_str()) {
+                            let gi = self.global_this;
+                            let absent = gi != 0
+                                && matches!(self.heap.get(gi), HeapObj::Object(m) if m.pos(&name).is_none());
+                            if absent {
+                                if let Some((v, a)) = self.global_slot_binding_descriptor(&name) {
+                                    if let HeapObj::Object(m) = self.heap.get_mut(gi) {
+                                        m.define(&name, v, a);
+                                    }
+                                    self.heap.write_barrier_val(gi, v);
+                                    self.heap.bump_version(gi);
+                                }
+                            }
+                            self.globals[rs as usize] = Value::UNINITIALIZED;
+                            self.bump_global_gen(rs);
+                            route_changed = true;
+                        }
+                    }
+                }
+                route_changed |= self.eval_lexical_globals.insert(rs);
             }
             for &slot in &eval_prog.const_globals {
                 route_changed |= self.eval_const_globals.insert(gmap[slot as usize]);
@@ -468,9 +516,20 @@ impl<'p> Vm<'p> {
         // becomes an own {writable, enumerable, CONFIGURABLE} property of the
         // global object (eval-created bindings are deletable and reflectable;
         // a $262.evalScript's are NON-configurable — script
-        // GlobalDeclarationInstantiation passes deletable=false);
-        // the slot stays UNINITIALIZED so reads/writes route through the own
-        // prop (the Load/StoreGlobal fallbacks). Existing bindings untouched.
+        // GlobalDeclarationInstantiation passes deletable=false).
+        //
+        // An ordinary eval's binding lives in its SLOT, as an implicit
+        // global's does (`global_slot_binding_descriptor` presents both as
+        // {w, e, c}, the key listings include them, and `delete` returns the
+        // slot to the sentinel). It used to be an own property with the slot
+        // left UNINITIALIZED, so every read and write of it — from any later
+        // script, and every script an embedder runs through
+        // `eval_in_context` declares its globals this way — took the
+        // global-object fallback (40-60 ns), and no JIT tier could compile a
+        // loop that touched it. A $262.evalScript's (whose non-configurable
+        // own properties the reflection tests check) and a realm's keep the
+        // own property. Existing bindings untouched.
+        let slot_backed_decls = !script_gdi && self.active_realm.is_none();
         // FUNCTION-context dynamic names: CreateMutableBinding(undefined) in
         // the caller's EvalScope (functions get their values in step 6).
         if let Some(sc) = eval_scope_idx {
@@ -502,6 +561,12 @@ impl<'p> Vm<'p> {
                             );
                             if has_own {
                                 own_backed = true;
+                            } else if slot_backed_decls {
+                                // Re-creating a deleted binding lifts the
+                                // deletion record, as StoreGlobal does.
+                                if !self.deleted_globals.is_empty() {
+                                    self.deleted_globals.remove(&name);
+                                }
                             } else if let HeapObj::Object(m) = self.heap.get_mut(gi) {
                                 m.define(
                                     &name,
@@ -525,12 +590,15 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // 6. CreateGlobalFunctionBinding for eval top-level function decls:
-        // when the slot is uninitialized, the binding lives as a global-object
-        // own property — absent: define {w, e, configurable: true}; existing
-        // configurable: redefine to that shape with the new value; existing
-        // non-configurable: write the value, keep the attributes. An
-        // initialized slot (a main-program binding) is written directly.
+        // 6. CreateGlobalFunctionBinding for eval top-level function decls.
+        // A REAL own property of the global object carries the binding's
+        // attributes, so it is updated there — existing configurable: redefine
+        // to {w, e, c} with the new value; existing non-configurable: write the
+        // value, keep the attributes — and a live slot behind it follows. An
+        // ABSENT binding is a slot, like a var's (step 5), except for a
+        // $262.evalScript or a realm, whose declarations become own properties.
+        // A slot-backed binding (a main-program one, an earlier eval's) is
+        // written directly.
         for local in start..count {
             let global_id = (self.main_func_count + local) as u32;
             if let Some(slot) = self.eval_funcs[local].name_global {
@@ -558,13 +626,17 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                if var_env_global
-                    && !self.eval_prelude_mode
-                    && self.globals[slot as usize].bits() == Value::UNINITIALIZED.bits()
-                {
+                if var_env_global && !self.eval_prelude_mode {
                     if let Some(name) = self.global_slot_name(slot as u32) {
-                        if self.global_this != 0 {
-                            let gi = self.global_this;
+                        let gi = self.global_this;
+                        let has_own = gi != 0
+                            && matches!(self.heap.get(gi), HeapObj::Object(m) if m.pos(&name).is_some());
+                        let uninit =
+                            self.globals[slot as usize].bits() == Value::UNINITIALIZED.bits();
+                        if uninit && !has_own && slot_backed_decls && !self.deleted_globals.is_empty() {
+                            self.deleted_globals.remove(&name);
+                        }
+                        if gi != 0 && (has_own || (uninit && !slot_backed_decls)) {
                             let attr = crate::heap::PropAttr {
                                 writable: true,
                                 enumerable: true,
@@ -598,6 +670,10 @@ impl<'p> Vm<'p> {
                                 // Nursery barrier: the fresh (young) function
                                 // now sits in the (old) global object.
                                 self.heap.write_barrier_val(gi, v);
+                                if !uninit {
+                                    self.globals[slot as usize] = v;
+                                    self.bump_global_gen(slot);
+                                }
                                 continue;
                             }
                         }
