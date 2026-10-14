@@ -1907,12 +1907,25 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::Eq { dst, a, b } => {
-                        let r = self.strict_eq(base, a, b);
+                        // Two small integers (one bit pattern per value) are
+                        // the loop counters and indices this compares most:
+                        // decided here instead of in `strict_eq`'s call.
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            self.strict_eq(base, a, b)
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Ne { dst, a, b } => {
-                        let r = self.strict_eq(base, a, b);
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            self.strict_eq(base, a, b)
+                        };
                         self.set(base, dst, Value::bool(!r));
                         ip += 1;
                     }
@@ -4637,7 +4650,13 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
-                        if !self.truthy(v) {
+                        // A comparison's boolean, nearly always: no call.
+                        let t = if v.is_bool() {
+                            v.bits() == Value::TRUE.bits()
+                        } else {
+                            self.truthy(v)
+                        };
+                        if !t {
                             // A taken BACKWARD conditional closes a loop
                             // (`do … while`): the same GC safe point as the
                             // `Jump` back-edge, or an allocating loop with no
@@ -4652,7 +4671,12 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
-                        if self.truthy(v) {
+                        let t = if v.is_bool() {
+                            v.bits() == Value::TRUE.bits()
+                        } else {
+                            self.truthy(v)
+                        };
+                        if t {
                             // See `JumpIfFalse`: a backward taken branch is a
                             // loop back-edge.
                             if (target as usize) < ip {
