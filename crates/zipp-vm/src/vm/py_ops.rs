@@ -2238,6 +2238,36 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// For [`Instr::PyGetItem`] / [`Instr::PySetItem`]: `o.items` and the
+    /// index when `o` is a record of the sequence template's shape whose
+    /// `cls` is `seq` and `k` an immediate int within its items: what
+    /// `py_item_kind` and `py_seq_slot` find for such a pair, read in one
+    /// pass (they read the record twice, the items once each). `None` for
+    /// anything else, which those then decide.
+    #[inline(always)]
+    fn py_seq_index_fast(&self, o: Value, k: Value, seq: Value) -> Option<(u32, usize)> {
+        let n = k.small_bigint_val()?;
+        if !o.is_heap() {
+            return None;
+        }
+        let shape = self.py_rt.as_deref()?.seq_shape;
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if m.is_ctor || shape == crate::shape::DICT || m.shape() != shape || m.val_at(0).bits() != seq.bits() {
+            return None;
+        }
+        let items = m.val_at(1);
+        if !items.is_heap() {
+            return None;
+        }
+        let HeapObj::Array(vals) = self.heap.get(items.heap_index()) else {
+            return None;
+        };
+        let i = usize::try_from(n).ok().filter(|&i| i < vals.len())?;
+        Some((items.heap_index(), i))
+    }
+
     /// `o.items` and a valid index into it for `k`.
     fn py_seq_slot(&self, o: Value, k: Value) -> Option<(u32, usize)> {
         let (_, items) = self.py_seq_parts(o)?;
@@ -2255,6 +2285,15 @@ impl<'p> Vm<'p> {
     /// [`Instr::PyGetItem`]: `Some(Some(value))`, `Some(None)` for a key
     /// the dict's table finds missing, `None` for the slow edge.
     pub(super) fn py_get_item(&mut self, o: Value, k: Value, seq: Value, dict: Value) -> Result<Option<Option<Value>>, Thrown> {
+        // The commonest case first, in one pass: a `seq` record of the
+        // sequence template's shape and a fast-tier int within its items.
+        if let Some((items, i)) = self.py_seq_index_fast(o, k, seq) {
+            let HeapObj::Array(vals) = self.heap.get(items) else {
+                return Ok(None);
+            };
+            let v = vals[i];
+            return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
+        }
         let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
             return Ok(None);
         };
@@ -2275,11 +2314,17 @@ impl<'p> Vm<'p> {
     }
 
     pub(super) fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {
-        let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
-            return Ok(false);
+        // As `py_get_item`: the commonest case's record and index first.
+        let fast = self.py_seq_index_fast(o, k, seq);
+        let (idx, is_seq) = match fast {
+            Some((items, _)) => (items, true),
+            None => match self.py_item_kind(o, seq, dict) {
+                Some(kind) => kind,
+                None => return Ok(false),
+            },
         };
         if is_seq {
-            let Some((items, i)) = self.py_seq_slot(o, k) else {
+            let Some((items, i)) = fast.or_else(|| self.py_seq_slot(o, k)) else {
                 return Ok(false);
             };
             // An element present in a plain Array (no side table: nothing
