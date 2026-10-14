@@ -1056,7 +1056,17 @@ impl<'p> Vm<'p> {
     /// function of the pair fires, false (spec no-op) for every later call.
     /// `pair == 0` (untracked internal resolvers) always fires.
     pub(crate) fn resolver_pair_fire(&mut self, pair: u32) -> bool {
-        pair == 0 || self.resolved_pairs.insert(pair)
+        if pair == 0 {
+            return true;
+        }
+        let (word, bit) = ((pair >> 6) as usize, 1u64 << (pair & 63));
+        if word >= self.resolved_pairs.len() {
+            self.resolved_pairs.resize(word + 1, 0);
+        }
+        let w = &mut self.resolved_pairs[word];
+        let first = *w & bit == 0;
+        *w |= bit;
+        first
     }
 
     /// True when adopting `value` (a native promise) into a resolution can skip

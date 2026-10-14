@@ -466,7 +466,7 @@ impl<'p> Vm<'p> {
             abstractmodulesource_ctor: 0,
             abstractmodulesource_proto: 0,
             resolver_pair_next: 1,
-            resolved_pairs: std::collections::HashSet::new(),
+            resolved_pairs: Vec::new(),
             promise_ctor_intrinsic: 0,
             promise_then_intrinsic: 0,
             promise_pristine_slots: None,

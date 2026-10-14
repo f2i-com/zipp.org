@@ -2769,10 +2769,12 @@ pub struct Vm<'p> {
     abstractmodulesource_ctor: u32,
     abstractmodulesource_proto: u32,
     /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
-    /// hands out fresh pair ids; a pair id enters `resolved_pairs` the first time
-    /// either function of the pair fires (ids only — no `Value`s, GC-inert).
+    /// hands out fresh pair ids; a pair id's bit in `resolved_pairs` is set the
+    /// first time either function of the pair fires (ids only — no `Value`s,
+    /// GC-inert). A bit per pair ever created, where a hash set of fired ids
+    /// cost a SipHash insert per resolution and kept about ten bytes for each.
     resolver_pair_next: u32,
-    resolved_pairs: std::collections::HashSet<u32>,
+    resolved_pairs: Vec<u64>,
     /// The intrinsic %Promise% constructor and %Promise.prototype.then% heap
     /// indices (the objects built in setup_globals), independent of later
     /// patches — identity anchors for the adoption fast-path check.
