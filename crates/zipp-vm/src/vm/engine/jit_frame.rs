@@ -55,10 +55,7 @@ impl<'p> Vm<'p> {
         }
         let stop = self.frames.len() - 1;
         self.jit_call_depth += 1;
-        #[cfg(feature = "python")]
         let native = self.jit_frame_run_native(fid, stop);
-        #[cfg(not(feature = "python"))]
-        let native = None;
         let r = match native {
             Some(r) => r,
             None => self.run_loop(stop),
@@ -86,11 +83,17 @@ impl<'p> Vm<'p> {
     /// throw unwinds from it as `run_loop` does. `None` when the body cannot
     /// be entered here (not compiled, not eligible, a nested native
     /// recursion, or a declined entry), so the caller runs `run_loop`.
-    #[cfg(all(feature = "jit", feature = "python", target_arch = "x86_64"))]
+    ///
+    /// Python programs used it first. A JavaScript frame call (a getter or
+    /// setter a compiled loop reads, a region's call to a compiled function)
+    /// went through `run_loop` to reach the same native entry, and the
+    /// interpreter loop's entry, dispatch and exit were a third of a getter
+    /// read's cost. `ZIPP_NO_JS_FRAME_NATIVE=1` restores that path for
+    /// JavaScript. Nesting stays bounded by `jit_call_depth`, which
+    /// `jit_frame_call` raises around this.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_frame_run_native(&mut self, fid: u32, stop: usize) -> Option<Result<Value, Thrown>> {
-        // Python programs only: a JavaScript frame call keeps the interpreter
-        // loop's own native entry (the path every JavaScript test exercises).
-        if !self.jit.python_program()
+        if (!self.jit.python_program() && !js_frame_native_enabled())
             || !self.jit_enabled
             || self.jit_recurse_depth != 0
             || !self.jit_func_eligible(fid)

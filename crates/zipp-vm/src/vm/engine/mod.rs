@@ -51,6 +51,15 @@ fn jit_module_functions_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_JIT").is_none())
 }
 
+/// Run a JavaScript frame call's compiled body straight from
+/// `jit_frame_call` (see `Vm::jit_frame_run_native`) instead of through the
+/// interpreter loop. Off switch for parity testing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn js_frame_native_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_JS_FRAME_NATIVE").is_none())
+}
+
 /// Let ordinary `eval` / `new Function` functions (every script an embedder
 /// runs through `eval_in_context`) use the function and region JITs too.
 /// Their protos are leaked at stable addresses and installed after the remap,
