@@ -1640,6 +1640,30 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// Whether the global object's prototype chain holds a Proxy. Found
+    /// through the ordinary objects in front of it, so no trap runs. A sloppy
+    /// assignment to an unresolvable name is `Set(globalObject, name)`, whose
+    /// OrdinarySet reaches that Proxy's `set` trap even when its `has` trap
+    /// denied the name, so such a store goes through [[Set]].
+    pub(crate) fn global_proto_chain_has_proxy(&mut self) -> bool {
+        if self.global_this == 0 {
+            return false;
+        }
+        let mut cur = Value::heap(self.global_this);
+        // Bounded: setPrototypeOf rejects a cycle among ordinary objects.
+        for _ in 0..10_000 {
+            let p = self.object_get_prototype_of(cur);
+            if !p.is_heap() {
+                return false;
+            }
+            if self.proxy_parts(p.heap_index()).is_some() {
+                return true;
+            }
+            cur = p;
+        }
+        false
+    }
+
     /// The CHEAP precondition for `global_real_own_route`: does the global object carry
     /// any real own property at all? One heap load and an `is_empty`. False for every
     /// program that never writes `globalThis.x = …` or `defineProperty(globalThis, …)`,

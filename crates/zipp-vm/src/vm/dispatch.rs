@@ -911,6 +911,13 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
+                                // See StoreGlobal: an unresolvable name with a
+                                // Proxy on the global's chain is [[Set]].
+                                if self.global_proto_chain_has_proxy() {
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 // See StoreGlobal: re-creating a deleted binding
                                 // lifts DeleteGlobal's deletion record.
                                 if !self.deleted_globals.is_empty() {
@@ -975,6 +982,15 @@ impl<'p> Vm<'p> {
                                     Value::NULL
                                 };
                                 if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
+                                // Unresolvable: PutValue is Set(globalObject,
+                                // name), and a Proxy on the global's chain gets
+                                // that write through its `set` trap even when
+                                // its `has` trap denied the name.
+                                if self.global_proto_chain_has_proxy() {
                                     self.set_prop(gobj, &name, v, false)?;
                                     ip += 1;
                                     continue;

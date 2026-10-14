@@ -1663,7 +1663,16 @@ impl<'p> Vm<'p> {
         // chains are handled just below via map.class; `__proto__` was handled
         // at the top.) Only when there's no own property with this key.
         let needs_proto_walk = (match self.heap.get(idx) {
-            HeapObj::Object(m) => m.class.is_none() && m.pos(key).is_none(),
+            // The global object's slot-backed bindings (builtins, `var` and
+            // function declarations) are own data properties too, though its
+            // map holds none of them: a write to one never reaches the chain.
+            HeapObj::Object(m) => {
+                m.class.is_none()
+                    && m.pos(key).is_none()
+                    && !(self.global_this != 0
+                        && idx == self.global_this
+                        && self.global_slot_binding_descriptor(key).is_some())
+            }
             // An EXOTIC receiver's inherited getter-only accessor (RegExp
             // global/source/flags, Map/Set size) must govern the write: assigning it
             // is a sloppy no-op / strict TypeError, NOT a new own data property. The

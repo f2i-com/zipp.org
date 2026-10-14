@@ -307,6 +307,15 @@ impl<'p> Vm<'p> {
                         ));
                         break;
                     }
+                    // The global object's slot-backed bindings are own data
+                    // properties its map does not hold: one governs here, and
+                    // the global's prototype chain is never consulted.
+                    if self.global_this != 0 && cur.heap_index() == self.global_this {
+                        if let Some((_, a)) = self.global_slot_binding_descriptor(&key) {
+                            governing = Some((false, a.writable, Value::UNDEFINED));
+                            break;
+                        }
+                    }
                     // A private name is never a prototype property: keep the
                     // class-aware target write for it.
                     if m.class.is_some() && key.starts_with('#') {
