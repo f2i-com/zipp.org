@@ -4009,6 +4009,11 @@ impl<'p> Vm<'p> {
                                         _ => {}
                                     }
                                 }
+                                // Freezing also makes the synthesized
+                                // `prototype` non-writable.
+                                if id == OBJ_FREEZE {
+                                    self.make_fn_proto_readonly(o);
+                                }
                             }
                         }
                     }

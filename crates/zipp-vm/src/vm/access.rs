@@ -1799,6 +1799,11 @@ impl<'p> Vm<'p> {
             // undefined/null/primitive — which the heap-only `prototypes` cache can't
             // hold), via `fn_proto_override` which the reads consult first.
             if key == "prototype" {
+                // A non-writable `prototype` (made so by defineProperty or
+                // freeze): a sloppy no-op, a strict TypeError.
+                if self.fn_proto_readonly.contains(&idx) {
+                    return self.reject_write(key, strict);
+                }
                 self.fn_proto_override.insert(idx, val);
                 if val.is_heap() {
                     self.prototypes.insert(idx, val.heap_index());
@@ -2354,7 +2359,11 @@ impl<'p> Vm<'p> {
         // synthesize one, so it need not be materialized here).
         if key == "prototype" && self.callable_has_prototype(obj) {
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
-            return Some(data(!is_class || self.fn_proto_override.contains_key(&idx)));
+            return Some(data(if is_class {
+                self.fn_proto_override.contains_key(&idx)
+            } else {
+                !self.fn_proto_readonly.contains(&idx)
+            }));
         }
         // A String wrapper's index/`length` and a RegExp's `lastIndex`.
         if let Some((_, len)) = self.string_exotic_chars(obj) {

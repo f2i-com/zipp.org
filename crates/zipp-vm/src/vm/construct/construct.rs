@@ -87,6 +87,24 @@ impl<'p> Vm<'p> {
     /// unless an object is returned — what that arm does for such a class
     /// (a base class ignores a primitive return). `Ok(None)`, with nothing
     /// done, for any other class or value.
+    /// Make the ordinary function `f`'s `prototype` non-writable, keeping
+    /// its current value (recorded in `fn_proto_override`, which every read
+    /// consults first and which roots `f`).
+    pub(crate) fn make_fn_proto_readonly(&mut self, f: Value) {
+        if !f.is_heap() || !self.callable_has_prototype(f) {
+            return;
+        }
+        let idx = f.heap_index();
+        if matches!(self.heap.get(idx), HeapObj::Class(_)) {
+            return;
+        }
+        if !self.fn_proto_override.contains_key(&idx) {
+            let cur = self.prototype_of(f).unwrap_or(Value::UNDEFINED);
+            self.fn_proto_override.insert(idx, cur);
+        }
+        self.fn_proto_readonly.insert(idx);
+    }
+
     pub(crate) fn flat_new_class_instance(
         &mut self,
         cv: Value,
@@ -1599,6 +1617,9 @@ impl<'p> Vm<'p> {
             }
             if let Some(v) = self.fn_proto_override.remove(&tvi) {
                 self.fn_proto_override.insert(oidx, v);
+            }
+            if self.fn_proto_readonly.remove(&tvi) {
+                self.fn_proto_readonly.insert(oidx);
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);

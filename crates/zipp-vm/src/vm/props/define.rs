@@ -694,15 +694,18 @@ impl<'p> Vm<'p> {
                 ));
             }
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
-            // A class's `prototype` is also non-writable: it cannot become
-            // writable, and only the same value may be restated.
-            if is_class && wr == Some(true) {
+            // A class's `prototype` is non-writable, and so is a function's
+            // once made so: it cannot become writable again, and only the
+            // same value may be restated (ValidateAndApplyPropertyDescriptor
+            // for a non-configurable, non-writable property).
+            let readonly = is_class || self.fn_proto_readonly.contains(&idx);
+            if readonly && wr == Some(true) {
                 return Err(Thrown::from_static(
                     "TypeError: Cannot redefine property: prototype",
                 ));
             }
             if let Some(v) = v {
-                if is_class {
+                if readonly {
                     let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
                     if !self.same_value(v, cur) {
                         return Err(Thrown::from_static(
@@ -717,6 +720,9 @@ impl<'p> Vm<'p> {
                         self.prototypes.insert(idx, v.heap_index());
                     }
                 }
+            }
+            if !is_class && wr == Some(false) {
+                self.make_fn_proto_readonly(obj);
             }
             return Ok(());
         }

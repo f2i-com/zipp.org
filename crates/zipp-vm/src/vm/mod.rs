@@ -2821,6 +2821,11 @@ pub struct Vm<'p> {
     /// getOwnPropertyDescriptor, so a function whose prototype was set to a
     /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
     fn_proto_override: std::collections::HashMap<u32, Value>,
+    /// Ordinary functions whose `prototype` was made non-writable
+    /// (`Object.defineProperty(f, "prototype", {writable: false})`,
+    /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
+    /// value), which roots the function, so no entry outlives it.
+    fn_proto_readonly: std::collections::HashSet<u32>,
     /// Heap indices of `[[IsHTMLDDA]]` exotic objects (`$262.IsHTMLDDA`, the
     /// `document.all` emulation): `typeof` is "undefined", loose `== null`/`==
     /// undefined` is true, ToBoolean is false, and calling it returns undefined —

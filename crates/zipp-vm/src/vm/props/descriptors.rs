@@ -232,7 +232,8 @@ impl<'p> Vm<'p> {
             // An explicit `fn.prototype = value` (incl. a non-object) is reported
             // verbatim as a writable, non-enumerable, non-configurable data property.
             if let Some(&v) = self.fn_proto_override.get(&idx) {
-                return self.make_data_descriptor(v, true, false, false);
+                let writable = !self.fn_proto_readonly.contains(&idx);
+                return self.make_data_descriptor(v, writable, false, false);
             }
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
             if let Some(p) = self.prototype_of(obj) {
