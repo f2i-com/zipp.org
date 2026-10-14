@@ -227,7 +227,9 @@ impl<'p> Vm<'p> {
                 let sv = self.alloc_str(style.clone());
                 r.set("style", sv);
                 if style == "currency" {
-                    let cv = self.alloc_str(currency.clone().unwrap_or_default().to_uppercase());
+                    let cv = self.alloc_str(crate::vm::special_casing::str_to_uppercase(
+                        currency.as_deref().unwrap_or_default(),
+                    ));
                     r.set("currency", cv);
                     let cdv = self.alloc_str(currency_display);
                     r.set("currencyDisplay", cdv);
