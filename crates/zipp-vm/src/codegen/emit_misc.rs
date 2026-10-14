@@ -41,17 +41,25 @@ fn typeof_is_inline_enabled() -> bool {
     }
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_TYPEOF_SMALL_BIGINT=1`: `emit_typeof_is` hands a small
+    /// (immediate) BigInt to `jit_typeof_is`, as before (the same-binary
+    /// A/B for its inline answer).
+    fn typeof_small_bigint_enabled() = "ZIPP_NO_TYPEOF_SMALL_BIGINT"
+}
+
 /// `TypeOfIs { dst, a, code, neg }` — `dst = (typeof a === TYPEOF_NAMES[code])
 /// != neg` as Bool bits — shared by the Tier-C and region emitters.
 ///
 /// A NaN-boxed value's tag decides five of the eight answers without the
 /// heap: any double or Int is "number", the Bool tag is "boolean", the
 /// Undefined tag is "undefined" (with any payload), the exact `null` is
-/// "object". Each of those is a compile-time constant for this `code`/`neg`,
-/// so the arm is a tag test and a constant store. Only a heap value —
-/// string, object, function, symbol, BigInt, the `[[IsHTMLDDA]]` exotic, or
-/// a Cell/Proxy that unwraps to anything — and a small (immediate) BigInt
-/// (the Null tag with a payload) call `jit_typeof_is`,
+/// "object", a small (immediate) BigInt (the Null tag with the marker bit)
+/// is "bigint". Each of those is a compile-time constant for this
+/// `code`/`neg`, so the arm is a tag test and a constant store. Only a heap
+/// value — string, object, function, symbol, BigInt, the `[[IsHTMLDDA]]`
+/// exotic, or a Cell/Proxy that unwraps to anything — and any other
+/// Null-tagged value call `jit_typeof_is`,
 /// which is where those rules live. PURE and total: no bail, no refetch,
 /// clobbers only rax/rcx/rdx/r8 (the helper call's own set).
 ///
@@ -80,15 +88,24 @@ pub(crate) fn emit_typeof_is(
     let answer = |name: &str| -> i64 {
         crate::value::Value::bool((lit == Some(name)) != neg).bits() as i64
     };
-    let (res_number, res_boolean, res_undefined, res_object) = (
+    let (res_number, res_boolean, res_undefined, res_object, res_bigint) = (
         answer("number"),
         answer("boolean"),
         answer("undefined"),
         answer("object"),
+        answer("bigint"),
     );
+    // A small (immediate) BigInt's top 17 bits: the Null tag and the
+    // marker bit (`Value::is_small_bigint`).
+    // (`-1` matches nothing: every such value goes to the helper.)
+    let small_bigint_top = match crate::value::Value::small_bigint(0) {
+        Some(v) if typeof_small_bigint_enabled() => (v.bits() >> 47) as i32,
+        _ => -1,
+    };
     let is_number = ops.new_dynamic_label();
     let is_boolean = ops.new_dynamic_label();
     let is_undefined = ops.new_dynamic_label();
+    let not_null = ops.new_dynamic_label();
     let heap = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     dynasm!(ops
@@ -105,12 +122,20 @@ pub(crate) fn emit_typeof_is(
         ; je => is_boolean
         ; cmp edx, 3
         ; je => is_undefined
-        // Null tag. Exactly `null` is "object"; any other Null-tagged value
-        // is a small (immediate) BigInt (value.rs), which the helper names.
+        // Null tag. Exactly `null` is "object"; a small (immediate) BigInt
+        // (value.rs: the Null tag with the marker bit) is "bigint" (every
+        // Python int loop counter); anything else the helper names.
         ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
         ; cmp rax, r8
-        ; jne => heap
+        ; jne => not_null
         ; mov rax, QWORD res_object
+        ; jmp => store
+        ; => not_null
+        ; mov r8, rax
+        ; shr r8, 47
+        ; cmp r8d, small_bigint_top
+        ; jne => heap
+        ; mov rax, QWORD res_bigint
         ; jmp => store
         ; => is_number
         ; mov rax, QWORD res_number
