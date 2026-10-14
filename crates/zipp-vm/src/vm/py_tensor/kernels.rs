@@ -1593,17 +1593,19 @@ pub(crate) trait Kernels: Host {
     /// - 1 `randDouble`: `nextDouble`, 53 bits from two words.
     /// - 2 `randn` float32, 16 or more: the AVX2 blocks (`avxBlock`).
     /// - 3 `randn` float64, 16 or more: `normalBlock` in double.
+    /// - 4 `uniform` float32 from `a` to `b` (PyTorch's float arithmetic,
+    ///   the bounds rounded to float32); 5 `uniform` float64.
     fn pt_rng(&mut self, a: &[Arg]) -> Option<()> {
         let mode = int_arg(a, 0)?;
         let (vm, vp, vo) = (self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?, self.pt_view(arg(a, 3))?);
         let (mean, std) = (num_arg(a, 4)?, num_arg(a, 5)?);
         let n = vo.len;
         let want = match mode {
-            0 | 2 => KIND_F32,
-            1 | 3 => KIND_F64,
+            0 | 2 | 4 => KIND_F32,
+            1 | 3 | 5 => KIND_F64,
             _ => return None,
         };
-        if vm.kind != KIND_U8 || vm.len != 624 * 4 || vp.kind != KIND_F64 || vp.len != 1 || vo.kind != want || (mode >= 2 && n < 16) {
+        if vm.kind != KIND_U8 || vm.len != 624 * 4 || vp.kind != KIND_F64 || vp.len != 1 || vo.kind != want || ((mode == 2 || mode == 3) && n < 16) {
             return None;
         }
         if vm.buffer == vp.buffer || vm.buffer == vo.buffer || vp.buffer == vo.buffer {
@@ -1613,7 +1615,7 @@ pub(crate) trait Kernels: Host {
         if !(0.0..=624.0).contains(&pos) || pos.fract() != 0.0 {
             return None;
         }
-        let normal = mode >= 2;
+        let normal = mode == 2 || mode == 3;
         let cost = self.pt_admit(n.saturating_mul(if normal { 16 } else { 2 }), n.saturating_add(624))?;
         let mut mt = Mt { w: [0u32; 624], i: pos as usize };
         {
@@ -1626,6 +1628,15 @@ pub(crate) trait Kernels: Host {
         match mode {
             0 => d.iter_mut().for_each(|x| *x = (mt.next() & 0xffffff) as f64 * F24),
             1 => d.iter_mut().for_each(|x| *x = mt.next_double()),
+            4 => {
+                let (lo, hi) = (mean as f32, std as f32);
+                let dd = hi - lo;
+                d.iter_mut().for_each(|x| *x = ((((mt.next() & 0xffffff) as f64 * F24) as f32 * dd) + lo) as f64);
+            }
+            5 => {
+                let dd = std - mean;
+                d.iter_mut().for_each(|x| *x = mt.next_double() * dd + mean);
+            }
             2 => {
                 let (mn, sd) = (mean as f32, std as f32);
                 d.iter_mut().for_each(|x| *x = (mt.next() & 0xffffff) as f64 * F24);
@@ -1640,7 +1651,7 @@ pub(crate) trait Kernels: Host {
                     avx_block(tail, mn, sd);
                 }
             }
-            _ => {
+            3 => {
                 d.iter_mut().for_each(|x| *x = mt.next_double());
                 let mut b = 0;
                 while b + 16 <= n {
@@ -1653,6 +1664,7 @@ pub(crate) trait Kernels: Host {
                     normal_block64(tail, mean, std);
                 }
             }
+            _ => return None,
         }
         self.pt_write(vo, 0, &d)?;
         {

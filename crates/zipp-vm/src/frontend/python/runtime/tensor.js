@@ -2345,9 +2345,10 @@
         return { mt: m, m8: new Uint8Array(m.buffer), i: 624, nd: null };
     }
     // The native draws (`vm::py_tensor`, `pt_rng`): `mode` 0 rand float32,
-    // 1 nextDouble, 2 randn float32 and 3 randn float64 (16 or more), the
-    // same words and values as the loops below; they advance the state in
-    // place. False when they decline (the loops then run).
+    // 1 nextDouble, 2 randn float32 and 3 randn float64 (16 or more), 4 and
+    // 5 uniform float32 and float64, the same words and values as the loops
+    // below; they advance the state in place. False when they decline (the
+    // loops then run).
     const RNG_POS = new Float64Array(1);
     function rngNative(s, mode, O, mean, std) {
         if (NATIVE === null) return false;
@@ -2432,6 +2433,26 @@
         else if (dtype === "bfloat16") for (let i = 0; i < n; i++) O[i] = (W[i] & 0xff) * 0.00390625;
         else for (let i = 0; i < n; i++) O[i] = (W[i] & 0xffffff) * 5.9604644775390625e-8;
         return finish(out);
+    }
+    // PyTorch's CPU uniform_(from, to) (uniform_real_distribution): float32
+    // `x * (to - from) + from` in float arithmetic, with `from` and `to`
+    // rounded to float32 first (its DistAccumType<float> is float) and x
+    // rand's 24-bit uniform; float64 the same in double, x nextDouble's 53
+    // bits. The one loop draws what rand draws.
+    function uniform(g, n, dtype, a, b) {
+        const s = needGen(g);
+        if (dtype === "float32") {
+            const out = alloc("float32", n), O = out.data;
+            if (n >= 16 && rngNative(s, 4, O, a, b)) return out;
+            const lo = fr(a), d = fr(fr(b) - lo);
+            for (let i = 0; i < n; i++) O[i] = fr((next32(s) & 0xffffff) * 5.9604644775390625e-8 * d) + lo;
+            return out;
+        }
+        const out = alloc("float64", n), O = out.data;
+        if (n >= 16 && rngNative(s, 5, O, a, b)) return out;
+        const d = b - a;
+        for (let i = 0; i < n; i++) O[i] = nextDouble(s) * d + a;
+        return out;
     }
     function randDouble(g, n) {
         const s = needGen(g), out = alloc("float64", n), O = out.data;
@@ -3837,6 +3858,12 @@
         fn("gen_initial_seed", 1, (a) => a[0].seed);
         fn("rand", 3, (a) => rand(a[0], num(a[1]), a[2] === undefined ? "float32" : rt.needStr(a[2])), 2);
         fn("rand_double", 2, (a) => randDouble(a[0], num(a[1])));
+        // uniform(gen, n, dtype, from, to): float32 or float64 (see `uniform`).
+        fn("uniform", 5, (a) => {
+            const d = rt.needStr(a[2]);
+            if (d !== "float32" && d !== "float64") fail(E.TypeError, "uniform: float32 or float64");
+            return uniform(a[0], num(a[1]), d, jsNumber(a[3]), jsNumber(a[4]));
+        });
         // randn(gen, n, dtype, mean=0, std=1)
         fn("randn", 5, (a) => randn(a[0], num(a[1]), rt.needStr(a[2]), a[3] === undefined ? 0 : num(a[3]), a[4] === undefined ? 1 : num(a[4])), 3);
         fn("randint", 4, (a) => randint(a[0], num(a[1]), num(a[2]), num(a[3])));

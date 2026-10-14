@@ -1453,6 +1453,13 @@ class Tensor:
         return self._inplace_op(lerp, end, weight)
 
     def uniform_(self, a=0.0, b=1.0, generator=None):
+        dt = self.dtype
+        if (dt is float32 or dt is float64) and (type(a) is _float or type(a) is _int) and (type(b) is _float or type(b) is _int):
+            # PyTorch's uniform kernel, values and draws: x * (to - from) +
+            # from in the dtype's arithmetic (float32: with from and to
+            # rounded to float32 first, which `rand() * (b - a) + a` did not
+            # do for b - a).
+            return self._overwrite(Tensor(_k.uniform(_gen(generator), _numel(self.shape), dt.name, _float(a), _float(b)), self.shape, dt))
         return self._overwrite(rand(*self.shape, generator=generator, dtype=self.dtype if self.dtype.is_floating_point else None) * (b - a) + a)
 
     def normal_(self, mean=0.0, std=1.0, generator=None):

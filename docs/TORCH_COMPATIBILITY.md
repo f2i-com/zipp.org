@@ -666,7 +666,11 @@ third-party ML packages is not supported; within the bundled `torch`:
   values bit for bit: Box-Muller with the cached second value below 16
   elements, and from 16 elements the vectorised fill PyTorch's x86 builds use (float16/bfloat16 tensors of 16 or
   more elements can differ by an ulp, and a PyTorch build without AVX2 draws
-  differently). `bernoulli` and dropout masks come from Zipp's stream (PyTorch
+  differently). `uniform_(from, to)` (so `nn.init.uniform_`,
+  `kaiming_uniform_`, `xavier_uniform_` and the initial weights of
+  nn.Linear and the convolutions) gives PyTorch's float32 and float64 values
+  bit for bit: `x * (to - from) + from` in the dtype's arithmetic, the bounds
+  rounded to it first. `bernoulli` and dropout masks come from Zipp's stream (PyTorch
   draws them through MKL), so they do not match PyTorch's masks.
   `get_state`/`set_state` and `torch.get_rng_state`/`set_rng_state` capture the
   full generator state in Zipp's own layout, not interchangeable with PyTorch's.

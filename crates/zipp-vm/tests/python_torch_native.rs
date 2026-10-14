@@ -917,6 +917,9 @@ def draws(native):
             out.append(t)
             t.uniform_(-0.5, 0.25)
             out.append(t)
+            t = torch.empty(n)
+            t.uniform_(0.1, 0.7)
+            out.append(t)
             out.append(torch.randn(n, dtype=torch.float16))
         out.append(torch.get_rng_state())
         st = torch.get_rng_state()
@@ -944,7 +947,7 @@ fn native_random_draws_give_the_javascript_loops_bytes() {
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("mismatches 0 []"), "{}", out[0]);
     let draws: usize = out[0].split_whitespace().nth(1).unwrap().parse().unwrap();
-    assert_eq!(draws, 2 * (50 * 8 + 6), "{}", out[0]);
+    assert_eq!(draws, 2 * (50 * 9 + 6), "{}", out[0]);
 }
 
 /// A native draw is charged, below what the interpreted loop spends.
