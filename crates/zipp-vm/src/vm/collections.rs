@@ -105,14 +105,21 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Per-collection acceleration index. Ordinary builds retain the measured flat
 /// open-addressing table: an 8-byte `(tag, slot)` entry and linear probing keep
-/// its memory traffic low. The hostile-code profile instead uses a `BTreeMap`
-/// from a full 128-bit composite content tag to the backing slot. Tree navigation
-/// is O(log n) and has no attacker-selectable bucket chain even on
-/// wasm32-unknown-unknown, where std's `RandomState` seed comes from predictable
-/// linear-memory addresses. An exact collision in BOTH 64-bit tag halves falls
-/// back to a confirmed slot list, so that astronomically difficult case remains
-/// linear in the number of exact composite collisions rather than being claimed
-/// as a strict worst-case logarithmic bound.
+/// its memory traffic low. The hostile-code profile starts with bucket chains
+/// ([`Chains`]) that no insert may make longer than [`CHAIN_MAX`], so a lookup
+/// confirms at most that many entries; an insert that would lengthen one
+/// rebuilds the index as a `BTreeMap` from a full 128-bit composite content tag
+/// to the backing slot, for the collection's life. Tree navigation is O(log n)
+/// and has no attacker-selectable bucket chain even on wasm32-unknown-unknown,
+/// where std's `RandomState` seed comes from predictable linear-memory
+/// addresses: crafting a long chain buys the tree, and nothing slower. An
+/// exact collision in BOTH 64-bit tag halves falls back to a confirmed slot
+/// list, so that astronomically difficult case remains linear in the number
+/// of exact composite collisions rather than being claimed as a strict
+/// worst-case logarithmic bound.
+///
+/// The tree alone cost a cache miss a level: in a Map of 800,000 keys a
+/// lookup was most of map-set-heavy's run.
 ///
 /// Both representations remain pure acceleration. A tag hit is always
 /// CONFIRMED with `svz_eq` against `keys[slot]`, and the authoritative insertion
@@ -128,6 +135,10 @@ pub(crate) struct CollIndex {
     /// so growth/rehash triggers on this.
     #[cfg(not(feature = "safe-sandbox"))]
     used: usize,
+    /// The bucket chains, until an insert would make one too long.
+    #[cfg(feature = "safe-sandbox")]
+    chains: Option<Chains>,
+    /// The tree, once `chains` is gone; empty until then.
     #[cfg(feature = "safe-sandbox")]
     tree: BTreeMap<u128, CollSlots>,
     /// The keyed half makes an exact composite-tag collision require defeating
@@ -145,6 +156,150 @@ enum CollSlots {
     Many(Vec<u32>),
 }
 
+/// Longest chain an insert may make in [`Chains`]. Buckets are kept at most
+/// half full, where an honest chain this long comes up about once in 10^17
+/// buckets: only keys chosen to collide reach it, and they get the tree.
+#[cfg(feature = "safe-sandbox")]
+const CHAIN_MAX: usize = 16;
+
+/// End of a chain, and the slot of a vacated entry.
+#[cfg(feature = "safe-sandbox")]
+const NO_ENTRY: u32 = u32::MAX;
+
+/// The hostile-code profile's index while every chain is short: buckets of
+/// entries linked in insertion order, picked by the seeded mix of the key's
+/// `svz_repr` (the ordinary profile's table hash).
+#[cfg(feature = "safe-sandbox")]
+struct Chains {
+    /// Bucket -> its first entry, `NO_ENTRY` when empty. A power of two, at
+    /// least twice the live entries.
+    heads: Vec<u32>,
+    entries: Vec<ChainEntry>,
+    /// Entries removals vacated, for the next inserts.
+    vacant: Vec<u32>,
+}
+
+#[cfg(feature = "safe-sandbox")]
+#[derive(Clone, Copy)]
+struct ChainEntry {
+    /// `svz_repr` of the key: equal keys have equal reprs.
+    repr: u64,
+    /// The key itself, to rebuild the index as the tree, whose tags hash the
+    /// key's content. It is also in the collection's backing at `slot`.
+    key: Value,
+    slot: u32,
+    next: u32,
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl Chains {
+    fn with_buckets(buckets: usize) -> Chains {
+        Chains {
+            heads: vec![NO_ENTRY; buckets],
+            entries: Vec::new(),
+            vacant: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn bucket(&self, repr: u64) -> usize {
+        (mix64(repr ^ crate::heap::hash_seed()) as usize) & (self.heads.len() - 1)
+    }
+
+    #[inline]
+    fn find(&self, heap: &Heap, keys: &[Value], key: Value, repr: u64) -> Option<usize> {
+        let mut at = self.heads[self.bucket(repr)];
+        while at != NO_ENTRY {
+            let entry = &self.entries[at as usize];
+            if entry.repr == repr && svz_eq(heap, keys[entry.slot as usize], key) {
+                return Some(entry.slot as usize);
+            }
+            at = entry.next;
+        }
+        None
+    }
+
+    /// Link `key` at `slot`, unless its chain already holds [`CHAIN_MAX`]
+    /// entries: then nothing is linked and the caller turns to the tree.
+    fn insert(&mut self, repr: u64, key: Value, slot: u32, live: usize) -> bool {
+        if (live + 1) * 2 > self.heads.len() {
+            self.grow();
+        }
+        let bucket = self.bucket(repr);
+        let mut len = 0;
+        let mut at = self.heads[bucket];
+        while at != NO_ENTRY {
+            len += 1;
+            at = self.entries[at as usize].next;
+        }
+        if len >= CHAIN_MAX {
+            return false;
+        }
+        let entry = ChainEntry {
+            repr,
+            key,
+            slot,
+            next: self.heads[bucket],
+        };
+        let at = match self.vacant.pop() {
+            Some(at) => {
+                self.entries[at as usize] = entry;
+                at
+            }
+            None => {
+                self.entries.push(entry);
+                (self.entries.len() - 1) as u32
+            }
+        };
+        self.heads[bucket] = at;
+        true
+    }
+
+    /// Unlink the entry for `slot` (whose key has `repr`); whether one was.
+    fn remove(&mut self, repr: u64, slot: u32) -> bool {
+        let bucket = self.bucket(repr);
+        let mut prev = NO_ENTRY;
+        let mut at = self.heads[bucket];
+        while at != NO_ENTRY {
+            let entry = self.entries[at as usize];
+            if entry.slot == slot {
+                if prev == NO_ENTRY {
+                    self.heads[bucket] = entry.next;
+                } else {
+                    self.entries[prev as usize].next = entry.next;
+                }
+                self.entries[at as usize].slot = NO_ENTRY;
+                self.vacant.push(at);
+                return true;
+            }
+            prev = at;
+            at = entry.next;
+        }
+        false
+    }
+
+    /// Double the buckets and relink every live entry. A chain only splits,
+    /// so none grows past what it was.
+    fn grow(&mut self) {
+        let buckets = self.heads.len() * 2;
+        self.heads = vec![NO_ENTRY; buckets];
+        for at in 0..self.entries.len() {
+            if self.entries[at].slot == NO_ENTRY {
+                continue;
+            }
+            let bucket = self.bucket(self.entries[at].repr);
+            self.entries[at].next = self.heads[bucket];
+            self.heads[bucket] = at as u32;
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        (self.heads.capacity() * std::mem::size_of::<u32>())
+            .saturating_add(self.entries.capacity() * std::mem::size_of::<ChainEntry>())
+            .saturating_add(self.vacant.capacity() * std::mem::size_of::<u32>())
+    }
+}
+
 #[cfg(not(feature = "safe-sandbox"))]
 const META_EMPTY: u32 = u32::MAX;
 #[cfg(not(feature = "safe-sandbox"))]
@@ -160,6 +315,10 @@ impl CollIndex {
                 .table
                 .capacity()
                 .saturating_mul(std::mem::size_of::<(u32, u32)>());
+        }
+        #[cfg(feature = "safe-sandbox")]
+        if let Some(chains) = &self.chains {
+            return chains.resident_bytes();
         }
         #[cfg(feature = "safe-sandbox")]
         {
@@ -197,9 +356,11 @@ impl CollIndex {
         }
         #[cfg(feature = "safe-sandbox")]
         {
-            let _ = n;
+            // At most half full: room for `n` entries before the first growth.
+            let buckets = (n * 2 + 1).next_power_of_two().max(16);
             return CollIndex {
                 live: 0,
+                chains: Some(Chains::with_buckets(buckets)),
                 tree: BTreeMap::new(),
                 hash_builder: RandomState::new(),
             };
@@ -286,6 +447,10 @@ impl CollIndex {
     #[inline]
     fn find(&self, heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
         #[cfg(feature = "safe-sandbox")]
+        if let Some(chains) = &self.chains {
+            return chains.find(heap, keys, key, svz_repr(heap, key));
+        }
+        #[cfg(feature = "safe-sandbox")]
         {
             let slots = self.tree.get(&self.key_tag(heap, key))?;
             return match slots {
@@ -321,19 +486,16 @@ impl CollIndex {
     fn insert(&mut self, heap: &Heap, key: Value, pos: u32) {
         #[cfg(feature = "safe-sandbox")]
         {
-            let tag = self.key_tag(heap, key);
-            match self.tree.entry(tag) {
-                Entry::Vacant(entry) => {
-                    entry.insert(CollSlots::One(pos));
+            let live = self.live;
+            if let Some(chains) = &mut self.chains {
+                if chains.insert(svz_repr(heap, key), key, pos, live) {
+                    self.live += 1;
+                    return;
                 }
-                Entry::Occupied(mut entry) => match entry.get_mut() {
-                    CollSlots::One(first) => {
-                        let first = *first;
-                        entry.insert(CollSlots::Many(vec![first, pos]));
-                    }
-                    CollSlots::Many(slots) => slots.push(pos),
-                },
+                // A chain at its limit: these keys were chosen to collide.
+                self.to_tree(heap);
             }
+            self.tree_insert(heap, key, pos);
             self.live += 1;
             return;
         }
@@ -351,6 +513,38 @@ impl CollIndex {
             let tag = self.key_tag(heap, key);
             self.insert_raw(tag, pos);
             self.live += 1;
+        }
+    }
+
+    /// Record `pos` under `key` in the tree.
+    #[cfg(feature = "safe-sandbox")]
+    fn tree_insert(&mut self, heap: &Heap, key: Value, pos: u32) {
+        let tag = self.key_tag(heap, key);
+        match self.tree.entry(tag) {
+            Entry::Vacant(entry) => {
+                entry.insert(CollSlots::One(pos));
+            }
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                CollSlots::One(first) => {
+                    let first = *first;
+                    entry.insert(CollSlots::Many(vec![first, pos]));
+                }
+                CollSlots::Many(slots) => slots.push(pos),
+            },
+        }
+    }
+
+    /// Move every chained entry into the tree, which serves the collection
+    /// from now on.
+    #[cfg(feature = "safe-sandbox")]
+    fn to_tree(&mut self, heap: &Heap) {
+        let Some(chains) = self.chains.take() else {
+            return;
+        };
+        for entry in &chains.entries {
+            if entry.slot != NO_ENTRY {
+                self.tree_insert(heap, entry.key, entry.slot);
+            }
         }
     }
 
@@ -376,6 +570,13 @@ impl CollIndex {
     /// Tombstone the entry for (`key`, `pos`): probe chains keep walking
     /// past it, and a later insert may reuse the slot.
     fn remove(&mut self, heap: &Heap, key: Value, pos: u32) {
+        #[cfg(feature = "safe-sandbox")]
+        if let Some(chains) = &mut self.chains {
+            if chains.remove(svz_repr(heap, key), pos) {
+                self.live -= 1;
+            }
+            return;
+        }
         #[cfg(feature = "safe-sandbox")]
         {
             let tag = self.key_tag(heap, key);
@@ -821,7 +1022,7 @@ mod safe_index_tests {
         for (pos, &key) in keys.iter().enumerate() {
             index.insert(&heap, key, pos as u32);
         }
-        assert_eq!(index.tree.len(), keys.len());
+        assert_eq!(index.live, keys.len());
         for (pos, &key) in keys.iter().enumerate() {
             assert_eq!(index.find(&heap, &keys, key), Some(pos));
         }
@@ -836,6 +1037,59 @@ mod safe_index_tests {
                 "wrong result for slot {pos} after tombstoning"
             );
         }
+    }
+
+    /// Reprs that the seeded mix sends to one bucket of 16 can be found in
+    /// a few hundred tries: a chain takes `CHAIN_MAX` of them and refuses the
+    /// next, which is what sends an index to the tree.
+    #[test]
+    fn a_chain_refuses_an_entry_past_its_limit() {
+        let mut chains = Chains::with_buckets(16);
+        let target = chains.bucket(0);
+        let colliding: Vec<u64> = (0u64..)
+            .filter(|&repr| chains.bucket(repr) == target)
+            .take(CHAIN_MAX + 1)
+            .collect();
+        for (slot, &repr) in colliding[..CHAIN_MAX].iter().enumerate() {
+            // `live` stays below the growth point: the buckets do not double.
+            assert!(chains.insert(repr, Value::int(slot as i32), slot as u32, 0));
+        }
+        assert!(!chains.insert(colliding[CHAIN_MAX], Value::UNDEFINED, 99, 0));
+        // A removal makes room again.
+        assert!(chains.remove(colliding[3], 3));
+        assert!(chains.insert(colliding[CHAIN_MAX], Value::UNDEFINED, 99, 0));
+    }
+
+    /// An index moved to the tree keeps every entry, and serves finds,
+    /// removals and later inserts from there.
+    #[test]
+    fn an_index_moved_to_the_tree_keeps_its_entries() {
+        let mut heap = Heap::new();
+        let mut keys: Vec<Value> = (0..300)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Value::heap(heap.alloc_str(format!("moved-key-{i}")))
+                } else {
+                    Value::int(i)
+                }
+            })
+            .collect();
+        let mut index = CollIndex::build(&heap, &keys);
+        for (pos, &key) in keys.iter().enumerate().step_by(5) {
+            index.remove(&heap, key, pos as u32);
+        }
+        index.to_tree(&heap);
+        assert!(index.chains.is_none());
+        assert_eq!(index.tree.len(), index.live);
+        for (pos, &key) in keys.iter().enumerate() {
+            assert_eq!(index.find(&heap, &keys, key), (pos % 5 != 0).then_some(pos));
+        }
+        let late = Value::heap(heap.alloc_str("late-key".to_string()));
+        index.insert(&heap, late, keys.len() as u32);
+        keys.push(late);
+        assert_eq!(index.find(&heap, &keys, late), Some(keys.len() - 1));
+        index.remove(&heap, keys[1], 1);
+        assert_eq!(index.find(&heap, &keys, keys[1]), None);
     }
 
     #[test]
