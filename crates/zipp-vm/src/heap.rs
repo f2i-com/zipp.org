@@ -1156,6 +1156,7 @@ impl<'a> IntoIterator for &'a mut PropKeys {
 }
 
 impl PropKeys {
+    #[inline]
     fn resident_bytes(&self) -> usize {
         match self {
             // A planned list is compiler-owned and shared by every object made
@@ -1833,6 +1834,7 @@ impl PropAttr {
 }
 
 impl ObjMap {
+    #[inline]
     pub(crate) fn resident_bytes(&self) -> usize {
         let mut n = self
             .keys
@@ -5624,6 +5626,9 @@ impl HeapObj {
                 Reactions::Many(v) => vec_capacity_bytes(v),
                 _ => 0,
             },
+            // Every `new C()` and object literal: three capacity reads, not
+            // the out-of-line forty-arm match.
+            HeapObj::Object(map) => std::mem::size_of::<ObjMap>().saturating_add(map.resident_bytes()),
             _ => self.resident_payload_bytes(),
         }
     }
