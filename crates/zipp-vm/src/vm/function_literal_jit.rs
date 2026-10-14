@@ -41,8 +41,8 @@ fn make_func_preflight(vm: &Vm<'_>, packed_fip: u64) -> Option<MakeFuncPlan> {
     let caller = (packed_fip >> 32) as u32 as usize;
     let ip = packed_fip as u32 as usize;
     // Loader-installed module protos live in the same append-only eval table;
-    // this total therefore covers both main and module ids. Ordinary eval ids
-    // can be interleaved, so retain the JIT eligibility boundary as well.
+    // this total therefore covers main, module and eval ids. The eligibility
+    // check keeps each runtime kind's off switch.
     let func_count = vm.main_func_count.checked_add(vm.eval_funcs.len())?;
     if caller >= func_count || !vm.jit_func_eligible(caller as u32) {
         return None;

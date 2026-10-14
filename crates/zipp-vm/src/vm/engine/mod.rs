@@ -51,6 +51,20 @@ fn jit_module_functions_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_JIT").is_none())
 }
 
+/// Let ordinary `eval` / `new Function` functions (every script an embedder
+/// runs through `eval_in_context`) use the function and region JITs too.
+/// Their protos are leaked at stable addresses and installed after the remap,
+/// exactly as a module's are; what differs is sloppy code and direct-eval
+/// scopes, which the JITs already meet in main-program code: a closure with
+/// an EvalScope stamp is refused by `closure_eval_scope`, and the dynamic
+/// name ops a direct eval compiles to are not admitted. Off switch for
+/// parity testing.
+#[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn jit_eval_functions_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_EVAL_JIT").is_none())
+}
+
 // submodules (split out of the former monolithic engine.rs)
 mod boot;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

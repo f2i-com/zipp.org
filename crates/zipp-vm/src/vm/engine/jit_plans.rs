@@ -4035,9 +4035,8 @@ impl<'p> Vm<'p> {
             if !shape_guardable
                 || self.current_realm_id().is_some()
                 || self.get_function_realm(callee_v) != 0
-                // Main-program and loader-recorded ES-module protos are the
-                // VM's exact immutable-JIT boundary. Ordinary eval/new Function
-                // ids share the runtime table but are deliberately excluded.
+                // The VM's immutable-JIT boundary (with each runtime kind's
+                // off switch); an inherited EvalScope is refused just below.
                 || !self.jit_func_eligible(fid)
                 || self.closure_eval_scope.contains_key(&callee_v.heap_index())
                 || self.global_route_epoch != 0

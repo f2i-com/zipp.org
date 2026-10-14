@@ -85,27 +85,41 @@ impl<'p> Vm<'p> {
 
     /// Whether `func_id` belongs to immutable code the native tiers may compile.
     ///
-    /// Main-program functions have always been eligible. Loader-installed ES
-    /// modules are eligible too: `prepare_eval_program` leaks their protos at
-    /// stable addresses and `module_func_ranges` records the exact half-open id
-    /// range for each module. Ordinary `eval`/`new Function` can be interleaved
-    /// in the same `eval_funcs` table, so accepting every id past
-    /// `main_func_count` would be unsound; only a recorded module range passes.
+    /// Main-program functions have always been eligible. Runtime-installed
+    /// functions are too: `prepare_eval_program` leaks their protos at stable
+    /// addresses and assigns ids only after the remap, and an id past
+    /// `main_func_count` names one installed function for the life of the VM.
+    /// Loader-installed ES modules (their exact ranges in `module_func_ranges`)
+    /// and ordinary `eval` / `new Function` code each keep an off switch
+    /// (`ZIPP_NO_MODULE_JIT`, `ZIPP_NO_EVAL_JIT`). Until the eval switch
+    /// existed, a script an embedder ran through `eval_in_context` never left
+    /// the interpreter: a pure loop took 35 ms there and 2 ms as main code.
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub(crate) fn jit_func_eligible(&self, func_id: u32) -> bool {
         if (func_id as usize) < self.main_func_count {
             return true;
         }
-        if !jit_module_functions_enabled() {
+        self.jit_installed_func_eligible(func_id)
+    }
+
+    /// The runtime-installed half of `jit_func_eligible`, out of line so the
+    /// main-code check stays one compare at every call and backedge.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[inline(never)]
+    fn jit_installed_func_eligible(&self, func_id: u32) -> bool {
+        if (func_id as usize).wrapping_sub(self.main_func_count) >= self.eval_funcs.len() {
             return false;
         }
-
         // Ranges are appended as the monotonically-growing runtime function
         // table is installed. Failed eval/module preparations can leave gaps,
         // but cannot reorder later ids, so binary search is valid and avoids a
         // module-count-linear tax at every hot backedge.
-        self.loader_module_func(func_id)
+        if self.loader_module_func(func_id) {
+            jit_module_functions_enabled()
+        } else {
+            jit_eval_functions_enabled()
+        }
     }
 
     /// Resolve a (unified) class id to its ClassDef: a compile-time program class

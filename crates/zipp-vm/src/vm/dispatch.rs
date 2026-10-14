@@ -384,9 +384,9 @@ impl<'p> Vm<'p> {
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
-                // Main-program functions and loader-recorded ES-module ranges
-                // are immutable and JIT-safe. Ordinary `eval`/`new Function`
-                // ids share the runtime table but remain interpreter-only.
+                // Main-program, module and installed eval/new Function protos
+                // are immutable and JIT-safe (each runtime kind has an off
+                // switch; see `jit_func_eligible`).
                 && self.jit_func_eligible(func_id)
                 // Dense tier check first: a known-ineligible (FN_DEAD) function
                 // pays ONE array read per call here, not 2-3 hash probes.
