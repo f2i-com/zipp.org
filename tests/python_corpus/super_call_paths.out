@@ -1,0 +1,8 @@
+scale 90000
+st [('st', 2), ('st', 3)] 200
+cm [('Derived', 0), ('Derived', 1), ('Derived', 2)] 200
+nested [('Derived', 0, ('st', 0)), ('Derived', 2, ('st', 1)), ('Derived', 4, ('st', 2))]
+nested static outer [('st', 0), ('st', 2), ('st', 4)]
+after warm ('Derived', 14, ('st', 7)) ('st', 14)
+with class ('Derived', 'base')
+flip [('plain pick', 'B', 0), ('static pick', 1), ('static pick', 2), ('plain pick', 'B', 3), ('static pick', 4), ('static pick', 5), ('static pick', 197), ('plain pick', 'B', 198), ('static pick', 199)]

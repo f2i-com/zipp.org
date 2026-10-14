@@ -83,6 +83,24 @@ pub(super) fn py_lazy_globals() -> bool {
         }
     }
 }
+/// Whether `super().name(...)` reads `R.mself` and the runtime's UNBOUND
+/// only where they are needed (`Emitter::super_method_call`, the
+/// prologue's implicit `__class__` cell) instead of on every call. On unless
+/// `ZIPP_NO_PY_SUPER_LEAN` is set (the same-binary A/B). Read once per
+/// process.
+pub(super) fn py_super_lean() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PY_SUPER_LEAN").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
@@ -364,10 +382,14 @@ impl<'a> Emitter<'a> {
         // Unbound-initialised locals and cells need UNBOUND right here, and
         // reads of captured cells test against it; global names, class
         // namespaces and nested code objects (which capture the globals)
-        // need the module's dictionary.
+        // need the module's dictionary. `super()` reads the implicit
+        // `__class__` cell of its method without that test, so a method
+        // whose only such name is that cell loads no sentinel here (a read
+        // of the name `__class__` itself loads it where it tests).
+        let lean_class_cell = self.fast && py_super_lean();
         let unbound_use = |(name, kind): (&String, &SymKind)| match kind {
             SymKind::Local | SymKind::Cell => !scope.params.contains(name),
-            SymKind::Free => true,
+            SymKind::Free => !(lean_class_cell && name == "__class__"),
             _ => false,
         };
         if scope.symbols.iter().any(unbound_use) {

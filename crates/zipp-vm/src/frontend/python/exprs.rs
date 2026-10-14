@@ -1,5 +1,5 @@
 //! Expression lowering for the Python emitter.
-use super::emitter::{Emitter, LoopCtx, MAX_DIRECT, R};
+use super::emitter::{py_super_lean, Emitter, LoopCtx, MAX_DIRECT, R};
 use super::stmts::{binop_name, inplace_binop_name, Display, Steps};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, PyArithOp, PyCmpOp, Reg};
@@ -1645,36 +1645,62 @@ impl<'a> Emitter<'a> {
         let (arg_base, argc) = self.arguments(&[cls, first, key])?;
         let rt = self.r_rt;
         self.emit(Instr::CallWithThis { dst: f, callee: native, this_v: rt, arg_base, argc, name: crate::bytecode::NO_NAME })?;
-        let undef = self.undefined()?;
-        let missed = self.alloc()?;
-        self.emit(Instr::Eq { dst: missed, a: f, b: undef })?;
+        // Whether the function is called with the receiver first is
+        // `R.mself`, read before the arguments (which may run a `super()` of
+        // their own). `SMFNATIVE` answers a function only on its cached hit,
+        // having set `R.mself` (`Vm::py_smfind`): there the receiver goes
+        // first, and `missed`, the `undefined` test's result, is `false`.
+        // So `missed` holds `!R.mself` from there on, and only `smfind`, out
+        // of line, reads the flag (into `missed`).
+        let lean = py_super_lean();
+        let missed = if lean {
+            self.typeof_is(f, "undefined")?
+        } else {
+            let undef = self.undefined()?;
+            let missed = self.alloc()?;
+            self.emit(Instr::Eq { dst: missed, a: f, b: undef })?;
+            missed
+        };
         let at = self.jump_if_true(missed)?;
+        let flag = self.string_index("mself");
         self.defer_cold(vec![at], Vec::new(), move |e| {
             let r = e.helper("smfind", &[cls, first, key])?;
             e.emit(Instr::Move { dst: f, src: r })?;
+            if lean {
+                let prepend = e.alloc()?;
+                e.emit(Instr::GetProp { dst: prepend, obj: e.r_rt, name: flag })?;
+                e.emit(Instr::Not { dst: missed, a: prepend })?;
+            }
             Ok(())
         });
-        let flag = self.string_index("mself");
-        let prepend = self.alloc()?;
-        self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+        // `ZIPP_NO_PY_SUPER_LEAN`: the flag read here on every call.
+        let prepend = if lean {
+            None
+        } else {
+            let prepend = self.alloc()?;
+            self.emit(Instr::GetProp { dst: prepend, obj: self.r_rt, name: flag })?;
+            Some(prepend)
+        };
         let mut regs = Vec::with_capacity(c.args.len());
         for e in &c.args {
             regs.push(self.expr(e, depth)?);
         }
         let dst = self.alloc()?;
-        let unbound = self.jump_if_false(prepend)?;
+        // The call without the receiver (a static method's), out of line.
+        let to_unbound = match prepend {
+            Some(prepend) => self.jump_if_false(prepend)?,
+            None => self.jump_if_true(missed)?,
+        };
         let mut with_self = Vec::with_capacity(regs.len() + 1);
         with_self.push(first);
         with_self.extend_from_slice(&regs);
         let r = self.call_with(f, &with_self)?;
         self.emit(Instr::Move { dst, src: r })?;
-        let done = self.jump()?;
-        let here = self.here();
-        self.patch(unbound, here)?;
-        let r = self.call_with(f, &regs)?;
-        self.emit(Instr::Move { dst, src: r })?;
-        let here = self.here();
-        self.patch(done, here)?;
+        self.defer_cold(vec![to_unbound], Vec::new(), move |e| {
+            let r = e.call_with(f, &regs)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
         Ok(Some(dst))
     }
 
