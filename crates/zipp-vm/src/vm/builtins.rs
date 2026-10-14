@@ -1462,6 +1462,9 @@ impl<'p> Vm<'p> {
                 if let Some(b) = self.has_own_index_fast(recv, a0) {
                     return Ok(Some(Value::bool(b)));
                 }
+                if let Some(b) = self.has_own_str_fast(recv, a0) {
+                    return Ok(Some(Value::bool(b)));
+                }
                 let key = self.to_property_key(a0)?;
                 return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
             }

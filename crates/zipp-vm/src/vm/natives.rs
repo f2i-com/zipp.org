@@ -2059,6 +2059,10 @@ impl<'p> Vm<'p> {
                     self.require_object_coercible(this)?;
                     return Ok(Value::bool(b));
                 }
+                // An object receiver: ToObject cannot throw.
+                if let Some(b) = self.has_own_str_fast(this, a0) {
+                    return Ok(Value::bool(b));
+                }
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
                 Value::bool(self.has_own_property_dyn(this, &k)?)

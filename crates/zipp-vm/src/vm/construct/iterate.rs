@@ -731,6 +731,39 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::has_own_property`] for an ordinary object and a flat string
+    /// key, with the key's bytes read in place: `obj.hasOwnProperty("a")`
+    /// built the key's text as a `String` (and freed it) on every call, most
+    /// of the call's cost. `None` for anything else (a symbol or rope key, an
+    /// escaped `@@` spelling, the global object, %Array.prototype% with its
+    /// exotic own `length`, a module namespace, whose uninitialized binding
+    /// must throw, an exotic receiver).
+    pub(crate) fn has_own_str_fast(&self, obj: Value, key: Value) -> Option<bool> {
+        if !obj.is_heap() || !key.is_heap() {
+            return None;
+        }
+        let idx = obj.heap_index();
+        if idx == self.arr_proto
+            || (idx == self.global_this && self.global_this != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        let Some(std::borrow::Cow::Borrowed(bytes)) = self.heap.str_wtf8_cow(key.heap_index())
+        else {
+            return None;
+        };
+        if bytes.starts_with(b"@@") {
+            return None;
+        }
+        let key = std::str::from_utf8(bytes).ok()?;
+        Some(m.pos(key).is_some())
+    }
+
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {
         // (Real private fields live in the side table and are invisible here;
         // a PUBLIC computed "#..." string key is an ordinary reflectable prop.)
