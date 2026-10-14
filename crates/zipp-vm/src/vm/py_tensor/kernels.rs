@@ -339,33 +339,77 @@ fn le64(c: &[u8]) -> f64 {
 }
 
 /// binaryFast's layouts over float32/float64 bytes (`py_tensor`'s
-/// OP_BIN_FAST): mode 0 `a` and `b` of one length, 1 `b` one element, 2 `a`
-/// one element, 3 `b` a bias tiled over `a` (`brow` bytes a row), 4 `a` a
-/// bias tiled over `b` (`arow` bytes a row); each element `f(a's, b's)`,
-/// computed and stored as `bytes_map2` does.
-pub(super) fn bytes_map_modes(kind: u8, mode: u8, a: &[u8], b: &[u8], out: &mut [u8], brow: usize, arow: usize, f: impl Fn(f64, f64) -> f64) {
+/// OP_BIN_FAST) for arithmetic op `code` (1-4: add, sub, mul, div): mode 0
+/// `a` and `b` of one length, 1 `b` one element, 2 `a` one element, 3 `b` a
+/// bias tiled over `a` (`brow` bytes a row), 4 `a` a bias tiled over `b`
+/// (`arow` bytes a row); each element computed and stored as `bytes_map2`
+/// does.
+pub(super) fn arith_modes(kind: u8, code: u8, mode: u8, a: &[u8], b: &[u8], out: &mut [u8], brow: usize, arow: usize) {
     match mode {
-        0 => bytes_map2(kind, a, b, out, false, false, f),
-        1 => bytes_map2(kind, a, b, out, true, false, f),
-        2 => bytes_map2(kind, b, a, out, true, true, f),
-        3 => {
-            for (o, x) in out.chunks_exact_mut(brow).zip(a.chunks_exact(brow)) {
-                bytes_map2(kind, x, b, o, false, false, &f);
-            }
-        }
+        1 => arith_map2(kind, code, a, b, out, true, false),
+        2 => arith_map2(kind, code, b, a, out, true, true),
         _ => {
-            for (o, y) in out.chunks_exact_mut(arow).zip(b.chunks_exact(arow)) {
-                bytes_map2(kind, a, y, o, false, false, &f);
+            // Row by row (mode 0: one row), the tiled operand whole.
+            let row = match mode {
+                3 => brow,
+                4 => arow,
+                _ => out.len(),
+            };
+            if row == 0 {
+                return;
+            }
+            for (r, o) in out.chunks_exact_mut(row).enumerate() {
+                let span = r * row..(r + 1) * row;
+                let x = if mode == 4 { Some(a) } else { a.get(span.clone()) };
+                let y = if mode == 3 { Some(b) } else { b.get(span) };
+                if let (Some(x), Some(y)) = (x, y) {
+                    arith_map2(kind, code, x, y, o, false, false);
+                }
             }
         }
     }
 }
 
-/// `out[i] = f(a[i], y)`, or `f(y, a[i])` when `flip`, over float32/float64
-/// bytes, `y` a value of that kind (`py_tensor`'s OP_BIN_SCALAR_FAST).
-pub(super) fn bytes_map_scalar(kind: u8, a: &[u8], y: f64, flip: bool, out: &mut [u8], f: impl Fn(f64, f64) -> f64) {
+/// `a op y`, or `y op a` when `flip`, over float32/float64 bytes for
+/// arithmetic op `code`, `y` a value of that kind (`py_tensor`'s
+/// OP_BIN_SCALAR_FAST).
+pub(super) fn arith_scalar(kind: u8, code: u8, a: &[u8], y: f64, flip: bool, out: &mut [u8]) {
     let yb = if kind == KIND_F32 { (y as f32).to_le_bytes().to_vec() } else { y.to_le_bytes().to_vec() };
-    bytes_map2(kind, a, &yb, out, true, flip, f);
+    arith_map2(kind, code, a, &yb, out, true, flip);
+}
+
+/// The four arithmetic ops as functions, one type each.
+fn op_add(x: f64, y: f64) -> f64 {
+    x + y
+}
+
+fn op_sub(x: f64, y: f64) -> f64 {
+    x - y
+}
+
+fn op_mul(x: f64, y: f64) -> f64 {
+    x * y
+}
+
+fn op_div(x: f64, y: f64) -> f64 {
+    x / y
+}
+
+/// `bytes_map2` for arithmetic op `code` (1-4: add, sub, mul, div): every
+/// caller (`pt_binary`, `arith_modes`, `arith_scalar`) shares one copy of
+/// each op's loops.
+fn arith_map2(kind: u8, code: u8, a: &[u8], b: &[u8], out: &mut [u8], b_one: bool, flip: bool) {
+    match code {
+        1 => arith_loops(kind, a, b, out, b_one, flip, op_add),
+        2 => arith_loops(kind, a, b, out, b_one, flip, op_sub),
+        3 => arith_loops(kind, a, b, out, b_one, flip, op_mul),
+        _ => arith_loops(kind, a, b, out, b_one, flip, op_div),
+    }
+}
+
+#[inline(never)]
+fn arith_loops<F: Fn(f64, f64) -> f64>(kind: u8, a: &[u8], b: &[u8], out: &mut [u8], b_one: bool, flip: bool, f: F) {
+    bytes_map2(kind, a, b, out, b_one, flip, f);
 }
 
 /// `out[i] = f(a[i], b[i])` over float32 (`kind` KIND_F32) or float64
@@ -1348,13 +1392,7 @@ pub(crate) trait Kernels: Host {
                 let mut out = zeroed_bytes(n.checked_mul(vo.size())?)?;
                 {
                     let (x, y) = if flip { (self.pt_bytes(vb)?, self.pt_bytes(va)?) } else { (self.pt_bytes(va)?, self.pt_bytes(vb)?) };
-                    let kd = vo.kind;
-                    match op {
-                        1 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p + q),
-                        2 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p - q),
-                        3 => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p * q),
-                        _ => bytes_map2(kd, x, y, &mut out, one, flip, |p, q| p / q),
-                    }
+                    arith_map2(vo.kind, op as u8, x, y, &mut out, one, flip);
                 }
                 self.pt_write_bytes(vo, &out)?;
                 self.pt_charge(cost);

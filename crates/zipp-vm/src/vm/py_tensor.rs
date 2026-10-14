@@ -205,12 +205,7 @@ impl Vm<'_> {
             };
             let (ab, bb) = (bytes(va)?, bytes(vb)?);
             let (brow, arow) = (nb * size, na * size);
-            match code {
-                1 => kernels::bytes_map_modes(va.kind, mode, ab, bb, &mut out, brow, arow, |x, y| x + y),
-                2 => kernels::bytes_map_modes(va.kind, mode, ab, bb, &mut out, brow, arow, |x, y| x - y),
-                3 => kernels::bytes_map_modes(va.kind, mode, ab, bb, &mut out, brow, arow, |x, y| x * y),
-                _ => kernels::bytes_map_modes(va.kind, mode, ab, bb, &mut out, brow, arow, |x, y| x / y),
-            }
+            kernels::arith_modes(va.kind, code, mode, ab, bb, &mut out, brow, arow);
         }
         let buf = self.alloc_array_buffer(out.len()).ok()?;
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
@@ -267,12 +262,7 @@ impl Vm<'_> {
                 return None;
             };
             let ab = data.get(va.offset..va.offset.checked_add(n * size)?)?;
-            match code {
-                1 => kernels::bytes_map_scalar(va.kind, ab, y, flip, &mut out, |x, z| x + z),
-                2 => kernels::bytes_map_scalar(va.kind, ab, y, flip, &mut out, |x, z| x - z),
-                3 => kernels::bytes_map_scalar(va.kind, ab, y, flip, &mut out, |x, z| x * z),
-                _ => kernels::bytes_map_scalar(va.kind, ab, y, flip, &mut out, |x, z| x / z),
-            }
+            kernels::arith_scalar(va.kind, code, ab, y, flip, &mut out);
         }
         let buf = self.alloc_array_buffer(out.len()).ok()?;
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
