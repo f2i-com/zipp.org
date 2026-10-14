@@ -6694,15 +6694,35 @@ def _matmul_bw(g, args):
         gg = unsqueeze(g, -1)
     else:
         gg = g
+    # Outside create_graph, real operands are read transposed in place
+    # (`_mm_t`) instead of from a transposed copy: the same values.
+    plain = _mm_plain(gg, xs, ys)
     if ra:
-        gx = _unbroadcast(matmul(gg, _cj(transpose(ys, -1, -2))), xs.shape)
+        gx = _unbroadcast(_mm_t(gg, ys, True, False) if plain else matmul(gg, _cj(transpose(ys, -1, -2))), xs.shape)
         if len(x.shape) == 1:
             gx = gx.reshape(*x.shape)
     if rb:
-        gy = _unbroadcast(matmul(_cj(transpose(xs, -1, -2)), gg), ys.shape)
+        gy = _unbroadcast(_mm_t(xs, gg, False, True) if plain else matmul(_cj(transpose(xs, -1, -2)), gg), ys.shape)
         if len(y.shape) == 1:
             gy = gy.reshape(*y.shape)
     return (gx, gy)
+
+
+def _mm_plain(g, x, w):
+    """Whether a product's backward may take `_mm_t`: no graph recording
+    (not create_graph, not a compiled capture) and plain real tensors."""
+    return (not _grad_enabled and not _graph_recording and g.__class__ is Tensor and x.__class__ is Tensor and w.__class__ is Tensor
+            and not g.dtype.is_complex and not x.dtype.is_complex and not w.dtype.is_complex)
+
+
+def _mm_t(a, b, trans_b, trans_a):
+    """matmul(a, b.transpose(-1, -2)) (`trans_b`) or matmul(a.transpose(-1,
+    -2), b) (`trans_a`) for plain real tensors of two or more dims, the
+    kernel reading the operand transposed where it lies: each output sums
+    the same products in the same order as the product of the transposed
+    copy, so the values are that path's. Records nothing (see `_mm_plain`)."""
+    storage, shape = _k.matmul(a._s, a.shape, b._s, b.shape, trans_b, trans_a)
+    return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
 
 def _max_pool2d(x, k, s, p, d, outs, replay):
@@ -6805,8 +6825,9 @@ def _linear_mm_bw(g, args):
         gx = _unbroadcast(matmul(g, Tensor(wsnap, wshape, wdt)), xs.shape)
     if rw:
         # g^T @ x sums, per element, the products x^T @ g sums, in
-        # the same order: the transposed path's value, transposed.
-        gw = _unbroadcast(matmul(transpose(g, -1, -2), xs), wshape)
+        # the same order: the transposed path's value, transposed. (g is
+        # read transposed in place when it can be: `_mm_t`.)
+        gw = _unbroadcast(_mm_t(g, xs, False, True) if _mm_plain(g, xs, xs) else matmul(transpose(g, -1, -2), xs), wshape)
     return (gx, gw)
 
 

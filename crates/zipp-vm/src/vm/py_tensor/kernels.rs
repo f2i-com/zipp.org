@@ -70,6 +70,7 @@ const OP_ARANGE: u32 = 30;
 const OP_OPTIM: u32 = 31;
 const OP_CELL: u32 = 32;
 const OP_RNG: u32 = 33;
+const OP_MATMUL_TN: u32 = 35;
 
 /// `x` as a store into an element of `kind` leaves it: the typed-array
 /// conversion (`helpers_numeric::ta_encode`), read back.
@@ -676,8 +677,9 @@ fn walk<const N: usize>(
 /// declines.
 pub(crate) fn run<H: Host + ?Sized>(h: &mut H, op: u32, a: &[Arg]) -> Outcome {
 match op {
-        OP_MATMUL => Outcome::ran(h.pt_matmul(a, false).is_some()),
-        OP_MATMUL_NT => Outcome::ran(h.pt_matmul(a, true).is_some()),
+        OP_MATMUL => Outcome::ran(h.pt_matmul(a, false, false).is_some()),
+        OP_MATMUL_NT => Outcome::ran(h.pt_matmul(a, false, true).is_some()),
+        OP_MATMUL_TN => Outcome::ran(h.pt_matmul(a, true, false).is_some()),
         OP_MAX_POOL2D => Outcome::ran(h.pt_max_pool2d(a, false).is_some()),
         OP_MAX_POOL2D_BACKWARD => Outcome::ran(h.pt_max_pool2d(a, true).is_some()),
         OP_CONV2D => Outcome::ran(h.pt_conv2d(a, false).is_some()),
@@ -854,9 +856,10 @@ pub(crate) trait Kernels: Host {
     /// `(A, B, O, aOff, bOff, oOff, m, k, n)`: one [m,k] @ [k,n] product of a
     /// batch, tensor.js's `matmul` loop: i-k-j order over one f64 row, each
     /// output rounded once on store. `trans_b`: B is stored as its [n,k]
-    /// transpose (the `transB` loop); element (i, j) still sums its k
-    /// products in p order from 0 in an f64, so it is the same value.
-    fn pt_matmul(&mut self, a: &[Arg], trans_b: bool) -> Option<()> {
+    /// transpose (the `transB` loop); `trans_a`: A as its [k,m] transpose
+    /// (`transA`). Element (i, j) still sums its k products in p order from
+    /// 0 in an f64, so it is the same value.
+    fn pt_matmul(&mut self, a: &[Arg], trans_a: bool, trans_b: bool) -> Option<()> {
         let (va, vb, vo) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?, self.pt_view(arg(a, 2))?);
         if vo.buffer == va.buffer || vo.buffer == vb.buffer {
             return None;
@@ -865,8 +868,24 @@ pub(crate) trait Kernels: Host {
         let (m, k, n) = (int_arg(a, 6)?, int_arg(a, 7)?, int_arg(a, 8)?);
         let (mk, kn, mn) = (m.checked_mul(k)?, k.checked_mul(n)?, m.checked_mul(n)?);
         // (the transposed operand's [k, n] copy is working memory too)
-        let cost = self.pt_admit(mn.checked_mul(k)?.checked_add(mn)?, mk.saturating_add(kn).saturating_add(mn).saturating_add(if trans_b { kn } else { 0 }))?;
+        let cost = self.pt_admit(
+            mn.checked_mul(k)?.checked_add(mn)?,
+            mk.saturating_add(kn).saturating_add(mn).saturating_add(if trans_b { kn } else { 0 }).saturating_add(if trans_a { mk } else { 0 }),
+        )?;
         let av = self.pt_read(va, ao, mk)?;
+        // A as [m, k] rows either way (the transposed operand's [k, m] rows
+        // laid out once, as B's below).
+        let av = if trans_a {
+            let mut t = zeroed(mk)?;
+            for p in 0..k {
+                for i in 0..m {
+                    t[i * k + p] = av[p * m + i];
+                }
+            }
+            t
+        } else {
+            av
+        };
         let bv = self.pt_read(vb, bo, kn)?;
         // B as [k, n] rows either way: the transposed operand's [n, k] rows
         // laid out once, so both forms run the same loops below (element

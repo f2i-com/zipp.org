@@ -218,6 +218,39 @@ A = storage("float32", (8, 8), 5)
 both("matmul_t self", lambda: _k.matmul(A, (8, 8), A, (8, 8), True))
 both("matmul_t mismatch", lambda: _k.matmul(A, (8, 8), A, (4, 16), True))
 both("matmul_t 3-d", lambda: _k.matmul(A, (8, 8), A, (2, 4, 8), True))
+# matmul with a transposed left operand (transA, a product's backward) and
+# with a batched transposed right one (transB): the bytes of the product of
+# the transposed copy.
+def swap_last(shape):
+    perm = list(range(len(shape)))
+    perm[-1], perm[-2] = perm[-2], perm[-1]
+    return perm
+for dta in ["float32", "float64", "int64"]:
+    for dtb in ["float32", "float64"]:
+        for sa, sb in [((32, 16), (32, 20)), ((12, 4, 10), (4, 9)), ((2, 5, 7), (2, 5, 3)), ((3, 0), (3, 4)), ((0, 4), (0, 6)), ((70, 3), (70, 9)), ((2, 1, 6, 5), (3, 6, 4)), ((5, 7), (2, 5, 3))]:
+            seed += 1
+            A = storage(dta, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("matmul_ta %s %s %s %s" % (dta, dtb, sa, sb), lambda: _k.matmul(A, sa, B, sb, False, True))
+            for on in (False, True):
+                _k._native(on)
+                At, st = _k.permute(A, sa, swap_last(sa))
+                if image(_k.matmul(A, sa, B, sb, False, True)) != image(_k.matmul(At, st, B, sb)):
+                    BAD.append("matmul_ta vs transposed copy %s %s %s %s %s" % (dta, dtb, sa, sb, on))
+        for sa, sb in [((2, 5, 7), (2, 9, 7)), ((3, 4, 6), (5, 6)), ((4, 6), (3, 2, 6)), ((2, 1, 3, 70), (4, 5, 70)), ((2, 0, 3), (2, 4, 3))]:
+            seed += 1
+            A = storage(dta, sa, seed)
+            B = storage(dtb, sb, seed + 3)
+            both("matmul_tb %s %s %s %s" % (dta, dtb, sa, sb), lambda: _k.matmul(A, sa, B, sb, True))
+            for on in (False, True):
+                _k._native(on)
+                Bt, st = _k.permute(B, sb, swap_last(sb))
+                if image(_k.matmul(A, sa, B, sb, True)) != image(_k.matmul(A, sa, Bt, st)):
+                    BAD.append("matmul_tb vs transposed copy %s %s %s %s %s" % (dta, dtb, sa, sb, on))
+A = storage("float32", (8, 8), 5)
+both("matmul_ta mismatch", lambda: _k.matmul(A, (8, 8), A, (4, 16), False, True))
+both("matmul_ta 1-d", lambda: _k.matmul(A, (64,), A, (64,), False, True))
+both("matmul_ta both", lambda: _k.matmul(A, (8, 8), A, (8, 8), True, True))
 # max_pool2d and its gradient: dims (Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw).
 for dt in ["float32", "float64", "float16", "bfloat16"]:
     for kd in [(2, 2, 2, 2, 0, 0, 1, 1), (2, 2, 3, 3, 0, 0, 1, 1), (2, 2, 2, 3, 1, 1, 1, 1), (3, 3, 3, 3, 1, 1, 1, 1), (2, 2, 3, 3, 0, 0, 2, 2),
@@ -1032,4 +1065,56 @@ fn relu_backward_kernel_gives_the_composites_bytes() {
     let out = run.output.expect("runs");
     assert_eq!(out.len(), 1, "{out:#?}");
     assert!(out[0].contains("cases 50 mismatches 0 []"), "{}", out[0]);
+}
+
+/// A product's gradients read its operands transposed in place (`_mm_t`)
+/// outside create_graph; under create_graph they are the recorded composite
+/// (transposed copies and products). Both must give the same bytes: matmul
+/// of every rank pairing (1-d, 2-d, batched, broadcast), nn.Linear on 2-d
+/// and 3-d inputs, float32 and float64, native loops off and on.
+const MM_GRADS: &str = r#"
+import torch
+from torch import nn
+
+def pattern(shape, seed, dt):
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor([((i * 37 + seed * 11) % 23 - 11) / 7.0 + (i % 5) * 0.013 for i in range(n)], dtype=dt).reshape(shape)
+
+def grads(fn, leaves, create):
+    out = fn()
+    w = pattern(tuple(out.shape), 99, out.dtype)
+    gs = torch.autograd.grad((out * w).sum(), leaves, create_graph=create)
+    return [torch._k.tobytes(g.detach()._s) for g in gs]
+
+bad = []
+cases = 0
+for native in (False, True):
+    torch._k._native(native)
+    for dt in (torch.float32, torch.float64):
+        for sa, sb in [((5, 7), (7, 3)), ((16, 32), (32, 20)), ((7,), (7, 3)), ((5, 7), (7,)), ((7,), (7,)), ((2, 5, 7), (7, 3)), ((5, 7), (2, 7, 3)), ((2, 3, 4, 5), (3, 5, 6)), ((2, 1, 4, 5), (3, 5, 2))]:
+            a = pattern(sa, 1, dt).requires_grad_()
+            b = pattern(sb, 2, dt).requires_grad_()
+            cases += 1
+            if grads(lambda: a @ b, [a, b], False) != grads(lambda: a @ b, [a, b], True):
+                bad.append("matmul %s %s %s %s" % (dt, sa, sb, native))
+        for xs in ((16, 32), (2, 16, 32), (3, 1, 4, 32)):
+            lin = nn.Linear(32, 20).to(dt)
+            with torch.no_grad():
+                lin.weight.copy_(pattern((20, 32), 3, dt))
+                lin.bias.copy_(pattern((20,), 4, dt))
+            x = pattern(xs, 5, dt).requires_grad_()
+            cases += 1
+            if grads(lambda: lin(x), [x, lin.weight, lin.bias], False) != grads(lambda: lin(x), [x, lin.weight, lin.bias], True):
+                bad.append("linear %s %s %s" % (dt, xs, native))
+print("cases", cases, "mismatches", len(bad), bad[:6])
+"#;
+
+#[test]
+fn transposed_in_place_product_gradients_give_the_composites_bytes() {
+    let run = run(MM_GRADS, 4_000_000_000, false);
+    let out = run.output.expect("runs");
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("cases 48 mismatches 0 []"), "{}", out[0]);
 }

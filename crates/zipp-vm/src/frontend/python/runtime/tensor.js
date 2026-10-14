@@ -39,7 +39,7 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33, N_LOCAL = 34;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33, N_LOCAL = 34, N_MATMUL_TN = 35;
     // The engine's own loops (`N_LOCAL` answers true) cost less per call
     // than an interpreted loop of 16 elements, so the elementwise kernels,
     // reductions and copies take them from there. A torch package in its own
@@ -1561,12 +1561,23 @@
     // (F.linear's weight), read in place instead of transposed into a copy.
     // Each output element sums the same k products in the same order, so
     // the result is the plain product's, byte for byte.
-    function matmul(a, ashape, b, bshape, transB) {
+    // `transB` / `transA`: that operand is stored as the transpose of its
+    // last two dims (F.linear's weight; a gradient's transposed operand),
+    // read in place instead of from a transposed copy. Each output element
+    // still sums its k products in p order in a double, so the values are
+    // the copy's.
+    function matmul(a, ashape, b, bshape, transB, transA) {
         let A = ashape.slice(), Bs = bshape.slice();
         if (A.length === 0 || Bs.length === 0) fail(E.RuntimeError, "both arguments to matmul need to be at least 1D");
         if (transB) {
-            if (Bs.length !== 2) fail(E.RuntimeError, "matmul: a transposed right operand must be 2-D");
-            Bs = [Bs[1], Bs[0]];
+            if (Bs.length < 2) fail(E.RuntimeError, "matmul: a transposed right operand must be at least 2-D");
+            const r = Bs.length;
+            Bs = Bs.slice(0, r - 2).concat([Bs[r - 1], Bs[r - 2]]);
+        }
+        if (transA) {
+            if (A.length < 2 || transB) fail(E.RuntimeError, "matmul: a transposed left operand must be at least 2-D, with a plain right one");
+            const r = A.length;
+            A = A.slice(0, r - 2).concat([A[r - 1], A[r - 2]]);
         }
         const squeezeA = A.length === 1, squeezeB = Bs.length === 1;
         if (squeezeA) A = [1, A[0]]; if (squeezeB) Bs = [Bs[0], 1];
@@ -1594,6 +1605,19 @@
                         for (let p = 0; p < k; p++) s += Ad[ia + p] * Bd[jb + p];
                         O[io] = s;
                     }
+                }
+                return;
+            }
+            if (transA) {
+                if (NATIVE !== null && NATIVE(N_MATMUL_TN, Ad, Bd, O, baseA, baseB, baseO, m, k, n)) return;
+                // A[i, p] is stored at [p, i]: the row loop below, reading it there.
+                for (let i = 0; i < m; i++) {
+                    row.fill(0);
+                    for (let p = 0, ia = baseA + i, ib = baseB; p < k; p++, ia += m, ib += n) {
+                        const x = Ad[ia];
+                        for (let j = 0; j < n; j++) row[j] += x * Bd[ib + j];
+                    }
+                    O.set(row, baseO + i * n);
                 }
                 return;
             }
@@ -3771,14 +3795,14 @@
             return asPair(roll(realOf(x), sh.concat([2]), num(a[2]), d < 0 ? d + sh.length : d), x.dtype);
         });
         fn("pad_last", 5, (a) => padLast(needS(a[0]), shapeOf(a[1]), num(a[2]), num(a[3]), num(a[4])));
-        fn("matmul", 5, (a) => {
-            const x = a[0], y = a[2], transB = a[4] !== undefined && a[4] !== null && rt.truth(a[4]);
+        fn("matmul", 6, (a) => {
+            const x = a[0], y = a[2], transB = a[4] !== undefined && a[4] !== null && rt.truth(a[4]), transA = a[5] !== undefined && a[5] !== null && rt.truth(a[5]);
             if (!isStorage(x) || !isStorage(y)) {
                 needC(x); needC(y);
-                if (transB) fail(E.RuntimeError, "matmul: a transposed complex operand is not supported");
+                if (transB || transA) fail(E.RuntimeError, "matmul: a transposed complex operand is not supported");
                 return cmatmul(x, shapeOf(a[1]), y, shapeOf(a[3]));
             }
-            return matmul(x, shapeOf(a[1]), y, shapeOf(a[3]), transB);
+            return matmul(x, shapeOf(a[1]), y, shapeOf(a[3]), transB, transA);
         }, 4);
         fn("max_pool2d", 3, (a) => maxPool2d(needS(a[0]), shapeOf(a[1]), ints(a[2])));
         fn("max_pool2d_backward", 4, (a) => maxPool2dBackward(needS(a[0]), needS(a[1]), shapeOf(a[2]), ints(a[3])));
