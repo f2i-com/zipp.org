@@ -102,6 +102,21 @@ mod asyncstats {
         }
     }
 
+    static JOB_WINDOW_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// One reaction job run over the shared job window (`run_job_windowed`).
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(super) fn job_window_call() {
+        if enabled() {
+            JOB_WINDOW_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump_job_window_calls() -> u64 {
+        JOB_WINDOW_CALLS.load(Ordering::Relaxed)
+    }
+
     static REUSE_ON: AtomicU8 = AtomicU8::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
@@ -139,6 +154,7 @@ mod asyncstats {
 
 pub use asyncstats::dump as async_stats;
 pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
+pub use asyncstats::dump_job_window_calls as async_job_window_stats;
 
 /// Collapse the next already-settled await job into the current AsyncResume job
 /// when no older microtask is waiting. A bounded trampoline preserves FIFO job
@@ -284,6 +300,35 @@ fn combinator_lean_enabled() -> bool {
             v == 1
         }
     }
+}
+
+/// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
+/// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn job_window_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JOB_WINDOW").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// The register window a run of reaction jobs calling one compiled callback
+/// shares (`Vm::run_job_windowed`): the callback, its native entry and where
+/// the window starts in the register file.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+struct JobWindow {
+    callee: Value,
+    native: super::misc_methods::NativeCb,
+    at: usize,
 }
 
 /// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
@@ -4114,6 +4159,11 @@ impl<'p> Vm<'p> {
         // job. WeakRef targets kept during it may now be cleared before the
         // first queued job starts.
         self.finish_weak_job();
+        // A run of reaction jobs calling the same compiled callback (a
+        // `.then(f)` chain) shares one register window: see `run_job_windowed`.
+        let mut window: Option<JobWindow> = None;
+        // The callback of the last reaction job the window path looked at.
+        let mut last_callback = 0u64;
         while let Some(t) = self.microtasks.pop_front() {
             // B214: the popped task's Values are kept reachable by ROOTING a
             // copy in `current_microtask` (traced by mark_roots) instead of
@@ -4127,15 +4177,115 @@ impl<'p> Vm<'p> {
             // callers (map/forEach) rely on.
             if crate::vm::microtask_root_enabled() {
                 let prev = self.current_microtask.replace(t.clone());
-                self.run_microtask(t);
+                if !self.run_job_windowed(&t, &mut window, &mut last_callback) {
+                    self.close_job_window(&mut window);
+                    self.run_microtask(t);
+                }
                 self.current_microtask = prev;
             } else {
+                self.close_job_window(&mut window);
                 // The pre-B214 comparator: suspend GC for the task's scope.
                 let _gc = self.gc_lock_guard();
                 self.run_microtask(t);
             }
             // Between microtasks no un-rooted local survives, so reclaim now.
             self.finish_weak_job();
+        }
+        self.close_job_window(&mut window);
+    }
+
+    /// Run a reaction job whose callback is a plain function the int tier
+    /// compiled, over a register window kept open across consecutive jobs
+    /// calling the same callback, as `Array.prototype.forEach` runs its
+    /// callback (`open_cb_window`, `run_cb_elem`). `false`, having done
+    /// nothing, for any other job: the caller closes the window and runs it
+    /// as before. Off under `ZIPP_NO_JOB_WINDOW=1`.
+    ///
+    /// The call is the job's `Call(handler, undefined, «argument»)` exactly:
+    /// `native_cb_entry` binds `this` as OrdinaryCallBindThis does, a bail
+    /// past the entry resumes the body on a frame of its own, and a throw
+    /// rejects the dependent as `run_microtask` does. Only an int-tier body
+    /// already compiled is taken: it calls no helper that needs a frame
+    /// under it (the drain has none), and a cold callback is not compiled
+    /// early. Between two jobs the window's registers are ordinary GC roots
+    /// holding the last call's values; each call resets them first.
+    fn run_job_windowed(
+        &mut self,
+        t: &Microtask,
+        window: &mut Option<JobWindow>,
+        last: &mut u64,
+    ) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            let Microtask::Reaction {
+                callback,
+                arg,
+                dependent,
+                finally: false,
+                ..
+            } = *t
+            else {
+                return false;
+            };
+            if !callback.is_heap() || !job_window_enabled() {
+                return false;
+            }
+            let reuse = matches!(window, Some(w) if w.callee.bits() == callback.bits());
+            if !reuse {
+                // Open one for the second job in a row calling this callback:
+                // a callback a single job calls (a chain of different
+                // handlers, a fresh closure per link) runs as before, with no
+                // window to open and close around it, which costs more than
+                // the ordinary call.
+                let repeat = *last == callback.bits();
+                *last = callback.bits();
+                if !repeat {
+                    return false;
+                }
+                let fid = match self.heap.get(callback.heap_index()) {
+                    HeapObj::Func(f) => *f,
+                    HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
+                    _ => return false,
+                };
+                if !self.jit.get(fid).is_some_and(|body| body.int_tier()) {
+                    return false;
+                }
+                self.close_job_window(window);
+                let (native, at) = self.open_cb_window(callback, Value::UNDEFINED);
+                let Some(native) = native else {
+                    return false;
+                };
+                *window = Some(JobWindow {
+                    callee: callback,
+                    native,
+                    at,
+                });
+            }
+            let Some(w) = *window else {
+                return false;
+            };
+            asyncstats::job_window_call();
+            match self.run_cb_elem(&Some(w.native), w.at, callback, &[arg], Value::UNDEFINED) {
+                Ok(ret) => self.resolve(dependent, ret),
+                Err(_) => {
+                    let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                    self.reject_thrown_job(dependent, r);
+                }
+            }
+            true
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            let _ = (t, window, last);
+            false
+        }
+    }
+
+    /// Release the job window `run_job_windowed` opened, if any.
+    #[inline]
+    fn close_job_window(&mut self, window: &mut Option<JobWindow>) {
+        if let Some(w) = window.take() {
+            self.regs.truncate(w.at);
         }
     }
 

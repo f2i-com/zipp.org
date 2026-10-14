@@ -3242,6 +3242,7 @@ mod values;
 
 pub(crate) use access::htmldda_membership_stats;
 pub(crate) use async_runtime::async_inline_await_stats;
+pub(crate) use async_runtime::async_job_window_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
 pub(crate) use coerce::pad2_concat_stats;
