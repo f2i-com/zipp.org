@@ -57,8 +57,12 @@ enum OrdRef {
 /// Instruction steps charged per key and per comparison of a native sort.
 const ORD_STEPS_PER_UNIT: u64 = 8;
 
-/// The widest tuple keys `Vm::py_ord_sort_columns` sorts by columns.
-const ORD_COLUMNS_MAX: usize = 4;
+/// The most items (columns) of a tuple key `Vm::py_ord_sort_columns`
+/// sorts by columns, nested tuples' items counted.
+const ORD_COLUMNS_MAX: usize = 6;
+
+/// How deep a tuple key `Vm::py_ord_sort_columns` sorts by columns nests.
+const ORD_COLUMNS_DEPTH: usize = 4;
 
 /// Whether a native sort may compare its keys by columns
 /// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
@@ -1873,14 +1877,17 @@ impl<'p> Vm<'p> {
     /// Sort `order` (the identity) by `keys` as [`Vm::py_ord_cmp`] orders
     /// them, stably, when every key is of one form whose order needs no
     /// case analysis per comparison: all ints of the fast tier, all floats
-    /// with no NaN, all strs, or all tuples of the same length (at most
-    /// [`ORD_COLUMNS_MAX`]) whose items at each place are all of one of
-    /// those kinds. The keys are then read once into columns and compared
+    /// with no NaN, all strs, or all tuples of one shape (the same lengths,
+    /// nested the same way, at most [`ORD_COLUMNS_MAX`] items in all, at
+    /// most [`ORD_COLUMNS_DEPTH`] deep) whose items at each place are all of
+    /// one of those kinds. The keys are then read once into columns (the
+    /// items in order, nested tuples' items in their place) and compared
     /// column by column, which is what `py_ord_cmp` answers for such pairs
     /// (two items of one kind compare as that kind, the first unequal pair
-    /// decides, equal tuples of one length are equal), without its match
-    /// on two keys of every kind for every comparison. `false`, with
-    /// `order` untouched, for any other set of keys.
+    /// decides, at whatever depth, and equal tuples of one shape are
+    /// equal), without its match on two keys of every kind for every
+    /// comparison. `false`, with `order` untouched, for any other set of
+    /// keys.
     fn py_ord_sort_columns(&self, keys: &[OrdKey], order: &mut [usize]) -> bool {
         use super::bigint::BigVal;
         enum Col<'h> {
@@ -1888,37 +1895,62 @@ impl<'p> Vm<'p> {
             Float(Vec<f64>),
             Str(Vec<&'h [u8]>),
         }
+        // A place in a key: the item indices from the top, with the length
+        // the tuple at each step must have.
+        type Path = Vec<(usize, usize)>;
+        // The places of `k`'s items (`k` itself when it is no tuple), in
+        // order; `None` past the bounds.
+        fn places(k: &OrdKey, at: &mut Path, out: &mut Vec<Path>) -> Option<()> {
+            match k {
+                OrdKey::Seq(items) => {
+                    if at.len() >= ORD_COLUMNS_DEPTH || items.is_empty() {
+                        return None;
+                    }
+                    for (i, x) in items.iter().enumerate() {
+                        at.push((i, items.len()));
+                        places(x, at, out)?;
+                        at.pop();
+                    }
+                }
+                _ => {
+                    if out.len() >= ORD_COLUMNS_MAX {
+                        return None;
+                    }
+                    out.push(at.clone());
+                }
+            }
+            Some(())
+        }
+        // `k`'s item at `path` when `k` has that shape there (a tuple of the
+        // length at each step, and no tuple at the end).
+        fn item_at<'k>(k: &'k OrdKey, path: &[(usize, usize)]) -> Option<&'k OrdKey> {
+            let mut node = k;
+            for &(i, len) in path {
+                match node {
+                    OrdKey::Seq(items) if items.len() == len => node = &items[i],
+                    _ => return None,
+                }
+            }
+            (!matches!(node, OrdKey::Seq(_))).then_some(node)
+        }
         if !py_sort_columns_enabled() {
             return false;
         }
         let Some(first) = keys.first() else {
             return false;
         };
-        // 0: the keys are themselves the items (no tuples).
-        let width = match first {
-            OrdKey::Seq(items) => items.len(),
-            _ => 0,
-        };
-        if width > ORD_COLUMNS_MAX {
+        let mut paths: Vec<Path> = Vec::new();
+        if places(first, &mut Vec::new(), &mut paths).is_none() {
             return false;
         }
-        // A key's item at place `c` (the key itself when keys are items).
-        fn item_at(k: &OrdKey, width: usize, c: usize) -> Option<&OrdKey> {
-            match k {
-                OrdKey::Seq(items) if width > 0 && items.len() == width => items.get(c),
-                OrdKey::Seq(_) => None,
-                _ if width == 0 => Some(k),
-                _ => None,
-            }
-        }
-        let item = |k, c| item_at(k, width, c);
-        let mut cols: Vec<Col<'_>> = Vec::with_capacity(width.max(1));
-        for c in 0..width.max(1) {
-            let col = match item(first, c) {
+        let mut cols: Vec<Col<'_>> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let item = |k| item_at(k, path);
+            let col = match item(first) {
                 Some(OrdKey::Int(BigVal::Small(_))) => {
                     let mut v = Vec::with_capacity(keys.len());
                     for k in keys {
-                        match item(k, c) {
+                        match item(k) {
                             Some(OrdKey::Int(BigVal::Small(x))) => v.push(*x),
                             _ => return false,
                         }
@@ -1928,7 +1960,7 @@ impl<'p> Vm<'p> {
                 Some(OrdKey::Float(_)) => {
                     let mut v = Vec::with_capacity(keys.len());
                     for k in keys {
-                        match item(k, c) {
+                        match item(k) {
                             Some(OrdKey::Float(x)) if !x.is_nan() => v.push(*x),
                             _ => return false,
                         }
@@ -1938,7 +1970,7 @@ impl<'p> Vm<'p> {
                 Some(OrdKey::Str(_)) => {
                     let mut v = Vec::with_capacity(keys.len());
                     for k in keys {
-                        match item(k, c) {
+                        match item(k) {
                             Some(OrdKey::Str(s)) => match self.heap.get(*s) {
                                 HeapObj::Str(st) => v.push(st.as_bytes()),
                                 _ => return false,

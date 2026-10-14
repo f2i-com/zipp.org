@@ -18,6 +18,12 @@ pairs = [(i % 4, "k%d" % (i % 3), i * 0.5) for i in range(30)]
 print(sorted(pairs)[:8])
 print(sorted(pairs, key=lambda p: (p[1], -p[0]))[:8])
 
+# Nested tuples of one shape (compared as their items in order).
+big = {("w%d" % (i % 7), "v%d" % (i % 5)): (i * 37) % 11 for i in range(60)}
+print(sorted(big.items(), key=lambda kv: (-kv[1], kv[0]))[:6])
+print(sorted([(1, (2, "b")), (1, (2, "a")), (0, (3, "z")), (1, (1, "z"))]))
+print(sorted([((1, 2), (3, 4)), ((1, 2), (3, 3)), ((0, 9), (9, 9))], reverse=True))
+
 # Keys that are not of one form: compared as before.
 print(sorted([3, 1.5, 2, -0.5, 10 ** 30, -(10 ** 40)]))
 nan = float("nan")
