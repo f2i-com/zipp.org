@@ -54,7 +54,6 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::StoreGlobal { src: r0, .. }
         | Instr::StoreGlobalStrict { src: r0, .. }
         | Instr::StoreGlobalResolved { src: r0, .. }
-        | Instr::Now { dst: r0, .. }
         | Instr::DecInits { recv: r0, .. }
         | Instr::ThisCheck { src: r0, .. }
         | Instr::RequireObject { val: r0, .. }
@@ -90,8 +89,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::OpenUsingScope { dst: r0, .. }
         | Instr::TemplateGetCached { dst: r0, .. }
         | Instr::TemplateSetCached { src: r0, .. }
-        | Instr::Return { src: r0, .. }
-        | Instr::Print { arg_base: r0, .. } => {
+        | Instr::Return { src: r0, .. } => {
             *r0 = m(*r0);
         }
         #[cfg(all())]
@@ -244,6 +242,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::CallMethodComputedSpread { dst: r0, obj: r1, key: r2, args: r3, .. }
         | Instr::MathOp { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::StaticFn { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
+        | Instr::Print { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::MathSpread { dst: r0, callee: r1, this_v: r2, args: r3, .. }
         | Instr::ObjectKeys { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
         | Instr::ObjectValues { dst: r0, obj: r1, callee: r2, this_v: r3, .. }

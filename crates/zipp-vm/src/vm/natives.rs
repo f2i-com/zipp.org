@@ -1207,7 +1207,7 @@ impl<'p> Vm<'p> {
         // Namespace objects: fresh per realm, with the main namespace's props
         // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
         // etc. are functional.
-        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console"] {
+        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console", "performance"] {
             let mut m = ObjMap::new();
             if let Some(&main_ns) = self.builtin_globals.get(ns) {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
@@ -3569,6 +3569,9 @@ impl<'p> Vm<'p> {
                     .map_err(|msg| Thrown(msg.into()))?;
                 self.push_console_line(line, true);
                 Value::UNDEFINED
+            }
+            PERFORMANCE_NOW => {
+                Value::num(crate::vm::clock::now_mono_ms() - self.start_mono_ms)
             }
             AGENT_SLEEP => {
                 let ms = self

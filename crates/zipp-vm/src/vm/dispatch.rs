@@ -1260,18 +1260,6 @@ impl<'p> Vm<'p> {
                         self.globals[idx as usize] = v;
                         ip += 1;
                     }
-                    Instr::Now { dst, epoch } => {
-                        let ms = if epoch {
-                            // Date.now(): integer ms since the Unix epoch.
-                            crate::vm::clock::now_epoch_ms()
-                        } else {
-                            // performance.now(): fractional ms since VM start.
-                            crate::vm::clock::now_mono_ms() - self.start_mono_ms
-                        };
-                        self.set(base, dst, Value::num(ms));
-                        ip += 1;
-                    }
-
                     Instr::Add { dst, a, b } => {
                         let r = self.add(base, a, b)?;
                         self.set(base, dst, r);
@@ -4684,16 +4672,32 @@ impl<'p> Vm<'p> {
                     }
 
                     Instr::Print {
+                        dst,
+                        callee,
+                        this_v,
                         arg_base,
                         argc,
-                        to_stderr,
                     } => {
-                        let line = self
-                            .inspect_line(argc as usize, |i| self.get(base, arg_base + i as u16));
-                        #[cfg(feature = "instrument")]
-                        self.instrument_output_line(&line)
-                            .map_err(|msg| Thrown(msg.into()))?;
-                        self.push_console_line(line, to_stderr);
+                        let f = self.get(base, callee);
+                        let v = match self.console_print_stream(f) {
+                            Some(to_stderr) => {
+                                let line = self.inspect_line(argc as usize, |i| {
+                                    self.get(base, arg_base + i as u16)
+                                });
+                                #[cfg(feature = "instrument")]
+                                self.instrument_output_line(&line)
+                                    .map_err(|msg| Thrown(msg.into()))?;
+                                self.push_console_line(line, to_stderr);
+                                Value::UNDEFINED
+                            }
+                            None => {
+                                let this_v = self.get(base, this_v);
+                                let args: Vec<Value> =
+                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                                self.call_value(f, this_v, &args)?
+                            }
+                        };
+                        self.set(base, dst, v);
                         ip += 1;
                     }
 
@@ -9655,6 +9659,9 @@ impl<'p> Vm<'p> {
                 let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 self.object_define_properties(a0, props)?;
                 a0
+            }
+            S::PerformanceNow => {
+                Value::num(crate::vm::clock::now_mono_ms() - self.start_mono_ms)
             }
             S::ObjectGetOwnPropertyDescriptor => {
                 self.require_object_coercible(a0)?; // ToObject(O)

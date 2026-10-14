@@ -2987,7 +2987,6 @@ fn plan_region_cold_inner(
                     | Instr::LoadUndefined { .. }
                     | Instr::LoadGlobal { .. }
                     | Instr::Jump { .. }
-                    | Instr::Now { .. }
                     | Instr::ReturnUndefined
             )
         };
@@ -3036,11 +3035,17 @@ fn plan_region_cold_inner(
                             arg_base,
                             argc,
                             ..
+                        }
+                        | Instr::Print {
+                            callee,
+                            this_v,
+                            arg_base,
+                            argc,
+                            ..
                         } => r == callee || r == this_v || (r >= arg_base && (r - arg_base) < argc),
                         Instr::NewArray { arg_base, argc, .. }
                         | Instr::ArrayCtor { arg_base, argc, .. }
-                        | Instr::GlobalFn { arg_base, argc, .. }
-                        | Instr::Print { arg_base, argc, .. } => {
+                        | Instr::GlobalFn { arg_base, argc, .. } => {
                             r >= arg_base && (r - arg_base) < argc
                         }
                         _ => false,
@@ -3071,13 +3076,13 @@ fn plan_region_cold_inner(
                             return true;
                         }
                         matches!(code[j],
-                            Instr::Now { dst, .. }
-                            | Instr::Call { dst, .. }
+                            Instr::Call { dst, .. }
                             | Instr::New { dst, .. }
                             | Instr::NewArray { dst, .. }
                             | Instr::ArrayCtor { dst, .. }
                             | Instr::GlobalFn { dst, .. }
-                            | Instr::StaticFn { dst, .. } if dst == r)
+                            | Instr::StaticFn { dst, .. }
+                            | Instr::Print { dst, .. } if dst == r)
                     };
                     let Some(d) = ((e + 1)..uip).rev().find(|&j| defines(j)) else {
                         if grdbg {
@@ -5479,8 +5484,14 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         }
         Instr::NewArray { arg_base, argc, .. }
         | Instr::DateNew { arg_base, argc, .. }
-        | Instr::DateUTC { arg_base, argc, .. }
-        | Instr::Print { arg_base, argc, .. } => win(&[], arg_base, argc),
+        | Instr::DateUTC { arg_base, argc, .. } => win(&[], arg_base, argc),
+        Instr::Print {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => win(&[callee, this_v], arg_base, argc),
         // Python-only fast paths; no JIT tier admits them.
         Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => vec![a, b],
         Instr::PyAddImm { a, .. } => vec![a],
@@ -5717,7 +5728,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::OpenUsingScope { .. }
         | Instr::TemplateGetCached { .. }
         | Instr::ImportMeta { .. }
-        | Instr::Now { .. }
         | Instr::Jump { .. }
         | Instr::JumpFinally { .. }
         | Instr::PushHandler { .. }
@@ -5839,7 +5849,8 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::NewObject { dst, .. }
         | Instr::NewPlannedObject { dst, .. }
         | Instr::FinalizeObject { dst, .. }
-        | Instr::NewArray { dst, .. } => Some(dst),
+        | Instr::NewArray { dst, .. }
+        | Instr::Print { dst, .. } => Some(dst),
         _ => None,
     }
 }

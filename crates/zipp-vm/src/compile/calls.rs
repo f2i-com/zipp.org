@@ -1361,45 +1361,27 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // console.log(...) → Print opcode.
+        // console.log(...) → Print opcode. The method is read before the
+        // arguments, as for any call, so a replaced one is what runs.
         if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "console"
                         && matches!(&**prop, "log" | "info" | "warn" | "error" | "debug")
                         && self.builtin_unshadowed("console")
+                        && !c.args.iter().any(|a| matches!(a, Arg::Spread(_)))
                     {
-                        // node routes console.error / console.warn to stderr.
-                        let to_stderr = matches!(&**prop, "error" | "warn");
+                        let save = self.next_reg;
+                        let (callee, this_v) = self.capture_member_callee(m)?;
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::Print {
+                            dst,
+                            callee,
+                            this_v,
                             arg_base,
                             argc,
-                            to_stderr,
                         });
-                        self.emit(Instr::LoadUndefined { dst });
-                        return Ok(dst);
-                    }
-                }
-            }
-        }
-
-        // The host-only `performance.now()` pseudo-namespace has no live object
-        // to capture. Date is a real namespace and therefore deliberately falls
-        // through to the captured ordinary-call path below, so replacements,
-        // accessors and a rebound global remain observable.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    let epoch = match (&**obj, &**prop) {
-                        ("performance", "now") => Some(false),
-                        _ => None,
-                    };
-                    if let Some(epoch) = epoch.filter(|_| self.builtin_unshadowed("performance")) {
-                        // Although the host pseudo ignores its arguments, call
-                        // argument expressions are still evaluated in order.
-                        let _ = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Now { dst, epoch });
+                        self.set_next_reg(save.max(dst.saturating_add(1)));
                         return Ok(dst);
                     }
                 }

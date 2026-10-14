@@ -431,6 +431,9 @@ pub const CONSOLE_INFO: u16 = 945;
 pub const CONSOLE_WARN: u16 = 946;
 pub const CONSOLE_ERROR: u16 = 947;
 pub const CONSOLE_DEBUG: u16 = 948;
+/// `performance.now()`: fractional ms since the VM started, on the engine's
+/// monotonic clock (the one an embedder can virtualise).
+pub const PERFORMANCE_NOW: u16 = 949;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -1785,6 +1788,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         CONSOLE_WARN => ("warn", 0),
         CONSOLE_ERROR => ("error", 0),
         CONSOLE_DEBUG => ("debug", 0),
+        PERFORMANCE_NOW => ("now", 0),
         SAB_GROW => ("grow", 1),
         SAB_SLICE => ("slice", 2),
         DISPOSABLE_USE => ("use", 1),

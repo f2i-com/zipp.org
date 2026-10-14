@@ -198,15 +198,6 @@ pub enum Instr {
         src: Reg,
     },
 
-    /// A clock read: `performance.now()` (`epoch = false`, fractional ms since
-    /// VM start) or `Date.now()` (`epoch = true`, integer ms since the Unix
-    /// epoch). Both yield an f64 `Value`. Recognised at compile time so the
-    /// common timing idiom works without a real global object model.
-    Now {
-        dst: Reg,
-        epoch: bool,
-    },
-
     // ── arithmetic (generic: operands may be any number) ──
     Add {
         dst: Reg,
@@ -2047,14 +2038,18 @@ pub enum Instr {
     /// Return undefined.
     ReturnUndefined,
 
-    /// `console.log`-style print of `argc` values starting at `arg_base`.
-    /// A dedicated opcode keeps the v1 stdlib trivial; later this becomes an
-    /// ordinary builtin call. `to_stderr` is set for `console.error`/`warn`
-    /// (which write to stderr in node), clear for `log`/`info`/`debug`.
+    /// `console.log(...)` and its siblings: `callee` and `this_v` hold the
+    /// method and receiver read before the arguments. When `callee` is one of
+    /// the intrinsic console methods, print the `argc` values at `arg_base`
+    /// (to stderr for `error`/`warn`, as node does) and set `dst` to
+    /// undefined; otherwise call it, as the program replaced it, and set
+    /// `dst` to its result.
     Print {
+        dst: Reg,
+        callee: Reg,
+        this_v: Reg,
         arg_base: Reg,
         argc: u16,
-        to_stderr: bool,
     },
 
     // ---- Python frontend fast paths ---------------------------------------
@@ -3131,6 +3126,8 @@ pub enum StaticFn {
     ObjectCreate,
     /// `Object.defineProperties(obj, descs)` — define multiple properties.
     ObjectDefineProperties,
+    /// `performance.now()` — fractional ms since the VM started.
+    PerformanceNow,
 }
 
 impl StaticFn {
@@ -3157,6 +3154,7 @@ impl StaticFn {
             ("Object", "getPrototypeOf") => StaticFn::ObjectGetPrototypeOf,
             ("Object", "create") => StaticFn::ObjectCreate,
             ("Object", "defineProperties") => StaticFn::ObjectDefineProperties,
+            ("performance", "now") => StaticFn::PerformanceNow,
             _ => return None,
         })
     }

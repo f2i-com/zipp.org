@@ -1367,7 +1367,6 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::NewObject { dst, .. }
         | Instr::NewPlannedObject { dst, .. }
         | Instr::MakeFunc { dst, .. }
-        | Instr::Now { dst, .. }
         | Instr::LoadNewTarget { dst }
         | Instr::LoadCallee { dst }
         | Instr::LoadClassValue { dst, .. }
@@ -1586,7 +1585,18 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             v.push(key);
             r(v, Some(dst))
         }
-        Instr::Print { arg_base, argc, .. } => r((0..argc).map(|k| arg_base + k).collect(), None),
+        Instr::Print {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            v.push(this_v);
+            r(v, Some(dst))
+        }
         Instr::ArrayAppend { arr, val, .. } => r(vec![arr, val], None),
         Instr::Jump { .. } | Instr::ReturnUndefined | Instr::GenStart => r(vec![], None),
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => r(vec![cond], None),

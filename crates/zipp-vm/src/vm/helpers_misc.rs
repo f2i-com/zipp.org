@@ -7477,6 +7477,7 @@ fn static_fn_intrinsic(op: crate::bytecode::StaticFn) -> (&'static str, u16) {
         S::ObjectGetPrototypeOf => ("Object", native::OBJ_GET_PROTO),
         S::ObjectCreate => ("Object", native::OBJ_CREATE),
         S::ObjectDefineProperties => ("Object", native::OBJ_DEFINE_PROPERTIES),
+        S::PerformanceNow => ("performance", native::PERFORMANCE_NOW),
     }
 }
 
@@ -7549,7 +7550,7 @@ pub(crate) extern "win64" fn jit_math_imul_prefix_is_intrinsic(
 }
 
 /// Number of entries in `Vm::builtin_ns_slots`.
-pub(crate) const BUILTIN_NS_COUNT: usize = 8;
+pub(crate) const BUILTIN_NS_COUNT: usize = 9;
 
 /// Index into `Vm::builtin_ns_slots` for the namespaces the intrinsic guards
 /// probe on hot paths (`MathOp`, `IsArray`, `JsonParse`/`JsonStringify`,
@@ -7566,11 +7567,30 @@ pub(crate) fn builtin_ns_index(namespace: &str) -> Option<usize> {
         "Promise" => 5,
         "Reflect" => 6,
         "String" => 7,
+        "performance" => 8,
         _ => return None,
     })
 }
 
 impl<'p> Vm<'p> {
+    /// For `Instr::Print`: `Some(to_stderr)` when `f` is one of the intrinsic
+    /// console methods (`error`/`warn` write to stderr, as in node), which
+    /// print their arguments whatever their receiver; `None` for anything
+    /// else, which the instruction calls as the program made it.
+    #[inline]
+    pub(crate) fn console_print_stream(&self, f: Value) -> Option<bool> {
+        if !f.is_heap() {
+            return None;
+        }
+        match self.heap.get(f.heap_index()) {
+            HeapObj::Native(native::CONSOLE_LOG | native::CONSOLE_INFO | native::CONSOLE_DEBUG) => {
+                Some(false)
+            }
+            HeapObj::Native(native::CONSOLE_WARN | native::CONSOLE_ERROR) => Some(true),
+            _ => None,
+        }
+    }
+
     pub(crate) fn static_builtin_is_intrinsic(
         &self,
         namespace: &str,
@@ -7637,6 +7657,7 @@ impl<'p> Vm<'p> {
             | S::PromiseRace
             | S::PromiseAny => Some(5),
             S::NumberIsInteger | S::NumberIsNaN | S::NumberIsFinite | S::NumberIsSafeInteger => Some(4),
+            S::PerformanceNow => Some(8),
             _ => None,
         };
         match ns {

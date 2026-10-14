@@ -522,6 +522,7 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
+        | Instr::Print { dst, .. }
         | Instr::ToConcatKey { dst, .. } => dst == r,
         // The fused opcode's externally modelled write is only `dst`: its
         // native hit intentionally omits the compiler-proved-dead scratch.
