@@ -18,13 +18,30 @@ _inf = float("inf")
 
 # ---- argument helpers ----------------------------------------------------------------------
 def _ntuple(value, n, name="argument"):
+    # (built without generator expressions, which cost several
+    # microseconds each on this runtime: a module constructor calls this
+    # for each of its sizes)
     if (isinstance(value, tuple) or isinstance(value, list)):
         if len(value) == 1 and n > 1:
-            return tuple(int(value[0]) for _ in range(n))
+            return _repeat(value[0], n)
         if len(value) != n:
             raise ValueError("%s must be an int or a tuple of %d ints, got %r" % (name, n, value))
-        return tuple(int(v) for v in value)
-    return tuple(int(value) for _ in range(n))
+        return tuple([int(v) for v in value])
+    return _repeat(value, n)
+
+
+def _repeat(value, n):
+    # `tuple(int(value) for _ in range(n))`
+    if n == 2:
+        return (int(value), int(value))
+    if n == 1:
+        return (int(value),)
+    if n == 3:
+        return (int(value), int(value), int(value))
+    out = []
+    for _ in range(n):
+        out.append(int(value))
+    return tuple(out)
 
 
 def _single(value):

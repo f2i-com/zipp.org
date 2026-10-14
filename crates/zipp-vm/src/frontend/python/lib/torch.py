@@ -2879,7 +2879,11 @@ def full(size, fill_value, dtype=None, layout=None, device=None, requires_grad=F
 
 def empty(*size, dtype=None, layout=None, device=None, requires_grad=False, pin_memory=False, memory_format=None):
     _check_cpu_device(device)
-    return zeros(*size, dtype=dtype, requires_grad=requires_grad)
+    # zeros(*size, dtype=dtype, requires_grad=requires_grad), without the
+    # re-packed call
+    shape = _shape_args(size)
+    dt = _dtype_of(dtype) or _default_dtype
+    return Tensor(_k.zeros(dt.name, _numel(shape)), shape, dt, requires_grad)
 
 
 def zeros_like(input, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None):

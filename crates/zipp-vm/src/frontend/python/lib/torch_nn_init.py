@@ -18,7 +18,7 @@ def calculate_gain(nonlinearity, param=None):
     if nonlinearity == "leaky_relu":
         if param is None:
             negative_slope = 0.01
-        elif not isinstance(param, bool) and isinstance(param, (int, float)):
+        elif not isinstance(param, bool) and (isinstance(param, int) or isinstance(param, float)):
             negative_slope = param
         else:
             raise ValueError("negative_slope %s not a valid number" % (param,))
@@ -31,10 +31,13 @@ def calculate_gain(nonlinearity, param=None):
 def _calculate_fan_in_and_fan_out(tensor):
     if tensor.dim() < 2:
         raise ValueError("Fan in and fan out can not be computed for tensor with fewer than 2 dimensions")
+    # (the sizes read from a plain tuple: indexing a Size takes the
+    # tuple-subclass path, about a microsecond per read here)
+    shape = tuple(tensor.shape)
     receptive = 1
-    for d in tensor.shape[2:]:
+    for d in shape[2:]:
         receptive *= d
-    return tensor.shape[1] * receptive, tensor.shape[0] * receptive
+    return shape[1] * receptive, shape[0] * receptive
 
 
 _fans = _calculate_fan_in_and_fan_out
@@ -48,37 +51,67 @@ def _calculate_correct_fan(tensor, mode):
     return fan_in if mode == "fan_in" else fan_out
 
 
+# The initializers below run their in-place write under no_grad, as
+# `with torch.no_grad():` does, by setting and restoring the grad mode
+# themselves: the context manager's object and its two calls cost several
+# times the rest of a small initializer here.
+
+
 def constant_(t, val):
-    with torch.no_grad():
+    _refuse_lazy(t, "constant_")
+    prev = torch._grad_enabled
+    torch._grad_enabled = False
+    try:
         t.fill_(val)
+    finally:
+        torch._grad_enabled = prev
     return t
 
 
 def zeros_(t):
-    with torch.no_grad():
+    prev = torch._grad_enabled
+    torch._grad_enabled = False
+    try:
         t.zero_()
+    finally:
+        torch._grad_enabled = prev
     return t
 
 
 def ones_(t):
-    with torch.no_grad():
+    prev = torch._grad_enabled
+    torch._grad_enabled = False
+    try:
         t.fill_(1.0)
+    finally:
+        torch._grad_enabled = prev
     return t
 
 
 def uniform_(t, a=0.0, b=1.0, generator=None):
-    with torch.no_grad():
+    _refuse_lazy(t, "uniform_")
+    prev = torch._grad_enabled
+    torch._grad_enabled = False
+    try:
         t.uniform_(a, b, generator=generator)
+    finally:
+        torch._grad_enabled = prev
     return t
 
 
 def normal_(t, mean=0.0, std=1.0, generator=None):
-    with torch.no_grad():
+    _refuse_lazy(t, "normal_")
+    prev = torch._grad_enabled
+    torch._grad_enabled = False
+    try:
         t.normal_(mean, std, generator=generator)
+    finally:
+        torch._grad_enabled = prev
     return t
 
 
 def kaiming_uniform_(t, a=0, mode="fan_in", nonlinearity="leaky_relu", generator=None):
+    _refuse_lazy(t, "kaiming_uniform_")
     if 0 in tuple(t.shape):
         return t
     fan = _calculate_correct_fan(t, mode)
@@ -214,23 +247,14 @@ def sparse_(tensor, sparsity, std=0.01, generator=None):
     return tensor
 
 
-def _guarded(fn):
-    """fn, refusing an uninitialized (lazy) parameter with PyTorch's error."""
-    def init(tensor, *args, **kwargs):
-        if getattr(tensor, "_uninitialized", False):
-            raise ValueError("Attempted to use an uninitialized parameter in <function %s>. This error happens when you are using a `LazyModule` or explicitly manipulating `torch.nn.parameter.%s` objects. When using LazyModules Call `forward` with a dummy batch to initialize the parameters before calling torch functions" % (fn.__name__, type(tensor).__name__))
-        return fn(tensor, *args, **kwargs)
-    init.__name__ = fn.__name__
-    init.__doc__ = fn.__doc__
-    return init
-
-
-# PyTorch routes these four through __torch_function__; the others reach
-# an uninitialized tensor's own methods (or its shape) first.
-constant_ = _guarded(constant_)
-uniform_ = _guarded(uniform_)
-normal_ = _guarded(normal_)
-kaiming_uniform_ = _guarded(kaiming_uniform_)
+def _refuse_lazy(tensor, name):
+    """Refuse an uninitialized (lazy) parameter with PyTorch's error. PyTorch
+    routes constant_, uniform_, normal_ and kaiming_uniform_ through
+    __torch_function__, which raises before anything else runs; the other
+    initializers reach an uninitialized tensor's own methods (or its shape)
+    first."""
+    if getattr(tensor, "_uninitialized", False):
+        raise ValueError("Attempted to use an uninitialized parameter in <function %s>. This error happens when you are using a `LazyModule` or explicitly manipulating `torch.nn.parameter.%s` objects. When using LazyModules Call `forward` with a dummy batch to initialize the parameters before calling torch functions" % (name, type(tensor).__name__))
 
 # The deprecated names without the trailing underscore.
 uniform = uniform_
