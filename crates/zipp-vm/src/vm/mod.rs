@@ -2202,6 +2202,13 @@ pub struct Vm<'p> {
     /// instance is what `construct` holds). Read+cleared by `construct` /
     /// `run_class_ctor`; transient like `super_called`.
     super_this: crate::slot_table::SlotTable<Value>,
+    /// The `newTarget` of a derived class's construction when it is not the
+    /// class itself, keyed by the pre-allocated instance. `Get(newTarget,
+    /// "prototype")` belongs to OrdinaryCreateFromConstructor in the base that
+    /// creates the object, so it waits here until `super()` reaches that base
+    /// (`settle_pending_ctor_proto`); a Proxy parent makes its own object and
+    /// drops the entry. Transient like `super_this`.
+    pending_ctor_proto: crate::slot_table::SlotTable<Value>,
     /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
     /// instance heap idx -> its `(brand, name id, value)` list, in definition
     /// order. Keyed by the per-evaluation brand so same-named fields of

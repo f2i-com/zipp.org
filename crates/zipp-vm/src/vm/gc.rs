@@ -762,6 +762,10 @@ impl Vm<'_> {
         for v in self.super_this.values() {
             root_val!(*v);
         }
+        // A derived construction's newTarget, until super() reaches its base.
+        for v in self.pending_ctor_proto.values() {
+            root_val!(*v);
+        }
         // Private field values: an entry keyed by a live instance must keep its
         // payload alive (over-approximate; dead-instance entries pruned below).
         for m in self.private_fields.values() {
@@ -990,6 +994,7 @@ impl Vm<'_> {
         self.this_tdz.retain_marked(&marks);
         self.super_called.retain_marked(&marks);
         self.super_this.retain_marked(&marks);
+        self.pending_ctor_proto.retain_marked(&marks);
         self.prototypes.retain_marked(&marks);
         self.class_proto_owner.retain_marked(&marks);
         self.ctor_initial_name.retain_marked(&marks);
@@ -1314,6 +1319,7 @@ impl Vm<'_> {
         prune_set!(self.this_tdz);
         prune_set!(self.super_called);
         prune_map!(self.super_this);
+        prune_map!(self.pending_ctor_proto);
         prune_map!(self.prototypes);
         prune_map!(self.class_proto_owner);
         prune_map!(self.ctor_initial_name);

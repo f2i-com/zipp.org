@@ -583,6 +583,15 @@ impl<'p> Vm<'p> {
                 // chain already reaches the error prototype (so name/toString/
                 // instanceof resolve), so nothing else is needed here.
                 _ => {
+                    // A non-class parent is the base that creates the object: a
+                    // Proxy through its own [[Construct]] (which reads, or not,
+                    // newTarget.prototype itself), anything else as its
+                    // OrdinaryCreateFromConstructor, which reads it first.
+                    if self.proxy_parts(cval.heap_index()).is_some() {
+                        self.pending_ctor_proto.remove(&obj.heap_index());
+                    } else {
+                        self.settle_pending_ctor_proto(obj, cval)?;
+                    }
                     // `super(...)` to a BUILT-IN EXOTIC parent (`class X extends Set/…`):
                     // brand the plain-Object instance with the builtin's internal
                     // representation so its methods work and it is a real instanceof. The
@@ -703,6 +712,11 @@ impl<'p> Vm<'p> {
                     return Ok(obj);
                 }
             };
+        // A base class creates the instance: a deferred newTarget prototype
+        // is read now, before its fields and constructor run.
+        if parent.is_none() && !extends_null {
+            self.settle_pending_ctor_proto(obj, cval)?;
+        }
         if has_explicit {
             // An explicit ctor produces `this`: its object-return (return-override)
             // becomes the effective instance; a non-object/undefined return keeps obj.

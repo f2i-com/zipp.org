@@ -228,6 +228,33 @@ impl<'p> Vm<'p> {
         ))
     }
 
+    /// The `Get(newTarget, "prototype")` a derived construction deferred
+    /// (`pending_ctor_proto`), run where `base` creates the instance `obj`, as
+    /// its OrdinaryCreateFromConstructor: `obj` takes `newTarget.prototype`
+    /// when that is an object, else newTarget's realm's intrinsic for `base`.
+    pub(crate) fn settle_pending_ctor_proto(&mut self, obj: Value, base: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Ok(());
+        }
+        let Some(nt) = self.pending_ctor_proto.remove(&obj.heap_index()) else {
+            return Ok(());
+        };
+        let p = self.get_prop(nt, "prototype")?;
+        let p = if self.is_object_value(p) {
+            p
+        } else {
+            let intrinsic = if base.is_heap() {
+                self.class_intrinsic_proto(base.heap_index())
+            } else {
+                self.obj_proto
+            };
+            self.newtarget_intrinsic_fallback(nt, intrinsic)?
+        };
+        self.note_class_instance_reproto(obj.heap_index());
+        self.proto_of.insert(obj.heap_index(), p);
+        Ok(())
+    }
+
     /// The intrinsic default proto for a class constructor's instances: the
     /// base of its `extends` chain allocates `this` (OrdinaryCreateFromConstructor
     /// runs there), so a chain that ends in a built-in constructor
@@ -1234,8 +1261,13 @@ impl<'p> Vm<'p> {
         // orders it: the `prototype` Get can be a Proxy trap or getter (guest
         // code), and an instance allocated first was only a Rust local across
         // it — a collection there handed the constructor a reused slot as `this`.
+        // A DERIVED class creates no object: the base its `super()` reaches
+        // does, and only that base reads `newTarget.prototype` (a Proxy base's
+        // `construct` trap may never read it), so the Get is deferred to there
+        // (`pending_ctor_proto`).
+        let derived = parent.is_some() || extends_null;
         let mut proto_override: Option<Value> = None;
-        if new_target.is_heap() && new_target != cv {
+        if new_target.is_heap() && new_target != cv && !derived {
             let p = self.get_prop(new_target, "prototype")?;
             proto_override = Some(if self.is_object_value(p) {
                 p
@@ -1258,6 +1290,8 @@ impl<'p> Vm<'p> {
             // class-shape inline caches.
             self.note_class_instance_reproto(obj.heap_index());
             self.proto_of.insert(obj.heap_index(), p);
+        } else if derived && new_target.is_heap() && new_target != cv {
+            self.pending_ctor_proto.insert(obj.heap_index(), new_target);
         }
         // The instance is a Rust local until a constructor frame holds it as
         // `this` — and a ctor-less class never gives it one: the implicit

@@ -311,6 +311,7 @@ impl<'p> Vm<'p> {
             super_called: crate::slot_table::SlotSet::default(),
             this_tdz: crate::slot_table::SlotSet::default(),
             super_this: crate::slot_table::SlotTable::default(),
+            pending_ctor_proto: crate::slot_table::SlotTable::default(),
             private_fields: crate::slot_table::SlotTable::default(),
             private_name_ids: rustc_hash::FxHashMap::default(),
             eval_fn_idx: 0,
