@@ -3979,10 +3979,28 @@ impl<'p> Vm<'p> {
                         // an own property regardless of side tables/prototypes.
                         // Misses (hole / out of range / overlay) take the full path.
                         if !brand && k.is_number() && o.is_heap() {
-                            if let HeapObj::Array(items) = self.heap.get(o.heap_index()) {
+                            let aidx = o.heap_index();
+                            if let HeapObj::Array(items) = self.heap.get(aidx) {
                                 if let Some(i) = array_index(k) {
                                     if i < items.len() && !items[i].is_hole() {
                                         self.set(base, dst, Value::bool(true));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                    // A hole, or an index past the dense end, is
+                                    // absent unless an overlay holds it or the
+                                    // chain can supply an index: the shortcut a
+                                    // hole read takes (`get_index`), under the
+                                    // same protector. It walked the full
+                                    // HasProperty, key text and all.
+                                    if crate::codegen::hole_undef_enabled()
+                                        && !self.array_proto_has_index
+                                        && !self.proto_of.contains_key(&aidx)
+                                        && (self.arguments_objs.is_empty()
+                                            || !self.arguments_objs.contains_key(&aidx))
+                                        && self.array_index_override(aidx, i).is_none()
+                                    {
+                                        self.set(base, dst, Value::bool(false));
                                         ip += 1;
                                         continue;
                                     }
