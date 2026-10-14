@@ -470,6 +470,8 @@ impl<'p> Vm<'p> {
             promise_ctor_intrinsic: 0,
             promise_then_intrinsic: 0,
             promise_pristine_slots: None,
+            promise_resolve_memo: (0, 0),
+            array_then_memo: (0, 0),
             matchall_fast_slots: None,
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),

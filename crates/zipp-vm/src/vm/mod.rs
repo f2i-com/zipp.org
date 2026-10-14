@@ -2786,6 +2786,14 @@ pub struct Vm<'p> {
     /// pristine); validated per call by version compares, re-resolved by the
     /// full proof on any guard mismatch.
     promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
+    /// `(version + 1, slot)` of %Promise%'s own data property `resolve` when
+    /// last found (0 = not recorded): GetPromiseResolve's Get read straight
+    /// from the slot while the version holds (`Vm::promise_ctor_resolve_get`).
+    promise_resolve_memo: (u32, u32),
+    /// `(version + 1)` of %Array.prototype% and %Object.prototype% when both
+    /// were last proven to have no `then` (0 = not proven): see
+    /// `Vm::array_then_absent`.
+    array_then_memo: (u32, u32),
     /// The prototype/constructor half of `regexp_matchall_fast_ok` resolved
     /// to slot indices plus the versions guarding them (see
     /// [`proxy_regexp::MatchallFastSlots`]). `None` until first proven
