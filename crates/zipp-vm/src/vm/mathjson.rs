@@ -1007,19 +1007,27 @@ impl<'p> Vm<'p> {
         Ok(match op {
             M::Min | M::Max | M::Hypot => {
                 // ToNumber EVERY argument (observable valueOf/toString, left-to-right)
-                // before reducing.
-                let mut nums = Vec::with_capacity(args.len());
-                for &v in args {
-                    nums.push(self.to_number_strict(v)?);
+                // before reducing. Up to eight go in a stack buffer: a `Vec`
+                // per call was most of what `Math.max(a, b)` cost.
+                let mut small = [0f64; 8];
+                let mut large = Vec::new();
+                let nums: &mut [f64] = if args.len() <= small.len() {
+                    &mut small[..args.len()]
+                } else {
+                    large.resize(args.len(), 0.0);
+                    &mut large
+                };
+                for (slot, &v) in nums.iter_mut().zip(args) {
+                    *slot = self.to_number_strict(v)?;
                 }
                 if matches!(op, M::Hypot) {
-                    return Ok(crate::vm::helpers_num2::hypot_scaled(&nums));
+                    return Ok(crate::vm::helpers_num2::hypot_scaled(nums));
                 }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
                     _ => f64::NEG_INFINITY,
                 };
-                for v in nums {
+                for &v in nums.iter() {
                     acc = match op {
                         // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
                         // so tie-break on the sign (Min prefers -0, Max prefers +0).
