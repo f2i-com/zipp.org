@@ -942,11 +942,18 @@ impl<'p> Vm<'p> {
         n
     }
 
-    /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`.
-    /// Kept as a named entry point for cheap call-site readability; the audit
-    /// itself takes `&self` and is the single source of truth.
+    /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`:
+    /// the audit with the heap's payload at its high-water mark, so the figure
+    /// an embedder reads stays monotonic. A ceiling is enforced against the
+    /// audit itself, which counts the payload alive now
+    /// ([`crate::heap::Heap::resident_bytes`]).
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.audit_heap_bytes()
+        let live = self.audit_heap_bytes();
+        live.saturating_add(
+            self.heap
+                .resident_peak_bytes()
+                .saturating_sub(self.heap.resident_bytes()),
+        )
     }
 
     /// The O(1) resident figure for headroom checks that run per operation

@@ -7818,7 +7818,15 @@ impl Heap {
         }
         let cap = self.objs.capacity();
         let step = (cap / 16).max(4096);
-        if cap.saturating_sub(self.objs.len()) > step {
+        // Free slots are reused before the tables grow: a heap whose last
+        // collection freed most of its slots is far from a doubling however
+        // close `objs.len()` sits to its capacity. Counting only the unused
+        // capacity charged a whole copy of the tables to a heap the collector
+        // had just emptied, so it could never allocate again (#55).
+        let headroom = cap
+            .saturating_sub(self.objs.len())
+            .saturating_add(self.free.len());
+        if headroom > step {
             return 0;
         }
         let mut n = vec_capacity_bytes(&self.objs)
@@ -8301,12 +8309,43 @@ impl Heap {
         self.objs.len()
     }
 
-    /// O(1) conservative resident-byte high-water estimate. Initial payloads are
-    /// charged at allocation and [`Self::audit_resident_bytes`] periodically
-    /// incorporates capacity growth in existing objects. The payload peak is
-    /// monotonic, while per-slot charges prevent freed/reused allocation churn
+    /// O(1) resident-byte estimate: the slot tables and pools at their capacity
+    /// plus the payload of the objects alive now. Initial payloads are charged
+    /// at allocation, a sweep takes a freed object's charge back, and
+    /// [`Self::audit_resident_bytes`] periodically incorporates capacity growth
+    /// in existing objects; per-slot charges keep freed/reused allocation churn
     /// from being mistaken for simultaneously resident memory.
+    ///
+    /// This is what a heap ceiling is enforced against. It used to carry the
+    /// payload's all-time PEAK instead, so once a script had filled the heap to
+    /// its ceiling and dropped everything, no later allocation fitted again:
+    /// a long-lived embedded VM that hit its limit once could never allocate
+    /// again (f2i-com/zipp.org#55). The peak is still reported, through
+    /// [`Self::resident_peak_bytes`].
     pub fn resident_bytes(&self) -> usize {
+        self.resident_table_bytes()
+            .saturating_add(self.resident_payload_current.get())
+    }
+
+    /// [`Self::resident_bytes`] with the payload's high-water mark in place of
+    /// the live payload: the most the heap has held at once. Monotonic.
+    pub fn resident_peak_bytes(&self) -> usize {
+        self.resident_table_bytes()
+            .saturating_add(self.resident_payload_high_water.get())
+    }
+
+    /// Ask for the next collection to be a major one (and for one to run at
+    /// the next safe point): what a heap ceiling's conviction waits for, since
+    /// only a major reclaims old garbage.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn request_major(&mut self) {
+        self.major_due = true;
+        self.gc_requested = true;
+    }
+
+    /// The slot tables and pools at their capacity: every resident byte but
+    /// the objects' payloads.
+    fn resident_table_bytes(&self) -> usize {
         vec_capacity_bytes(&self.objs)
             .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
             .saturating_add({
@@ -8372,7 +8411,6 @@ impl Heap {
             .saturating_add(vec_capacity_bytes(&self.scan_roots))
             .saturating_add(self.nonyoung_cache.capacity().div_ceil(8))
             .saturating_add(vec_capacity_bytes(&self.vremset))
-            .saturating_add(self.resident_payload_high_water.get())
     }
 
     /// Reconcile in-place payload growth into the current and peak caches. This

@@ -291,6 +291,29 @@ impl Vm<'_> {
         }
     }
 
+    /// Whether a collection may run once the next safe point is reached: setup
+    /// has pinned the built-ins (`gc_floor`) and no native scope holds the
+    /// collector off (`gc_lock`). The same test `maybe_gc` applies.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn gc_can_run_now(&self) -> bool {
+        #[cfg(feature = "safe-sandbox")]
+        let unlocked = self.gc_lock.get() == 0;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let unlocked = self.gc_lock == 0;
+        unlocked && self.gc_floor != 0
+    }
+
+    /// Run a MAJOR collection now. Only for callers at a safe point with no
+    /// frame running, such as an embedder re-arming the heap ceiling between
+    /// entries (`ScriptState::set_heap_limit`).
+    #[cfg(feature = "instrument")]
+    pub(crate) fn collect_major_now(&mut self) {
+        if self.frames.is_empty() && self.gc_can_run_now() {
+            self.heap.request_major();
+            self.gc();
+        }
+    }
+
     /// B242: the collector behind the poll, kept OUT OF LINE on purpose.
     ///
     /// `maybe_gc` is `#[inline]` and is polled once per object by every JIT

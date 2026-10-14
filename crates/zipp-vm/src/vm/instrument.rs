@@ -439,6 +439,10 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// A poll found the heap over `heap_limit` and asked for a major
+    /// collection instead of convicting: the poll that follows that
+    /// collection decides. See `instrument_heap_poll_inner`.
+    pub(crate) ceiling_gc_pending: bool,
     /// Combined UTF-8 bytes retained for stdout/stderr lines, including the
     /// newline written for each line; `usize::MAX` means unlimited.
     pub(crate) output_limit: usize,
@@ -531,6 +535,7 @@ impl Recorder {
             steps_base: 0,
             abort: None,
             heap_limit: usize::MAX,
+            ceiling_gc_pending: false,
             output_limit: usize::MAX,
             output_used: 0,
             output_exhausted: false,
@@ -851,6 +856,12 @@ impl super::Vm<'_> {
         heap_now.saturating_add(rec.heap_audit_non_heap.get())
     }
 
+    /// [`Vm::instrument_heap_estimate`] for the embedding API: the O(1)
+    /// resident figure with the payload alive now.
+    pub(crate) fn heap_bytes_live_estimate(&self) -> usize {
+        self.instrument_heap_estimate()
+    }
+
     /// The estimate with the RegExp programs admitted since the latest walks
     /// added. It can exceed the exact figure (see `external_bytes_admitted`),
     /// so it only ever decides that a walk is due; the walk gives the verdict.
@@ -1152,7 +1163,8 @@ impl super::Vm<'_> {
             .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = 0;
 
-        let resident = self.heap_bytes();
+        // The live audit, not the reported peak (`heap_bytes`).
+        let resident = self.audit_heap_bytes();
         let rec = self
             .instr_rec
             .as_mut()
@@ -1419,7 +1431,7 @@ impl super::Vm<'_> {
             if !self.heap.payload_accounting_enabled() {
                 rec.external_heap_dirty = true;
             }
-            if self.instrument_heap_poll_inner(polls).is_err() {
+            if self.instrument_heap_poll_inner(polls, true).is_err() {
                 self.jit_steps = 0;
                 return 0;
             }
@@ -1961,7 +1973,7 @@ impl super::Vm<'_> {
     #[cold]
     #[inline(never)]
     pub(crate) fn instrument_heap_poll(&mut self) -> Tick {
-        self.instrument_heap_poll_inner(1)
+        self.instrument_heap_poll_inner(1, true)
     }
 
     /// The same reconciliation, driven by a collection rather than by the
@@ -1989,13 +2001,27 @@ impl super::Vm<'_> {
         if self.heap.take_growth_walk_due() {
             self.instrument_mark_external_heap_growth();
         }
+        // A conviction that waited for this collection is decided now.
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.ceiling_gc_pending = false;
+        }
         let force = !self.heap.payload_accounting_enabled();
-        self.instrument_heap_poll_inner(u32::from(force))
+        self.instrument_heap_poll_inner(u32::from(force), false)
     }
 
+    ///
+    /// `may_defer`: a heap found over the ceiling may first ask for a major
+    /// collection rather than convict. The figure counts the payload alive
+    /// NOW, but garbage stays in it until a collection sweeps it, and this
+    /// poll runs where collecting is not safe (the top of an instruction, or
+    /// inside one with a value held in a Rust local). So it requests a major,
+    /// which the next safe point runs, and `instrument_heap_poll_after_gc`
+    /// decides on what survived. Without this, a script that dropped a full
+    /// heap was convicted by its own garbage. A drain that holds the collector
+    /// off, and the post-collection poll, decide at once.
     #[cold]
     #[inline(never)]
-    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: u32) -> Tick {
+    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: u32, may_defer: bool) -> Tick {
         let ceiling = match self.instr_rec.as_ref() {
             Some(rec) => rec.heap_limit,
             None => return Ok(()),
@@ -2072,11 +2098,18 @@ impl super::Vm<'_> {
         };
         if convicted || reconcile {
             let total = self.audit_heap_bytes();
+            let collectable = may_defer && self.gc_can_run_now();
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
             if let Some(now) = crate::heap::every_block_footprint() {
                 rec.walk_footprint_floor = now;
             }
             if total.saturating_add(growth) > ceiling {
+                if collectable && !rec.ceiling_gc_pending {
+                    rec.ceiling_gc_pending = true;
+                    self.heap.request_major();
+                    return Ok(());
+                }
+                rec.ceiling_gc_pending = false;
                 return Err(rec.exhaust(ResourceExhaustion::Heap));
             }
         }
@@ -2099,7 +2132,7 @@ impl super::Vm<'_> {
         if steps & 1023 != 0 {
             return Ok(());
         }
-        self.instrument_heap_poll_inner(0)
+        self.instrument_heap_poll_inner(0, false)
             .map_err(|message| super::Thrown(message.into()))
     }
 

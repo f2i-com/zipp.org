@@ -783,9 +783,19 @@ impl ScriptState {
         self.with_vm(|vm| {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
+                rec.ceiling_gc_pending = false;
             }
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
+            // Re-arming between entries starts a budget on what is alive, not
+            // on what a previous entry left for the collector: a heap past half
+            // the ceiling is collected now, while no frame runs. After a script
+            // filled the heap and dropped it, the next entry would otherwise
+            // need a slot-table doubling before any collection had freed the
+            // dead objects' slots (f2i-com/zipp.org#55).
+            if bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
+                vm.collect_major_now();
+            }
         });
     }
 
