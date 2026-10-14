@@ -286,21 +286,21 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.23` release provides x86-64 CLI binaries for Windows and Linux
+The `0.0.24` release provides x86-64 CLI binaries for Windows and Linux
 (complete: JavaScript, the experimental Python frontend as `zipp py`, torch and
 the native GPU path) and five browser WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
-| `zipp-wasm-0.0.23-web.zip` | JavaScript applications and embedding (about 1.18 MB Brotli) |
-| `zipp-wasm-0.0.23-web-lite.zip` | ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size rather than speed (about 0.70 MB) |
-| `zipp-wasm-0.0.23-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.57 MB) |
-| `zipp-wasm-0.0.23-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 1.92 MB) |
-| `zipp-wasm-0.0.23-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.38 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
+| `zipp-wasm-0.0.24-web.zip` | JavaScript applications and embedding (about 1.13 MB Brotli) |
+| `zipp-wasm-0.0.24-web-lite.zip` | ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size rather than speed (about 0.67 MB) |
+| `zipp-wasm-0.0.24-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.52 MB) |
+| `zipp-wasm-0.0.24-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 1.90 MB) |
+| `zipp-wasm-0.0.24-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.40 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
-assets and [0.0.23 release notes](docs/releases/0.0.23.md) for scope and limits.
-`0.0.23` is the latest published release; the download commands below use it.
+assets and [0.0.24 release notes](docs/releases/0.0.24.md) for scope and limits.
+`0.0.24` is the latest published release; the download commands below use it.
 Every WASM archive carries the exact source revision, language profile and
 checksums. The sizes are each module's Brotli-11 transfer size, as measured in
 [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#build-variants-zipp-lite-javascript-python-and-the-torch-package),
@@ -326,7 +326,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.23'
+$version = '0.0.24'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -346,7 +346,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.23
+version=0.0.24
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -355,7 +355,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.23-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.24-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -399,9 +399,10 @@ own front end ([`crates/zipp-pyparse`](crates/zipp-pyparse)) and lowered
 straight to the engine's register bytecode (no transpilation to JavaScript and
 no second interpreter), so a `.py` file runs on the same VM. On the command
 line hot Python loops are JIT-compiled (x86-64), and over the 36 programs of
-the Python benchmark suite Zipp runs at about 1.3x CPython 3.13's time;
-eleven of them, including `range_loop`, `int_arith`, `float_arith`,
-`global_read` and `list_index`, take less time than in CPython. WebAssembly
+the Python benchmark suite Zipp runs at about 1.1x CPython 3.13's time (its
+30 small programs level with CPython); fifteen of them, including
+`range_loop`, `float_arith`, `int_arith`, `global_read`, `dict_get` and
+`json_roundtrip`, take less time than in CPython. WebAssembly
 and budgeted embedders run the same code interpreted. Compiled code is
 cached per user, so a hello-world starts in about 20 ms. Save this as
 `fib.py`:
@@ -430,7 +431,7 @@ statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
 `dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
 all work; `async` does not yet. Semantics are checked
-differentially against CPython: the 179 programs of `tests/python_corpus/*.py`
+differentially against CPython: the 195 programs of `tests/python_corpus/*.py`
 must print exactly what CPython 3.13 prints, in the default, no-fast-path and
 no-JIT modes.
 
@@ -626,7 +627,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.23
+version=0.0.24
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"

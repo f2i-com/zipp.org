@@ -1,5 +1,49 @@
 # Zipp performance handoff
 
+### 14 October: sixteenth pass, round two, released as 0.0.24
+
+Round two of the sixteenth pass went to `main` in three pushes
+(`2cb7176f`, `7da3519d`, `35e6d1dc`) and is released as 0.0.24 from the
+commit that adds this entry; its record is
+[docs/validation/2026-10-14-engine-size-round16-r2.md](docs/validation/2026-10-14-engine-size-round16-r2.md)
+and the release notes [docs/releases/0.0.24.md](docs/releases/0.0.24.md).
+The entry below describes round one, which went to `main` as `828038b6`
+and is part of the same release.
+
+Eight issues from @takahashim are fixed and answered on GitHub
+(#32 to #34, #41 to #45; regression tests in
+`crates/zipp-vm/tests/reported_property_bugs.rs` and
+`reported_semantics_bugs.rs`), with nine more wrong answers found by
+differential programs. Four agents (Python, torch, async, size) were
+merged whole; the six Dependabot PRs (#35 to #40) were applied as
+commits and closed themselves.
+
+Against 0.0.23, on the release's source: the 13 native rows 0.9739x
+(headline ten 0.9730x), the headline ten at 0.8819x of Node 24 with
+ZIPP's median below Node's on all 13; Python 1.09x CPython 3.13 (micro
+1.00x, macro 1.68x); torch 4.22x PyTorch (from 16.96x); the modules
+after Brotli Lite -3.8%, JavaScript -4.0%, Python-base -2.8%, Python +
+Torch -1.0%, their speed level. `map-set-heavy` is 2.8% slower than in
+0.0.23 [+0.7%, +6.8%], not run down.
+
+**Decisions that are the user's** (as in round one): Python docstrings
+and the Unicode character-name table could be dropped from the modules;
+`b13da1e5`'s 16 KB in Python + Torch.
+
+**Leads**: `performance.mark`/`measure` with the rest of User Timing
+(agreed with the user for the next round); `queueMicrotask`; the
+arguments, closure, spread and Map/Set probes (2.8x to 7.6x Node);
+Python rows above 2x CPython; the Python agent's `__class__` cell. The
+record's "Leads" has the detail.
+
+**Traps hit this round** (in the memory notes too): gate B's `DONE
+failed_binaries` line ends the default suite, not the gate (wait for
+`^done` in both logs, and never change the main checkout while a gate
+can still compile from it); a workflow dispatch needs the full SHA;
+moving an interpreter arm's body out of line can cost every interpreted
+Python call 5% (bisect on fresh copies); a call lowering that names more
+registers can starve the local-SROA lane of spare homes.
+
 ### 14 October: sixteenth pass, local (`perf-round16`)
 
 The local branch `perf-round16` carries the sixteenth pass: 63 commits

@@ -267,21 +267,26 @@ have identical import/export surfaces; the selected module retains the audited
 1 GiB memory maximum. Release tests run on the selected bytes, and packaging
 checks that the browser module is byte-identical to the tested Node module.
 
-Measured on 2026-10-12 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the fifteenth pass, on a Windows build of `20123116`, the source of
-release 0.0.23:
+Measured on 2026-10-14 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
+after the sixteenth pass, on a Windows build of `35e6d1dc`, the source of
+release 0.0.24:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,678,584 / 700,429 | 2,573,530 / 697,741 |
-| JavaScript | 4,790,112 / 1,186,115 | 4,636,144 / 1,180,609 |
-| Python-base | 6,519,475 / 1,574,300 | 6,331,117 / 1,566,620 |
-| Python + Torch | 8,447,665 / 1,925,027 | 8,254,998 / 1,918,013 |
+| Lite | 2,560,566 / 687,430 | 2,450,334 / 671,251 |
+| JavaScript | 4,606,091 / 1,155,548 | 4,435,704 / 1,133,411 |
+| Python-base | 6,367,829 / 1,553,282 | 6,146,540 / 1,524,284 |
+| Python + Torch | 8,407,894 / 1,927,651 | 8,178,282 / 1,898,530 |
+
+The torch package (`zipp_torch.wasm`) is 2,156,516 / 401,594.
 
 These are module bytes, excluding JS glue; Brotli is the download size. See the
-[fifteenth pass's audit](../../docs/validation/2026-10-12-engine-size-round15.md)
-for the variant deltas, the speed screen and validation. The fourteenth
-pass's modules were 2,573,185 / 694,745, 4,703,604 / 1,189,469,
+[sixteenth pass's second record](../../docs/validation/2026-10-14-engine-size-round16-r2.md)
+for the variant deltas, the speed screen and validation. The fifteenth
+pass's modules, release 0.0.23's, were 2,573,530 / 697,741,
+4,636,144 / 1,180,609, 6,331,117 / 1,566,620 and 8,254,998 / 1,918,013
+([its audit](../../docs/validation/2026-10-12-engine-size-round15.md)). The
+fourteenth pass's modules were 2,573,185 / 694,745, 4,703,604 / 1,189,469,
 6,379,257 / 1,578,173 and 8,303,296 / 1,929,593
 ([its audit](../../docs/validation/2026-10-12-engine-size-round14.md)). The
 thirteenth pass's, which release 0.0.22 was cut from, were
