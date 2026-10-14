@@ -803,6 +803,13 @@ impl<'p> Vm<'p> {
     }
 
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
+    ///
+    /// The safe profile's dispatch loop takes it inline. Left to the
+    /// heuristic, the choice turned on unrelated code: dropping the JIT's
+    /// mirror stores from the allocator (d2886b14) made class-prototype-hot
+    /// 26% slower with every extra cycle at this call site, and forcing it
+    /// either way restored it.
+    #[cfg_attr(feature = "safe-sandbox", inline(always))]
     pub(crate) fn ic_get_prop(
         &mut self,
         func_id: u32,
