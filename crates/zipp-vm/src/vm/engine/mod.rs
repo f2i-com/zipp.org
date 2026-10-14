@@ -53,6 +53,8 @@ fn jit_module_functions_enabled() -> bool {
 
 // submodules (split out of the former monolithic engine.rs)
 mod boot;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod ctor_store;
 mod eval_prog;
 mod jit_calls;
 mod jit_frame;

@@ -5156,7 +5156,7 @@ const SHAPE_PLAN_MAX_BYTES: usize = 512;
 /// `shape`'s key list as a shared plan, built the first time an add way
 /// reaches the shape; `None` for a dictionary shape or a list past the caps.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyPlan> {
+pub(crate) fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyPlan> {
     let s = shape as usize;
     if shape == crate::shape::DICT || s >= 1 << 14 {
         return None;

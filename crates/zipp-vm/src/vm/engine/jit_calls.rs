@@ -1509,12 +1509,16 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() || !matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
             return None;
         }
+        let target = self.flat_new_class_target(cv)?;
+        // A body that only stores its arguments: the finished instance.
+        if let Some(v) = self.ctor_store_new(target.0, cv.heap_index(), Value::UNDEFINED, base, arg_base, argc) {
+            return Some(v.bits());
+        }
         self.jit_call_depth += 1;
-        let made = self.flat_new_class_instance(cv);
+        let made = self.flat_new_class_make(cv, target);
         self.jit_call_depth -= 1;
         let (fid, closure, obj, f) = match made {
-            Ok(Some(made)) => made,
-            Ok(None) => return None,
+            Ok(made) => made,
             Err(t) => {
                 self.osr_deopt_exempt = true;
                 return Some(self.jit_thrown_to_sentinel(t));
@@ -1600,6 +1604,10 @@ impl<'p> Vm<'p> {
             if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
                 proto = Value::heap(rp);
             }
+        }
+        // A body that only stores its arguments: the finished instance.
+        if let Some(v) = self.ctor_store_new(fid, u32::MAX, proto, base, arg_base, argc) {
+            return Some(v.bits());
         }
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(

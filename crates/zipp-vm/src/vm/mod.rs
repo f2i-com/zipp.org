@@ -1805,6 +1805,11 @@ pub struct Vm<'p> {
     /// every cache for each one. Pure memo: every hit rechecks it live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_ways: Vec<AddWay>,
+    /// Per constructor body: whether it only stores its arguments and
+    /// constants into `this`, and the proof of the last receiver a compiled
+    /// `new` answered that way (`engine::ctor_store`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_stores: rustc_hash::FxHashMap<u32, engine::ctor_store::CtorStore>,
     /// Per function: 0 not yet scanned, 1 its body cannot observe its frame's
     /// `new.target` (so a compiled `new` may run it frame-free), 2 it can
     /// (`Vm::ctor_body_framefree`).

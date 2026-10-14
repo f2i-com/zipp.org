@@ -91,8 +91,18 @@ impl<'p> Vm<'p> {
         &mut self,
         cv: Value,
     ) -> Result<Option<(u32, u32, Value, Value)>, Thrown> {
-        if !cv.is_heap() {
+        let Some(target) = self.flat_new_class_target(cv) else {
             return Ok(None);
+        };
+        self.flat_new_class_make(cv, target).map(Some)
+    }
+
+    /// The tests of [`Vm::flat_new_class_instance`]: whether `cv` is a class
+    /// its flat path takes, and if so its constructor (`fid`, `closure`, the
+    /// function value). Nothing is made.
+    pub(crate) fn flat_new_class_target(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        if !cv.is_heap() {
+            return None;
         }
         let ci = cv.heap_index();
         let simple = match self.heap.get(ci) {
@@ -110,20 +120,32 @@ impl<'p> Vm<'p> {
             || !self.realm_global_objs.is_empty()
             || self.get_function_realm(cv) != 0
         {
-            return Ok(None);
+            return None;
         }
         // `brand_instance` would stamp nothing.
         if let Some(own) = self.method_brand.get(&ci).and_then(|b| b.first()) {
             if self.brand_private_names.contains_key(own) {
-                return Ok(None);
+                return None;
             }
         }
         let Some(f) = self.class_body_fn(cv, false) else {
-            return Ok(None);
+            return None;
         };
         let Some((fid, closure)) = self.ic_plain_fn(f) else {
-            return Ok(None);
+            return None;
         };
+        Some((fid, closure, f))
+    }
+
+    /// The making half of [`Vm::flat_new_class_instance`] for a `target`
+    /// [`Vm::flat_new_class_target`] returned: the instance, with the class's
+    /// field initializers run on it.
+    pub(crate) fn flat_new_class_make(
+        &mut self,
+        cv: Value,
+        (fid, closure, f): (u32, u32, Value),
+    ) -> Result<(u32, u32, Value, Value), Thrown> {
+        let ci = cv.heap_index();
         let mut map = ObjMap::new();
         map.class = Some(ci);
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
@@ -133,7 +155,7 @@ impl<'p> Vm<'p> {
         let thunk = self.run_field_thunk(obj, cv);
         self.host_result_roots.truncate(rooted);
         thunk?;
-        Ok(Some((fid, closure, obj, f)))
+        Ok((fid, closure, obj, f))
     }
 
     /// `new cv(args)` with newTarget defaulting to the constructor itself (the
