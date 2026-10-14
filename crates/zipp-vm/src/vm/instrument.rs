@@ -331,12 +331,13 @@ const PREFLIGHT_AUDIT_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// The walk is O(slots) and a fixed byte window is independent of the heap,
 /// so on its own the byte stride still taxes a string-building loop in
-/// proportion to everything the guest retains. `join` is the sharp case:
-/// each part preflights the builder's running total, so a 4,000-part join
-/// of a 23 KB result preflights about 46 MB and walked the heap six times
-/// whatever that heap held -- 5 ms per join on a small heap, and on the
-/// wasm build with 300,000 objects live the walk alone was most of the
-/// call. Widening the window with the slot count (4 KiB of preflighted
+/// proportion to everything the guest retains. `join` was the sharp case
+/// while each part advanced the stride by the builder's running total: a
+/// 4,000-part join of a 23 KB result preflighted about 46 MB and walked the
+/// heap six times whatever that heap held -- 5 ms per join on a small heap,
+/// and on the wasm build with 300,000 objects live the walk alone was most
+/// of the call. (A part now advances it by its own bytes; see
+/// `instrument_preflight_builder_growth`.) Widening the window with the slot count (4 KiB of preflighted
 /// allocation per slot, the same reasoning `heap_walk_stride_for` applies
 /// to the dispatch poll) holds the walk's share of such a loop near a
 /// constant few percent. Every call still convicts on the O(1) estimate,
@@ -1095,6 +1096,22 @@ impl super::Vm<'_> {
     /// lets an ArrayBuffer exceed a small budget by gigabytes before the next
     /// bytecode poll.
     pub(crate) fn instrument_preflight_heap_growth(&mut self, bytes: usize) -> Tick {
+        self.instrument_preflight_builder_growth(bytes, bytes)
+    }
+
+    /// [`Self::instrument_preflight_heap_growth`] for a buffer that is not in
+    /// the heap yet and grows by appends: `in_flight`, its whole size after
+    /// this one, must fit under the ceiling, while only `fresh`, what this
+    /// append adds, advances the walk stride. Charging the running total to
+    /// the stride made a builder's walks quadratic in its parts: a
+    /// 150,000-part join of 22 MB preflighted about 1.7 TB and walked the
+    /// heap at each window of it, 1.76 s against 18 ms without a ceiling.
+    pub(crate) fn instrument_preflight_builder_growth(
+        &mut self,
+        in_flight: usize,
+        fresh: usize,
+    ) -> Tick {
+        let bytes = in_flight;
         // Recorder check FIRST: `heap_bytes()` below is a full O(heap-slots)
         // audit walk, and this preflight sits on per-part/per-result string
         // paths (join, builders, regex results). An un-instrumented run — the
@@ -1153,7 +1170,7 @@ impl super::Vm<'_> {
             .instr_rec
             .as_mut()
             .expect("recorder checked present above");
-        rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(bytes);
+        rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(fresh);
         if rec.preflight_bytes_since_audit < preflight_audit_bytes_for(self.heap.len()) {
             return Ok(());
         }

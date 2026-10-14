@@ -413,7 +413,7 @@ impl<'p> Vm<'p> {
             .filter(|&n| n <= MAX_STRING_BYTES)
             .ok_or_else(|| Thrown::from_static("RangeError: Invalid string length"))?;
         #[cfg(feature = "instrument")]
-        self.instrument_preflight_heap_growth(total)
+        self.instrument_preflight_builder_growth(total, additional)
             .map_err(|message| Thrown(message.into()))?;
         #[cfg(not(feature = "instrument"))]
         let _ = total;

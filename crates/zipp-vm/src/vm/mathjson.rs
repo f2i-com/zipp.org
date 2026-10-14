@@ -440,7 +440,7 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| self.json_key_snapshot_limit_error())?;
         #[cfg(feature = "instrument")]
         if self.instr_rec.is_some() {
-            self.instrument_preflight_heap_growth(projected)
+            self.instrument_preflight_builder_growth(projected, additional)
                 .map_err(|message| Thrown(message.into()))?;
         }
         #[cfg(not(feature = "instrument"))]
@@ -470,7 +470,7 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| self.json_key_snapshot_limit_error())?;
         #[cfg(feature = "instrument")]
         if self.instr_rec.is_some() {
-            self.instrument_preflight_heap_growth(projected)
+            self.instrument_preflight_builder_growth(projected, additional)
                 .map_err(|message| Thrown(message.into()))?;
         }
         #[cfg(not(feature = "instrument"))]
