@@ -1535,7 +1535,7 @@ impl<'p> Vm<'p> {
                 return self.realm_global_slot(rid, name);
             }
         }
-        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+        if let Some(i) = self.main_global_pos(name) {
             return Ok(i as u32);
         }
         if let Some(&s) = self.eval_global_map.get(name) {
@@ -1575,10 +1575,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The main program's slot for `name` (its first position in
+    /// `program.global_names`), in one lookup.
+    #[inline]
+    pub(crate) fn main_global_pos(&self, name: &str) -> Option<usize> {
+        self.main_global_index.get(name).map(|&i| i as usize)
+    }
+
     /// The global SLOT behind a name — the inverse of `global_slot_name`. Main-program
     /// compile-time names first, then bindings a later script/eval introduced.
     pub(crate) fn global_slot_of_name(&self, name: &str) -> Option<u32> {
-        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+        if let Some(i) = self.main_global_pos(name) {
             return Some(i as u32);
         }
         self.eval_global_map.get(name).copied()

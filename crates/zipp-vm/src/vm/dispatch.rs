@@ -10783,10 +10783,7 @@ impl<'p> Vm<'p> {
         if gidx != crate::bytecode::BARE_MATH_BY_NAME as u32 {
             return Some(gidx);
         }
-        self.program
-            .global_names
-            .iter()
-            .position(|n| n == "Math")
+        self.main_global_pos("Math")
             .map(|i| i as u32)
             .or_else(|| self.eval_global_map.get("Math").copied())
     }

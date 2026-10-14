@@ -2081,7 +2081,7 @@ impl<'p> Vm<'p> {
         // slot stays own-prop-backed — LoadGlobal's fallback reads it; a
         // lexical let/const binding is not an object property at all.)
         if idx == self.global_this && self.global_this != 0 && !self.global_name_is_lexical(key) {
-            if let Some(slot) = self.program.global_names.iter().position(|n| n == key) {
+            if let Some(slot) = self.main_global_pos(key) {
                 if !self.globals[slot].is_uninitialized() {
                     self.globals[slot] = val;
                     // The `globalThis.f = g` rebind path — the main slot-guard

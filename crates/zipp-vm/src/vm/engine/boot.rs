@@ -187,6 +187,14 @@ impl<'p> Vm<'p> {
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_names: rustc_hash::FxHashMap::default(),
+            main_global_index: {
+                let mut m = rustc_hash::FxHashMap::default();
+                m.reserve(program.global_names.len());
+                for (i, n) in program.global_names.iter().enumerate() {
+                    m.entry(n.as_str()).or_insert(i as u32);
+                }
+                m
+            },
             pool_slot_names: rustc_hash::FxHashMap::default(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
@@ -897,6 +905,7 @@ impl<'p> Vm<'p> {
             n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_names)),
             |n, name| n.saturating_add(name.capacity()),
         );
+        n = n.saturating_add(Self::hash_map_resident_bytes(&self.main_global_index));
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
             |n, name| match name {

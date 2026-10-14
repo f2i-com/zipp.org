@@ -1486,6 +1486,11 @@ pub struct Vm<'p> {
     /// scanning the whole map made it linear in the globals earlier scripts
     /// introduced.
     eval_global_names: rustc_hash::FxHashMap<u32, String>,
+    /// `program.global_names` by name (first position, as `position()` found
+    /// it): the main program's slot for a name in one lookup. Every
+    /// global-object property path (`globalThis.x` reads and writes, its
+    /// descriptors, deletes and key listings) used to scan the whole table.
+    main_global_index: rustc_hash::FxHashMap<&'p str, u32>,
     /// Pool slots that deliberately have NO `eval_global_map` entry, by what
     /// they bind: a loaded module's own declarations (per-module, so two
     /// modules' same-named bindings never collide) and ShadowRealm names.

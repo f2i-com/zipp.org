@@ -373,7 +373,7 @@ impl<'p> Vm<'p> {
         if self.program.lexical_globals.is_empty() && self.eval_lexical_globals.is_empty() {
             return false;
         }
-        let slot = if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+        let slot = if let Some(i) = self.main_global_pos(name) {
             i as u32
         } else if let Some(&s) = self.eval_global_map.get(name) {
             s
@@ -401,7 +401,7 @@ impl<'p> Vm<'p> {
             }
             return None;
         }
-        if let Some(slot) = self.program.global_names.iter().position(|n| n == name) {
+        if let Some(slot) = self.main_global_pos(name) {
             // A never-declared slot reads as "absent"; fall through to the
             // built-in table below rather than exposing the internal sentinel.
             match self.globals.get(slot).copied() {
