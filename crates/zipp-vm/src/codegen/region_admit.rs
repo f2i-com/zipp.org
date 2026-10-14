@@ -18,6 +18,29 @@ env_off_switch! {
     fn iter_region_enabled() = "ZIPP_NO_ITER_REGION"
 }
 
+/// The statics a memory region answers with its own arm (one argument:
+/// `Promise.resolve` and the four `Number.is*` tests), rather than through
+/// `jit_static_fn_ic`. Tier C leaves a body holding one to the region, whose
+/// arm is the faster.
+pub(crate) fn static_fn_region_inline(op: crate::bytecode::StaticFn, argc: u16) -> bool {
+    use crate::bytecode::StaticFn as S;
+    argc == 1
+        && matches!(
+            op,
+            S::PromiseResolve
+                | S::NumberIsInteger
+                | S::NumberIsNaN
+                | S::NumberIsFinite
+                | S::NumberIsSafeInteger
+        )
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_STATICFN_JIT=1` declines a region or a Tier C body holding a
+    /// `StaticFn` other than the five inline ones again (the same-binary A/B).
+    fn static_fn_jit_enabled() = "ZIPP_NO_STATICFN_JIT"
+}
+
 env_off_switch! {
     /// `ZIPP_NO_GENERAL_ITER_REGION=1` declines a memory region holding the
     /// general iterator protocol or `ArrayCtor` again (the same-binary A/B).
@@ -817,17 +840,11 @@ pub(crate) fn region_op_admitted(
         // microtask) and deopts a heap argument to the interpreter's
         // identity/thenable protocol. Every other StaticFn keeps declining.
         Instr::StaticFn { op, argc, .. } => {
-            use crate::bytecode::StaticFn as S;
-            let ok = argc == 1
-                && matches!(
-                    op,
-                    S::PromiseResolve
-                        | S::NumberIsInteger
-                        | S::NumberIsNaN
-                        | S::NumberIsFinite
-                        | S::NumberIsSafeInteger
-                );
-            if !ok {
+            let inline = static_fn_region_inline(op, argc);
+            // Every other static (`Object.assign`, `String.fromCharCode`, …)
+            // runs the interpreter's arm through `jit_static_fn_ic`, with the
+            // call protocol. MEM path only.
+            if !inline && !(const_strs.is_some() && static_fn_jit_enabled()) {
                 reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
             }
         }

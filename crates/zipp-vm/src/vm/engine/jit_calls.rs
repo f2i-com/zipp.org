@@ -1181,6 +1181,56 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_static_fn_ic`]: the interpreter's
+    /// `StaticFn` arm for the instruction at `packed_fip` — the intrinsic
+    /// when the callee and receiver captured before the arguments are still
+    /// it (`static_fn_is_intrinsic`), else a call of that captured callee.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_static_fn_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let fid = (packed_fip >> 32) as u32;
+        let ip = (packed_fip as u32) as usize;
+        let crate::bytecode::Instr::StaticFn {
+            op,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } = self.func(fid as usize).code[ip]
+        else {
+            return SELF_CALL_DEOPT;
+        };
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        // Most of these allocate: the safe point precedes the operand reads
+        // (the window's Values are roots).
+        self.maybe_gc();
+        let callee = self.get(base, callee);
+        let this_v = self.get(base, this_v);
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.jit_call_depth += 1;
+        let r = if self.static_fn_is_intrinsic(op, callee, this_v) {
+            self.static_fn_exec(op, args)
+        } else {
+            self.call_value(callee, this_v, &args)
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_array_ctor_ic`]: the interpreter's
     /// `ArrayCtor` arm (a replaced `Array` is called or constructed through
     /// the ordinary value paths).

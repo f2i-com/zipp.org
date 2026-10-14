@@ -4091,146 +4091,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
-                        let v = match op {
-                            S::ArrayOf => Value::heap(self.heap.alloc(HeapObj::Array(args))),
-                            S::NumberIsInteger => Value::bool(num_is_integer(a0)),
-                            S::NumberIsNaN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
-                            S::NumberIsFinite => Value::bool(num_is_finite(a0)),
-                            S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
-                            S::StringFromCharCode => {
-                                // ToUint16(ToNumber(v)) per arg, in argument order;
-                                // adjacent (high, low) surrogate halves combine into
-                                // the astral scalar â€” see `string_from_char_codes`.
-                                let js = self.string_from_char_codes(&args)?;
-                                Value::heap(self.heap.alloc_js(js))
-                            }
-                            S::ObjectAssign => self.object_assign(&args)?,
-                            S::ObjectFromEntries => self.object_from_entries(a0)?,
-                            S::PromiseResolve => {
-                                // Promise.resolve(p) of an existing Promise is identity
-                                // ONLY when Get(p, "constructor") is still %Promise%
-                                // (PromiseResolve step 2) — a changed constructor gets
-                                // a fresh adopting promise.
-                                if a0.is_heap()
-                                    && matches!(
-                                        self.heap.get(a0.heap_index()),
-                                        HeapObj::Promise { .. }
-                                    )
-                                    && self.get_prop(a0, "constructor")?
-                                        == self.promise_ctor_value()
-                                {
-                                    a0
-                                } else if let Some(p) =
-                                    self.try_alloc_fulfilled_primitive_promise(a0)
-                                {
-                                    Value::heap(p)
-                                } else {
-                                    let p = self.alloc_promise();
-                                    if a0.is_heap() {
-                                        self.resolve_fresh_promise(p, a0);
-                                    } else {
-                                        self.resolve(p, a0);
-                                    }
-                                    Value::heap(p)
-                                }
-                            }
-                            S::PromiseReject => {
-                                let p = self.alloc_promise();
-                                self.reject(p, a0);
-                                Value::heap(p)
-                            }
-                            S::PromiseAll => {
-                                let c = self.promise_ctor_value();
-                                self.promise_combine(crate::heap::CombKind::All, a0, c)?
-                            }
-                            S::PromiseAllSettled => {
-                                let c = self.promise_ctor_value();
-                                self.promise_combine(crate::heap::CombKind::AllSettled, a0, c)?
-                            }
-                            S::PromiseRace => {
-                                let c = self.promise_ctor_value();
-                                self.promise_combine(crate::heap::CombKind::Race, a0, c)?
-                            }
-                            S::PromiseAny => {
-                                let c = self.promise_ctor_value();
-                                self.promise_combine(crate::heap::CombKind::Any, a0, c)?
-                            }
-                            S::ObjectDefineProperty => {
-                                // Type(O) must be Object — checked BEFORE
-                                // ToPropertyKey(P), whose toString may run.
-                                if !self.is_object_value(a0) {
-                                    return Err(Thrown(
-                                        "TypeError: Object.defineProperty called on non-object"
-                                            .into(),
-                                    ));
-                                }
-                                let key = self.to_property_key(
-                                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
-                                )?;
-                                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                                self.object_define_property(a0, &key, desc)?;
-                                a0
-                            }
-                            S::ObjectDefineProperties => {
-                                if !self.is_object_value(a0) {
-                                    return Err(Thrown(
-                                        "TypeError: Object.defineProperties called on non-object"
-                                            .into(),
-                                    ));
-                                }
-                                let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                                self.object_define_properties(a0, props)?;
-                                a0
-                            }
-                            S::ObjectGetOwnPropertyDescriptor => {
-                                self.require_object_coercible(a0)?; // ToObject(O)
-                                let o = self.to_object(a0)?;
-                                let key = self.to_property_key(
-                                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
-                                )?;
-                                self.defer_check(o, &key)?;
-                                self.ns_tdz_check(o, &key)?; // uninit export throws
-                                match self.proxy_gopd(o, &key)? {
-                                    Some(d) => d,
-                                    None => self.object_get_own_property_descriptor(o, &key),
-                                }
-                            }
-                            S::ObjectGetOwnPropertyNames => {
-                                self.require_object_coercible(a0)?; // ToObject(O)
-                                let o = self.to_object(a0)?;
-                                self.object_own_property_names(o)?
-                            }
-                            S::ObjectGetPrototypeOf => {
-                                self.require_object_coercible(a0)?; // ToObject(O)
-                                let o = self.to_object(a0)?;
-                                self.get_prototype_of_checked(o)?
-                            }
-                            S::ObjectCreate => {
-                                if a0 != Value::NULL && !self.is_object_value(a0) {
-                                    return Err(Thrown(
-                                        "TypeError: Object prototype may only be an Object or null"
-                                            .into(),
-                                    ));
-                                }
-                                let o = Value::heap(
-                                    self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))),
-                                );
-                                if a0 != Value::UNDEFINED {
-                                    self.proto_of.insert(o.heap_index(), a0);
-                                }
-                                if let Some(props) = args.get(1).copied() {
-                                    if props != Value::UNDEFINED {
-                                        // `o` is a Rust local across the descriptor
-                                        // getters (as in the OBJ_CREATE native).
-                                        self.with_host_roots(&[o], |vm| {
-                                            vm.object_define_properties(o, props)
-                                        })?;
-                                    }
-                                }
-                                o
-                            }
-                        };
+                        let v = self.static_fn_exec(op, args)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -9680,6 +9541,160 @@ impl<'p> Vm<'p> {
             self.regs[caller_base + finished.ret_dst as usize] = ret;
         }
         false
+    }
+
+    /// The intrinsic of a `StaticFn` instruction (`Object.assign`,
+    /// `Object.fromEntries`, `Array.of`, `String.fromCharCode`, the
+    /// `Number.is*` tests, the `Promise` statics, `Object.defineProperty` and
+    /// its siblings) applied to `args`, once the instruction's callee and
+    /// receiver are proven the intrinsic (`static_fn_is_intrinsic`). Shared by
+    /// the interpreter's arm and compiled code (`jit_static_fn_ic`).
+    pub(crate) fn static_fn_exec(
+        &mut self,
+        op: crate::bytecode::StaticFn,
+        args: Vec<Value>,
+    ) -> Result<Value, Thrown> {
+        use crate::bytecode::StaticFn as S;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        Ok(match op {
+            S::ArrayOf => Value::heap(self.heap.alloc(HeapObj::Array(args))),
+            S::NumberIsInteger => Value::bool(num_is_integer(a0)),
+            S::NumberIsNaN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
+            S::NumberIsFinite => Value::bool(num_is_finite(a0)),
+            S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
+            S::StringFromCharCode => {
+                // ToUint16(ToNumber(v)) per arg, in argument order;
+                // adjacent (high, low) surrogate halves combine into
+                // the astral scalar â€” see `string_from_char_codes`.
+                let js = self.string_from_char_codes(&args)?;
+                Value::heap(self.heap.alloc_js(js))
+            }
+            S::ObjectAssign => self.object_assign(&args)?,
+            S::ObjectFromEntries => self.object_from_entries(a0)?,
+            S::PromiseResolve => {
+                // Promise.resolve(p) of an existing Promise is identity
+                // ONLY when Get(p, "constructor") is still %Promise%
+                // (PromiseResolve step 2) — a changed constructor gets
+                // a fresh adopting promise.
+                if a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Promise { .. }
+                    )
+                    && self.get_prop(a0, "constructor")?
+                        == self.promise_ctor_value()
+                {
+                    a0
+                } else if let Some(p) =
+                    self.try_alloc_fulfilled_primitive_promise(a0)
+                {
+                    Value::heap(p)
+                } else {
+                    let p = self.alloc_promise();
+                    if a0.is_heap() {
+                        self.resolve_fresh_promise(p, a0);
+                    } else {
+                        self.resolve(p, a0);
+                    }
+                    Value::heap(p)
+                }
+            }
+            S::PromiseReject => {
+                let p = self.alloc_promise();
+                self.reject(p, a0);
+                Value::heap(p)
+            }
+            S::PromiseAll => {
+                let c = self.promise_ctor_value();
+                self.promise_combine(crate::heap::CombKind::All, a0, c)?
+            }
+            S::PromiseAllSettled => {
+                let c = self.promise_ctor_value();
+                self.promise_combine(crate::heap::CombKind::AllSettled, a0, c)?
+            }
+            S::PromiseRace => {
+                let c = self.promise_ctor_value();
+                self.promise_combine(crate::heap::CombKind::Race, a0, c)?
+            }
+            S::PromiseAny => {
+                let c = self.promise_ctor_value();
+                self.promise_combine(crate::heap::CombKind::Any, a0, c)?
+            }
+            S::ObjectDefineProperty => {
+                // Type(O) must be Object — checked BEFORE
+                // ToPropertyKey(P), whose toString may run.
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object.defineProperty called on non-object"
+                            .into(),
+                    ));
+                }
+                let key = self.to_property_key(
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                self.object_define_property(a0, &key, desc)?;
+                a0
+            }
+            S::ObjectDefineProperties => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object.defineProperties called on non-object"
+                            .into(),
+                    ));
+                }
+                let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                self.object_define_properties(a0, props)?;
+                a0
+            }
+            S::ObjectGetOwnPropertyDescriptor => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                let key = self.to_property_key(
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                )?;
+                self.defer_check(o, &key)?;
+                self.ns_tdz_check(o, &key)?; // uninit export throws
+                match self.proxy_gopd(o, &key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(o, &key),
+                }
+            }
+            S::ObjectGetOwnPropertyNames => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                self.object_own_property_names(o)?
+            }
+            S::ObjectGetPrototypeOf => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                let o = self.to_object(a0)?;
+                self.get_prototype_of_checked(o)?
+            }
+            S::ObjectCreate => {
+                if a0 != Value::NULL && !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object prototype may only be an Object or null"
+                            .into(),
+                    ));
+                }
+                let o = Value::heap(
+                    self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))),
+                );
+                if a0 != Value::UNDEFINED {
+                    self.proto_of.insert(o.heap_index(), a0);
+                }
+                if let Some(props) = args.get(1).copied() {
+                    if props != Value::UNDEFINED {
+                        // `o` is a Rust local across the descriptor
+                        // getters (as in the OBJ_CREATE native).
+                        self.with_host_roots(&[o], |vm| {
+                            vm.object_define_properties(o, props)
+                        })?;
+                    }
+                }
+                o
+            }
+        })
     }
 
     /// Render a thrown value for the UNCAUGHT-throw message (the `Outcome.error`

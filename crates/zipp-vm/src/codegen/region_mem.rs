@@ -4425,6 +4425,26 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
+            Instr::StaticFn { dst, op, argc, .. }
+                if !crate::codegen::static_fn_region_inline(op, argc) =>
+            {
+                // The general static: `jit_static_fn_ic` reads the
+                // instruction from the bytecode.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_static_fn_ic as usize,
+                    packed_fip,
+                    0,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::StaticFn {
                 dst,
                 op,

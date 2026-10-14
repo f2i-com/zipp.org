@@ -1225,6 +1225,30 @@ pub(crate) extern "win64" fn jit_iter_op_ic(
     })
 }
 
+/// Win64 helper for a `StaticFn` (`Object.assign`, `String.fromCharCode`,
+/// `Array.of`, `Object.fromEntries`, the `Promise` statics,
+/// `Object.defineProperty` and its siblings) in a compiled region or Tier C
+/// body: the interpreter's arm for the instruction at `packed_fip`, read
+/// from the function's bytecode. A replaced static is called, and several
+/// intrinsics run user code (getters, setters, thenables, a Proxy's
+/// traps), so the call protocol applies.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_static_fn_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    _packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_static_fn_impl(caller_base_ptr, packed_fip)
+    })
+}
+
 /// Win64 helper for `ArrayCtor` (`Array(...)`, `new Array(...)`, and the
 /// engine's own array creation) in a compiled region: the interpreter's arm
 /// (`packed_args` = `callee | arg_base << 16 | is_construct << 32`, callee

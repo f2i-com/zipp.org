@@ -1328,6 +1328,19 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
             // `new F(…)`: the construct helper, with the call protocol.
             Instr::New { .. } => {}
+            // `Object.assign(…)` and the other statics: the interpreter's
+            // arm through `jit_static_fn_ic`, with the call protocol.
+            Instr::StaticFn { op, argc, .. } => {
+                if !crate::codegen::static_fn_jit_enabled() {
+                    reject!("[tierC-reject] op StaticFn (disabled)");
+                }
+                // `Promise.resolve(x)` and the `Number.is*` tests: a loop of
+                // them runs as a region, whose own arm is faster than this
+                // helper (a whole-body compile made such a loop 40% slower).
+                if crate::codegen::static_fn_region_inline(op, argc) {
+                    reject!("[tierC-reject] op StaticFn {op:?} (the region's)");
+                }
+            }
             // `v instanceof c`: the operator's helper, with the call protocol.
             Instr::InstanceOfDyn { .. } => {}
             // `${v}`: the conversion's helper, with the call protocol.
@@ -1759,6 +1772,17 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 argc,
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
             Instr::InstanceOfDyn { dst, val, ctor } => (u2(val, ctor), Some(dst)),
+            Instr::StaticFn {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } => (
+                Uses::range(arg_base, argc).plus(callee).plus(this_v),
+                Some(dst),
+            ),
             Instr::ToStr { dst, a } => (u1(a), Some(dst)),
             Instr::LoadClassValue { dst, .. } => (u0(), Some(dst)),
             Instr::CallWithThis {
@@ -5887,6 +5911,24 @@ pub(crate) fn compile_proto_mem(
                     crate::vm::jit_instanceof_ic as usize,
                     packed_fip,
                     packed_args,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::StaticFn { dst, .. } => {
+                // A static through `jit_static_fn_ic`, which reads the
+                // instruction from the bytecode; see the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_static_fn_ic as usize,
+                    packed_fip,
+                    0,
                     0,
                     dst,
                     refetch,
