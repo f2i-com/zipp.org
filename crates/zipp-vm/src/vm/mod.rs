@@ -2826,6 +2826,10 @@ pub struct Vm<'p> {
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
     /// value), which roots the function, so no entry outlives it.
     fn_proto_readonly: std::collections::HashSet<u32>,
+    /// `object_proto_native_resolves`'s memo for `hasOwnProperty`,
+    /// `propertyIsEnumerable` and `isPrototypeOf`: (receiver shape,
+    /// %Object.prototype% version, slot).
+    objproto_method_memo: [(u32, u32, u32); 3],
     /// Heap indices of `[[IsHTMLDDA]]` exotic objects (`$262.IsHTMLDDA`, the
     /// `document.all` emulation): `typeof` is "undefined", loose `== null`/`==
     /// undefined` is true, ToBoolean is false, and calling it returns undefined —
