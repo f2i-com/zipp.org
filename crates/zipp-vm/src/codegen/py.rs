@@ -1075,6 +1075,13 @@ pub(crate) fn emit_py_op(
             let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
             emit_py_step_with(ops, crate::vm::Vm::jit_py_call as usize, func_id, ip, Some(regs), labels, refetch);
         }
+        // A raise: through `Vm::jit_py_raise` with the operands packed, the
+        // step's own `py_raise_step` without the instruction found and
+        // decoded again; the same outcomes as `jit_py_op`'s.
+        Instr::PyRaise { e, rt, catch, .. } if !crate::vm::prof_py::on() && py_raise_helper_enabled() => {
+            let regs = e as u64 | (rt as u64) << 16 | (catch as u64) << 32;
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_raise as usize, func_id, ip, Some(regs), labels, refetch);
+        }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
         Instr::PyGetAttr { .. } | Instr::PySetAttr { .. } => {
@@ -1449,6 +1456,12 @@ env_off_switch! {
     /// out-of-line blocks (every slow path then exits the region), the
     /// same-binary A/B for [`py_region_members`]'s extension.
     fn py_region_ext_enabled() = "ZIPP_NO_PY_REGION_EXT"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_PY_RAISE_HELPER=1` compiles a `PyRaise` to `Vm::jit_py_op`,
+    /// as before (the same-binary A/B for `Vm::jit_py_raise`).
+    fn py_raise_helper_enabled() = "ZIPP_NO_PY_RAISE_HELPER"
 }
 
 env_off_switch! {

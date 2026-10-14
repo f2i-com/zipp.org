@@ -395,56 +395,7 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
-            Instr::PyRaise { e, rt, slow, catch } => {
-                let (ev, rv) = (self.get(base, e), self.get(base, rt));
-                let Some((ctx_slot, tb_slot, cur)) = self.py_raise_plan(ev, rv) else {
-                    return Ok(slow as usize);
-                };
-                let idx = ev.heap_index();
-                // Raising an exception some frame caught (its `tbfn` set):
-                // `R.raise` first records that frame's traceback entry.
-                if self.py_exc_caught(idx) {
-                    return Ok(slow as usize);
-                }
-                if let Some(cur) = cur {
-                    if cur.bits() != ev.bits() {
-                        if cur.is_heap() {
-                            self.heap.write_barrier_val(idx, cur);
-                        }
-                        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                            m.set_val_at(ctx_slot, cur);
-                        }
-                    }
-                }
-                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.set_val_at(tb_slot, Value::int(-1));
-                }
-                // As `Throw`: the frame's ip kept coherent, the value thrown.
-                // The message is left empty: `run_loop` builds it from the
-                // pending value, which nothing changes before then, when the
-                // throw leaves the loop uncaught (a caught one never reads it).
-                let top = self.frames.len() - 1;
-                self.frames[top].ip = ip;
-                // The frame's own innermost handler is the catch handler the
-                // instruction names: caught here, as `unwind_to_handler`
-                // catches a throw in the frame that raised it (the handler
-                // popped, the frame's line noted, the exception in the
-                // handler's register), without leaving the dispatch loop.
-                if let Some(&Handler::Catch { target, reg }) = self.frames[top].handlers.last() {
-                    if target == catch {
-                        self.frames[top].handlers.pop();
-                        if self.py_unwind_candidate(top) {
-                            self.py_unwind_frame(top, true, ev, true);
-                        }
-                        let fbase = self.frames[top].base;
-                        self.regs[fbase + reg as usize] = ev;
-                        self.frames[top].ip = target as usize;
-                        return Ok(target as usize);
-                    }
-                }
-                self.pending_throw = Some(ev);
-                return Err(Thrown(String::new()));
-            }
+            Instr::PyRaise { e, rt, slow, catch } => return self.py_raise_step(base, ip, e, rt, slow, catch),
             Instr::PyCaught { dst, e, line, rt, slow } => {
                 let (ev, lv, rv) = (self.get(base, e), self.get(base, line), self.get(base, rt));
                 if !self.py_caught(ev, lv, rv) {
@@ -1483,6 +1434,62 @@ impl<'p> Vm<'p> {
         let shape = m.shape();
         let slot = if shape != crate::shape::DICT && exc_shape == Some(shape) { Some(7) } else { m.pos("tbfn") };
         slot.is_none_or(|s| m.val_at(s) != Value::NULL)
+    }
+
+    /// [`Instr::PyRaise`] (see the instruction): its step, for the
+    /// interpreter's `py_step_ext` and compiled code's `jit_py_raise`. The
+    /// next ip (`slow`, or `catch` when the frame's own innermost handler is
+    /// that catch handler), or the throw (pending).
+    #[inline(never)]
+    pub(super) fn py_raise_step(&mut self, base: usize, ip: usize, e: u16, rt: u16, slow: u32, catch: u32) -> Result<usize, Thrown> {
+        let (ev, rv) = (self.get(base, e), self.get(base, rt));
+        let Some((ctx_slot, tb_slot, cur)) = self.py_raise_plan(ev, rv) else {
+            return Ok(slow as usize);
+        };
+        let idx = ev.heap_index();
+        // Raising an exception some frame caught (its `tbfn` set):
+        // `R.raise` first records that frame's traceback entry.
+        if self.py_exc_caught(idx) {
+            return Ok(slow as usize);
+        }
+        if let Some(cur) = cur {
+            if cur.bits() != ev.bits() {
+                if cur.is_heap() {
+                    self.heap.write_barrier_val(idx, cur);
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.set_val_at(ctx_slot, cur);
+                }
+            }
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(tb_slot, Value::int(-1));
+        }
+        // As `Throw`: the frame's ip kept coherent, the value thrown.
+        // The message is left empty: `run_loop` builds it from the
+        // pending value, which nothing changes before then, when the
+        // throw leaves the loop uncaught (a caught one never reads it).
+        let top = self.frames.len() - 1;
+        self.frames[top].ip = ip;
+        // The frame's own innermost handler is the catch handler the
+        // instruction names: caught here, as `unwind_to_handler`
+        // catches a throw in the frame that raised it (the handler
+        // popped, the frame's line noted, the exception in the
+        // handler's register), without leaving the dispatch loop.
+        if let Some(&Handler::Catch { target, reg }) = self.frames[top].handlers.last() {
+            if target == catch {
+                self.frames[top].handlers.pop();
+                if self.py_unwind_candidate(top) {
+                    self.py_unwind_frame(top, true, ev, true);
+                }
+                let fbase = self.frames[top].base;
+                self.regs[fbase + reg as usize] = ev;
+                self.frames[top].ip = target as usize;
+                return Ok(target as usize);
+            }
+        }
+        self.pending_throw = Some(ev);
+        return Err(Thrown(String::new()));
     }
 
     /// For [`Instr::PyRaise`]: the slots to write and the current exception
