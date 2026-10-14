@@ -122,10 +122,14 @@ def _unbind(x, dim=0):
     hub.requires_grad = True
     hub._node = torch._Node(hub_backward, (x,), "UnbindBackward0")
 
+    # The hub reads only `slots`: the gradient each piece hands it just
+    # makes it run, so they share one zero instead of building their own.
+    zero = torch.zeros((), dtype=x.dtype)
+
     def report(i):
         def backward(g):
             slots[i] = g if slots[i] is None else slots[i] + g
-            return (torch.zeros((), dtype=g.dtype),)
+            return (zero,)
         return backward
     for i, p in enumerate(pieces):
         p.requires_grad = True

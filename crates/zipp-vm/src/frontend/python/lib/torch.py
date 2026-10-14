@@ -5684,6 +5684,22 @@ def cat(tensors, dim=0):
 
         def backward(g):
             grads, start = [], 0
+            if not _grad_enabled and g.__class__ is Tensor:
+                # Each piece is `narrow(g, d, start, s)`'s slice, taken by
+                # the kernel directly (nothing to record outside
+                # create_graph; the starts and sizes are in range).
+                rank = len(g.shape)
+                whole = (None, None, None)
+                for t_, s in zip(tensors, sizes):
+                    if t_.requires_grad:
+                        spec = [whole] * rank
+                        spec[d] = (start, start + s, None)
+                        storage, shape = _k.slice(g._s, g.shape, spec)
+                        grads.append(Tensor(storage, shape, g.dtype))
+                    else:
+                        grads.append(None)
+                    start += s
+                return _tuple(grads)
             for t_, s in zip(tensors, sizes):
                 grads.append(narrow(g, d, start, s) if t_.requires_grad else None)
                 start += s
