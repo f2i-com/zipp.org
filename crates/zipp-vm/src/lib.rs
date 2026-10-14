@@ -355,6 +355,13 @@ pub fn async_inline_await_stats() -> u64 {
     vm::async_inline_await_stats()
 }
 
+/// Number of promise reaction jobs the drain ran over a shared job window
+/// (a run of jobs calling one compiled int-tier callback) while
+/// `ZIPP_ASYNCSTATS=1` is active.
+pub fn async_job_window_stats() -> u64 {
+    vm::async_job_window_stats()
+}
+
 /// `ZIPP_ICSTATS=1` HTMLDDA membership counters:
 /// `(scalar_mirror_checks, fallback_set_checks)`. The second counter is nonzero
 /// only when `ZIPP_NO_HTMLDDA_SCALAR=1` restores the incumbent HashSet lookup.

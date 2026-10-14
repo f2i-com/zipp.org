@@ -102,6 +102,21 @@ mod asyncstats {
         }
     }
 
+    static JOB_WINDOW_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    /// One reaction job run over the shared job window (`run_job_windowed`).
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub(super) fn job_window_call() {
+        if enabled() {
+            JOB_WINDOW_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump_job_window_calls() -> u64 {
+        JOB_WINDOW_CALLS.load(Ordering::Relaxed)
+    }
+
     static REUSE_ON: AtomicU8 = AtomicU8::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
@@ -139,6 +154,7 @@ mod asyncstats {
 
 pub use asyncstats::dump as async_stats;
 pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
+pub use asyncstats::dump_job_window_calls as async_job_window_stats;
 
 /// Collapse the next already-settled await job into the current AsyncResume job
 /// when no older microtask is waiting. A bounded trampoline preserves FIFO job
@@ -240,6 +256,79 @@ pub(super) fn promise_resolve_direct_enabled() -> bool {
             v == 1
         }
     }
+}
+
+/// `ZIPP_NO_PROMISE_CAPABILITY_DIRECT=1` makes NewPromiseCapability(%Promise%)
+/// construct the promise through its executor again (see
+/// `intrinsic_promise_capability`). The two sides of a one-binary A/B.
+#[inline]
+fn promise_capability_direct_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_CAPABILITY_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_COMBINATOR_LEAN=1` restores the per-call work of the intrinsic
+/// combinators that this switch's paths skip when it cannot be observed:
+/// GetIterator's `@@iterator` Get on a plain array, GetPromiseResolve's Get of
+/// `%Promise%.resolve`, and the call of the result capability's own resolve
+/// function when the result settles. The two sides of a one-binary A/B.
+#[inline]
+fn combinator_lean_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_COMBINATOR_LEAN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
+/// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn job_window_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JOB_WINDOW").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// The register window a run of reaction jobs calling one compiled callback
+/// shares (`Vm::run_job_windowed`): the callback, its native entry and where
+/// the window starts in the register file.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+struct JobWindow {
+    callee: Value,
+    native: super::misc_methods::NativeCb,
+    at: usize,
 }
 
 /// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
@@ -1056,7 +1145,17 @@ impl<'p> Vm<'p> {
     /// function of the pair fires, false (spec no-op) for every later call.
     /// `pair == 0` (untracked internal resolvers) always fires.
     pub(crate) fn resolver_pair_fire(&mut self, pair: u32) -> bool {
-        pair == 0 || self.resolved_pairs.insert(pair)
+        if pair == 0 {
+            return true;
+        }
+        let (word, bit) = ((pair >> 6) as usize, 1u64 << (pair & 63));
+        if word >= self.resolved_pairs.len() {
+            self.resolved_pairs.resize(word + 1, 0);
+        }
+        let w = &mut self.resolved_pairs[word];
+        let first = *w & bit == 0;
+        *w |= bit;
+        first
     }
 
     /// True when adopting `value` (a native promise) into a resolution can skip
@@ -1469,7 +1568,7 @@ impl<'p> Vm<'p> {
             // object with a callable `then` is adopted — defer
             // `then.call(value, resolveFn, rejectFn)` to a microtask (spec ordering).
             // A throwing `then` GETTER rejects the promise.
-            if self.is_object_value(value) {
+            if self.is_object_value(value) && !self.array_then_absent(value) {
                 let then = match self.get_prop(value, "then") {
                     Ok(t) => t,
                     Err(Thrown(msg)) => {
@@ -1494,6 +1593,55 @@ impl<'p> Vm<'p> {
             }
         }
         self.settle(p, PromiseState::Fulfilled, value);
+    }
+
+    /// Whether `Get(v, "then")` is `undefined` without running anything: `v`
+    /// is an array with no own named property and its default prototype, and
+    /// neither %Array.prototype% nor %Object.prototype% (the rest of its
+    /// chain) has a `then`. Resolving a promise with an array (a
+    /// `Promise.all` result, an async function's `return [a, b]`) then
+    /// fulfills it directly instead of walking that chain for a key it never
+    /// finds. The chain is proven once and trusted while the two prototypes'
+    /// heap versions hold: adding, deleting or redefining a key, or replacing
+    /// a [[Prototype]], bumps them. One realm only, and not under
+    /// `ZIPP_NO_COMBINATOR_LEAN=1`.
+    fn array_then_absent(&mut self, v: Value) -> bool {
+        let idx = v.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || !combinator_lean_enabled()
+            || !self.realm_global_objs.is_empty()
+            || self.arr_props.contains_key(&idx)
+            || self.proto_of.contains_key(&idx)
+        {
+            return false;
+        }
+        let (a, o) = (self.arr_proto, self.obj_proto);
+        if a == 0 || o == 0 {
+            return false;
+        }
+        let versions = (
+            self.heap.version_of(a).wrapping_add(1),
+            self.heap.version_of(o).wrapping_add(1),
+        );
+        // A version at u32::MAX reads as 0, which is never a recorded proof.
+        if versions.0 != 0 && versions.1 != 0 && self.array_then_memo == versions {
+            return true;
+        }
+        let no_then = |vm: &Self, i: u32| {
+            !vm.arr_props.contains_key(&i)
+                && matches!(vm.heap.get(i), HeapObj::Object(m) if m.pos("then").is_none())
+        };
+        if !no_then(self, a)
+            || !no_then(self, o)
+            || self.proxy_parts(a).is_some()
+            || self.proxy_parts(o).is_some()
+            || self.object_get_prototype_of(Value::heap(a)) != Value::heap(o)
+            || self.object_get_prototype_of(Value::heap(o)) != Value::NULL
+        {
+            return false;
+        }
+        self.array_then_memo = versions;
+        true
     }
 
     pub(crate) fn reject(&mut self, p: u32, reason: Value) {
@@ -2656,6 +2804,9 @@ impl<'p> Vm<'p> {
         &mut self,
         c: Value,
     ) -> Result<(Value, Value, Value), Thrown> {
+        if let Some(cap) = self.intrinsic_promise_capability(c) {
+            return Ok(cap);
+        }
         if !self.is_constructor(c) {
             return Err(Thrown::from_static(
                 "TypeError: NewPromiseCapability requires a constructor",
@@ -2683,6 +2834,87 @@ impl<'p> Vm<'p> {
             ));
         }
         Ok((promise, resolve, reject))
+    }
+
+    /// NewPromiseCapability(%Promise%) without the construction: the promise
+    /// and its two resolving functions, allocated directly, exactly as
+    /// `new Promise(executor)` makes them for its executor. `None` for any
+    /// other `c`, with another realm alive, or under
+    /// `ZIPP_NO_PROMISE_CAPABILITY_DIRECT=1`.
+    ///
+    /// Nothing the construction did is observable for the intrinsic: its
+    /// OrdinaryCreateFromConstructor reads `%Promise%.prototype`, which is
+    /// non-writable and non-configurable, and the executor it passes is the
+    /// built-in GetCapabilitiesExecutor, which only records the two functions.
+    /// The construction cost an executor object, a `construct` through the
+    /// generic constructor dispatch and a call of the executor: a third of a
+    /// `Promise.all` of one element.
+    #[inline]
+    fn intrinsic_promise_capability(&mut self, c: Value) -> Option<(Value, Value, Value)> {
+        if !c.is_heap()
+            || self.promise_ctor_intrinsic == 0
+            || c.heap_index() != self.promise_ctor_intrinsic
+            || !self.realm_global_objs.is_empty()
+            || self.active_realm.is_some()
+            || self.native_callee_realm.is_some()
+            || !promise_capability_direct_enabled()
+        {
+            return None;
+        }
+        // `alloc` never collects: the promise needs no root until it is
+        // returned.
+        let promise = self.alloc_promise();
+        let pair = self.new_resolver_pair();
+        let resolve = self.heap.alloc(HeapObj::BoundResolver {
+            promise,
+            is_reject: false,
+            pair,
+        });
+        let reject = self.heap.alloc(HeapObj::BoundResolver {
+            promise,
+            is_reject: true,
+            pair,
+        });
+        Some((
+            Value::heap(promise),
+            Value::heap(resolve),
+            Value::heap(reject),
+        ))
+    }
+
+    /// `Get(%Promise%, "resolve")` when it is an own data property, read from
+    /// its slot: `None` for any other `ctor`, an accessor, an absent key, with
+    /// another realm alive, or under `ZIPP_NO_COMBINATOR_LEAN=1` (the caller
+    /// then makes the Get). A data property's Get runs nothing and returns
+    /// the slot's value; the slot is found once and trusted while %Promise%'s
+    /// heap version holds (a key added, deleted or redefined bumps it, an
+    /// in-place write changes only the value read here).
+    fn promise_ctor_resolve_get(&mut self, ctor: Value) -> Option<Value> {
+        let c = self.promise_ctor_intrinsic;
+        if c == 0
+            || !ctor.is_heap()
+            || ctor.heap_index() != c
+            || !self.realm_global_objs.is_empty()
+            || !combinator_lean_enabled()
+        {
+            return None;
+        }
+        let ver = self.heap.version_of(c).wrapping_add(1);
+        let HeapObj::Object(m) = self.heap.get(c) else {
+            return None;
+        };
+        let (memo_ver, memo_slot) = self.promise_resolve_memo;
+        let slot = if ver != 0 && memo_ver == ver && (memo_slot as usize) < m.vals_len() {
+            memo_slot as usize
+        } else {
+            let slot = m.pos("resolve")?;
+            self.promise_resolve_memo = (ver, slot as u32);
+            slot
+        };
+        if m.is_accessor_at(slot) {
+            return None;
+        }
+        Some(m.val_at(slot))
     }
 
     /// The `Promise` constructor value, for the lowered `Promise.all/race/...`
@@ -2754,7 +2986,9 @@ impl<'p> Vm<'p> {
         // `Promise.resolve` is visible, and a non-callable resolve rejects). When C
         // isn't a usable object we fall back to internal coercion. An abrupt Get or
         // a non-callable resolve rejects the result (IfAbruptRejectPromise).
-        let promise_resolve = if self.is_object_value(ctor) {
+        let promise_resolve = if let Some(r) = self.promise_ctor_resolve_get(ctor) {
+            Some(r)
+        } else if self.is_object_value(ctor) {
             match self.get_prop(ctor, "resolve") {
                 Ok(r) => Some(r),
                 Err(Thrown(msg)) => {
@@ -2844,8 +3078,20 @@ impl<'p> Vm<'p> {
         // GetIterator(iterable): invoke @@iterator to obtain a REAL iterator object
         // (not the array fast-path, which `get_iterator` returns un-stepped) so the
         // lazy step + IteratorClose below work. A non-callable @@iterator / abrupt →
-        // reject (IfAbruptRejectPromise).
-        let iter_method = match self.get_prop(iterable, "@@iterator") {
+        // reject (IfAbruptRejectPromise). The Get reads nothing a program can
+        // see for an array with no own properties and its default prototype,
+        // whose `@@iterator` is still the default data method
+        // (`builtin_iter_fast`, a version memo): that method stands in for it.
+        let iter_get_unobservable = iterable.is_heap()
+            && matches!(self.heap.get(iterable.heap_index()), HeapObj::Array(_))
+            && combinator_lean_enabled()
+            && self.builtin_iter_fast(iterable, true);
+        let iter_method = if iter_get_unobservable {
+            Ok(self.default_array_iter)
+        } else {
+            self.get_prop(iterable, "@@iterator")
+        };
+        let iter_method = match iter_method {
             Ok(m) if self.is_callable(m) => m,
             Ok(_) => {
                 let disp = self.display(iterable);
@@ -2884,10 +3130,12 @@ impl<'p> Vm<'p> {
             // inherited indexed accessors, and the full live Array length.
             && !self.array_js_len.contains_key(&iterable.heap_index())
             && iter_method.bits() == self.default_array_iter.bits()
-            && match self.heap.get(self.array_iter_proto) {
-                HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
-                _ => false,
-            };
+            // `builtin_iter_fast` proved `next` pristine with the method.
+            && (iter_get_unobservable
+                || match self.heap.get(self.array_iter_proto) {
+                    HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+                    _ => false,
+                });
         let mut fast_pos: Option<usize> = if arr_fast { Some(0) } else { None };
         let mut iter = Value::UNDEFINED;
         if !arr_fast {
@@ -3241,8 +3489,14 @@ impl<'p> Vm<'p> {
         if remaining != 0 || ckind == CombKind::Race {
             return;
         }
-        let (collected, comb_keys) = match self.heap.get(comb) {
-            HeapObj::Combinator(__c) => (__c.results.clone(), __c.keys.clone()),
+        // The combinator is done: `remaining` reached 0 once, with every
+        // element recorded, and a later element call finds its index settled
+        // and returns before it reads these. Moved out, not copied.
+        let (collected, comb_keys) = match self.heap.get_mut(comb) {
+            HeapObj::Combinator(__c) => (
+                std::mem::take(&mut __c.results),
+                std::mem::take(&mut __c.keys),
+            ),
             _ => return,
         };
         // Settle THROUGH the result capability (per spec): Any rejects with an
@@ -3270,6 +3524,22 @@ impl<'p> Vm<'p> {
             }
             _ => {
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
+                // The intrinsic capability's resolve is a resolving function:
+                // calling it is its [[AlreadyResolved]] check and Resolve,
+                // which is all `call_value` would reach after its dispatch.
+                if combinator_lean_enabled() && cap_resolve.is_heap() {
+                    if let HeapObj::BoundResolver {
+                        promise,
+                        is_reject: false,
+                        pair,
+                    } = *self.heap.get(cap_resolve.heap_index())
+                    {
+                        if self.resolver_pair_fire(pair) {
+                            self.resolve(promise, arr);
+                        }
+                        return;
+                    }
+                }
                 if let Err(Thrown(msg)) = self.call_value(cap_resolve, Value::UNDEFINED, &[arr]) {
                     self.combinator_reject_on_resolve_throw(cap_reject, msg);
                 }
@@ -3436,7 +3706,69 @@ impl<'p> Vm<'p> {
         self.drive_async_inner(idx, input, true);
     }
 
+    /// Every drive installs its own settled-await state (`async_inline_frame`,
+    /// `async_inline_budget`) and puts back the one it found: an activation
+    /// driven from inside another's run (an async call, a nested drain) must
+    /// neither inherit nor consume the outer one's.
     fn drive_async_inner(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
+        let saved = (self.async_inline_frame, self.async_inline_budget);
+        self.async_inline_frame = usize::MAX;
+        self.async_inline_budget = 0;
+        self.drive_async_body(idx, input, allow_trampoline);
+        self.async_inline_frame = saved.0;
+        self.async_inline_budget = saved.1;
+    }
+
+    /// The value an `Await` at frame `frame_idx` continues with in place, or
+    /// `None` to suspend. `v` is what PromiseResolve gave the `Await` arm. Only
+    /// the activation `drive_async_inner` marked (`async_inline_frame`), with
+    /// budget left and the microtask queue empty, continues.
+    ///
+    /// Await(v) is PerformPromiseThen on PromiseResolve(%Promise%, v) and a
+    /// return to the job that resumed the activation. For a promise already
+    /// fulfilled, or a primitive (which PromiseResolve wraps in a promise
+    /// fulfilled with it, with no `then` lookup), that enqueues the
+    /// activation's resume job at once and nothing else; with the queue empty
+    /// the job is the next one the drain runs, and the drain does nothing
+    /// observable between two jobs. So running the job's work here, at the
+    /// await, is the same execution: the trampoline in `drive_async_body`
+    /// already ran it one step later, after popping and re-pushing the frame.
+    /// A rejected promise, a pending one and any object (a thenable's `then`
+    /// is a Get) suspend as before.
+    #[inline]
+    pub(crate) fn await_continue_in_place(&mut self, frame_idx: usize, v: Value) -> Option<Value> {
+        if frame_idx != self.async_inline_frame
+            || self.async_inline_budget == 0
+            || !self.microtasks.is_empty()
+        {
+            return None;
+        }
+        let r = self.await_settled_inline(v)?;
+        self.async_inline_budget -= 1;
+        asyncstats::inline_await();
+        Some(r)
+    }
+
+    /// The settled value of `v` for [`Self::await_continue_in_place`].
+    #[inline]
+    fn await_settled_inline(&self, v: Value) -> Option<Value> {
+        if !v.is_heap() {
+            return Some(v);
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Promise {
+                state: PromiseState::Fulfilled,
+                result,
+                ..
+            } => Some(*result),
+            HeapObj::Promise { .. } => None,
+            // A heap primitive (a string, symbol or BigInt) as a number is.
+            _ if !self.is_object_value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn drive_async_body(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
         let (state, fid, closure, result, callee) = match self.heap.get(idx) {
             HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result, a.callee),
             _ => return,
@@ -3474,12 +3806,16 @@ impl<'p> Vm<'p> {
         let mut resume_handlers = saved_handlers;
         // Periodically re-queue even when the queue stays empty. This restores a
         // GC checkpoint for allocation-heavy loops without giving up the common
-        // settled-promise fast path.
-        let mut inline_budget = if allow_trampoline && async_settled_trampoline_enabled() {
-            1024usize
-        } else {
-            0
-        };
+        // settled-promise fast path. The `Await` arm continues a settled await
+        // in place while the activation's frame is `stop` (see
+        // `await_continue_in_place`); the loop below catches the ones it
+        // leaves. The mark is set only while that frame runs: once it is
+        // popped, `to_promise` and `resolve` can run a `then` getter whose
+        // own frames (an async generator's body) start at `stop` again.
+        let armed = allow_trampoline && async_settled_trampoline_enabled();
+        if armed {
+            self.async_inline_budget = 1024;
+        }
         // The activation owns and traces its immutable callee. Reuse the
         // captured identity for every resumed frame, without a side-table lookup.
         let outcome = loop {
@@ -3504,6 +3840,9 @@ impl<'p> Vm<'p> {
             });
             // A mapped `arguments` object aliases every resumed frame window.
             self.relink_mapped_args(idx, stop, new_base);
+            if armed {
+                self.async_inline_frame = stop;
+            }
             // Position the resume point and deliver the awaited value/rejection.
             let outcome = if resume_ip == usize::MAX {
                 self.run_loop(stop)
@@ -3530,11 +3869,15 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            self.async_inline_frame = usize::MAX;
             let Some((awaited, await_ip, handlers)) = self.pending_await.take() else {
                 break outcome;
             };
 
-            let settled = if inline_budget != 0 && self.microtasks.is_empty() && awaited.is_heap() {
+            let settled = if self.async_inline_budget != 0
+                && self.microtasks.is_empty()
+                && awaited.is_heap()
+            {
                 match self.heap.get(awaited.heap_index()) {
                     HeapObj::Promise {
                         state: PromiseState::Fulfilled,
@@ -3559,7 +3902,7 @@ impl<'p> Vm<'p> {
                         *handled = true;
                     }
                 }
-                inline_budget -= 1;
+                self.async_inline_budget -= 1;
                 asyncstats::inline_await();
                 resume_ip = await_ip;
                 resume_input = next_input;
@@ -3816,7 +4159,15 @@ impl<'p> Vm<'p> {
         // job. WeakRef targets kept during it may now be cleared before the
         // first queued job starts.
         self.finish_weak_job();
+        // A run of reaction jobs calling the same compiled callback (a
+        // `.then(f)` chain) shares one register window: see `run_job_windowed`.
+        let mut window: Option<JobWindow> = None;
+        // The callback of the last reaction job the window path looked at.
+        let mut last_callback = 0u64;
         while let Some(t) = self.microtasks.pop_front() {
+            // The job leaves from the front: one fewer job from before the
+            // last collection, if it was one (`microtasks_old`).
+            self.microtasks_old = self.microtasks_old.saturating_sub(1);
             // B214: the popped task's Values are kept reachable by ROOTING a
             // copy in `current_microtask` (traced by mark_roots) instead of
             // suspending GC for the task's whole scope — a top-level-await
@@ -3829,15 +4180,115 @@ impl<'p> Vm<'p> {
             // callers (map/forEach) rely on.
             if crate::vm::microtask_root_enabled() {
                 let prev = self.current_microtask.replace(t.clone());
-                self.run_microtask(t);
+                if !self.run_job_windowed(&t, &mut window, &mut last_callback) {
+                    self.close_job_window(&mut window);
+                    self.run_microtask(t);
+                }
                 self.current_microtask = prev;
             } else {
+                self.close_job_window(&mut window);
                 // The pre-B214 comparator: suspend GC for the task's scope.
                 let _gc = self.gc_lock_guard();
                 self.run_microtask(t);
             }
             // Between microtasks no un-rooted local survives, so reclaim now.
             self.finish_weak_job();
+        }
+        self.close_job_window(&mut window);
+    }
+
+    /// Run a reaction job whose callback is a plain function the int tier
+    /// compiled, over a register window kept open across consecutive jobs
+    /// calling the same callback, as `Array.prototype.forEach` runs its
+    /// callback (`open_cb_window`, `run_cb_elem`). `false`, having done
+    /// nothing, for any other job: the caller closes the window and runs it
+    /// as before. Off under `ZIPP_NO_JOB_WINDOW=1`.
+    ///
+    /// The call is the job's `Call(handler, undefined, «argument»)` exactly:
+    /// `native_cb_entry` binds `this` as OrdinaryCallBindThis does, a bail
+    /// past the entry resumes the body on a frame of its own, and a throw
+    /// rejects the dependent as `run_microtask` does. Only an int-tier body
+    /// already compiled is taken: it calls no helper that needs a frame
+    /// under it (the drain has none), and a cold callback is not compiled
+    /// early. Between two jobs the window's registers are ordinary GC roots
+    /// holding the last call's values; each call resets them first.
+    fn run_job_windowed(
+        &mut self,
+        t: &Microtask,
+        window: &mut Option<JobWindow>,
+        last: &mut u64,
+    ) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            let Microtask::Reaction {
+                callback,
+                arg,
+                dependent,
+                finally: false,
+                ..
+            } = *t
+            else {
+                return false;
+            };
+            if !callback.is_heap() || !job_window_enabled() {
+                return false;
+            }
+            let reuse = matches!(window, Some(w) if w.callee.bits() == callback.bits());
+            if !reuse {
+                // Open one for the second job in a row calling this callback:
+                // a callback a single job calls (a chain of different
+                // handlers, a fresh closure per link) runs as before, with no
+                // window to open and close around it, which costs more than
+                // the ordinary call.
+                let repeat = *last == callback.bits();
+                *last = callback.bits();
+                if !repeat {
+                    return false;
+                }
+                let fid = match self.heap.get(callback.heap_index()) {
+                    HeapObj::Func(f) => *f,
+                    HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
+                    _ => return false,
+                };
+                if !self.jit.get(fid).is_some_and(|body| body.int_tier()) {
+                    return false;
+                }
+                self.close_job_window(window);
+                let (native, at) = self.open_cb_window(callback, Value::UNDEFINED);
+                let Some(native) = native else {
+                    return false;
+                };
+                *window = Some(JobWindow {
+                    callee: callback,
+                    native,
+                    at,
+                });
+            }
+            let Some(w) = *window else {
+                return false;
+            };
+            asyncstats::job_window_call();
+            match self.run_cb_elem(&Some(w.native), w.at, callback, &[arg], Value::UNDEFINED) {
+                Ok(ret) => self.resolve(dependent, ret),
+                Err(_) => {
+                    let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                    self.reject_thrown_job(dependent, r);
+                }
+            }
+            true
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            let _ = (t, window, last);
+            false
+        }
+    }
+
+    /// Release the job window `run_job_windowed` opened, if any.
+    #[inline]
+    fn close_job_window(&mut self, window: &mut Option<JobWindow>) {
+        if let Some(w) = window.take() {
+            self.regs.truncate(w.at);
         }
     }
 

@@ -1727,6 +1727,19 @@ pub struct Vm<'p> {
     /// activation, mirroring `pending_yield`. Unlike generators, async activations
     /// PRESERVE handlers across a suspension so `try { await p } catch` works.
     pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// The frame index of the async activation `drive_async_inner` is running
+    /// as its own `AsyncResume` job with the settled-await trampoline on
+    /// (`usize::MAX`: none). An `Await` in exactly that frame of an
+    /// already-fulfilled promise or a primitive, with the microtask queue
+    /// empty, continues in place instead of suspending (see
+    /// `Vm::await_settled_inline`). Saved and restored around every drive.
+    async_inline_frame: usize,
+    /// Settled awaits that activation may still continue without a round
+    /// trip through the queue, shared by the `Await` arm and the trampoline
+    /// in `drive_async_inner`: at zero the next await suspends for real, and
+    /// the job boundary it reaches is the drain's collector and WeakRef
+    /// checkpoint.
+    async_inline_budget: u32,
     /// Scratch slot for NewPromiseCapability: the capturing executor (CAP_EXECUTOR)
     /// writes its (resolve, reject) arguments here during `new C(executor)`, which
     /// `new_promise_capability` `.take()`s immediately after construction. `Some`
@@ -1750,6 +1763,13 @@ pub struct Vm<'p> {
     /// the interpreter's ordinary safepoints work inside resumed bodies.
     /// Saved/restored around nested drains.
     current_microtask: Option<Microtask>,
+    /// How many jobs at the front of `microtasks` were already queued when
+    /// the last collection finished. Every Value they hold was a root of that
+    /// collection and survived it, so it is OLD now, and a job never changes
+    /// once queued: a minor's root walk skips them (see `Vm::mark_roots`).
+    /// The end of every collection sets it to the queue's length, and each
+    /// pop from the front takes one off. Jobs only ever leave from the front.
+    microtasks_old: usize,
     /// Heap Values held only in Rust by an in-flight Promise abstract operation:
     /// fresh targets, capability functions, and transient constructor results.
     /// Executors/callbacks/`then` getters may re-enter and collect, so keep a
@@ -2761,10 +2781,12 @@ pub struct Vm<'p> {
     abstractmodulesource_ctor: u32,
     abstractmodulesource_proto: u32,
     /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
-    /// hands out fresh pair ids; a pair id enters `resolved_pairs` the first time
-    /// either function of the pair fires (ids only — no `Value`s, GC-inert).
+    /// hands out fresh pair ids; a pair id's bit in `resolved_pairs` is set the
+    /// first time either function of the pair fires (ids only — no `Value`s,
+    /// GC-inert). A bit per pair ever created, where a hash set of fired ids
+    /// cost a SipHash insert per resolution and kept about ten bytes for each.
     resolver_pair_next: u32,
-    resolved_pairs: std::collections::HashSet<u32>,
+    resolved_pairs: Vec<u64>,
     /// The intrinsic %Promise% constructor and %Promise.prototype.then% heap
     /// indices (the objects built in setup_globals), independent of later
     /// patches — identity anchors for the adoption fast-path check.
@@ -2776,6 +2798,14 @@ pub struct Vm<'p> {
     /// pristine); validated per call by version compares, re-resolved by the
     /// full proof on any guard mismatch.
     promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
+    /// `(version + 1, slot)` of %Promise%'s own data property `resolve` when
+    /// last found (0 = not recorded): GetPromiseResolve's Get read straight
+    /// from the slot while the version holds (`Vm::promise_ctor_resolve_get`).
+    promise_resolve_memo: (u32, u32),
+    /// `(version + 1)` of %Array.prototype% and %Object.prototype% when both
+    /// were last proven to have no `then` (0 = not proven): see
+    /// `Vm::array_then_absent`.
+    array_then_memo: (u32, u32),
     /// The prototype/constructor half of `regexp_matchall_fast_ok` resolved
     /// to slot indices plus the versions guarding them (see
     /// [`proxy_regexp::MatchallFastSlots`]). `None` until first proven
@@ -3233,6 +3263,7 @@ mod values;
 
 pub(crate) use access::htmldda_membership_stats;
 pub(crate) use async_runtime::async_inline_await_stats;
+pub(crate) use async_runtime::async_job_window_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
 pub(crate) use coerce::pad2_concat_stats;

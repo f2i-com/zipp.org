@@ -288,11 +288,16 @@ impl<'p> Vm<'p> {
         // resume point in the top frame). The code that called the builtin
         // has one, except when the builtin itself is what the host runs: a
         // bound `forEach` as a promise reaction, whose compiled callback then
-        // called a function, indexed an empty frame stack and panicked.
-        if self.frames.is_empty() {
+        // called a function, indexed an empty frame stack and panicked. An
+        // int-tier body calls no helper but its own self-call, which pushes
+        // the frames it needs, so one already compiled runs without (a
+        // promise reaction's callback the drain calls, `drain_microtasks`).
+        let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
+        if self.frames.is_empty()
+            && !(ups.is_empty() && self.jit.get(fid).is_some_and(|body| body.int_tier()))
+        {
             return None;
         }
-        let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
         // A capturing closure reads upvalue cells (heap) — outside the
         // leaf-int JIT this function compiles with. It needs the body its own
         // calls compiled, and the conditions of a frame-free native call (the

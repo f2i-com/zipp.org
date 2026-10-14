@@ -8157,7 +8157,7 @@ impl<'p> Vm<'p> {
                         self.pending_yield = Some((Value::UNDEFINED, ip));
                         return Ok(Value::UNDEFINED);
                     }
-                    Instr::Await { val, .. } => {
+                    Instr::Await { dst, val } => {
                         // Suspend the async activation: pop the frame ENTRY but
                         // leave its register window live at the top of `self.regs`
                         // for `drive_async` to park into the heap AsyncState. Unlike
@@ -8200,6 +8200,15 @@ impl<'p> Vm<'p> {
                         } else {
                             v
                         };
+                        // An already-settled await in an activation resumed by
+                        // its own job, with nothing else queued: the resume job
+                        // would run next, so continue here (async_runtime.rs,
+                        // `await_continue_in_place`).
+                        if let Some(r) = self.await_continue_in_place(frame_idx, v) {
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let f = self.frames.pop().unwrap();
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);

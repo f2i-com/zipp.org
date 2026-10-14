@@ -241,6 +241,10 @@ fn main() -> ExitCode {
             "[async] {} settled awaits continued in-job",
             zipp_vm::async_inline_await_stats()
         );
+        eprintln!(
+            "[async] {} reaction jobs run over a shared job window",
+            zipp_vm::async_job_window_stats()
+        );
     }
     if std::env::var_os("ZIPP_ICSTATS").is_some() {
         let (gm, gk, gn, gd, sm, sg, sd, gah, sah) = zipp_vm::ic_stats();
