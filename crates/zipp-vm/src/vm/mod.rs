@@ -1468,11 +1468,17 @@ pub struct Vm<'p> {
     /// Number of functions in the compile-time `program` (the boundary between
     /// program function ids and runtime `eval_funcs` ids).
     main_func_count: usize,
-    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each is a leaked
-    /// `Box<ClassDef>` addressed by a unified class_id (`program.classes` below
+    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each lives in
+    /// `eval_arena`, addressed by a unified class_id (`program.classes` below
     /// `main_class_count`, `eval_classes` beyond). Their func-id members and the
     /// referencing `MakeClass`/`Super*` ops are re-indexed at install time.
-    eval_classes: Vec<&'static crate::bytecode::ClassDef>,
+    eval_classes: Vec<&'p crate::bytecode::ClassDef>,
+    /// Where the functions and classes installed at run time live (see
+    /// `eval_arena`): beside the `Program` in an embedder's state, so they are
+    /// freed with it. The tails make an append one step.
+    eval_arena: &'p eval_arena::EvalArena,
+    eval_func_tail: Option<&'p eval_arena::Node<crate::bytecode::FuncProto>>,
+    eval_class_tail: Option<&'p eval_arena::Node<crate::bytecode::ClassDef>>,
     /// Number of classes in the compile-time `program` (boundary between program
     /// and runtime `eval_classes` class ids).
     main_class_count: usize,
@@ -3212,6 +3218,7 @@ mod access;
 mod async_runtime;
 mod builtins;
 pub(crate) mod clock;
+pub(crate) mod eval_arena;
 mod dispatch;
 mod engine;
 pub(crate) mod host_api;

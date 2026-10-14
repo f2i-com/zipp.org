@@ -132,11 +132,19 @@ self_cell::self_cell!(
     /// moves the `Vm` (native code keeps deriving VM-relative addresses from
     /// the live VM argument regardless).
     struct OwnedVm {
-        owner: Box<Program>,
+        owner: Box<VmOwner>,
         #[covariant]
         dependent: Vm,
     }
 );
+
+/// What an [`OwnedVm`]'s `Vm` borrows: the compiled program and the arena the
+/// VM installs its run-time code in (`eval`, `new Function`, modules), so that
+/// code is freed with the state rather than leaked (f2i-com/zipp.org#53).
+struct VmOwner {
+    program: Program,
+    arena: crate::vm::eval_arena::EvalArena,
+}
 
 /// Parse and compile `src` as a classic script, returning a VM ready to run it.
 ///
@@ -244,8 +252,12 @@ pub fn compile_script_with_preamble(
 impl ScriptState {
     /// Take ownership of a compiled program and boot a VM over it.
     pub(crate) fn from_program(program: Program) -> ScriptState {
-        let cell = OwnedVm::new(Box::new(program), |program| {
-            let mut vm = Vm::new(program);
+        let owner = Box::new(VmOwner {
+            program,
+            arena: crate::vm::eval_arena::EvalArena::default(),
+        });
+        let cell = OwnedVm::new(owner, |owner| {
+            let mut vm = Vm::new_with_arena(&owner.program, &owner.arena);
             // No test262 host object for embedded code. `$262.agent.start()`
             // spawns a detached OS thread running its own VM — outside any
             // budget, abort flag, trace or timeout the embedder set — and

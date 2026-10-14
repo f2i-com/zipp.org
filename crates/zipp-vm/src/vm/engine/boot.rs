@@ -133,7 +133,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A VM over `program` whose run-time code (`eval`, `new Function`,
+    /// modules) lives in an arena of its own that is never freed. An embedder's
+    /// state owns its arena instead (`Vm::new_with_arena`), so dropping the
+    /// state frees that code.
     pub fn new(program: &'p Program) -> Vm<'p> {
+        Self::new_with_arena(
+            program,
+            Box::leak(Box::new(crate::vm::eval_arena::EvalArena::default())),
+        )
+    }
+
+    /// A VM over `program` that installs its run-time functions and classes
+    /// in `eval_arena`, which must outlive it (the embedding keeps both in
+    /// one owner).
+    pub(crate) fn new_with_arena(
+        program: &'p Program,
+        eval_arena: &'p crate::vm::eval_arena::EvalArena,
+    ) -> Vm<'p> {
         let mut heap = Heap::new();
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
@@ -184,6 +201,9 @@ impl<'p> Vm<'p> {
             static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),
             eval_classes: Vec::new(),
+            eval_arena,
+            eval_func_tail: None,
+            eval_class_tail: None,
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_names: rustc_hash::FxHashMap::default(),

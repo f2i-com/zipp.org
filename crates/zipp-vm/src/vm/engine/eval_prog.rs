@@ -159,12 +159,14 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            self.eval_classes.push(Box::leak(Box::new(cd)));
+            let node = self.eval_arena.classes.push(self.eval_class_tail, cd);
+            self.eval_class_tail = Some(node);
+            self.eval_classes.push(&node.value);
             self.class_values.push(None);
         }
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
-        let mut new_funcs: Vec<&'static FuncProto> = Vec::with_capacity(eval_prog.functions.len());
+        let mut new_funcs: Vec<&'p FuncProto> = Vec::with_capacity(eval_prog.functions.len());
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
@@ -282,7 +284,9 @@ impl<'p> Vm<'p> {
             if let Some(s) = f.name_global {
                 f.name_global = Some(gmap[s as usize]);
             }
-            new_funcs.push(Box::leak(Box::new(f)));
+            let node = self.eval_arena.funcs.push(self.eval_func_tail, f);
+            self.eval_func_tail = Some(node);
+            new_funcs.push(&node.value);
         }
         for r in new_funcs {
             // New code can bytecode-store slots the main-program scan proved
