@@ -2089,8 +2089,30 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // The global object's builtin bindings (`print`, `parseInt`, ...) are
+        // own data properties {w, !e, c} its map does not hold until something
+        // writes one. OrdinarySet updates that existing property, so the first
+        // write keeps those attributes (it used to add an enumerable property,
+        // which `Object.keys(globalThis)` and for-in then listed). A deleted
+        // one is gone: writing it creates an ordinary {w, e, c} property and
+        // lifts the deletion record, as `StoreGlobal` does for `delete x; x = 1`.
+        let global_builtin = idx == self.global_this
+            && self.global_this != 0
+            && self.builtin_globals.contains_key(key)
+            && !self.global_name_is_lexical(key);
+        let revived = global_builtin && self.deleted_globals.contains(key);
         let mut added = false;
         match self.heap.get_mut(idx) {
+            HeapObj::Object(map) if global_builtin && !revived && map.pos(key).is_none() => {
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                added = map.define(key, val, attr);
+            }
             HeapObj::Object(map) => {
                 // A non-extensible object rejects NEW own properties (sloppy no-op);
                 // existing writable data properties still accept writes.
@@ -2098,6 +2120,9 @@ impl<'p> Vm<'p> {
                     return self.reject_write(key, strict);
                 }
                 added = map.set(key, val);
+                if revived {
+                    self.deleted_globals.remove(key);
+                }
             }
             // Static-member assignment on a class value (`C.x = …`).
             HeapObj::Class(c) => {

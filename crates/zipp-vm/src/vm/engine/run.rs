@@ -1552,17 +1552,37 @@ impl<'p> Vm<'p> {
         // code (`eval("new RangeError()")`, `eval("Object.keys(x)")`): seed the
         // fresh slot with the builtin value rather than the never-declared
         // sentinel. A genuinely-undeclared name stays UNINITIALIZED → ReferenceError.
-        let seed = match self.builtin_globals.get(name) {
-            Some(&v) => Value::heap(v),
-            None => Value::UNINITIALIZED,
+        //
+        // Only while the global object's binding IS still that builtin. A
+        // program that replaced it (`globalThis.print = f`, a getter defined
+        // over it) holds the replacement as an own property, and one that
+        // deleted it holds nothing: either way the slot starts UNINITIALIZED,
+        // and a read falls back to the global object exactly as for any other
+        // name (`get_prop` of the own property; the builtin table, which
+        // respects the deletion; else a ReferenceError). Seeding the builtin
+        // there made eval and `new Function` code call the original `print`
+        // after the program had silenced it, and see a deleted builtin.
+        let builtin = self.builtin_globals.get(name).copied();
+        let replaced = builtin.is_some()
+            && (self.deleted_globals.contains(name)
+                || (self.global_this != 0
+                    && matches!(
+                        self.heap.get(self.global_this),
+                        HeapObj::Object(m) if m.pos(name).is_some()
+                    )));
+        let seed = match builtin {
+            Some(v) if !replaced => Value::heap(v),
+            _ => Value::UNINITIALIZED,
         };
         // A plain {w, e, c} data property the global object already holds
         // (`globalThis.d = v` before any code named `d`) moves into the new
         // slot, which presents exactly that descriptor: every read and write
         // of `d` from the code being compiled is then a slot access, in every
         // tier, instead of the global-object fallback. Anything else (an
-        // accessor, other attributes, a ShadowRealm's binding) stays put.
+        // accessor, other attributes, a ShadowRealm's binding, a replaced
+        // builtin, whose slot presents the builtin's descriptor) stays put.
         let migrate = seed.is_uninitialized()
+            && builtin.is_none()
             && self.active_realm.is_none()
             && self.global_this != 0
             && matches!(
