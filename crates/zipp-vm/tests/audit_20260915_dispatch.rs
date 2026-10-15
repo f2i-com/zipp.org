@@ -555,8 +555,8 @@ fn audit_20260915_dynamic_import_evaluates_in_a_later_job() {
 /// longer share a 1024-slot pool with a misleading "eval" error: large module
 /// graphs load, many eval'd names work, and retrying a module whose link fails
 /// neither changes its error nor starves an unrelated later eval. (The
-/// hardened profile keeps its small committed pool; see `EVAL_POOL`.)
-#[cfg(not(feature = "safe-sandbox"))]
+/// hardened profile reserves a small pool and grows it; see
+/// `EVAL_POOL_RESERVE`.)
 #[test]
 fn audit_20260915_module_and_eval_global_pool() {
     let exports: String = (0..1100).map(|i| format!("export const v{i} = {i};\n")).collect();

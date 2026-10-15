@@ -177,10 +177,11 @@ impl<'p> Vm<'p> {
         // as scratch "field globals" for object scalar-replacement (SROA): a
         // field-promoted region's GetProp/SetProp are rewritten to Load/StoreGlobal
         // on pool slots, and the interpreter syncs object.field ↔ pool slot around
-        // the native run. The whole pool is RESERVED here so the globals Vec never
-        // reallocates at runtime (the JIT pins its base pointer); the eval pool's
-        // slots join the live length only as they are handed out.
-        let pool_reserve = program.global_count as usize + FIELD_POOL + EVAL_POOL;
+        // the native run. A JIT build RESERVES the whole pool here so the globals
+        // Vec never reallocates at runtime (the JIT pins its base pointer); see
+        // `EVAL_POOL_RESERVE`. The eval pool's slots join the live length only
+        // as they are handed out.
+        let pool_reserve = program.global_count as usize + FIELD_POOL + EVAL_POOL_RESERVE;
         let mut globals = Vec::with_capacity(pool_reserve);
         globals.resize(program.global_count as usize + FIELD_POOL, Value::UNDEFINED);
         // Real global slots start as the never-declared sentinel: a LoadGlobal of

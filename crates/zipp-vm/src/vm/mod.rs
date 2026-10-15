@@ -98,15 +98,12 @@ const FIELD_POOL: usize = 64;
 /// top-level binding of a loader-loaded ES module (exported or not) plus its
 /// namespace/source bookkeeping slots.
 ///
-/// The CAPACITY is reserved once at startup so `globals` (and `global_gens`)
-/// never reallocate at runtime — the JIT pins both base pointers — while the
-/// LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so GC
-/// root scans and resident-byte accounting see only slots in use. Exhaustion
-/// throws rather than growing the Vec. Native builds reserve address space
-/// generously (one bundled module can declare thousands of top-level
-/// functions; a 1024-slot pool failed real module graphs outright); the
-/// hardened and wasm profiles, whose reservation is real committed memory,
-/// keep the small pool.
+/// The LENGTH grows as slots are handed out (`Vm::alloc_global_pool_slot`), so
+/// GC root scans and resident-byte accounting see only slots in use, and
+/// exhaustion throws. One bundled module can declare thousands of top-level
+/// functions, and an embedder that runs each script through `eval_in_context`
+/// gives every script's `var` and function declarations a pool slot: a
+/// 1024-slot pool failed real module graphs and script sets outright.
 ///
 /// NOT LARGER than this without fixing eval-global rooting first: past about
 /// 21,000 pool slots a function declared by one `eval` is collected while its
@@ -114,10 +111,23 @@ const FIELD_POOL: usize = 64;
 /// clean "too many global bindings" error into silent wrong results. The
 /// defect is older than the pool size — reproduced by raising this constant
 /// alone on the base commit — but only a large pool makes it reachable.
-#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
 const EVAL_POOL: usize = 1 << 14;
+
+/// Pool slots whose CAPACITY is reserved at startup. The x86-64 JIT pins the
+/// base pointers of `globals` and `global_gens`, so a JIT build reserves the
+/// whole pool and the two never reallocate; a native build's reservation is
+/// untouched address space either way. The hardened and wasm profiles, where
+/// a reservation is real committed memory, have no JIT: they reserve a small
+/// pool and let the two vectors grow past it as slots are handed out.
+#[cfg(not(any(feature = "safe-sandbox", target_arch = "wasm32")))]
+const EVAL_POOL_RESERVE: usize = EVAL_POOL;
 #[cfg(any(feature = "safe-sandbox", target_arch = "wasm32"))]
-const EVAL_POOL: usize = 1024;
+const EVAL_POOL_RESERVE: usize = 1024;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = assert!(
+    EVAL_POOL_RESERVE == EVAL_POOL,
+    "the JIT pins `globals`: reserve the whole eval pool"
+);
 
 /// What an unnamed run-time pool slot binds (see `Vm::pool_slot_names`).
 pub(crate) enum PoolSlotName {
@@ -1530,7 +1540,7 @@ pub struct Vm<'p> {
     pool_slot_names: rustc_hash::FxHashMap<u32, PoolSlotName>,
     /// Next free EVAL_POOL slot — always `globals.len()`. Starts at
     /// `global_count + FIELD_POOL`; bumped as pool slots are handed out, capped
-    /// at `+ EVAL_POOL` (the reserved capacity).
+    /// at `+ EVAL_POOL` (the reserved capacity in a JIT build).
     eval_global_next: u32,
     /// Every builtin global NAME → its heap value, recorded at setup regardless of
     /// whether the running program referenced it. Lets `eval`'d code resolve

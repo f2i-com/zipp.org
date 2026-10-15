@@ -1456,9 +1456,10 @@ impl<'p> Vm<'p> {
     }
 
     /// Hand out the next slot of the run-time global pool (see `EVAL_POOL`),
-    /// seeded with `seed`. The pool's capacity was reserved at boot, so the
-    /// pushes below never reallocate `globals` / `global_gens` (the JIT pins
-    /// both). `what` names the consumer in the exhaustion error.
+    /// seeded with `seed`. A JIT build reserved the pool's capacity at boot,
+    /// so there the pushes below never reallocate `globals` / `global_gens`
+    /// (the JIT pins both); the profiles without a JIT may grow them (see
+    /// `EVAL_POOL_RESERVE`). `what` names the consumer in the exhaustion error.
     pub(crate) fn alloc_global_pool_slot(
         &mut self,
         seed: Value,
@@ -1473,6 +1474,7 @@ impl<'p> Vm<'p> {
             )));
         }
         debug_assert_eq!(self.globals.len(), s);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         debug_assert!(s < self.globals.capacity() && s < self.global_gens.capacity());
         self.globals.push(seed);
         self.global_gens.push(0);
