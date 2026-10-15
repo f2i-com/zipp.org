@@ -316,6 +316,101 @@ fn mm_block(out: &mut [f64], av: &[f64], bv: &[f64], i: usize, j: usize, k: usiz
     out[(i + 3) * n + j..(i + 3) * n + j + MM_COLS].copy_from_slice(&c3);
 }
 
+/// AVX2 forms of [`mm_block`] over eight columns: the same outputs, each the
+/// sum of its k products in p order from 0, computed four lanes at a time.
+/// `block_fma` fuses each multiply-add, which gives the same value as the
+/// separate multiply and add only when every product is exact in an f64:
+/// true unless an operand is float64 (a float32, float16, uint8 or uint16
+/// value has at most 24 significant bits, so a product of two has at most
+/// 48). `block_mul_add` is the unfused form for float64 operands.
+#[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+mod mm_avx2 {
+    use std::arch::x86_64::*;
+
+    pub(super) const COLS: usize = 8;
+
+    /// 0: no AVX2; 1: AVX2; 2: AVX2 and FMA. Detected once.
+    pub(super) fn level() -> u8 {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static LEVEL: AtomicU8 = AtomicU8::new(u8::MAX);
+        let l = LEVEL.load(Ordering::Relaxed);
+        if l != u8::MAX {
+            return l;
+        }
+        let l = if std::env::var_os("ZIPP_NO_TORCH_AVX2").is_some() || !is_x86_feature_detected!("avx2") {
+            0
+        } else if is_x86_feature_detected!("fma") {
+            2
+        } else {
+            1
+        };
+        LEVEL.store(l, Ordering::Relaxed);
+        l
+    }
+
+    macro_rules! block {
+        ($name:ident, $features:literal, $step:ident) => {
+            /// Callers check [`level`] first: calling this on a CPU without
+            /// the named features is undefined behavior.
+            #[target_feature(enable = $features)]
+            pub(super) fn $name(out: &mut [f64], av: &[f64], bv: &[f64], i: usize, j: usize, k: usize, n: usize) {
+                let a0 = &av[i * k..(i + 1) * k];
+                let a1 = &av[(i + 1) * k..(i + 2) * k];
+                let a2 = &av[(i + 2) * k..(i + 3) * k];
+                let a3 = &av[(i + 3) * k..(i + 4) * k];
+                assert!(k == 0 || (k - 1) * n + j + COLS <= bv.len());
+                assert!((i + 3) * n + j + COLS <= out.len());
+                let zero = _mm256_setzero_pd();
+                let (mut c00, mut c01, mut c10, mut c11) = (zero, zero, zero, zero);
+                let (mut c20, mut c21, mut c30, mut c31) = (zero, zero, zero, zero);
+                let b = bv.as_ptr();
+                for p in 0..k {
+                    // SAFETY: p * n + j + 8 <= bv.len(), asserted above.
+                    let row = unsafe { b.add(p * n + j) };
+                    let (b0, b1) = unsafe { (_mm256_loadu_pd(row), _mm256_loadu_pd(row.add(4))) };
+                    let x0 = _mm256_set1_pd(a0[p]);
+                    c00 = $step(x0, b0, c00);
+                    c01 = $step(x0, b1, c01);
+                    let x1 = _mm256_set1_pd(a1[p]);
+                    c10 = $step(x1, b0, c10);
+                    c11 = $step(x1, b1, c11);
+                    let x2 = _mm256_set1_pd(a2[p]);
+                    c20 = $step(x2, b0, c20);
+                    c21 = $step(x2, b1, c21);
+                    let x3 = _mm256_set1_pd(a3[p]);
+                    c30 = $step(x3, b0, c30);
+                    c31 = $step(x3, b1, c31);
+                }
+                let o = out.as_mut_ptr();
+                // SAFETY: (i + 3) * n + j + 8 <= out.len(), asserted above.
+                unsafe {
+                    for (r, (lo, hi)) in [(c00, c01), (c10, c11), (c20, c21), (c30, c31)].into_iter().enumerate() {
+                        let at = o.add((i + r) * n + j);
+                        _mm256_storeu_pd(at, lo);
+                        _mm256_storeu_pd(at.add(4), hi);
+                    }
+                }
+            }
+        };
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    fn fused(x: __m256d, b: __m256d, c: __m256d) -> __m256d {
+        _mm256_fmadd_pd(x, b, c)
+    }
+
+    /// c + x * b, rounded twice: the scalar loop's `c += x * b`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn mul_add(x: __m256d, b: __m256d, c: __m256d) -> __m256d {
+        _mm256_add_pd(c, _mm256_mul_pd(x, b))
+    }
+
+    block!(block_fma, "avx2,fma", fused);
+    block!(block_mul_add, "avx2", mul_add);
+}
+
 /// Columns `j0..` of one output row (`row`, starting at column j0, zeroed):
 /// `row[j] += a[p] * b[p, j0 + j]` for p in order, the row loop.
 fn mm_row_tail(row: &mut [f64], arow: &[f64], bv: &[f64], n: usize, j0: usize) {
@@ -1046,13 +1141,22 @@ pub(crate) trait Kernels: Host {
         let rows_per_poll = (POLL_UNITS / k.max(1).saturating_mul(n).max(1)).max(1);
         let mut since_poll = 0usize;
         let mut i = 0;
-        // Blocks of MM_ROWS x MM_COLS outputs, each output a sum in an f64
+        // With AVX2, blocks eight columns wide (`mm_avx2`): the same sums in
+        // the same order, fused only where that is the same value.
+        #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+        let wide = if n >= 2 * mm_avx2::COLS { mm_avx2::level() } else { 0 };
+        #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+        let wide = 0u8;
+        #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+        let exact_products = va.kind != KIND_F64 && vb.kind != KIND_F64;
+        let cols = if wide > 0 { 8 } else { MM_COLS };
+        // Blocks of MM_ROWS x `cols` outputs, each output a sum in an f64
         // register that starts at 0 and adds its products in p order: what
         // the row loop computes for it, with B's row and A's values read
         // once per p for the whole block.
         // (Narrow products keep the row loop: a block's setup costs more
         // than it saves below two blocks a row.)
-        while n >= 2 * MM_COLS && i + MM_ROWS <= m {
+        while n >= 2 * cols && i + MM_ROWS <= m {
             since_poll += MM_ROWS;
             if since_poll >= rows_per_poll {
                 since_poll = 0;
@@ -1061,9 +1165,22 @@ pub(crate) trait Kernels: Host {
                 }
             }
             let mut j = 0;
-            while j + MM_COLS <= n {
+            while j + cols <= n {
+                #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+                if wide > 0 {
+                    // SAFETY: `mm_avx2::level` detected each kernel's features.
+                    unsafe {
+                        if wide == 2 && exact_products {
+                            mm_avx2::block_fma(&mut out, &av, &bv, i, j, k, n);
+                        } else {
+                            mm_avx2::block_mul_add(&mut out, &av, &bv, i, j, k, n);
+                        }
+                    }
+                    j += cols;
+                    continue;
+                }
                 mm_block(&mut out, &av, &bv, i, j, k, n);
-                j += MM_COLS;
+                j += cols;
             }
             if j < n {
                 for r in 0..MM_ROWS {
