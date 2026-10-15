@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Diagnostic Zipp/QuickJS-NG/Boa native comparison.
+"""Diagnostic native comparison of Zipp against interpreters and no-JIT modes.
 
 The public Zipp benchmark harness deliberately knows only its canonical engine
-set.  This separate runner keeps ecosystem comparisons explicit and avoids
-changing that publication series.  It stages identical source bytes for every
-engine, checks stdout after only CRLF-to-LF canonicalization, counterbalances
-process order, and retains every raw observation in JSON.
+set (Node, Bun, Deno and Zipp, every one with its production JIT).  This
+separate runner keeps the other comparisons explicit and avoids changing that
+publication series: Zipp's interpreter (`ZIPP_NOJIT=1`) against QuickJS
+(Bellard's and QuickJS-NG, neither of which has a JIT), Boa, and Node, Deno and
+Bun with their JITs switched off (`--jitless`, `--v8-flags=--jitless`,
+`BUN_JSC_useJIT=0`).  It stages identical source bytes for every engine,
+checks stdout after only CRLF-to-LF canonicalization, counterbalances process
+order, and retains every raw observation in JSON.
 """
 
 from __future__ import annotations
@@ -259,13 +263,15 @@ def run_once(
         }
 
 
+# Bellard's QuickJS CLI has no version flag: `--version` prints its version line
+# and usage, then exits 1. The probe records that output; the exit status is
+# not a failure for this engine.
+PROBE_NONZERO_OK = frozenset({"quickjs"})
+
+
 def version_probe(engine: Engine, timeout: float) -> dict[str, Any]:
-    if engine.name == "node":
-        suffix = ("--version",)
-    elif engine.name.startswith("zipp-"):
+    if engine.name.startswith("zipp-"):
         suffix = ("--version", "--json")
-    elif engine.name == "quickjs-ng":
-        suffix = ("--version",)
     else:
         suffix = ("--version",)
     result = subprocess.run(
@@ -452,9 +458,12 @@ def machine_metadata() -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zipp", type=Path, required=True)
-    parser.add_argument("--quickjs-ng", type=Path, required=True)
-    parser.add_argument("--boa", type=Path, required=True)
+    parser.add_argument("--quickjs", type=Path, help="Bellard's QuickJS qjs")
+    parser.add_argument("--quickjs-ng", type=Path)
+    parser.add_argument("--boa", type=Path)
     parser.add_argument("--node", default="node")
+    parser.add_argument("--deno", default="deno")
+    parser.add_argument("--bun", default="bun")
     parser.add_argument("--suite", choices=("micro5", "real13"), default="micro5")
     parser.add_argument("--reps", type=int, default=12)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
@@ -465,9 +474,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engines",
         default="node,zipp-jit,zipp-interp,quickjs-ng,boa,boa-opt",
-        help="comma-separated subset (default all six)",
+        help=(
+            "comma-separated subset of node, node-jitless, deno, deno-jitless, "
+            "bun, bun-nojit, zipp-jit, zipp-interp, quickjs, quickjs-ng, boa, "
+            "boa-opt (default: the original six)"
+        ),
     )
     parser.add_argument("--zipp-revision")
+    parser.add_argument("--quickjs-revision")
     parser.add_argument("--quickjs-ng-revision")
     parser.add_argument("--boa-revision")
     return parser.parse_args()
@@ -484,26 +498,55 @@ def main() -> int:
         raise SystemExit(f"refusing to overwrite {result_path}; pass --overwrite")
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    node = executable(args.node)
-    zipp = executable(args.zipp)
-    quickjs_ng = executable(args.quickjs_ng)
-    boa = executable(args.boa)
-    available = {
-        "node": Engine("node", (str(node),), {}, node),
-        "zipp-jit": Engine("zipp-jit", (str(zipp), "js"), {}, zipp),
-        "zipp-interp": Engine(
-            "zipp-interp", (str(zipp), "js"), {"ZIPP_NOJIT": "1"}, zipp
-        ),
-        "quickjs-ng": Engine(
-            "quickjs-ng", (str(quickjs_ng),), {}, quickjs_ng
-        ),
-        "boa": Engine("boa", (str(boa),), {}, boa),
-        "boa-opt": Engine("boa-opt", (str(boa), "--optimize"), {}, boa),
-    }
     requested = args.engines.split(",")
-    unknown = sorted(set(requested) - set(available))
+    # Each engine is built only when requested, so a run needs only the
+    # binaries it names.
+    def binary_for(name: str) -> Path:
+        flag = {
+            "node": args.node,
+            "node-jitless": args.node,
+            "deno": args.deno,
+            "deno-jitless": args.deno,
+            "bun": args.bun,
+            "bun-nojit": args.bun,
+            "zipp-jit": args.zipp,
+            "zipp-interp": args.zipp,
+            "quickjs": args.quickjs,
+            "quickjs-ng": args.quickjs_ng,
+            "boa": args.boa,
+            "boa-opt": args.boa,
+        }[name]
+        if flag is None:
+            raise SystemExit(f"engine {name} needs its binary flag")
+        return executable(flag)
+
+    def make_engine(name: str) -> Engine:
+        binary = binary_for(name)
+        command, environment = {
+            "node": ((str(binary),), {}),
+            "node-jitless": ((str(binary), "--jitless"), {}),
+            "deno": ((str(binary), "run", "-q"), {}),
+            "deno-jitless": ((str(binary), "run", "-q", "--v8-flags=--jitless"), {}),
+            "bun": ((str(binary),), {}),
+            # JavaScriptCore's option switch: every JIT tier off, LLInt only.
+            "bun-nojit": ((str(binary),), {"BUN_JSC_useJIT": "0"}),
+            "zipp-jit": ((str(binary), "js"), {}),
+            "zipp-interp": ((str(binary), "js"), {"ZIPP_NOJIT": "1"}),
+            "quickjs": ((str(binary),), {}),
+            "quickjs-ng": ((str(binary),), {}),
+            "boa": ((str(binary),), {}),
+            "boa-opt": ((str(binary), "--optimize"), {}),
+        }[name]
+        return Engine(name, command, environment, binary)
+
+    known = {
+        "node", "node-jitless", "deno", "deno-jitless", "bun", "bun-nojit",
+        "zipp-jit", "zipp-interp", "quickjs", "quickjs-ng", "boa", "boa-opt",
+    }
+    unknown = sorted(set(requested) - known)
     if unknown or not requested or len(requested) != len(set(requested)):
         raise SystemExit(f"invalid --engines list; unknown={unknown}")
+    available = {name: make_engine(name) for name in requested}
     engines = [available[name] for name in requested]
     engine_names = [engine.name for engine in engines]
     if "node" not in engine_names:
@@ -515,6 +558,7 @@ def main() -> int:
         name
         for name, identity in engine_identities_before.items()
         if identity["version_probe"]["returncode"] != 0
+        and name not in PROBE_NONZERO_OK
     ]
     if failed_version_probes:
         raise SystemExit(
@@ -697,13 +741,20 @@ def main() -> int:
 
     revisions = {
         "zipp": args.zipp_revision,
+        "quickjs": args.quickjs_revision,
         "quickjs-ng": args.quickjs_ng_revision,
         "boa": args.boa_revision,
     }
     revision_keys = {
         "node": None,
+        "node-jitless": None,
+        "deno": None,
+        "deno-jitless": None,
+        "bun": None,
+        "bun-nojit": None,
         "zipp-jit": "zipp",
         "zipp-interp": "zipp",
+        "quickjs": "quickjs",
         "quickjs-ng": "quickjs-ng",
         "boa": "boa",
         "boa-opt": "boa",
