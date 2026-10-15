@@ -70,10 +70,13 @@ pub(super) fn builtin_stats_enabled_for_vm() -> bool {
     std::env::var_os("ZIPP_BUILTINSTATS").is_some()
 }
 
+/// `charCodeAt`'s index in the B191 memo (`str_memo_id`).
+const STR_MEMO_CHAR_CODE_AT: usize = 0;
+
 /// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
 fn str_memo_id(name: &str) -> Option<usize> {
     Some(match name {
-        "charCodeAt" => 0,
+        "charCodeAt" => STR_MEMO_CHAR_CODE_AT,
         "charAt" => 1,
         "indexOf" => 2,
         "slice" => 3,
@@ -507,6 +510,56 @@ impl<'p> Vm<'p> {
         self.array_method_is_intrinsic("push")
     }
 
+    /// `string_method_is_intrinsic("charCodeAt")` with the memo's hit inlined,
+    /// as [`Vm::array_push_is_intrinsic`] does for `push`: a tokenizer's
+    /// `src.charCodeAt(i)` paid an out-of-line call and a match of the name
+    /// against sixteen memoised ones for the proof (6% of parse-large-js with
+    /// the other proofs of the same call).
+    #[inline(always)]
+    pub(crate) fn char_code_at_is_intrinsic(&mut self) -> bool {
+        if self.realm_global_objs.is_empty() {
+            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[STR_MEMO_CHAR_CODE_AT] {
+                let proto = self.str_proto;
+                if self.heap.version_of(proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get_for_ic(proto) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        self.string_method_is_intrinsic("charCodeAt")
+    }
+
+    /// Whether a CAPTURED callee `bits` is the boot intrinsic `name` of
+    /// %Array.prototype% (`is_arr`) / %String.prototype% while the main realm
+    /// is running — the identity half of [`Vm::proto_intrinsic_bits`], which
+    /// is all a captured call needs: the Get that captured it already
+    /// answered what the prototype held, and the lane runs exactly the
+    /// captured intrinsic (see `captured_intrinsic_lane`). A filled memo holds
+    /// the boot bits (`proto_method_is_baseline` only memoises a baseline
+    /// match), so a memoised name is one load; any other asks the table.
+    fn captured_is_boot_intrinsic(&self, name: &str, is_arr: bool, bits: u64) -> bool {
+        let (proto, memo) = if is_arr {
+            (self.arr_proto, arr_memo_id(name).and_then(|n| self.arr_intrinsic_memo[n]))
+        } else {
+            (self.str_proto, str_memo_id(name).and_then(|n| self.str_intrinsic_memo[n]))
+        };
+        if proto == 0 || self.active_realm_proto(proto) != proto {
+            return false;
+        }
+        if let Some((_, _, fn_bits)) = memo {
+            return fn_bits == bits;
+        }
+        let table = if is_arr {
+            &self.arr_proto_baseline
+        } else {
+            &self.str_proto_baseline
+        };
+        table.get(name) == Some(&bits)
+    }
+
     /// B289: `recv.name` for an Array or String receiver answered from the
     /// B191 baseline proof (see [`Vm::proto_intrinsic_bits`]) — `Some(bits)`
     /// only when a real Get would resolve to exactly that boot intrinsic:
@@ -857,7 +910,7 @@ impl<'p> Vm<'p> {
             }
             _ => return Ok(None),
         };
-        if self.proto_intrinsic_bits(key, is_arr) != Some(callee.bits()) {
+        if !self.captured_is_boot_intrinsic(key, is_arr, callee.bits()) {
             return Ok(None);
         }
         if argc == 1 {

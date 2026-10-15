@@ -44,7 +44,7 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || !arg.is_int()
             || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_))
-            || !self.string_method_is_intrinsic("charCodeAt")
+            || !self.char_code_at_is_intrinsic()
         {
             return None;
         }
