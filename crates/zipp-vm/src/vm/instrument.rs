@@ -387,6 +387,11 @@ const HEAP_WALK_STRIDE: u32 = 64;
 /// that followed it; the slack is what a poll may leave unreconciled.
 const HEAP_WALK_FOOTPRINT_SLACK: usize = 64 * 1024;
 
+/// Heap growth since the level a walk found after the last major (or a
+/// quarter of that level, if more) at which the walk asks for a major of its
+/// own. See `Recorder::growth_level`.
+const HEAP_GROWTH_MAJOR_STEP: usize = 8 * 1024 * 1024;
+
 fn heap_walk_stride_for(slots: usize) -> u32 {
     if slots < 4_096 {
         1
@@ -444,6 +449,15 @@ pub(crate) struct Recorder {
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
     pub(crate) ceiling_gc_pending: bool,
+    /// What the first heap walk after the latest major found (`growth_major`
+    /// names that major): the level in-place growth is measured from. The
+    /// collector schedules on what it allocates, and an Array filled by
+    /// `push` allocates nothing, so a program that refills such arrays never
+    /// collected the old ones at all. See `instrument_heap_poll_inner`.
+    growth_level: usize,
+    growth_major: u64,
+    /// A walk asked for a major on growth; cleared when one completes.
+    growth_gc_pending: bool,
     /// Combined UTF-8 bytes retained for stdout/stderr lines, including the
     /// newline written for each line; `usize::MAX` means unlimited.
     pub(crate) output_limit: usize,
@@ -555,6 +569,9 @@ impl Recorder {
             abort: None,
             heap_limit: usize::MAX,
             ceiling_gc_pending: false,
+            growth_level: 0,
+            growth_major: u64::MAX,
+            growth_gc_pending: false,
             output_limit: usize::MAX,
             output_used: 0,
             output_exhausted: false,
@@ -2261,6 +2278,7 @@ impl super::Vm<'_> {
         if convicted || reconcile {
             let total = self.audit_heap_bytes();
             let collectable = may_defer && self.gc_can_run_now();
+            let majors = self.heap.majors_done();
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
             if let Some(now) = crate::heap::every_block_footprint() {
                 rec.walk_footprint_floor = now;
@@ -2273,6 +2291,28 @@ impl super::Vm<'_> {
                 }
                 rec.ceiling_gc_pending = false;
                 return Err(rec.exhaust(ResourceExhaustion::Heap));
+            }
+            // Growth the collector's own schedule cannot see. It counts what
+            // it allocates; an Array filled by `push` grows in place, so a
+            // tokenizer refilling three arrays per pass never collected the
+            // old ones (eight passes held 106 MB where QuickJS held 38). The
+            // walk sees that growth: once the heap stands a step over the
+            // level the first walk after the last major found, ask for a
+            // major. The step is half that level when that is more, so a
+            // heap that is really growing pays for O(log) majors, not O(n).
+            if rec.growth_major != majors {
+                rec.growth_major = majors;
+                rec.growth_level = total;
+                rec.growth_gc_pending = false;
+            } else if collectable
+                && !rec.growth_gc_pending
+                && total
+                    >= rec
+                        .growth_level
+                        .saturating_add(HEAP_GROWTH_MAJOR_STEP.max(rec.growth_level / 4))
+            {
+                rec.growth_gc_pending = true;
+                self.heap.request_major();
             }
         }
         Ok(())

@@ -6393,6 +6393,10 @@ pub struct Heap {
     /// major schedule is measured against (a post-MINOR count includes floated
     /// old garbage, which must not compound the threshold — B120's named fix).
     live_at_major: usize,
+    /// Majors completed. The meter's heap poll measures growth from the
+    /// level its first walk after the latest major finds (see
+    /// `Vm::instrument_heap_poll_inner`), so it needs to see one complete.
+    majors_done: u64,
     /// Occupied-slot count that latches the next collection into a MAJOR:
     /// the PRE-NURSERY schedule (`GC_GROWTH * live_at_major`, floored). A
     /// minor that ends with the heap still at or above this point has proven
@@ -6988,6 +6992,7 @@ impl Heap {
             remset: Vec::new(),
             scan_roots: Vec::new(),
             live_at_major: live,
+            majors_done: 0,
             // Same offset as gc_threshold: a first minor's occupied count
             // includes these permanent slots, so preserve the old boundary in
             // terms of collectable survivors rather than total prefix size.
@@ -8663,6 +8668,12 @@ impl Heap {
         self.gc_requested = true;
     }
 
+    /// Majors completed so far (see the field).
+    #[cfg(feature = "instrument")]
+    pub(crate) fn majors_done(&self) -> u64 {
+        self.majors_done
+    }
+
     /// The slot tables and pools at their capacity: every resident byte but
     /// the objects' payloads.
     fn resident_table_bytes(&self) -> usize {
@@ -9243,6 +9254,7 @@ impl Heap {
         };
         self.gc_requested = false;
         self.live_at_major = live;
+        self.majors_done = self.majors_done.wrapping_add(1);
         self.minors_since_major = 0;
         self.major_due = false;
         self.big_bytes_since_gc = 0;
