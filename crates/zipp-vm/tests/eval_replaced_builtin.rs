@@ -74,12 +74,20 @@ log("7b", hot(3), ev("encodeURIComponent('x')"));
 console.log(out.join("\n"));
 "#;
 
+/// Node's output for `source`, run from a file: `node -e` assigns
+/// `globalThis.module` after the script, which a frozen global refuses.
 fn node_output(source: &str) -> Vec<String> {
-    let out = std::process::Command::new("node")
-        .arg("-e")
-        .arg(source)
-        .output()
-        .expect("node on PATH");
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "zipp-eval-replaced-builtin-{}-{}.js",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, source).expect("write the node script");
+    let out = std::process::Command::new("node").arg(&path).output();
+    let _ = std::fs::remove_file(&path);
+    let out = out.expect("node on PATH");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
@@ -117,6 +125,30 @@ fn eval_sees_replaced_builtins_all_modes() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// A first write of a builtin through the global object updates an existing
+/// property: it keeps the builtin's attributes and is not refused by a
+/// non-extensible global, while freezing and sealing (which make the
+/// builtins real own properties with their new attributes) still govern it.
+/// Each case runs in a fresh VM, against Node.
+#[test]
+fn builtin_writes_on_a_non_extensible_frozen_or_sealed_global() {
+    const BODY: &str = r#"
+var d = function (n) { var x = Object.getOwnPropertyDescriptor(globalThis, n); return x ? [typeof x.value, x.writable, x.enumerable, x.configurable].join("/") : "absent"; };
+var f = function () { return "f"; };
+function trySloppy(name) { try { globalThis[name] = f; return globalThis[name] === f ? "replaced" : "kept"; } catch (e) { return e.constructor.name; } }
+function tryStrict(name) { "use strict"; try { globalThis[name] = f; return globalThis[name] === f ? "replaced" : "kept"; } catch (e) { return e.constructor.name; } }
+function evalSees(name) { return (0, eval)(name) === f ? "eval:f" : "eval:orig"; }
+SETUP;
+console.log([trySloppy("parseInt"), d("parseInt"), evalSees("parseInt"), tryStrict("isNaN"), d("isNaN"), evalSees("isNaN"), trySloppy("newGlobalName"), d("newGlobalName")].join(" "));
+"#;
+    for setup in ["", "Object.preventExtensions(globalThis)", "Object.freeze(globalThis)", "Object.seal(globalThis)"] {
+        let src = BODY.replace("SETUP", setup);
+        let out = zipp_vm::run(&src).expect("source compiles");
+        assert!(out.error.is_none(), "{setup}: unexpected runtime error: {:?}", out.error);
+        assert_eq!(out.output, node_output(&src), "{setup}");
     }
 }
 
