@@ -695,13 +695,17 @@ impl<'p> Vm<'p> {
                                     self.deleted_globals.remove(&name);
                                 }
                             }
-                        } else if self.global_real_own_route(idx) {
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
                             // A defineProperty'd REAL own property of the global
                             // object (its attributes live on the object, not in
                             // the slot) governs the write — route through [[Set]]
                             // (staging/sm/Proxy/regress-bug1037770). A global
                             // LEXICAL binding is not an object property: the slot
-                            // stays authoritative for it.
+                            // stays authoritative for it. As in the strict arm and
+                            // `LoadGlobal`, the route can only have appeared after
+                            // `note_global_own_property_change` bumped the epoch;
+                            // ungated, the heap and name probe ran on every `var`
+                            // initializer (98M times in typedarray-math).
                             let name = self.global_slot_name(idx).unwrap_or_default();
                             if !self.global_name_is_lexical(&name) {
                                 let gobj = Value::heap(self.global_this);
