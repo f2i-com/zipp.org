@@ -4083,13 +4083,24 @@ impl<'p> Vm<'p> {
     /// (on `<= 0`, and on the NaN that SortCompare maps to +0) the LEFT run's
     /// element wins, preserving original order. The comparator re-enters the VM
     /// (`call_value`) and may throw — from the call or from its own ToNumber.
-    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
     fn exact_numeric_sub_sort_cmp(&mut self, cmp: Value, items: &[Value]) -> Option<&'p [Instr]> {
-        // This is deliberately an artifact-profile specialization, not a
+        // This is deliberately an exact-bytecode specialization, not a
         // source-text heuristic. Only a real immutable user Func/Closure can
         // enter; Bound/Proxy/native callables and closures with lexical cells
         // retain the ordinary callback path.
         if !cmp.is_heap() {
+            return None;
+        }
+        // Outside the WebAssembly artifact profile a recorder traces each
+        // instruction's function and register base, which an elided frame
+        // cannot reproduce: a metered or traced VM keeps the real callback.
+        // (The artifact profile's hook keeps only the tick and heap-poll
+        // schedule, which `run_exact_numeric_sub_sort_cmp` replays.)
+        #[cfg(all(
+            feature = "instrument",
+            not(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))
+        ))]
+        if self.instr_rec.is_some() {
             return None;
         }
         let fid = match self.heap.get(cmp.heap_index()) {
@@ -4139,8 +4150,11 @@ impl<'p> Vm<'p> {
         Some(p.code.as_slice())
     }
 
-    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
     #[inline(always)]
+    #[cfg_attr(
+        not(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit"))),
+        allow(unused_variables)
+    )]
     fn run_exact_numeric_sub_sort_cmp(
         &mut self,
         code: &'p [Instr],
@@ -4155,11 +4169,15 @@ impl<'p> Vm<'p> {
         // register base/instruction identity and retains just the exact tick and
         // heap-poll schedule. The comparator bytecode IPs remain exact (0, 1);
         // there is no trace/fid location channel in this artifact profile.
+        // Every other profile admits the fast path only with no recorder
+        // (`exact_numeric_sub_sort_cmp`), so it has no tick to replay.
+        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         if self.instr_rec.is_some() {
             self.instrument_step(0, 0, &code[0])
                 .map_err(|msg| Thrown(msg.to_string()))?;
         }
         let result = left.as_f64() - right.as_f64();
+        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         if self.instr_rec.is_some() {
             self.instrument_step(0, 1, &code[1])
                 .map_err(|msg| Thrown(msg.to_string()))?;
@@ -4183,7 +4201,6 @@ impl<'p> Vm<'p> {
         // Classify and preflight before moving or merging any elements. If the
         // exact call/meter contract cannot be reproduced, the complete sort
         // stays on the established callback implementation.
-        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
         let numeric_sub_code = self.exact_numeric_sub_sort_cmp(cmp, items);
         // Native-callback fast path: a compiled non-capturing comparator is called
         // directly over one reused register window (skipping a per-comparison frame
@@ -4214,25 +4231,8 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let fast_ord: Option<Result<f64, Thrown>> = {
-                        #[cfg(all(
-                            feature = "safe-sandbox",
-                            feature = "meter-only",
-                            not(feature = "jit")
-                        ))]
-                        {
-                            numeric_sub_code
-                                .map(|code| self.run_exact_numeric_sub_sort_cmp(code, a[l], a[r]))
-                        }
-                        #[cfg(not(all(
-                            feature = "safe-sandbox",
-                            feature = "meter-only",
-                            not(feature = "jit")
-                        )))]
-                        {
-                            None
-                        }
-                    };
+                    let fast_ord: Option<Result<f64, Thrown>> = numeric_sub_code
+                        .map(|code| self.run_exact_numeric_sub_sort_cmp(code, a[l], a[r]));
                     let ord = match fast_ord {
                         Some(Ok(n)) => n,
                         Some(Err(e)) => {
@@ -4305,7 +4305,6 @@ impl<'p> Vm<'p> {
     }
 }
 
-#[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
 fn exact_numeric_sub_sort_proto(p: &crate::bytecode::FuncProto) -> bool {
     // A simple two-parameter function has no default/destructuring prologue.
     // Rest/arguments, generators and async functions all have observable call
