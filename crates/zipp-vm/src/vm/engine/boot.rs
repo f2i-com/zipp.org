@@ -116,6 +116,17 @@ impl<'p> Vm<'p> {
         if (func_id as usize).wrapping_sub(self.main_func_count) >= self.eval_funcs.len() {
             return false;
         }
+        // The default: no meter and both kinds' switches on, so a module
+        // function and an eval function answer alike and the range search
+        // below is not needed (it was 2% of an interpreted torch loop, which
+        // asks at every frame entry and back-edge of the Python runtime).
+        #[cfg(feature = "instrument")]
+        let metered = self.instr_rec.is_some();
+        #[cfg(not(feature = "instrument"))]
+        let metered = false;
+        if !metered && jit_module_functions_enabled() && jit_eval_functions_enabled() {
+            return true;
+        }
         // Ranges are appended as the monotonically-growing runtime function
         // table is installed. Failed eval/module preparations can leave gaps,
         // but cannot reorder later ids, so binary search is valid and avoids a

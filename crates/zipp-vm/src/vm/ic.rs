@@ -370,6 +370,7 @@ fn builtin_object_method(key: &str) -> bool {
 
 /// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
 /// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
+#[inline]
 fn dynamic_ic_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
@@ -407,9 +408,19 @@ impl<'p> Vm<'p> {
     /// case, must stay one compare in the caller: the module and dynamic
     /// checks (two lazily read switches, a range scan, a subtraction) live
     /// out of line so their size can never cost the hot path its inlining.
+    ///
+    /// Installed code is hot too: every function of the Python runtime (and
+    /// of torch) and every script an embedder runs through `eval_in_context`
+    /// is installed, and the out-of-line half binary-searched the module
+    /// ranges on each probe (2% of an interpreted torch loop). With dynamic
+    /// caching on, the default, an installed function is eligible whichever
+    /// kind it is, so that answer is one more compare here.
     #[inline(always)]
     fn ic_func_eligible(&self, func_id: u32) -> bool {
-        (func_id as usize) < self.main_func_count || self.ic_func_eligible_installed(func_id)
+        let f = func_id as usize;
+        f < self.main_func_count
+            || (f.wrapping_sub(self.main_func_count) < self.eval_funcs.len() && dynamic_ic_enabled())
+            || self.ic_func_eligible_installed(func_id)
     }
 
     /// The runtime-installed half of `ic_func_eligible`: loader-recorded
