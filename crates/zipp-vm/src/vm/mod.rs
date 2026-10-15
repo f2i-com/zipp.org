@@ -3275,6 +3275,7 @@ mod builtins;
 pub(crate) mod clock;
 pub(crate) mod eval_arena;
 mod dispatch;
+mod dispatch_cold;
 mod engine;
 pub(crate) mod host_api;
 mod indexing_date;
