@@ -1076,36 +1076,21 @@ impl<'p> Vm<'p> {
                 self.args_mapped_set(idx, i, val);
             }
         }
-        // A write past the eager-materialization cap goes to the SPARSE overlay:
-        // the element lives in arr_props under its canonical index key (default
-        // data attributes) and the JS length in the virtual-length side table —
-        // the dense Vec is never resized to billions of holes. (An overridden /
-        // defineProperty'd index was routed to set_prop above, and an arguments
-        // object's past-the-end write returned above, so this index is NEW.)
-        if let Some(i) = array_index(key) {
-            if i >= crate::vm::MAX_DENSE_ARRAY_LEN
-                && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
-            {
-                self.arr_props
-                    .entry(idx)
-                    .or_insert_with(ObjMap::new_side_table)
-                    .set(&i.to_string(), val);
-                self.array_grow_js_len(idx, i);
-                self.heap.bump_version(idx);
-                return Ok(());
-            }
-        }
+        // A write at or past the dense end goes through `array_index_grow`,
+        // which keeps one past the eager-materialization cap, or too far past
+        // the dense end, out of the Vec. (An overridden / defineProperty'd
+        // index was routed to set_prop above, and an arguments object's
+        // past-the-end write returned above, so such an index is NEW.)
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces
-                // f64 indices): store, growing with `undefined` holes past the end.
+                // f64 indices): an in-range store stays here.
                 if let Some(i) = array_index(key) {
-                    if i >= items.len() {
-                        // Slots between the old length and the new index are
-                        // HOLES (absent), not present undefineds.
-                        items.resize(i + 1, Value::HOLE);
+                    if i < items.len() {
+                        items[i] = val;
+                        return Ok(());
                     }
-                    items[i] = val;
+                    return self.array_index_grow(idx, i, val);
                 }
                 Ok(())
             }

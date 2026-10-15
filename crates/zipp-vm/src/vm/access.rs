@@ -1934,11 +1934,22 @@ impl<'p> Vm<'p> {
                     if self.array_index_write_rejected(idx, n) {
                         return self.reject_write(key, strict);
                     }
-                    // Past the eager-materialization cap AND the dense prefix:
-                    // a sparse-overlay element + a virtual-length bump (never a
-                    // billions-of-holes resize). Mirrors set_index's numeric path.
-                    if n >= crate::vm::MAX_DENSE_ARRAY_LEN && !present {
-                        if !self.arguments_objs.contains_key(&idx) {
+                    // Past the dense prefix and either the eager-materialization
+                    // cap or the widest gap the Vec opens: a sparse-overlay
+                    // element + a virtual-length bump (never a long resize over
+                    // holes). Mirrors set_index's numeric path.
+                    let args = self.arguments_objs.contains_key(&idx);
+                    let dense_len = match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.len(),
+                        _ => usize::MAX,
+                    };
+                    let sparse = if args {
+                        n >= crate::vm::MAX_DENSE_ARRAY_LEN
+                    } else {
+                        n >= dense_len && self.array_new_index_sparse(idx, n, dense_len)
+                    };
+                    if sparse && !present {
+                        if !args {
                             self.arr_props
                                 .entry(idx)
                                 .or_insert_with(ObjMap::new_side_table)
@@ -1956,12 +1967,17 @@ impl<'p> Vm<'p> {
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
+                    let mut grew = false;
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {
                             // Intervening slots are HOLES (absent), per spec.
                             items.resize(n + 1, Value::HOLE);
+                            grew = true;
                         }
                         items[n] = val;
+                    }
+                    if grew && !args {
+                        self.array_dense_grew(idx, dense_len);
                     }
                     self.heap.bump_version(idx);
                     return Ok(true);

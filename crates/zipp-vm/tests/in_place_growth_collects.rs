@@ -1,7 +1,8 @@
 //! Memory that grows in place has to reach the collector's schedule.
 //!
-//! An array is born empty and pushed, or index-stored, to a megabyte; a Map
-//! fills. None of that allocates an object, so neither the count of objects
+//! An array is born empty and pushed, or given a length, to a megabyte; a Map
+//! fills. (A lone store far past the end no longer grows one: more than
+//! `MAX_DENSE_GAP` holes out, the element goes to the sparse overlay.) None of that allocates an object, so neither the count of objects
 //! nor the size at birth moves, and a loop that built and dropped such things
 //! ran no collection: a native run held 1.2 GB where Node peaked at 121 MB,
 //! and under a heap ceiling the WebAssembly modules ended a script whose live
@@ -104,12 +105,12 @@ fn peak_growth_of_all<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (value, ALL_PEAK.load(Ordering::Relaxed).saturating_sub(start))
 }
 
-/// Each iteration makes one array and stores at index 131,071, which fills a
-/// megabyte in place, then drops it. Nothing else is allocated.
+/// Each iteration makes one array and sets its length to 131,072, which fills
+/// a megabyte with holes in place, then drops it. Nothing else is allocated.
 const DROPPED_ARRAYS: &str = r#"
 function w(n) {
   var s = 0;
-  for (var i = 0; i < n; i++) { var a = []; a[131071] = 1; s += a.length; }
+  for (var i = 0; i < n; i++) { var a = []; a.length = 131072; s += a.length; }
   return s;
 }
 "#;
@@ -253,7 +254,7 @@ mod checked {
         // (200 MiB against a 64 MiB ceiling) before any poll looked.
         let mut state = engine(
             "var keep = []\n\
-             function grow(n) { for (var i = 0; i < n; i++) { var a = []; a[131071] = 1; keep.push(a) } return keep.length }",
+             function grow(n) { for (var i = 0; i < n; i++) { var a = []; a.length = 131072; keep.push(a) } return keep.length }",
             CEILING,
         );
         let grow = slot(&state, "grow");
@@ -272,7 +273,7 @@ mod checked {
         let mut state = engine(
             "var arrs = []\n\
              for (var k = 0; k < 200; k++) arrs.push([])\n\
-             function fill(n) { for (var i = 0; i < n; i++) arrs[i][131071] = 1; return n }",
+             function fill(n) { for (var i = 0; i < n; i++) arrs[i].length = 131072; return n }",
             CEILING,
         );
         let fill = slot(&state, "fill");

@@ -391,12 +391,14 @@ impl<'p> Vm<'p> {
                     // window is an ordinary named own property — `length`
                     // (items.len()) must stay argc, so never grow the Vec.
                     let args_past = i >= dense_len && self.arguments_objs.contains_key(&idx);
-                    // Past the eager-materialization cap AND the dense prefix:
-                    // a SPARSE define — the entry lives in arr_props with NO
-                    // dense placeholder (the Vec is never resized to billions
-                    // of holes); `length` comes from the virtual side table.
-                    let sparse_target =
-                        i >= crate::vm::MAX_DENSE_ARRAY_LEN && i >= dense_len && !args_past;
+                    // Past the dense prefix and either the eager-materialization
+                    // cap or the widest gap the Vec opens: a SPARSE define — the
+                    // entry lives in arr_props with NO dense placeholder (the
+                    // Vec is never resized over a long run of holes); `length`
+                    // comes from the virtual side table.
+                    let sparse_target = i >= dense_len
+                        && !args_past
+                        && self.array_new_index_sparse(idx, i, dense_len);
                     // Nursery barrier: this array-index arm returns before the
                     // generic define route's barrier below; both its stores
                     // (the dense element and an arr_props override's
@@ -404,6 +406,10 @@ impl<'p> Vm<'p> {
                     // (defineProperty is rare; the sidecar is also
                     // root-rescanned every minor).
                     self.heap.write_barrier(idx);
+                    // The Vec grows to take index `i` (as an element or as an
+                    // override's placeholder): settle a virtual length and the
+                    // overlay it now reaches (`array_dense_grew`).
+                    let grows = i >= dense_len && !args_past && !sparse_target;
                     if is_default_data && !args_past && !sparse_target {
                         // Lives in the dense Vec; drop any stale special override.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
@@ -415,6 +421,9 @@ impl<'p> Vm<'p> {
                                 items.resize(i + 1, Value::HOLE);
                             }
                             items[i] = stored;
+                        }
+                        if grows {
+                            self.array_dense_grew(idx, dense_len);
                         }
                     } else {
                         // Special: store in arr_props and keep a dense placeholder so
@@ -434,6 +443,8 @@ impl<'p> Vm<'p> {
                             .define(&key_i, stored, attr);
                         if sparse_target {
                             self.array_grow_js_len(idx, i);
+                        } else if grows {
+                            self.array_dense_grew(idx, dense_len);
                         }
                     }
                     self.heap.bump_version(idx);

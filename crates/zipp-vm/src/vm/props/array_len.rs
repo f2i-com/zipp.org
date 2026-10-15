@@ -86,6 +86,195 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether a NEW element at index `i`, at or past the dense length
+    /// `dense_len`, goes to the sparse overlay rather than the dense Vec: past
+    /// the eager-materialization cap, or more than
+    /// [`crate::vm::MAX_DENSE_GAP`] holes past the dense end. Growing the Vec
+    /// over a gap costs 8 bytes a hole, so 64 elements 64K apart
+    /// (`a[e * 65536] = e`) used to build a 32 MB Vec of holes.
+    #[inline]
+    pub(crate) fn array_index_goes_sparse(i: usize, dense_len: usize) -> bool {
+        i >= crate::vm::MAX_DENSE_ARRAY_LEN || i - dense_len > crate::vm::MAX_DENSE_GAP
+    }
+
+    /// [`Self::array_index_goes_sparse`] for a write about to add index `i` to
+    /// the array at `arr_idx`, with one exception: once the elements would
+    /// fill at least half of a Vec reaching `i`, the write grows the Vec
+    /// instead, and [`Self::array_dense_grew`] brings the overlay in. An array
+    /// keyed by ids that start high (`byId[5000 + k] = …`) would otherwise
+    /// stay in the string-keyed overlay for good.
+    pub(crate) fn array_new_index_sparse(&self, arr_idx: u32, i: usize, dense_len: usize) -> bool {
+        if !Self::array_index_goes_sparse(i, dense_len) {
+            return false;
+        }
+        if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
+            return true;
+        }
+        let overlay = self.arr_props.get(&arr_idx).map_or(0, |m| m.len());
+        (dense_len + overlay + 1) * 2 <= i + 1
+    }
+
+    /// `set_index`'s store of a NEW index `i`, at or past the dense end of the
+    /// (non-arguments) array at `arr_idx`. Past the eager-materialization cap,
+    /// or too far past the dense end ([`Self::array_new_index_sparse`]), the
+    /// element goes to the SPARSE overlay: arr_props under its canonical index
+    /// key (default data attributes), the JS length to the virtual-length
+    /// side table — the Vec is never resized over a long run of holes.
+    /// Otherwise the Vec grows to take it. Out of line so the in-range store
+    /// it splits from stays small.
+    #[inline(never)]
+    pub(crate) fn array_index_grow(
+        &mut self,
+        arr_idx: u32,
+        i: usize,
+        val: Value,
+    ) -> Result<(), Thrown> {
+        let dense_len = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return Ok(()),
+        };
+        if self.array_new_index_sparse(arr_idx, i, dense_len) {
+            let mut buf = [0u8; 20];
+            self.arr_props
+                .entry(arr_idx)
+                .or_insert_with(ObjMap::new_side_table)
+                .set(crate::heap::index_key(&mut buf, i), val);
+            self.array_grow_js_len(arr_idx, i);
+            self.heap.bump_version(arr_idx);
+            return Ok(());
+        }
+        if let HeapObj::Array(items) = self.heap.get_mut(arr_idx) {
+            if i == items.len() {
+                items.push(val);
+            } else {
+                // Slots between the old length and the new index are HOLES
+                // (absent), not present undefineds.
+                items.resize(i + 1, Value::HOLE);
+                items[i] = val;
+            }
+        }
+        self.array_dense_grew(arr_idx, dense_len);
+        Ok(())
+    }
+
+    /// Bookkeeping after the dense Vec of the (non-arguments) array at
+    /// `arr_idx` grew from `old_len` past its old end. Cheap unless the array
+    /// is virtual or has element overrides.
+    ///
+    /// * Plain overlay elements within [`crate::vm::MAX_DENSE_GAP`] of the
+    ///   Vec's end, and those continuing them within a gap of each other, move
+    ///   into the Vec — where they would be had they been written in ascending
+    ///   order. An array filled in reverse densifies
+    ///   ([`Self::array_new_index_sparse`]) and gets its dense store and every
+    ///   fast path back.
+    ///
+    ///   Finding them must not scan the overlay on every append. An overlay
+    ///   element only ever enters that window as the Vec grows (a write inside
+    ///   the window goes to the Vec), so a growth probes just the indices it
+    ///   brought into the window — one, for an append — and only a hit, or a
+    ///   jump of more than a gap (a densify, a `length` extension), pays the
+    ///   full pass. A hit skips it when the overlay is too spread out for the
+    ///   chain to reach its end: moving elements in one at a time costs a
+    ///   table rebuild each, and while any stay past the end the array is
+    ///   overlaid regardless.
+    /// * A virtual length the Vec now covers is dropped: every element left in
+    ///   the overlay lies below the Vec's end, over a HOLE placeholder, which
+    ///   is the representation of a defineProperty'd element.
+    pub(crate) fn array_dense_grew(&mut self, arr_idx: u32, old_len: usize) {
+        // An ordinary array — no virtual length, no side table — has nothing
+        // to settle.
+        if self.array_js_len.is_empty() && !self.arr_props.contains_key(&arr_idx) {
+            return;
+        }
+        let dense_len = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) if !self.arguments_objs.contains_key(&arr_idx) => items.len(),
+            _ => return,
+        };
+        let gap = crate::vm::MAX_DENSE_GAP;
+        let plain = |a: PropAttr| !a.accessor && a.writable && a.enumerable && a.configurable;
+        let end = match self.arr_props.get(&arr_idx) {
+            Some(m) if m.has_element_key() && m.extensible && !m.sealed && !m.frozen => {
+                let jump = dense_len.saturating_sub(old_len) > gap + 1;
+                let entered = || {
+                    (old_len + gap + 1..=dense_len + gap)
+                        .any(|k| m.element_pos(k).is_some_and(|p| plain(m.attr_at(p))))
+                };
+                let reachable = || {
+                    self.js_array_len(arr_idx).saturating_sub(dense_len)
+                        <= m.len().saturating_mul(gap + 1)
+                };
+                if !(jump || (entered() && reachable())) {
+                    None
+                } else {
+                    // Where the Vec would end had the plain elements past it been
+                    // written in ascending order.
+                    let mut past: Vec<usize> = m
+                        .iter()
+                        .filter_map(|(k, _, a)| {
+                            canonical_index_str(k).filter(|n| *n >= dense_len && plain(a))
+                        })
+                        .collect();
+                    past.sort_unstable();
+                    let mut end = dense_len;
+                    for n in past {
+                        if Self::array_index_goes_sparse(n, end) {
+                            break;
+                        }
+                        end = n + 1;
+                    }
+                    Some(end)
+                }
+            }
+            _ => None,
+        };
+        if let Some(end) = end {
+            let moved = match self.arr_props.get_mut(&arr_idx) {
+                Some(m) => m.remove_elements_where(|n, a| n < end && plain(a)),
+                None => Vec::new(),
+            };
+            if !moved.is_empty() {
+                // Nursery barrier: the side table is rescanned as a root every
+                // minor, an old array's Vec is not — the young values moving
+                // across need the holder carded (the store that brought us here
+                // was barriered for ITS value only).
+                self.heap.write_barrier(arr_idx);
+                if let HeapObj::Array(items) = self.heap.get_mut(arr_idx) {
+                    if end > items.len() {
+                        items.resize(end, Value::HOLE);
+                    }
+                    for (n, v, _) in moved {
+                        items[n] = v;
+                    }
+                }
+                self.heap.bump_version(arr_idx);
+            }
+        }
+        if let Some(&n) = self.array_js_len.get(&arr_idx) {
+            let dense_len = match self.heap.get(arr_idx) {
+                HeapObj::Array(items) => items.len(),
+                _ => return,
+            };
+            if n as usize <= dense_len {
+                self.array_js_len.remove(&arr_idx);
+            }
+        }
+        self.array_drop_empty_side_table(arr_idx);
+    }
+
+    /// Drop the array's side table once it holds nothing — no key, default
+    /// integrity flags — so the dense fast paths that test for any side table
+    /// at all (the JIT's) take the array again. Not while a virtual length is
+    /// left: those same tests are what keep an append from running past it.
+    pub(crate) fn array_drop_empty_side_table(&mut self, arr_idx: u32) {
+        let empty = self
+            .arr_props
+            .get(&arr_idx)
+            .is_some_and(|m| m.len() == 0 && m.extensible && !m.sealed && !m.frozen);
+        if empty && !self.array_js_len.contains_key(&arr_idx) {
+            self.arr_props.remove(&arr_idx);
+        }
+    }
+
     /// Whether Array `[[DefineOwnProperty]]` rejects a plain data write of index
     /// `i` on the array at `arr_idx` — the integrity-level half of `set_index`,
     /// shared so `OrdinarySet`'s boolean and the assignment path cannot drift
@@ -159,32 +348,37 @@ impl<'p> Vm<'p> {
     /// blocker into `n`.
     pub(crate) fn array_apply_length(&mut self, arr_idx: u32, n: usize) {
         if let Some(m) = self.arr_props.get_mut(&arr_idx) {
-            let doomed: Vec<String> = m
-                .keys
-                .iter()
-                // Only true array indices (< 2^32-1) are swept by truncation;
-                // "4294967295"/"4294967296" are ordinary named props and stay.
-                .filter(|k| canonical_index_str(k).is_some_and(|i| i < 4_294_967_295 && i >= n))
-                .cloned()
-                .collect();
-            for k in doomed {
-                m.remove(&k);
+            // Only true array indices (< 2^32-1) are swept by truncation;
+            // "4294967295"/"4294967296" are ordinary named props and stay. One
+            // pass: a sparse array can shed tens of thousands of elements here.
+            if m.has_element_key() {
+                m.remove_elements_where(|i, _| i >= n);
             }
         }
         let dense_len = match self.heap.get(arr_idx) {
             HeapObj::Array(items) => items.len(),
             _ => 0,
         };
-        if n <= dense_len || n <= crate::vm::MAX_DENSE_ARRAY_LEN {
+        // A SHRINK of a virtual array that stays more than a gap past its
+        // dense prefix keeps the length virtual: materializing holes up to the
+        // new length is the allocation the sparse overlay exists to avoid.
+        let virtual_shrink =
+            n > dense_len + crate::vm::MAX_DENSE_GAP && n < self.js_array_len(arr_idx);
+        if n <= dense_len || (n <= crate::vm::MAX_DENSE_ARRAY_LEN && !virtual_shrink) {
             // Materialized: truncate, or extend with HOLES (absent elements).
             if let HeapObj::Array(items) = self.heap.get_mut(arr_idx) {
                 items.resize(n, Value::HOLE);
             }
             self.array_js_len.remove(&arr_idx);
+            // Overlay elements the extended Vec now covers move into it.
+            if n > dense_len && self.arr_props.contains_key(&arr_idx) {
+                self.array_dense_grew(arr_idx, dense_len);
+            }
         } else {
             // Keep the dense prefix; the JS length lives in the side table.
             self.array_js_len.insert(arr_idx, n as u32);
         }
+        self.array_drop_empty_side_table(arr_idx);
         // `bump_version` also advances B244's saturating Array-snapshot epoch,
         // including the side-table-only branch where the dense Vec did not
         // move. A post-cross-call snapshot must therefore recheck virtual len.
@@ -722,5 +916,107 @@ mod array_snapshot_epoch_tests {
         assert!(vm.heap.array_snapshot_epoch > before);
         assert_eq!(vm.js_array_len(idx), 2);
         assert!(!vm.array_js_len.contains_key(&idx));
+    }
+}
+
+/// Where elements written past an array's end are STORED: the dense Vec, the
+/// sparse overlay, and the virtual length. Semantics are compared with Node by
+/// the scripts; these pin the representation, which no script can observe.
+#[cfg(test)]
+mod dense_gap_tests {
+    use super::*;
+
+    /// Run `src` and report, per global array name: (dense Vec length, overlay
+    /// keys — `None` when the array has no side table at all, which is what
+    /// the JIT's dense lanes require — and the virtual length if any).
+    fn shapes(src: &str, names: &[&str]) -> Vec<(usize, Option<usize>, Option<u32>)> {
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = crate::compile::compile_program(&ast, src).expect("source compiles");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+        names
+            .iter()
+            .map(|name| {
+                let slot = program
+                    .global_names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .unwrap_or_else(|| panic!("missing global slot for {name}"));
+                let idx = vm.globals[slot].heap_index();
+                let dense = match vm.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => panic!("{name} is not an array"),
+                };
+                let overlay = vm.arr_props.get(&idx).map(|m| m.len());
+                (dense, overlay, vm.array_js_len.get(&idx).copied())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_write_far_past_the_end_goes_to_the_overlay() {
+        let got = shapes(
+            "var a = []; for (var e = 0; e < 64; e++) a[e * 65536] = e;
+             var b = []; b[0] = 0; b[1026] = 1;
+             var c = []; c[0] = 0; c[1025] = 1;
+             var d = []; d['5000'] = 1;
+             var f = []; Object.defineProperty(f, 7000, {value: 1, writable: true, enumerable: true, configurable: true});",
+            &["a", "b", "c", "d", "f"],
+        );
+        let far = Some(63 * 65536 + 1);
+        assert_eq!(got[0], (1, Some(63), far), "64K gaps must not build a Vec of holes");
+        assert_eq!(got[1], (1, Some(1), Some(1027)), "1025 holes is past the widest gap");
+        assert_eq!(got[2], (1026, None, None), "1024 holes is the widest");
+        assert_eq!(got[3], (0, Some(1), Some(5001)), "a string-keyed index write too");
+        assert_eq!(got[4], (0, Some(1), Some(7001)), "so does a default-attribute define");
+    }
+
+    #[test]
+    fn filling_back_in_returns_the_elements_to_the_vec() {
+        let got = shapes(
+            "var rev = []; for (var i = 4999; i >= 0; i--) rev[i] = i;
+             var odd = []; for (var j = 9999; j >= 0; j -= 2) odd[j] = j;
+             var ids = []; for (var k = 5000; k < 16000; k++) ids[k] = k;
+             var up = []; up[3000] = 3; for (var m = 0; m < 2000; m++) up[m] = m;
+             var ext = []; ext[0] = 0; ext[3000] = 3; ext.length = 4000;",
+            &["rev", "odd", "ids", "up", "ext"],
+        );
+        assert_eq!(got[0], (5000, None, None), "a reverse fill ends dense, table dropped");
+        assert_eq!(got[1], (10000, None, None), "strided gaps within the limit too");
+        assert_eq!(got[2], (16000, None, None), "ids that start high densify once half full");
+        assert_eq!(got[3], (3001, None, None), "the Vec within a gap of an element absorbs it");
+        assert_eq!(got[4], (4000, None, None), "a length extension absorbs what it covers");
+    }
+
+    #[test]
+    fn non_default_elements_stay_in_the_overlay_over_a_placeholder() {
+        let got = shapes(
+            "var a = []; a[0] = 0;
+             Object.defineProperty(a, 2000, {get: function () { return 1; }, enumerable: true, configurable: true});
+             a[3000] = 3;
+             for (var i = 1; i < 2100; i++) if (i !== 2000) a[i] = i;
+             var s = []; s[0] = 0; s[5000] = 5; Object.seal(s); s[5000] = 6;",
+            &["a", "s"],
+        );
+        // The accessor keeps its overlay entry (over a HOLE in the Vec); the
+        // plain far element moved in once the Vec reached within a gap of it.
+        assert_eq!(got[0], (3001, Some(1), None));
+        assert_eq!(got[1], (1, Some(1), Some(5001)), "a sealed array's elements never move");
+    }
+
+    #[test]
+    fn truncation_and_virtual_shrink() {
+        let got = shapes(
+            "var a = []; for (var i = 0; i < 20000; i++) a[i * 2000] = i;
+             a.length = 10;
+             var v = []; v[0] = 0; v[9000] = 9; v.length = 5000;
+             var w = []; w[0] = 0; w[9000] = 9; w.length = 5000; for (var k = 1; k < 5100; k++) w[k] = k;",
+            &["a", "v", "w"],
+        );
+        assert_eq!(got[0], (10, None, None), "20,000 overlay elements shed in one pass");
+        // The emptied side table stays while the length is virtual (it keeps
+        // the JIT's append lane off the array), and goes with it.
+        assert_eq!(got[1], (1, Some(0), Some(5000)), "a shrink a gap past the Vec stays virtual");
+        assert_eq!(got[2], (5100, None, None), "the Vec reaching the virtual length drops it");
     }
 }

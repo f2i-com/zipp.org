@@ -268,6 +268,12 @@ pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 
+/// The most holes one write past an array's dense end opens in the Vec. A
+/// write further out puts the element in the sparse overlay (V8's `kMaxGap`
+/// is the same 1024); see `Vm::array_new_index_sparse`, which also takes the
+/// array back to the Vec once its elements would fill half of it.
+pub const MAX_DENSE_GAP: usize = 1024;
+
 /// Largest dense array one native operation builds from a LENGTH rather than
 /// from elements that already exist: materializing a virtual array (see
 /// [`MAX_DENSE_ARRAY_LEN`]), draining an iterator eagerly, or copying an
@@ -2194,8 +2200,11 @@ pub struct Vm<'p> {
     /// keys (GC-traced there); this table holds no Values — sweep-only. Absent
     /// for every fully-materialized array, so dense behavior is unchanged
     /// (`js_array_len` falls back to `items.len()`). Values are `1..=u32::MAX`
-    /// (a JS length is at most 2^32-1) and always exceed both the dense length
-    /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
+    /// (a JS length is at most 2^32-1) and always exceed the dense length: a
+    /// write past `MAX_DENSE_ARRAY_LEN` or more than `MAX_DENSE_GAP` past the
+    /// dense end, a `length` past the cap, or a shrink that stays past the
+    /// dense prefix inserts one, and the Vec growing to it removes it
+    /// (`Vm::array_dense_grew`).
     array_js_len: crate::slot_table::SlotTable<u32>,
     /// The INDEXED-PROTOTYPE PROTECTOR, inverted: `false` means "nothing in a plain
     /// array's prototype chain can supply an integer index", which is the state every

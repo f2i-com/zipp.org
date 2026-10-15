@@ -3215,6 +3215,42 @@ impl ObjMap {
         }
         key
     }
+
+    /// Remove every Array-index key `drop(index, attrs)` selects, in ONE pass:
+    /// the survivors are re-appended in order, with their attributes, to a
+    /// fresh side table that keeps this map's flags. `remove` shifts every
+    /// later slot and rescans the keys, so shedding `k` of `n` keys through it
+    /// is `O(k·n)`; a sparse array going back to its dense store sheds tens of
+    /// thousands at once. Returns the removed `(index, value, attrs)` in table
+    /// order. For side tables only (the result's shape is DICT); the caller
+    /// bumps the object's version when anything was removed.
+    pub(crate) fn remove_elements_where(
+        &mut self,
+        mut drop: impl FnMut(usize, PropAttr) -> bool,
+    ) -> Vec<(usize, Value, PropAttr)> {
+        let mut gone = Vec::new();
+        let mut kept = ObjMap::new_side_table();
+        for (k, v, a) in self.iter() {
+            if let Some(n) = canonical_array_index_key(k) {
+                if drop(n as usize, a) {
+                    gone.push((n as usize, v, a));
+                    continue;
+                }
+            }
+            kept.define(k, v, a);
+        }
+        if !gone.is_empty() {
+            kept.class = self.class;
+            kept.extensible = self.extensible;
+            kept.is_ctor = self.is_ctor;
+            kept.is_raw_json = self.is_raw_json;
+            kept.sealed = self.sealed;
+            kept.frozen = self.frozen;
+            kept.class_proto = self.class_proto;
+            *self = kept;
+        }
+        gone
+    }
 }
 
 /// A flat (contiguous) JS string with cached metadata so `.length` and indexing

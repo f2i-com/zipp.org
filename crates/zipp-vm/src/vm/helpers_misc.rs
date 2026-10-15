@@ -2067,10 +2067,14 @@ pub(crate) extern "win64" fn jit_set_index(
         HeapObj::Array(items) => i >= items.len() || items[i].is_hole(),
         _ => false,
     };
+    // A VIRTUAL array's length is its side-table entry, which an append at
+    // the dense end would leave behind once the Vec reaches it; the
+    // interpreter's growth path settles it (`Vm::array_dense_grew`).
     if creates_new_index
         && (vm.array_length_nonwritable.contains(&arr.heap_index())
             || vm.array_proto_has_index
-            || vm.proto_of.contains_key(&arr.heap_index()))
+            || vm.proto_of.contains_key(&arr.heap_index())
+            || vm.array_js_len.contains_key(&arr.heap_index()))
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
