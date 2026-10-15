@@ -702,6 +702,17 @@ pub(crate) extern "win64" fn jit_coll_lookup(
     if !vm.collection_method_is_intrinsic(idx, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    coll_lookup_proven(vm, idx, key_bits, op)
+}
+
+/// [`jit_coll_lookup`]'s lookup itself, for a caller that has already proved
+/// the method is the intrinsic and the receiver `idx` the collection its `op`
+/// names (a Map for 0 and 1, a Set for 2): `jit_coll_lookup` after its own
+/// proof, and [`jit_captured_method`], whose captured callee IS the intrinsic,
+/// which is all the call it stands for invokes. Runs no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn coll_lookup_proven(vm: &mut Vm, idx: u32, key_bits: u64, op: u64) -> u64 {
     let found = vm.coll_find(idx, Value::from_bits(key_bits));
     match op {
         0 => match found {
@@ -766,16 +777,32 @@ pub(crate) extern "win64" fn jit_coll_mutate(
         }
         return jit_weak_coll(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, key_bits, val_bits, id);
     }
-    let (name, kind) = match op {
+    let (name, kind) = coll_mutate_name(op);
+    if !vm.collection_method_is_intrinsic(idx, name, kind) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_mutate_proven(vm, idx, key_bits, val_bits, op)
+}
+
+/// [`jit_coll_mutate`]'s method name and receiver kind for `op`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn coll_mutate_name(op: u64) -> (&'static str, u8) {
+    match op {
         0 => ("set", 4u8),
         1 => ("clear", 4),
         2 => ("add", 3),
         3 => ("delete", 4),
         _ => ("delete", 3),
-    };
-    if !vm.collection_method_is_intrinsic(idx, name, kind) {
-        return crate::codegen::SELF_CALL_DEOPT;
     }
+}
+
+/// [`jit_coll_mutate`]'s mutation itself, for a caller that has already
+/// proved the method is the intrinsic and the receiver `idx` the collection
+/// `op` names (see [`coll_lookup_proven`]). Runs no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn coll_mutate_proven(vm: &mut Vm, idx: u32, key_bits: u64, val_bits: u64, op: u64) -> u64 {
+    let (name, kind) = coll_mutate_name(op);
     let key = Value::from_bits(key_bits);
     let val = Value::from_bits(val_bits);
     if (key.is_heap() && key.heap_index() as usize >= vm.heap.len())
@@ -991,9 +1018,20 @@ pub(crate) extern "win64" fn jit_captured_method(
         }
     };
     match lane {
-        Lane::Lookup(o) => jit_coll_lookup(vm, recv_bits, arg(0), o),
+        // The lane above proved the captured callee is the intrinsic for this
+        // receiver's kind: the call runs it, so the dedicated helpers' own
+        // re-proof of the same method (a second `collection_method_is_intrinsic`
+        // with nothing run in between) is skipped.
+        Lane::Lookup(o) => {
+            // SAFETY: generated code passes its exclusive live VM pointer; the
+            // proof's borrow has ended.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            coll_lookup_proven(vm, idx, arg(0), o)
+        }
         Lane::Mutate(o) => {
-            jit_coll_mutate(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
+            // SAFETY: as above.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            coll_mutate_proven(vm, idx, arg(0), if argc >= 2 { arg(1) } else { 0 }, o)
         }
         Lane::Weak(id) => jit_weak_coll(vm, recv_bits, arg(0), if argc >= 2 { arg(1) } else { 0 }, id),
         Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
