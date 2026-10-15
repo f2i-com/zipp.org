@@ -1020,6 +1020,15 @@ fn loc_src(l: Loc) -> Src {
 /// failure mode stays "decline as today", never "engage mostly-spilled").
 const GPR_SPILL_CAP: usize = 8;
 
+/// The cap for a region holding a dense computed-call splice. Such a region
+/// has no DOUBLE-tier alternative (its virtual plan cannot reach an XMM
+/// emitter), so a decline here lands on the MEMORY tier, several times slower
+/// than a spilled integer body. A captured `Math.imul` in one arm (the
+/// spec-order `LoadGlobal Math; GetProp imul` pair) adds a home: the
+/// bytecode-vm row's three-arm helper table needed nine spills, declined at
+/// eight and ran 3.7x slower than with the relaxed call order.
+const COMPUTED_SPLICE_SPILL_CAP: usize = 12;
+
 /// Deferred-deopt shadows are deliberately a small, local escape hatch, not a
 /// second register file. Thirty-two qwords is enough for every DV plan seen in
 /// the suite while bounding frame growth and compile-time scans.
@@ -2655,7 +2664,13 @@ pub(crate) fn compile_region_int_gpr(
     let general_spill = gpr_spill_slots_enabled() || computed_spill;
     let spill_enabled =
         allow_spill && (general_spill || captured_prefix_spill || split_prefix_spill);
-    let spill_cap = if general_spill { GPR_SPILL_CAP } else { 1 };
+    let spill_cap = if computed_spill {
+        COMPUTED_SPLICE_SPILL_CAP
+    } else if general_spill {
+        GPR_SPILL_CAP
+    } else {
+        1
+    };
     let (map, hoist_c, inline_guards, n_spill) = match gpr_home_map(
         proto,
         plan,
