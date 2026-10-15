@@ -40,6 +40,8 @@ pub(crate) fn can_kernel_body(proto: &FuncProto) -> bool {
                 | Instr::Ge { .. }
                 | Instr::Eq { .. }
                 | Instr::Ne { .. }
+                | Instr::Bitwise { .. }
+                | Instr::BitNot { .. }
                 | Instr::Return { .. }
                 | Instr::ReturnUndefined
         )
@@ -51,7 +53,8 @@ pub(crate) fn can_kernel_body(proto: &FuncProto) -> bool {
 fn kernel_reads_this(instr: &Instr) -> bool {
     match *instr {
         Instr::Move { src, .. } | Instr::Return { src } => src == 0,
-        Instr::AddInt { a, .. } => a == 0,
+        Instr::AddInt { a, .. } | Instr::BitNot { a, .. } => a == 0,
+        Instr::Bitwise { a, b, .. } => a == 0 || b == 0,
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
         | Instr::Mul { a, b, .. }
@@ -228,6 +231,55 @@ pub(crate) fn kmap_dcmp(
     );
 }
 
+/// Bitwise op or shift for a kernel body, as the region tier emits it: ToInt32
+/// both operands (an Int payload, or a double whose truncation fits i64; NaN,
+/// ±Infinity, |x| >= 2^63 and every non-number bail), then the 32-bit op. x86
+/// masks a 32-bit shift count to five bits, exactly JS's `& 31`. Every result
+/// is an Int except a `>>>` above i32::MAX, an exact double. Clobbers
+/// rax/rcx/r8/r10 and xmm0/xmm1, as the arithmetic ops do.
+pub(crate) fn kmap_bitwise(
+    ops: &mut dynasmrt::x64::Assembler,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    op: crate::bytecode::BitwiseOp,
+) {
+    use crate::bytecode::BitwiseOp as B;
+    load_toint32(ops, a, bail);
+    dynasm!(ops ; mov r8d, eax);
+    load_toint32(ops, b, bail);
+    dynasm!(ops ; mov ecx, eax ; mov eax, r8d);
+    match op {
+        B::And => dynasm!(ops ; and eax, ecx),
+        B::Or => dynasm!(ops ; or eax, ecx),
+        B::Xor => dynasm!(ops ; xor eax, ecx),
+        B::Shl => dynasm!(ops ; shl eax, cl),
+        B::Shr => dynasm!(ops ; sar eax, cl),
+        B::Ushr => {
+            let as_dbl = ops.new_dynamic_label();
+            let done = ops.new_dynamic_label();
+            dynasm!(ops
+                ; shr eax, cl
+                ; test eax, eax
+                ; js => as_dbl                 // u32 > i32::MAX → double
+            );
+            box_eax(ops, dst);
+            dynasm!(ops
+                ; jmp => done
+                ; => as_dbl
+                ; mov eax, eax                 // zero-extend the u32
+                ; cvtsi2sd xmm0, rax           // exact (< 2^32)
+                ; movq rax, xmm0
+                ; mov [rbx + dreg(dst)], rax
+                ; => done
+            );
+            return;
+        }
+    }
+    box_eax(ops, dst);
+}
+
 /// How a kernel callback body op classifies: a value op already emitted, or a
 /// `Return` the kernel must turn into its own result-commit.
 pub(crate) enum KBody {
@@ -304,6 +356,18 @@ pub(crate) fn emit_kernel_arith(
         }
         Instr::Ne { dst, a, b } => {
             kmap_dcmp(ops, bail, dst, a, b, Cmp::Ne);
+            Some(KBody::Plain)
+        }
+        Instr::Bitwise { dst, a, b, op } => {
+            kmap_bitwise(ops, bail, dst, a, b, op);
+            Some(KBody::Plain)
+        }
+        Instr::BitNot { dst, a } => {
+            // `~x`: ToInt32 (Int payload or a double `cvttsd2si` holds; anything
+            // else bails), complement, an Int result.
+            load_toint32(ops, a, bail);
+            dynasm!(ops ; not eax);
+            box_eax(ops, dst);
             Some(KBody::Plain)
         }
         Instr::Return { src } => Some(KBody::Ret(src)),

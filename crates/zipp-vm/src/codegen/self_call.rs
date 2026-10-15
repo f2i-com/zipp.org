@@ -160,10 +160,11 @@ pub(crate) fn emit_self_call(
 // body per element. No per-element call.
 //
 // SAFETY MODEL — same correctness-first stance as the leaf JIT:
-// * `can_kernel_body` accepts ONLY pure-arithmetic callbacks (no calls,
-//   globals, heap ops, branches, `%`, or non-int constants), so the kernel is
-//   CALL-FREE and `self.regs`/the snapshot/the output buffer can't reallocate
-//   under the live pointers during a run.
+// * `can_kernel_body` accepts ONLY pure-arithmetic callbacks (arithmetic,
+//   comparisons, bitwise ops and shifts; no calls, globals, heap ops,
+//   branches, or non-int constants), so the kernel is CALL-FREE and
+//   `self.regs`/the snapshot/the output buffer can't reallocate under the
+//   live pointers during a run.
 // * Arithmetic is f64/SSE (reusing the region's `load_num_xmm`/`store_xmm`), so
 //   a kernel handles BOTH int-tagged and double elements — loop-built numeric
 //   arrays hold doubles (the building loop ran in the SSE region). A non-number
