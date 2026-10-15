@@ -1644,6 +1644,15 @@ pub struct Vm<'p> {
     /// pointer in the hot struct rather than the recorder's whole footprint.
     #[cfg(feature = "instrument")]
     pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
+    /// The dispatch hook's countdown, held here rather than in the boxed
+    /// recorder so the per-instruction cost is one decrement and one test
+    /// with no load through the box. With a recorder installed the real
+    /// countdown is `Recorder::countdown + step_hot`; every other reader of
+    /// the recorder folds this in first (`rec_mut!`) or passes it along, and
+    /// the hook's slow path, taken when this goes negative, folds it, steps
+    /// exactly as before and reloads it. `i64::MAX` without a recorder.
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+    pub(crate) step_hot: i64,
     /// B269: what the last exact heap audit counted BEYOND the heap's own O(1)
     /// resident figure (VM-owned side tables, frames, regex programs). The
     /// per-operation headroom checks add it to the cheap figure, so between
@@ -3219,6 +3228,17 @@ impl<'p> Vm<'p> {
         self.native_recursion_depth -= 1;
         result
     }
+}
+
+/// The recorder for a mutable use outside the dispatch hook: the hook's
+/// `step_hot` folded into it first (`Vm::meter_fold`), then the field
+/// itself, so the borrow is of the field alone, as `instr_rec.as_mut()` was.
+#[cfg(feature = "instrument")]
+macro_rules! rec_mut {
+    ($vm:expr) => {{
+        $vm.meter_fold();
+        $vm.instr_rec.as_mut()
+    }};
 }
 
 // submodules (split from the former monolithic vm.rs)

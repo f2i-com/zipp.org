@@ -1012,7 +1012,7 @@ mod replay_safety_tests {
             .instr_rec
             .as_ref()
             .expect("recorder attached")
-            .steps_used();
+            .steps_used(vm.meter_hot());
 
         assert_eq!(
             vm.try_method_inline(fid, subject, 0, 0, 0),
@@ -1020,7 +1020,7 @@ mod replay_safety_tests {
             "nested work must fall back to the exactly metered frame path"
         );
         assert_eq!(
-            vm.instr_rec.as_ref().unwrap().steps_used(),
+            vm.instr_rec.as_ref().unwrap().steps_used(vm.meter_hot()),
             before,
             "a declined speculative path must not consume metered work"
         );
@@ -1057,7 +1057,7 @@ mod replay_safety_tests {
             .instr_rec
             .as_ref()
             .expect("recorder attached")
-            .steps_used();
+            .steps_used(vm.meter_hot());
         let before_value = vm.get_prop(subject, "n").expect("read n");
 
         assert_eq!(vm.accessor_fast_get(getter, subject), None);
@@ -1068,7 +1068,7 @@ mod replay_safety_tests {
             "the metered setter shortcut must decline before its store"
         );
         assert_eq!(
-            vm.instr_rec.as_ref().unwrap().steps_used(),
+            vm.instr_rec.as_ref().unwrap().steps_used(vm.meter_hot()),
             before_steps,
             "declined accessor shortcuts must not consume untracked work"
         );

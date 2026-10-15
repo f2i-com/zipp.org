@@ -270,6 +270,8 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
             instr_rec: None,
+            #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+            step_hot: i64::MAX,
             heap_audit_extra: std::cell::Cell::new(0),
             #[cfg(feature = "instrument")]
             jit_steps: 0,
@@ -1048,6 +1050,12 @@ impl<'p> Vm<'p> {
         // whether the dispatch hook may take its short path.
         rec.refresh_slow();
         self.instr_rec = Some(Box::new(rec));
+        // The new recorder's own countdown is the whole of it: the next step
+        // takes the hook's slow path, which schedules the first countdown.
+        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+        {
+            self.step_hot = 0;
+        }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             // Safe to read now that `instr_rec` is set: the offset is relative to

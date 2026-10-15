@@ -936,7 +936,7 @@ impl<'p> Vm<'p> {
         // crate's Cargo.toml advertises, both failed to compile.
         #[cfg(feature = "instrument")]
         {
-            match self.instr_rec.as_mut() {
+            match rec_mut!(self) {
                 Some(rec) if rec.exhaustion.is_none() => {
                     rec.set_step_limit(max_steps);
                     true
@@ -1455,7 +1455,7 @@ impl<'p> Vm<'p> {
         let (steps_used, dynamic_code_calls, dynamic_code_source_bytes) = match &self.instr_rec {
             Some(rec) => {
                 let (calls, bytes) = rec.dynamic_code_usage();
-                (rec.steps_used(), calls, bytes)
+                (rec.steps_used(self.meter_hot()), calls, bytes)
             }
             None => (0, 0, 0),
         };

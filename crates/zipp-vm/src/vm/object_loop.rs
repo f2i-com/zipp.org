@@ -329,7 +329,7 @@ impl<'p> Vm<'p> {
         // the real exit instruction then fails exactly as before.
         if let Some(rec) = self.instr_rec.as_ref() {
             if rec.exhaustion.is_some()
-                || rec.remaining_now() < values.charge
+                || rec.remaining_now(self.meter_hot()) < values.charge
             {
                 return None;
             }
@@ -552,7 +552,7 @@ mod tests {
             Value::int(72)
         );
         assert_eq!(
-            measured.instr_rec.as_ref().unwrap().steps_used(),
+            measured.instr_rec.as_ref().unwrap().steps_used(measured.meter_hot()),
             STEPS as u64
         );
 
@@ -561,12 +561,12 @@ mod tests {
             invoke(&mut exact, slot).expect("exact run succeeds"),
             Value::int(72)
         );
-        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(), 0);
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining_now(exact.meter_hot()), 0);
 
         let (mut short, slot) = ready(STEPS - 1);
         let error = invoke(&mut short, slot).expect_err("Return must cross the boundary");
         assert!(error.0.contains("instruction budget"), "got {error:?}");
-        assert_eq!(short.instr_rec.as_ref().unwrap().remaining_now(), 0);
+        assert_eq!(short.instr_rec.as_ref().unwrap().remaining_now(short.meter_hot()), 0);
     }
 
     #[test]
@@ -607,7 +607,7 @@ mod tests {
             )
             .expect("comparison wrapper succeeds");
         assert_eq!(vm.display(result), "250000500000");
-        assert_eq!(vm.instr_rec.as_ref().unwrap().steps_used(), EXPECTED_STEPS);
+        assert_eq!(vm.instr_rec.as_ref().unwrap().steps_used(vm.meter_hot()), EXPECTED_STEPS);
         assert!(
             FAST_FORWARD_HITS.load(std::sync::atomic::Ordering::Relaxed) > before,
             "real wrapper did not enter the object-loop kernel"

@@ -138,7 +138,7 @@ impl Vm<'_> {
         // uncharged Return attempts its tick.
         if let Some(rec) = self.instr_rec.as_ref() {
             if rec.exhaustion.is_some()
-                || rec.remaining_now() < skipped_steps
+                || rec.remaining_now(self.meter_hot()) < skipped_steps
             {
                 return false;
             }

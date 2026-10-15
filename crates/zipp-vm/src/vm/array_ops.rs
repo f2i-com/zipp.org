@@ -324,7 +324,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "meter-only")]
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps = plan.steps();
-            if rec.exhaustion.is_some() || rec.remaining_now() < steps {
+            if rec.exhaustion.is_some() || rec.remaining_now(self.meter_hot()) < steps {
                 return None;
             }
         }

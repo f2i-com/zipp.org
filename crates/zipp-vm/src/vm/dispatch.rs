@@ -612,7 +612,20 @@ impl<'p> Vm<'p> {
                 // when it is present but unused — this is the hot loop.
                 // `ip` (the local) is the pc, never `frames[..].ip`, which is
                 // only synced at frame transitions and is stale in here.
-                #[cfg(feature = "instrument")]
+                // (The general profile's hook is one decrement of `step_hot`
+                // and one test, with or without a recorder: see `step_hot`.)
+                #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+                {
+                    self.step_hot -= 1;
+                    if self.step_hot < 0 {
+                        if let Err(msg) = self.instrument_step_hot_out(base, ip, instr) {
+                            let top = self.frames.len() - 1;
+                            self.frames[top].ip = ip;
+                            return Err(Thrown(msg.to_string()));
+                        }
+                    }
+                }
+                #[cfg(feature = "meter-only")]
                 if self.instr_rec.is_some() {
                     if let Err(msg) = self.instrument_step(base, ip, instr) {
                         let top = self.frames.len() - 1;
@@ -10597,7 +10610,7 @@ impl<'p> Vm<'p> {
         let steps = 13u64.checked_mul(b)?.checked_sub(10)?;
         if let Some(rec) = self.instr_rec.as_ref() {
             let steps_i64 = i64::try_from(steps).ok()?;
-            if rec.exhaustion.is_some() || rec.remaining_now() < steps_i64 {
+            if rec.exhaustion.is_some() || rec.remaining_now(self.meter_hot()) < steps_i64 {
                 // The finite error path must still stop at its historical child
                 // opcode (and retain every scheduled resource audit), so only a
                 // completely payable pure activation is collapsed.
