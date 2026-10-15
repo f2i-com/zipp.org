@@ -1271,6 +1271,53 @@ impl<'p> Vm<'p> {
 
     // ── SetProp sites ──
 
+    /// The way-0 own-data hit of [`Self::ic_set_prop`], inline in the general
+    /// profile's dispatch loop (see [`Self::ic_get_prop_own_hit`]): the same
+    /// shape guard and the same store `ic_apply_set`'s `WriteOwn` makes.
+    /// `false` leaves the write to the full call.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_set_prop_own_hit(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        val: Value,
+    ) -> bool {
+        if !self.ic_func_eligible(func_id) {
+            return false;
+        }
+        let Some(site) = self
+            .site_ics
+            .get(func_id as usize)
+            .and_then(|f| f.as_ref())
+            .and_then(|f| f.get(ip))
+            .and_then(|s| s.as_deref())
+        else {
+            return false;
+        };
+        if site.n == 0 {
+            return false;
+        }
+        let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
+            return false;
+        };
+        let Some((idx, m)) = self.ic_recv_map(recv) else {
+            return false;
+        };
+        let sh = m.shape();
+        if sh == crate::shape::DICT || sh != cached {
+            return false;
+        }
+        if val.is_heap() {
+            self.heap.write_barrier_val(idx, val);
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(slot as usize, val);
+        }
+        true
+    }
+
     /// IC lookup + fill for a `SetProp` site. `SetAct::Done` means the own
     /// data slot was written; `Setter` hands a plain setter to frame-call.
     pub(crate) fn ic_set_prop(

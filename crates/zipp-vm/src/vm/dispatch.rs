@@ -3517,6 +3517,13 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // The cache's way-0 own-data hit, inline; anything
+                        // else is the full `ic_set_prop` call below.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                            ip += 1;
+                            continue;
+                        }
                         // ── interpreter property IC ── an existing own data
                         // slot writes directly; a cached class/own SETTER
                         // frame-calls on THIS dispatch loop with the value as
