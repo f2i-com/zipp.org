@@ -11,6 +11,11 @@
 //
 // The module's allocator now reports what it has outstanding and the
 // collector's poll reads it.
+//
+// A store more than 1,024 holes past an array's end goes to its sparse side
+// table rather than growing it (0.0.25), so `a[131071]=1` on an empty array
+// no longer makes a megabyte. The index stores below step by 1,024, each
+// within the dense gap, and grow the same megabyte in place.
 const { Engine } = require("./pkg/zipp_wasm.js");
 
 let pass = 0;
@@ -49,7 +54,7 @@ const GARBAGE = [
     "function w(n){const a=[];for(let i=0;i<n;i++)a.push(i);let s=0;for(let i=0;i<a.length;i++)s+=a[i];return s}",
     700, [80000], 3199960000],
   ["a megabyte index store on a fresh array, 2,000 times in one call",
-    "function w(){let s=0;for(let i=0;i<2000;i++){const a=[];a[131071]=1;s+=a.length}return s}",
+    "function w(){let s=0;for(let i=0;i<2000;i++){const a=[];for(let j=1023;j<131072;j+=1024)a[j]=1;s+=a.length}return s}",
     1, [], 262144000],
   ["a megabyte length set and fill, 2,000 times in one call",
     "function w(){let s=0;for(let i=0;i<2000;i++){const a=[];a.length=131072;a.fill(0);s+=a.length}return s}",
@@ -79,12 +84,12 @@ for (const [label, source, calls, args, expected] of GARBAGE) {
 // ---- live growth: the ceiling's error, not the linear memory's trap ------
 const LIVE = [
   ["600 live megabyte arrays, each made and index-stored",
-    "var keep=[];function grow(n){for(let i=0;i<n;i++){const a=[];a[131071]=1;keep.push(a)}return keep.length}",
+    "var keep=[];function grow(n){for(let i=0;i<n;i++){const a=[];for(let j=1023;j<131072;j+=1024)a[j]=1;keep.push(a)}return keep.length}",
     "grow", [600]],
   // Nothing is allocated while these grow: only the poll at the loop's
   // back-edge can see them.
   ["600 live megabyte arrays that existed before they grew",
-    "var arrs=[];for(let k=0;k<600;k++)arrs.push([]);function fill(n){for(let i=0;i<n;i++)arrs[i][131071]=1;return n}",
+    "var arrs=[];for(let k=0;k<600;k++)arrs.push([]);function fill(n){for(let i=0;i<n;i++){const a=arrs[i];for(let j=1023;j<131072;j+=1024)a[j]=1}return n}",
     "fill", [600]],
 ];
 for (const [label, source, name, args] of LIVE) {
