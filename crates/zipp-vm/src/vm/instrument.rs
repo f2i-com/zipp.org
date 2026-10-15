@@ -1909,7 +1909,7 @@ impl super::Vm<'_> {
     #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
     #[inline(always)]
     pub(crate) fn instrument_step(&mut self, _base: usize, _ip: usize, _instr: &Instr) -> Tick {
-        let rec = match rec_mut!(self) {
+        let rec = match self.instr_rec.as_mut() {
             Some(rec) => rec,
             None => return Ok(()),
         };
@@ -1933,7 +1933,7 @@ impl super::Vm<'_> {
     #[cold]
     #[inline(never)]
     fn instrument_step_stop(&mut self) -> Tick {
-        let rec = match rec_mut!(self) {
+        let rec = match self.instr_rec.as_mut() {
             Some(rec) => rec,
             None => return Ok(()),
         };
@@ -1951,7 +1951,7 @@ impl super::Vm<'_> {
     #[cfg(all(feature = "meter-only", any(feature = "jit", test)))]
     #[inline(always)]
     pub(crate) fn instrument_step(&mut self, _base: usize, _ip: usize, _instr: &Instr) -> Tick {
-        let rec = match rec_mut!(self) {
+        let rec = match self.instr_rec.as_mut() {
             Some(rec) => rec,
             None => return Ok(()),
         };
@@ -1965,12 +1965,12 @@ impl super::Vm<'_> {
                     return Err(self.instrument_steps_out());
                 }
             }
-            let Some(rec) = rec_mut!(self) else {
+            let Some(rec) = self.instr_rec.as_mut() else {
                 return Ok(());
             };
             rec.remaining -= 1;
         }
-        let Some(rec) = rec_mut!(self) else {
+        let Some(rec) = self.instr_rec.as_mut() else {
             return Ok(());
         };
         rec.ticks = rec.ticks.wrapping_add(1);
@@ -2025,14 +2025,21 @@ impl super::Vm<'_> {
     /// Out of line: it sits at every such use, several of them inside code
     /// the dispatch loop inlines, and inlined there it cost the loop's code
     /// generation far more than the call does.
+    #[cfg(not(feature = "meter-only"))]
     #[inline(never)]
     pub(crate) fn meter_fold(&mut self) {
-        #[cfg(not(feature = "meter-only"))]
         if let Some(rec) = self.instr_rec.as_mut() {
             rec.countdown += self.step_hot;
             self.step_hot = 0;
         }
     }
+
+    /// The meter-only profile keeps no `step_hot`: nothing to fold. Inlined
+    /// away, so its own per-instruction hook (which reaches the recorder
+    /// through `rec_mut!` like everything else) pays nothing for it.
+    #[cfg(feature = "meter-only")]
+    #[inline(always)]
+    pub(crate) fn meter_fold(&mut self) {}
 
     /// The VM's unfolded `step_hot`, for a read-only use of the recorder's
     /// countdown figures (`remaining_now`, `steps_used`, ...); 0 where the
@@ -2340,8 +2347,12 @@ impl super::Vm<'_> {
             // old ones (eight passes held 106 MB where QuickJS held 38). The
             // walk sees that growth: once the heap stands a step over the
             // level the first walk after the last major found, ask for a
-            // major. The step is half that level when that is more, so a
-            // heap that is really growing pays for O(log) majors, not O(n).
+            // major. The step is a quarter of that level when that is more,
+            // so a heap that is really growing pays for O(log) majors, not
+            // O(n). (Weighing every poll with the O(1) estimate as well was
+            // tried: json-large's peak fell 89 MB to 57, but extra majors cost
+            // json-large 15% and markdown-render 20% of their time, and a
+            // gentler step raised markdown-render's peak instead.)
             if rec.growth_major != majors {
                 rec.growth_major = majors;
                 rec.growth_level = total;
