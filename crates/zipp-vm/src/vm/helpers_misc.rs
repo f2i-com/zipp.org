@@ -2724,6 +2724,19 @@ pub(crate) extern "win64" fn jit_array_push(
     if vm.array_js_len.contains_key(&arr.heap_index()) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // An OWN `push` (`arr.push = fn; arr.push(x)`) is what a real Get finds
+    // before the prototype's intrinsic, so `fn` must run: the interpreter's
+    // lane (`interp_array_push_fast`, B289) declines it, and this one
+    // appended instead. It lives in the side table as a named key, which
+    // `array_elements_overlaid` below does not see.
+    if !vm.arr_props.is_empty()
+        && vm
+            .arr_props
+            .get(&arr.heap_index())
+            .is_some_and(|m| m.pos("push").is_some())
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     // `push` is `Set(O, len, v, true)` then `Set(O, "length", …, true)`, and BOTH
     // can fail. This arm was an unconditional `Vec::push`, so on a frozen, sealed
     // or non-extensible array — or one whose `length` was made non-writable —
