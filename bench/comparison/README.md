@@ -1,7 +1,53 @@
-# QuickJS-NG and Boa comparison
+# Interpreter, QuickJS-NG and Boa comparisons
 
 This is a **diagnostic ecosystem comparison**, separate from Zipp's canonical
-Node/Bun/Deno publication series.  It answers two narrower questions:
+Node/Bun/Deno publication series.
+
+## Interpreter versus interpreter, 2026-10-15
+
+The current interpreter table in the root README compares Zipp's interpreter
+with other interpreters and with JIT engines running JIT-off. The canonical
+PGO binary at `fa8e3b86` runs with `ZIPP_NOJIT=1` (`zipp-interp`) against:
+
+| Engine name | What runs | No-JIT check |
+|---|---|---|
+| `quickjs` | Bellard's QuickJS 2026-06-04 (`qjs`) | no JIT exists |
+| `quickjs-ng` | QuickJS-NG 0.17.0 Windows x86-64 release | no JIT exists |
+| `node-jitless` | Node v24.19.0 `--jitless` (Ignition only) | 27× slower on a tight loop |
+| `deno-jitless` | Deno 2.6.10 `run -q --v8-flags=--jitless` | 1.9× slower |
+| `bun-nojit` | Bun 1.3.14 with `BUN_JSC_useJIT=0` (LLInt only) | 2.5× slower |
+| `node` | Node v24.19.0 with its JIT, the output reference | — |
+
+Zipp's own interpreter mode is 18× slower than its JIT on the same tight loop.
+Raw results, 8 counterbalanced repetitions each:
+
+- [`interp_real13_fa8e3b86_2026-10-15.json`](interp_real13_fa8e3b86_2026-10-15.json):
+  the 13 normal rows. Zipp's interpreter is 0.713× Bellard's QuickJS
+  [0.711, 0.722] (8 / 13 point wins), 0.442× QuickJS-NG [0.439, 0.448]
+  (13 / 13), 0.941× Bun no-JIT, 1.368× Deno jitless and 1.427× Node jitless.
+- [`interp_micro5_fa8e3b86_2026-10-15.json`](interp_micro5_fa8e3b86_2026-10-15.json):
+  the five downscaled micro kernels. Zipp's interpreter is 1.12× Bellard's
+  QuickJS, 0.71× QuickJS-NG and 1.26× Node jitless; recursive `fib` is the
+  largest gap (179 ms against 108 for QuickJS).
+
+The command, from the repository root (`$Q` holding the two QuickJS paths):
+
+```powershell
+python bench\comparison\run_native.py `
+  --zipp target\x86_64-pc-windows-msvc\release\zipp.exe `
+  --quickjs $Q\qjs.exe --quickjs-ng $Q\qjs-windows-x86_64.exe `
+  --suite real13 --reps 8 --bootstrap-samples 10000 `
+  --engines node,zipp-interp,quickjs,quickjs-ng,node-jitless,deno-jitless,bun-nojit `
+  --json target\bench-results\interp-real13.json
+```
+
+`--suite micro5` runs the micro kernels. Every engine's output is checked
+against Node's before timing. The JIT-off engines are not their shipped
+configurations; they answer the interpreter question only.
+
+## Earlier QuickJS-NG and Boa comparisons
+
+The sections below answer two narrower questions:
 
 1. How do Zipp's default native engine and interpreter-only mode compare with
    pinned QuickJS-NG and Boa interpreter builds on identical work?

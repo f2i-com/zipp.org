@@ -438,46 +438,46 @@ type BenchmarkRow = {
   nodeRatio: number
 }
 
-// Canonical clean PGO capture at engine commit 8229b3fc (2026-09-02): cold wall
+// Canonical clean PGO capture at engine commit fa8e3b86 (2026-10-15): cold wall
 // time medians in milliseconds over 15 counterbalanced repetitions, exact
 // output on every row. Zipp / Node is the paired median ratio; below 1 is a win.
 const benchmarkRows: BenchmarkRow[] = [
-  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 333.709, bun: 369.218, deno: 358.858, zipp: 372.081 }, nodeRatio: 1.117837201 },
-  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 296.712, bun: 332.470, deno: 329.464, zipp: 226.104 }, nodeRatio: 0.765493100 },
-  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 269.681, bun: 192.494, deno: 321.981, zipp: 270.987 }, nodeRatio: 1.005076903 },
-  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 783.680, bun: 855.047, deno: 1264.368, zipp: 671.598 }, nodeRatio: 0.836944805 },
-  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 268.494, bun: 207.260, deno: 315.656, zipp: 208.937 }, nodeRatio: 0.766882616 },
-  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 272.752, bun: 230.340, deno: 295.818, zipp: 232.997 }, nodeRatio: 0.858903804 },
-  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 327.670, bun: 331.062, deno: 339.806, zipp: 309.218 }, nodeRatio: 0.941870413 },
-  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 477.981, bun: 564.193, deno: 459.624, zipp: 447.904 }, nodeRatio: 0.937927904 },
-  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 81.067, bun: 112.802, deno: 129.281, zipp: 73.196 }, nodeRatio: 0.907736876 },
-  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 199.845, bun: 913.841, deno: 169.910, zipp: 144.073 }, nodeRatio: 0.719316384 },
-  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 81.101, bun: 87.345, deno: 131.428, zipp: 24.475 }, nodeRatio: 0.301551988 },
-  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 265.405, bun: 157.550, deno: 318.663, zipp: 9.578 }, nodeRatio: 0.036206078 },
-  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 171.083, bun: 366.301, deno: 183.858, zipp: 99.229 }, nodeRatio: 0.585244499 },
+  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 336.601, bun: 374.520, deno: 358.927, zipp: 266.166 }, nodeRatio: 0.797618071 },
+  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 299.272, bun: 340.157, deno: 324.051, zipp: 235.234 }, nodeRatio: 0.785232020 },
+  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 256.500, bun: 201.053, deno: 310.786, zipp: 216.099 }, nodeRatio: 0.845923039 },
+  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 625.833, bun: 782.816, deno: 1099.255, zipp: 533.533 }, nodeRatio: 0.836722110 },
+  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 269.725, bun: 219.219, deno: 317.218, zipp: 188.405 }, nodeRatio: 0.694825722 },
+  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 273.269, bun: 236.203, deno: 280.478, zipp: 239.302 }, nodeRatio: 0.883679131 },
+  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 330.337, bun: 339.327, deno: 330.671, zipp: 233.194 }, nodeRatio: 0.707904244 },
+  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 468.318, bun: 566.224, deno: 461.764, zipp: 405.567 }, nodeRatio: 0.859336916 },
+  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 81.207, bun: 106.401, deno: 123.595, zipp: 72.310 }, nodeRatio: 0.894341930 },
+  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 203.935, bun: 918.178, deno: 166.755, zipp: 139.572 }, nodeRatio: 0.681613051 },
+  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 83.500, bun: 94.811, deno: 125.613, zipp: 22.080 }, nodeRatio: 0.266160503 },
+  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 258.435, bun: 164.682, deno: 308.671, zipp: 10.278 }, nodeRatio: 0.039778745 },
+  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 173.210, bun: 375.925, deno: 181.567, zipp: 99.831 }, nodeRatio: 0.573755134 },
 ]
 
 // The 17-case hostile corpus from the same capture: closures, mixed locals,
 // shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
 // warm router, a bytecode VM and vendored NanoID.
 const hostileRows: BenchmarkRow[] = [
-  { id: 'calls-baseline', name: 'Calls baseline', group: 'scope', times: { node: 35.011, bun: 48.041, deno: 89.448, zipp: 16.645 }, nodeRatio: 0.484551966 },
-  { id: 'calls-closures', name: 'Closure calls', group: 'scope', times: { node: 40.840, bun: 54.905, deno: 95.804, zipp: 45.099 }, nodeRatio: 1.117471074 },
-  { id: 'shapes-stable', name: 'Stable shapes', group: 'objects', times: { node: 39.412, bun: 60.900, deno: 93.161, zipp: 49.122 }, nodeRatio: 1.240556978 },
-  { id: 'shapes-megamorphic', name: 'Megamorphic shapes', group: 'objects', times: { node: 46.973, bun: 66.623, deno: 102.152, zipp: 57.708 }, nodeRatio: 1.244923066 },
-  { id: 'types-stable', name: 'Stable types', group: 'types', times: { node: 35.607, bun: 49.166, deno: 91.632, zipp: 18.132 }, nodeRatio: 0.513822180 },
-  { id: 'types-churn', name: 'Type churn', group: 'types', times: { node: 44.496, bun: 61.416, deno: 98.173, zipp: 32.367 }, nodeRatio: 0.739798825 },
-  { id: 'branch-control', name: 'Branch control', group: 'errors', times: { node: 39.439, bun: 50.227, deno: 93.166, zipp: 31.451 }, nodeRatio: 0.828287808 },
-  { id: 'throw-catch', name: 'Throw / catch', group: 'errors', times: { node: 310.219, bun: 94.378, deno: 104.759, zipp: 154.263 }, nodeRatio: 0.497572259 },
-  { id: 'allocation-ephemeral', name: 'Ephemeral allocation', group: 'allocation', times: { node: 35.324, bun: 70.550, deno: 94.108, zipp: 12.778 }, nodeRatio: 0.359466993 },
-  { id: 'allocation-survival', name: 'Allocation survival', group: 'allocation', times: { node: 57.644, bun: 74.927, deno: 111.657, zipp: 88.851 }, nodeRatio: 1.558883643 },
-  { id: 'async-burst', name: 'Async burst', group: 'async', times: { node: 53.767, bun: 53.846, deno: 106.954, zipp: 33.021 }, nodeRatio: 0.612580589 },
-  { id: 'async-lived', name: 'Long-lived async', group: 'async', times: { node: 40.254, bun: 66.679, deno: 93.237, zipp: 40.176 }, nodeRatio: 1.005144446 },
-  { id: 'reactish-reconcile', name: 'React-shaped reconcile', group: 'applications', times: { node: 44.927, bun: 66.858, deno: 97.706, zipp: 69.853 }, nodeRatio: 1.578095226 },
-  { id: 'warm-router', name: 'Warm router', group: 'server', times: { node: 45.753, bun: 69.834, deno: 98.819, zipp: 69.247 }, nodeRatio: 1.520160112 },
-  { id: 'bytecode-vm', name: 'Bytecode VM', group: 'endurance', times: { node: 44.155, bun: 57.216, deno: 97.122, zipp: 42.976 }, nodeRatio: 0.978347456 },
-  { id: 'module-hot-graph', name: 'Hot module graph', group: 'modules', times: { node: 40.302, bun: 51.111, deno: 92.933, zipp: 16.179 }, nodeRatio: 0.401317326 },
-  { id: 'npm-nanoid', name: 'npm nanoid', group: 'npm', times: { node: 84.057, bun: 113.397, deno: 126.571, zipp: 81.913 }, nodeRatio: 0.974690733 },
+  { id: 'calls-baseline', name: 'Calls baseline', group: 'scope', times: { node: 36.297, bun: 55.900, deno: 82.558, zipp: 17.172 }, nodeRatio: 0.472791641 },
+  { id: 'calls-closures', name: 'Closure calls', group: 'scope', times: { node: 43.335, bun: 61.956, deno: 89.834, zipp: 47.789 }, nodeRatio: 1.106885342 },
+  { id: 'shapes-stable', name: 'Stable shapes', group: 'objects', times: { node: 42.549, bun: 68.930, deno: 86.039, zipp: 45.382 }, nodeRatio: 1.080813788 },
+  { id: 'shapes-megamorphic', name: 'Megamorphic shapes', group: 'objects', times: { node: 50.051, bun: 74.798, deno: 97.794, zipp: 56.131 }, nodeRatio: 1.132164055 },
+  { id: 'types-stable', name: 'Stable types', group: 'types', times: { node: 37.283, bun: 57.128, deno: 85.747, zipp: 18.377 }, nodeRatio: 0.498741071 },
+  { id: 'types-churn', name: 'Type churn', group: 'types', times: { node: 48.157, bun: 67.839, deno: 92.360, zipp: 32.350 }, nodeRatio: 0.686712299 },
+  { id: 'branch-control', name: 'Branch control', group: 'errors', times: { node: 40.932, bun: 58.801, deno: 87.719, zipp: 33.047 }, nodeRatio: 0.804560763 },
+  { id: 'throw-catch', name: 'Throw / catch', group: 'errors', times: { node: 303.729, bun: 101.094, deno: 100.565, zipp: 149.744 }, nodeRatio: 0.493573608 },
+  { id: 'allocation-ephemeral', name: 'Ephemeral allocation', group: 'allocation', times: { node: 38.640, bun: 76.989, deno: 88.156, zipp: 13.923 }, nodeRatio: 0.366322640 },
+  { id: 'allocation-survival', name: 'Allocation survival', group: 'allocation', times: { node: 60.244, bun: 82.004, deno: 107.490, zipp: 82.024 }, nodeRatio: 1.367110656 },
+  { id: 'async-burst', name: 'Async burst', group: 'async', times: { node: 57.656, bun: 60.460, deno: 102.293, zipp: 31.606 }, nodeRatio: 0.543463257 },
+  { id: 'async-lived', name: 'Long-lived async', group: 'async', times: { node: 42.573, bun: 74.555, deno: 90.151, zipp: 34.918 }, nodeRatio: 0.827094579 },
+  { id: 'reactish-reconcile', name: 'React-shaped reconcile', group: 'applications', times: { node: 46.453, bun: 73.833, deno: 94.897, zipp: 59.708 }, nodeRatio: 1.276443224 },
+  { id: 'warm-router', name: 'Warm router', group: 'server', times: { node: 46.926, bun: 75.588, deno: 94.757, zipp: 65.129 }, nodeRatio: 1.380637848 },
+  { id: 'bytecode-vm', name: 'Bytecode VM', group: 'endurance', times: { node: 45.848, bun: 63.408, deno: 93.115, zipp: 145.023 }, nodeRatio: 3.134895385 },
+  { id: 'module-hot-graph', name: 'Hot module graph', group: 'modules', times: { node: 42.237, bun: 59.500, deno: 90.239, zipp: 17.203 }, nodeRatio: 0.401094420 },
+  { id: 'npm-nanoid', name: 'npm nanoid', group: 'npm', times: { node: 85.187, bun: 112.906, deno: 124.454, zipp: 81.456 }, nodeRatio: 0.954692149 },
 ]
 
 const nodeWins = (rows: BenchmarkRow[]) => rows.filter((row) => row.nodeRatio < 1).length
@@ -491,7 +491,7 @@ const readingGuide = [
   },
   {
     title: 'Cold time, exact output',
-    copy: 'Every number includes process launch, and a row only counts when all four engines print byte-identical output. Zipp’s 7.4 ms launch is real, but the ratios are about the work, not the start.',
+    copy: 'Every number includes process launch, and a row only counts when all four engines print byte-identical output. Zipp’s 8.3 ms launch is real, but the ratios are about the work, not the start.',
   },
   {
     title: 'One number for the whole picture',
@@ -868,10 +868,10 @@ function App() {
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
-  // These figures belong to the pinned 2 September capture, not today's release.
+  // These figures belong to the pinned 15 October capture, not today's release.
   const liveWins = nodeWins(benchmarkRows) + nodeWins(hostileRows)
-  const liveAll30 = 0.728
-  const liveStartup = 7.4
+  const liveAll30 = 0.703
+  const liveStartup = 8.3
 
   const visibleBenchmarks = useMemo(
     () =>
@@ -1106,30 +1106,30 @@ function App() {
             </div>
           </div>
 
-          <p className="benchmark-capture-note">Measured 2 September 2026 · native Windows x86-64 · engine <code>8229b3fc</code>. These are retained benchmark results, not measurements of the latest release or browser playground. <a href={CAPTURE_README_URL} target="_blank" rel="noreferrer">Read the capture summary ↗</a></p>
+          <p className="benchmark-capture-note">Measured 15 October 2026 · native Windows x86-64 · engine <code>fa8e3b86</code>. These are retained benchmark results, not measurements of the latest release or browser playground. <a href={CAPTURE_README_URL} target="_blank" rel="noreferrer">Read the capture summary ↗</a></p>
           <div className="benchmark-summary">
             <article className="headline-result">
               <div>
                 <span>Native equal-row all-30 headline</span>
-                <strong>0.7278×</strong>
+                <strong>0.7028×</strong>
                 <p>Native Zipp / Node paired geomean · lower is better</p>
               </div>
-              <div className="confidence-pill">95% interval&nbsp; 0.723–0.730</div>
+              <div className="confidence-pill">95% interval&nbsp; 0.700–0.707</div>
             </article>
 
             <article className="ratio-card">
               <span>Native all-30 paired geomeans</span>
-              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7278×</strong></div>
-              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.5936×</strong></div>
-              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4604×</strong></div>
-              <small>95% intervals: Node 0.723–0.730 · Bun 0.591–0.598 · Deno 0.458–0.464. Normal 13 + hostile 17; equal weight per row. Reported in the capture README.</small>
+              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7028×</strong></div>
+              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.5482×</strong></div>
+              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4728×</strong></div>
+              <small>95% intervals: Node 0.700–0.707 · Bun 0.544–0.551 · Deno 0.470–0.477. Normal 13 + hostile 17; equal weight per row. Reported in the capture README.</small>
             </article>
 
             <article className="ratio-card suite-card">
               <span>Suite geomeans vs Node</span>
-              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6136×</strong></div>
+              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.5661×</strong></div>
               <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8293×</strong></div>
-              <small>95% intervals: normal 0.611–0.617 · hostile 0.820–0.833. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
+              <small>95% intervals: normal 0.563–0.570 · hostile 0.824–0.837. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
             </article>
           </div>
 
@@ -1245,10 +1245,10 @@ function App() {
               <p>
                 Native Windows x86-64 CLI, high-performance power mode. Cold wall time includes process launch;
                 15 paired repetitions with deterministically shuffled engine and benchmark order;
-                10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
-                Deno 2.6.10, Zipp 0.0.12 at clean PGO source <code>8229b3fc</code>; binary SHA-256
-                <code>bf9fddab…dc9986</code>. Median startup: Zipp 7.4 ms, Node 30.4 ms, Bun 43.3 ms,
-                Deno 82.6 ms. The all-30 result gives equal weight to all normal and hostile rows;
+                10,000 paired-bootstrap samples; exact-byte outputs. Node 24.19.0, Bun 1.3.14,
+                Deno 2.6.10, Zipp 0.0.24 at clean PGO source <code>fa8e3b86</code>; binary SHA-256
+                <code>318619b2…5699f3</code>. Median startup: Zipp 8.3 ms, Node 33.0 ms, Bun 50.8 ms,
+                Deno 79.0 ms. The all-30 result gives equal weight to all normal and hostile rows;
                 its bootstrap intervals are descriptive. Ratios above one remain point gaps even when an
                 interval crosses one. These native workloads are evidence, not a claim of universal
                 runtime superiority; they are not browser-WASM results.

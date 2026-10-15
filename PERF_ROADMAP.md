@@ -23,39 +23,51 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-09-02
+## Current status — 2026-10-15
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `8229b3fc`, the last
-before B280 made specification-order method calls the default. The later
-publishable capture at `14770703` measures headline ten 1.0025× Node, all 13
-0.677× and hostile 17 cold 0.875× (HANDOFF B314); no headline is claimed for it.
-The `8229b3fc` rows:
+The public score is the clean four-engine PGO capture at `fa8e3b86`. The
+`fa8e3b86` rows:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.878×** [0.875, 0.884] | 0.752× [0.747, 0.755] | 0.765× [0.761, 0.774] | 8 / 10 |
-| diagnostics three | **0.186×** [0.183, 0.188] | 0.166× [0.164, 0.169] | 0.145× [0.143, 0.149] | 3 / 3 |
-| all 13 | **0.614×** [0.611, 0.617] | 0.531× [0.528, 0.533] | 0.521× [0.519, 0.526] | 11 / 13 |
-| hostile all 17, ordinary | **0.829×** [0.820, 0.833] | 0.647× [0.643, 0.655] | 0.419× [0.415, 0.423] | 10 / 17 |
-| hostile category-balanced | **0.862×** [0.852, 0.865] | 0.661× [0.656, 0.673] | 0.432× [0.429, 0.436] | — |
-| all 30, equal row weight | **0.728×** [0.723, 0.730] | 0.594× [0.591, 0.598] | 0.460× [0.458, 0.464] | 21 / 30 |
+| retained ten | **0.795×** [0.790, 0.801] | 0.663× [0.655, 0.668] | 0.701× [0.695, 0.706] | 10 / 10 |
+| diagnostics three | **0.182×** [0.180, 0.184] | 0.158× [0.155, 0.160] | 0.147× [0.146, 0.150] | 3 / 3 |
+| all 13 | **0.566×** [0.563, 0.570] | 0.476× [0.471, 0.479] | 0.489× [0.486, 0.492] | 13 / 13 |
+| hostile all 17, ordinary | **0.829×** [0.824, 0.837] | 0.611× [0.604, 0.616] | 0.461× [0.456, 0.467] | 10 / 17 |
+| hostile category-balanced | **0.895×** [0.890, 0.905] | 0.650× [0.641, 0.657] | 0.491× [0.486, 0.498] | — |
+| all 30, equal row weight | **0.703×** [0.700, 0.707] | 0.548× [0.544, 0.551] | 0.473× [0.470, 0.477] | 23 / 30 |
 
 Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
 counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
 and failure lists. The all-30 interval is a stratified descriptive bootstrap:
 normal and hostile repetitions are resampled independently, while every row
-inside one suite shares the same repetition indices. Every aggregate is a
-series best; the previous canonical pair (`b65aa353`, earlier on 2026-09-02)
-read 0.903× / 0.187× / 0.628× / 0.836× / 0.870× / 0.739×, and `21288c1`
-(2026-08-30) 0.921× / 0.192× / 0.642× / 0.881× / 0.913× / 0.768×.
+inside one suite shares the same repetition indices. The previous canonical
+pair (`8229b3fc`, 2026-09-02) read 0.878× / 0.186× / 0.614× / 0.829× / 0.862×
+/ 0.728× against Node; `b65aa353` (earlier on 2026-09-02) 0.903× / 0.187× /
+0.628× / 0.836× / 0.870× / 0.739×, and `21288c1` (2026-08-30) 0.921× / 0.192× /
+0.642× / 0.881× / 0.913× / 0.768×. The publishable `14770703` capture
+(2026-09-11) is recorded without a headline claim.
 
-Across Node, Bun, and Deno, the normal suite has 33 / 39 point and 29 / 39
-exact-sign wins; hostile has 39 / 51 point and 34 / 51 exact-sign wins. The
-literal all-row target remains false. See
+Across Node, Bun, and Deno, the normal suite has 37 / 39 point and 36 / 39
+exact-sign wins; hostile has 39 / 51 point and 37 / 51 exact-sign wins. The
+literal all-row target remains false: every Node gap is now in the hostile
+set (closure calls, both shape stressors, allocation survival, React
+reconcile, the warm router and the bytecode VM). See
 [`README.md`](README.md#performance-measured-honestly) for the tables and raw
 artifact links.
+
+### Interpreter versus interpreter
+
+The same PGO binary with `ZIPP_NOJIT=1`, over the 13 normal rows
+(`bench/comparison/interp_real13_fa8e3b86_2026-10-15.json`, a diagnostic
+`run_native.py` run): **0.713×** Bellard's QuickJS (8 / 13 point wins),
+**0.442×** QuickJS-NG (13 / 13), 0.941× Bun with JavaScriptCore's JIT off,
+1.368× Deno `--jitless` and 1.427× Node `--jitless`. Bellard's QuickJS still
+wins property-ic-shapes (1.56×), typedarray-math (1.54×), class-prototype-hot
+(1.11×) and the two polymorphic rows; on the five micro kernels Zipp's
+interpreter is 1.12× Bellard's, most of it calls (`fib` 1.66×).
 
 
 ### Historical v0.0.5 QuickJS-NG and Boa diagnostic

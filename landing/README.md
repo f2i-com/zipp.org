@@ -138,18 +138,18 @@ cannot fetch live repository facts. Normal builds work without network access.
 
 ## Evidence and engine provenance
 
-Canonical native CLI numbers remain attached to the reviewed 2 September 2026
-captures at `8229b3fc`:
+Canonical native CLI numbers are attached to the 15 October 2026 captures at
+`fa8e3b86`:
 
-- `../bench/real13_8229b3fc_pgo_2026-09-02.json`
-- `../bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
+- `../bench/real13_fa8e3b86_pgo_2026-10-15.json`
+- `../bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`
 
-The executable's own recorded build identity is v0.0.12. Aggregate descriptive
-intervals are reported by the README pinned at repository commit
-`e6e0f65dd402f1bf75b9675d7acd904cb239c5a3`. This README calls the same capture
-v0.0.13; the page uses the artifact's recorded v0.0.12 identity. Benchmark
+The executable's recorded build identity is v0.0.24 (`zipp 0.0.24`, clean
+source `fa8e3b86`), and the root README quotes the same capture. Benchmark
 headlines, confidence intervals, row counts, and the table refer to the same
 capture, rather than silently mixing new README headlines with old table rows.
+The previous canonical pair (`8229b3fc`, 2 September 2026, recorded as
+v0.0.12) stays in `../bench/` as a prior series point.
 
 The optional JavaScript story scratchpad's browser engine is v0.0.24, 4,436,611 raw bytes, SHA-256
 `017fc04d6d17e0acf69fc6ccb23806d06196462f495ec2da0b26452480b8819b`.

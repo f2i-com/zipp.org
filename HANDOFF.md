@@ -1668,22 +1668,29 @@ silently replace it.
 
 The current raw captures are:
 
-- `bench/real13_8229b3fc_pgo_2026-09-02.json`
-- `bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
+- `bench/real13_fa8e3b86_pgo_2026-10-15.json`
+- `bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`
 
-Both use Node v24.12.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.11. Both report
-`publishable:true`, `ALL_CORRECT=1`, 15 complete counterbalanced repetitions,
-10,000 bootstrap samples, and empty provenance, publication, correctness,
-health, source-drift, engine-drift, input-drift, and harness-drift failures.
+Both use Node v24.19.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.24 (clean PGO
+source `fa8e3b86`). Both report `publishable:true`, `ALL_CORRECT=1`, 15
+complete counterbalanced repetitions, 10,000 bootstrap samples, and empty
+provenance, publication, correctness, health, source-drift, engine-drift,
+input-drift, and harness-drift failures.
 
 | Corpus | vs Node | vs Bun | vs Deno |
 |---|---:|---:|---:|
-| retained ten | **0.886×** [0.880, 0.892] | 0.757× [0.752, 0.764] | 0.770× [0.761, 0.778] |
-| diagnostics three | **0.189×** [0.186, 0.192] | 0.171× [0.169, 0.175] | 0.149× [0.146, 0.153] |
-| normal all 13 | **0.620×** [0.616, 0.624] | 0.537× [0.534, 0.542] | 0.527× [0.521, 0.532] |
-| hostile all 17 | **0.824×** [0.800, 0.838] | 0.657× [0.648, 0.666] | 0.429× [0.422, 0.436] |
-| hostile category-balanced | **0.860×** [0.834, 0.873] | 0.676× [0.663, 0.683] | 0.442× [0.435, 0.449] |
-| all 30, equal row weight | **0.729×** [0.716, 0.736] | 0.602× [0.597, 0.607] | 0.469× [0.464, 0.474] |
+| retained ten | **0.795×** [0.790, 0.801] | 0.663× [0.655, 0.668] | 0.701× [0.695, 0.706] |
+| diagnostics three | **0.182×** [0.180, 0.184] | 0.158× [0.155, 0.160] | 0.147× [0.146, 0.150] |
+| normal all 13 | **0.566×** [0.563, 0.570] | 0.476× [0.471, 0.479] | 0.489× [0.486, 0.492] |
+| hostile all 17 | **0.829×** [0.824, 0.837] | 0.611× [0.604, 0.616] | 0.461× [0.456, 0.467] |
+| hostile category-balanced | **0.895×** [0.890, 0.905] | 0.650× [0.641, 0.657] | 0.491× [0.486, 0.498] |
+| all 30, equal row weight | **0.703×** [0.700, 0.707] | 0.548× [0.544, 0.551] | 0.473× [0.470, 0.477] |
+
+The interpreter-versus-interpreter diagnostic of the same binary with
+`ZIPP_NOJIT=1` (`bench/comparison/interp_real13_fa8e3b86_2026-10-15.json`,
+13 normal rows, 8 repetitions): 0.713× Bellard's QuickJS (8 / 13 point wins),
+0.442× QuickJS-NG, 0.941× Bun with `BUN_JSC_useJIT=0`, 1.368× Deno and 1.427×
+Node with `--jitless`.
 
 The all-30 point is
 `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`. Its 10,000-sample descriptive
@@ -1691,35 +1698,33 @@ bootstrap shares resampled repetition indices within a suite and resamples the
 normal and hostile captures independently. It is not a hypothesis test and does
 not estimate machine-to-machine variability.
 
-Normal has 33 / 39 point and 29 / 39 Bonferroni exact-sign wins across all
-competitors; hostile has 39 / 51 point and 34 / 51 exact-sign wins. Against
-Node alone, Zipp has 21 / 30 point wins. The literal all-row target remains
+Normal has 37 / 39 point and 36 / 39 Bonferroni exact-sign wins across all
+competitors; hostile has 39 / 51 point and 37 / 51 exact-sign wins. Against
+Node alone, Zipp has 23 / 30 point wins. The literal all-row target remains
 false.
 
 ## Current Node gaps
 
-Canonical capture `8229b3fc` (2026-09-02); Zipp / Node paired cold medians.
+Canonical capture `fa8e3b86` (2026-10-15); Zipp / Node paired cold medians.
+Every gap is in the hostile set; all 13 normal rows beat Node.
 
 | Row | Zipp / Node | Descriptive 95% interval |
 |---|---:|---:|
-| reactish-reconcile | **1.578×** | [1.490, 1.608] |
-| allocation-survival | **1.559×** | [1.500, 1.594] |
-| warm-router | **1.520×** | [1.503, 1.592] |
-| shapes-megamorphic | **1.245×** | [1.204, 1.260] |
-| shapes-stable | **1.241×** | [1.226, 1.294] |
-| async-promise-chain | **1.118×** | [1.108, 1.132] |
-| calls-closures | **1.117×** | [1.068, 1.137] |
-| async-lived | **1.005×** | [0.969, 1.039] |
-| json-large | **1.005×** | [0.988, 1.034] |
+| bytecode-vm | **3.135×** | [3.070, 3.212] |
+| warm-router | **1.381×** | [1.335, 1.407] |
+| allocation-survival | **1.367×** | [1.350, 1.406] |
+| reactish-reconcile | **1.276×** | [1.239, 1.322] |
+| shapes-megamorphic | **1.132×** | [1.075, 1.146] |
+| calls-closures | **1.107×** | [1.094, 1.137] |
+| shapes-stable | **1.081×** | [1.034, 1.097] |
 
-json-large and async-lived are point gaps whose intervals cross parity;
-bytecode-vm (0.978×) and npm-nanoid (0.975×) are point wins. All-30 node point
-wins: 21/30 (normal 11/13, hostile 10/17); all-30 equal-row geomean 0.728× Node
-[0.723, 0.730]. Relative to `c28781cf`: warm-router 1.563 → 1.520, async-lived
-1.065 → 1.005, json-large 1.022 → 1.005; allocation-survival 1.484 → 1.559 and
-shapes-stable 1.199 → 1.241 moved the other way with no covering mechanism (the
-one-binary latches of B270-B273 on the PGO binary are neutral or positive on
-both rows), i.e. PGO-profile and layout variation of the size the intervals show.
+bytecode-vm was a 0.978× point win at `8229b3fc` and is the largest gap now:
+the `14770703` capture already had it at 3.59× (B314 places that regression
+after `8229b3fc`, with B280's strict call-order default the suspect), so it is
+not new in this capture. npm-nanoid (0.955×) is the closest point win. Against
+`8229b3fc` the normal set gained most: async-promise-chain 1.118 → 0.798,
+json-large 1.005 → 0.846, polymorphic-objects 0.942 → 0.708; all-30 Node point
+wins 21/30 → 23/30 and the equal-row geomean 0.728× → 0.703× Node.
 
 ## Local verification
 

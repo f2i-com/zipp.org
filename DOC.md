@@ -366,10 +366,14 @@ complete, provenance-stamped capture.
 
 The canonical engine table lives in the root README, which quotes its
 geomeans and intervals. Its clean PGO inputs are
-`bench/real13_8229b3fc_pgo_2026-09-02.json` and
-`bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`; both are complete
+`bench/real13_fa8e3b86_pgo_2026-10-15.json` and
+`bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`; both are complete
 four-engine captures with `publishable:true` and exact output throughout. The
-README also names the later `14770703` capture, for which no headline is claimed.
+README's interpreter-versus-interpreter table comes from the diagnostic
+`bench/comparison/interp_real13_fa8e3b86_2026-10-15.json` (the same binary with
+`ZIPP_NOJIT=1` against QuickJS, QuickJS-NG and the JIT-off modes of Node, Deno
+and Bun). Earlier captures (`8229b3fc`, and `14770703`, for which no headline
+was claimed) stay in `bench/` as prior series points.
 
 The optional all-30 view is an explicitly derived equal-row aggregate. It does
 not erase suite ownership: its point is

@@ -126,15 +126,22 @@ never turn a noncanonical run into publishable evidence.
 
 The current canonical public artifacts, the pair the root README tabulates, are:
 
-- [`real13_8229b3fc_pgo_2026-09-02.json`](real13_8229b3fc_pgo_2026-09-02.json)
-- [`hostile/head_clean_8229b3fc_pgo_2026-09-02.json`](hostile/head_clean_8229b3fc_pgo_2026-09-02.json)
+- [`real13_fa8e3b86_pgo_2026-10-15.json`](real13_fa8e3b86_pgo_2026-10-15.json)
+- [`hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`](hostile/head_clean_fa8e3b86_pgo_2026-10-15.json)
 
 Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
 15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
-The previous canonical pairs (`c28781cf`, `b65aa353`, both 2026-09-02;
-`21288c1`, 2026-08-30) stay in this directory as prior series points. The later
-publishable `14770703` pair (2026-09-11) is recorded without a headline claim;
-the root README explains why.
+The previous canonical pairs (`8229b3fc`, `c28781cf`, `b65aa353`, all
+2026-09-02; `21288c1`, 2026-08-30) stay in this directory as prior series
+points. The publishable `14770703` pair (2026-09-11) is recorded without a
+headline claim.
+
+The root README's interpreter-versus-interpreter table comes from
+[`comparison/interp_real13_fa8e3b86_2026-10-15.json`](comparison/interp_real13_fa8e3b86_2026-10-15.json)
+and [`comparison/interp_micro5_fa8e3b86_2026-10-15.json`](comparison/interp_micro5_fa8e3b86_2026-10-15.json),
+diagnostic `run_native.py` runs of the same PGO binary with `ZIPP_NOJIT=1`
+against interpreters and JIT-off engine modes (see
+[`comparison/README.md`](comparison/README.md)).
 
 ### Explicit all-30 view
 
@@ -145,10 +152,11 @@ When one project-wide number is useful, the documented equal-row point is:
 G30 = exp((13 × ln(G13) + 17 × ln(G17)) / 30)
 ```
 
-For the `8229b3fc` artifacts it is **0.728× Node** [0.723, 0.730], **0.594×
-Bun** [0.591, 0.598], and **0.460× Deno** [0.458, 0.464], the descriptive 95%
-intervals the root README quotes. The earlier `c28781cf` pair gave 0.728776×
-Node, 0.602213× Bun and 0.469238× Deno.
+For the `fa8e3b86` artifacts it is **0.703× Node** [0.700, 0.707], **0.548×
+Bun** [0.544, 0.551], and **0.473× Deno** [0.470, 0.477], the descriptive 95%
+intervals the root README quotes. The `8229b3fc` pair gave 0.728× Node
+[0.723, 0.730], 0.594× Bun [0.591, 0.598] and 0.460× Deno [0.458, 0.464], and
+the earlier `c28781cf` pair 0.728776× Node, 0.602213× Bun and 0.469238× Deno.
 
 Each bootstrap replicate draws one shared repetition-index multiset for all 13
 normal rows and an independent shared multiset for all 17 hostile rows, then
