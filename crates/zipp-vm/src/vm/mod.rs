@@ -1095,7 +1095,25 @@ impl RegisterFile {
 
     /// Vec-compatible resize of the live prefix. Revived inactive slots are
     /// overwritten with `fill`; shrinking never reduces the initialized extent.
+    ///
+    /// Every interpreted call grows the live prefix by the callee's window,
+    /// almost always inside the initialized extent a previous call left: that
+    /// case only overwrites the revived slots (no reallocation, so the pointer
+    /// mirror stands) and stays inline at the call site. It was an out-of-line
+    /// call costing 7% of an interpreted recursive call.
+    #[inline(always)]
     pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        let old_logical = self.logical_len;
+        if new_len > old_logical && new_len <= self.storage.len() {
+            self.storage[old_logical..new_len].fill(fill);
+            self.logical_len = new_len;
+            return;
+        }
+        self.resize_general(new_len, fill);
+    }
+
+    #[inline(never)]
+    fn resize_general(&mut self, new_len: usize, fill: Value) {
         let old_logical = self.logical_len;
         if new_len > old_logical {
             let old_high_water = self.storage.len();
