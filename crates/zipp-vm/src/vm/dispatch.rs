@@ -3359,6 +3359,14 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // The cache's way-0 own-data hit, inline; anything
+                        // else is the full `ic_get_prop` call below.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
                         // own / chain GETTER frame-calls on THIS dispatch loop

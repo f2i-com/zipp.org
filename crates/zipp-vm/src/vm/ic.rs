@@ -802,6 +802,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The way-0 own-data hit of [`Self::ic_get_prop`], for the general
+    /// profile's dispatch loop to take inline. `ic_get_prop` is large and stays
+    /// a call there; on an interpreted property-read loop the call and its
+    /// prologue were a sixth of the run (property-ic-shapes) for a hit that is
+    /// three loads and a compare. This is exactly `ic_get_prop`'s first check:
+    /// the same answer, or `None` and the full call. The safe profile inlines
+    /// `ic_get_prop` whole and does not use it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        let IcEntry::OwnData { shape, slot } = site.entries[0] else {
+            return None;
+        };
+        let (_, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     ///
     /// The safe profile's dispatch loop takes it inline. Left to the
