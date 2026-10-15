@@ -1,5 +1,35 @@
 # Zipp performance handoff
 
+### 15 October: the embedding and safe-sandbox passes, released as 0.0.25
+
+The 55 commits after 0.0.24 (the fixes for #46 to #55, the embedding pass
+after #50, the safe-sandbox pass against QuickJS, the interpreter work and
+the 15 October capture) are released as 0.0.25 from the commit that adds
+this entry; the record is
+[docs/validation/2026-10-15-release-0.0.25.md](docs/validation/2026-10-15-release-0.0.25.md)
+and the notes [docs/releases/0.0.25.md](docs/releases/0.0.25.md).
+
+Against 0.0.24, on ordinary builds: the safe-sandbox embedding (limits
+on) 0.583x of its time over the 13 rows, 0.843x of Bellard's QuickJS
+(0.0.24: 1.444x), peak working set 1.18x QuickJS's (0.0.24: 2.16x); the
+CLI interpreter 0.846x, 0.805x of Bellard's; the CLI with its JIT level
+(0.994x); Python level; the WebAssembly modules 0.6% to 1.8% larger after
+Brotli, their screen level (0.995, 0.998) with Lite `prop-mono`, the
+JavaScript module's `prop-poly` and `alloc-object` 6% to 8% slower.
+
+Found while releasing: the safe-sandbox and wasm profiles held only 1,024
+run-time globals, so #50's own program failed there (`3e8a5d07` gives
+them the native 16,384, grown on demand); and `in-place-growth.cjs` still
+assumed `a[131071] = 1` grows a megabyte, which the sparse overlay ended
+(`eab501f9`). Only CI builds the WebAssembly modules and runs that suite:
+run `run-boundary-suite.cjs` against a built module before pushing an
+array or heap change.
+
+**Leads**: the `bytecode-vm` hostile row (43 ms at `8229b3fc`, 160 ms at
+`14770703`, 46 commits apart, not bisected); the WebAssembly cases above;
+interpreted calls (`fib` 1.80x Bellard's QuickJS) and inherited property
+reads; memory per object and string.
+
 ### 14 October: sixteenth pass, round two, released as 0.0.24
 
 Round two of the sixteenth pass went to `main` in three pushes

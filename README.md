@@ -286,21 +286,21 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The `0.0.24` release provides x86-64 CLI binaries for Windows and Linux
+The `0.0.25` release provides x86-64 CLI binaries for Windows and Linux
 (complete: JavaScript, the experimental Python frontend as `zipp py`, torch and
 the native GPU path) and five browser WebAssembly packages:
 
 | Download | Use it for |
 | --- | --- |
-| `zipp-wasm-0.0.24-web.zip` | JavaScript applications and embedding (about 1.13 MB Brotli) |
-| `zipp-wasm-0.0.24-web-lite.zip` | ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size rather than speed (about 0.67 MB) |
-| `zipp-wasm-0.0.24-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.52 MB) |
-| `zipp-wasm-0.0.24-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 1.90 MB) |
-| `zipp-wasm-0.0.24-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.40 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
+| `zipp-wasm-0.0.25-web.zip` | JavaScript applications and embedding (about 1.15 MB Brotli) |
+| `zipp-wasm-0.0.25-web-lite.zip` | ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size rather than speed (about 0.68 MB) |
+| `zipp-wasm-0.0.25-web-python-base.zip` | JavaScript plus experimental Python, without torch (about 1.54 MB) |
+| `zipp-wasm-0.0.25-web-python.zip` | JavaScript plus experimental Python projects with torch built in, and the browser GPU adapters (about 1.91 MB) |
+| `zipp-wasm-0.0.25-web-torch.zip` | The torch package (`zipp_torch.wasm` and its `zipp_torch.js` loader, about 0.40 MB) that adds torch to `web-python-base` at run time through `addPythonPackage` |
 
 See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
-assets and [0.0.24 release notes](docs/releases/0.0.24.md) for scope and limits.
-`0.0.24` is the latest published release; the download commands below use it.
+assets and [0.0.25 release notes](docs/releases/0.0.25.md) for scope and limits.
+`0.0.25` is the latest published release; the download commands below use it.
 Every WASM archive carries the exact source revision, language profile and
 checksums. The sizes are each module's Brotli-11 transfer size, as measured in
 [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#build-variants-zipp-lite-javascript-python-and-the-torch-package),
@@ -326,7 +326,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.24'
+$version = '0.0.25'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -346,7 +346,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.24
+version=0.0.25
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -355,7 +355,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.24-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.25-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -627,7 +627,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.24
+version=0.0.25
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -940,6 +940,12 @@ polymorphic-objects (1.02×). The five downscaled micro kernels in
 show where the remaining interpreter cost is, calls and tight loops: there Zipp
 is 1.12× Bellard's QuickJS (179 ms against 108 on recursive `fib`), 0.71×
 QuickJS-NG and 1.26× Node `--jitless`.
+
+Embedders who build the safe-sandbox profile (no `unsafe`, no JIT, with step
+and heap limits set) run the same 13 rows at **0.843×** Bellard's QuickJS and
+**0.525×** QuickJS-NG, in 0.583× of release 0.0.24's time and with a peak
+working set 1.18× Bellard's QuickJS's; see the
+[0.0.25 release notes](docs/releases/0.0.25.md#embedding-the-safe-sandbox-profile).
 
 ### Earlier QuickJS-NG, Boa and WebAssembly comparisons
 

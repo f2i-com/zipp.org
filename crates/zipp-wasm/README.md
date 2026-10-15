@@ -267,23 +267,28 @@ have identical import/export surfaces; the selected module retains the audited
 1 GiB memory maximum. Release tests run on the selected bytes, and packaging
 checks that the browser module is byte-identical to the tested Node module.
 
-Measured on 2026-10-14 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
-after the sixteenth pass, on a Windows build of `35e6d1dc`, the source of
-release 0.0.24:
+Measured on 2026-10-15 with Rust 1.92.0, wasm-bindgen 0.2.126 and Node 24.19.0,
+on a Windows build of `3e8a5d07`, the code of release 0.0.25:
 
 | Variant | Before post-processing, raw / Brotli | Selected, raw / Brotli |
 | --- | ---: | ---: |
-| Lite | 2,560,566 / 687,430 | 2,450,334 / 671,251 |
-| JavaScript | 4,606,091 / 1,155,548 | 4,435,704 / 1,133,411 |
-| Python-base | 6,367,829 / 1,553,282 | 6,146,540 / 1,524,284 |
-| Python + Torch | 8,407,894 / 1,927,651 | 8,178,282 / 1,898,530 |
+| Lite | 2,604,423 / 699,638 | 2,491,268 / 683,540 |
+| JavaScript | 4,636,750 / 1,168,133 | 4,465,884 / 1,146,012 |
+| Python-base | 6,396,546 / 1,563,599 | 6,186,350 / 1,535,746 |
+| Python + Torch | 8,436,751 / 1,940,053 | 8,219,147 / 1,909,367 |
 
-The torch package (`zipp_torch.wasm`) is 2,156,516 / 401,594.
+The torch package (`zipp_torch.wasm`), unchanged since 0.0.24, is
+2,156,516 / 401,594.
 
-These are module bytes, excluding JS glue; Brotli is the download size. See the
-[sixteenth pass's second record](../../docs/validation/2026-10-14-engine-size-round16-r2.md)
-for the variant deltas, the speed screen and validation. The fifteenth
-pass's modules, release 0.0.23's, were 2,573,530 / 697,741,
+These are module bytes, excluding JS glue; Brotli is the download size. The
+modules grew by 0.6% to 1.8% after Brotli since 0.0.24, with the embedding
+and interpreter work; see the
+[0.0.25 record](../../docs/validation/2026-10-15-release-0.0.25.md) for the
+deltas, the speed screen and validation. The sixteenth pass's modules,
+release 0.0.24's, were 2,450,334 / 671,251, 4,435,704 / 1,133,411,
+6,146,540 / 1,524,284 and 8,178,282 / 1,898,530
+([its record](../../docs/validation/2026-10-14-engine-size-round16-r2.md)).
+The fifteenth pass's modules, release 0.0.23's, were 2,573,530 / 697,741,
 4,636,144 / 1,180,609, 6,331,117 / 1,566,620 and 8,254,998 / 1,918,013
 ([its audit](../../docs/validation/2026-10-12-engine-size-round15.md)). The
 fourteenth pass's modules were 2,573,185 / 694,745, 4,703,604 / 1,189,469,
