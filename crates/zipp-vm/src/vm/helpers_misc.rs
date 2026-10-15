@@ -705,6 +705,82 @@ pub(crate) extern "win64" fn jit_coll_lookup(
     coll_lookup_proven(vm, idx, key_bits, op)
 }
 
+/// The Map/Set lookups compiled code calls once a captured callee's bits ARE
+/// the boot intrinsic's (`Vm::coll_boot_bits`, compared inline by
+/// `emit_captured_method_lane`): `callee.[[Call]](recv, [key])` for
+/// %Map.prototype.get% (`op` 0), %Map.prototype.has% (1) or
+/// %Set.prototype.has% (2). The bits are the whole proof of WHICH function
+/// runs (the natives sit in pinned slots below the GC floor, as for the
+/// `push`/`charCodeAt` lane), and running it needs only a receiver of its
+/// brand: any other declines (`SELF_CALL_DEOPT`), so the generic call raises
+/// the TypeError. What `recv.get` would resolve to now does not matter: the
+/// call invokes the value captured before the arguments. Runs no user code.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_coll_lookup_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    op: u64,
+) -> u64 {
+    let recv = Value::from_bits(recv_bits);
+    if vm.is_null() || !recv.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: generated code passes its exclusive live VM pointer.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = recv.heap_index();
+    if idx as usize >= vm.heap.len() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let branded = matches!(
+        (vm.heap.get(idx), op),
+        (HeapObj::Map { .. }, 0 | 1) | (HeapObj::Set(_), 2)
+    );
+    if !branded {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_lookup_proven(vm, idx, key_bits, op)
+}
+
+/// [`jit_coll_lookup_direct`]'s twin for the two mutations compiled code
+/// calls directly: %Map.prototype.set% (`op` 0, `key`, `val`) and
+/// %Set.prototype.add% (`op` 2, `key` the value). The same proof (the
+/// captured callee's bits, compared inline) and the same brand check;
+/// neither intrinsic can run user code.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_coll_mutate_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+    op: u64,
+) -> u64 {
+    let recv = Value::from_bits(recv_bits);
+    if vm.is_null() || !recv.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: generated code passes its exclusive live VM pointer.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = recv.heap_index();
+    if idx as usize >= vm.heap.len() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let branded = matches!(
+        (vm.heap.get(idx), op),
+        (HeapObj::Map { .. }, 0) | (HeapObj::Set(_), 2)
+    );
+    if !branded {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    coll_mutate_proven(vm, idx, key_bits, val_bits, op)
+}
+
 /// [`jit_coll_lookup`]'s lookup itself, for a caller that has already proved
 /// the method is the intrinsic and the receiver `idx` the collection its `op`
 /// names (a Map for 0 and 1, a Set for 2): `jit_coll_lookup` after its own

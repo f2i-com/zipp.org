@@ -6061,7 +6061,7 @@ pub(crate) fn compile_proto_mem(
                             &mut ops, callee, this_v, arg_base, dst, bits, helper, None,
                         ),
                         CapturedLane::Proved { op } => emit_captured_method_lane(
-                            &mut ops, callee, this_v, arg_base, argc, dst, op, refetch,
+                            &mut ops, callee, this_v, arg_base, argc, dst, op, refetch, &heap,
                         ),
                     });
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;

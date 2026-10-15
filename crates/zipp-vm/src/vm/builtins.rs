@@ -99,6 +99,13 @@ fn str_memo_id(name: &str) -> Option<usize> {
 /// `push`'s index in the B191 memo (`arr_memo_id`).
 const ARR_MEMO_PUSH: usize = 0;
 
+/// The `arr_proto_baseline` keys of the collection methods' boot bits
+/// (`Vm::coll_boot_bits`): %Map.prototype% `get`, `has`, %Set.prototype%
+/// `has`, %Map.prototype% `set`, %Set.prototype% `add`. The NUL prefix
+/// keeps them apart from every name the Array fast paths ask the table for.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const COLL_BOOT_KEYS: [&str; 5] = ["\0map.get", "\0map.has", "\0set.has", "\0map.set", "\0set.add"];
+
 /// Whether a method name is `push`, by its bytes: `key == "push"` is a call
 /// to the slice comparison in a size-first build, on every method call with
 /// one argument.
@@ -442,6 +449,8 @@ impl<'p> Vm<'p> {
     /// boot. The captured natives live in pinned slots below the GC floor,
     /// so the bits are stable for the VM's lifetime and value-bits equality
     /// against this table is a tamper-proof "still the boot intrinsic" test.
+    /// B191 (see below), plus the Map/Set methods compiled code calls directly
+    /// (`jit_coll_lookup_direct`, `jit_coll_mutate_direct`).
     pub(crate) fn capture_proto_baselines(&mut self) {
         for (proto, out) in [(self.str_proto, 0usize), (self.arr_proto, 1usize)] {
             if proto == 0 {
@@ -468,6 +477,51 @@ impl<'p> Vm<'p> {
                 table.insert(k, b);
             }
         }
+        // The same snapshot of the Map/Set methods compiled code calls
+        // directly once the captured callee's bits are these: `get`, `has`
+        // and `set` of %Map.prototype%, `has` and `add` of %Set.prototype%
+        // (0 when absent).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            let slot_bits = |vm: &Self, proto: u32, name: &str| -> u64 {
+                match vm.heap.get(proto) {
+                    HeapObj::Object(map) if proto != 0 => map
+                        .pos(name)
+                        .filter(|&i| !map.attr_at(i).accessor)
+                        .map(|i| map.val_at(i))
+                        .filter(|v| v.is_heap())
+                        .map_or(0, |v| v.bits()),
+                    _ => 0,
+                }
+            };
+            let bits = [
+                slot_bits(self, self.map_proto, "get"),
+                slot_bits(self, self.map_proto, "has"),
+                slot_bits(self, self.set_proto, "has"),
+                slot_bits(self, self.map_proto, "set"),
+                slot_bits(self, self.set_proto, "add"),
+            ];
+            // Kept in the Array table under keys none of its fast paths asks
+            // for (a NUL prefix), not in a `Vm` field of their own: one
+            // reordered the struct's fields and measured slower on an
+            // unrelated GC-bound row.
+            for (key, b) in COLL_BOOT_KEYS.iter().zip(bits) {
+                if b != 0 {
+                    self.arr_proto_baseline.insert((*key).into(), b);
+                }
+            }
+        }
+    }
+
+    /// The collection methods' boot bits [`Vm::capture_proto_baselines`]
+    /// recorded, in `COLL_BOOT_KEYS` order (0 = absent).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn coll_boot_bits(&self) -> [u64; 5] {
+        let mut out = [0; 5];
+        for (o, key) in out.iter_mut().zip(COLL_BOOT_KEYS) {
+            *o = self.arr_proto_baseline.get(key).copied().unwrap_or(0);
+        }
+        out
     }
 
     /// B191: is `name` on %String.prototype% still the boot intrinsic — the

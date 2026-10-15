@@ -4089,6 +4089,7 @@ pub(crate) fn compile_region_mem(
                             dst,
                             op,
                             refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            &heap,
                         ),
                     });
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;

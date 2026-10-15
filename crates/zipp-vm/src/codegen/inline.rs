@@ -119,6 +119,13 @@ pub(crate) fn emit_region_call_ic(
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_COLL_DIRECT_LANE=1` sends a captured Map/Set `get` / `has`
+    /// whose callee is the boot intrinsic through the proved lane, as before
+    /// (the same-binary A/B for `jit_coll_lookup_direct`).
+    fn coll_direct_lane_enabled() = "ZIPP_NO_COLL_DIRECT_LANE"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_CAPTURED_METHOD_LANE=1` removes the proved captured-method
     /// lane (`jit_captured_method`), so a split Map / Set / string /
     /// `hasOwn.call` member call takes the generic captured-callee helper
@@ -213,6 +220,13 @@ pub(crate) fn captured_builtin_lane(
 /// none of these intrinsics runs user code or grows a dense Array, so no
 /// pinned-array snapshot needs repair. Returns the join label the caller must
 /// define after its generic path.
+///
+/// A `get` / `has` lookup first tries the boot intrinsics' bits inline
+/// (`HeapHelpers::coll_boot_bits`): a captured callee that IS one of them
+/// runs `jit_coll_lookup_direct` with no proof in Rust at all, as the
+/// `push` / `charCodeAt` lane does. Any other callee (a WeakMap's, an
+/// override), and a receiver of another brand, continues into the proved
+/// call below exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_captured_method_lane(
     ops: &mut dynasmrt::x64::Assembler,
@@ -223,10 +237,78 @@ pub(crate) fn emit_captured_method_lane(
     dst: u16,
     op: u32,
     refetch: Option<(usize, usize)>,
+    heap: &HeapHelpers,
 ) -> dynasmrt::DynamicLabel {
     let done = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let packed = ((argc as u32) << 8) | op;
+    use crate::vm::captured_op as cop;
+    // (the boot bits to compare, the helper's `op`) for this selector, and
+    // whether it is a mutation (`jit_coll_mutate_direct`, the value in r9 and
+    // `op` the fifth argument) or a lookup (`jit_coll_lookup_direct`, `op`
+    // in r9).
+    let (direct, mutate): (&[(u64, u64)], bool) = match (op, argc) {
+        (cop::GET, 1) => (&[(heap.coll_boot_bits[0], 0)], false),
+        (cop::HAS, 1) => (&[(heap.coll_boot_bits[1], 1), (heap.coll_boot_bits[2], 2)], false),
+        (cop::SET, 2) => (&[(heap.coll_boot_bits[3], 0)], true),
+        (cop::ADD, 1) => (&[(heap.coll_boot_bits[4], 2)], true),
+        _ => (&[], false),
+    };
+    let helper = if mutate { heap.coll_mutate_direct } else { heap.coll_lookup_direct };
+    if coll_direct_lane_enabled() && helper != 0 && direct.iter().any(|&(bits, _)| bits != 0) {
+        let proved = ops.new_dynamic_label();
+        let call = ops.new_dynamic_label();
+        dynasm!(ops ; mov rax, [rbx + dreg(callee)]); // captured callee bits
+        for &(bits, helper_op) in direct {
+            if bits == 0 {
+                continue;
+            }
+            let next = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov r10, QWORD bits as i64
+                ; cmp rax, r10
+                ; jne => next
+            );
+            if mutate {
+                dynasm!(ops ; mov QWORD [rsp + 32], helper_op as i32); // 5th arg: op
+            } else {
+                dynasm!(ops ; mov r9, QWORD helper_op as i64);
+            }
+            dynasm!(ops
+                ; jmp => call
+                ; => next
+            );
+        }
+        dynasm!(ops
+            ; jmp => proved
+            ; => call
+            ; mov rcx, rdi                          // vm
+            ; mov rdx, [rbx + dreg(this_v)]         // captured receiver bits
+            ; mov r8, [rbx + dreg(arg_base)]        // key / value bits
+        );
+        if mutate {
+            if argc >= 2 {
+                dynasm!(ops ; mov r9, [rbx + dreg(arg_base + 1)]); // Map.set's value
+            } else {
+                dynasm!(ops ; xor r9d, r9d);
+            }
+        }
+        dynasm!(ops
+            ; mov rax, QWORD helper as i64
+            ; call rax
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => proved                          // another brand -> proved call
+            ; mov [rbx + dreg(dst)], rax
+        );
+        if let Some((vb, icb)) = refetch {
+            emit_refetch_pinned(ops, vb, Some(icb));
+        }
+        dynasm!(ops
+            ; jmp => done
+            ; => proved
+        );
+    }
     dynasm!(ops
         ; mov rcx, rdi                          // vm
         ; mov rdx, [rbx + dreg(this_v)]         // captured receiver bits

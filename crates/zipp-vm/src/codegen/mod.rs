@@ -1542,6 +1542,14 @@ pub struct HeapHelperAddrs {
     /// captured callee IS that native runs the dedicated helper.
     pub push_intrinsic_bits: u64,
     pub char_code_at_intrinsic_bits: u64,
+    /// Boot bits of %Map.prototype% `get` / `has`, %Set.prototype% `has`,
+    /// %Map.prototype% `set` and %Set.prototype% `add` (0 = unavailable),
+    /// and the helpers a captured callee of one of them calls directly
+    /// (`jit_coll_lookup_direct`, `jit_coll_mutate_direct`; see
+    /// `emit_captured_method_lane`).
+    pub coll_boot_bits: [u64; 5],
+    pub coll_lookup_direct: usize,
+    pub coll_mutate_direct: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -1740,6 +1748,9 @@ impl HeapHelperAddrs {
             cross3_finish: self.cross3_finish,
             push_intrinsic_bits: self.push_intrinsic_bits,
             char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
+            coll_boot_bits: self.coll_boot_bits,
+            coll_lookup_direct: self.coll_lookup_direct,
+            coll_mutate_direct: self.coll_mutate_direct,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,

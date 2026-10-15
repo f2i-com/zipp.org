@@ -5228,6 +5228,9 @@ impl<'p> Vm<'p> {
             // B191's baseline tables hold only heap Values, so a real entry is
             // never 0; an absent one (pre-boot, a stripped prototype) is.
             push_intrinsic_bits: self.arr_proto_baseline.get("push").copied().unwrap_or(0),
+            coll_boot_bits: self.coll_boot_bits(),
+            coll_lookup_direct: crate::vm::helpers_misc::jit_coll_lookup_direct as usize,
+            coll_mutate_direct: crate::vm::helpers_misc::jit_coll_mutate_direct as usize,
             char_code_at_intrinsic_bits: self
                 .str_proto_baseline
                 .get("charCodeAt")
