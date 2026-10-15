@@ -180,12 +180,17 @@ impl Value {
         // (breaking `1/-0` === -Infinity, `Object.is(-0,+0)`, SameValue, etc.), so
         // -0.0 is kept as a double. (+0.0 still narrows: the `== 0.0` short-circuits
         // for non-zero integers, so this only costs a sign check at exactly zero.)
-        if n.fract() == 0.0
-            && n >= i32::MIN as f64
-            && n <= i32::MAX as f64
-            && !(n == 0.0 && n.is_sign_negative())
-        {
-            return Value::int(n as i32);
+        //
+        // The range test comes first and exactness is the round trip through
+        // i32 (`cvttsd2si`/`cvtsi2sd`): `fract()` is `n - trunc(n)`, a libm
+        // call on baseline x86-64, and it ran ahead of the range test on
+        // every double result — 1% of a `double + int` loop in the call
+        // alone. NaN fails both range compares.
+        if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+            let i = n as i32;
+            if i as f64 == n && !(i == 0 && n.is_sign_negative()) {
+                return Value::int(i);
+            }
         }
         if n.is_nan() {
             return Value(QNAN); // canonical NaN double (no tag bits set)
