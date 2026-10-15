@@ -3345,6 +3345,20 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // A receiver with no shape (an Array, a string, a
+                        // DataView, a Map or Set, a promise) can never hit the
+                        // shape-keyed IC below, so its prototype-intrinsic
+                        // reads (`dv.getUint32`, `arr.push`) take the B191
+                        // proof first instead of paying the IC's site probe and
+                        // miss on every read. Any receiver the proof does not
+                        // answer goes on to the IC exactly as before.
+                        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
                         // own / chain GETTER frame-calls on THIS dispatch loop
