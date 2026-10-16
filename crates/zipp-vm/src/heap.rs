@@ -1074,6 +1074,11 @@ where
 #[cfg(not(feature = "safe-sandbox"))]
 const ARR_POOL_MAX_CAP: usize = 32;
 
+/// Largest string byte-buffer CAPACITY the byte pool retains (see
+/// `Heap::byte_pool`).
+#[cfg(not(feature = "safe-sandbox"))]
+const BYTE_POOL_MAX_CAP: usize = 64;
+
 /// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
 /// at each collection-done note keeps `max(2 * served, floor)` shells, so a
 /// steady literal-churn loop ramps the pool to its whole inter-sweep window
@@ -4145,6 +4150,13 @@ impl JsStr {
         self.bytes.capacity()
     }
 
+    /// The byte buffer itself (the sweep's `Heap::byte_pool` keeps it).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn into_byte_buf(self) -> Vec<u8> {
+        self.bytes.0
+    }
+
     /// Prepare this proven-linear flat ASCII string for a native append
     /// cursor. The returned allocation pointer stays valid until another
     /// operation mutates this string's `Vec`; the cursor planner admits no
@@ -6296,6 +6308,23 @@ pub struct Heap {
     /// by the same notes and flag as the shell pool.
     #[cfg(not(feature = "safe-sandbox"))]
     arr_pool: Vec<Vec<Value>>,
+    /// Recycled string byte buffers (capacity 1..=`BYTE_POOL_MAX_CAP`), the
+    /// string twin of `arr_pool`: a minor's sweep keeps a dying small
+    /// string's buffer here instead of freeing it, and the producers that
+    /// build a new string's bytes (`take_byte_buf`) take one instead of
+    /// allocating. Demand-trimmed at each collection-done note like the
+    /// other pools; never traced (plain bytes).
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool: Vec<Vec<u8>>,
+    /// `take_byte_buf` calls of a pool-sized buffer since the last
+    /// collection-done note: the trim's demand signal.
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool_asks: usize,
+    /// Whether the last window asked for any: only then does the sweep keep
+    /// string buffers (a workload whose producers never ask would only move
+    /// each free from the sweep to the trim).
+    #[cfg(not(feature = "safe-sandbox"))]
+    byte_pool_want: bool,
     /// B220: recycled property-key buffers, the third member of the
     /// B194/B196b pool family. The sweep drains a dying DYNAMIC-keyed
     /// object's key Strings here and the `obj["prefix" + i] = v` append pops
@@ -7005,6 +7034,12 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             arr_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool_asks: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            byte_pool_want: false,
+            #[cfg(not(feature = "safe-sandbox"))]
             key_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             key_pool_stats: [0; 3],
@@ -7229,6 +7264,39 @@ impl Heap {
             }
         }
         Vec::with_capacity(cap)
+    }
+
+    /// A byte buffer for a new string's bytes — recycled from `byte_pool`
+    /// when the pool has one and `cap` fits its class (cleared here), fresh
+    /// otherwise. Hand it to a `JsStr` constructor; a buffer that ends up
+    /// unused goes back through `return_byte_buf`.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))] // the Python str methods' producers
+    #[inline]
+    pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cap <= BYTE_POOL_MAX_CAP {
+            self.byte_pool_asks += 1;
+            if let Some(mut v) = self.byte_pool.pop() {
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap);
+                }
+                return v;
+            }
+        }
+        Vec::with_capacity(cap)
+    }
+
+    /// Give back a buffer `take_byte_buf` handed out that was not used.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn return_byte_buf(&mut self, v: Vec<u8>) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if (1..=BYTE_POOL_MAX_CAP).contains(&v.capacity()) {
+            self.byte_pool.push(v);
+            return;
+        }
+        drop(v);
     }
 
     /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
@@ -7772,6 +7840,7 @@ impl Heap {
     #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub fn refresh_mirror(&mut self, _idx: u32) {}
+
 
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
     /// matching [`Heap::pretenure_end`], every allocation is stamped OLD-clean
@@ -9115,6 +9184,18 @@ impl Heap {
                 self.free_slot_tail(idx);
                 return;
             }
+            // A small string's bytes, for the next string a producer builds
+            // (`take_byte_buf`). Nothing else in a `JsStr` owns memory.
+            HeapObj::Str(js)
+                if self.byte_pool_want
+                    && self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity()) =>
+            {
+                self.byte_pool.push(js.into_byte_buf());
+                self.free_slot_tail(idx);
+                return;
+            }
             other => other,
         };
         // B210: check the discriminant BY REFERENCE before the courier match —
@@ -9316,6 +9397,16 @@ impl Heap {
                     self.obj_pool_sort_stats[(!run) as usize] += 1;
                 }
             }
+            // The byte pool, trimmed the same way by the window's asks; its
+            // buffers are a few dozen bytes and drop inline.
+            let keep = self
+                .byte_pool_asks
+                .saturating_mul(2)
+                .max(self.byte_pool.len() / 2)
+                .max(OBJ_POOL_FLOOR);
+            self.byte_pool_want = self.byte_pool_asks != 0;
+            self.byte_pool_asks = 0;
+            self.byte_pool.truncate(keep);
             let keep = self
                 .arr_pool_pops
                 .saturating_mul(2)
