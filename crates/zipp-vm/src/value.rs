@@ -186,6 +186,32 @@ impl Value {
         // call on baseline x86-64, and it ran ahead of the range test on
         // every double result — 1% of a `double + int` loop in the call
         // alone. NaN fails both range compares.
+        //
+        // On x86-64 the truncation is the raw `cvttsd2si`, with no range
+        // test: it gives i32::MIN for NaN and for every out-of-range value,
+        // which the round trip then rejects (NaN compares unequal, an
+        // out-of-range value is not -2^31) unless `n` IS -2^31, which is an
+        // int. Rust's saturating `as i32` put a clamp (`maxsd`, `minsd`, a
+        // NaN `cmov`) in front of the conversion and two range branches
+        // around it: the dependent chain of every typed-array read and
+        // double arithmetic result. Without `unsafe` (safe-sandbox) the
+        // nearest form is a saturating i64 truncation, two `cmov`s, whose
+        // wrap to i32 the round trip rejects the same way.
+        #[cfg(target_arch = "x86_64")]
+        {
+            #[cfg(not(feature = "safe-sandbox"))]
+            // SAFETY: SSE2 is part of the x86-64 baseline.
+            let i = unsafe {
+                use core::arch::x86_64::{_mm_cvttsd_si32, _mm_set_sd};
+                _mm_cvttsd_si32(_mm_set_sd(n))
+            };
+            #[cfg(feature = "safe-sandbox")]
+            let i = n as i64 as i32;
+            if i as f64 == n && (i != 0 || n.to_bits() == 0) {
+                return Value::int(i);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             let i = n as i32;
             if i as f64 == n && !(i == 0 && n.is_sign_negative()) {
@@ -440,5 +466,36 @@ mod tests {
         let v = Value::num(1.7976931348623157e308); // near f64::MAX
         assert!(v.is_double());
         assert!(!v.is_heap());
+    }
+
+    /// The narrowing truncates without a range test (the raw `cvttsd2si`,
+    /// whose out-of-range and NaN answer is i32::MIN): every value that is
+    /// not exactly an i32 must stay a double, -2^31 itself must narrow, and
+    /// -0 must keep its sign. Checked against the definition, value by value.
+    #[test]
+    fn num_narrowing_edges() {
+        let min = i32::MIN as f64;
+        let max = i32::MAX as f64;
+        let cases = [
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1e-310, -1e-310, min, max, min - 1.0, max + 1.0,
+            min + 0.5, max - 0.5, 4294967296.0, 4294967297.0, -4294967296.0, 2147483648.0,
+            9007199254740993.0, 1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+            -f64::NAN, f64::MIN_POSITIVE, f64::MAX, f64::MIN,
+        ];
+        for n in cases {
+            let v = Value::num(n);
+            let exact = n >= min && n <= max && n.fract() == 0.0 && !(n == 0.0 && n.is_sign_negative());
+            if exact {
+                assert!(v.is_int(), "{n:e} should narrow");
+                assert_eq!(v.as_int() as f64, n, "{n:e}");
+            } else {
+                assert!(v.is_double(), "{n:e} should stay a double");
+                if n.is_nan() {
+                    assert_eq!(v.bits(), QNAN, "NaN is canonical");
+                } else {
+                    assert_eq!(v.as_f64().to_bits(), n.to_bits(), "{n:e} keeps its bits");
+                }
+            }
+        }
     }
 }
