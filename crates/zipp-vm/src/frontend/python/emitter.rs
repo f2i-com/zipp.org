@@ -1414,6 +1414,9 @@ impl<'a> Emitter<'a> {
     /// by the `getattr` helper) answers from its own dict when the name is
     /// there; everything else, and every miss, asks `getattr`.
     pub fn attr_get(&mut self, obj: Reg, name: &str) -> R<Reg> {
+        if self.fast && name == "__class__" {
+            return self.class_attr(obj);
+        }
         if !self.inline_attr_name(name) {
             let key = self.string(name)?;
             return self.helper("getattr", &[obj, key]);
@@ -1444,6 +1447,32 @@ impl<'a> Emitter<'a> {
             let here = e.here();
             e.patch(done, here)?;
             e.patch(cls_done, here)?;
+            Ok(())
+        });
+        Ok(dst)
+    }
+    /// `obj.__class__`. The `getattr` helper answers it with the record's
+    /// own `cls` for everything but a module (its globals may name
+    /// `__class__`) and a `super` proxy (resolved on its MRO), and a
+    /// primitive's type: so the record's class read natively (`PyClassOf`)
+    /// is the answer unless it is one of those two, which ask the helper as
+    /// whatever `PyClassOf` declines does. The torch library tests
+    /// `x.__class__ is Tensor` on nearly every operation, and each test was
+    /// an interpreted call of the helper.
+    fn class_attr(&mut self, obj: Reg) -> R<Reg> {
+        let dst = self.alloc()?;
+        let at = self.emit(Instr::PyClassOf { dst, obj, slow: 0 })?;
+        let same = self.alloc()?;
+        let mut general = Vec::new();
+        for name in ["TMODULE", "TSUPER"] {
+            let t = self.prop(self.r_rt, name)?;
+            self.emit(Instr::Eq { dst: same, a: dst, b: t })?;
+            general.push(self.jump_if_true(same)?);
+        }
+        self.defer_cold(general, vec![at], move |e| {
+            let key = e.string("__class__")?;
+            let r = e.helper("getattr", &[obj, key])?;
+            e.emit(Instr::Move { dst, src: r })?;
             Ok(())
         });
         Ok(dst)

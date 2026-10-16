@@ -1,0 +1,21 @@
+A True
+B True
+Size True
+Bag True
+int True
+int True
+float True
+str True
+bool True
+NoneType True
+tuple True
+list True
+dict True
+set True
+function True
+True True True
+True False True
+Other
+A True
+[('A', 2500), ('B', 2500), ('NoneType', 2500), ('Size', 2500), ('WithMeta', 2500), ('float', 2500), ('int', 2500), ('str', 2500)]
+20000

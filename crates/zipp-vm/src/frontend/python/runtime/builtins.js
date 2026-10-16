@@ -2028,6 +2028,9 @@
     "use strict";
     const rt = R.__rt, T = rt.T;
     R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set;
+    // The two classes whose instances' `__class__` is not their `cls` as
+    // `getattr` answers it (a module's globals, a super proxy's MRO).
+    R.TMODULE = T.module; R.TSUPER = T.super;
     // The emitter's native list and tuple displays (`PySeq`) copy this
     // record, which `sequence` made and nothing else ever sees.
     R.SEQTMPL = rt.list([]);
