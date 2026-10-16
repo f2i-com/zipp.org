@@ -9758,7 +9758,38 @@ impl Heap {
             }
             _ => {}
         }
-        self.alloc(HeapObj::Str(JsStr::new(s)))
+        self.alloc_str_settled(JsStr::new(s))
+    }
+
+    /// [`Heap::alloc`] of a string. A small one takes B257's slot-reuse path
+    /// (`alloc_array_settled`'s): a `Str` owns no mirror line, so the cleared
+    /// mirror `free_slot` left stands, and the slot is written without the
+    /// occupant drop glue `alloc`'s assignment runs on the tombstone. A
+    /// string past `BIG_PAYLOAD_BYTES`, a heap without allocator reporting
+    /// (whose `alloc` weighs every payload) and every non-default
+    /// configuration go through `alloc` unchanged.
+    #[inline]
+    fn alloc_str_settled(&mut self, js: JsStr) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc
+            && !self.payload_accounting.get()
+            && js.byte_capacity() < BIG_PAYLOAD_BYTES
+            && ALLOCATOR_REPORTS.load(Ordering::Relaxed)
+        {
+            if let Some(idx) = self.free.pop() {
+                #[cfg(feature = "jit")]
+                debug_assert_eq!(
+                    self.hot_mirror[idx as usize],
+                    HotMirror::CLEAR,
+                    "free_slot leaves a recycled slot's mirror cleared"
+                );
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Str(js));
+                self.reuse_slot_stamp(idx);
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Str(js))
     }
 
     /// `alloc_str` for an already-built `JsStr` (the WTF-8 creation sites):
@@ -9770,7 +9801,7 @@ impl Heap {
             1 if b[0] < 128 => return b[0] as u32,
             _ => {}
         }
-        self.alloc(HeapObj::Str(js))
+        self.alloc_str_settled(js)
     }
 
     /// Allocate a rope node over two string-like children (O(1) concatenation).
