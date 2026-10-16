@@ -1314,6 +1314,89 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// [`Vm::ta_snapshot`] of a non-BigInt view as the Numbers its Values
+    /// hold (`Value::num(x).as_f64()`, so a NaN is the canonical one and -0
+    /// stays -0), each element decoded as [`Vm::ta_element_get`] decodes it,
+    /// with the view resolved once; an element past the end reads as that
+    /// call's `undefined` does, NaN.
+    pub(crate) fn ta_read_numbers(&mut self, ta_idx: u32) -> Vec<f64> {
+        let len = self.ta_len_kind(ta_idx).0;
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return vec![f64::NAN; len],
+        };
+        debug_assert!(!native::TA_KINDS[kind as usize].2, "a BigInt view holds BigInts");
+        let size = native::TA_KINDS[kind as usize].1;
+        let eff = self.ta_effective_len(ta_idx).unwrap_or(0);
+        let data: &[u8] = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            _ => &[],
+        };
+        (0..len)
+            .map(|i| {
+                let off = byte_offset + i * size;
+                if i >= eff || off + size > data.len() {
+                    return f64::NAN;
+                }
+                let b = &data[off..off + size];
+                let x = match kind {
+                    0 => b[0] as i8 as f64,
+                    1 | 2 => b[0] as f64,
+                    3 => i16::from_le_bytes([b[0], b[1]]) as f64,
+                    4 => u16::from_le_bytes([b[0], b[1]]) as f64,
+                    5 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    6 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    7 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+                    8 => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+                    11 => crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([b[0], b[1]])),
+                    _ => f64::NAN,
+                };
+                Value::num(x).as_f64()
+            })
+            .collect()
+    }
+
+    /// [`Vm::ta_element_set`] of a run of Numbers into elements `start..` of a
+    /// non-BigInt view, for a caller whose values are already coerced: no
+    /// user code runs between the stores, so the view, its effective length
+    /// and the buffer's state are read once, and each value is encoded and
+    /// stored exactly as the per-element call stores it (an element past the
+    /// end is skipped, as there). `fill` and a cross-kind `set` stored every
+    /// element through that call, resolving the view each time.
+    pub(crate) fn ta_store_numbers(&mut self, ta_idx: u32, start: usize, values: impl Iterator<Item = f64>) {
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return,
+        };
+        debug_assert!(!native::TA_KINDS[kind as usize].2, "a BigInt view stores BigInts");
+        let size = native::TA_KINDS[kind as usize].1;
+        let len = self.ta_effective_len(ta_idx).unwrap_or(0);
+        let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) else {
+            return;
+        };
+        if *detached {
+            return;
+        }
+        for (k, f) in values.enumerate() {
+            let i = start + k;
+            let off = byte_offset + i * size;
+            if i >= len || off + size > data.len() {
+                break;
+            }
+            data[off..off + size].copy_from_slice(&ta_encode(kind, f)[..size]);
+        }
+    }
+
     /// The ArrayBuffer/SharedArrayBuffer constructor's observable argument
     /// coercions, split from allocation so the ctor can run them BEFORE
     /// OrdinaryCreateFromConstructor reads newTarget.prototype: ToIndex(length)

@@ -2600,8 +2600,14 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 self.preflight_native_iteration_work(end.saturating_sub(start) as u64)?;
-                for i in start..end {
-                    self.ta_element_set(idx, i, v)?;
+                if !is_big {
+                    // `v` is a Number: storing it runs no user code.
+                    let f = v.as_f64();
+                    self.ta_store_numbers(idx, start, (start..end).map(|_| f));
+                } else {
+                    for i in start..end {
+                        self.ta_element_set(idx, i, v)?;
+                    }
                 }
                 Ok(Some(recv))
             }
@@ -2937,7 +2943,14 @@ impl<'p> Vm<'p> {
                         }
                         return Ok(Some(Value::UNDEFINED));
                     }
-                    // Different element kinds convert each snapshotted value.
+                    // Different element kinds convert each snapshotted value
+                    // (Numbers when the target is not BigInt: the kinds
+                    // agree on that, checked above).
+                    if !target_big {
+                        let src = self.ta_read_numbers(source_idx);
+                        self.ta_store_numbers(idx, offset, src.into_iter());
+                        return Ok(Some(Value::UNDEFINED));
+                    }
                     let src = self.ta_snapshot(source_idx);
                     for (k, v) in src.into_iter().enumerate() {
                         self.ta_element_set(idx, offset + k, v)?;
