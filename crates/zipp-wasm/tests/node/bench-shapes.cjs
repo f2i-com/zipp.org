@@ -3,7 +3,7 @@
 // shapes that take the spec-order (captured) lowering under the strict
 // default call order (B280), against the same calls over plain locals, and
 // the bare property reads the captured lowering pays for. This is the
-// measurement behind HANDOFF.md's B289 table.
+// measurement behind docs/archive/HANDOFF-through-0.0.25.md's B289 table.
 //
 //   wasm-bindgen --target nodejs --out-dir tests/node/pkg \
 //     target/wasm32-unknown-unknown/release/zipp_wasm.wasm

@@ -41,7 +41,7 @@ print("nan-operator", nan == nan, nan != nan, x == x, x is x, nan < nan, nan >= 
 # Distinct NaNs are distinct keys and never equal (CPython compares elements
 # by identity first, so only the SAME object finds itself; Zipp's floats are
 # unboxed and have no identity, which is documented in
-# docs/PYTHON_FRONTEND_EXPERIMENT.md).
+# docs/python/FRONTEND.md).
 a, b = float("nan"), float("nan")
 print("nan-distinct", a in [b], [a] == [b], len({a: 1, b: 2}), len({a, b}), {a: 1}.get(b, "missing"), [a].count(b))
 

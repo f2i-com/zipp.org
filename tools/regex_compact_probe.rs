@@ -1,5 +1,5 @@
 // Differential probe: compile against regress with and without compact-utf16.
-// Compare stdout byte-for-byte; see docs/validation/2026-09-29-engine-size-round4.md.
+// Compare stdout byte-for-byte; see docs/archive/validation/2026-09-29-engine-size-round4.md.
 extern crate regress;
 use regress::{Flags, MatchLimits, Regex};
 fn main() {

@@ -3,7 +3,7 @@
 Repository/API contracts inspected at ZIPP commit
 `62da28d9bdcd66fccbf5627d887d574016501f9d`:
 
-- `docs/PYTHON_FRONTEND_EXPERIMENT.md`: module compilation, VFS policy, Python/host hooks.
+- `docs/python/FRONTEND.md`: module compilation, VFS policy, Python/host hooks.
 - `crates/zipp-wasm/playground/engine.worker.js`: Engine construction, project init,
   Python calls, budget renewal, Worker ownership and compute backend hookup.
 - `crates/zipp-wasm/host-sdk/zipp-host.worker.mjs`: explicit capability grants.
@@ -32,7 +32,7 @@ depends on what they decide:
 - `crates/zipp-wasm/gpu-lab/src/graph.mjs` node fields: `permute.dims`,
   `reshape.shape`, `softmax.axis` (last axis only), `mean.axis`/`keepdim`,
   `full.value` and matmul's rank two/three rule match what the plugin emits.
-- `docs/PYTHON_FRONTEND_EXPERIMENT.md`: `json` and `math` are built-in modules, so
+- `docs/python/FRONTEND.md`: `json` and `math` are built-in modules, so
   the generated bootstrap and the transformer plugin need nothing installed.
 
 The above source files were read, not copied over or modified by this overlay.

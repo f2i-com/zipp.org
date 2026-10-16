@@ -127,7 +127,7 @@ the engine allows) for the program's top level and then for each frame,
 renewed by the worker before every frame so a long-running animation is
 bounded per frame rather than in total, the engine's heap and output ceilings,
 and the Python frontend's compile-time caps. The Python side is Zipp's own
-Python 3 implementation described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
+Python 3 implementation described in `docs/python/FRONTEND.md`
 (classes, exceptions, generators, `match`, the builtin types and a set of
 standard modules; no `async` or real files). GPU graphs are validated and
 bounded again by the host runtime (node count, tensor sizes, work and
@@ -142,4 +142,4 @@ the GPU completes; this is an experimental asynchronous extension, not full
 PyTorch. **Samples → Python: Torch ML training (GPU)** adds a live loss curve
 for a dense ReLU network trained using MSE and SGD. `torch.compile(training=True)`
 records forward, backward and updates. Each call uploads weights and reads them
-back; persistent compiled models and GPU Conv2d are not implemented. See the [compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
+back; persistent compiled models and GPU Conv2d are not implemented. See the [compatibility guide](../../../docs/python/TORCH_COMPATIBILITY.md).

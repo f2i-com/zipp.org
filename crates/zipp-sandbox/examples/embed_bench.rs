@@ -8,7 +8,7 @@
 //! limits; `--steps-only` and `--heap-only` attach one of the two. Console
 //! output goes to stdout as it is produced. With `ZIPP_HEAPBYTES` set, the
 //! heap figure's peak is printed to stderr at the end. The 0.0.25 release
-//! record (docs/validation/2026-10-15-release-0.0.25.md) measured with it.
+//! record (docs/archive/validation/2026-10-15-release-0.0.25.md) measured with it.
 
 #![forbid(unsafe_code)]
 

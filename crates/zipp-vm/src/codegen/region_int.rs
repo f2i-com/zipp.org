@@ -827,7 +827,7 @@ pub(crate) fn compile_region_int(
 ///
 /// What it misses is that the REGISTER PLAN is built by skipping the cold
 /// blocks, so the plan and the emitted code disagree about what those blocks do.
-/// `PERF_ROADMAP.md` B9 has the ten-line reproduction (a `delete` + rebuild loop
+/// `docs/PERF_ROADMAP.md` B9 has the ten-line reproduction (a `delete` + rebuild loop
 /// that returns `s = 0` instead of `3050`). It was found only after
 /// `GetIndexConcat` was admitted, which let a region shape reach the tier that
 /// had never reached it before.

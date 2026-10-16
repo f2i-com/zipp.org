@@ -830,7 +830,7 @@ impl<'p> Vm<'p> {
         let (attr, stored) = self.merge_property_descriptor(
             key, existing, extensible, value, get, set, d_wr, d_en, d_cf,
         )?;
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1's define
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1's define
         // route (Object/Class/sidecar targets all store `stored` under holder
         // `idx`; the sidecars are additionally root-rescanned every minor).
         // An accessor define also stores the SETTER half in `attrs[i].setter`

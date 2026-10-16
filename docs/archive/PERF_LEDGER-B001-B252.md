@@ -2,7 +2,7 @@
 
 > **Archived B001–B252 experiment ledger.** Measurements and refutations remain
 > valid only for the commits and setups they name. Use the current root
-> [`PERF_ROADMAP.md`](../../PERF_ROADMAP.md) for live priorities.
+> [`PERF_ROADMAP.md`](../PERF_ROADMAP.md) for live priorities.
 
 > **Goal:** match V8 on speed, and pass all of test262.
 >

@@ -2,7 +2,7 @@
 
 This is the durable technical reference. The public overview and canonical
 scoreboard are in [`README.md`](README.md); current experiments are in
-[`PERF_ROADMAP.md`](PERF_ROADMAP.md); the previous long-form snapshot is
+[`docs/PERF_ROADMAP.md`](docs/PERF_ROADMAP.md); the previous long-form snapshot is
 preserved at [`docs/archive/DOC-through-B252.md`](docs/archive/DOC-through-B252.md).
 
 ## Contents
@@ -238,7 +238,7 @@ promotion, recycled shells, write barriers, weak edges, finalizers, and external
 payload accounting share the same stable slot identity.
 
 The design basis and edge inventory remain in
-[`NURSERY_DESIGN.md`](NURSERY_DESIGN.md). That document began as a proposal but
+[`docs/archive/NURSERY_DESIGN.md`](docs/archive/NURSERY_DESIGN.md). That document began as a proposal but
 its non-moving index-state nursery is now implemented; historical estimates in
 it are not current benchmark claims.
 
@@ -381,7 +381,7 @@ not erase suite ownership: its point is
 the two separately captured suites as independent strata. Node point gaps
 remain, so it is not an every-row superiority claim.
 
-Current optimization evidence and next work live in `PERF_ROADMAP.md`. Detailed
+Current optimization evidence and next work live in `docs/PERF_ROADMAP.md`. Detailed
 B001–B252 measurements and refutations live in the archive.
 
 The distinction is deliberate:

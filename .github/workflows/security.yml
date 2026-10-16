@@ -10,7 +10,7 @@ name: Security
 # `-f skip_heavy=false`; the former Monday 03:17 UTC schedule can be
 # restored when automatic checks resume. CI (ci.yml) is the minimum gate, and the
 # broad lanes — the full engine suite, the safe profile, the sandboxes, the
-# browser Workers — are run locally before a push (HANDOFF.md, "Local
+# browser Workers — are run locally before a push (docs/DEVELOPMENT.md, "Local
 # verification") and here on demand. Release publishing calls this workflow
 # at the validated tag commit and consumes every result.
 #

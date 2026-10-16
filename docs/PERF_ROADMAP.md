@@ -933,7 +933,7 @@ and no drift.
 ## Historical lookup
 
 The archived ledger retains B001–B252, old section numbers, detailed hazard
-proofs, and refuted experiments. Source comments that cite “`PERF_ROADMAP.md`
+proofs, and refuted experiments. Source comments that cite “`docs/PERF_ROADMAP.md`
 B59”, B9, B29, or another historical ID refer to that archive. The durable
-nursery design remains at [`NURSERY_DESIGN.md`](NURSERY_DESIGN.md) because code
+nursery design remains at [`docs/archive/NURSERY_DESIGN.md`](docs/archive/NURSERY_DESIGN.md) because code
 comments cite its numbered sections directly.

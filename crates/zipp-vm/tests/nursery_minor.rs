@@ -8,7 +8,7 @@
 //! cover (a live young object invisible to the minor trace — SWEPT ALIVE,
 //! i.e. silent corruption), a side-table entry surviving its freed key, a
 //! survivor swept, or floated old garbage accumulating without bound. Each
-//! test aims at one, per edge idiom of NURSERY_DESIGN.md §1:
+//! test aims at one, per edge idiom of docs/archive/NURSERY_DESIGN.md §1:
 //!
 //!   * the two old→young idioms B119's oracle measured as dominant — young
 //!     values pushed into a retained array (227k, `jit_set_index`/push lanes)

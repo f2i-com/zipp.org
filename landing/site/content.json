@@ -784,7 +784,7 @@
             },
             {
               "type": "p",
-              "text": "Each area is checked against values PyTorch 2.11 generated, and eager torch's heavy loops (matmul, convolution, elementwise ops, reductions, FFT, factorizations) run as native kernels that repeat the JavaScript fallback's arithmetic in the same order, byte for byte. Hugging Face's `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py`, `modeling_mistral.py` and `modeling_gpt_neo.py` run unmodified. `device=\"cuda\"` is rejected rather than silently ignored, and the [Torch compatibility guide](https://github.com/f2i-com/zipp.org/blob/main/docs/TORCH_COMPATIBILITY.md) lists what is still missing."
+              "text": "Each area is checked against values PyTorch 2.11 generated, and eager torch's heavy loops (matmul, convolution, elementwise ops, reductions, FFT, factorizations) run as native kernels that repeat the JavaScript fallback's arithmetic in the same order, byte for byte. Hugging Face's `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py`, `modeling_mistral.py` and `modeling_gpt_neo.py` run unmodified. `device=\"cuda\"` is rejected rather than silently ignored, and the [Torch compatibility guide](https://github.com/f2i-com/zipp.org/blob/main/docs/python/TORCH_COMPATIBILITY.md) lists what is still missing."
             },
             {
               "type": "p",
@@ -1149,7 +1149,7 @@
             },
             {
               "type": "table",
-              "caption": "Against PyTorch 2.11 + CUDA 12.8 on the same RTX 5090, ms per step (docs/TORCH_COMPATIBILITY.md)",
+              "caption": "Against PyTorch 2.11 + CUDA 12.8 on the same RTX 5090, ms per step (docs/python/TORCH_COMPATIBILITY.md)",
               "head": [
                 "Case",
                 "PyTorch CUDA eager",
@@ -1316,7 +1316,7 @@
             {
               "@type": "DataDownload",
               "encodingFormat": "application/json",
-              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/docs/validation/2026-09-14-test262-datetimeformat.json"
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json"
             }
           ]
         }
@@ -1461,8 +1461,8 @@
               "type": "ul",
               "items": [
                 "[Hosted run at 1539eb4b](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947), the clean-build confirmation of the table above.",
-                "[docs/validation/2026-09-14-test262-datetimeformat.json](https://github.com/f2i-com/zipp.org/blob/main/docs/validation/2026-09-14-test262-datetimeformat.json), the machine-readable summary with engine identity, corpus pin, correction hashes and report hashes.",
-                "[docs/validation/2026-09-14-ci-readiness.md](https://github.com/f2i-com/zipp.org/blob/main/docs/validation/2026-09-14-ci-readiness.md), the narrative log with a per-failure analysis.",
+                "[docs/archive/validation/2026-09-14-test262-datetimeformat.json](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json), the machine-readable summary with engine identity, corpus pin, correction hashes and report hashes.",
+                "[docs/archive/validation/2026-09-14-ci-readiness.md](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-ci-readiness.md), the narrative log with a per-failure analysis.",
                 "[tools/test262-corrections/](https://github.com/f2i-com/zipp.org/tree/main/tools/test262-corrections), the manifest and the five patches.",
                 "[tools/test262-expected-failures.txt](https://github.com/f2i-com/zipp.org/blob/main/tools/test262-expected-failures.txt), the nine-entry manifest with reasons.",
                 "[tools/run_test262.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262.py) and [tools/run_test262_dual.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262_dual.py).",
@@ -2205,7 +2205,7 @@
             },
             {
               "type": "p",
-              "text": "The geometric mean is 0.882× Node over the ten headline rows [0.873, 0.887] and 0.622× over all 13. Zipp's median is below Node's on every row; the strict sign test proves eight of them. Node's process start is about 30 ms of each of its times and Zipp's 7. Against v0.0.23 the same rows take 2.6% less time; `map-set-heavy` is the one row slower, by 2.8%. The [validation record](https://github.com/f2i-com/zipp.org/blob/main/docs/validation/2026-10-14-engine-size-round16-r2.md) has the paired intervals and the A/B."
+              "text": "The geometric mean is 0.882× Node over the ten headline rows [0.873, 0.887] and 0.622× over all 13. Zipp's median is below Node's on every row; the strict sign test proves eight of them. Node's process start is about 30 ms of each of its times and Zipp's 7. Against v0.0.23 the same rows take 2.6% less time; `map-set-heavy` is the one row slower, by 2.8%. The [validation record](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-10-14-engine-size-round16-r2.md) has the paired intervals and the A/B."
             }
           ]
         },
@@ -2227,7 +2227,7 @@
                 "[bench/real13_8229b3fc_pgo_2026-09-02.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json), the previous canonical capture.",
                 "[bench/real13_14770703_pgo_2026-09-11.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_14770703_pgo_2026-09-11.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_14770703_pgo_2026-09-11.json), the later capture.",
                 "[bench/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/README.md), the suite map and publication gate; [bench/hostile/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/README.md) and [manifest.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/manifest.json).",
-                "[PERF_ROADMAP.md](https://github.com/f2i-com/zipp.org/blob/main/PERF_ROADMAP.md), the checkable roadmap, and the [archived performance ledger](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/PERF_LEDGER-B001-B252.md), 881 KB of experiments including the refuted ones."
+                "[docs/PERF_ROADMAP.md](https://github.com/f2i-com/zipp.org/blob/main/docs/PERF_ROADMAP.md), the checkable roadmap, and the [archived performance ledger](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/PERF_LEDGER-B001-B252.md), 881 KB of experiments including the refuted ones."
               ]
             },
             {
@@ -2394,8 +2394,8 @@
           "href": "/architecture/"
         },
         {
-          "label": "DOC.md, the full reference in the repository",
-          "href": "https://github.com/f2i-com/zipp.org/blob/main/DOC.md"
+          "label": "docs/REFERENCE.md, the full reference in the repository",
+          "href": "https://github.com/f2i-com/zipp.org/blob/main/docs/REFERENCE.md"
         }
       ]
     },
@@ -4438,7 +4438,7 @@
         "blocks": [
           {
             "type": "p",
-            "text": "`NURSERY_DESIGN.md` was written when GC looked dominant; the ledger later corrected that (\"GC is 2-12%, not dominant — B81 corrected\" and \"it is the COLLECTOR, not the allocator — pool built, measured zero, reverted\"). Stage 1 of the nursery was refuted; stage 3 (`82e454fa`, `72cb640f`) landed with a prover that verifies remembered-set invariants, `ZIPP_NURSERY_VERIFY=1`. The design document now carries a header calling itself historical. `0d124bf1`, \"feat: add Zipp landing page\", is the first version of this site."
+            "text": "`docs/archive/NURSERY_DESIGN.md` was written when GC looked dominant; the ledger later corrected that (\"GC is 2-12%, not dominant — B81 corrected\" and \"it is the COLLECTOR, not the allocator — pool built, measured zero, reverted\"). Stage 1 of the nursery was refuted; stage 3 (`82e454fa`, `72cb640f`) landed with a prover that verifies remembered-set invariants, `ZIPP_NURSERY_VERIFY=1`. The design document now carries a header calling itself historical. `0d124bf1`, \"feat: add Zipp landing page\", is the first version of this site."
           }
         ]
       },
@@ -4617,7 +4617,7 @@
         "slug": "function-jit-on-by-default-and-the-roadmap",
         "date": "2026-06-14",
         "title": "Tier C function JIT on by default, and a checkable roadmap",
-        "summary": "The whole-function JIT tier is enabled by default (parse 4.1× → 3.3× Node) and PERF_ROADMAP.md is written as a checkable path to V8 parity. Then the log goes quiet for six weeks.",
+        "summary": "The whole-function JIT tier is enabled by default (parse 4.1× → 3.3× Node) and docs/PERF_ROADMAP.md is written as a checkable path to V8 parity. Then the log goes quiet for six weeks.",
         "tags": [
           "jit",
           "performance"
@@ -4630,7 +4630,7 @@
         "blocks": [
           {
             "type": "p",
-            "text": "`4e12a406` and `f0d725a8` enable the Tier C function-level JIT by default. `62dbba15` adds `PERF_ROADMAP.md`, whose tickets (B1, B2, B3…) number every later performance commit. The day before, `7e29d967` had fixed six JIT soundness bugs found by an adversarial audit of the session's own codegen. June ends with 1,039 commits."
+            "text": "`4e12a406` and `f0d725a8` enable the Tier C function-level JIT by default. `62dbba15` adds `docs/PERF_ROADMAP.md`, whose tickets (B1, B2, B3…) number every later performance commit. The day before, `7e29d967` had fixed six JIT soundness bugs found by an adversarial audit of the session's own codegen. June ends with 1,039 commits."
           }
         ]
       },

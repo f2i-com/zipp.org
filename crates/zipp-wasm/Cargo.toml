@@ -69,7 +69,7 @@ default = []
 # ZIPP Lite: JavaScript core without Intl, Temporal, Python or Torch.
 lite = ["zipp-vm/wasm-lite"]
 # `Engine.initSource(source, "python")`: the experimental Python-subset
-# frontend (docs/PYTHON_FRONTEND_EXPERIMENT.md).
+# frontend (docs/python/FRONTEND.md).
 python = ["zipp-vm/python"]
 python-js-interop = ["python", "zipp-vm/python-js-interop"]
 # The Python frontend without the torch package (the `python` artifact): a

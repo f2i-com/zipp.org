@@ -2179,7 +2179,7 @@ impl<'p> Vm<'p> {
     /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
     pub(crate) fn json_parse(&mut self, src: &[u8]) -> Result<Value, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
-        // W9 static pretenure (NURSERY_DESIGN.md §4): the parsed tree is the
+        // W9 static pretenure (docs/archive/NURSERY_DESIGN.md §4): the parsed tree is the
         // measured pretenure case (B119's oracle: json-large's 48% old-trace
         // share with ~zero old→young stores), so the whole builder allocates
         // OLD. No user code runs inside this scope (the reviver path,

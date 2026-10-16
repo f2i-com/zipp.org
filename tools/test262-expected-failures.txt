@@ -2,7 +2,7 @@
 # in the outer arguments binding. Local regression tests cover current semantics.
 annexB/language/function-code/block-decl-func-skip-arguments.js [sloppy]
 # Upstream harness inconsistencies at corpus 4249661388e5d3f92a85186213da140a6481490f.
-# See docs/validation/2026-09-14-ci-readiness.md for evidence; these still RUN.
+# See docs/archive/validation/2026-09-14-ci-readiness.md for evidence; these still RUN.
 # nativeErrors.js includes Error, but these tests expect only Error subclasses.
 staging/sm/Error/constructor-proto.js [sloppy]
 staging/sm/Error/constructor-proto.js [strict]

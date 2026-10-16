@@ -19,7 +19,7 @@
 #   landing  the public site's tests, typecheck and production build, plus the
 #            playground copy it synchronises out of crates/zipp-wasm.
 #
-# Everything heavier is a LOCAL command (see HANDOFF.md "Local verification"):
+# Everything heavier is a LOCAL command (see docs/DEVELOPMENT.md "Local verification"):
 # the full 230-binary engine suite, the safe-profile and instrumented lanes,
 # test262, the three-browser Worker smoke, the density and benchmark
 # harnesses. security.yml runs the broader matrix on demand.

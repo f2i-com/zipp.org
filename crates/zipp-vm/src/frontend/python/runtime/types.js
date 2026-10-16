@@ -581,7 +581,7 @@
             // equal would make every NaN one key: `{nan1: "a", nan2: "b"}`
             // would collapse to one entry and lose a value. A miss is the safe
             // answer (and what the engine did before); the limitation is in
-            // docs/PYTHON_FRONTEND_EXPERIMENT.md.
+            // docs/python/FRONTEND.md.
             if (ta === "number") return tb === "number" ? false : tb === "bigint" ? a == b : tb === "boolean" && a === (b ? 1 : 0);
             if (ta === "bigint") return tb === "number" ? a == b : tb === "boolean" && a === (b ? 1n : 0n);
             if (ta === "boolean") return tb === "bigint" ? (a ? 1n : 0n) === b : tb === "number" && (a ? 1 : 0) === b;

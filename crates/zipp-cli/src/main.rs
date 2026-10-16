@@ -3,7 +3,7 @@
 //! Usage:
 //!   zipp js  <file.js>            run a script
 //!   zipp mjs <file.mjs> [harness] run a file as an ES module
-//!   zipp py  <file.py>            run a Python program (see docs/PYTHON_FRONTEND_EXPERIMENT.md)
+//!   zipp py  <file.py>            run a Python program (see docs/python/FRONTEND.md)
 //!   zipp run [--lang=L] <file>    run, selecting the frontend by flag, extension or shebang
 
 use std::process::ExitCode;
@@ -159,7 +159,7 @@ fn main() -> ExitCode {
         eprintln!(
             "[gc-nursery] minors {minors} ({mn_ms:.1}ms)  majors {majors} ({mj_ms:.1}ms)  swept-young {swept_young}  dirty peak {dirty_peak} swept-at-major {floated_swept}  peak slots {peak}  budget {budget_last} (peak {budget_peak})"
         );
-        // B6 generational-oracle report (NURSERY_DESIGN.md §6): young =
+        // B6 generational-oracle report (docs/archive/NURSERY_DESIGN.md §6): young =
         // allocated since the previous collection; old-attributable = the part
         // of trace+sweep a young-only minor GC would NOT have to do.
         let (my, mo, sy, so, wy, wt, alloced, ty, to) = zipp_vm::gc_gen_stats();

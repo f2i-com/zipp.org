@@ -21,7 +21,7 @@ which is why it was chosen. Replacing it means writing an engine. The former
 Stage 5A plan and its ~10.7× regex gap belong to the
 [archived performance ledger](../../docs/archive/PERF_LEDGER-B001-B252.md), not
 the current baseline: the canonical `regex-log-scan` row is now 1.02× Node.
-Current priorities live in [`PERF_ROADMAP.md`](../../PERF_ROADMAP.md).
+Current priorities live in [`docs/PERF_ROADMAP.md`](../../docs/PERF_ROADMAP.md).
 
 ## Relationship to upstream
 
@@ -275,7 +275,7 @@ unchanged. Zero/one mandatory characters retain direct fast paths.
 
 Full/native profiles retain their original separate input types and scalar
 budgeted loops. ZIPP enables the new feature only through `wasm-lite`.
-See [the fourth size audit](../../docs/validation/2026-09-29-engine-size-round4.md)
+See [the fourth size audit](../../docs/archive/validation/2026-09-29-engine-size-round4.md)
 for sizes, paired performance measurements and the differential probe. Unit tests
 cover every individual code unit, surrogate boundaries, forward/backward stepping,
 subinputs and scalar-equivalent budget boundaries (including prior exhaustion

@@ -1,7 +1,7 @@
 # Handoff — the Node-parity performance campaign
 
 > **Archived cumulative handoff through B252.** Use the current root
-> [`HANDOFF.md`](../../HANDOFF.md) for the active engine baseline, gates, and
+> [`HANDOFF.md`](HANDOFF-through-0.0.25.md) for the active engine baseline, gates, and
 > next commands.
 
 Written at the end of a long working session, for whoever picks this up next

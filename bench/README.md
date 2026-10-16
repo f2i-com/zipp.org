@@ -240,5 +240,5 @@ Run the local integrity suite after changing a harness, manifest, or workload:
 python -m unittest tools.test_bench
 ```
 
-See [`PERF_ROADMAP.md`](../PERF_ROADMAP.md) for current optimization targets and
+See [`docs/PERF_ROADMAP.md`](../docs/PERF_ROADMAP.md) for current optimization targets and
 the [historical ledger](../docs/archive/README.md) for prior experiments.

@@ -5,7 +5,7 @@
 //! artifact records the executable's SHA-256, but with no way to ask a binary
 //! what it was built from there is nothing to cross-check it against: an A/B run
 //! whose two sides were the SAME build reported a clean pass, and the only tell
-//! was a ratio that failed to move. See `PERF_ROADMAP.md` B59/B60/B61.
+//! was a ratio that failed to move. See `docs/PERF_ROADMAP.md` B59/B60/B61.
 //!
 //! Everything here degrades to `"unknown"` rather than failing the build — a
 //! source tarball with no `.git`, or a machine without `git` on PATH, must still

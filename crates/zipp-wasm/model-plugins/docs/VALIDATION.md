@@ -132,6 +132,6 @@ example models' identity pins; it reads each plugin's declared checkpoint family
 from its source, so a manifest cannot claim one the code does not implement. The
 bigram model is a hand-authored 7-by-7 transition table, not a trained transformer.
 
-Before merging, complete the browser and SoftN acceptance checks in `HANDOFF.md`.
+Before merging, complete the browser and SoftN acceptance checks in `docs/archive/HANDOFF-through-0.0.25.md`.
 Do not relabel skipped tests as passes, and do not read a passing Gate A as
 evidence for Gates B through E.

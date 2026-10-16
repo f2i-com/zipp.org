@@ -9,7 +9,7 @@
 //! These tests pin the OBSERVABLE side of that: every value must be what the
 //! eager form produced. `zipp_vm::run` output is compared against
 //! hand-written expectations derived from V8 (see
-//! `PERF_ROADMAP.md` B60 for the differential run).
+//! `docs/PERF_ROADMAP.md` B60 for the differential run).
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");

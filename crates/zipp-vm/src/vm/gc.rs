@@ -20,7 +20,7 @@
 //!      `with_host_roots` stack (`push_host_root`), or take `gc_lock_guard`
 //!      when the re-entry is bounded.
 //!
-//! Two collection kinds since the nursery (NURSERY_DESIGN.md §§1-2;
+//! Two collection kinds since the nursery (docs/archive/NURSERY_DESIGN.md §§1-2;
 //! `ZIPP_NO_NURSERY=1` restores majors-only exactly):
 //!   * MAJOR — the historical collection, unchanged: full mark, sweep
 //!     `floor..len`, whole-table side-table retains.
@@ -358,7 +358,7 @@ impl Vm<'_> {
     }
 
     /// Stage-3 write barrier + B6 oracle, one latched call per store
-    /// chokepoint (NURSERY_DESIGN.md §1). With the nursery on, an old-holder/
+    /// chokepoint (docs/archive/NURSERY_DESIGN.md §1). With the nursery on, an old-holder/
     /// young-value store enters `holder` into the remembered set (holder-
     /// grain, deduped by the generation byte); with `ZIPP_GCSTATS=1` the
     /// same condition is counted per site. Both latches off — the default —
@@ -1136,7 +1136,7 @@ impl Vm<'_> {
         }
     }
 
-    /// Stage-3 MINOR collection (NURSERY_DESIGN.md §§1-2): minor liveness =
+    /// Stage-3 MINOR collection (docs/archive/NURSERY_DESIGN.md §§1-2): minor liveness =
     /// reachable-from(roots ∪ dirty old holders) ∩ young. Old objects are
     /// BOUNDARY nodes — pre-marked from the generation bytes, presumed live,
     /// never traced; the remembered set (this epoch's write-barrier hits) and
@@ -1262,7 +1262,7 @@ impl Vm<'_> {
     /// trace and panic on the first live young object the minor missed — a
     /// write-barrier hole caught AT the collection where it opened, with the
     /// slot named, instead of surfacing as silent corruption arbitrarily
-    /// later (the failure mode NURSERY_DESIGN.md names as this design's
+    /// later (the failure mode docs/archive/NURSERY_DESIGN.md names as this design's
     /// biggest risk). Test/stress use only: it doubles the mark.
     fn verify_minor_marks(&mut self, minor_marks: &[bool], n: usize) {
         let mut marks = vec![false; n];
@@ -2348,7 +2348,7 @@ mod gcstats {
     static SLOTS: AtomicU64 = AtomicU64::new(0);
     static LIVE: AtomicU64 = AtomicU64::new(0);
     static SWEPT: AtomicU64 = AtomicU64::new(0);
-    // B6 generational-oracle splits (NURSERY_DESIGN.md §6): young = allocated
+    // B6 generational-oracle splits (docs/archive/NURSERY_DESIGN.md §6): young = allocated
     // since the previous collection. Summed over all collections.
     static MARKED_YOUNG: AtomicU64 = AtomicU64::new(0);
     static MARKED_OLD: AtomicU64 = AtomicU64::new(0);

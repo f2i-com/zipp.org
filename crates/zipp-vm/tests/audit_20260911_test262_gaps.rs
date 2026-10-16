@@ -1,5 +1,5 @@
 //! Two engine defects surfaced by the fresh test262 run recorded in
-//! HANDOFF.md (B309), reduced to the engine's own API so they stay pinned
+//! docs/archive/HANDOFF-through-0.0.25.md (B309), reduced to the engine's own API so they stay pinned
 //! whether or not the conformance corpus is at hand.
 //!
 //! 1. A native array-builtin callback entry that bailed PAST its first

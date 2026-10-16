@@ -158,7 +158,7 @@ _PUBLIC_CONTROL_VALUE = re.compile(
 _REDACTED_ENV_VALUE = "<redacted>"
 
 # The RETAINED TEN. This list is the historical series and must not change: every
-# geomean in README.md and PERF_ROADMAP.md is comparable only because these ten
+# geomean in README.md and docs/PERF_ROADMAP.md is comparable only because these ten
 # programs, in this form, have been the headline since the series started.
 HEADLINE_BENCHES = (
     "parse-large-js",

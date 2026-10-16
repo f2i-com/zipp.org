@@ -2045,7 +2045,7 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2, the JIT
+    // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 2, the JIT
     // element-store route. There is NO inline region element store for a
     // dense Array (`region_mem.rs` deliberately routes every Array SetIndex
     // through this helper — growth/holes/length exotica), and pinned
@@ -5573,7 +5573,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // living in `vm.eval_funcs` past `main_func_count`, and indexing the program's
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
-    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss
+    // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1, the JIT miss
     // route. IC-HIT stores make no call — that is what `register_scan_root`
     // at the fill below is for.
     vm.store_barrier(

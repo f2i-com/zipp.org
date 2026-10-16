@@ -793,7 +793,7 @@ impl<'p> Vm<'p> {
     /// while the collection has no index (it is built lazily by `coll_find`,
     /// which every insertion path calls first).
     pub(crate) fn coll_index_insert(&mut self, idx: u32, key: Value, pos: usize) {
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 6 —
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 6 —
         // Map/Set/WeakMap/WeakSet insert on an old collection. Every insert
         // path calls this right after its push (no safe point in between, so
         // the age cannot change between store and barrier). Key-grain here;

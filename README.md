@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#start-the-local-gpu-lab"><strong>Run the GPU lab</strong></a> ·
   <a href="#gpu-computing-from-javascript-and-python"><strong>Write GPU code</strong></a> ·
-  <a href="DOC.md"><strong>Read the docs</strong></a>
+  <a href="docs/REFERENCE.md"><strong>Read the docs</strong></a>
 </p>
 
 <p align="center">
@@ -72,8 +72,8 @@ frontends use the same engine, with native and WebAssembly builds.
   Python-to-JavaScript evaluation inside the very same VM instance.
 
 Python support and Torch compatibility are experimental. The
-[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) and
-[Python frontend guide](docs/PYTHON_FRONTEND_EXPERIMENT.md) explain the supported
+[Torch compatibility guide](docs/python/TORCH_COMPATIBILITY.md) and
+[Python frontend guide](docs/python/FRONTEND.md) explain the supported
 surface and remaining differences.
 
 ## What runs where
@@ -187,7 +187,7 @@ per `prepared.step`, and 1.8 ms per step with `prepared.steps` at eight steps
 per run (WebGL2: 89 / 3.3 / 2.2 ms; WebAssembly: 74 / 4.9 / 3.6 ms). Small
 examples demonstrate correctness, not a GPU speedup over native PyTorch. There is
 no graph cache or multi-GPU training. See the
-[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) for supported operations,
+[Torch compatibility guide](docs/python/TORCH_COMPATIBILITY.md) for supported operations,
 limits and failure behavior. NCA experiments remain in their separate repository.
 
 ## Python and JavaScript inside one VM
@@ -314,7 +314,7 @@ const greet = name => `Hello, ${name}!`;
 console.log(greet("Zipp"));
 ```
 
-Building an application? Start with the [Rust embedding guide](DOC.md#embedding),
+Building an application? Start with the [Rust embedding guide](docs/REFERENCE.md#embedding),
 the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 [execution profiles](#choose-the-right-execution-profile).
 
@@ -461,14 +461,14 @@ supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
 cross-entropy, SGD with momentum, Adam or AdamW), and `compiled.prepare()`
 keeps the weights and optimizer state on the device between steps (see
 [Train a small model on the browser GPU](#train-a-small-model-on-the-browser-gpu)).
-Natively, `zipp py` runs the same recorded graphs on a hardware GPU through wgpu when one is present, synchronously and with the same results, and on the engine's tensor kernels otherwise ([Native GPU](docs/TORCH_COMPATIBILITY.md#native-gpu-zipp-py)). The
+Natively, `zipp py` runs the same recorded graphs on a hardware GPU through wgpu when one is present, synchronously and with the same results, and on the engine's tensor kernels otherwise ([Native GPU](docs/python/TORCH_COMPATIBILITY.md#native-gpu-zipp-py)). The
 subset covers enough of what real model code reaches for -- `torch.autocast`
 among it, a no-op here since every tensor is float32 -- that Hugging Face's
 `modeling_qwen3.py`, `modeling_qwen2.py`, `modeling_llama.py` and
 `modeling_mistral.py` compile and run exactly as published, within 1.8e-7 of
 transformers ([interop](crates/zipp-wasm/model-plugins/interop/README.md)). The scope
 matrix, limits and the bytecode design are in
-[docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
+[docs/python/FRONTEND.md](docs/python/FRONTEND.md). The
 feature is on by default in the CLI (`--no-default-features` builds the
 JavaScript-only binary) and off by default in the `zipp-vm` library and the
 WebAssembly package, which offers it as a
@@ -886,7 +886,7 @@ async-promise-chain went from 1.12× to 0.80× Node and json-large from 1.01× t
 series point, as do the 2026-09-11 `14770703` pair recorded without a headline
 claim. See the [`bench` guide](bench/README.md),
 [hostile suite](bench/hostile/README.md), and
-[`PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
+[`docs/PERF_ROADMAP.md`](docs/PERF_ROADMAP.md) for exact methodology and remaining work.
 
 </details>
 
@@ -1004,7 +1004,7 @@ Brotli-11, so Zipp is `3.586×` as large raw and `2.958×` as large on the wire.
 
 Main has moved past that module. On 2026-09-05 an external audit of the
 WASM build was implemented as B274-B278 (see
-[`PERF_ROADMAP.md`](PERF_ROADMAP.md)): interpreter-side changes that close
+[`docs/PERF_ROADMAP.md`](docs/PERF_ROADMAP.md)): interpreter-side changes that close
 four cliffs the native PGO capture never sees. Every unit-addressed read on a
 non-ASCII string decoded from byte zero, so scanning loops were quadratic;
 the string-part allocation preflight walked the whole heap on a window blind
@@ -1079,7 +1079,7 @@ shard also passes **488 / 488**, without corrections or skips.
 
 For comparison, the unmodified pinned core result is
 **99.991% of test262**: 95,671 / 95,680 executions, with the same nine documented
-upstream inconsistencies and zero skips. [Validation evidence](docs/validation/2026-09-14-ci-readiness.md)
+upstream inconsistencies and zero skips. [Validation evidence](docs/archive/validation/2026-09-14-ci-readiness.md)
 retains both results; the corrected profile is not an unmodified-upstream claim.
 The corpus is pinned to `4249661388e5d3f92a85186213da140a6481490f`, including
 staging and excluding the separate ECMA-402 suite.
@@ -1099,7 +1099,7 @@ separate from unmodified upstream conformance. The German formatting failures
 are fixed in the VM without test changes. Passing the DateTimeFormat shard
 does not establish complete ECMA-402 coverage or universal ICU parity.
 
-The [12 September 2026 correctness audit](docs/audits/2026-09-12-correctness.md)
+The [12 September 2026 correctness audit](docs/archive/audits/2026-09-12-correctness.md)
 recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.
 That older corpus has a different execution count. The audit tightened negative-test scoring and fixed 42
 executions previously counted as passes despite reporting the wrong error type.
@@ -1107,7 +1107,7 @@ The runner's `--expected-failures` option now rejects unexpected failures, stale
 expectations and skips; `--json` records the engine and corpus identities.
 The former errored-module-cycle and deferred top-level-await failures are fixed.
 
-The [deep follow-up audit](docs/audits/2026-09-12-follow-up.md) then exercises
+The [deep follow-up audit](docs/archive/audits/2026-09-12-follow-up.md) then exercises
 re-entrant buffer operations, strict numeric coercion, Promise capabilities,
 temporary GC roots, live collection iteration, weak references/finalization,
 compiler metadata boundaries and hostile browser-host exceptions. Its focused
@@ -1136,7 +1136,7 @@ ES2015–ES2025 is essentially complete, including:
 DateTimeFormat ships CLDR 48 data for `en`/`en-US`, `de`/`de-DE`, `ja`/`ja-JP`,
 `zh`/`zh-CN` and `ar-EG`. Other Intl services
 currently ship English locale data only. The detailed support notes and durable
-architecture reference live in [`DOC.md`](DOC.md).
+architecture reference live in [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## How it works
 
@@ -1177,7 +1177,7 @@ Workspace map:
 
 Bug reports, documentation improvements, small fixes and careful measurements
 are welcome. Browse the [open issues](https://github.com/f2i-com/zipp.org/issues)
-or the [roadmap](PERF_ROADMAP.md) to find a place to start.
+or the [roadmap](docs/PERF_ROADMAP.md) to find a place to start.
 
 For bug reports, include a small JavaScript example, the expected output, your
 Zipp version and execution profile. A clear reproducer makes it much easier to help.
@@ -1207,9 +1207,9 @@ than repeating the same attractive mistake. Start with:
 
 | Document | Use it for |
 |---|---|
-| [`DOC.md`](DOC.md) | Durable architecture, language, embedding, and development reference. |
-| [`PERF_ROADMAP.md`](PERF_ROADMAP.md) | Current performance evidence, open targets, and next gates. |
-| [`HANDOFF.md`](HANDOFF.md) | Exact current continuation state and commands. |
+| [`docs/REFERENCE.md`](docs/REFERENCE.md) | Durable architecture, language, embedding, and development reference. |
+| [`docs/PERF_ROADMAP.md`](docs/PERF_ROADMAP.md) | Current performance evidence, open targets, and next gates. |
+| [`docs/archive/HANDOFF-through-0.0.25.md`](docs/archive/HANDOFF-through-0.0.25.md) | Exact current continuation state and commands. |
 | [`SECURITY.md`](SECURITY.md) | Threat model and deployment requirements. |
 | [`docs/archive`](docs/archive/README.md) | Dated historical handoffs, designs, and the full experiment ledger. |
 

@@ -1036,7 +1036,7 @@ impl<'p> Vm<'p> {
     /// covers double-resolve / resolve-then-reject / race losers), scheduling its
     /// matching reactions as microtasks.
     pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 —
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 5 —
         // resolving an old promise with a young value.
         self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
         let (reactions, unhandled) = match self.heap.get_mut(p) {
@@ -1723,7 +1723,7 @@ impl<'p> Vm<'p> {
         into: Option<u32>,
     ) -> u32 {
         let dep = into.unwrap_or_else(|| self.alloc_promise());
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then`
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 5 — `.then`
         // on an old promise with young callbacks / dependent.
         self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
         self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_r);

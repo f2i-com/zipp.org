@@ -834,7 +834,7 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<(), Thrown> {
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2 (interp
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 2 (interp
         // SetIndex — every downstream route stores `val` under this holder).
         self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {

@@ -1149,7 +1149,7 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<bool, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
-        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1 (interp
+        // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1 (interp
         // SetProp, incl. the fn_props/arr_props sidecar routes below — same
         // holder, same value; the sidecars are additionally root-rescanned
         // at every minor).

@@ -272,7 +272,7 @@ pub fn gc_gen_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 }
 
 /// `ZIPP_GCSTATS=1` B6 oracle would-be old→young store counts per helper
-/// chokepoint (NURSERY_DESIGN.md §1): `(site, count)`. Zeroed unless set.
+/// chokepoint (docs/archive/NURSERY_DESIGN.md §1): `(site, count)`. Zeroed unless set.
 pub fn gc_oracle_stats() -> Vec<(&'static str, u64)> {
     heap::gcoracle::dump()
 }

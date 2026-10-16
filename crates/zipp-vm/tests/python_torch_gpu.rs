@@ -401,7 +401,7 @@ attempt("reshape-only indexing", lambda x, y: F.cross_entropy(model(x)[None][0][
         out,
         [
             "torch.erf -> This torch function is not supported by torch.compile: it cannot record it on a compiled graph tensor \
-             (the supported operations are listed in docs/TORCH_COMPATIBILITY.md)",
+             (the supported operations are listed in docs/python/TORCH_COMPATIBILITY.md)",
             "clamp accepted",
             "slice accepted",
             "mask index -> torch.compile cannot index with a boolean mask: it selects a data-dependent number of elements, \

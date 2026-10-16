@@ -37,7 +37,7 @@
 //!   * none of the ~49 sites that bake `vals.as_ptr()` into compiled code move,
 //!   * and the measured win — the cliff above — is available immediately, while
 //!     the allocation win from actually moving keys into the shape is worth far
-//!     less (see `PERF_ROADMAP.md` B29/B37: removing allocations from these
+//!     less (see `docs/PERF_ROADMAP.md` B29/B37: removing allocations from these
 //!     paths has measured ~0 four times).
 //!
 //! ## Transitions

@@ -6433,7 +6433,7 @@ pub struct Heap {
     /// gate on every oracle field above. `false` = the default build's behavior,
     /// bit for bit.
     oracle: bool,
-    /// Stage-1 nursery alloc log (NURSERY_DESIGN.md §6, step 2): the slots
+    /// Stage-1 nursery alloc log (docs/archive/NURSERY_DESIGN.md §6, step 2): the slots
     /// allocated since the last collection, in allocation order — what a MINOR
     /// collection sweeps INSTEAD of walking `floor..len`. One `Vec` push per
     /// allocation (~1ns amortized against B104's 23-148ns alloc/free; the
@@ -6466,7 +6466,7 @@ pub struct Heap {
     /// `gen == GEN_YOUNG ⇔ the slot is in the young log` is a real invariant.
     gen: Vec<u8>,
     /// Stage-3 remembered set: OLD holders that received a young store since
-    /// the last collection (holder-grain — NURSERY_DESIGN.md §1's dirty-object
+    /// the last collection (holder-grain — docs/archive/NURSERY_DESIGN.md §1's dirty-object
     /// form; deduped by the `GEN_DIRTY` state so each holder appears once).
     /// A minor re-traces every entry's full edge list; drained and reset to
     /// `GEN_OLD` by [`Heap::remset_reset`] at the end of each minor.
@@ -6562,7 +6562,7 @@ pub struct Heap {
     /// construction; values below 1024 are ignored as certainly-wrong). Only
     /// read under `self.nursery`, so the default build is bit-identical.
     young_budget: usize,
-    /// W9 static-pretenure depth (NURSERY_DESIGN.md §4): while non-zero,
+    /// W9 static-pretenure depth (docs/archive/NURSERY_DESIGN.md §4): while non-zero,
     /// `alloc` stamps new slots OLD-clean and skips the young log — used by
     /// the builtin builders whose output is measured to survive minors
     /// wholesale (JSON.parse's tree, String.prototype.split's parts). A depth,
@@ -6660,7 +6660,7 @@ pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 /// already grown still collects on the same schedule it did.
 const GC_GROWTH: usize = 3;
 
-/// Stage-3 nursery scheduling (NURSERY_DESIGN.md §2): allocations between
+/// Stage-3 nursery scheduling (docs/archive/NURSERY_DESIGN.md §2): allocations between
 /// MINOR collections. A minor's cost is O(young live + roots + remset), not
 /// O(heap), so it can afford to run far more often than a major — this is the
 /// slot-recycling cadence §2 argues is the design's locality upside.
@@ -7873,7 +7873,7 @@ impl Heap {
     pub fn refresh_mirror(&mut self, _idx: u32) {}
 
 
-    /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
+    /// W9: enter a static-pretenure scope (docs/archive/NURSERY_DESIGN.md §4) — until the
     /// matching [`Heap::pretenure_end`], every allocation is stamped OLD-clean
     /// and skipped from the young log. Callers must pair begin/end on every
     /// path OUT of the scope including errors: a leaked depth silently turns
@@ -8584,7 +8584,7 @@ impl Heap {
     /// `free_slot` exactly as the major does (tombstone + version bump + free
     /// list), so every stale inline cache misses identically. Survivors are
     /// PROMOTED (`GEN_OLD`, keeping a sticky scan bit) — promotion is a
-    /// bookkeeping byte, never a copy (NURSERY_DESIGN.md §0). `free_slot`
+    /// bookkeeping byte, never a copy (docs/archive/NURSERY_DESIGN.md §0). `free_slot`
     /// appends each reclaimed slot to the persistent free list; the caller
     /// records that list's pre-sweep length and uses the appended suffix as its
     /// exact side-table prune set. The young log is then cleared (capacity
@@ -9622,7 +9622,7 @@ impl Heap {
             self.resident_payload_high_water
                 .set(self.resident_payload_high_water.get().max(current));
         }
-        // Nursery barrier (NURSERY_DESIGN.md §1 case 8): the incoming object
+        // Nursery barrier (docs/archive/NURSERY_DESIGN.md §1 case 8): the incoming object
         // may hold young references; if the SLOT is old, its whole edge list
         // is re-traced at the next minor (holder-grain — the value set is a
         // full HeapObj, not a single Value).
@@ -10263,7 +10263,7 @@ impl Heap {
     #[inline]
     pub fn cell_set(&mut self, idx: u32, v: Value) {
         // Nursery barrier + B6 oracle: a captured-variable write is edge
-        // source 3 of NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
+        // source 3 of docs/archive/NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
         // all land here — the JIT's `jit_cell_set`/`jit_upval_set` too).
         self.write_barrier_val(idx, v);
         if self.oracle
@@ -10299,7 +10299,7 @@ impl Heap {
 }
 
 /// B6 generational-ORACLE store counters (`ZIPP_GCSTATS=1` only): how many
-/// stores at each helper chokepoint of NURSERY_DESIGN.md §1 would have been an
+/// stores at each helper chokepoint of docs/archive/NURSERY_DESIGN.md §1 would have been an
 /// old→young edge — i.e. would have entered a remembered set had the nursery
 /// existed. The tax NUMERATOR of the design study's kill rule; zero behavior.
 pub(crate) mod gcoracle {

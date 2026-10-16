@@ -21,7 +21,7 @@ or tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam or AdamW,
 comparisons and masks, where/masked_fill, clamp, hardtanh/relu6/leaky_relu,
 maximum/minimum, dropout drawn on the device, and element selection: slices,
 split/chunk, cat/stack, index_select/embedding lookups and gather).
-General Python is not compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
+General Python is not compiled to shaders. See the [Torch compatibility guide](../../../docs/python/TORCH_COMPATIBILITY.md).
 
 ## Use JavaScript directly
 

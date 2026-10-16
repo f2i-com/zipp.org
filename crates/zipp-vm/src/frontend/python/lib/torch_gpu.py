@@ -820,7 +820,7 @@ class _Tensor:
         if name == "_s":
             # An eager torch function asked a graph tensor for its storage.
             raise CompileUnsupportedError("This torch function is not supported by torch.compile: it cannot record it on a compiled graph tensor "
-                               "(the supported operations are listed in docs/TORCH_COMPATIBILITY.md)")
+                               "(the supported operations are listed in docs/python/TORCH_COMPATIBILITY.md)")
         raise CompileUnsupportedError("Tensor.%s is not supported by torch.compile" % name)
 
     def _binary(self, operation, other, reverse=False):

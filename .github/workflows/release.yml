@@ -709,7 +709,7 @@ jobs:
             cp -R gpu-lab/src "dist/$bundle/gpu-lab/"
             install -m 0644 gpu-lab/wasm/kernels.wasm "dist/$bundle/gpu-lab/wasm/"
             install -m 0644 gpu-lab/LICENSE gpu-lab/NOTICE "dist/$bundle/gpu-lab/"
-            install -m 0644 ../../docs/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
+            install -m 0644 ../../docs/python/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
           fi
           sdk_version="$(node -e 'import("./host-sdk/zipp-host.mjs").then((m) => console.log(m.ZIPP_HOST_SDK_VERSION))')"
           node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.mjs"
@@ -812,7 +812,7 @@ jobs:
           install -m 0644 dist/torch/zipp_torch.wasm dist/torch/zipp_torch.js "dist/$bundle/"
           install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
           mkdir -p "dist/$bundle/docs"
-          install -m 0644 ../../docs/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
+          install -m 0644 ../../docs/python/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
           node --input-type=module --check < "dist/$bundle/zipp_torch.js"
           {
             printf 'version=%s\n' "$RELEASE_VERSION"

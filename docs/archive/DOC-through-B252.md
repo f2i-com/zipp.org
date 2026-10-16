@@ -2,7 +2,7 @@
 
 > **Archived snapshot through B252.** This document contains stale present-tense
 > performance and conformance statements by design. Use the current root
-> [`DOC.md`](../../DOC.md) for live guidance.
+> [`DOC.md`](../REFERENCE.md) for live guidance.
 
 Detail that used to live in `README.md`. The README is the current state at a
 glance; this file is the long form. Measured figures and the reasoning behind

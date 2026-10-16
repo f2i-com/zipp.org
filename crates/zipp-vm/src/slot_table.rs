@@ -12,7 +12,7 @@
 //! `matchAll` result parks its `index`/`input`/`groups`. On `regex-log-scan`,
 //! ablating those four properties entirely is **−14.9%** of the row
 //! ([−15.4, −13.7], 1882→1600ms) — the largest single measured item in
-//! `PERF_ROADMAP.md`. Ablating only the *table insert*, while still building the
+//! `docs/PERF_ROADMAP.md`. Ablating only the *table insert*, while still building the
 //! `ObjMap` and dropping it, is **−12.2%** ([−12.5, −12.0]). So **79% of that
 //! prize is the table, not the properties**: an `FxHashMap` that grows to
 //! hundreds of thousands of entries inside one phase, is probed with a

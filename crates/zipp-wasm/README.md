@@ -28,7 +28,7 @@ brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 
 The crate builds several variants. The default is JavaScript-only; the Python
 variants add the experimental Python-subset frontend
-(`docs/PYTHON_FRONTEND_EXPERIMENT.md`) behind `Engine.initSource(source,
+(`docs/python/FRONTEND.md`) behind `Engine.initSource(source,
 "python")` alongside the unchanged JavaScript entry points. Torch is a package:
 built into `all`, or added to `python` at run time from a second module,
 `zipp_torch.wasm`, for hosts that want it.
@@ -82,7 +82,7 @@ These are deterministic core-language defaults, not locale-aware formatting.
 execution speed for size. Use `--release --features lite` for the same feature
 set with throughput-oriented optimization. Standard builds keep `--release`.
 
-See [the latest size audit](../../docs/validation/2026-10-09-engine-size-round11.md)
+See [the latest size audit](../../docs/archive/validation/2026-10-09-engine-size-round11.md)
 for measured sizes, speed tradeoffs and the remaining gap to QuickJS. To test
 the built Lite package, generate a Node package with wasm-bindgen and run
 `tests/node/lite.cjs` using `pkg-redirect.cjs` / `ZIPP_PKG` (see the Node test README).
@@ -193,7 +193,7 @@ for `.js` projects): a project folder with subfolders and binaries, an
 editor, program arguments, a console and a canvas driven by
 `draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
 
-The bundled `torch` subset (see `docs/PYTHON_FRONTEND_EXPERIMENT.md`) runs
+The bundled `torch` subset (see `docs/python/FRONTEND.md`) runs
 inside the engine on typed-array CPU kernels. Supported dense training steps
 can opt into WebGPU or WebGL2 through asynchronous `torch.compile(training=True)`
 submissions. CPU Conv2d and autograd remain available on the CPU; compiled GPU
@@ -283,25 +283,25 @@ The torch package (`zipp_torch.wasm`), unchanged since 0.0.24, is
 These are module bytes, excluding JS glue; Brotli is the download size. The
 modules grew by 0.6% to 1.8% after Brotli since 0.0.24, with the embedding
 and interpreter work; see the
-[0.0.25 record](../../docs/validation/2026-10-15-release-0.0.25.md) for the
+[0.0.25 record](../../docs/archive/validation/2026-10-15-release-0.0.25.md) for the
 deltas, the speed screen and validation. The sixteenth pass's modules,
 release 0.0.24's, were 2,450,334 / 671,251, 4,435,704 / 1,133,411,
 6,146,540 / 1,524,284 and 8,178,282 / 1,898,530
-([its record](../../docs/validation/2026-10-14-engine-size-round16-r2.md)).
+([its record](../../docs/archive/validation/2026-10-14-engine-size-round16-r2.md)).
 The fifteenth pass's modules, release 0.0.23's, were 2,573,530 / 697,741,
 4,636,144 / 1,180,609, 6,331,117 / 1,566,620 and 8,254,998 / 1,918,013
-([its audit](../../docs/validation/2026-10-12-engine-size-round15.md)). The
+([its audit](../../docs/archive/validation/2026-10-12-engine-size-round15.md)). The
 fourteenth pass's modules were 2,573,185 / 694,745, 4,703,604 / 1,189,469,
 6,379,257 / 1,578,173 and 8,303,296 / 1,929,593
-([its audit](../../docs/validation/2026-10-12-engine-size-round14.md)). The
+([its audit](../../docs/archive/validation/2026-10-12-engine-size-round14.md)). The
 thirteenth pass's, which release 0.0.22 was cut from, were
 2,634,413 / 710,436, 4,876,583 / 1,227,452, 6,519,418 / 1,597,418 and
 8,443,452 / 1,950,080
-([its audit](../../docs/validation/2026-10-10-engine-size-round13.md)); the
+([its audit](../../docs/archive/validation/2026-10-10-engine-size-round13.md)); the
 twelfth pass's 2,655,190 / 715,896, 4,898,060 / 1,228,986,
 6,564,659 / 1,601,071 and 8,488,699 / 1,952,907; the eleventh pass's
 2,654,515 / 716,795, 4,977,978 / 1,239,416, 6,644,132 / 1,612,708 and
-8,568,374 / 1,963,702 ([its audit](../../docs/validation/2026-10-09-engine-size-round11.md)
+8,568,374 / 1,963,702 ([its audit](../../docs/archive/validation/2026-10-09-engine-size-round11.md)
 has the QuickJS gap); the ninth pass's 2,827,053 / 753,477,
 5,220,442 / 1,290,210, 6,896,451 / 1,663,170 and 8,851,582 / 2,008,520.
 

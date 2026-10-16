@@ -1015,7 +1015,7 @@ impl<'p> Vm<'p> {
                 parts
                     .try_reserve_exact(count)
                     .map_err(|_| Thrown::from_static("RangeError: Invalid array length"))?;
-                // W9 static pretenure (NURSERY_DESIGN.md §4): split's parts and
+                // W9 static pretenure (docs/archive/NURSERY_DESIGN.md §4): split's parts and
                 // result array are the markdown/regex rows' retained "builder"
                 // output — measured to survive minors wholesale, so they
                 // allocate OLD. Purely internal from here down: nothing throws

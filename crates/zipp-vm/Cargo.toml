@@ -42,7 +42,7 @@ wasm-lite = ["safe-sandbox", "wasm-no-fs-loader", "wasm-single-agent", "regress/
 # The full WebAssembly artifacts share the UTF-16 and UCS-2 matcher bodies
 # too. The ASCII matcher, which serves every ASCII subject, stays its own.
 wasm-compact-regex = ["regress/compact-utf16"]
-# Experimental Python-subset frontend (see docs/PYTHON_FRONTEND_EXPERIMENT.md).
+# Experimental Python-subset frontend (see docs/python/FRONTEND.md).
 # Pulls in the Python parser and `instrument` (a Python state starts with the
 # VM JIT off; a host without an instruction budget, such as the CLI's
 # `zipp py`/`zipp run`, turns on its Python loop tier with
