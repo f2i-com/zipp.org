@@ -6484,6 +6484,9 @@ pub struct Heap {
     /// small-object path that the count-based schedule already handles well
     /// pays one size read and nothing else.
     big_bytes_since_gc: usize,
+    /// Byte-schedule collections requested since the last major (see
+    /// [`Heap::big_payload_due`]).
+    big_triggers: u32,
     /// Payload bytes allocated since the last collection, counted only while
     /// no allocator reports blocks (`ALLOCATOR_REPORTS`). Without those
     /// reports the byte schedule never fires and collections ran on slot
@@ -6652,6 +6655,12 @@ const BIG_PAYLOAD_BYTES: usize = 4096;
 /// exists to prevent — and large enough that a program allocating big buffers
 /// steadily is not collecting on every frame.
 const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
+
+/// Byte-schedule collections per major while the nursery is on (see
+/// `Heap::big_payload_due`): old garbage held in large payloads is
+/// reclaimed within this many `BIG_PAYLOAD_GC_AT` steps.
+#[cfg(not(feature = "safe-sandbox"))]
+const BIG_TRIGGERS_PER_MAJOR: u32 = 4;
 
 /// Net bytes the process's allocator has outstanding, for a binary whose
 /// global allocator reports them: every block through [`note_every_block`] (the
@@ -7034,6 +7043,7 @@ impl Heap {
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
+            big_triggers: 0,
             payload_since_gc: 0,
             footprint_gc_at: footprint_bytes().saturating_add(FOOTPRINT_STEP),
             footprint_at_look: footprint_bytes(),
@@ -7765,9 +7775,32 @@ impl Heap {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(bytes);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
                 self.big_bytes_since_gc = 0;
-                self.gc_requested = true;
-                self.major_due = true;
+                self.big_payload_due();
             }
+        }
+    }
+
+    /// A collection on the byte schedule: `BIG_PAYLOAD_GC_AT` of large
+    /// payloads allocated since the last one. With the nursery on it is a
+    /// minor, and every `BIG_TRIGGERS_PER_MAJOR`-th since the last major is a
+    /// major. A large buffer is born young (only a static-pretenure scope
+    /// stamps an allocation old), so the minor reclaims every one that died
+    /// young, which is what a loop of temporary buffers makes: a torch
+    /// training step's tensors (young survival 4%) forced a major, a walk of
+    /// the whole old heap, every 8 MiB of them. Buffers that were promoted
+    /// and then dropped wait for the major at most four steps away, or for
+    /// the footprint and ceiling schedules' own majors. The checked profile,
+    /// whose heap ceilings the WebAssembly modules enforce, still takes a
+    /// major every time.
+    fn big_payload_due(&mut self) {
+        self.gc_requested = true;
+        self.big_triggers = self.big_triggers.saturating_add(1);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let major = !self.nursery || self.big_triggers >= BIG_TRIGGERS_PER_MAJOR;
+        #[cfg(feature = "safe-sandbox")]
+        let major = true;
+        if major {
+            self.major_due = true;
         }
     }
 
@@ -7972,11 +8005,10 @@ impl Heap {
         // everything else before the counter is touched, so the small-object
         // path the count-based schedule already serves well is unaffected.
         //
-        // A major is requested, not a minor. Large buffers are what the
-        // nursery pretenures and what survives a minor, so a young-only sweep
-        // is precisely the collection that cannot reclaim them — that is why
-        // the existing schedule, which reaches a major only after 64 minors,
-        // never arrived in time.
+        // Which collection it is, and when a major follows, is
+        // `big_payload_due`'s: the count schedule alone reaches a major only
+        // after 64 minors, which never arrived in time for buffers that were
+        // promoted and then dropped.
         let big = obj.birth_payload_bytes();
         debug_assert_eq!(big, obj.resident_payload_bytes());
         // With no allocator reporting, weigh every payload: a minor once a
@@ -7996,8 +8028,7 @@ impl Heap {
             self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
             if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
                 self.big_bytes_since_gc = 0;
-                self.gc_requested = true;
-                self.major_due = true;
+                self.big_payload_due();
             }
         }
         // Memory that grew in place since the last look (see
@@ -9294,6 +9325,7 @@ impl Heap {
         self.minors_since_major = 0;
         self.major_due = false;
         self.big_bytes_since_gc = 0;
+        self.big_triggers = 0;
         self.payload_since_gc = 0;
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
