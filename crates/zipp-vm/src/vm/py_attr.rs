@@ -634,7 +634,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let p = self.py_rt_for(rt)?;
-        let (ty, t_str) = (p.ty?, p.t_str);
+        let (_ty, t_str) = (p.ty?, p.t_str);
         let k = self.py_hit_keys()?;
         let (cls, dict) = if self.heap.is_str_like(o.heap_index()) {
             (t_str, Value::UNDEFINED)
@@ -649,11 +649,13 @@ impl<'p> Vm<'p> {
             return None;
         }
         if e.kind == ic::METHOD {
-            let f = self.py_table_at(cls, ty.gm, e.b, e.pos)?;
-            (self.py_plain_rec(f) && e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)).then_some(f)
+            // The function itself, as for a builtin method (see `py_method`).
+            let f = Value::from_bits(e.b);
+            (e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d)).then_some(f)
         } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
-            let b = self.py_table_at(cls, ty.gb, e.b, e.pos)?;
-            self.py_plain_rec(b).then_some(b)
+            // The method itself (see `py_method`'s fill): while the stamp
+            // holds, the table still answers it.
+            Some(Value::from_bits(e.b))
         } else {
             None
         }
@@ -1072,24 +1074,17 @@ impl<'p> Vm<'p> {
         let e = self.py_ic_class(func_id, ip, cls.bits());
         if e.a == cls.bits() && self.py_cls_stamp_ok(cls, e.hver, e.c) {
             if e.kind == ic::METHOD {
-                if let Some(f) = self.py_table_at(cls, ty.gm, e.b, e.pos) {
-                    if self.py_plain_rec(f) {
-                        if e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) {
-                            return Some(f);
-                        }
-                        let name = self.py_const_name(func_id, key)?;
-                        let k = self.resolve_const_slot(func_id, key);
-                        let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
-                        self.py_note_lacks(func_id, ip, e, l);
-                        return lacks.then_some(f);
-                    }
+                let f = Value::from_bits(e.b);
+                if e.d != 0 && self.py_attrs_of(dict).is_some_and(|(l, _)| l == e.d) {
+                    return Some(f);
                 }
+                let name = self.py_const_name(func_id, key)?;
+                let k = self.resolve_const_slot(func_id, key);
+                let (lacks, l) = self.py_store_lacks(dict, name, k, e.d)?;
+                self.py_note_lacks(func_id, ip, e, l);
+                return lacks.then_some(f);
             } else if e.kind == ic::BUILTIN_METHOD && dict.is_undefined() {
-                if let Some(b) = self.py_table_at(cls, ty.gb, e.b, e.pos) {
-                    if self.py_plain_rec(b) {
-                        return Some(b);
-                    }
-                }
+                return Some(Value::from_bits(e.b));
             }
         }
         // A module's functions are its globals (`PyModGet`).
@@ -1100,25 +1095,32 @@ impl<'p> Vm<'p> {
         if !dict.is_undefined() {
             // A user class's function, unless the instance dict shadows it.
             let name = self.py_const_name(func_id, key)?;
-            if let Some((t, s, m)) = self.py_table_entry(cls, ty.gm, "gm", name) {
+            if let Some((_, s, m)) = self.py_table_entry(cls, ty.gm, "gm", name) {
                 if self.py_plain_rec(m) {
                     let k = self.resolve_const_slot(func_id, key);
                     let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
+                    // The entry keeps the function itself (see the builtin
+                    // method's entry below).
                     if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-                        self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: l });
+                        self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: m.bits(), c: ver, d: l });
                     }
                     return lacks.then_some(m);
                 }
             }
         }
         let gb_name: &str = self.func(func_id as usize).string_constants[gb as usize].as_str();
-        let (t, s, b) = self.py_table_entry(cls, ty.gb, "gb", gb_name)?;
+        let (_, s, b) = self.py_table_entry(cls, ty.gb, "gb", gb_name)?;
         if !self.py_plain_rec(b) {
             return None;
         }
+        // The entry keeps the method itself (`b`), not the table it sits in:
+        // the class's tables only gain entries while its stamp holds (a
+        // replacement or a clear bumps `ver`, core.js `forgetName`), so the
+        // method found now is the one a lookup finds for as long as the
+        // stamp holds, as the JIT's inline plan already relies on.
         if dict.is_undefined() {
             if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-                self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: t.bits(), c: ver, d: 0 });
+                self.py_ic_put(func_id, ip, PyIc { kind: ic::BUILTIN_METHOD, pos, hver, a: cls.bits(), b: b.bits(), c: ver, d: 0 });
             }
         }
         Some(b)
@@ -1138,16 +1140,13 @@ impl<'p> Vm<'p> {
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     pub(super) fn py_method_plan(&self, e: &PyIc) -> Option<(u32, Value, u32)> {
         let p = self.py_rt.as_deref()?;
-        let ty = p.ty?;
+        let _ty = p.ty?;
         let cls = Value::from_bits(e.a);
         if !cls.is_heap() || !self.py_cls_stamp_ok(cls, e.hver, e.c) {
             return None;
         }
         match e.kind {
-            ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => {
-                let f = self.py_table_at(cls, ty.gm, e.b, e.pos)?;
-                self.py_plain_rec(f).then_some((p.inst_shape, f, e.d))
-            }
+            ic::METHOD if e.d != 0 && p.inst_shape != crate::shape::DICT => Some((p.inst_shape, Value::from_bits(e.b), e.d)),
             ic::BUILTIN_METHOD => {
                 let shape = if cls.bits() == p.t_list.bits() || cls.bits() == p.t_tuple.bits() {
                     p.seq_shape
@@ -1159,8 +1158,7 @@ impl<'p> Vm<'p> {
                 if shape == crate::shape::DICT {
                     return None;
                 }
-                let b = self.py_table_at(cls, ty.gb, e.b, e.pos)?;
-                self.py_plain_rec(b).then_some((shape, b, 0))
+                Some((shape, Value::from_bits(e.b), 0))
             }
             _ => None,
         }
