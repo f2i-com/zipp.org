@@ -1005,15 +1005,23 @@ impl RegisterFile {
         Self::from_vec(Vec::new())
     }
 
-    /// The live prefix.
+    /// The live prefix. Every safe `regs[i]` goes through it, so it does not
+    /// check what the invariant guarantees: an index is then checked once,
+    /// against the live length, instead of the prefix within the storage
+    /// first.
     #[inline(always)]
     fn live(&self) -> &[Value] {
-        &self.storage[..self.logical_len]
+        debug_assert!(self.logical_len <= self.storage.len());
+        // SAFETY: `logical_len <= storage.len()` after every operation (the
+        // type's invariant; `set_len` asserts it).
+        unsafe { self.storage.get_unchecked(..self.logical_len) }
     }
 
     #[inline(always)]
     fn live_mut(&mut self) -> &mut [Value] {
-        &mut self.storage[..self.logical_len]
+        debug_assert!(self.logical_len <= self.storage.len());
+        // SAFETY: as `live`.
+        unsafe { self.storage.get_unchecked_mut(..self.logical_len) }
     }
 
     #[inline]
@@ -1074,16 +1082,22 @@ impl RegisterFile {
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &Value {
-        // SAFETY: forwarded from the caller; the slice limits the contract to
-        // the live prefix rather than the initialized inactive tail.
-        unsafe { self.storage[..self.logical_len].get_unchecked(index) }
+        // SAFETY: forwarded from the caller, who proves `index < logical_len`;
+        // `logical_len <= storage.len()` always, so the slot is initialized
+        // storage. Indexing the whole storage rather than the live slice
+        // matters: the slice is bounds-checked itself, two loads, a compare
+        // and a branch on every register read and write of the interpreter,
+        // which the optimizer cannot prove away.
+        debug_assert!(index < self.logical_len, "register read past the live prefix");
+        unsafe { self.storage.get_unchecked(index) }
     }
 
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
-        // SAFETY: forwarded from the caller; callers prove index < logical_len.
-        unsafe { self.storage[..self.logical_len].get_unchecked_mut(index) }
+        // SAFETY: as `get_unchecked`; callers prove `index < logical_len`.
+        debug_assert!(index < self.logical_len, "register write past the live prefix");
+        unsafe { self.storage.get_unchecked_mut(index) }
     }
 
     /// Set the live length, preserving all backing elements as initialized.
