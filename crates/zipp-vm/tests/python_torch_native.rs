@@ -454,6 +454,45 @@ for dt in FLOATS:
                         A = _k.as_complex(A)
                     scale = (1.0, 1.0 / n, 1.0 / (n ** 0.5))[seed % 3]
                     both("fft %s n%d mode%d inv%s in%d" % (dt, n, mode, inverse, n_in), lambda: _k.fft(A, rows, n_in, n, mode, inverse, scale))
+# Slice stores (`setslice`: tensor.js's scatterStrided, N_SCATTER) and
+# index accumulation (`scatter_add`: scatterAdd, N_SCATTER_ADD), each into a
+# fresh storage returned whole; a raise returns the storage as it was left.
+def sliced(dt, shape, spec, vshape, s1, s2):
+    x = storage(dt, shape, s1)
+    _k.setslice(x, shape, spec, storage(dt, vshape, s2), vshape)
+    return x
+def accumulated(dt, shape, idx, ishape, vdt, vshape, s1, s2):
+    x = storage(dt, shape, s1)
+    try:
+        _k.scatter_add(x, shape, [_k.from_flat("int64", i) for i in idx], ishape, storage(vdt, vshape, s2), vshape)
+        return x
+    except IndexError:
+        return (x, True)
+for dt in ["float32", "float64", "int64", "uint8", "bool", "float16"]:
+    for shape, spec, vshape in [
+        ((8, 12), [(1, 7, 2), (0, 12, 3)], (3, 4)),
+        ((8, 12), [None, (2, 10, 1)], (8, 8)),
+        ((4, 5, 6), [2, (0, 5, 2), None], (3, 6)),
+        ((4, 5, 6), [(0, 4, 1), (1, 5, 1), (5, 0, 1)], (4, 4, 0)),
+        ((64,), [(3, 60, 3)], (19,)),
+        ((6, 7), [(0, 6, 1)], (6, 7)),
+        ((6, 7), [(0, 6, 1), (2, 3, 1)], (6, 1)),
+        ((8, 12), [(1, 7, 2), (0, 12, 3)], (1, 4)),
+    ]:
+        seed += 1
+        both("setslice %s %s %s %s" % (dt, shape, spec, vshape), lambda: sliced(dt, shape, spec, vshape, seed, seed + 1))
+for dt in ["float32", "float64", "int64"]:
+    for shape, idx, ishape, vshape, vdt in [
+        ((10, 6), [[3, 1, 3, -1, 0, 3, 9, -10]], (8,), (8, 6), dt),
+        ((5, 4, 3), [[1, 4, 1, 0, 2, 3, -1, 4], [3, 0, 3, -4, 1, 2, 0, -1]], (8,), (8, 3), dt),
+        ((40,), [[(i * 7) % 40 for i in range(64)]], (64,), (64,), dt),
+        ((10, 6), [[3, 1, 10, 2]], (4,), (4, 6), dt),
+        ((10, 6), [[0, 1, 2, -11]], (4,), (4, 6), dt),
+        ((10, 6), [[3, 1, 3, -1, 0, 3, 9, -10]], (8,), (1, 6), dt),
+        ((10, 6), [[3, 1, 3, -1, 0, 3, 9, -10]], (8,), (8, 6), "float64" if dt != "float64" else "float32"),
+    ]:
+        seed += 1
+        both("scatter_add %s %s %s %s %s" % (dt, shape, idx, vshape, vdt), lambda: accumulated(dt, shape, idx, ishape, vdt, vshape, seed, seed + 1))
 print("cases", CASES[0], "mismatches", len(BAD), BAD[:5])
 "#;
 

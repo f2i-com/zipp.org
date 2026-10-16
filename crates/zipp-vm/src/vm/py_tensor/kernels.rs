@@ -71,6 +71,10 @@ const OP_OPTIM: u32 = 31;
 const OP_CELL: u32 = 32;
 const OP_RNG: u32 = 33;
 const OP_MATMUL_TN: u32 = 35;
+// 36-38 are `args::OP_BIN_FAST`, `OP_BIN_SCALAR_FAST` and `OP_MM_FAST`,
+// which `Vm::py_tensor` answers before this table.
+const OP_SCATTER: u32 = 39;
+const OP_SCATTER_ADD: u32 = 40;
 /// (`OP_MATMUL` / `OP_MATMUL_NT` for `py_tensor`'s OP_MM_FAST)
 pub(super) const OP_MATMUL_PUB: u32 = OP_MATMUL;
 pub(super) const OP_MATMUL_NT_PUB: u32 = OP_MATMUL_NT;
@@ -927,6 +931,8 @@ match op {
         OP_REDUCE => Outcome::ran(h.pt_reduce(a).is_some()),
         OP_SOFTMAX => Outcome::ran(h.pt_softmax(a).is_some()),
         OP_GATHER => Outcome::ran(h.pt_gather(a).is_some()),
+        OP_SCATTER => Outcome::ran(h.pt_scatter(a).is_some()),
+        OP_SCATTER_ADD => Outcome::ran(h.pt_scatter_add(a).is_some()),
         OP_ALL_FINITE => match h.pt_all_finite(a) {
             Some(b) => Outcome::Answer(b),
             None => Outcome::Null,
@@ -2138,6 +2144,132 @@ pub(crate) trait Kernels: Host {
             }
         }
         self.pt_write(vo, 0, &out)?;
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(A, V, shape, strides, base)`: `A[base + offset of o] = V[o]`,
+    /// tensor.js's `scatterStrided` (a slice assignment whose values are of
+    /// the storage's element type and not broadcast): [`Kernels::pt_gather`]'s
+    /// walk, storing. A and V share an element type, so each element's bytes
+    /// move as they are. V on A's buffer declines: the JavaScript loop's
+    /// order then decides what an overlapping store reads.
+    fn pt_scatter(&mut self, a: &[Arg]) -> Option<()> {
+        let (va, vv) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?);
+        if vv.buffer == va.buffer || vv.kind != va.kind {
+            return None;
+        }
+        let shape = self.pt_ints(arg(a, 2))?;
+        let st = self.pt_ints(arg(a, 3))?;
+        let base = int_arg(a, 4)?;
+        if st.len() != shape.len() {
+            return None;
+        }
+        let n = shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))?;
+        if vv.len != n {
+            return None;
+        }
+        let cost = self.pt_admit(n, n)?;
+        if n > 0 {
+            if max_offset(&shape, &st, base)? >= va.len {
+                return None;
+            }
+            let es = va.size();
+            let src = self.pt_bytes(vv)?.to_vec();
+            let a_hi = va.offset.checked_add(va.len.checked_mul(es)?)?;
+            let data = self.bytes_mut(va.buffer)?;
+            if a_hi > data.len() {
+                return None;
+            }
+            let dst = &mut data[va.offset..a_hi];
+            // `walk`'s poll is a `&self` call that the store's borrow of the
+            // buffer excludes; the strides walked are the gather's, and the
+            // admitted work is n element moves.
+            let done = walk(&shape, [&st], || false, |i, [x]| {
+                let to = (base + x) * es;
+                dst[to..to + es].copy_from_slice(&src[i * es..(i + 1) * es]);
+            });
+            if !done {
+                return None;
+            }
+        }
+        self.pt_charge(cost);
+        Some(())
+    }
+
+    /// `(A, V, strides, shape, rest, n, k, I0, .., I(k-1))`: tensor.js's
+    /// `scatterAdd` for values of the storage's float element type, not
+    /// broadcast. `strides` and `shape` are A's; index storage `Id` holds
+    /// the `n` indices into dim `d` (a negative one counting from the end).
+    /// For each index tuple in turn, the `rest` elements from
+    /// `sum_d j_d * strides[d]` gain V's next `rest` values, each sum
+    /// rounded once on store, as the JavaScript loop adds them. Every index
+    /// is checked before the first store: one out of range (or not an
+    /// integer) declines, and the JavaScript loop then makes the same stores
+    /// up to it and raises its IndexError.
+    fn pt_scatter_add(&mut self, a: &[Arg]) -> Option<()> {
+        let (va, vv) = (self.pt_view(arg(a, 0))?, self.pt_view(arg(a, 1))?);
+        if vv.buffer == va.buffer || vv.kind != va.kind || !matches!(va.kind, KIND_F32 | KIND_F64) {
+            return None;
+        }
+        let st = self.pt_ints(arg(a, 2))?;
+        let dims = self.pt_ints(arg(a, 3))?;
+        let (rest, n, k) = (int_arg(a, 4)?, int_arg(a, 5)?, int_arg(a, 6)?);
+        if k == 0 || st.len() < k || dims.len() < k || vv.len != n.checked_mul(rest)? {
+            return None;
+        }
+        let mut idx = Vec::new();
+        idx.try_reserve_exact(k).ok()?;
+        for d in 0..k {
+            let vi = self.pt_view(arg(a, 7 + d))?;
+            if vi.kind != KIND_F64 || vi.len != n || vi.buffer == va.buffer {
+                return None;
+            }
+            idx.push(vi);
+        }
+        let cost = self.pt_admit(n.checked_mul(k)?.checked_add(vv.len)?, n.saturating_add(vv.len))?;
+        // The element each index tuple starts at, all checked first.
+        let mut starts = Vec::new();
+        starts.try_reserve_exact(n).ok()?;
+        starts.resize(n, 0usize);
+        for (d, &vi) in idx.iter().enumerate() {
+            let size = dims[d] as f64;
+            for (s, &j) in starts.iter_mut().zip(&self.pt_read_all(vi)?) {
+                let j = if j < 0.0 { j + size } else { j };
+                if !(j >= 0.0) || j.fract() != 0.0 || j >= size {
+                    return None;
+                }
+                *s = s.checked_add((j as usize).checked_mul(st[d])?)?;
+            }
+        }
+        if starts.iter().any(|&s| s.checked_add(rest).is_none_or(|end| end > va.len)) {
+            return None;
+        }
+        let vals = self.pt_read_all(vv)?;
+        let es = va.size();
+        let a_hi = va.offset.checked_add(va.len.checked_mul(es)?)?;
+        let data = self.bytes_mut(va.buffer)?;
+        if a_hi > data.len() {
+            return None;
+        }
+        let dst = &mut data[va.offset..a_hi];
+        let mut y = 0usize;
+        for &s in &starts {
+            for p in s..s + rest {
+                let v = vals[y];
+                y += 1;
+                if es == 4 {
+                    let c = &mut dst[p * 4..p * 4 + 4];
+                    let x = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 + v;
+                    c.copy_from_slice(&(x as f32).to_le_bytes());
+                } else {
+                    let c = &mut dst[p * 8..p * 8 + 8];
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(c);
+                    c.copy_from_slice(&(f64::from_le_bytes(b) + v).to_le_bytes());
+                }
+            }
+        }
         self.pt_charge(cost);
         Some(())
     }

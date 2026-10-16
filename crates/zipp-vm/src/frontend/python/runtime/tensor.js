@@ -39,7 +39,8 @@
     const NATIVE_MIN = 64;
     const N_MATMUL = 1, N_CONV2D = 2, N_CONV2D_BACKWARD = 3, N_CONV1D = 4, N_CONV1D_BACKWARD = 5, N_BINARY = 6, N_UNARY = 7,
         N_REDUCE = 8, N_SOFTMAX = 9, N_GATHER = 10, N_ALL_FINITE = 11, N_WHERE = 12, N_MATMUL_NT = 13, N_MAX_POOL2D = 14, N_MAX_POOL2D_BACKWARD = 15, N_FFT = 16, N_LINALG = 17, N_SPMM = 18, N_SP_COALESCE = 19, N_SP_KEYS = 20, N_SP_SCATTER = 21, N_SP_MERGE = 22, N_INDEX_SELECT = 23,
-        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33, N_LOCAL = 34, N_MATMUL_TN = 35;
+        N_Q_QUANTIZE = 24, N_Q_DEQUANTIZE = 25, N_Q_MATMUL = 26, N_Q_CONV2D = 27, N_Q_REQUANT = 28, N_Q_FAKE = 29, N_ARANGE = 30, N_OPTIM = 31, N_CELL = 32, N_RNG = 33, N_LOCAL = 34, N_MATMUL_TN = 35,
+        N_SCATTER = 39, N_SCATTER_ADD = 40;
     // The engine's own loops (`N_LOCAL` answers true) cost less per call
     // than an interpreted loop of 16 elements, so the elementwise kernels,
     // reductions and copies take them from there. A torch package in its own
@@ -1387,6 +1388,7 @@
     // A[base + offset of o] = V[o]: gatherStrided's walk, storing.
     function scatterStrided(A, V, shape, sa, base) {
         const rank = shape.length, n = V.length;
+        if (n >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_SCATTER, A, V, shape, sa, base)) return;
         if (rank === 0) { if (n) A[base] = V[0]; return; }
         const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
         let x = base, o = 0;
@@ -1528,6 +1530,7 @@
             // of the sum is what the typed-array store keeps for these
             // dtypes (an int64/int32 sum of integers is one).
             const nIdx = numel(ish);
+            if (V.length >= NATIVE_SMALL && NATIVE !== null && NATIVE(N_SCATTER_ADD, A, V, inS, shape, restN, nIdx, k, ...I)) { written(a); return null; }
             for (let i = 0, y = 0; i < nIdx; i++) {
                 let base = 0;
                 for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
