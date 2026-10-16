@@ -3843,7 +3843,19 @@ impl<'p> Vm<'p> {
                         // this call only when the captured Value is still the
                         // pristine slice/concat intrinsic. The recognizer also
                         // proves the complete GetProp/argument/loop window.
-                        if let Some(method) = self.captured_array_copy_method(func_id, ip) {
+                        // The call's own method name rules out every other call
+                        // first: the recognizer re-read this instruction and the
+                        // one three back, a chain of dependent loads on every
+                        // split call (6% of a `dv.getUint32(o, le)` loop). Only
+                        // the reduction, an optimization, depends on the filter.
+                        let copy_method = if name == crate::bytecode::NO_NAME
+                            || matches!(strs[name as usize].as_str(), "slice" | "concat")
+                        {
+                            self.captured_array_copy_method(func_id, ip)
+                        } else {
+                            None
+                        };
+                        if let Some(method) = copy_method {
                             if let Some(exit) = self.try_array_copy_len_reduce(
                                 func_id,
                                 ip,

@@ -901,12 +901,12 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Result<Option<Value>, Thrown> {
-        if !recv.is_heap()
-            || !callee.is_heap()
-            || !matches!(self.heap.get(callee.heap_index()), HeapObj::Native(_))
-        {
+        if !recv.is_heap() || !callee.is_heap() {
             return Ok(None);
         }
+        let HeapObj::Native(native_id) = *self.heap.get(callee.heap_index()) else {
+            return Ok(None);
+        };
         let key: &'p str = &self.func(func_id as usize).string_constants[name as usize];
         let idx = recv.heap_index();
         let is_arr = match self.heap.get(idx) {
@@ -951,16 +951,13 @@ impl<'p> Vm<'p> {
             }
             // `dv.getUint32(o, le === 1)`: the captured callee's identity is
             // the whole proof, so no prototype check is needed.
+            // The arguments are read in place: a closure for them stayed an
+            // out-of-line call, twice per `dv.getUint32(o, le)`.
             HeapObj::DataView { .. } => {
-                let arg = |i: u16| {
-                    if i < argc {
-                        self.regs[base + (arg_base + i) as usize]
-                    } else {
-                        Value::UNDEFINED
-                    }
-                };
-                let (position, little_endian) = (arg(0), arg(1));
-                return self.dataview_captured_get(idx, callee, position, little_endian);
+                let at = base + arg_base as usize;
+                let position = if argc > 0 { self.regs[at] } else { Value::UNDEFINED };
+                let little_endian = if argc > 1 { self.regs[at + 1] } else { Value::UNDEFINED };
+                return self.dataview_captured_get(idx, native_id, position, little_endian);
             }
             _ => return Ok(None),
         };

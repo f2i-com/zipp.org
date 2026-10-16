@@ -503,27 +503,24 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The split member-call form's DataView lane. `callee` is the Value the
-    /// call's `[[Get]]` already returned, so when it is the main realm's
-    /// intrinsic numeric getter the call is that getter's, whatever the
-    /// receiver or its prototype holds by now. `None`: nothing observable
-    /// happened and the caller makes the generic call.
+    /// The split member-call form's DataView lane. `native_id` is the id of
+    /// the Native the call's `[[Get]]` already returned, so when it is the
+    /// main realm's intrinsic numeric getter the call is that getter's,
+    /// whatever the receiver or its prototype holds by now. `None`: nothing
+    /// observable happened and the caller makes the generic call.
     pub(crate) fn dataview_captured_get(
         &self,
         view_idx: u32,
-        callee: Value,
+        native_id: u16,
         position: Value,
         little_endian: Value,
     ) -> Result<Option<Value>, Thrown> {
         // Main realm only, as for the fused form's leaf: with no child realm
         // the one Native of a getter's id is the main realm's.
-        if !self.realm_global_objs.is_empty() || !callee.is_heap() {
+        if !self.realm_global_objs.is_empty() {
             return Ok(None);
         }
-        let HeapObj::Native(id) = self.heap.get(callee.heap_index()) else {
-            return Ok(None);
-        };
-        let method = id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        let method = native_id.wrapping_sub(native::DV_METHOD_BASE) as usize;
         if method >= DV_GET_KINDS.len() {
             return Ok(None);
         }
