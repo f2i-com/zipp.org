@@ -2276,7 +2276,8 @@ pub(crate) fn multi_split_enabled() -> bool {
 /// MEASURED ON THE DEFAULT BUILD (W18, 21 paired reps, one binary, the switch
 /// as the only difference): `parse-large-js` 420ms -> 370ms, **-11.6%
 /// [-12.6, -11.1]** — W17's -11.8% [-12.2, -11.3] reproduced now that the row
-/// is the default. `bench/w18_gprwtshare_default_2026-08-22.json`.
+/// is the default. `w18_gprwtshare_default_2026-08-22.json` in
+/// `bench/history/results.csv`.
 ///
 /// `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-W17 plans byte-for-byte, matching
 /// every other perf mechanism in this file: a memoized latch, read at plan time,

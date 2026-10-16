@@ -132,9 +132,11 @@ The current canonical public artifacts, the pair the root README tabulates, are:
 Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
 15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
 The previous canonical pairs (`8229b3fc`, `c28781cf`, `b65aa353`, all
-2026-09-02; `21288c1`, 2026-08-30) stay in this directory as prior series
-points. The publishable `14770703` pair (2026-09-11) is recorded without a
-headline claim.
+2026-09-02; `21288c1`, 2026-08-30; the publishable `14770703` pair of
+2026-09-11, recorded without a headline claim) and every earlier routine
+capture are condensed into [`history/`](history/README.md): one CSV row per
+capture with its geomean, interval and per-row ratios. Git history keeps the
+original files.
 
 The root README's interpreter-versus-interpreter table comes from
 [`comparison/interp_real13_fa8e3b86_2026-10-15.json`](comparison/interp_real13_fa8e3b86_2026-10-15.json)
@@ -211,7 +213,8 @@ results in the tracked tree.
 |---|---|---|
 | Routine A/B or filtered diagnostic | `target/bench-results/*.json` | No |
 | Temporary frozen executable | `target/bench-binaries/` | No |
-| Reviewed canonical capture | `bench/*.json` or `bench/hostile/*.json` | Yes, deliberately promoted |
+| Reviewed canonical capture | `bench/*.json` or `bench/hostile/*.json` | Yes, deliberately promoted; the current one only |
+| Superseded capture | One row of `bench/history/*.csv` | Yes, condensed |
 | Manifest, input, provenance, or license | Beside its suite | Yes |
 | Historical narrative | `docs/archive/` | Yes |
 
