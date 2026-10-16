@@ -183,7 +183,19 @@ impl<'p> Vm<'p> {
 
     fn run_loop_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
-            match self.dispatch_body(stop_depth) {
+            // The main loop is compiled twice: with the lite loop's hook for an
+            // interpreter-only VM (`lite_entry_ok`), and without it for every
+            // other, whose code is then what it was before the lite loop (the
+            // hook alone moved the JIT build's Python calls by 4-5%).
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            let body = if self.lite_entry_ok() {
+                self.dispatch_body::<true>(stop_depth)
+            } else {
+                self.dispatch_body::<false>(stop_depth)
+            };
+            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
+            let body = self.dispatch_body::<false>(stop_depth);
+            match body {
                 Ok(v) => return Ok(v),
                 Err(t) => {
                     let tv = match self.pending_throw {
@@ -353,7 +365,16 @@ impl<'p> Vm<'p> {
     /// The inner execution loop: runs ops in the current frame until a frame
     /// transition (a call pushes / a return pops) or a throw. Returns the value
     /// when the `stop_depth` frame returns, or `Err` to begin unwinding.
-    pub(crate) fn dispatch_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+    ///
+    /// `LITE`: the VM was interpreter-only when this call began
+    /// (`lite_entry_ok`), so frames may run in the lite loop and the native
+    /// tiers and the per-frame statistics are skipped. Neither the JIT nor the
+    /// statistics switch on during a run, so nothing is lost.
+    pub(crate) fn dispatch_body<const LITE: bool>(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+        // Set when the lite loop has just handed the top frame over: the main
+        // loop then runs it to its next frame transition.
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        let mut lite_skip = false;
         loop {
             // GC safe point on every frame transition (call/return): no native
             // built-in is mid-flight holding an un-rooted Vec here, and all live
@@ -402,7 +423,8 @@ impl<'p> Vm<'p> {
             // interpreter frames never reach MAX_FRAMES. Staying interpreted in
             // that subtree lets frames accumulate monotonically â†’ RangeError.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            if ip == 0
+            if !LITE
+                && ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
                 // Main-program, module and installed eval/new Function protos
@@ -450,7 +472,8 @@ impl<'p> Vm<'p> {
             // depth guard nor heap/global helper plans: a guard miss simply
             // reports this instruction and the unchanged interpreter resumes.
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
-            if ip == 0
+            if !LITE
+                && ip == 0
                 && self.jit_enabled
                 && self.jit_func_eligible(func_id)
                 && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
@@ -472,6 +495,24 @@ impl<'p> Vm<'p> {
                 }
             }
 
+            // A simple function runs in the lite loop (`vm/lite.rs`), and so
+            // do the simple frames it calls or returns to; it hands back what
+            // it does not run.
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            {
+                let try_lite = !std::mem::replace(&mut lite_skip, false);
+                if LITE && try_lite && self.lite_eligible(func_id) {
+                    self.frames[frame_idx].ip = ip;
+                    match self.run_lite(stop_depth)? {
+                        super::lite::LiteExit::Done(v) => return Ok(v),
+                        super::lite::LiteExit::Resume => {
+                            lite_skip = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // What the dispatch below matches on: the function's
             // superinstruction copy (`FusedCode`, built on its first entry)
             // when anything in it fused, else its code. Only the `match`
@@ -489,7 +530,7 @@ impl<'p> Vm<'p> {
             // `ip` (the native tiers above either bailed here or did not take
             // it). Free when unset: one latched load per frame transition.
             #[cfg(not(target_arch = "wasm32"))]
-            if interp_stats::enabled() {
+            if !LITE && interp_stats::enabled() {
                 interp_stats::bump(func_id, &self.func(func_id as usize).name, ip != 0);
             }
 
@@ -1562,7 +1603,7 @@ impl<'p> Vm<'p> {
                         // back-edge also feeds the OSR tier, so the `Jump` arm
                         // takes it.
                         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        if self.jit_enabled {
+                        if !LITE && self.jit_enabled {
                             ip += 1;
                             continue;
                         }
@@ -2504,7 +2545,8 @@ impl<'p> Vm<'p> {
                         // exit or a guard bail). Gated like the function JIT:
                         // enabled, and not inside a native self-recursion.
                         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        if self.jit_enabled
+                        if !LITE
+                            && self.jit_enabled
                             && self.jit_recurse_depth == 0
                             && self.jit_func_eligible(func_id)
                             && t < ip
@@ -6308,7 +6350,7 @@ impl<'p> Vm<'p> {
     /// Number paths inline, a Python `for` counter's small BigInt inline as
     /// in the arm (it is every iteration's), the rest out of line.
     #[inline(always)]
-    fn add_int_value(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
+    pub(crate) fn add_int_value(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
         if va.is_int() {
             return Ok(match va.as_int().checked_add(imm) {
                 Some(v) => Value::int(v),

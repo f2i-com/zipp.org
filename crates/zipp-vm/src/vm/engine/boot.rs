@@ -367,6 +367,8 @@ impl<'p> Vm<'p> {
             class_proto_owner: rustc_hash::FxHashMap::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::SlotTable::default(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            lite: Default::default(),
             ctor_field_hint: Vec::new(),
             fn_props: crate::slot_table::SlotTable::default(),
             arr_props: crate::slot_table::SlotTable::default(),

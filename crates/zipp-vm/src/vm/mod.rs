@@ -2080,6 +2080,9 @@ pub struct Vm<'p> {
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: crate::slot_table::SlotTable<Value>,
+    /// The lite loop's tables (`vm/lite.rs`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    lite: lite::LiteState<'p>,
     /// Per-function-id LEARNED own-property count of the instances a user
     /// constructor produces, used to pre-size the next instance's `ObjMap`.
     ///
@@ -3323,6 +3326,8 @@ mod counted_loop;
 mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+mod lite;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
