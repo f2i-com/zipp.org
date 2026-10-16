@@ -367,5 +367,58 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         Instr::PyExcPop { rt: r0, .. } => {
             *r0 = m(*r0);
         }
+        // Interpreter superinstructions never come out of the compiler (see
+        // `FusedCode`); remapped all the same.
+        #[cfg(all())]
+        Instr::FuseEqJump { dst: r0, a: r1, b: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
+        #[cfg(all())]
+        Instr::FuseTypeOfJump { dst: r0, a: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::FuseLoadGlobal2 { dst: r0, dst2: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::FuseAddIntMove { dst: r0, a: r1, mdst: r2, msrc: r3, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
+        #[cfg(all())]
+        Instr::FuseLoadIntBitwise { ldst: r0, dst: r1, a: r2, b: r3, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
+        #[cfg(all())]
+        Instr::FuseIntCmpJump { ldst: r0, a: r1, .. }
+        | Instr::FuseGlobalCmpJump { gdst: r0, a: r1, .. }
+        | Instr::FuseAddIntJump { dst: r0, a: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::FuseAddLoadInt { ldst: r0, dst: r1, a: r2, .. }
+        | Instr::FuseLoadGlobalAddInt { gdst: r0, dst: r1, a: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
+        #[cfg(all())]
+        Instr::FuseAddReturn { dst: r0, a: r1, b: r2, src: r3 } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
     );
 }

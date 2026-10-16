@@ -1130,6 +1130,7 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
+            fused: Default::default(),
         })
     }
 
@@ -1480,6 +1481,7 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
+            fused: Default::default(),
         })
     }
 
@@ -1767,6 +1769,7 @@ impl Compiler {
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
+            fused: Default::default(),
         })
     }
 }

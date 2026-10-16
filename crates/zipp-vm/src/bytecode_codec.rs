@@ -349,6 +349,8 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         upvalues,
         eval_sites,
         source,
+        // The interpreter's superinstruction copy is rebuilt at run time.
+        fused: _,
     } = f;
     w.str(name);
     w.len(code.len());
@@ -510,6 +512,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         upvalues,
         eval_sites,
         source,
+        fused: Default::default(),
     })
 }
 

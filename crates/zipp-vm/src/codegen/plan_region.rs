@@ -5318,6 +5318,18 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
     /// The activation's `this`.
     const THIS: u16 = 0;
     match *i {
+        // ── interpreter superinstructions ── never in the code the JIT
+        // reads (`FusedCode`); both halves' reads, conservatively.
+        Instr::FuseAddIntMove { a, msrc, .. } => vec![a, msrc],
+        Instr::FuseLoadGlobal2 { .. } => vec![],
+        Instr::FuseLoadIntBitwise { a, b, .. } | Instr::FuseEqJump { a, b, .. } => vec![a, b],
+        Instr::FuseTypeOfJump { a, .. }
+        | Instr::FuseIntCmpJump { a, .. }
+        | Instr::FuseGlobalCmpJump { a, .. }
+        | Instr::FuseAddLoadInt { a, .. }
+        | Instr::FuseAddIntJump { a, .. }
+        | Instr::FuseLoadGlobalAddInt { a, .. } => vec![a],
+        Instr::FuseAddReturn { a, b, src, .. } => vec![a, b, src],
         // ── pure transfers ──
         Instr::Move { src, .. } => vec![src],
         Instr::StoreGlobal { src, .. }

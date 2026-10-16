@@ -2534,6 +2534,113 @@ pub enum Instr {
         argc: u16,
         slow: u32,
     },
+
+    // ── interpreter superinstructions ──
+    // Never in a `FuncProto::code`: only in the copy `FusedCode` builds for
+    // the interpreter's dispatch, at the position of the FIRST of the two
+    // instructions it stands for. The second stays in place, so the copy has
+    // the original's length and positions: a jump to the second still runs
+    // it alone, and every reader other than the dispatch (the JIT, its
+    // planners and recognizers, the cold paths) reads the original code.
+    // Each runs both instructions in one dispatch and continues at `ip + 2`.
+    /// `AddInt { dst, a, imm, upd }` then `Move { dst: mdst, src: msrc }`.
+    FuseAddIntMove {
+        dst: Reg,
+        a: Reg,
+        imm: i32,
+        upd: bool,
+        mdst: Reg,
+        msrc: Reg,
+    },
+    /// `LoadGlobal { dst, idx }` then `LoadGlobal { dst: dst2, idx: idx2 }`.
+    FuseLoadGlobal2 {
+        dst: Reg,
+        idx: u32,
+        dst2: Reg,
+        idx2: u32,
+    },
+    /// `LoadInt { dst: ldst, val }` then `Bitwise { dst, a, b, op }`.
+    FuseLoadIntBitwise {
+        ldst: Reg,
+        val: i32,
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        op: BitwiseOp,
+    },
+    /// `Eq { dst, a, b }` (`Ne` when `ne`) then `JumpIfTrue { cond: dst,
+    /// target }` when `when`, `JumpIfFalse` otherwise, with `target` past
+    /// the pair (a backward branch is a loop back-edge, never fused).
+    FuseEqJump {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        ne: bool,
+        when: bool,
+        target: u32,
+    },
+    /// `TypeOfIs { dst, a, code, neg }` then the conditional jump on `dst`,
+    /// as [`Instr::FuseEqJump`].
+    FuseTypeOfJump {
+        dst: Reg,
+        a: Reg,
+        code: u8,
+        neg: bool,
+        when: bool,
+        target: u32,
+    },
+    /// `LoadInt { dst: ldst, val }` then `JumpIfNotLt { a, b: ldst, target }`
+    /// (`JumpIfNotLe` when `le`): a loop or branch bound that is a literal.
+    FuseIntCmpJump {
+        ldst: Reg,
+        val: i32,
+        a: Reg,
+        le: bool,
+        target: u32,
+    },
+    /// `LoadGlobal { dst: gdst, idx }` then `JumpIfNotLt { a, b: gdst,
+    /// target }` (`JumpIfNotLe` when `le`): a bound held in a global.
+    FuseGlobalCmpJump {
+        gdst: Reg,
+        idx: u32,
+        a: Reg,
+        le: bool,
+        target: u32,
+    },
+    /// `LoadInt { dst: ldst, val }` then `Add { dst, a, b: ldst }`.
+    FuseAddLoadInt {
+        ldst: Reg,
+        val: i32,
+        dst: Reg,
+        a: Reg,
+    },
+    /// `AddInt { dst, a, imm, upd }` then a backward `Jump { target }`: a
+    /// loop's counter step and its back-edge.
+    FuseAddIntJump {
+        dst: Reg,
+        a: Reg,
+        imm: i32,
+        upd: bool,
+        target: u32,
+    },
+    /// `LoadGlobal { dst: gdst, idx }` then `AddInt { dst, a, imm, upd }`
+    /// (independent operands as often as not: a global callee, then its
+    /// argument `n - 1`).
+    FuseLoadGlobalAddInt {
+        gdst: Reg,
+        idx: u32,
+        dst: Reg,
+        a: Reg,
+        imm: i32,
+        upd: bool,
+    },
+    /// `Add { dst, a, b }` then `Return { src }`.
+    FuseAddReturn {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        src: Reg,
+    },
 }
 
 /// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every
@@ -2708,6 +2815,291 @@ pub struct FuncProto {
     /// the synthetic top-level script body and for placeholders, in which case
     /// `toString` falls back to the native-function form.
     pub source: String,
+    /// The interpreter's copy of `code` with superinstructions, built the
+    /// first time the interpreter enters the function (see [`FusedCode`]).
+    pub fused: FusedCode,
+}
+
+/// An interpreter-only copy of a function's `code` in which some adjacent
+/// pairs run as one superinstruction (`Instr::Fuse*`), built once, when the
+/// interpreter first enters the function. Same length and positions as
+/// `code`; the dispatch loop alone reads it. A clone starts unbuilt.
+///
+/// Built on the first entry rather than once the function proves warm: a
+/// count of entries cost every frame transition an atomic add until then,
+/// and a back-edge check every loop iteration, where the copy costs one
+/// pass over code the compiler has just produced.
+#[derive(Default)]
+pub struct FusedCode {
+    /// The copy; an empty one when nothing in the function fuses.
+    code: std::sync::OnceLock<Box<[Instr]>>,
+}
+
+impl Clone for FusedCode {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for FusedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FusedCode")
+    }
+}
+
+impl FusedCode {
+    /// The copy, once built and when anything in it fused.
+    #[inline]
+    pub fn get(&self) -> Option<&[Instr]> {
+        self.code.get().map(|c| &**c).filter(|c| !c.is_empty())
+    }
+
+    /// An entry of the function whose bytecode is `code`: the copy, built
+    /// now if this is the first, when anything in it fused.
+    #[inline]
+    pub fn entered(&self, code: &[Instr]) -> Option<&[Instr]> {
+        match self.code.get() {
+            Some(c) => (!c.is_empty()).then_some(&**c),
+            None => self.build(code),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build(&self, code: &[Instr]) -> Option<&[Instr]> {
+        self.code.get_or_init(|| fuse_for_interpreter(code).unwrap_or_default());
+        self.get()
+    }
+}
+
+/// The interpreter's superinstruction copy of `code` (see [`FusedCode`]),
+/// or `None` when no pair in it fuses. Pairs never overlap: after a fused
+/// pair the scan resumes at the instruction after its second.
+pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
+    let mut out: Option<Vec<Instr>> = None;
+    let mut i = 0;
+    while i + 1 < code.len() {
+        let fused = match (code[i], code[i + 1]) {
+            (Instr::AddInt { dst, a, imm, upd }, Instr::Move { dst: mdst, src: msrc }) => {
+                Some(Instr::FuseAddIntMove { dst, a, imm, upd, mdst, msrc })
+            }
+            (Instr::LoadGlobal { dst, idx }, Instr::LoadGlobal { dst: dst2, idx: idx2 }) => {
+                Some(Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 })
+            }
+            (Instr::LoadInt { dst: ldst, val }, Instr::Bitwise { dst, a, b, op }) => {
+                Some(Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op })
+            }
+            // A bound compared against the value just loaded for it.
+            (Instr::LoadInt { dst: ldst, val }, Instr::JumpIfNotLt { a, b, target }) if b == ldst => {
+                Some(Instr::FuseIntCmpJump { ldst, val, a, le: false, target })
+            }
+            (Instr::LoadInt { dst: ldst, val }, Instr::JumpIfNotLe { a, b, target }) if b == ldst => {
+                Some(Instr::FuseIntCmpJump { ldst, val, a, le: true, target })
+            }
+            (Instr::LoadGlobal { dst: gdst, idx }, Instr::JumpIfNotLt { a, b, target }) if b == gdst => {
+                Some(Instr::FuseGlobalCmpJump { gdst, idx, a, le: false, target })
+            }
+            (Instr::LoadGlobal { dst: gdst, idx }, Instr::JumpIfNotLe { a, b, target }) if b == gdst => {
+                Some(Instr::FuseGlobalCmpJump { gdst, idx, a, le: true, target })
+            }
+            (Instr::LoadInt { dst: ldst, val }, Instr::Add { dst, a, b }) if b == ldst => {
+                Some(Instr::FuseAddLoadInt { ldst, val, dst, a })
+            }
+            // A counter step and the back-edge after it (backward only: the
+            // fused arm does what `Jump` does at a back-edge).
+            (Instr::AddInt { dst, a, imm, upd }, Instr::Jump { target }) if target as usize <= i => {
+                Some(Instr::FuseAddIntJump { dst, a, imm, upd, target })
+            }
+            (Instr::LoadGlobal { dst: gdst, idx }, Instr::AddInt { dst, a, imm, upd }) => {
+                Some(Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd })
+            }
+            (Instr::Add { dst, a, b }, Instr::Return { src }) => Some(Instr::FuseAddReturn { dst, a, b, src }),
+            // A compare and the branch on its result, forward only.
+            (first, Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target })
+                if target as usize > i + 1 =>
+            {
+                let when = matches!(code[i + 1], Instr::JumpIfTrue { .. });
+                match first {
+                    Instr::Eq { dst, a, b } if dst == cond => {
+                        Some(Instr::FuseEqJump { dst, a, b, ne: false, when, target })
+                    }
+                    Instr::Ne { dst, a, b } if dst == cond => {
+                        Some(Instr::FuseEqJump { dst, a, b, ne: true, when, target })
+                    }
+                    Instr::TypeOfIs { dst, a, code, neg } if dst == cond => {
+                        Some(Instr::FuseTypeOfJump { dst, a, code, neg, when, target })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match fused {
+            Some(f) => {
+                out.get_or_insert_with(|| code.to_vec())[i] = f;
+                i += 2;
+            }
+            None => i += 1,
+        }
+    }
+    out.map(Vec::into_boxed_slice)
+}
+
+#[cfg(test)]
+mod fused_code_tests {
+    use super::*;
+
+    /// The copy keeps the original's length, each superinstruction sits
+    /// where the first of its pair was with the second left in place, pairs
+    /// never overlap, and code with nothing to fuse gets no copy.
+    #[test]
+    fn fused_copy_keeps_positions() {
+        let code = [
+            Instr::LoadGlobal { dst: 1, idx: 4 },
+            Instr::LoadGlobal { dst: 2, idx: 5 },
+            Instr::LoadGlobal { dst: 3, idx: 6 },
+            Instr::LoadInt { dst: 4, val: 0 },
+            Instr::Bitwise { dst: 5, a: 3, b: 4, op: BitwiseOp::Or },
+            Instr::AddInt { dst: 6, a: 6, imm: 1, upd: true },
+            Instr::Move { dst: 7, src: 6 },
+            Instr::Move { dst: 8, src: 7 },
+            Instr::Return { src: 8 },
+        ];
+        let fused = fuse_for_interpreter(&code).expect("pairs fuse");
+        assert_eq!(fused.len(), code.len());
+        assert!(matches!(fused[0], Instr::FuseLoadGlobal2 { dst: 1, idx: 4, dst2: 2, idx2: 5 }));
+        assert!(matches!(fused[1], Instr::LoadGlobal { dst: 2, idx: 5 }));
+        // The third load starts no pair: its partner would be a LoadInt.
+        assert!(matches!(fused[2], Instr::LoadGlobal { dst: 3, idx: 6 }));
+        assert!(matches!(fused[3], Instr::FuseLoadIntBitwise { ldst: 4, val: 0, dst: 5, a: 3, b: 4, op: BitwiseOp::Or }));
+        assert!(matches!(fused[4], Instr::Bitwise { dst: 5, .. }));
+        assert!(matches!(fused[5], Instr::FuseAddIntMove { dst: 6, a: 6, imm: 1, upd: true, mdst: 7, msrc: 6 }));
+        assert!(matches!(fused[6], Instr::Move { dst: 7, src: 6 }));
+        // Overlap is not allowed: the Move after a fused pair's Move stays.
+        assert!(matches!(fused[7], Instr::Move { dst: 8, src: 7 }));
+        assert!(matches!(fused[8], Instr::Return { src: 8 }));
+        assert!(fuse_for_interpreter(&[Instr::Move { dst: 1, src: 2 }, Instr::Return { src: 1 }]).is_none());
+        // A compare and the branch on its own result fuse when the branch
+        // goes forward; a backward one, or a branch on another register,
+        // does not.
+        let cmp = [
+            Instr::Eq { dst: 3, a: 1, b: 2 },
+            Instr::JumpIfFalse { cond: 3, target: 5 },
+            Instr::TypeOfIs { dst: 4, a: 1, code: 1, neg: false },
+            Instr::JumpIfTrue { cond: 4, target: 0 },
+            Instr::Ne { dst: 5, a: 1, b: 2 },
+            Instr::JumpIfTrue { cond: 6, target: 9 },
+        ];
+        let fused = fuse_for_interpreter(&cmp).expect("forward compare fuses");
+        assert!(matches!(fused[0], Instr::FuseEqJump { dst: 3, a: 1, b: 2, ne: false, when: false, target: 5 }));
+        assert!(matches!(fused[1], Instr::JumpIfFalse { cond: 3, target: 5 }));
+        assert!(matches!(fused[2], Instr::TypeOfIs { .. }));
+        assert!(matches!(fused[4], Instr::Ne { .. }));
+        // A holder builds on its first entry; nothing to fuse leaves it built
+        // and empty.
+        let holder = FusedCode::default();
+        assert!(holder.entered(&code).is_some());
+        assert!(holder.get().is_some());
+        let none = FusedCode::default();
+        assert!(none.entered(&[Instr::Return { src: 0 }]).is_none());
+        assert!(none.code.get().is_some() && none.get().is_none());
+    }
+
+    /// The bound tests, the literal add and the counter's back-edge fuse
+    /// only in the shapes their arms assume: the jump compares against the
+    /// register just loaded, the add adds it, and the jump after a counter
+    /// step goes backward.
+    #[test]
+    fn bound_and_step_pairs() {
+        let code = [
+            Instr::LoadInt { dst: 3, val: 10 },
+            Instr::JumpIfNotLt { a: 1, b: 3, target: 12 },
+            Instr::LoadGlobal { dst: 4, idx: 2 },
+            Instr::JumpIfNotLe { a: 1, b: 4, target: 12 },
+            Instr::LoadInt { dst: 5, val: 1 },
+            Instr::Add { dst: 6, a: 2, b: 5 },
+            Instr::AddInt { dst: 1, a: 1, imm: 1, upd: true },
+            Instr::Jump { target: 0 },
+            // The loaded register is not the one compared: no fusion.
+            Instr::LoadInt { dst: 3, val: 10 },
+            Instr::JumpIfNotLt { a: 3, b: 1, target: 12 },
+            // A forward jump after a step: no fusion.
+            Instr::AddInt { dst: 1, a: 1, imm: 1, upd: true },
+            Instr::Jump { target: 12 },
+            Instr::Return { src: 1 },
+        ];
+        let fused = fuse_for_interpreter(&code).expect("pairs fuse");
+        assert!(matches!(fused[0], Instr::FuseIntCmpJump { ldst: 3, val: 10, a: 1, le: false, target: 12 }));
+        assert!(matches!(fused[1], Instr::JumpIfNotLt { .. }));
+        assert!(matches!(fused[2], Instr::FuseGlobalCmpJump { gdst: 4, idx: 2, a: 1, le: true, target: 12 }));
+        assert!(matches!(fused[4], Instr::FuseAddLoadInt { ldst: 5, val: 1, dst: 6, a: 2 }));
+        assert!(matches!(fused[6], Instr::FuseAddIntJump { dst: 1, a: 1, imm: 1, upd: true, target: 0 }));
+        assert!(matches!(fused[8], Instr::LoadInt { .. }));
+        assert!(matches!(fused[10], Instr::AddInt { .. }));
+        // A global callee and its argument, and a sum returned.
+        let call = [
+            Instr::LoadGlobal { dst: 5, idx: 0 },
+            Instr::AddInt { dst: 6, a: 1, imm: -1, upd: false },
+            Instr::Call { dst: 4, callee: 5, arg_base: 6, argc: 1 },
+            Instr::Add { dst: 3, a: 4, b: 5 },
+            Instr::Return { src: 3 },
+        ];
+        let fused = fuse_for_interpreter(&call).expect("pairs fuse");
+        assert!(matches!(fused[0], Instr::FuseLoadGlobalAddInt { gdst: 5, idx: 0, dst: 6, a: 1, imm: -1, upd: false }));
+        assert!(matches!(fused[2], Instr::Call { .. }));
+        assert!(matches!(fused[3], Instr::FuseAddReturn { dst: 3, a: 4, b: 5, src: 3 }));
+    }
+
+    /// A program run on the interpreter builds the copies of the code that
+    /// ran warm (a loop, a second call), and they hold every
+    /// superinstruction: the dispatch really runs them.
+    #[test]
+    fn warm_code_runs_fused() {
+        if !interp_fuse_enabled() {
+            return;
+        }
+        let src = "var g = 1, h = 2, t = 0; \
+                   function f(n) { var s = 0, i = 0; for (; i < n; i++) { s = (s + g + h) | 0; } return s; } \
+                   for (var k = 0; k < 3; k++) { t = t + g + h + f(4); } console.log(t);";
+        let ast = crate::front::parse_auto(src).expect("parse");
+        let program = crate::compile::compile_program(&ast, src).expect("compile");
+        let mut vm = crate::vm::Vm::new(&program);
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        vm.set_jit_enabled(false);
+        vm.run().expect("run");
+        assert_eq!(vm.output, ["45"]);
+        let fused: Vec<Instr> = program
+            .functions
+            .iter()
+            .filter_map(|f| f.fused.get())
+            .flatten()
+            .copied()
+            .collect();
+        assert!(fused.iter().any(|i| matches!(i, Instr::FuseLoadGlobal2 { .. })), "LoadGlobal pair");
+        assert!(fused.iter().any(|i| matches!(i, Instr::FuseLoadIntBitwise { .. })), "LoadInt/Bitwise pair");
+        assert!(fused.iter().any(|i| matches!(i, Instr::FuseAddIntMove { .. })), "AddInt/Move pair");
+        assert!(fused.iter().any(|i| matches!(i, Instr::FuseIntCmpJump { .. })), "literal bound");
+    }
+}
+
+/// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
+/// same-binary A/B for [`FusedCode`]).
+#[inline]
+pub(crate) fn interp_fuse_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INTERP_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 /// Immutable property names shared by all objects created at one eligible

@@ -364,6 +364,16 @@ impl<'p> Vm<'p> {
             // function again first (a bounds-checked double index, and in a
             // size-first build a call).
             let strs: &'p [String] = running.string_constants.as_slice();
+            // What the dispatch below matches on: the function's
+            // superinstruction copy (`FusedCode`, built on its first entry)
+            // when anything in it fused, else its code. Only the `match`
+            // reads it; every lookahead, cold path and tier reads `code`,
+            // which it equals position for position.
+            let icode: &'p [Instr] = if self.interp_fuse_ok() {
+                running.fused.entered(&running.code).unwrap_or(running.code.as_slice())
+            } else {
+                running.code.as_slice()
+            };
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -483,9 +493,9 @@ impl<'p> Vm<'p> {
                 // one. Two of them were visible 19 KB apart in `dispatch_body`.
                 // (`Instr` is `Copy` now; borrowing it is still the right thing.)
                 #[cfg(feature = "safe-sandbox")]
-                let instr: &crate::bytecode::Instr = &code[ip];
+                let instr: &crate::bytecode::Instr = &icode[ip];
                 #[cfg(not(feature = "safe-sandbox"))]
-                let instr = &code[ip];
+                let instr = &icode[ip];
                 // Step budget / abort poll / execution trace. Compiled out
                 // entirely without the `instrument` feature, and a null check
                 // when it is present but unused — this is the hot loop.
@@ -1506,6 +1516,177 @@ impl<'p> Vm<'p> {
                         };
                         self.set(base, dst, r);
                         ip += 1;
+                    }
+
+                    // ── superinstructions (`FusedCode`) ── each is its two
+                    // instructions' arms run back to back: the same number
+                    // paths inline, the same helpers otherwise.
+                    Instr::FuseAddIntMove { dst, a, imm, upd, mdst, msrc } => {
+                        let va = self.get(base, a);
+                        let r = self.add_int_value(va, imm, upd)?;
+                        self.set(base, dst, r);
+                        let v = self.get(base, msrc);
+                        self.set(base, mdst, v);
+                        ip += 2;
+                    }
+                    Instr::FuseAddIntJump { dst, a, imm, upd, target } => {
+                        let va = self.get(base, a);
+                        let r = self.add_int_value(va, imm, upd)?;
+                        self.set(base, dst, r);
+                        // The `Jump` at `ip + 1`, which goes backward (see the
+                        // variant): its GC safe point. With the JIT on, a
+                        // back-edge also feeds the OSR tier, so the `Jump` arm
+                        // takes it.
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if self.jit_enabled {
+                            ip += 1;
+                            continue;
+                        }
+                        self.maybe_gc();
+                        ip = target as usize;
+                    }
+                    Instr::FuseIntCmpJump { ldst, val, a, le, target } => {
+                        self.set(base, ldst, Value::int(val));
+                        let va = self.get(base, a);
+                        let r = if va.is_int() {
+                            if le {
+                                va.as_int() <= val
+                            } else {
+                                va.as_int() < val
+                            }
+                        } else if va.is_double() {
+                            let x = va.as_f64();
+                            if le {
+                                x <= val as f64
+                            } else {
+                                x < val as f64
+                            }
+                        } else if le {
+                            self.cmp_le(base, a, ldst, true)?
+                        } else {
+                            self.cmp_lt(base, a, ldst, true)?
+                        };
+                        ip = if r { ip + 2 } else { target as usize };
+                    }
+                    Instr::FuseGlobalCmpJump { gdst, idx, a, le, target } => {
+                        let g = self.globals[idx as usize];
+                        let g = if g.is_uninitialized()
+                            || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                        {
+                            self.load_global_slow(idx, func_id)?
+                        } else {
+                            g
+                        };
+                        self.set(base, gdst, g);
+                        let va = self.get(base, a);
+                        let r = if va.is_int() && g.is_int() {
+                            if le {
+                                va.as_int() <= g.as_int()
+                            } else {
+                                va.as_int() < g.as_int()
+                            }
+                        } else if le {
+                            self.cmp_le(base, a, gdst, true)?
+                        } else {
+                            self.cmp_lt(base, a, gdst, true)?
+                        };
+                        ip = if r { ip + 2 } else { target as usize };
+                    }
+                    Instr::FuseAddLoadInt { ldst, val, dst, a } => {
+                        self.set(base, ldst, Value::int(val));
+                        let va = self.get(base, a);
+                        let r = if va.is_int() {
+                            match va.as_int().checked_add(val) {
+                                Some(v) => Value::int(v),
+                                None => Value::num(va.as_int() as f64 + val as f64),
+                            }
+                        } else if va.is_double() {
+                            Value::num(va.as_f64() + val as f64)
+                        } else {
+                            self.add_values(va, Value::int(val))?
+                        };
+                        self.set(base, dst, r);
+                        ip += 2;
+                    }
+                    Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd } => {
+                        let g = self.globals[idx as usize];
+                        let g = if g.is_uninitialized()
+                            || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                        {
+                            self.load_global_slow(idx, func_id)?
+                        } else {
+                            g
+                        };
+                        self.set(base, gdst, g);
+                        let va = self.get(base, a);
+                        let r = self.add_int_value(va, imm, upd)?;
+                        self.set(base, dst, r);
+                        ip += 2;
+                    }
+                    Instr::FuseAddReturn { dst, a, b, src } => {
+                        let r = self.add(base, a, b)?;
+                        self.set(base, dst, r);
+                        // A frame with `try` handlers may have a `finally` to
+                        // run first: the `Return` at `ip + 1` routes it.
+                        if !self.frames[frame_idx].handlers.is_empty() {
+                            ip += 1;
+                            continue;
+                        }
+                        let v = self.get(base, src);
+                        if self.pop_frame_with(v, stop_depth) {
+                            return Ok(v);
+                        }
+                        break;
+                    }
+                    Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 } => {
+                        let v = self.globals[idx as usize];
+                        let v = if v.is_uninitialized()
+                            || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                        {
+                            self.load_global_slow(idx, func_id)?
+                        } else {
+                            v
+                        };
+                        self.set(base, dst, v);
+                        let v = self.globals[idx2 as usize];
+                        let v = if v.is_uninitialized()
+                            || (self.global_route_epoch != 0 && self.global_real_own_route(idx2))
+                        {
+                            self.load_global_slow(idx2, func_id)?
+                        } else {
+                            v
+                        };
+                        self.set(base, dst2, v);
+                        ip += 2;
+                    }
+                    Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } => {
+                        self.set(base, ldst, Value::int(val));
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let r = self.fused_bitwise(va, vb, op)?;
+                        self.set(base, dst, r);
+                        ip += 2;
+                    }
+                    Instr::FuseEqJump { dst, a, b, ne, when, target } => {
+                        let (va, vb) = (self.get(base, a), self.get(base, b));
+                        let eq = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            self.strict_eq(base, a, b)
+                        };
+                        let r = eq != ne;
+                        self.set(base, dst, Value::bool(r));
+                        // Forward only (see the variant): no back-edge here.
+                        ip = if r == when { target as usize } else { ip + 2 };
+                    }
+                    Instr::FuseTypeOfJump { dst, a, code, neg, when, target } => {
+                        let va = self.get(base, a);
+                        let t = self.type_of(va);
+                        let m = crate::bytecode::TYPEOF_NAMES
+                            .get(code as usize)
+                            .is_some_and(|&n| n == t)
+                            != neg;
+                        self.set(base, dst, Value::bool(m));
+                        ip = if m == when { target as usize } else { ip + 2 };
                     }
 
                     Instr::Lt { dst, a, b } => {
@@ -6015,6 +6196,108 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "safe-sandbox"))]
         return unsafe { *self.regs.get_unchecked(index) };
     }
+    /// Whether the dispatch may run a function's superinstruction copy
+    /// (`FusedCode`): not under `ZIPP_NO_INTERP_FUSE`, and not while a
+    /// recorder meters or traces each instruction, which a superinstruction
+    /// (one dispatch for two) would miscount.
+    #[inline(always)]
+    pub(crate) fn interp_fuse_ok(&self) -> bool {
+        // A metered build's step counts and its exact-shape loop projections
+        // (`try_metered_*`) are its original instructions'.
+        if cfg!(feature = "meter-only") {
+            return false;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return false;
+        }
+        crate::bytecode::interp_fuse_enabled()
+    }
+
+    /// `Bitwise`'s result for two operands already read, for its
+    /// superinstructions: two Int32s inline, Numbers that convert exactly,
+    /// everything else (coercion, BigInt, the TypeErrors) through
+    /// `numeric_binop`.
+    #[inline(always)]
+    fn fused_bitwise(&mut self, va: Value, vb: Value, op: crate::bytecode::BitwiseOp) -> Result<Value, Thrown> {
+        use crate::bytecode::BitwiseOp as B;
+        let ints = if va.is_int() && vb.is_int() {
+            Some((va.as_int(), vb.as_int()))
+        } else {
+            number_int32(va).zip(number_int32(vb))
+        };
+        if let Some((x, y)) = ints {
+            return Ok(match op {
+                B::And => Value::int(x & y),
+                B::Or => Value::int(x | y),
+                B::Xor => Value::int(x ^ y),
+                B::Shl => Value::int(x.wrapping_shl((y as u32) & 31)),
+                B::Shr => Value::int(x >> ((y as u32) & 31)),
+                B::Ushr => {
+                    let u = (x as u32) >> ((y as u32) & 31);
+                    if u <= i32::MAX as u32 {
+                        Value::int(u as i32)
+                    } else {
+                        Value::num(u as f64)
+                    }
+                }
+            });
+        }
+        let bop = match op {
+            B::And => BigOp::And,
+            B::Or => BigOp::Or,
+            B::Xor => BigOp::Xor,
+            B::Shl => BigOp::Shl,
+            B::Shr => BigOp::Shr,
+            B::Ushr => BigOp::Ushr,
+        };
+        self.numeric_binop(bop, va, vb)
+    }
+
+    /// `AddInt`'s result (see its arm), for its superinstructions: the
+    /// Number paths inline, a Python `for` counter's small BigInt inline as
+    /// in the arm (it is every iteration's), the rest out of line.
+    #[inline(always)]
+    fn add_int_value(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
+        if va.is_int() {
+            return Ok(match va.as_int().checked_add(imm) {
+                Some(v) => Value::int(v),
+                None => Value::num(va.as_int() as f64 + imm as f64),
+            });
+        }
+        if va.is_double() {
+            return Ok(Value::num(va.as_f64() + imm as f64));
+        }
+        #[cfg(feature = "python")]
+        if upd {
+            if let Some(v) = va.small_bigint_val().and_then(|n| Value::small_bigint(n as i128 + imm as i128)) {
+                return Ok(v);
+            }
+        }
+        self.add_int_generic(va, imm, upd)
+    }
+
+    /// `AddInt`'s path for an operand that is not a Number, for its
+    /// superinstruction (`Instr::FuseAddIntMove`): the arm's own code.
+    #[cold]
+    #[inline(never)]
+    fn add_int_generic(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
+        let p = self.numeric_prim(va)?;
+        if let Some(b) = self.bigint_val(p) {
+            if upd {
+                self.bigint_op(
+                    BigOp::Add,
+                    b,
+                    crate::vm::bigint::BigVal::Small(imm as i128),
+                )
+            } else {
+                Err(Thrown(crate::vm::bigint::BIGINT_MIX_ERR.into()))
+            }
+        } else {
+            Ok(Value::num(self.to_number(p)? + imm as f64))
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn set(&mut self, base: usize, r: u16, v: Value) {
         let index = base.wrapping_add(r as usize);

@@ -421,6 +421,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
         source: String::new(),
+        fused: Default::default(),
     }
 }
 
