@@ -88,6 +88,27 @@ pub(crate) mod interp_stats {
     }
 }
 
+/// `ZIPP_NO_LEAN_CALL=1`: every call-cache hit pushes its frame through
+/// `setup_call` and every return pops through `pop_frame_with`, out of line
+/// (the same-binary comparator for `setup_call_lean` / `pop_frame_fast`).
+#[inline(always)]
+fn lean_calls_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_LEAN_CALL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Drives execution from the current frame until the frame that was current
     /// on entry returns (frames drops to `stop_depth`), catching thrown values
@@ -1633,7 +1654,7 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let v = self.get(base, src);
-                        if self.pop_frame_with(v, stop_depth) {
+                        if self.pop_frame_fast(v, stop_depth) {
                             return Ok(v);
                         }
                         break;
@@ -4127,7 +4148,7 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            self.setup_call(
+                            self.setup_call_lean(
                                 call.fid,
                                 call.closure,
                                 Value::UNDEFINED,
@@ -4406,7 +4427,7 @@ impl<'p> Vm<'p> {
                             if let Some((fid, closure, callee)) =
                                 self.ic_call_method(func_id, ip, recv, key)
                             {
-                                self.setup_call(
+                                self.setup_call_lean(
                                     fid,
                                     closure,
                                     recv,
@@ -4733,7 +4754,7 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        if self.pop_frame_with(v, stop_depth) {
+                        if self.pop_frame_fast(v, stop_depth) {
                             return Ok(v);
                         }
                         break;
@@ -4745,7 +4766,7 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        if self.pop_frame_with(Value::UNDEFINED, stop_depth) {
+                        if self.pop_frame_fast(Value::UNDEFINED, stop_depth) {
                             return Ok(Value::UNDEFINED);
                         }
                         break;
@@ -5977,6 +5998,32 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// [`Self::pop_frame_with`] inline, for the frame nearly every return
+    /// pops: no `arguments` object to flush, not a flat `new`, no handler
+    /// buffer to give back. Any other frame takes the full routine. Out of
+    /// line, the pop's call and its frame setup were a third of its cost on
+    /// a recursive call.
+    #[inline(always)]
+    pub(crate) fn pop_frame_fast(&mut self, ret: Value, stop_depth: usize) -> bool {
+        let n = self.frames.len();
+        let f = &self.frames[n - 1];
+        if f.args_obj != u32::MAX || f.construct_this || f.handlers.capacity() != 0 || !lean_calls_enabled() {
+            return self.pop_frame_with(ret, stop_depth);
+        }
+        let (fbase, ret_dst) = (f.base, f.ret_dst);
+        self.frames.truncate(n - 1);
+        self.tail_reuse_streak = 0;
+        self.regs.truncate(fbase);
+        if n - 1 == stop_depth {
+            return true;
+        }
+        if ret_dst != RET_DISCARD {
+            let caller_base = self.frames[n - 2].base;
+            self.regs[caller_base + ret_dst as usize] = ret;
+        }
+        false
+    }
+
     /// The intrinsic of a `StaticFn` instruction (`Object.assign`,
     /// `Object.fromEntries`, `Array.of`, `String.fromCharCode`, the
     /// `Number.is*` tests, the `Promise` statics, `Object.defineProperty` and
@@ -6950,6 +6997,101 @@ impl<'p> Vm<'p> {
             callee: callee_val,
         });
         Ok(())
+    }
+
+    /// [`Self::setup_call`] inline, for the activation the call caches hand
+    /// over nearly every time: no rest parameter, no `arguments` object, not
+    /// an arrow, a `this` that needs no boxing (a strict callee's, or a
+    /// nullish one, which a sloppy callee replaces with its realm's global),
+    /// and a register window that fits the file as it stands. Anything else,
+    /// including every limit that would throw, takes `setup_call`, which
+    /// decides it all again. Out of line, the call and its frame setup were a
+    /// fifth of `setup_call`'s cost on a recursive call.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_lean(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this_val: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let proto = self.func(func_id as usize);
+        let callee_regs = (proto.reg_count as usize).max(1);
+        let new_base = self.regs.len();
+        let lean = proto.rest_reg.is_none()
+            && proto.arguments_reg.is_none()
+            && !proto.lexical_this
+            && (proto.is_strict || this_val.is_nullish())
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + callee_regs)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call(
+                func_id,
+                closure,
+                this_val,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        let this_val = if !proto.is_strict && self.global_this != 0 {
+            Value::heap(self.callee_this_global(callee_val))
+        } else {
+            this_val
+        };
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+        self.regs[new_base] = this_val;
+        let n = (argc as usize).min(proto.param_count as usize);
+        for i in 0..n {
+            let v = self.regs[caller_base + arg_base as usize + i];
+            self.regs[new_base + 1 + i] = v;
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: (caller_base + arg_base as usize) as u32,
+            argc,
+            is_eval: false,
+            construct_this: false,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: callee_val,
+        });
+        Ok(())
+    }
+
+    /// Whether a register window ending at `needed` fits the register file
+    /// with nothing to decide: inside its capacity (so no growth to charge)
+    /// and inside the pinned native capacity. `regs_would_overflow` is
+    /// `false` whenever this is `true`.
+    #[inline(always)]
+    fn regs_fit_now(&self, needed: usize) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if self.reg_capacity_pub() != 0 && needed > self.reg_capacity_pub() {
+            return false;
+        }
+        needed <= self.regs.capacity()
     }
 
     /// Collapse the canonical pure numeric Fibonacci body used by small
