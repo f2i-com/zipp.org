@@ -9033,6 +9033,21 @@ impl Heap {
                 self.arr_pool.push(v);
                 HeapObj::Date(f64::NAN)
             }
+            // A Python instance's layout-mode attribute values are the same
+            // small `Value` buffer (`take_arr_buf` hands one back to
+            // `py_attrs_new`): every instance of a class with attributes
+            // allocated one and the sweep freed it. Compiled code reads the
+            // buffer through the slot's hot mirror, cleared above and
+            // rewritten for the next owner at its allocation.
+            #[cfg(feature = "python")]
+            HeapObj::PyAttrs { vals, .. }
+                if self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()) =>
+            {
+                self.arr_pool.push(vals);
+                HeapObj::Date(f64::NAN)
+            }
             other => other,
         };
         // B210: check the discriminant BY REFERENCE before the courier match —

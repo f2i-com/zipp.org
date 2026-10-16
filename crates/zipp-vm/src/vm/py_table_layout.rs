@@ -226,7 +226,8 @@ impl<'p> Vm<'p> {
         let obj = if self.py_rt.is_some() {
             HeapObj::PyAttrs {
                 layout: ROOT,
-                vals: Vec::with_capacity(cap),
+                // A dead instance's buffer when the pool holds one.
+                vals: self.heap.take_arr_buf(cap),
             }
         } else {
             HeapObj::PyTable(Box::new(PyTable::with_kinds(false, PyKinds::default())))
