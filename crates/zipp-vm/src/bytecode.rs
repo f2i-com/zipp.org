@@ -3077,7 +3077,13 @@ mod fused_code_tests {
             .collect();
         assert!(fused.iter().any(|i| matches!(i, Instr::FuseLoadGlobal2 { .. })), "LoadGlobal pair");
         assert!(fused.iter().any(|i| matches!(i, Instr::FuseLoadIntBitwise { .. })), "LoadInt/Bitwise pair");
-        assert!(fused.iter().any(|i| matches!(i, Instr::FuseAddIntMove { .. })), "AddInt/Move pair");
+        // The `i++` step: with its statement value's copy where the build
+        // keeps it (one with the JIT), else straight into the back-edge (a
+        // build without one compiles the step in place).
+        assert!(
+            fused.iter().any(|i| matches!(i, Instr::FuseAddIntMove { .. } | Instr::FuseAddIntJump { .. })),
+            "AddInt/Move or AddInt/Jump pair"
+        );
         assert!(fused.iter().any(|i| matches!(i, Instr::FuseIntCmpJump { .. })), "literal bound");
     }
 }
@@ -3573,15 +3579,18 @@ mod static_key_plan_layout_tests {
     use super::*;
 
     /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
-    /// when the optimization never applies. Keep that startup/many-function
-    /// cost, plus the retained-charge assumptions for non-empty plans, explicit.
+    /// when the optimization never applies, and `fused` (the interpreter's
+    /// superinstruction copy, `FusedCode`) another 24 until it is built. Keep
+    /// that startup/many-function cost, plus the retained-charge assumptions
+    /// for non-empty plans, explicit.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 272);
+        assert_eq!(std::mem::size_of::<FusedCode>(), 24);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 296);
     }
 }
 
