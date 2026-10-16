@@ -9078,10 +9078,13 @@ impl Heap {
                         self.obj_pool_stats[0] += 1;
                     }
                     self.obj_pool.push(m);
-                    HeapObj::Date(f64::NAN)
-                } else {
-                    HeapObj::Object(m)
+                    // Nothing is left to ship or drop: finish here rather
+                    // than carry a tombstone through the courier test and
+                    // the enum's out-of-line drop glue at the end.
+                    self.free_slot_tail(idx);
+                    return;
                 }
+                HeapObj::Object(m)
             }
             other => other,
         };
@@ -9093,7 +9096,8 @@ impl Heap {
                     && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()) =>
             {
                 self.arr_pool.push(v);
-                HeapObj::Date(f64::NAN)
+                self.free_slot_tail(idx);
+                return;
             }
             // A Python instance's layout-mode attribute values are the same
             // small `Value` buffer (`take_arr_buf` hands one back to
@@ -9108,7 +9112,8 @@ impl Heap {
                     && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()) =>
             {
                 self.arr_pool.push(vals);
-                HeapObj::Date(f64::NAN)
+                self.free_slot_tail(idx);
+                return;
             }
             other => other,
         };
@@ -9235,6 +9240,14 @@ impl Heap {
                 other => drop(other),
             }
         }
+        self.free_slot_tail(idx);
+    }
+
+    /// The bookkeeping that ends every `free_slot` whose occupant has been
+    /// pooled, shipped or dropped: a new version for the slot and its return
+    /// to the free list.
+    #[inline(always)]
+    fn free_slot_tail(&mut self, idx: u32) {
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         if self.nursery {
             // Tombstones read OLD: `gen == GEN_YOUNG ⇔ in the young log`
