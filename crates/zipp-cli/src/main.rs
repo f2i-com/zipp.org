@@ -335,7 +335,13 @@ fn main() -> ExitCode {
             "[interp] {} functions ran interpreted: {entries} entries (not taken by the JIT at ip 0), {resumes} resumes (returns into a frame, JIT bails)",
             rows.len()
         );
-        for (id, name, e, r) in rows.iter().take(30) {
+        // `ZIPP_INTERPSTATS_TOP=n` lists more than the top thirty, for a
+        // difference of two runs (per-step counts with start-up cancelled).
+        let top = std::env::var("ZIPP_INTERPSTATS_TOP")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(30);
+        for (id, name, e, r) in rows.iter().take(top) {
             let shown = if name.is_empty() { "<anonymous>" } else { name.as_str() };
             eprintln!("[interp] {e:>10} entries {r:>10} resumes  fn{id} {shown}");
         }
