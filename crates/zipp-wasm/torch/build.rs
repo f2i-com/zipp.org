@@ -17,8 +17,8 @@ mod abi;
 
 fn main() {
     let vm = Path::new("../../zipp-vm");
-    let lib = vm.join("src/frontend/python/lib");
-    let runtime = vm.join("src/frontend/python/runtime");
+    let lib = vm.join("src/lang/python/lib");
+    let runtime = vm.join("src/lang/python/runtime");
     for p in [
         "build.rs",
         "../../zipp-vm/build",
