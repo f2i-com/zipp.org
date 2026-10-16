@@ -223,15 +223,12 @@ impl<'p> Vm<'p> {
     /// New, empty attribute storage with room for `cap` values: layout
     /// mode once the runtime is bound, a dict-mode table before.
     pub(crate) fn py_attrs_new(&mut self, cap: usize) -> Value {
-        let obj = if self.py_rt.is_some() {
-            HeapObj::PyAttrs {
-                layout: ROOT,
-                // A dead instance's buffer when the pool holds one.
-                vals: self.heap.take_arr_buf(cap),
-            }
-        } else {
-            HeapObj::PyTable(Box::new(PyTable::with_kinds(false, PyKinds::default())))
-        };
+        if self.py_rt.is_some() {
+            // A dead instance's buffer when the pool holds one.
+            let vals = self.heap.take_arr_buf(cap);
+            return Value::heap(self.heap.alloc_py_attrs(ROOT, vals));
+        }
+        let obj = HeapObj::PyTable(Box::new(PyTable::with_kinds(false, PyKinds::default())));
         Value::heap(self.heap.alloc(obj))
     }
 

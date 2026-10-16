@@ -7763,6 +7763,37 @@ impl Heap {
     ///
     /// `ZIPP_NO_SETTLED_ALLOC=1` routes back through `refresh_mirror`, so the
     /// two spellings can be A/B'd on one binary.
+    /// Python layout-mode attribute storage (`vm::py_table::layout`), with
+    /// its mirror (`LAYOUT_BASE | layout`, the buffer, as `refresh_mirror`
+    /// writes it) settled from the values in hand instead of re-read from
+    /// the slot just written; a recycled slot is written as B257's thin
+    /// paths write one (no drop glue on the tombstone).
+    #[cfg(feature = "python")]
+    pub(crate) fn alloc_py_attrs(&mut self, layout: u32, vals: Vec<Value>) -> u32 {
+        #[cfg(feature = "jit")]
+        let hot = Some(HotMirror {
+            shape: crate::vm::py_table::layout::LAYOUT_BASE | layout,
+            fid: FID_MIRROR_NONE,
+            vals: vals.as_ptr() as u64,
+        });
+        #[cfg(not(feature = "jit"))]
+        let hot = no_hot_mirror();
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::PyAttrs { layout, vals });
+                #[cfg(feature = "jit")]
+                if let Some(hot) = hot {
+                    self.hot_mirror[idx as usize] = hot;
+                }
+                self.reuse_slot_stamp(idx);
+                return idx;
+            }
+        }
+        self.alloc_settled(HeapObj::PyAttrs { layout, vals }, hot)
+    }
+
     pub fn alloc_object_settled(&mut self, boxed: Box<ObjMap>, shape: u32) -> u32 {
         if !settled_alloc_enabled() {
             return self.alloc(HeapObj::Object(boxed));
