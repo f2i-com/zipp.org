@@ -385,16 +385,6 @@ impl<'p> Vm<'p> {
             // function again first (a bounds-checked double index, and in a
             // size-first build a call).
             let strs: &'p [String] = running.string_constants.as_slice();
-            // What the dispatch below matches on: the function's
-            // superinstruction copy (`FusedCode`, built on its first entry)
-            // when anything in it fused, else its code. Only the `match`
-            // reads it; every lookahead, cold path and tier reads `code`,
-            // which it equals position for position.
-            let icode: &'p [Instr] = if self.interp_fuse_ok() {
-                running.fused.entered(&running.code).unwrap_or(running.code.as_slice())
-            } else {
-                running.code.as_slice()
-            };
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -481,6 +471,19 @@ impl<'p> Vm<'p> {
                     self.jit.compile(func_id, unsafe { &*proto });
                 }
             }
+
+            // What the dispatch below matches on: the function's
+            // superinstruction copy (`FusedCode`, built on its first entry)
+            // when anything in it fused, else its code. Only the `match`
+            // reads it; every lookahead, cold path and tier reads `code`,
+            // which it equals position for position. Chosen past the native
+            // tiers: a frame they run whole needs none, and code placed
+            // before their entry slowed a JIT row by 7% (warm-router).
+            let icode: &'p [Instr] = if self.interp_fuse_ok() {
+                running.fused.entered(&running.code).unwrap_or(running.code.as_slice())
+            } else {
+                running.code.as_slice()
+            };
 
             // `ZIPP_INTERPSTATS=1`: this frame is about to be INTERPRETED from
             // `ip` (the native tiers above either bailed here or did not take
