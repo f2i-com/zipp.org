@@ -97,7 +97,7 @@ fn repository_python() -> Vec<(String, String)> {
     let mut files = Vec::new();
     for dir in [
         "tests/python_corpus",
-        "crates/zipp-vm/src/frontend/python/lib",
+        "crates/zipp-vm/src/lang/python/lib",
         "crates/zipp-wasm/model-plugins",
         "tools/python_bench",
     ] {
@@ -558,7 +558,7 @@ fn throughput() {
     let root = repo_root();
     let mut files = Vec::new();
     collect_py(
-        &root.join("crates/zipp-vm/src/frontend/python/lib"),
+        &root.join("crates/zipp-vm/src/lang/python/lib"),
         &mut files,
     );
     let sources: Vec<String> = files.iter().filter_map(|p| read_source(p)).collect();

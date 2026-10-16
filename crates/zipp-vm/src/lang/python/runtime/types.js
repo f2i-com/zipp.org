@@ -947,7 +947,7 @@
     // and combined into a non-negative 46-bit value: the second lane's top
     // 14 bits above the first's 32, the widest int the engine keeps in the
     // value itself, so a hash is never a heap BigInt. The engine computes
-    // the same number (`hash_str_units` in vm/py_table.rs, which must
+    // the same number (`hash_str_units` in lang/python/vm/py_table.rs, which must
     // agree). The per-character step is plain int arithmetic, which the
     // interpreter runs without calls.
     // Recent str hashes (a str is immutable, so its hash never changes; the

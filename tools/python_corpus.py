@@ -24,9 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "python_corpus"
 
 
-# Library modules bundled with the frontend (crates/zipp-vm/src/frontend/python/lib)
+# Library modules bundled with the frontend (crates/zipp-vm/src/lang/python/lib)
 # are importable from CPython too, so corpus programs can use them.
-LIB = ROOT / "crates" / "zipp-vm" / "src" / "frontend" / "python" / "lib" / "shared"
+LIB = ROOT / "crates" / "zipp-vm" / "src" / "lang" / "python" / "lib" / "shared"
 
 
 def run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:

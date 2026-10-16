@@ -84,8 +84,11 @@ mod jit_frame;
 mod jit_plans;
 mod method_inline;
 mod modules;
+// Python's native-tier entry points (see `lang/python/jit/`).
 #[cfg(feature = "python")]
+#[path = "../../lang/python/jit/py_jit.rs"]
 mod py_jit;
 #[cfg(all(feature = "python", feature = "jit", target_arch = "x86_64"))]
+#[path = "../../lang/python/jit/py_jit_attr.rs"]
 mod py_jit_attr;
 mod run;

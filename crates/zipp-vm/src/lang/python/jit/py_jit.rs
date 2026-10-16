@@ -1,5 +1,5 @@
 //! The native tiers' out-of-line step for the Python frontend's fused
-//! instructions (`Instr::Py*`, see `vm/py_ops.rs`).
+//! instructions (`Instr::Py*`, see `lang/python/vm/py_ops.rs`).
 //!
 //! Compiled code calls [`Vm::jit_py_op`] for any such instruction its inline
 //! fast path does not settle. The helper runs exactly the interpreter's step

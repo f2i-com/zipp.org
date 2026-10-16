@@ -1,7 +1,7 @@
 //! zipp_torch.wasm: the torch package archive and the native tensor kernels
 //! for ZIPP's WebAssembly `python` artifact.
 //!
-//! The kernels are zipp-vm's own (`vm/py_tensor/*`, included by path, not
+//! The kernels are zipp-vm's own (`lang/python/vm/py_tensor/*`, included by path, not
 //! copied): the engine sends each call here as bytes (`wire`) and this
 //! module runs it over those bytes exactly as the engine runs it over its
 //! heap in the `all` artifact. Exports (no imports):
@@ -14,28 +14,28 @@
 #![allow(clippy::missing_safety_doc)]
 
 #[allow(dead_code, unused_imports)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/args.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/args.rs"]
 mod args;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/fft.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/fft.rs"]
 mod fft;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/jsmath.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/jsmath.rs"]
 mod jsmath;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/kernels.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/kernels.rs"]
 mod kernels;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/linalg.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/linalg.rs"]
 mod linalg;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/quant.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/quant.rs"]
 mod quant;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/sparse.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/sparse.rs"]
 mod sparse;
 #[allow(dead_code)]
-#[path = "../../../zipp-vm/src/vm/py_tensor/wire.rs"]
+#[path = "../../../zipp-vm/src/lang/python/vm/py_tensor/wire.rs"]
 mod wire;
 
 static PACKAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/torch.zpkg"));

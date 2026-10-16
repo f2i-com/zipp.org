@@ -1,6 +1,6 @@
 // The import statements of a bundled Python module, read at build time so a
 // program can follow its imports without compiling it (see `Bundled` in
-// src/frontend/python/mod.rs). Mirrors what the frontend's
+// src/lang/python/frontend/mod.rs). Mirrors what the frontend's
 // `imported_modules` collects from the parsed module: every `import` and
 // `from ... import` statement anywhere in the module, except inside
 // `async def` / `async for` / `async with` bodies. The frontend's

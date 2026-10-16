@@ -26,7 +26,7 @@
 //! byte after `end\n`.
 use std::sync::Mutex;
 
-#[path = "../build/sha256.rs"]
+#[path = "../../../build/sha256.rs"]
 mod sha256;
 
 /// The archive's first line.

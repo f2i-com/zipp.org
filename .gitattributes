@@ -10,8 +10,8 @@ bench/pgo-training/** text eol=lf
 # carriage return per source line into every artifact built from it (60 KB in
 # the complete WebAssembly module), so a Windows build was larger than the
 # Linux release build of the same commit and embedded different text.
-crates/zipp-vm/src/frontend/python/lib/** text eol=lf
-crates/zipp-vm/src/frontend/python/runtime/** text eol=lf
+crates/zipp-vm/src/lang/python/lib/** text eol=lf
+crates/zipp-vm/src/lang/python/runtime/** text eol=lf
 crates/zipp-wasm/src/preamble.js text eol=lf
 
 # The WASM engine pairs are hash-checked against their manifests; never convert line endings.

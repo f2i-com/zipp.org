@@ -1023,14 +1023,14 @@ fn bench() {
 #[test]
 fn runtime_storage_check() {
     const FILES: [(&str, &str); 8] = [
-        ("types.js", include_str!("../frontend/python/runtime/types.js")),
-        ("builtins.js", include_str!("../frontend/python/runtime/builtins.js")),
-        ("core.js", include_str!("../frontend/python/runtime/core.js")),
-        ("stdlib.js", include_str!("../frontend/python/runtime/stdlib.js")),
-        ("tensor.js", include_str!("../frontend/python/runtime/tensor.js")),
-        ("entry.js", include_str!("../frontend/python/runtime/entry.js")),
-        ("javascript.js", include_str!("../frontend/python/runtime/javascript.js")),
-        ("native_gpu.js", include_str!("../frontend/python/runtime/native_gpu.js")),
+        ("types.js", include_str!("../runtime/types.js")),
+        ("builtins.js", include_str!("../runtime/builtins.js")),
+        ("core.js", include_str!("../runtime/core.js")),
+        ("stdlib.js", include_str!("../runtime/stdlib.js")),
+        ("tensor.js", include_str!("../runtime/tensor.js")),
+        ("entry.js", include_str!("../runtime/entry.js")),
+        ("javascript.js", include_str!("../runtime/javascript.js")),
+        ("native_gpu.js", include_str!("../runtime/native_gpu.js")),
     ];
     // (file, first line containing, the line after the section containing)
     const OWNERS: [(&str, &str, &str); 2] = [

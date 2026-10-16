@@ -1,5 +1,5 @@
 //! Dense double-precision factorizations behind the bundled `torch.linalg`
-//! (`frontend/python/lib/torch_linalg.py`), one matrix per call.
+//! (`lang/python/lib/torch_linalg.py`), one matrix per call.
 //!
 //! Every routine mirrors the Python fallback's algorithm and conventions so
 //! the two paths agree to the documented tolerances (1e-12 relative in

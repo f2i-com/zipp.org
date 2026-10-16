@@ -1,7 +1,7 @@
 //! Native loops behind the Python runtime's `_zipp_tensor` kernels.
 //!
 //! The bundled `torch` stores tensors in JavaScript typed arrays and runs its
-//! kernels as JavaScript (`frontend/python/runtime/tensor.js`). Python states
+//! kernels as JavaScript (`lang/python/runtime/tensor.js`). Python states
 //! run those on the interpreter — always in the wasm build — where a float32
 //! matmul costs ~50 ns per multiply-add. This module runs the heavy loops in
 //! Rust instead, over the same typed arrays.
@@ -51,20 +51,28 @@
 //! each call goes there as bytes (`wire`) through the host function the host
 //! registered (`python_packages::set_kernel_bridge`). Either way the same
 //! code computes over the same bytes, with the same budget decisions.
+#[path = "py_tensor/args.rs"]
 mod args;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/fft.rs"]
 mod fft;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/jsmath.rs"]
 mod jsmath;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/kernels.rs"]
 mod kernels;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/linalg.rs"]
 mod linalg;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/quant.rs"]
 mod quant;
 #[cfg(not(feature = "python-no-torch"))]
+#[path = "py_tensor/sparse.rs"]
 mod sparse;
 #[cfg(feature = "python-no-torch")]
+#[path = "py_tensor/wire.rs"]
 mod wire;
 
 use super::{native, Thrown, Vm};

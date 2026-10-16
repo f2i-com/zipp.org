@@ -1,5 +1,5 @@
 //! The Python-visible hash and dict/set order that the native table
-//! (`vm/py_table.rs`) reproduces, pinned: `hash()` of numbers, None, bools
+//! (`lang/python/vm/py_table.rs`) reproduces, pinned: `hash()` of numbers, None, bools
 //! and tuples of them against CPython 3.13 (str hashes are randomized in
 //! CPython, so ZIPP's own str hash is checked against the native one by the
 //! library's `py_table` tests), and set/dict iteration order as ZIPP's

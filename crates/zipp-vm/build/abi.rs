@@ -11,7 +11,7 @@ pub const PACKAGE_FORMAT: &str = "zipp-python-package 1";
 
 #[allow(dead_code)]
 pub fn package_abi(vm_crate: &Path) -> String {
-    let py = vm_crate.join("src/frontend/python/runtime");
+    let py = vm_crate.join("src/lang/python/runtime");
     let mut all = Vec::new();
     all.extend_from_slice(PACKAGE_FORMAT.as_bytes());
     for file in ["core.js", "types.js", "builtins.js", "stdlib.js", "storage.js", "entry.js"] {
@@ -22,7 +22,7 @@ pub fn package_abi(vm_crate: &Path) -> String {
         all.extend_from_slice(super::minify::strip_javascript(&text.replace("\r\n", "\n")).as_bytes());
     }
     for file in ["args.rs", "wire.rs"] {
-        let text = std::fs::read_to_string(vm_crate.join("src/vm/py_tensor").join(file))
+        let text = std::fs::read_to_string(vm_crate.join("src/lang/python/vm/py_tensor").join(file))
             .unwrap_or_else(|e| panic!("py_tensor/{file}: {e}"));
         all.extend_from_slice(file.as_bytes());
         all.extend_from_slice(text.replace("\r\n", "\n").as_bytes());

@@ -1,5 +1,5 @@
 // Comment stripping for the Python library and runtime sources the Python
-// frontend embeds (`src/frontend/python/{lib,runtime}`). Shared by
+// frontend embeds (`src/lang/python/frontend/{lib,runtime}`). Shared by
 // `build.rs`, which writes the stripped copies to `$OUT_DIR/pysrc/`, and by
 // the frontend's `minify_check` test, which proves the stripped text
 // compiles to the same program.

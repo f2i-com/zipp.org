@@ -1,6 +1,6 @@
 // Writes comment-stripped copies of the Python frontend's embedded library
 // and runtime sources to `$OUT_DIR/pysrc/<same relative path>`, which
-// `src/frontend/python/mod.rs` embeds in place of the originals. The
+// `src/lang/python/frontend/mod.rs` embeds in place of the originals. The
 // WebAssembly artifact carries this text verbatim, so comments are shipped
 // bytes; see `build/minify.rs` for what is removed and why every line and
 // column of code is preserved.
@@ -25,9 +25,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build/abi.rs");
     println!("cargo:rerun-if-changed=build/instr_codec.rs");
     println!("cargo:rerun-if-changed=src/bytecode.rs");
-    println!("cargo:rerun-if-changed=src/vm/py_tensor/args.rs");
-    println!("cargo:rerun-if-changed=src/vm/py_tensor/wire.rs");
-    let root = Path::new("src/frontend/python");
+    println!("cargo:rerun-if-changed=src/lang/python/vm/py_tensor/args.rs");
+    println!("cargo:rerun-if-changed=src/lang/python/vm/py_tensor/wire.rs");
+    let root = Path::new("src/lang/python");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("pysrc");
     for dir in ["lib", "runtime"] {
         // A directory path makes cargo rescan everything under it.

@@ -135,7 +135,7 @@ self-checking programs across Node, the interpreter, and JIT-tier controls.
 
 ## Frontend design
 
-`crates/zipp-vm/src/parse` is a hand-written lexer and recursive-descent parser.
+`crates/zipp-vm/src/lang/js/parse` is a hand-written lexer and recursive-descent parser.
 It owns its AST and strings, so parsed programs can be cached and shared without
 an arena lifetime. The compiler builds a separate binding/scope model; parser
 scope state exists only long enough to enforce static semantics and early
@@ -306,8 +306,12 @@ are in [`SECURITY.md`](SECURITY.md) and the two runner READMEs.
 
 ```text
 crates/zipp-vm/src/
-  parse/            source -> owned AST
-  compile/          AST -> register bytecode
+  lang/             the languages; lang/mod.rs selects a frontend
+    js/parse/       JavaScript source -> owned AST
+    js/compile/     AST -> register bytecode
+    js/front.rs     the parse entry points, one per grammar
+    python/         frontend/, runtime/ (JS), lib/ (bundled modules),
+                    vm/ (Py* instructions, tables, tensors), jit/
   bytecode.rs       instruction definitions
   value.rs          NaN-boxed Value
   heap.rs           object storage, shapes, generations, GC substrate

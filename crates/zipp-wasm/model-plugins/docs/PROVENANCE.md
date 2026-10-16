@@ -18,7 +18,7 @@ Repository/API contracts inspected at ZIPP commit
 Read again while integrating this overlay into a full checkout, because the host
 depends on what they decide:
 
-- `crates/zipp-vm/src/frontend/python/stmts.rs`: `ImportFrom` with a level above
+- `crates/zipp-vm/src/lang/python/frontend/stmts.rs`: `ImportFrom` with a level above
   zero was refused (`relative imports are not supported`) when this overlay was
   integrated, which is why a plugin's sibling modules are imported absolutely
   under the installed `zipp_plugin` package. Since `90e0a9c7` the frontend

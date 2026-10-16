@@ -2190,7 +2190,7 @@ pub enum Instr {
     },
 
     // ---- Python frontend fast paths, round 2 (additive) --------------------
-    // Each is executed out of line by `Vm::py_step` (`vm/py_ops.rs`), always
+    // Each is executed out of line by `Vm::py_step` (`lang/python/vm/py_ops.rs`), always
     // has a `slow` edge to the emitter's generic code, and never calls out
     // to guest code: the fast path only reads (or, where stated, writes)
     // runtime records, Maps and primitive values.

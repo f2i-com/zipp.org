@@ -7,6 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 #[cfg(feature = "python")]
+#[path = "python/frontend/mod.rs"]
 mod python;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +179,7 @@ pub fn set_python_runtime_memo(enabled: bool) {
 /// process, such as the `zipp` command: only the first process then compiles
 /// the runtime (about 0.7 MB of JavaScript) and each library module. Entries
 /// belong to the executable and settings that wrote them, see
-/// `frontend/python/code_cache.rs`. Takes effect if called before the first
+/// `lang/python/frontend/code_cache.rs`. Takes effect if called before the first
 /// Python compile; ignored on `wasm32`.
 pub fn set_python_runtime_cache(dir: Option<std::path::PathBuf>) {
     #[cfg(feature = "python")]

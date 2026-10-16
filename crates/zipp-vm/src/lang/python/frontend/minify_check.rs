@@ -14,7 +14,7 @@ use zipp_pyparse::{lexer, token::T, Limits, Mode};
 use std::path::{Path, PathBuf};
 
 fn pairs(dir: &str, ext: &str) -> Vec<(PathBuf, String, String)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/frontend/python");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lang/python");
     let out = Path::new(env!("OUT_DIR")).join("pysrc");
     let mut found = Vec::new();
     let mut stack = vec![PathBuf::from(dir)];

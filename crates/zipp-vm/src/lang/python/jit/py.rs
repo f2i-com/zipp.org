@@ -1,6 +1,6 @@
 //! The JIT's Python support: the Python frontend's fused instructions
 //! (`Instr::Py*`, executed by `Vm::py_step`/`py_step_ext` in
-//! `vm/py_ops.rs`) in the memory-backed tiers, and the policy for what a
+//! `lang/python/vm/py_ops.rs`) in the memory-backed tiers, and the policy for what a
 //! Python program compiles.
 //!
 //! # What compiles
@@ -929,7 +929,7 @@ pub(crate) fn emit_py_op(
             );
         }
         // The instructions that only answer a value or take their slow edge:
-        // each through its own helper (`vm/engine/py_jit.rs`), the step's
+        // each through its own helper (`lang/python/jit/py_jit.rs`), the step's
         // function over the operands with the site for its cache entry,
         // instead of through `Vm::jit_py_op`, which finds and decodes the
         // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary

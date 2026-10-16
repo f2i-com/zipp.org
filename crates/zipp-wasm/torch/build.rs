@@ -22,9 +22,9 @@ fn main() {
     for p in [
         "build.rs",
         "../../zipp-vm/build",
-        "../../zipp-vm/src/frontend/python/lib",
-        "../../zipp-vm/src/frontend/python/runtime",
-        "../../zipp-vm/src/vm/py_tensor",
+        "../../zipp-vm/src/lang/python/lib",
+        "../../zipp-vm/src/lang/python/runtime",
+        "../../zipp-vm/src/lang/python/vm/py_tensor",
     ] {
         println!("cargo:rerun-if-changed={p}");
     }

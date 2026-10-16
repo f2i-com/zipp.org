@@ -1165,7 +1165,7 @@ Workspace map:
 
 | Path | Purpose |
 |---|---|
-| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, JITs, and the experimental Python frontend (`src/frontend`). |
+| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, JITs, and the languages (`src/lang/`: JavaScript and the experimental Python). |
 | [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` / `zipp py` command line. |
 | [`crates/regress-fork`](crates/regress-fork) | ECMAScript regex engine fork and conformance fixes. |
 | [`crates/zipp-wasm`](crates/zipp-wasm/README.md) | Browser/Worker embedding. |

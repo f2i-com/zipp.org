@@ -3419,30 +3419,45 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 mod handler_pool;
 pub(crate) mod prof;
+// ── Python's half of the VM ── its instructions' semantics, runtime
+// tables and library natives. The files live with the rest of the language
+// in `lang/python/vm/`; they are modules of `vm` because they implement the
+// VM itself and work on its private state.
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/prof_py.rs"]
 pub(crate) mod prof_py;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_attr.rs"]
 mod py_attr;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_ops.rs"]
 mod py_ops;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_rt.rs"]
 mod py_rt;
 #[cfg(feature = "python")]
 #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(unused_imports))]
 pub(crate) use py_rt::py_frame_guard_start;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_gen.rs"]
 mod py_gen;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_in.rs"]
 mod py_in;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_json.rs"]
 mod py_json;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_lazy.rs"]
 mod py_lazy;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_str.rs"]
 mod py_str;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_table.rs"]
 pub(crate) mod py_table;
 #[cfg(feature = "python")]
+#[path = "../lang/python/vm/py_tensor.rs"]
 mod py_tensor;
 pub(crate) use prof::dump as prof_stats;
 pub(crate) use temporal::tzdb_version;

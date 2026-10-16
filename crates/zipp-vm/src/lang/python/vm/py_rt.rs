@@ -1,7 +1,7 @@
 //! The Python runtime's registry, per VM (`Vm::py_rt`), and the fused
 //! instructions' per-site caches.
 //!
-//! The runtime (`frontend/python/runtime/*.js`) ends its initialisation with
+//! The runtime (`lang/python/runtime/*.js`) ends its initialisation with
 //! `__zipp_py_bind(R, pins, dict)` (entry.js), handing the engine its helper
 //! object once. What the fused instructions (`vm::py_ops`, `vm::py_attr`)
 //! need from it is read then and kept here: the builtin type objects and

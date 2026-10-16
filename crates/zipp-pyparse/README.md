@@ -2,7 +2,7 @@
 
 ZIPP's own Python front end: a byte-oriented lexer, a compact arena AST, a
 recursive-descent parser for Python 3.13 syntax, and the tree ZIPP's
-compiler walks. ZIPP's Python frontend (`crates/zipp-vm/src/frontend/python`)
+compiler walks. ZIPP's Python frontend (`crates/zipp-vm/src/lang/python/frontend`)
 parses every module with it. It was written for ZIPP and contains no
 RustPython code.
 

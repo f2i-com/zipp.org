@@ -34,7 +34,7 @@ it is not automatically granted browser APIs by the stock playground.
 ## Diagnostic demo
 
 `python scripts/serve.py` serves `demo/` with no npm install. It runs graphs
-previously exported from `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`, rather than executing the displayed
+previously exported from `../../zipp-vm/src/lang/python/lib/shared/zipp_gpu.py`, rather than executing the displayed
 Python source. Use the project playground above to run/edit Python itself.
 The native `examples/run_native.py` harness uses installed CPython and Node.
 
@@ -151,7 +151,7 @@ callback that resubmits cannot recurse), and rejects work after tenant invalidat
 - `src/kernel-math.mjs`: the scalar definitions (erf-based GELU, sigmoid, NaN-keeping ReLU) every backend implements.
 - `src/zipp-python-adapter.mjs`: actual Python host bridge.
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
-- `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
+- `../../zipp-vm/src/lang/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
 - `src/quant.mjs`: Q4_K block decoding, a port of ggml's own, checked against
   the `f2i-gguf-quants` crate rather than only against itself. An `input` node may
   declare `dtype: 'q4_k'` and carry blocks instead of values; a `matmul` with

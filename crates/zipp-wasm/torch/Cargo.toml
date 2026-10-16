@@ -4,7 +4,7 @@
 # embeds its own, with a manifest of SHA-256 digests and the engine ABI they
 # were built against) and the native tensor kernels, compiled from the same
 # source the engine compiles into the `all` artifact
-# (crates/zipp-vm/src/vm/py_tensor/*). A host adds it with the loader
+# (crates/zipp-vm/src/lang/python/vm/py_tensor/*). A host adds it with the loader
 # `zipp_torch.js`; see ../README.md.
 #
 # Its own workspace, like ../rust: a freestanding module with no imports and

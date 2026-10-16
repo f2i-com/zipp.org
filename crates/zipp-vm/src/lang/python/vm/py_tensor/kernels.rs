@@ -7,7 +7,7 @@
 //!
 //! Nothing here names the engine: arguments arrive as [`Arg`]s, typed-array
 //! bytes through [`Host::bytes`] / [`Host::bytes_mut`], and the budget
-//! through [`Host::admits`] / [`Host::charge`]. See `vm/py_tensor.rs` for
+//! through [`Host::admits`] / [`Host::charge`]. See `lang/python/vm/py_tensor.rs` for
 //! the contract (same values or decline) and the budget.
 #![allow(clippy::too_many_arguments)]
 use super::jsmath::{f16_bits_to_f64, f64_to_f16_bits, math_unary, to_uint_modular, M};
