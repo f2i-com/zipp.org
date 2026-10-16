@@ -291,7 +291,9 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
             let bits = unsafe { *regs.add(val_base + offset) };
             buf[offset] = Value::from_bits(bits);
         }
-        let idx = vm.heap.alloc_finalized(&plan, &buf[..count], shape);
+        // SAFETY: the plan is an entry of a root FuncProto's table (above),
+        // which outlives the VM and its heap.
+        let idx = unsafe { vm.heap.alloc_finalized_borrowed(plan, &buf[..count], shape) };
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
@@ -376,7 +378,9 @@ pub(crate) extern "win64" fn jit_finalize_object_thin(
         let plan = unsafe { &*(plan_ptr as usize as *const crate::bytecode::StaticKeyPlan) };
         debug_assert!(plan.runtime_valid() && plan.len() == count);
         let vals = unsafe { std::slice::from_raw_parts(src as *const Value, count) };
-        let idx = vm.heap.alloc_finalized(plan, vals, shape);
+        // SAFETY: the plan is an entry of a root FuncProto's table (above),
+        // which outlives the VM and its heap.
+        let idx = unsafe { vm.heap.alloc_finalized_borrowed(plan, vals, shape) };
         vm.realm_born(idx, vm.obj_proto);
         // The thin heap fold implies the static-key statistics are off; the
         // counter call is reachable (and needed) only otherwise.
@@ -424,7 +428,6 @@ pub(crate) extern "win64" fn jit_finalize_object(
             .func(func_id as usize)
             .static_key_plans
             .get(plan_idx as usize)
-            .cloned()
         else {
             return crate::codegen::SELF_CALL_DEOPT;
         };
@@ -440,8 +443,8 @@ pub(crate) extern "win64" fn jit_finalize_object(
             let bits = unsafe { *regs.add(val_base + offset) };
             buf[offset] = Value::from_bits(bits);
         }
-        let shape = vm.finalize_shape(func_id, plan_idx as u16, &plan);
-        let idx = vm.heap.alloc_finalized(&plan, &buf[..count], shape);
+        let shape = vm.finalize_shape(func_id, plan_idx as u16, plan);
+        let idx = vm.alloc_finalized_site(plan, &buf[..count], shape);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()

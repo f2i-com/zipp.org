@@ -2867,16 +2867,6 @@ impl StaticKeyPlan {
         }))
     }
 
-    /// B239: do these two handles name the SAME plan? Plans are immutable and
-    /// shared by `Arc`, so pointer equality is a sound (if incomplete) answer
-    /// to "are these key sequences identical", and the only one cheap enough
-    /// to ask on every object construction.
-    #[cfg(not(feature = "safe-sandbox"))]
-    #[inline]
-    pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&a.0, &b.0)
-    }
-
     /// Precomputed "any key names an array element" bit — see the field doc.
     #[inline]
     pub(crate) fn has_element_key(&self) -> bool {
@@ -2904,6 +2894,288 @@ impl StaticKeyPlan {
     }
 }
 
+/// An object's hold on the key plan its keys come from (`PropKeys::Planned`).
+///
+/// An OWNED handle keeps one strong count on the plan, exactly as the
+/// `StaticKeyPlan` it replaced. A BORROWED handle keeps none: it is minted
+/// only for a plan that lives in an installed `FuncProto`'s plan table
+/// (`Heap::alloc_finalized_borrowed`), and those tables belong to the
+/// `Program`, the eval arena or a leaked program, all of which outlive the
+/// VM and therefore its heap. A pooled object shell is refit from one literal
+/// site to another on every allocation; with owned handles each such refit
+/// incremented the new plan's count and decremented the old one's, two
+/// atomic read-modify-writes on lines the courier thread also writes when it
+/// frees shells. Borrowed handles make that swap two plain stores.
+///
+/// Cloning always yields an OWNED handle (one increment, what cloning a
+/// `StaticKeyPlan` cost), so a copy of a map that leaves its heap holds its
+/// plan alive by itself. Dropping a borrowed handle does nothing, which is why
+/// the heap may drop its objects, and the courier its shells, after the
+/// program is gone: neither dereferences the plan.
+#[cfg(not(feature = "safe-sandbox"))]
+pub struct PlanHandle {
+    /// `Arc::as_ptr` of the plan's data, with bit 0 set for a borrowed
+    /// handle. `StaticKeyPlanData` is 8-aligned, so bit 0 of the address
+    /// itself is always clear.
+    tagged: std::ptr::NonNull<StaticKeyPlanData>,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl PlanHandle {
+    const BORROWED: usize = 1;
+
+    /// A handle that takes over `plan`'s strong count.
+    #[inline]
+    pub(crate) fn owned(plan: StaticKeyPlan) -> Self {
+        let raw = std::sync::Arc::into_raw(plan.0).cast_mut();
+        // SAFETY: `Arc::into_raw` never returns null.
+        Self {
+            tagged: unsafe { std::ptr::NonNull::new_unchecked(raw) },
+        }
+    }
+
+    /// A handle that holds no count on `plan`.
+    ///
+    /// # Safety
+    ///
+    /// `plan`'s allocation must stay alive for as long as the handle, or any
+    /// map holding it, can still be read or cloned: in practice, `plan` is an
+    /// entry of an installed `FuncProto`'s `static_key_plans` and the handle
+    /// lives in that VM's heap.
+    #[inline]
+    pub(crate) unsafe fn borrowed(plan: &StaticKeyPlan) -> Self {
+        let raw = std::sync::Arc::as_ptr(&plan.0).cast_mut();
+        let tagged = raw.map_addr(|a| a | Self::BORROWED);
+        // SAFETY: the tagged address is the plan's own (non-null) address
+        // with bit 0 set.
+        Self {
+            tagged: unsafe { std::ptr::NonNull::new_unchecked(tagged) },
+        }
+    }
+
+    /// A handle on a plan that lives as long as the process.
+    #[inline]
+    pub(crate) fn of_static(plan: &'static StaticKeyPlan) -> Self {
+        if plan_borrow_enabled() {
+            // SAFETY: a `'static` plan outlives every handle.
+            unsafe { Self::borrowed(plan) }
+        } else {
+            Self::owned(plan.clone())
+        }
+    }
+
+    #[inline]
+    fn ptr(&self) -> *const StaticKeyPlanData {
+        self.tagged.as_ptr().map_addr(|a| a & !Self::BORROWED).cast_const()
+    }
+
+    #[inline]
+    fn is_borrowed(&self) -> bool {
+        self.tagged.as_ptr().addr() & Self::BORROWED != 0
+    }
+
+    #[inline]
+    fn data(&self) -> &StaticKeyPlanData {
+        // SAFETY: an owned handle holds a strong count; a borrowed one is
+        // within `borrowed`'s contract.
+        unsafe { &*self.ptr() }
+    }
+
+    /// B239: does this handle name exactly `plan`? Plans are immutable and
+    /// shared, so pointer identity is a sound (if incomplete) answer to "are
+    /// these key sequences identical", and the only one cheap enough to ask
+    /// on every object construction.
+    #[inline]
+    pub(crate) fn is(&self, plan: &StaticKeyPlan) -> bool {
+        std::ptr::eq(self.ptr(), std::sync::Arc::as_ptr(&plan.0))
+    }
+
+    /// The plan itself, as a new strong count.
+    #[inline]
+    pub(crate) fn to_plan(&self) -> StaticKeyPlan {
+        let p = self.ptr();
+        // SAFETY: the allocation is live (see `data`); the count taken here
+        // is the returned `Arc`'s.
+        unsafe {
+            std::sync::Arc::increment_strong_count(p);
+            StaticKeyPlan(std::sync::Arc::from_raw(p))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_element_key(&self) -> bool {
+        self.data().has_element_key
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data().keys.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data().keys.is_empty()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> &[String] {
+        self.data().keys.as_slice()
+    }
+
+    #[inline]
+    pub(crate) fn runtime_valid(&self) -> bool {
+        self.data().runtime_valid
+    }
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl Clone for PlanHandle {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::owned(self.to_plan())
+    }
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl Drop for PlanHandle {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.is_borrowed() {
+            // SAFETY: an owned handle holds exactly one strong count, taken
+            // over in `owned`.
+            unsafe { std::sync::Arc::decrement_strong_count(self.ptr()) };
+        }
+    }
+}
+
+// SAFETY: the pointee is immutable `Send + Sync` data. An owned handle is an
+// `Arc` in all but type. A borrowed one is dereferenced only while its VM
+// runs, on the VM's thread or under its borrow; the courier thread only drops
+// shells, and dropping a borrowed handle touches nothing.
+#[cfg(not(feature = "safe-sandbox"))]
+unsafe impl Send for PlanHandle {}
+#[cfg(not(feature = "safe-sandbox"))]
+unsafe impl Sync for PlanHandle {}
+
+#[cfg(all(test, not(feature = "safe-sandbox")))]
+mod plan_handle_tests {
+    use super::*;
+
+    fn count(plan: &StaticKeyPlan) -> usize {
+        std::sync::Arc::strong_count(&plan.0)
+    }
+
+    #[test]
+    fn borrowed_handles_never_count_and_clones_always_own() {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "b".into()]);
+        let base = count(&plan);
+        // SAFETY: `plan` outlives every handle below.
+        let borrowed = unsafe { PlanHandle::borrowed(&plan) };
+        assert_eq!(count(&plan), base);
+        assert!(borrowed.is_borrowed() && borrowed.is(&plan));
+        assert_eq!(borrowed.keys(), ["a", "b"]);
+        assert!(borrowed.runtime_valid() && !borrowed.has_element_key());
+
+        let cloned = borrowed.clone();
+        assert!(!cloned.is_borrowed() && cloned.is(&plan));
+        assert_eq!(count(&plan), base + 1);
+        drop(borrowed);
+        assert_eq!(count(&plan), base + 1);
+        drop(cloned);
+        assert_eq!(count(&plan), base);
+
+        let owned = PlanHandle::owned(plan.clone());
+        assert_eq!(count(&plan), base + 1);
+        let again = owned.to_plan();
+        assert_eq!(count(&plan), base + 2);
+        drop(owned);
+        drop(again);
+        assert_eq!(count(&plan), base);
+
+        let other = StaticKeyPlan::new(vec!["a".into(), "b".into()]);
+        // SAFETY: as above.
+        assert!(!unsafe { PlanHandle::borrowed(&other) }.is(&plan));
+    }
+
+    #[test]
+    fn a_static_plan_is_borrowed_unless_switched_off() {
+        static PLAN: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+        let plan = PLAN.get_or_init(|| StaticKeyPlan::new(vec!["x".into()]));
+        let base = count(plan);
+        let h = PlanHandle::of_static(plan);
+        assert_eq!(h.is_borrowed(), plan_borrow_enabled());
+        drop(h);
+        assert_eq!(count(plan), base);
+    }
+}
+
+/// The safe-sandbox profile's handle: always owned.
+#[cfg(feature = "safe-sandbox")]
+#[derive(Clone)]
+pub struct PlanHandle(StaticKeyPlan);
+
+#[cfg(feature = "safe-sandbox")]
+impl PlanHandle {
+    #[inline]
+    pub(crate) fn owned(plan: StaticKeyPlan) -> Self {
+        Self(plan)
+    }
+
+    #[inline]
+    pub(crate) fn of_static(plan: &'static StaticKeyPlan) -> Self {
+        Self(plan.clone())
+    }
+
+    #[cfg_attr(not(feature = "python"), allow(dead_code))] // the Python records' caller
+    #[inline]
+    pub(crate) fn to_plan(&self) -> StaticKeyPlan {
+        self.0.clone()
+    }
+
+    #[inline]
+    pub(crate) fn has_element_key(&self) -> bool {
+        self.0.has_element_key()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> &[String] {
+        self.0.keys()
+    }
+
+    #[inline]
+    pub(crate) fn runtime_valid(&self) -> bool {
+        self.0.runtime_valid()
+    }
+}
+
+/// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
+/// same-binary comparator for borrowed handles).
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+pub(crate) fn plan_borrow_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PLAN_BORROW").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 #[cfg(test)]
 mod static_key_plan_layout_tests {
     use super::*;
@@ -2915,6 +3187,7 @@ mod static_key_plan_layout_tests {
     #[test]
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
+        assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
         assert_eq!(std::mem::size_of::<FuncProto>(), 272);
     }

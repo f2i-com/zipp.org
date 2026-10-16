@@ -1543,6 +1543,25 @@ impl<'p> Vm<'p> {
         shape
     }
 
+    /// Allocate a `FinalizeObject` literal from `plan`, an entry of one of
+    /// this VM's own `FuncProto` plan tables. Those outlive the VM and the
+    /// heap it owns, so the object's keys borrow the plan instead of counting
+    /// it (`PlanHandle`).
+    #[inline]
+    pub(crate) fn alloc_finalized_site(
+        &mut self,
+        plan: &'p crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        // SAFETY: `plan` is borrowed for `'p`, which outlives `self` and so
+        // the heap `self` owns (the heap is never moved out of its VM).
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { self.heap.alloc_finalized_borrowed(plan, vals, shape) };
+        #[cfg(feature = "safe-sandbox")]
+        self.heap.alloc_finalized(plan, vals, shape)
+    }
+
     /// Tag a freshly-created function/class with the realm whose code created it
     /// (no-op in the main realm) — functions born inside a child realm's
     /// eval/Function code carry the child's realm for GetFunctionRealm,

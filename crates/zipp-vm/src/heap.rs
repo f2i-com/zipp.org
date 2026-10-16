@@ -11,7 +11,7 @@
 //! enumeration order and is correct (if not yet fast — shapes/inline-caches are
 //! a later tier).
 
-use crate::bytecode::{static_key_plans_enabled, StaticKeyPlan};
+use crate::bytecode::{static_key_plans_enabled, PlanHandle, StaticKeyPlan};
 use crate::value::Value;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -1217,7 +1217,7 @@ pub(crate) fn note_static_key_jit_object() {
 pub enum PropKeys {
     Owned(Vec<String>),
     Planned {
-        all: StaticKeyPlan,
+        all: PlanHandle,
         visible_len: usize,
     },
 }
@@ -1292,7 +1292,7 @@ impl PropKeys {
 
     fn planned(plan: StaticKeyPlan) -> Self {
         Self::Planned {
-            all: plan,
+            all: PlanHandle::owned(plan),
             visible_len: 0,
         }
     }
@@ -2559,7 +2559,8 @@ impl ObjMap {
     /// `finalized_from_store` overwrites applied on top.
     #[cfg(not(feature = "safe-sandbox"))]
     fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
-        self.refit_finalized_inner(plan, vals, shape);
+        // SAFETY: no borrowed handle is minted.
+        unsafe { self.refit_finalized_inner(plan, vals, shape, false) };
         static_key_stats::object();
         static_key_stats::bulk_appends(plan.len());
     }
@@ -2567,14 +2568,34 @@ impl ObjMap {
     /// `refit_finalized` for the construction-latched thin path. That path is
     /// reachable only while static-key telemetry is disabled, so avoid the
     /// two otherwise-redundant atomic latch loads per literal.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn refit_finalized_no_stats(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
-        self.refit_finalized_inner(plan, vals, shape);
+    unsafe fn refit_finalized_no_stats(
+        &mut self,
+        plan: &StaticKeyPlan,
+        vals: ValStore,
+        shape: u32,
+        borrow: bool,
+    ) {
+        // SAFETY: this function's contract.
+        unsafe { self.refit_finalized_inner(plan, vals, shape, borrow) };
     }
 
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
-    fn refit_finalized_inner(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+    unsafe fn refit_finalized_inner(
+        &mut self,
+        plan: &StaticKeyPlan,
+        vals: ValStore,
+        shape: u32,
+        borrow: bool,
+    ) {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2599,12 +2620,17 @@ impl ObjMap {
         // Whatever the list was, it is the plan's below, which owns no strings.
         *key_bytes = 0;
         match keys {
-            PropKeys::Planned { all, visible_len } if StaticKeyPlan::ptr_eq(all, plan) => {
+            PropKeys::Planned { all, visible_len } if all.is(plan) => {
                 *visible_len = n;
             }
             _ => {
                 *keys = PropKeys::Planned {
-                    all: plan.clone(),
+                    all: if borrow {
+                        // SAFETY: this function's contract.
+                        unsafe { PlanHandle::borrowed(plan) }
+                    } else {
+                        PlanHandle::owned(plan.clone())
+                    },
                     visible_len: n,
                 }
             }
@@ -2644,7 +2670,7 @@ impl ObjMap {
     /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
     fn finalized_from_store(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
         let n = plan.len();
-        let m = Self::finalized_from_store_inner(plan, vals, shape);
+        let m = Self::finalized_from_store_inner(PlanHandle::owned(plan), vals, shape);
         static_key_stats::object();
         static_key_stats::bulk_appends(n);
         m
@@ -2654,11 +2680,11 @@ impl ObjMap {
     /// `refit_finalized_no_stats`.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn finalized_from_store_no_stats(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+    fn finalized_from_store_no_stats(plan: PlanHandle, vals: ValStore, shape: u32) -> ObjMap {
         Self::finalized_from_store_inner(plan, vals, shape)
     }
 
-    fn finalized_from_store_inner(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+    fn finalized_from_store_inner(plan: PlanHandle, vals: ValStore, shape: u32) -> ObjMap {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2736,7 +2762,7 @@ impl ObjMap {
         };
         let mut m = ObjMap::new_side_table();
         m.set_keys(PropKeys::Planned {
-            all: plan.clone(),
+            all: PlanHandle::of_static(plan),
             visible_len: 3,
         });
         m.vals = ValStore::Vec(vec![length, iterator, callee]);
@@ -3027,7 +3053,7 @@ impl ObjMap {
             Some(all) if all.len() == n + 1 => {
                 debug_assert!(all.keys()[..n] == *self.keys.as_ref() && all.keys()[n] == key);
                 self.set_keys(PropKeys::Planned {
-                    all,
+                    all: PlanHandle::owned(all),
                     visible_len: n + 1,
                 });
             }
@@ -7217,7 +7243,8 @@ impl Heap {
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc {
-            return self.alloc_finalized_thin(plan, vals, shape);
+            // SAFETY: no borrowed handle is minted.
+            return unsafe { self.alloc_finalized_thin(plan, vals, shape, false) };
         }
         #[cfg(not(feature = "safe-sandbox"))]
         let store = match val_slab_class(vals.len()) {
@@ -7279,6 +7306,30 @@ impl Heap {
         self.alloc_object_settled(boxed, shape)
     }
 
+    /// [`Heap::alloc_finalized`] for a literal site's own plan: the object's
+    /// keys BORROW the plan (see [`PlanHandle`]), so neither this allocation
+    /// nor a later refit of its shell to another site changes a plan's count.
+    ///
+    /// # Safety
+    ///
+    /// `plan` must outlive this heap: an entry of an installed `FuncProto`'s
+    /// `static_key_plans` (the program, eval arena and leaked programs all
+    /// outlive the VM that owns the heap).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) unsafe fn alloc_finalized_borrowed(
+        &mut self,
+        plan: &crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        if self.thin_alloc && crate::bytecode::plan_borrow_enabled() {
+            // SAFETY: this function's contract.
+            return unsafe { self.alloc_finalized_thin(plan, vals, shape, true) };
+        }
+        self.alloc_finalized(plan, vals, shape)
+    }
+
     /// B257: the thin twin of [`Heap::alloc_finalized`] — the same slab
     /// cell, pool pop and in-place refit, with the allocation-mode latches
     /// already folded into `thin_alloc` and the occupant installed by
@@ -7287,13 +7338,18 @@ impl Heap {
     /// the shell refit and the settled mirror are all on and the static-key
     /// statistics are off — exactly the configuration whose general-path
     /// behaviour this reproduces.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn alloc_finalized_thin(
+    unsafe fn alloc_finalized_thin(
         &mut self,
         plan: &crate::bytecode::StaticKeyPlan,
         vals: &[Value],
         shape: u32,
+        borrow: bool,
     ) -> u32 {
         debug_assert!(self.thin_alloc);
         let class = val_slab_class(vals.len());
@@ -7382,11 +7438,17 @@ impl Heap {
                 if self.oracle {
                     self.obj_pool_stats[1] += 1;
                 }
-                b.refit_finalized_no_stats(plan, store, shape);
+                // SAFETY: this function's contract.
+                unsafe { b.refit_finalized_no_stats(plan, store, shape, borrow) };
                 b
             }
             None => Box::new(ObjMap::finalized_from_store_no_stats(
-                plan.clone(),
+                if borrow {
+                    // SAFETY: this function's contract.
+                    unsafe { PlanHandle::borrowed(plan) }
+                } else {
+                    PlanHandle::owned(plan.clone())
+                },
                 store,
                 shape,
             )),

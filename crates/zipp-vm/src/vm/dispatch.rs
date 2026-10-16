@@ -3034,7 +3034,6 @@ impl<'p> Vm<'p> {
                             .func(func_id as usize)
                             .static_key_plans
                             .get(plan as usize)
-                            .cloned()
                             .ok_or_else(|| {
                                 Thrown("InternalError: invalid static key plan".to_string())
                             })?;
@@ -3053,7 +3052,7 @@ impl<'p> Vm<'p> {
                                 "InternalError: invalid static key plan".to_string(),
                             ));
                         }
-                        let shape = self.finalize_shape(func_id, plan_idx, &plan);
+                        let shape = self.finalize_shape(func_id, plan_idx, plan);
                         // B187: values staged in a stack buffer (count <= 16 by
                         // the compile gate AND the check above), the map's storage
                         // comes from the literal slab — no per-object Vec round-trip.
@@ -3061,8 +3060,8 @@ impl<'p> Vm<'p> {
                         for i in 0..count {
                             buf[i as usize] = self.get(base, val_base + i);
                         }
-                        let v = Value::heap(self.heap.alloc_finalized(
-                            &plan,
+                        let v = Value::heap(self.alloc_finalized_site(
+                            plan,
                             &buf[..count as usize],
                             shape,
                         ));

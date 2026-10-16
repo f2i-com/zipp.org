@@ -1285,14 +1285,14 @@ impl<'p> Vm<'p> {
         };
         #[cfg(not(feature = "safe-sandbox"))]
         let idx = {
-            let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| crate::bytecode::StaticKeyPlan::ptr_eq(k, all)));
+            let kept = self.py_rt.as_deref().and_then(|p| p.plans.iter().position(|k| all.is(k)));
             match kept {
                 Some(i) => {
                     let p = self.py_rt.as_deref()?;
                     self.heap.alloc_finalized(&p.plans[i], vals, shape)
                 }
                 None => {
-                    let plan = all.clone();
+                    let plan = all.to_plan();
                     if let Some(p) = self.py_rt.as_deref_mut() {
                         if p.plans.len() < 8 {
                             p.plans.push(plan.clone());
@@ -1304,7 +1304,7 @@ impl<'p> Vm<'p> {
         };
         #[cfg(feature = "safe-sandbox")]
         let idx = {
-            let plan = all.clone();
+            let plan = all.to_plan();
             self.heap.alloc_finalized(&plan, vals, shape)
         };
         self.realm_born(idx, self.obj_proto);
