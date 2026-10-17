@@ -115,6 +115,7 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::Ne { .. }
             | Instr::FuseEqJump { .. }
             | Instr::FuseIntEqJump { .. }
+            | Instr::FuseIntNeJump { .. }
             | Instr::JumpIfFalse { .. }
             | Instr::JumpIfTrue { .. }
             | Instr::FuseAddIntJump { .. }
@@ -127,6 +128,9 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::UpvalGet { .. }
             | Instr::UpvalSet { .. }
             | Instr::MathOp { .. }
+            // A script's counters and accumulators.
+            | Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
     )
 }
 
@@ -701,6 +705,30 @@ impl<'p> Vm<'p> {
                     };
                     self.set(base, dst, Value::bool(r));
                     ip = if r { target as usize } else { ip + 3 };
+                }
+                // A global's store where the main arms' is the slot write: an
+                // initialized slot no defineProperty'd own property governs,
+                // and no `$262.evalScript` const anywhere.
+                Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } if FULL => {
+                    if self.globals[idx as usize].is_uninitialized()
+                        || !self.eval_const_globals.is_empty()
+                        || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                    {
+                        hand_over!();
+                    }
+                    self.globals[idx as usize] = self.get(base, src);
+                    ip += 1;
+                }
+                Instr::FuseIntNeJump { ldst, val, a, dst, target } if FULL => {
+                    self.set(base, ldst, Value::int(val));
+                    let va = self.get(base, a);
+                    let r = if va.is_int() {
+                        va.as_int() == val
+                    } else {
+                        va.is_double() && va.as_f64() == val as f64
+                    };
+                    self.set(base, dst, Value::bool(r));
+                    ip = if r { ip + 3 } else { target as usize };
                 }
                 Instr::GetIndex { dst, obj, key } if FULL => {
                     let (o, k) = (self.get(base, obj), self.get(base, key));

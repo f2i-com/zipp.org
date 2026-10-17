@@ -409,6 +409,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         #[cfg(all())]
         Instr::FuseAddLoadInt { ldst: r0, dst: r1, a: r2, .. }
         | Instr::FuseIntEqJump { ldst: r0, dst: r1, a: r2, .. }
+        | Instr::FuseIntNeJump { ldst: r0, dst: r1, a: r2, .. }
         | Instr::FuseConstEqJump { ldst: r0, dst: r1, a: r2, .. }
         | Instr::FuseLoadGlobalAddInt { gdst: r0, dst: r1, a: r2, .. } => {
             *r0 = m(*r0);

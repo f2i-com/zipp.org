@@ -63,6 +63,33 @@ Object.defineProperty(globalThis, "GG", { get: function () { return 7; }, config
 function readGetter() { return GG + 1; }
 log("getter", readGetter(), readGetter());
 
+// Global stores: script `var` and `let` counters, a store before the `let`
+// is initialized, undeclared names (sloppy creates, strict throws), a
+// setter, a const, and a `var` made non-writable after the loop ran.
+var VC = 0; let LC = 0;
+function bump(n) { for (var i = 0; i < n; i++) { VC = VC + 1; LC = LC + 2; } return VC + LC; }
+log("store", bump(5), bump(3), VC, LC);
+function storeLate(v) { LATE2 = v; return LATE2; }
+log("store-tdz", catchName(function () { return storeLate(1); }));
+let LATE2 = 0;
+log("store-late", storeLate(9), LATE2);
+function storeNew(v) { NEWG = v; return NEWG; }
+function storeNewStrict(v) { "use strict"; NEWS = v; return NEWS; }
+log("store-undeclared", storeNew(3), storeNew(4), typeof NEWG, catchName(function () { return storeNewStrict(1); }), typeof NEWS);
+var setLog = [];
+Object.defineProperty(globalThis, "SG", { get: function () { return -1; }, set: function (v) { setLog.push(v); }, configurable: true });
+function storeSetter(n) { for (var i = 0; i < n; i++) { SG = i; } return SG + ":" + setLog.join(","); }
+log("store-setter", storeSetter(3));
+const KC = 1;
+function storeConst() { KC = 2; return KC; }
+log("store-const", catchName(storeConst), KC);
+var RO = 1;
+function storeRO(v) { RO = v; return RO; }
+function storeROStrict(v) { "use strict"; RO = v; return RO; }
+log("store-ro-before", storeRO(5), storeROStrict(6));
+Object.defineProperty(globalThis, "RO", { writable: false });
+log("store-ro", storeRO(7), catchName(function () { return storeROStrict(8); }), RO, bump(1));
+
 // A loop with a counter step and bound, the lite set's jumps.
 function loopSum(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + i; } return s; }
 function loopLe(n) { var s = 0; for (var i = 0; i <= n; i++) { s = s + 1; } return s; }

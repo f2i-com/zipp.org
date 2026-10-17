@@ -1756,12 +1756,23 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r { target as usize } else { ip + 3 };
                     }
-                    Instr::FuseConstEqJump { ldst, idx, a, dst, target } => {
+                    Instr::FuseIntNeJump { ldst, val, a, dst, target } => {
+                        self.set(base, ldst, Value::int(val));
+                        let va = self.get(base, a);
+                        let r = if va.is_int() {
+                            va.as_int() == val
+                        } else {
+                            va.is_double() && va.as_f64() == val as f64
+                        };
+                        self.set(base, dst, Value::bool(r));
+                        ip = if r { ip + 3 } else { target as usize };
+                    }
+                    Instr::FuseConstEqJump { ldst, idx, a, dst, when, target } => {
                         let c = self.resolve_const_slot(func_id, idx);
                         self.set(base, ldst, c);
                         let r = self.strict_eq(base, a, ldst);
                         self.set(base, dst, Value::bool(r));
-                        ip = if r { target as usize } else { ip + 3 };
+                        ip = if r == when { target as usize } else { ip + 3 };
                     }
                     Instr::FuseTypeOfJump { dst, a, code, neg, when, target } => {
                         let va = self.get(base, a);
