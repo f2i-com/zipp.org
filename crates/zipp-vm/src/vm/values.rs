@@ -1449,6 +1449,12 @@ impl<'p> Vm<'p> {
             if let Some(found) = self.plain_string_key_has(idx, key) {
                 return Ok(found);
             }
+            // An array-index number (`n in counts`), found by number.
+            if let Some(i) = crate::vm::array_index(key) {
+                if let Some(found) = self.plain_index_key_has(idx, i, false) {
+                    return Ok(found);
+                }
+            }
             let k = self.key_of(key);
             if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
                 return Ok(true);

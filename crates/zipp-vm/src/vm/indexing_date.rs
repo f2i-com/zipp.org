@@ -301,6 +301,61 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// `i in o` for an array index `i` and the plain object `idx`, from the
+    /// same levels [`Vm::plain_index_key_get`] reads (a data property or an
+    /// accessor is present either way). `own` asks `hasOwnProperty` instead:
+    /// `idx`'s own properties only. `None` leaves it to the general path,
+    /// which spelled `i` as a fresh `String` to look it up.
+    #[inline]
+    pub(crate) fn plain_index_key_has(&self, idx: u32, i: usize, own: bool) -> Option<bool> {
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if !index_key_fast_enabled()
+            || (idx == self.global_this && self.global_this != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || !self.deferred_ns_state.is_empty()
+            || !self.realm_global_objs.is_empty()
+        {
+            return None;
+        }
+        if m.element_pos(i).is_some() {
+            return Some(true);
+        }
+        if own {
+            return Some(false);
+        }
+        if !self.ic_obj_ok(idx) || m.class.is_some() || m.is_ctor {
+            return None;
+        }
+        let mut cur = idx;
+        for _ in 0..64 {
+            let next = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(false),
+                None => {
+                    if self.obj_proto == 0 || cur == self.obj_proto {
+                        return Some(false);
+                    }
+                    self.obj_proto
+                }
+            };
+            if !self.ic_obj_ok(next) {
+                return None;
+            }
+            match self.heap.get(next) {
+                HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                    if m2.element_pos(i).is_some() {
+                        return Some(true);
+                    }
+                }
+                _ => return None, // exotic link
+            }
+            cur = next;
+        }
+        None
+    }
+
     /// [[Get]] of the array index `i` from the prototype `proto` up, for a
     /// hole or an index past an Array's end: each level a plain object,
     /// searched by number. `%Array.prototype%` is such a level here, though

@@ -710,8 +710,14 @@ impl<'p> Vm<'p> {
             return None;
         }
         let idx = obj.heap_index();
-        let HeapObj::Array(items) = self.heap.get(idx) else {
-            return None;
+        let items = match self.heap.get(idx) {
+            HeapObj::Array(items) => items,
+            // A plain object's own index key, found by number.
+            HeapObj::Object(_) => {
+                let i = crate::vm::array_index(key)?;
+                return self.plain_index_key_has(idx, i, true);
+            }
+            _ => return None,
         };
         // A non-integral or negative key spells something `has_own_property`'s
         // `parse::<usize>()` would reject; leave those to the general path
