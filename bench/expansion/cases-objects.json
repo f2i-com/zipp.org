@@ -1,0 +1,72 @@
+[
+  {
+    "id": "accessors-proxy",
+    "entry": "objects/accessors-proxy.js",
+    "category": "objects",
+    "goal": "script",
+    "sizes": {"s": 2, "m": 200, "l": 1200},
+    "covers": ["object-literal getters", "object-literal setters", "Object.defineProperty accessors", "Object.defineProperties", "Object.getOwnPropertyDescriptor", "closure-backed per-instance accessors", "Proxy get trap", "Proxy set trap", "Proxy has trap", "Proxy over array (negative index)", "empty-handler Proxy forwarding", "Reflect.get with receiver", "Reflect.set", "Reflect.has", "Reflect.ownKeys", "Reflect.deleteProperty", "Reflect.defineProperty", "Object.freeze reads", "sloppy writes to frozen/sealed/non-extensible objects", "Object.isFrozen/isSealed/isExtensible"],
+    "description": "Accessor properties (literal and defineProperty), Proxy objects with get/set/has traps in hot loops, Reflect operations, and reads of frozen configuration objects with ignored sloppy-mode writes.",
+    "notes": ""
+  },
+  {
+    "id": "dict-churn",
+    "entry": "objects/dict-churn.js",
+    "category": "objects",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 800},
+    "covers": ["2,100-key dictionary objects", "integer-like keys (numeric and string)", "in operator", "hasOwnProperty.call", "Object.hasOwn", "delete on large dictionaries", "re-insertion after delete", "Object.keys order", "Object.values", "Object.entries", "for-in", "delete of the visited key during for-in", "Object.assign", "object spread", "computed keys in object literals"],
+    "description": "Plain objects used as hash maps: 2,100 keys (1,500 strings, 600 integer-like) inserted, probed, half deleted and partly re-added each round, then enumerated, iterated with for-in and merged with Object.assign and spread.",
+    "notes": ""
+  },
+  {
+    "id": "class-features",
+    "entry": "objects/class-features.js",
+    "category": "classes",
+    "goal": "script",
+    "sizes": {"s": 2, "m": 200, "l": 1500},
+    "covers": ["private fields", "private methods", "private getters", "static private fields and methods", "#x in obj brand checks", "public class fields", "static fields", "static blocks", "class getters/setters", "3-level derived constructors with field initialisers", "super method calls through 3 levels", "new.target", "instanceof across a hierarchy", "Symbol.hasInstance", "Symbol.iterator with a hand-written iterator class", "generator Symbol.iterator method", "class expressions evaluated per call"],
+    "description": "Construction and method calls through a three-level class hierarchy that uses private fields and methods, static fields and blocks, new.target, instanceof, and iterable classes.",
+    "notes": ""
+  },
+  {
+    "id": "mutators",
+    "entry": "objects/mutators.js",
+    "category": "arrays",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 600},
+    "covers": ["push", "pop", "shift", "unshift", "splice insert in the middle", "splice delete in the middle", "slice", "concat", "reverse", "fill", "indexOf", "lastIndexOf", "includes (NaN)", "flat", "flatMap", "Array.from with map function", "holey arrays (delete, length assignment)", "iteration over holes (index+in, forEach, for-of, map)", "mixed element kinds", "int to double to generic element transitions"],
+    "description": "Array mutators and copiers (queue/deque traffic, middle splices, slice/concat/reverse/fill, searches, flat/flatMap, Array.from), holey arrays and mixed element kinds.",
+    "notes": "No output differences. Queue and splice arrays are kept at 250-500 elements: QuickJS's shift/unshift/splice cost grows with array length, and at 1,000-1,200 elements those two phases took about 90% of the QuickJS run."
+  },
+  {
+    "id": "sort-variants",
+    "entry": "objects/sort-variants.js",
+    "category": "arrays",
+    "goal": "script",
+    "sizes": {"s": 2, "m": 200, "l": 1600},
+    "covers": ["default sort of numbers (string order)", "default sort of strings", "numeric comparator on ints and doubles", "descending comparator", "objects by numeric key", "objects by string key", "multi-field comparator", "stability with many equal keys", "already-sorted input", "reverse-sorted input", "all-equal input", "many duplicates", "sawtooth input", "nearly-sorted input", "binary search over sorted results"],
+    "description": "Array.prototype.sort over default and comparator orderings, object keys, stability checks and adversarial input orders, with binary searches over each result.",
+    "notes": ""
+  },
+  {
+    "id": "dataview-binary",
+    "entry": "objects/dataview-binary.js",
+    "category": "arrays",
+    "goal": "script",
+    "sizes": {"s": 5, "m": 500, "l": 4000},
+    "covers": ["DataView setUint8/Int8/Uint16/Int16/Int32/Uint32", "DataView setFloat32/setFloat64", "DataView setBigInt64/setBigUint64", "DataView getters", "little and big endian", "LEB128 varints", "zigzag encoding", "CRC-32 with a Uint32Array table", "Uint8Array.set", "Uint8Array.subarray", "Uint8Array.slice", "BigInt arithmetic and comparison"],
+    "description": "A binary record codec that encodes and decodes 192 records per round through DataView in both endiannesses, with varints, CRC-32 checksums and Uint8Array framing.",
+    "notes": ""
+  },
+  {
+    "id": "destructuring-spread",
+    "entry": "objects/destructuring-spread.js",
+    "category": "arrays",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 800},
+    "covers": ["array destructuring with defaults, holes and rest", "destructuring swap", "nested array destructuring", "object destructuring with defaults, renaming and rest", "parameter destructuring with defaults", "for-of over Object.entries and Array#entries", "spread calls with variable-length arguments", "Math.max/min spread", "rest parameters", "arguments object", "array literal spread", "object literal spread", "map/filter/reduce chains", "some/every/find/findIndex"],
+    "description": "Array and object destructuring with defaults and rest, spread in calls and literals with variable-length argument lists, and map/filter/reduce chains over 1,000-element arrays.",
+    "notes": ""
+  }
+]

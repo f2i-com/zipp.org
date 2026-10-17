@@ -1,0 +1,72 @@
+[
+  {
+    "id": "regex-compile-exec",
+    "entry": "text/regex-compile-exec.js",
+    "category": "regex",
+    "goal": "script",
+    "sizes": {"s": 400, "m": 40000, "l": 320000},
+    "covers": ["RegExp constructor (distinct and repeated sources)", "RegExp flags g/i/m/s/y/u", "exec numbered captures", "named groups", "RegExp.prototype.test", "global regex lastIndex loop", "String.prototype.match /g", "String.prototype.matchAll", "replace with function callback", "replace with $1/$&/$<name> substitutions"],
+    "description": "Compiles SIZE/4 distinct generated regexes and as many repeated ones, then runs one log-line regex with numbered and named captures, test(), a lastIndex-driven global loop, match/matchAll and replace with callbacks and substitution patterns.",
+    "notes": "Generated patterns avoid '/' and line terminators, and only re.source.length is hashed, because the exact escaping of `source` is partly implementation-defined. Alternations stay well under 64 alternatives."
+  },
+  {
+    "id": "regex-unicode-sticky",
+    "entry": "text/regex-unicode-sticky.js",
+    "category": "regex",
+    "goal": "script",
+    "sizes": {"s": 120, "m": 12000, "l": 96000},
+    "covers": ["u flag over non-ASCII and astral text", "\\p{L} / \\p{N} / \\p{Lu} / \\p{Ll} property escapes", "\\p{Script=...}", "astral code point ranges", "case-insensitive u matching (simple case folding)", "lookbehind (positive and negative)", "lookahead", "split by regex (including empty-width splits)", "sticky (y) tokenizer: combined alternation", "sticky (y) tokenizer: regex list at lastIndex"],
+    "description": "Runs u-flag property-escape, lookbehind and split regexes over mixed-script sentences, fixed case-folding probes, and tokenizes a generated program of SIZE statements with a sticky combined regex and with a list of sticky regexes.",
+    "notes": ""
+  },
+  {
+    "id": "strings-build-slice",
+    "entry": "text/strings-build-slice.js",
+    "category": "strings",
+    "goal": "script",
+    "sizes": {"s": 1500, "m": 150000, "l": 900000},
+    "covers": ["string += append (rope-like)", "string prepend", "template literals", "Array.prototype.join", "string equality of large strings", "slice / substring", "indexOf / lastIndexOf with position", "includes / startsWith / endsWith", "split / join", "replace / replaceAll with string patterns", "padStart / padEnd / trim / trimStart / trimEnd", "repeat / at / toUpperCase / toLowerCase (ASCII)", "charCodeAt / [] / charAt at random indices"],
+    "description": "Builds a SIZE-record ASCII string by += and by join, then slices and searches it at random offsets, splits/joins/replaces its lines, runs short-string padding/trim/case operations and reads it at random indices.",
+    "notes": "Full-string scans for absent needles are a fixed 8 rounds so that the run stays linear in SIZE. The large size is 6x the medium one: at 8x, random reads into the 17 MB string became cache-bound on every engine (the random-read section grew 16x on qjs), and the run reached 6.5 s on ZIPP."
+  },
+  {
+    "id": "strings-unicode-scan",
+    "entry": "text/strings-unicode-scan.js",
+    "category": "strings",
+    "goal": "script",
+    "sizes": {"s": 200, "m": 20000, "l": 160000},
+    "covers": ["codePointAt walk", "String.fromCodePoint (single and apply)", "for-of string iteration", "spread / Array.from of strings", "toUpperCase / toLowerCase on non-ASCII (special casing, final sigma)", "normalize NFC / NFD / NFKC / NFKD", "indexOf / lastIndexOf / includes on two-byte strings", "encodeURIComponent / decodeURIComponent", "encodeURI / decodeURI"],
+    "description": "Walks and rebuilds a 4*SIZE-code-point mixed-script string, iterates it by code point, case-maps and normalizes non-ASCII words, searches a large well-formed two-byte string, and round-trips text through the URI coders.",
+    "notes": "Three ZIPP slow paths found while writing this (all outputs identical, so none is a correctness bug). (1) Array.prototype.slice(i, i + 16) costs O(array length) per call in both the interpreter and the JIT tier. The likely cause is that the dense path of the \"slice\" arm in crates/zipp-vm/src/vm/array_ops.rs calls array_has_holes, which scans the whole array, where scanning items[start..end] would do. The chunks are therefore copied into a scratch array, since slicing a 4*SIZE array made this section quadratic (6 s of 9.7 s at the large size). (2) indexOf/lastIndexOf on a string that holds a lone surrogate is O(length) per call: a find-all loop over 48K units took 112 ms, against 0 ms for the same slice+concat construction when it stays well formed. `big` is cut on code-point boundaries so it stays well formed. (3) UTF-16 index access into non-ASCII strings is O(distance from the last position) (WTF-8 storage with a one-position memo): the random-start searches run on a 16,000-unit document so that their cost does not grow with SIZE. That share is left in the workload on purpose, and it is most of ZIPP's deficit here."
+  },
+  {
+    "id": "json-small-many",
+    "entry": "text/json-small-many.js",
+    "category": "json",
+    "goal": "script",
+    "sizes": {"s": 200, "m": 20000, "l": 160000},
+    "covers": ["JSON.stringify small objects", "JSON.parse small objects", "JSON.parse reviver", "JSON.stringify function replacer", "JSON.stringify array (whitelist) replacer", "JSON.stringify indent (number and string)", "nested arrays", "string escaping: quotes, backslash, control characters", "non-ASCII and emoji in strings", "lone surrogate escaping (well-formed JSON.stringify)", "-0 and large doubles"],
+    "description": "Round-trips SIZE varied API-message objects through JSON.stringify and JSON.parse, with a reviver, function and array replacers, indentation, nested arrays and escaped strings.",
+    "notes": ""
+  },
+  {
+    "id": "collections-map-mixed",
+    "entry": "text/collections-map-mixed.js",
+    "category": "collections",
+    "goal": "script",
+    "sizes": {"s": 1000, "m": 100000, "l": 800000},
+    "covers": ["Map get/set/has/delete", "Set add/has/delete", "mixed key types (int, double, string, object, array, symbol, boolean, null, undefined)", "SameValueZero: NaN and -0/+0 keys", "small / medium / large live sizes", "for-of over Map entries", "Map keys()/values()", "Map and Set forEach", "delete-heavy churn and iteration past deletions", "delete and insert during forEach", "Map.prototype.clear", "WeakMap get/set/has/delete with object, array and function keys"],
+    "description": "Churns Map and Set with mixed-type keys at ~8, ~1k and ~SIZE live entries, iterates them, deletes 90% of a SIZE/2 map and walks it while mutating, and exercises a WeakMap of SIZE/4 object keys.",
+    "notes": "The large tier scales with SIZE (about 110k live keys at the medium size, about 1.1k at the small size) so that the small run stays about 1/100 of the medium work; the ~8 and ~1k tiers are fixed."
+  },
+  {
+    "id": "numbers-format-parse",
+    "entry": "text/numbers-format-parse.js",
+    "category": "numbers",
+    "goal": "script",
+    "sizes": {"s": 400, "m": 40000, "l": 320000},
+    "covers": ["Number.prototype.toString(radix) on integers", "parseInt with radix", "toFixed", "toPrecision", "toExponential", "String(double) shortest round trip", "Number(string)", "parseFloat", "Float64Array bit patterns", "Math.sqrt/pow/exp/log/sin/cos/tanh/atan2/hypot/cbrt", "Math.imul/clz32/fround", "BigInt add/sub/mul/div/mod/shift", "BigInt.asUintN / asIntN", "BigInt toString (10 and 16)", "BigInt(string)"],
+    "description": "Formats and parses SIZE integers and doubles through toString(radix), toFixed/toPrecision/toExponential, String() and parseInt/parseFloat/Number(), runs exact and quantised Math functions, and does 64-256-bit BigInt arithmetic with toString.",
+    "notes": "Implementation-approximated Math results (pow, exp, log, sin, cos, tanh, atan2, hypot, cbrt) are quantised before hashing; numeric strings are kept at 20 significant digits or fewer so that parsing is exactly specified."
+  }
+]

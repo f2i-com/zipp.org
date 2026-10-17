@@ -60,6 +60,13 @@ class Workload:
     relative_source: str
     # (old token, new token, required occurrence count)
     replacements: tuple[tuple[str, str, int], ...] = ()
+    # "module" runs the entry as an ES module (Zipp's `mjs` subcommand; Node
+    # and QuickJS select it by the `.mjs` extension).
+    goal: str = "script"
+    category: str = ""
+    # A suite directory staged whole, so a module's relative imports and a
+    # vendored package resolve exactly as in the repository.
+    suite_root: str = ""
 
 
 # These are existing project fixtures, not a new hand-picked source corpus.
@@ -159,12 +166,69 @@ def controlled_environment(delta: dict[str, str]) -> dict[str, str]:
     return environment
 
 
-def source_workloads(suite: str) -> tuple[Workload, ...]:
+def read_manifest(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def source_workloads(suite: str, sizes: tuple[str, ...] = ("m",)) -> tuple[Workload, ...]:
     if suite == "micro5":
         return MICRO5
-    return tuple(
-        Workload(name, f"bench/real/{name}.js") for name in REAL13
-    )
+    if suite == "real13":
+        return tuple(
+            Workload(name, f"bench/real/{name}.js") for name in REAL13
+        )
+    if suite == "hostile17":
+        # The hostile suite's own manifest, unchanged: each case's declared
+        # entry and goal, every file of the suite staged alongside.
+        manifest = read_manifest(ROOT / "bench/hostile/manifest.json")
+        return tuple(
+            Workload(
+                case["id"],
+                f"bench/hostile/{case['entry']}",
+                goal=case.get("goal", "module" if case["entry"].endswith(".mjs") else "script"),
+                category=case.get("category", ""),
+                suite_root="bench/hostile",
+            )
+            for case in manifest["cases"]
+        )
+    if suite == "expansion":
+        # The expansion suite (bench/expansion/manifest.json): every case at
+        # each requested size, the size substituted into the case's single
+        # `const SIZE = <n>;` line. A case's medium size is its source as
+        # committed.
+        manifest = read_manifest(ROOT / "bench/expansion/manifest.json")
+        out = []
+        for case in manifest["cases"]:
+            case_sizes = case["sizes"]
+            for size in sizes:
+                if size not in case_sizes:
+                    continue
+                token_old = f"const SIZE = {case_sizes['m']};"
+                token_new = f"const SIZE = {case_sizes[size]};"
+                out.append(
+                    Workload(
+                        f"{case['id']}@{size}",
+                        f"bench/expansion/{case['entry']}",
+                        () if size == "m" else ((token_old, token_new, 1),),
+                        goal=case.get("goal", "script"),
+                        category=case.get("category", ""),
+                        suite_root="bench/expansion",
+                    )
+                )
+        return tuple(out)
+    raise ValueError(f"unknown suite {suite}")
+
+
+def staged_name(workload: Workload) -> str:
+    """The staged entry's path relative to the stage directory."""
+    if not workload.suite_root:
+        return f"{workload.name}.js"
+    relative = Path(workload.relative_source).relative_to(workload.suite_root)
+    if "@" in workload.name:
+        # Size variants of one source are staged side by side.
+        size = workload.name.rsplit("@", 1)[1]
+        relative = relative.with_name(f"{relative.stem}@{size}{relative.suffix}")
+    return relative.as_posix()
 
 
 def stage_inputs(
@@ -176,6 +240,14 @@ def stage_inputs(
     metadata: dict[str, dict[str, Any]] = {}
     empty = stage / "empty.js"
     empty.write_bytes(b";void 0;\n")
+    # Suites staged whole: their modules' imports and vendored packages.
+    for root in sorted({w.suite_root for w in workloads if w.suite_root}):
+        shutil.copytree(
+            ROOT / root,
+            stage,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("*.json", "*.md", "node_modules"),
+        )
     for workload in workloads:
         source = (ROOT / workload.relative_source).resolve(strict=True)
         raw = source.read_bytes()
@@ -197,9 +269,12 @@ def stage_inputs(
         # this to every engine's identical input keeps console output comparable
         # without changing the measured work.
         staged_bytes = (text.rstrip() + "\n;void 0;\n").encode("utf-8")
-        destination = stage / f"{workload.name}.js"
+        destination = stage / staged_name(workload)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(staged_bytes)
         metadata[workload.name] = {
+            "goal": workload.goal,
+            "category": workload.category,
             "source": str(source),
             "source_sha256": bytes_sha256(raw),
             "source_bytes": len(raw),
@@ -209,9 +284,56 @@ def stage_inputs(
             "replacements": applied,
             "completion_suppression": ";void 0;",
         }
-    for path in stage.iterdir():
-        path.chmod(stat.S_IREAD)
+    for path in stage.rglob("*"):
+        if path.is_file():
+            path.chmod(stat.S_IREAD)
     return stage, metadata
+
+
+def process_counters(handle: int) -> dict[str, Any]:
+    """CPU cycles and peak working set of an exited process whose handle is
+    still open (Windows); empty elsewhere. Cycles are what the process ran,
+    whatever else the machine did meanwhile."""
+    if os.name != "nt":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    cycles = ctypes.c_ulonglong(0)
+    counters = Counters()
+    counters.cb = ctypes.sizeof(Counters)
+    out: dict[str, Any] = {}
+    if ctypes.windll.kernel32.QueryProcessCycleTime(wintypes.HANDLE(handle), ctypes.byref(cycles)):
+        out["cycles"] = cycles.value
+    if ctypes.windll.psapi.GetProcessMemoryInfo(
+        wintypes.HANDLE(handle), ctypes.byref(counters), counters.cb
+    ):
+        out["peak_working_set_bytes"] = counters.PeakWorkingSetSize
+        out["peak_pagefile_bytes"] = counters.PeakPagefileUsage
+    return out
+
+
+def engine_command(engine: Engine, source: Path) -> list[str]:
+    command = list(engine.command)
+    # Zipp names the goal by subcommand; the other engines take a `.mjs`
+    # entry as a module.
+    if engine.name.startswith("zipp-") and source.suffix == ".mjs":
+        command[1] = "mjs"
+    return [*command, str(source)]
 
 
 def run_once(
@@ -220,30 +342,37 @@ def run_once(
     *,
     timeout: float,
 ) -> dict[str, Any]:
-    command = [*engine.command, str(source)]
+    command = engine_command(engine, source)
     started = time.perf_counter_ns()
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=controlled_environment(engine.environment),
-            timeout=timeout,
-            check=False,
+            cwd=source.parent,
         )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout, stdout, stderr)
         elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
-        canonical = canonical_stdout(result.stdout)
+        counters = process_counters(int(process._handle)) if os.name == "nt" else {}
+        canonical = canonical_stdout(stdout)
         return {
             "elapsed_s": elapsed,
-            "returncode": result.returncode,
+            "returncode": process.returncode,
             "timed_out": False,
-            "stdout_sha256": bytes_sha256(result.stdout),
-            "stdout_bytes": len(result.stdout),
+            **counters,
+            "stdout_sha256": bytes_sha256(stdout),
+            "stdout_bytes": len(stdout),
             "stdout_canonical_sha256": bytes_sha256(canonical),
             "stdout_canonical_bytes": len(canonical),
-            "stdout": result.stdout.decode("utf-8", errors="replace"),
-            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stderr": stderr.decode("utf-8", errors="replace"),
         }
     except subprocess.TimeoutExpired as exc:
         elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
@@ -464,7 +593,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node", default="node")
     parser.add_argument("--deno", default="deno")
     parser.add_argument("--bun", default="bun")
-    parser.add_argument("--suite", choices=("micro5", "real13"), default="micro5")
+    parser.add_argument(
+        "--suite", choices=("micro5", "real13", "hostile17", "expansion"), default="micro5"
+    )
+    parser.add_argument(
+        "--sizes",
+        default="m",
+        help="expansion suite: comma-separated size variants to run (s, m, l)",
+    )
+    parser.add_argument(
+        "--cases",
+        help="comma-separated case names to keep (default: every case of the suite)",
+    )
+    parser.add_argument(
+        "--skip-unsupported",
+        action="store_true",
+        help=(
+            "record a case an engine fails or answers differently as excluded "
+            "(with the reason) and time the rest, instead of stopping"
+        ),
+    )
     parser.add_argument("--reps", type=int, default=12)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--seed", type=lambda value: int(value, 0), default=DEFAULT_SEED)
@@ -584,7 +732,10 @@ def main() -> int:
                     f"dirty={reported.get('dirty')!r}"
                 )
 
-    workloads = source_workloads(args.suite)
+    workloads = source_workloads(args.suite, tuple(args.sizes.split(",")))
+    if args.cases:
+        keep = set(args.cases.split(","))
+        workloads = tuple(w for w in workloads if w.name in keep or w.name.split("@")[0] in keep)
     cases = [workload.name for workload in workloads]
     source_hashes_before = {
         workload.name: file_sha256(ROOT / workload.relative_source)
@@ -592,6 +743,8 @@ def main() -> int:
     }
     stage, input_metadata = stage_inputs(workloads, result_path.parent)
     empty = stage / "empty.js"
+    staged = {workload.name: stage / staged_name(workload) for workload in workloads}
+    excluded: dict[str, list[dict[str, str]]] = {}
 
     # Untimed validation also warms filesystem/binary pages.  This preserves the
     # intended fresh-process metric while keeping one engine from uniquely paying
@@ -600,33 +753,41 @@ def main() -> int:
     expected: dict[str, str] = {}
     node_engine = available["node"]
     print("validating exact output", file=sys.stderr, flush=True)
+    def reject(engine_name: str, case: str, reason: str) -> None:
+        if not args.skip_unsupported:
+            raise SystemExit(f"{engine_name} {reason} on {case}")
+        excluded.setdefault(case, []).append({"engine": engine_name, "reason": reason})
+
     for workload in workloads:
         result = run_once(
-            node_engine, stage / f"{workload.name}.js", timeout=args.timeout
+            node_engine, staged[workload.name], timeout=args.timeout
         )
         validation.append({"engine": "node", "case": workload.name, **result})
         if not healthy(result):
-            raise SystemExit(f"node validation failed on {workload.name}")
+            reject("node", workload.name, "validation failed: " + result["stderr"][:300])
+            continue
         expected[workload.name] = result["stdout_canonical_sha256"]
     for engine in engines:
         if engine.name == "node":
             continue
         for workload in workloads:
+            if workload.name not in expected:
+                continue
             result = run_once(
-                engine, stage / f"{workload.name}.js", timeout=args.timeout
+                engine, staged[workload.name], timeout=args.timeout
             )
             validation.append(
                 {"engine": engine.name, "case": workload.name, **result}
             )
             if not healthy(result):
-                raise SystemExit(
-                    f"{engine.name} validation failed on {workload.name}: "
-                    f"{result['stderr'][:300]}"
-                )
-            if result["stdout_canonical_sha256"] != expected[workload.name]:
-                raise SystemExit(
-                    f"{engine.name} stdout differs from node on {workload.name}"
-                )
+                reject(engine.name, workload.name, "validation failed: " + result["stderr"][:300])
+            elif result["stdout_canonical_sha256"] != expected[workload.name]:
+                reject(engine.name, workload.name, "stdout differs from node")
+    if excluded:
+        print(f"excluded: {sorted(excluded)}", file=sys.stderr, flush=True)
+    cases = [case for case in cases if case not in excluded]
+    if not cases:
+        raise SystemExit("every case was excluded")
 
     observations: list[dict[str, Any]] = []
     schedules: list[dict[str, Any]] = []
@@ -645,7 +806,7 @@ def main() -> int:
             }
         )
         for case_position, case in enumerate(bench_order):
-            source = stage / f"{case}.js"
+            source = staged[case]
             for engine_position, engine in enumerate(ordered):
                 startup = run_once(engine, empty, timeout=args.timeout)
                 full = run_once(engine, source, timeout=args.timeout)
@@ -675,7 +836,7 @@ def main() -> int:
         for workload in workloads
     }
     staged_hashes_after = {
-        workload.name: file_sha256(stage / f"{workload.name}.js")
+        workload.name: file_sha256(staged[workload.name])
         for workload in workloads
     }
     if source_hashes_before != source_hashes_after:
@@ -701,6 +862,13 @@ def main() -> int:
         engine: {case: [0.0] * args.reps for case in cases}
         for engine in engine_names
     }
+    # Process CPU cycles (Windows): what each run itself executed, full run
+    # less its preceding empty launch, independent of what else ran.
+    have_cycles = all("cycles" in o["full"] and "cycles" in o["startup"] for o in observations)
+    adjusted_cycles = {
+        engine: {case: [0.0] * args.reps for case in cases}
+        for engine in engine_names
+    }
     for observation in observations:
         engine = observation["engine"]
         case = observation["case"]
@@ -708,6 +876,10 @@ def main() -> int:
         cold[engine][case][rep] = observation["full"]["elapsed_s"]
         startup[engine][case][rep] = observation["startup"]["elapsed_s"]
         adjusted[engine][case][rep] = observation["adjusted_s"]
+        if have_cycles:
+            adjusted_cycles[engine][case][rep] = max(
+                1.0, float(observation["full"]["cycles"] - observation["startup"]["cycles"])
+            )
 
     summary = {
         "cold": summarize_metric(
@@ -738,6 +910,16 @@ def main() -> int:
             metric="adjusted",
         ),
     }
+    if have_cycles:
+        summary["adjusted_cycles"] = summarize_metric(
+            adjusted_cycles,
+            engine_names=engine_names,
+            cases=cases,
+            reps=args.reps,
+            seed=args.seed,
+            bootstrap_samples=args.bootstrap_samples,
+            metric="adjusted_cycles",
+        )
 
     revisions = {
         "zipp": args.zipp_revision,
@@ -790,6 +972,8 @@ def main() -> int:
         "reps": args.reps,
         "bootstrap_samples": args.bootstrap_samples,
         "cases": cases,
+        "sizes": args.sizes if args.suite == "expansion" else None,
+        "excluded": excluded,
         "stage": str(stage),
         "inputs": input_metadata,
         "engines": {

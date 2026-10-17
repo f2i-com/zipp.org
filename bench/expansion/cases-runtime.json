@@ -1,0 +1,72 @@
+[
+  {
+    "id": "recursion-shapes",
+    "entry": "runtime/recursion-shapes.js",
+    "category": "calls",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 600},
+    "covers": ["mutual recursion", "three-way mutual recursion", "ackermann", "recursive tree build and walk", "backtracking (n-queens)", "divide and conquer (merge sort)", "default parameters", "argument-count mismatch", "rest parameters and spread", "object-literal method recursion", "class method recursion", "polymorphic prototype dispatch"],
+    "description": "Recursion shapes other than fib (mutual, Ackermann, tree build and walk, backtracking, merge sort, many-argument defaults, method recursion), at depths of up to about 700 frames.",
+    "notes": "Maximum depth is about 700 frames instead of a few thousand: Bellard qjs's default stack overflows at about 1,550 frames of one-argument mutual recursion, about 1,200 with seven default parameters and about 1,500 for method recursion (zipp and node pass 3,000)."
+  },
+  {
+    "id": "generators-iterators",
+    "entry": "runtime/generators-iterators.js",
+    "category": "calls",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 600},
+    "covers": ["generator functions", "yield* delegation with return values", "next(value)", "generator pipelines", "generator scheduler", "custom iterables", "iterator return() on early exit", "generator finally on break", "for-of over Map/Set/array/string", "spread of iterables", "Array.from", "Map/Set from iterables", "array destructuring from iterators"],
+    "description": "Generators, the iteration protocol and built-in iterables end to end, including early-exit cleanup counted into the checksum.",
+    "notes": "Recursive yield* tree depth is kept at 10: Bellard qjs overflows at about 650 nested yield* levels."
+  },
+  {
+    "id": "finally-labels",
+    "entry": "runtime/finally-labels.js",
+    "category": "control",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 600},
+    "covers": ["return through finally", "nested finally", "return in finally", "break/continue through finally", "labelled break/continue", "labelled block", "string switch with fallthrough", "dense int switch", "sparse int switch", "char-code lexer", "Error subclass construction", "rethrow", "Error cause"],
+    "description": "Non-exceptional try/finally exits, labelled jumps, switch dispatch and a small share of Error construction with rethrow a few levels up.",
+    "notes": ""
+  },
+  {
+    "id": "old-to-young",
+    "entry": "runtime/old-to-young.js",
+    "category": "gc",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 1000},
+    "covers": ["large long-lived heap", "old-to-young property stores", "old-to-young array element stores", "write barrier", "record replacement", "short-lived garbage", "many collections"],
+    "description": "A 100,000-record long-lived table and 512 old bucket arrays continuously receive freshly allocated objects, arrays and strings, mixed with non-escaping garbage.",
+    "notes": "Peak working set, measured once: m node 114 MB, zipp 247 MB, qjs 89 MB; l node 234 MB, zipp 830 MB, qjs 146 MB."
+  },
+  {
+    "id": "large-heap-churn",
+    "entry": "runtime/large-heap-churn.js",
+    "category": "gc",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 1600},
+    "covers": ["LRU cache", "Map with string keys", "doubly-linked list pointer updates", "insert/evict churn", "survivor cohort", "bulk free", "heap growth", "GC pauses", "extended run"],
+    "description": "An LRU cache of up to 50,000 string-keyed entries under steady insert/evict churn, with a retained survivor cohort and periodic bulk frees; the large size is an extended run.",
+    "notes": "Peak working set, measured once: m node 138 MB, zipp 199 MB, qjs 47 MB; l node 357 MB, zipp 352 MB, qjs 45 MB."
+  },
+  {
+    "id": "await-sustained",
+    "entry": "runtime/await-sustained.js",
+    "category": "async",
+    "goal": "script",
+    "sizes": {"s": 8, "m": 800, "l": 6000},
+    "covers": ["async call chains", "async fan-out", "async tree", "Promise.all", "Promise.allSettled", "Promise.race", "await in loops", "for-await", "thenables", "rejection with try/await/catch/finally", "async return of a promise", "microtask ordering"],
+    "description": "Async functions awaiting async functions in depth and breadth, with Promise combinators, thenables and caught rejections, all completed on the microtask queue.",
+    "notes": "The microtask-order hash (line 3) is the same on zipp and qjs as on node, so all three schedule await, thenable adoption and async return of a promise with the same tick counts."
+  },
+  {
+    "id": "eval-function",
+    "entry": "runtime/eval-function.js",
+    "category": "dynamic",
+    "goal": "script",
+    "sizes": {"s": 1, "m": 100, "l": 600},
+    "covers": ["new Function", "indirect eval", "large generated function", "direct eval in function scope", "eval writing locals", "repeated vs distinct eval sources"],
+    "description": "Run-time compilation after warm-up: thousands of small distinct new Function and indirect-eval bodies, one large generated function, and direct eval of short expressions in a function scope.",
+    "notes": "node may serve the repeated direct-eval sources from its eval cache. zipp's peak working set grows about 1.4 KB per dropped new Function, about the same as when every function is kept live, even under old-space allocation pressure (m 136 MB, l 594 MB; qjs 9 MB)."
+  }
+]

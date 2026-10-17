@@ -45,6 +45,36 @@ python bench\comparison\run_native.py `
 against Node's before timing. The JIT-off engines are not their shipped
 configurations; they answer the interpreter question only.
 
+## Hostile and expansion suites against Bellard's QuickJS (diagnostic)
+
+`run_native.py` also runs two suites beyond real13 and micro5, still a
+diagnostic series and never part of a canonical geomean:
+
+- `--suite hostile17`: the 17 hostile workloads, from
+  `bench/hostile/manifest.json` unchanged. Each suite is staged whole, so a
+  module's relative imports and the vendored npm package resolve as in the
+  repository; a module entry runs through `zipp mjs` (Node and QuickJS take
+  `.mjs` as a module).
+- `--suite expansion --sizes s,m,l`: the expansion workloads
+  (`bench/expansion/`, see its README), each at the requested sizes.
+
+`--skip-unsupported` records a case an engine fails or answers differently
+(with the reason) and times the rest, instead of stopping; the artifact's
+`excluded` lists them. On Windows each run also records the process's CPU
+cycles and peak working set, and the summary gains `adjusted_cycles`
+(full-run cycles less the preceding empty launch's).
+`expansion_report.py ARTIFACT` prints each row's ratio with a 95% bootstrap
+interval and a verdict (an interval containing 1 is ambiguous), the cold,
+startup and peak-memory ratios, the ordinary and category-balanced geomeans
+and the exclusions.
+
+```powershell
+python bench\comparison\run_native.py --zipp <zipp.exe> --quickjs $Q\qjs.exe `
+  --suite hostile17 --reps 15 --engines node,zipp-interp,quickjs `
+  --skip-unsupported --json target\bench-results\hostile17-quickjs.json
+python bench\comparison\expansion_report.py target\bench-results\hostile17-quickjs.json
+```
+
 ## Earlier QuickJS-NG and Boa comparisons
 
 The sections below answer two narrower questions:

@@ -1,0 +1,608 @@
+{
+  "schema_version": 1,
+  "series": "zipp-expansion-v1",
+  "description": "Diagnostic expansion suite: workloads the canonical real13, micro5 and hostile17 suites do not reach. Never part of the canonical geomean.",
+  "cases": [
+    {
+      "id": "accessors-proxy",
+      "entry": "objects/accessors-proxy.js",
+      "category": "objects",
+      "goal": "script",
+      "sizes": {
+        "s": 2,
+        "m": 200,
+        "l": 1200
+      },
+      "covers": [
+        "object-literal getters",
+        "object-literal setters",
+        "Object.defineProperty accessors",
+        "Object.defineProperties",
+        "Object.getOwnPropertyDescriptor",
+        "closure-backed per-instance accessors",
+        "Proxy get trap",
+        "Proxy set trap",
+        "Proxy has trap",
+        "Proxy over array (negative index)",
+        "empty-handler Proxy forwarding",
+        "Reflect.get with receiver",
+        "Reflect.set",
+        "Reflect.has",
+        "Reflect.ownKeys",
+        "Reflect.deleteProperty",
+        "Reflect.defineProperty",
+        "Object.freeze reads",
+        "sloppy writes to frozen/sealed/non-extensible objects",
+        "Object.isFrozen/isSealed/isExtensible"
+      ],
+      "description": "Accessor properties (literal and defineProperty), Proxy objects with get/set/has traps in hot loops, Reflect operations, and reads of frozen configuration objects with ignored sloppy-mode writes.",
+      "notes": "",
+      "source_sha256": "83369c1dbd58f6bc97d8325659346cc615ac94d0b97f9ca5dbcafbdc9a89ec46"
+    },
+    {
+      "id": "dict-churn",
+      "entry": "objects/dict-churn.js",
+      "category": "objects",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 800
+      },
+      "covers": [
+        "2,100-key dictionary objects",
+        "integer-like keys (numeric and string)",
+        "in operator",
+        "hasOwnProperty.call",
+        "Object.hasOwn",
+        "delete on large dictionaries",
+        "re-insertion after delete",
+        "Object.keys order",
+        "Object.values",
+        "Object.entries",
+        "for-in",
+        "delete of the visited key during for-in",
+        "Object.assign",
+        "object spread",
+        "computed keys in object literals"
+      ],
+      "description": "Plain objects used as hash maps: 2,100 keys (1,500 strings, 600 integer-like) inserted, probed, half deleted and partly re-added each round, then enumerated, iterated with for-in and merged with Object.assign and spread.",
+      "notes": "",
+      "source_sha256": "6111d3b0d0db52b2adb1bce3cb1d241ed7baae29f4bee3a659795099ed9a00bf"
+    },
+    {
+      "id": "class-features",
+      "entry": "objects/class-features.js",
+      "category": "classes",
+      "goal": "script",
+      "sizes": {
+        "s": 2,
+        "m": 200,
+        "l": 1500
+      },
+      "covers": [
+        "private fields",
+        "private methods",
+        "private getters",
+        "static private fields and methods",
+        "#x in obj brand checks",
+        "public class fields",
+        "static fields",
+        "static blocks",
+        "class getters/setters",
+        "3-level derived constructors with field initialisers",
+        "super method calls through 3 levels",
+        "new.target",
+        "instanceof across a hierarchy",
+        "Symbol.hasInstance",
+        "Symbol.iterator with a hand-written iterator class",
+        "generator Symbol.iterator method",
+        "class expressions evaluated per call"
+      ],
+      "description": "Construction and method calls through a three-level class hierarchy that uses private fields and methods, static fields and blocks, new.target, instanceof, and iterable classes.",
+      "notes": "",
+      "source_sha256": "3e3e9a85279736b9e4f18a953de5c5abc92e0bff50db75e8bec991cedbd18955"
+    },
+    {
+      "id": "mutators",
+      "entry": "objects/mutators.js",
+      "category": "arrays",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 600
+      },
+      "covers": [
+        "push",
+        "pop",
+        "shift",
+        "unshift",
+        "splice insert in the middle",
+        "splice delete in the middle",
+        "slice",
+        "concat",
+        "reverse",
+        "fill",
+        "indexOf",
+        "lastIndexOf",
+        "includes (NaN)",
+        "flat",
+        "flatMap",
+        "Array.from with map function",
+        "holey arrays (delete, length assignment)",
+        "iteration over holes (index+in, forEach, for-of, map)",
+        "mixed element kinds",
+        "int to double to generic element transitions"
+      ],
+      "description": "Array mutators and copiers (queue/deque traffic, middle splices, slice/concat/reverse/fill, searches, flat/flatMap, Array.from), holey arrays and mixed element kinds.",
+      "notes": "No output differences. Queue and splice arrays are kept at 250-500 elements: QuickJS's shift/unshift/splice cost grows with array length, and at 1,000-1,200 elements those two phases took about 90% of the QuickJS run.",
+      "source_sha256": "c99ed5a38a8e33b3cc9f5fa220bcf11fc2eaa4a1f603c9f070aa2f71d974f45b"
+    },
+    {
+      "id": "sort-variants",
+      "entry": "objects/sort-variants.js",
+      "category": "arrays",
+      "goal": "script",
+      "sizes": {
+        "s": 2,
+        "m": 200,
+        "l": 1600
+      },
+      "covers": [
+        "default sort of numbers (string order)",
+        "default sort of strings",
+        "numeric comparator on ints and doubles",
+        "descending comparator",
+        "objects by numeric key",
+        "objects by string key",
+        "multi-field comparator",
+        "stability with many equal keys",
+        "already-sorted input",
+        "reverse-sorted input",
+        "all-equal input",
+        "many duplicates",
+        "sawtooth input",
+        "nearly-sorted input",
+        "binary search over sorted results"
+      ],
+      "description": "Array.prototype.sort over default and comparator orderings, object keys, stability checks and adversarial input orders, with binary searches over each result.",
+      "notes": "",
+      "source_sha256": "a6deb461cde818a9b820e47e9577472c5203d0c04cfb99aa1139b2b41e7984d5"
+    },
+    {
+      "id": "dataview-binary",
+      "entry": "objects/dataview-binary.js",
+      "category": "arrays",
+      "goal": "script",
+      "sizes": {
+        "s": 5,
+        "m": 500,
+        "l": 4000
+      },
+      "covers": [
+        "DataView setUint8/Int8/Uint16/Int16/Int32/Uint32",
+        "DataView setFloat32/setFloat64",
+        "DataView setBigInt64/setBigUint64",
+        "DataView getters",
+        "little and big endian",
+        "LEB128 varints",
+        "zigzag encoding",
+        "CRC-32 with a Uint32Array table",
+        "Uint8Array.set",
+        "Uint8Array.subarray",
+        "Uint8Array.slice",
+        "BigInt arithmetic and comparison"
+      ],
+      "description": "A binary record codec that encodes and decodes 192 records per round through DataView in both endiannesses, with varints, CRC-32 checksums and Uint8Array framing.",
+      "notes": "",
+      "source_sha256": "35afff08a6708a6bd39daf04694120ab7ac2a8715fadb1aa42fb89d5f1646cb5"
+    },
+    {
+      "id": "destructuring-spread",
+      "entry": "objects/destructuring-spread.js",
+      "category": "arrays",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 800
+      },
+      "covers": [
+        "array destructuring with defaults, holes and rest",
+        "destructuring swap",
+        "nested array destructuring",
+        "object destructuring with defaults, renaming and rest",
+        "parameter destructuring with defaults",
+        "for-of over Object.entries and Array#entries",
+        "spread calls with variable-length arguments",
+        "Math.max/min spread",
+        "rest parameters",
+        "arguments object",
+        "array literal spread",
+        "object literal spread",
+        "map/filter/reduce chains",
+        "some/every/find/findIndex"
+      ],
+      "description": "Array and object destructuring with defaults and rest, spread in calls and literals with variable-length argument lists, and map/filter/reduce chains over 1,000-element arrays.",
+      "notes": "",
+      "source_sha256": "1faaff9587af52fc7d2eb01e7737896dc1435fe58d9ca71e1f554f7ac46e78fa"
+    },
+    {
+      "id": "recursion-shapes",
+      "entry": "runtime/recursion-shapes.js",
+      "category": "calls",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 600
+      },
+      "covers": [
+        "mutual recursion",
+        "three-way mutual recursion",
+        "ackermann",
+        "recursive tree build and walk",
+        "backtracking (n-queens)",
+        "divide and conquer (merge sort)",
+        "default parameters",
+        "argument-count mismatch",
+        "rest parameters and spread",
+        "object-literal method recursion",
+        "class method recursion",
+        "polymorphic prototype dispatch"
+      ],
+      "description": "Recursion shapes other than fib (mutual, Ackermann, tree build and walk, backtracking, merge sort, many-argument defaults, method recursion), at depths of up to about 700 frames.",
+      "notes": "Maximum depth is about 700 frames instead of a few thousand: Bellard qjs's default stack overflows at about 1,550 frames of one-argument mutual recursion, about 1,200 with seven default parameters and about 1,500 for method recursion (zipp and node pass 3,000).",
+      "source_sha256": "a54242fb039735c38f6d732efba3e73e7d4205fc68911e340fcefa3665052ef9"
+    },
+    {
+      "id": "generators-iterators",
+      "entry": "runtime/generators-iterators.js",
+      "category": "calls",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 600
+      },
+      "covers": [
+        "generator functions",
+        "yield* delegation with return values",
+        "next(value)",
+        "generator pipelines",
+        "generator scheduler",
+        "custom iterables",
+        "iterator return() on early exit",
+        "generator finally on break",
+        "for-of over Map/Set/array/string",
+        "spread of iterables",
+        "Array.from",
+        "Map/Set from iterables",
+        "array destructuring from iterators"
+      ],
+      "description": "Generators, the iteration protocol and built-in iterables end to end, including early-exit cleanup counted into the checksum.",
+      "notes": "Recursive yield* tree depth is kept at 10: Bellard qjs overflows at about 650 nested yield* levels.",
+      "source_sha256": "e5a32c3c6f0437207b521784114d6dac75703bb6abf2c867ec0ad56e6c55a782"
+    },
+    {
+      "id": "finally-labels",
+      "entry": "runtime/finally-labels.js",
+      "category": "control",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 600
+      },
+      "covers": [
+        "return through finally",
+        "nested finally",
+        "return in finally",
+        "break/continue through finally",
+        "labelled break/continue",
+        "labelled block",
+        "string switch with fallthrough",
+        "dense int switch",
+        "sparse int switch",
+        "char-code lexer",
+        "Error subclass construction",
+        "rethrow",
+        "Error cause"
+      ],
+      "description": "Non-exceptional try/finally exits, labelled jumps, switch dispatch and a small share of Error construction with rethrow a few levels up.",
+      "notes": "",
+      "source_sha256": "01d758e4aa54ee6ef806504dac04d07308963e8a33d974e2db3f428341dbb706"
+    },
+    {
+      "id": "old-to-young",
+      "entry": "runtime/old-to-young.js",
+      "category": "gc",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 1000
+      },
+      "covers": [
+        "large long-lived heap",
+        "old-to-young property stores",
+        "old-to-young array element stores",
+        "write barrier",
+        "record replacement",
+        "short-lived garbage",
+        "many collections"
+      ],
+      "description": "A 100,000-record long-lived table and 512 old bucket arrays continuously receive freshly allocated objects, arrays and strings, mixed with non-escaping garbage.",
+      "notes": "Peak working set, measured once: m node 114 MB, zipp 247 MB, qjs 89 MB; l node 234 MB, zipp 830 MB, qjs 146 MB.",
+      "source_sha256": "d4994bb212dc11d215ce4da2e5f01f2834ca8deacb32ec61e2f93ed26b611b5a"
+    },
+    {
+      "id": "large-heap-churn",
+      "entry": "runtime/large-heap-churn.js",
+      "category": "gc",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 1600
+      },
+      "covers": [
+        "LRU cache",
+        "Map with string keys",
+        "doubly-linked list pointer updates",
+        "insert/evict churn",
+        "survivor cohort",
+        "bulk free",
+        "heap growth",
+        "GC pauses",
+        "extended run"
+      ],
+      "description": "An LRU cache of up to 50,000 string-keyed entries under steady insert/evict churn, with a retained survivor cohort and periodic bulk frees; the large size is an extended run.",
+      "notes": "Peak working set, measured once: m node 138 MB, zipp 199 MB, qjs 47 MB; l node 357 MB, zipp 352 MB, qjs 45 MB.",
+      "source_sha256": "6b0b8cc4f25f7f620e1858097a8cb56584dcc49a638326e4b64277594d0e262e"
+    },
+    {
+      "id": "await-sustained",
+      "entry": "runtime/await-sustained.js",
+      "category": "async",
+      "goal": "script",
+      "sizes": {
+        "s": 8,
+        "m": 800,
+        "l": 6000
+      },
+      "covers": [
+        "async call chains",
+        "async fan-out",
+        "async tree",
+        "Promise.all",
+        "Promise.allSettled",
+        "Promise.race",
+        "await in loops",
+        "for-await",
+        "thenables",
+        "rejection with try/await/catch/finally",
+        "async return of a promise",
+        "microtask ordering"
+      ],
+      "description": "Async functions awaiting async functions in depth and breadth, with Promise combinators, thenables and caught rejections, all completed on the microtask queue.",
+      "notes": "The microtask-order hash (line 3) is the same on zipp and qjs as on node, so all three schedule await, thenable adoption and async return of a promise with the same tick counts.",
+      "source_sha256": "87514caf65291caf2a0d624176766694331db4d55d6b4f4827cdf502c0bae748"
+    },
+    {
+      "id": "eval-function",
+      "entry": "runtime/eval-function.js",
+      "category": "dynamic",
+      "goal": "script",
+      "sizes": {
+        "s": 1,
+        "m": 100,
+        "l": 600
+      },
+      "covers": [
+        "new Function",
+        "indirect eval",
+        "large generated function",
+        "direct eval in function scope",
+        "eval writing locals",
+        "repeated vs distinct eval sources"
+      ],
+      "description": "Run-time compilation after warm-up: thousands of small distinct new Function and indirect-eval bodies, one large generated function, and direct eval of short expressions in a function scope.",
+      "notes": "node may serve the repeated direct-eval sources from its eval cache. zipp's peak working set grows about 1.4 KB per dropped new Function, about the same as when every function is kept live, even under old-space allocation pressure (m 136 MB, l 594 MB; qjs 9 MB).",
+      "source_sha256": "4a17fa13802284c8a02f786301d4a6cb1e81fa651aec18e2dc8c950b108b1e03"
+    },
+    {
+      "id": "regex-compile-exec",
+      "entry": "text/regex-compile-exec.js",
+      "category": "regex",
+      "goal": "script",
+      "sizes": {
+        "s": 400,
+        "m": 40000,
+        "l": 320000
+      },
+      "covers": [
+        "RegExp constructor (distinct and repeated sources)",
+        "RegExp flags g/i/m/s/y/u",
+        "exec numbered captures",
+        "named groups",
+        "RegExp.prototype.test",
+        "global regex lastIndex loop",
+        "String.prototype.match /g",
+        "String.prototype.matchAll",
+        "replace with function callback",
+        "replace with $1/$&/$<name> substitutions"
+      ],
+      "description": "Compiles SIZE/4 distinct generated regexes and as many repeated ones, then runs one log-line regex with numbered and named captures, test(), a lastIndex-driven global loop, match/matchAll and replace with callbacks and substitution patterns.",
+      "notes": "Generated patterns avoid '/' and line terminators, and only re.source.length is hashed, because the exact escaping of `source` is partly implementation-defined. Alternations stay well under 64 alternatives.",
+      "source_sha256": "70d6acf3a924e946a43b768c732b447d917f636635fdd8fff241fe022836bb70"
+    },
+    {
+      "id": "regex-unicode-sticky",
+      "entry": "text/regex-unicode-sticky.js",
+      "category": "regex",
+      "goal": "script",
+      "sizes": {
+        "s": 120,
+        "m": 12000,
+        "l": 96000
+      },
+      "covers": [
+        "u flag over non-ASCII and astral text",
+        "\\p{L} / \\p{N} / \\p{Lu} / \\p{Ll} property escapes",
+        "\\p{Script=...}",
+        "astral code point ranges",
+        "case-insensitive u matching (simple case folding)",
+        "lookbehind (positive and negative)",
+        "lookahead",
+        "split by regex (including empty-width splits)",
+        "sticky (y) tokenizer: combined alternation",
+        "sticky (y) tokenizer: regex list at lastIndex"
+      ],
+      "description": "Runs u-flag property-escape, lookbehind and split regexes over mixed-script sentences, fixed case-folding probes, and tokenizes a generated program of SIZE statements with a sticky combined regex and with a list of sticky regexes.",
+      "notes": "",
+      "source_sha256": "03defe93146a88ee8dc73b81f28f68e75a9d9e64907d007967cb31b3f8b9ae16"
+    },
+    {
+      "id": "strings-build-slice",
+      "entry": "text/strings-build-slice.js",
+      "category": "strings",
+      "goal": "script",
+      "sizes": {
+        "s": 1500,
+        "m": 150000,
+        "l": 900000
+      },
+      "covers": [
+        "string += append (rope-like)",
+        "string prepend",
+        "template literals",
+        "Array.prototype.join",
+        "string equality of large strings",
+        "slice / substring",
+        "indexOf / lastIndexOf with position",
+        "includes / startsWith / endsWith",
+        "split / join",
+        "replace / replaceAll with string patterns",
+        "padStart / padEnd / trim / trimStart / trimEnd",
+        "repeat / at / toUpperCase / toLowerCase (ASCII)",
+        "charCodeAt / [] / charAt at random indices"
+      ],
+      "description": "Builds a SIZE-record ASCII string by += and by join, then slices and searches it at random offsets, splits/joins/replaces its lines, runs short-string padding/trim/case operations and reads it at random indices.",
+      "notes": "Full-string scans for absent needles are a fixed 8 rounds so that the run stays linear in SIZE. The large size is 6x the medium one: at 8x, random reads into the 17 MB string became cache-bound on every engine (the random-read section grew 16x on qjs), and the run reached 6.5 s on ZIPP.",
+      "source_sha256": "83eee08f0e86c00e976a7eacac9cd32a716c10b45a6e2fda8f1024804eef6262"
+    },
+    {
+      "id": "strings-unicode-scan",
+      "entry": "text/strings-unicode-scan.js",
+      "category": "strings",
+      "goal": "script",
+      "sizes": {
+        "s": 200,
+        "m": 20000,
+        "l": 160000
+      },
+      "covers": [
+        "codePointAt walk",
+        "String.fromCodePoint (single and apply)",
+        "for-of string iteration",
+        "spread / Array.from of strings",
+        "toUpperCase / toLowerCase on non-ASCII (special casing, final sigma)",
+        "normalize NFC / NFD / NFKC / NFKD",
+        "indexOf / lastIndexOf / includes on two-byte strings",
+        "encodeURIComponent / decodeURIComponent",
+        "encodeURI / decodeURI"
+      ],
+      "description": "Walks and rebuilds a 4*SIZE-code-point mixed-script string, iterates it by code point, case-maps and normalizes non-ASCII words, searches a large well-formed two-byte string, and round-trips text through the URI coders.",
+      "notes": "Three ZIPP slow paths found while writing this (all outputs identical, so none is a correctness bug). (1) Array.prototype.slice(i, i + 16) costs O(array length) per call in both the interpreter and the JIT tier. The likely cause is that the dense path of the \"slice\" arm in crates/zipp-vm/src/vm/array_ops.rs calls array_has_holes, which scans the whole array, where scanning items[start..end] would do. The chunks are therefore copied into a scratch array, since slicing a 4*SIZE array made this section quadratic (6 s of 9.7 s at the large size). (2) indexOf/lastIndexOf on a string that holds a lone surrogate is O(length) per call: a find-all loop over 48K units took 112 ms, against 0 ms for the same slice+concat construction when it stays well formed. `big` is cut on code-point boundaries so it stays well formed. (3) UTF-16 index access into non-ASCII strings is O(distance from the last position) (WTF-8 storage with a one-position memo): the random-start searches run on a 16,000-unit document so that their cost does not grow with SIZE. That share is left in the workload on purpose, and it is most of ZIPP's deficit here.",
+      "source_sha256": "5ed2e8bc714d16cb8d3a5966bdf97d63238e92f56bb5435a8bf317dcf9f2f5ea"
+    },
+    {
+      "id": "json-small-many",
+      "entry": "text/json-small-many.js",
+      "category": "json",
+      "goal": "script",
+      "sizes": {
+        "s": 200,
+        "m": 20000,
+        "l": 160000
+      },
+      "covers": [
+        "JSON.stringify small objects",
+        "JSON.parse small objects",
+        "JSON.parse reviver",
+        "JSON.stringify function replacer",
+        "JSON.stringify array (whitelist) replacer",
+        "JSON.stringify indent (number and string)",
+        "nested arrays",
+        "string escaping: quotes, backslash, control characters",
+        "non-ASCII and emoji in strings",
+        "lone surrogate escaping (well-formed JSON.stringify)",
+        "-0 and large doubles"
+      ],
+      "description": "Round-trips SIZE varied API-message objects through JSON.stringify and JSON.parse, with a reviver, function and array replacers, indentation, nested arrays and escaped strings.",
+      "notes": "",
+      "source_sha256": "c20b396c470e0865a4b489cfba020f7a7896e7faefce32d77a3a990d053f2f56"
+    },
+    {
+      "id": "collections-map-mixed",
+      "entry": "text/collections-map-mixed.js",
+      "category": "collections",
+      "goal": "script",
+      "sizes": {
+        "s": 1000,
+        "m": 100000,
+        "l": 800000
+      },
+      "covers": [
+        "Map get/set/has/delete",
+        "Set add/has/delete",
+        "mixed key types (int, double, string, object, array, symbol, boolean, null, undefined)",
+        "SameValueZero: NaN and -0/+0 keys",
+        "small / medium / large live sizes",
+        "for-of over Map entries",
+        "Map keys()/values()",
+        "Map and Set forEach",
+        "delete-heavy churn and iteration past deletions",
+        "delete and insert during forEach",
+        "Map.prototype.clear",
+        "WeakMap get/set/has/delete with object, array and function keys"
+      ],
+      "description": "Churns Map and Set with mixed-type keys at ~8, ~1k and ~SIZE live entries, iterates them, deletes 90% of a SIZE/2 map and walks it while mutating, and exercises a WeakMap of SIZE/4 object keys.",
+      "notes": "The large tier scales with SIZE (about 110k live keys at the medium size, about 1.1k at the small size) so that the small run stays about 1/100 of the medium work; the ~8 and ~1k tiers are fixed.",
+      "source_sha256": "d4016708dd6492ea8ef7cb1c585727e170c9de0948a2aaac64f037f6b3b79e90"
+    },
+    {
+      "id": "numbers-format-parse",
+      "entry": "text/numbers-format-parse.js",
+      "category": "numbers",
+      "goal": "script",
+      "sizes": {
+        "s": 400,
+        "m": 40000,
+        "l": 320000
+      },
+      "covers": [
+        "Number.prototype.toString(radix) on integers",
+        "parseInt with radix",
+        "toFixed",
+        "toPrecision",
+        "toExponential",
+        "String(double) shortest round trip",
+        "Number(string)",
+        "parseFloat",
+        "Float64Array bit patterns",
+        "Math.sqrt/pow/exp/log/sin/cos/tanh/atan2/hypot/cbrt",
+        "Math.imul/clz32/fround",
+        "BigInt add/sub/mul/div/mod/shift",
+        "BigInt.asUintN / asIntN",
+        "BigInt toString (10 and 16)",
+        "BigInt(string)"
+      ],
+      "description": "Formats and parses SIZE integers and doubles through toString(radix), toFixed/toPrecision/toExponential, String() and parseInt/parseFloat/Number(), runs exact and quantised Math functions, and does 64-256-bit BigInt arithmetic with toString.",
+      "notes": "Implementation-approximated Math results (pow, exp, log, sin, cos, tanh, atan2, hypot, cbrt) are quantised before hashing; numeric strings are kept at 20 significant digits or fewer so that parsing is exactly specified.",
+      "source_sha256": "1c897e93c6956f427d056b29e062089ebb1a22974ecedfcea814608eefd46010"
+    }
+  ]
+}
