@@ -695,7 +695,7 @@ mod tests {
                 // Boot objects (prototypes, constructors) install
                 // non-enumerable properties and are legitimately explicit;
                 // the retained `{a,b,c,d}` user literals must stay elided.
-                if m.len() == 4 && m.key_at(0) == "a" && m.key_at(3) == "d" {
+                if m.live_len() == 4 && m.key_at(0) == "a" && m.key_at(3) == "d" {
                     objects += 1;
                     if m.may_deviate_attrs() {
                         deviating += 1;
@@ -810,7 +810,7 @@ mod tests {
             panic!("result was not a plain object")
         };
         map.verify_shape().expect("malformed sequence shape");
-        (map.keys.as_ref().to_vec(), map.vals_slice().to_vec())
+        (map.keys_iter().cloned().collect(), map.vals_slice().to_vec())
     }
 
     #[test]
@@ -960,7 +960,7 @@ mod tests {
         let HeapObj::Object(map) = vm.heap.get(duplicate_idx) else {
             panic!("planned helper did not allocate an object")
         };
-        assert_eq!(map.keys.as_ref(), &["a".to_string()]);
+        assert_eq!(map.keys_iter().cloned().collect::<Vec<_>>(), ["a".to_string()]);
         assert_eq!(map.vals_slice(), &[Value::int(1)]);
 
         // Exact-IP interpreter replay owns malformed duplicate semantics.
@@ -969,7 +969,7 @@ mod tests {
             unreachable!()
         };
         map.push_static_data("a", Value::int(9));
-        assert_eq!(map.keys.as_ref(), &["a".to_string()]);
+        assert_eq!(map.keys_iter().cloned().collect::<Vec<_>>(), ["a".to_string()]);
         assert_eq!(map.vals_slice(), &[Value::int(9)]);
 
         let reordered_bits = jit_new_planned_object(vm_ptr, alloc);
@@ -993,7 +993,7 @@ mod tests {
             unreachable!()
         };
         map.push_static_data("b", Value::int(7));
-        assert_eq!(map.keys.as_ref(), &["b".to_string(), "a".to_string()]);
+        assert_eq!(map.keys_iter().cloned().collect::<Vec<_>>(), ["b".to_string(), "a".to_string()]);
         assert_eq!(map.vals_slice(), &[Value::int(7), Value::int(1)]);
         map.verify_shape().expect("native malformed append shape");
     }
@@ -1035,8 +1035,8 @@ mod tests {
             panic!("planned helper did not allocate a plain object")
         };
         assert_eq!(
-            map.keys.as_ref(),
-            &["a".to_string(), "1".to_string(), "tail".to_string()]
+            map.keys_iter().cloned().collect::<Vec<_>>(),
+            ["a".to_string(), "1".to_string(), "tail".to_string()]
         );
         assert_eq!(map.element_pos(1), Some(1));
         map.verify_shape().expect("JIT planned append shape");
@@ -1063,11 +1063,11 @@ mod tests {
         let HeapObj::Object(map) = vm.heap.get(object.heap_index()) else {
             unreachable!()
         };
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.live_len(), 1);
         assert_eq!(map.key_at(0), "boundedKey");
         assert_eq!(map.val_at(0), Value::int(37));
 
-        let before = map.len();
+        let before = map.live_len();
         let bad_name = ((func_id as u64) << 32) | u32::MAX as u64;
         assert_eq!(
             jit_append_data_prop(vm_ptr, object_bits, bad_name, Value::int(9).bits()),
@@ -1076,7 +1076,7 @@ mod tests {
         let HeapObj::Object(map) = vm.heap.get(object.heap_index()) else {
             unreachable!()
         };
-        assert_eq!(map.len(), before, "a declined append must be a pure prefix");
+        assert_eq!(map.live_len(), before, "a declined append must be a pure prefix");
     }
 
     #[test]

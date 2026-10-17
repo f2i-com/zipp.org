@@ -3506,18 +3506,18 @@ impl<'p> Vm<'p> {
                         out.push_char(' ');
                     }
                 }
-                if map.keys.is_empty() {
+                if map.is_empty() {
                     out.push_str("{}");
                     return;
                 }
                 out.push_str("{ ");
-                for (i, (key, value)) in map.keys.iter().zip(map.vals_slice().iter()).enumerate() {
+                for (i, (key, value, _)) in map.iter().enumerate() {
                     if i != 0 {
                         out.push_str(", ");
                     }
                     out.push_str(guest_key_text(key));
                     out.push_str(": ");
-                    self.inspect_value_into(out, *value, true, depth + 1);
+                    self.inspect_value_into(out, value, true, depth + 1);
                     if out.truncated {
                         break;
                     }

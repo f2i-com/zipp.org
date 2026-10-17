@@ -367,10 +367,10 @@ impl<'p> Vm<'p> {
                 // VALUE is copied (not the accessor) and a throw propagates.
                 let keys: Vec<String> = if s.is_heap() {
                     match self.heap.get(s.heap_index()) {
-                        HeapObj::Object(map) => spec_key_order(&map.keys)
+                        HeapObj::Object(map) => spec_key_order_map(&map)
                             .into_iter()
                             .filter(|&i| map.attr_at(i).enumerable)
-                            .map(|i| map.keys[i].clone())
+                            .map(|i| map.key_at(i).to_owned())
                             .filter(|k| !excluded.iter().any(|e| e == k))
                             .collect(),
                         // A STRING source: its UNITS are own enumerable
@@ -422,10 +422,10 @@ impl<'p> Vm<'p> {
                 }
                 let keys: Vec<String> = if s.is_heap() {
                     match self.heap.get(s.heap_index()) {
-                        HeapObj::Object(map) => spec_key_order(&map.keys)
+                        HeapObj::Object(map) => spec_key_order_map(&map)
                             .into_iter()
                             .filter(|&i| map.attr_at(i).enumerable)
-                            .map(|i| map.keys[i].clone())
+                            .map(|i| map.key_at(i).to_owned())
                             .filter(|k| !excluded.iter().any(|e| e == k))
                             .collect(),
                         HeapObj::Str(st) => (0..st.units())

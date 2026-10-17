@@ -126,7 +126,7 @@ pub mod bench_support {
             v.push(Value::num((bits ^ (salt as u64 ^ i as u64)) as f64));
         }
         let m = Box::new(ObjMap::finalized_from_plan(plan.clone(), v, shape));
-        (m.len() as usize).wrapping_add(m.shape() as usize & 1)
+        (m.live_len() as usize).wrapping_add(m.shape() as usize & 1)
     }
 
     /// B187 stage-3: the allocator/init/store decomposition ladder (lives in

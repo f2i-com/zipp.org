@@ -859,16 +859,13 @@ impl<'p> Vm<'p> {
                 self.realm_ctor_main.insert(ctor_idx, main_ctor);
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ctor) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            k.as_str() != "prototype"
-                                && k.as_str() != "name"
-                                && k.as_str() != "length"
+                        .filter(|&(k, _, _)| {
+                            k != "prototype"
+                                && k != "name"
+                                && k != "length"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -890,12 +887,9 @@ impl<'p> Vm<'p> {
             if main_proto != 0 {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| k.as_str() != "constructor")
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .filter(|&(k, _, _)| k != "constructor")
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -975,19 +969,15 @@ impl<'p> Vm<'p> {
                 }
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(src) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            let k = k.as_str();
+                        .filter(|&(k, _, _)| {
                             if skip_ctor {
                                 k != "constructor"
                             } else {
                                 k != "prototype" && k != "name" && k != "length"
                             }
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1089,14 +1079,11 @@ impl<'p> Vm<'p> {
                 let fnp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_fn_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .filter(|((k, _), _)| {
-                            k.as_str() != "constructor" && k.as_str() != "prototype"
+                        .filter(|&(k, _, _)| {
+                            k != "constructor" && k != "prototype"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1143,12 +1130,9 @@ impl<'p> Vm<'p> {
                     for srcp in sources {
                         let props: Vec<(String, Value, PropAttr)> = match self.heap.get(srcp) {
                             HeapObj::Object(mm) => mm
-                                .keys
                                 .iter()
-                                .zip(mm.vals_slice().iter())
-                                .zip(mm.attrs_iter())
-                                .filter(|((k, _), _)| k.as_str() != "constructor")
-                                .map(|((k, v), a)| (k.clone(), *v, a))
+                                .filter(|&(k, _, _)| k != "constructor")
+                                .map(|(k, v, a)| (k.to_owned(), v, a))
                                 .collect(),
                             _ => Vec::new(),
                         };
@@ -1207,11 +1191,8 @@ impl<'p> Vm<'p> {
                 }
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1240,11 +1221,8 @@ impl<'p> Vm<'p> {
             if let Some(&main_ns) = self.builtin_globals.get(ns) {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
                     HeapObj::Object(mm) => mm
-                        .keys
                         .iter()
-                        .zip(mm.vals_slice().iter())
-                        .zip(mm.attrs_iter())
-                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1317,12 +1295,9 @@ impl<'p> Vm<'p> {
         if self.dollar262 != 0 {
             let props: Vec<(String, Value, PropAttr)> = match self.heap.get(self.dollar262) {
                 HeapObj::Object(mm) => mm
-                    .keys
                     .iter()
-                    .zip(mm.vals_slice().iter())
-                    .zip(mm.attrs_iter())
-                    .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
-                    .map(|((k, v), a)| (k.clone(), *v, a))
+                    .filter(|&(k, _, _)| k != "global" && k != "evalScript")
+                    .map(|(k, v, a)| (k.to_owned(), v, a))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -3803,8 +3778,7 @@ impl<'p> Vm<'p> {
                 } else if a0.is_heap() {
                     if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
                         let keys: Vec<String> = m
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .filter(|k| k.starts_with("@@"))
                             .cloned()
                             .collect();
@@ -3820,8 +3794,7 @@ impl<'p> Vm<'p> {
                         let mut keys: Vec<String> = Vec::new();
                         for k in c
                             .statics
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .chain(c.static_getters.iter().map(|(n, _)| n))
                             .chain(c.static_setters.iter().map(|(n, _)| n))
                         {
@@ -3840,8 +3813,7 @@ impl<'p> Vm<'p> {
                             self.arr_props
                                 .get(&a0.heap_index())
                                 .map_or(Vec::new(), |m| {
-                                    m.keys
-                                        .iter()
+                                    m.keys_iter()
                                         .filter(|k| k.starts_with("@@"))
                                         .cloned()
                                         .collect()
@@ -3870,8 +3842,7 @@ impl<'p> Vm<'p> {
                             self.arr_props.get(&a0.heap_index())
                         };
                         let keys: Vec<String> = table.map_or(Vec::new(), |m| {
-                            m.keys
-                                .iter()
+                            m.keys_iter()
                                 .filter(|k| k.starts_with("@@"))
                                 .cloned()
                                 .collect()

@@ -211,7 +211,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(v.heap_index()) else {
             return None;
         };
-        if m.is_ctor || !m.extensible || m.len() != keys.len() {
+        if m.is_ctor || !m.extensible || m.slot_len() != keys.len() {
             return None;
         }
         for (i, k) in keys.iter().enumerate() {

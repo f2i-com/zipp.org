@@ -207,9 +207,9 @@ impl<'p> Vm<'p> {
     fn py_prof_kind(&self, i: u32) -> String {
         let k = match self.heap.get(i) {
             HeapObj::Object(m) => {
-                let n = m.len().min(3);
+                let n = m.live_len().min(3);
                 let keys: Vec<&str> = (0..n).map(|s| m.key_at(s)).collect();
-                return format!("Object{{{}{}}}", keys.join(","), if m.len() > 3 { ",.." } else { "" });
+                return format!("Object{{{}{}}}", keys.join(","), if m.live_len() > 3 { ",.." } else { "" });
             }
             HeapObj::Str(_) => "Str",
             HeapObj::Cons { .. } => "Cons",

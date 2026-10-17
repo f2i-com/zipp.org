@@ -112,6 +112,11 @@ impl Value {
     /// a prototype lookup). `is_undefined()` uses an exact bit compare, so a hole is
     /// not `undefined`.
     pub const HOLE: Value = Value(TAG_UNDEFINED | 2);
+    /// An INTERNAL-ONLY sentinel for a deleted slot of a dictionary-mode object
+    /// (`heap::ObjMap::delete_at`): the value column's mark that the slot holds
+    /// no property. Never stored anywhere else, and never read as a value —
+    /// every positional reader of an object skips such slots.
+    pub const PROP_HOLE: Value = Value(TAG_UNDEFINED | 4);
     pub const NULL: Value = Value(TAG_NULL);
     pub const TRUE: Value = Value(TAG_BOOL | 1);
     pub const FALSE: Value = Value(TAG_BOOL);

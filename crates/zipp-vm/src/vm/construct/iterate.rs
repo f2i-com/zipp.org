@@ -58,7 +58,7 @@ impl<'p> Vm<'p> {
             let copy = match (self.heap.get(src.heap_index()), self.heap.get(ti)) {
                 (HeapObj::Object(sm), HeapObj::Object(tm))
                     if !sm.is_ctor
-                        && tm.keys.is_empty()
+                        && tm.is_empty()
                         && tm.extensible
                         && tm.class.is_none()
                         && !tm.class_proto =>
@@ -83,14 +83,14 @@ impl<'p> Vm<'p> {
         // Everything else: the general CopyDataProperties (getters, proxies,
         // strings, arrays, symbols, index order), then each property defined.
         let m = self.with_host_roots(&[target], |vm| vm.copy_data_properties_rest(src, &[]))?;
-        let n = m.keys.len();
-        for i in 0..n {
+        let n = m.live_len();
+        for i in m.slots() {
             let v = m.val_at(i);
             if v.is_heap() {
                 self.heap.write_barrier_val(ti, v);
             }
             if let HeapObj::Object(tm) = self.heap.get_mut(ti) {
-                tm.define(&m.keys[i], v, crate::heap::PropAttr::data());
+                tm.define(m.key_at(i), v, crate::heap::PropAttr::data());
             }
         }
         if n > 0 {
@@ -233,13 +233,13 @@ impl<'p> Vm<'p> {
             || tm.class.is_some()
             || tm.class_proto
             || tm.is_ctor
-            || sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__")
+            || sm.keys_iter().any(|k| k.starts_with("@@") || k == "__proto__")
         {
             return false;
         }
         // Every key's Set must be an own store or an ordinary append.
-        let target_empty = tm.keys.is_empty();
-        let sets_plain = sm.keys.iter().all(|k| {
+        let target_empty = tm.is_empty();
+        let sets_plain = sm.keys_iter().all(|k| {
             self.plain_add_chain_clear(tidx, k)
                 && (target_empty
                     || match tm.pos(k) {
@@ -271,7 +271,7 @@ impl<'p> Vm<'p> {
             }
         }
         let (keys, vals): (Vec<String>, Vec<Value>) = match self.heap.get(sidx) {
-            HeapObj::Object(sm) => (sm.keys.iter().cloned().collect(), sm.vals_slice().to_vec()),
+            HeapObj::Object(sm) => sm.iter().map(|(k, v, _)| (k.to_owned(), v)).unzip(),
             _ => return false,
         };
         for (k, v) in keys.into_iter().zip(vals) {
@@ -1054,8 +1054,7 @@ impl<'p> Vm<'p> {
         let hit = e.proto_ver != 0
             && e.proto_ver == self.heap.version_of(e.proto).wrapping_add(1)
             && matches!(self.heap.get(e.proto), HeapObj::Object(p)
-                if (e.next_slot as usize) < p.keys.len()
-                    && p.val_at(e.next_slot as usize).bits() == e.next_bits)
+                if p.val_get(e.next_slot as usize).is_some_and(|v| v.bits() == e.next_bits))
             && (!closes
                 || (e.chain_len > 0
                     && e.chain[..e.chain_len as usize]
@@ -1198,7 +1197,7 @@ impl<'p> Vm<'p> {
             && self.heap.version_of(first).wrapping_add(1) == memo.first_ver
             && self.heap.version_of(memo.holder) == memo.holder_ver
             && matches!(self.heap.get(memo.holder), HeapObj::Object(m)
-                if (memo.slot as usize) < m.vals_len() && m.val_at(memo.slot as usize).bits() == memo.bits)
+                if m.val_get(memo.slot as usize).is_some_and(|v| v.bits() == memo.bits))
         {
             return true;
         }
@@ -1280,7 +1279,7 @@ impl<'p> Vm<'p> {
         let hit = ver != 0
             && ver == self.heap.version_of(holder).wrapping_add(1)
             && matches!(self.heap.get(holder), HeapObj::Object(p)
-                if (at as usize) < p.keys.len() && p.val_at(at as usize).bits() == default.bits());
+                if p.val_get(at as usize).is_some_and(|v| v.bits() == default.bits()));
         if !hit {
             // Prove the holder's own `@@iterator` is the default DATA method;
             // its slot then stays valid for as long as its version does.

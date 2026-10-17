@@ -398,6 +398,16 @@ impl NumIndex {
         }
     }
 
+    /// The owning map moved each slot `s` to `to[s]` (see `PropIndex::remap`).
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn remap(&mut self, to: &[u32]) {
+        for s in self.slots.iter_mut() {
+            if *s != PROP_EMPTY {
+                *s = to[*s as usize];
+            }
+        }
+    }
+
     fn resident_bytes(&self) -> usize {
         vec_capacity_bytes(&self.idx).saturating_add(vec_capacity_bytes(&self.slots))
     }
@@ -491,6 +501,9 @@ pub enum PropIndex {
         table: Vec<(u32, u32)>,
         mask: usize,
         len: usize,
+        /// Deleted slots of the owning map that no entry names (see
+        /// [`ObjMap::delete_at`]).
+        holes: usize,
     },
     /// W19 M1: parallel `tags` / `slots`, same length, same bucket index.
     /// INVARIANT: `tags.len() == slots.len() == mask + 1`, a bucket is occupied
@@ -500,6 +513,8 @@ pub enum PropIndex {
         slots: Vec<u32>,
         mask: usize,
         len: usize,
+        /// As for `Inter`.
+        holes: usize,
     },
 }
 
@@ -531,12 +546,14 @@ impl PropIndex {
                 slots: vec![PROP_EMPTY; cap],
                 mask: cap - 1,
                 len: 0,
+                holes: 0,
             }
         } else {
             PropIndex::Inter {
                 table: vec![(0, PROP_EMPTY); cap],
                 mask: cap - 1,
                 len: 0,
+                holes: 0,
             }
         }
     }
@@ -788,8 +805,10 @@ impl PropIndex {
     /// key through this very index.
     ///
     /// Both arms run the SAME two passes over the SAME buckets in the same
-    /// order; only the physical layout differs.
-    fn remove_slot(&mut self, tag: u32, slot: u32) {
+    /// order; only the physical layout differs. Without `renumber` the second
+    /// pass is skipped: the owning map left `slot` in place as a hole, so no
+    /// other key moved.
+    fn remove_slot(&mut self, tag: u32, slot: u32, renumber: bool) {
         match self {
             #[cfg(feature = "safe-sandbox")]
             PropIndex::HashTree { .. } | PropIndex::Tree { .. } => unreachable!(),
@@ -824,9 +843,11 @@ impl PropIndex {
                     k = (k + 1) & mask;
                 }
                 *len -= 1;
-                for e in table.iter_mut() {
-                    if e.1 != PROP_EMPTY && e.1 > slot {
-                        e.1 -= 1;
+                if renumber {
+                    for e in table.iter_mut() {
+                        if e.1 != PROP_EMPTY && e.1 > slot {
+                            e.1 -= 1;
+                        }
                     }
                 }
             }
@@ -865,7 +886,9 @@ impl PropIndex {
                 *len -= 1;
                 // The renumber sweep, and the whole point of the split: one
                 // contiguous u32 store per entry.
-                renumber_above(slots, slot);
+                if renumber {
+                    renumber_above(slots, slot);
+                }
             }
         }
     }
@@ -901,7 +924,59 @@ impl PropIndex {
             }
             return;
         }
-        self.remove_slot(prop_tag(key), slot);
+        self.remove_slot(prop_tag(key), slot, true);
+    }
+
+    /// Holes left by [`ObjMap::delete_at`] in the owning map: slots that no
+    /// entry names. Always 0 for the safe profile's trees, which never hold
+    /// one.
+    #[inline]
+    fn holes(&self) -> usize {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => 0,
+            PropIndex::Inter { holes, .. } | PropIndex::Split { holes, .. } => *holes,
+        }
+    }
+
+    /// Unrecord `slot` (`key`'s), which the owning map keeps as a hole: no
+    /// other slot moves, so nothing is renumbered. The flat layouts only.
+    fn forget(&mut self, key: &str, slot: u32) {
+        self.remove_slot(prop_tag(key), slot, false);
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => {
+                unreachable!("the safe profile's maps never hold holes")
+            }
+            PropIndex::Inter { holes, .. } | PropIndex::Split { holes, .. } => *holes += 1,
+        }
+    }
+
+    /// The owning map dropped its holes, moving each slot `s` to `to[s]`:
+    /// rewrite every entry to match.
+    fn remap(&mut self, to: &[u32]) {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::HashTree { .. } | PropIndex::Tree { .. } => {
+                unreachable!("the safe profile's maps never hold holes")
+            }
+            PropIndex::Inter { table, holes, .. } => {
+                for e in table.iter_mut() {
+                    if e.1 != PROP_EMPTY {
+                        e.1 = to[e.1 as usize];
+                    }
+                }
+                *holes = 0;
+            }
+            PropIndex::Split { slots, holes, .. } => {
+                for s in slots.iter_mut() {
+                    if *s != PROP_EMPTY {
+                        *s = to[*s as usize];
+                    }
+                }
+                *holes = 0;
+            }
+        }
     }
 
     /// Double and rehash from the stored tags (bucket = `tag & mask`).
@@ -1531,10 +1606,98 @@ fn key_bytes_sub(count: &mut u32, n: usize) {
     }
 }
 
+/// Slots a map must have before [`ObjMap::delete_at`] leaves a hole rather
+/// than shifting every later slot down: below this the shift is cheaper than
+/// skipping holes afterwards.
+const HOLE_MIN_SLOTS: usize = 32;
+
+/// `ZIPP_PROP_HOLES`: `0` turns holes off (every delete shifts, as before
+/// they existed), `all` makes every delete from any map with owned keys
+/// leave one, building the index holes need on demand — the setting the test
+/// suites run under to reach every positional reader with one. Anything else,
+/// or unset, is the shipped policy. Latched once. The safe profile never
+/// holds a hole: its indexes are trees.
+fn prop_holes_mode() -> u8 {
+    if cfg!(feature = "safe-sandbox") {
+        return 0;
+    }
+    if crate::WASM_STATIC_SWITCHES {
+        return 1;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let s = STATE.load(Ordering::Relaxed);
+    if s != u8::MAX {
+        return s;
+    }
+    let mode = match std::env::var("ZIPP_PROP_HOLES").as_deref() {
+        Ok("0") => 0,
+        Ok("all") => 2,
+        _ => 1,
+    };
+    STATE.store(mode, Ordering::Relaxed);
+    mode
+}
+
+/// The slot index of every property of an [`ObjMap`], in order: its slots
+/// without the holes [`ObjMap::delete_at`] left. Exact-sized, so collecting
+/// through it allocates once, as collecting a slice iterator did.
+#[derive(Clone)]
+pub struct Slots<'a> {
+    /// The value column when the map holds holes (each a
+    /// [`Value::PROP_HOLE`]); `None` when every slot is a property.
+    vals: Option<&'a [Value]>,
+    front: usize,
+    back: usize,
+    left: usize,
+}
+
+impl Iterator for Slots<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        while self.front < self.back {
+            let i = self.front;
+            self.front += 1;
+            if self.vals.is_none_or(|v| v[i].bits() != Value::PROP_HOLE.bits()) {
+                self.left -= 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for Slots<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<usize> {
+        while self.front < self.back {
+            self.back -= 1;
+            let i = self.back;
+            if self.vals.is_none_or(|v| v[i].bits() != Value::PROP_HOLE.bits()) {
+                self.left -= 1;
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+impl ExactSizeIterator for Slots<'_> {}
+
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Default)]
 pub struct ObjMap {
-    pub keys: PropKeys,
+    /// PRIVATE since dictionary holes (see [`ObjMap::delete_at`]): a slot of
+    /// the list can hold no property, so every read of it goes through the
+    /// accessors that know which slots do.
+    keys: PropKeys,
     /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
     /// access goes through the `val_*`/`vals_*` methods so the storage can
     /// change underneath — the planned literal-born representation keeps the
@@ -2297,14 +2460,95 @@ impl ObjMap {
 
     /// Number of own properties.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn live_len(&self) -> usize {
+        self.keys.len() - self.hole_count()
+    }
+
+    /// Whether the map holds no property.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.live_len() == 0
+    }
+
+    /// Number of slots, holes included (see [`ObjMap::delete_at`]): the bound
+    /// of a slot index, not a property count.
+    #[inline]
+    pub fn slot_len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Slots that hold no property (see [`ObjMap::delete_at`]). Only a map
+    /// with a flat index holds one.
+    #[inline]
+    fn hole_count(&self) -> usize {
+        match &self.index {
+            Some(ix) => ix.holes(),
+            None => 0,
+        }
+    }
+
+    /// Whether any slot holds no property (see [`ObjMap::delete_at`]).
+    #[inline]
+    pub fn has_holes(&self) -> bool {
+        self.hole_count() != 0
+    }
+
+    /// Whether slot `i` holds no property. Meaningful for any `i` below
+    /// `slot_len()`; only a map that `has_holes` answers `true`.
+    #[inline]
+    pub fn is_hole(&self, i: usize) -> bool {
+        self.vals.as_slice()[i].bits() == Value::PROP_HOLE.bits()
+    }
+
+    /// The slot of every property, in order (see [`Slots`]).
+    #[inline]
+    pub fn slots(&self) -> Slots<'_> {
+        let n = self.keys.len();
+        let holes = self.hole_count();
+        Slots {
+            vals: (holes != 0).then(|| self.vals.as_slice()),
+            front: 0,
+            back: n,
+            left: n - holes,
+        }
+    }
+
+    /// The name of every property, in order.
+    #[inline]
+    pub fn keys_iter(&self) -> impl DoubleEndedIterator<Item = &String> + ExactSizeIterator + Clone + '_ {
+        let keys: &[String] = &self.keys;
+        self.slots().map(move |i| &keys[i])
+    }
+
+    /// The key list itself, for a caller asking which REPRESENTATION it is
+    /// (a planned list is shared with the literal that made it). Its slots
+    /// include holes; a planned list never holds one.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn prop_keys(&self) -> &PropKeys {
+        &self.keys
+    }
+
+    /// `(slot, name)` of every property, in order: what
+    /// `keys.iter().enumerate()` was before holes.
+    #[inline]
+    pub fn slot_keys(&self) -> impl DoubleEndedIterator<Item = (usize, &String)> + ExactSizeIterator + Clone + '_ {
+        let keys: &[String] = &self.keys;
+        self.slots().map(move |i| (i, &keys[i]))
+    }
+
+    /// The property name at slot `i`, or `None` past the end or at a hole.
+    #[inline]
+    pub fn key_get(&self, i: usize) -> Option<&str> {
+        let k = self.keys.get(i)?;
+        (!self.has_holes() || !self.is_hole(i)).then_some(k.as_str())
     }
 
     /// The property name at `i`. Panics out of range, exactly like the indexing
     /// it replaces — every caller has already established `i` from `pos()`.
     #[inline]
     pub fn key_at(&self, i: usize) -> &str {
+        debug_assert!(!self.has_holes() || !self.is_hole(i), "key_at({i}) read a hole");
         &self.keys[i]
     }
 
@@ -2312,11 +2556,13 @@ impl ObjMap {
     #[cfg_attr(feature = "wasm-lite", inline(always))]
     #[cfg_attr(not(feature = "wasm-lite"), inline)]
     pub fn val_at(&self, i: usize) -> Value {
+        debug_assert!(self.vals[i].bits() != Value::PROP_HOLE.bits(), "val_at({i}) read a hole");
         self.vals[i]
     }
 
     #[inline]
     pub fn attr_at(&self, i: usize) -> PropAttr {
+        debug_assert!(!self.has_holes() || !self.is_hole(i), "attr_at({i}) read a hole");
         self.attrs.at(i)
     }
 
@@ -2402,10 +2648,16 @@ impl ObjMap {
         self.attrs.push(a);
     }
 
-    /// Every slot's attributes in order, by value (`PropAttr` is `Copy`).
+    /// Every property's attributes in order, by value (`PropAttr` is
+    /// `Copy`): one per [`ObjMap::slots`] entry.
     #[inline]
     pub fn attrs_iter(&self) -> impl Iterator<Item = PropAttr> + '_ {
-        self.attrs.iter()
+        let holes = self.has_holes();
+        self.attrs
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| !holes || !self.is_hole(i))
+            .map(|(_, a)| a)
     }
 
     /// Number of attribute slots. Equals `len()` for a consistent map; the
@@ -2465,8 +2717,9 @@ impl ObjMap {
 
     /// `(name, value, attrs)` per own property, insertion order.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Value, PropAttr)> {
-        (0..self.keys.len()).map(move |i| (&*self.keys[i], self.vals[i], self.attrs.at(i)))
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&str, Value, PropAttr)> + ExactSizeIterator {
+        self.slots()
+            .map(move |i| (&*self.keys[i], self.vals[i], self.attrs.at(i)))
     }
 
     /// This object's hidden class, or [`shape::DICT`] if it has none.
@@ -2620,6 +2873,9 @@ impl ObjMap {
         m.numeric_index = self.numeric_index.clone();
         m.has_element_key = self.has_element_key;
         m.planned_append_failed = self.planned_append_failed;
+        // The copy is a consistent map, holes and all; a fresh literal has
+        // no reason to carry them.
+        m.compact();
         Some(m)
     }
 
@@ -3039,6 +3295,8 @@ impl ObjMap {
 
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
     pub fn seal(&mut self) {
+        // A sealed map takes no more deletes: drop its holes once.
+        self.compact();
         self.extensible = false;
         self.sealed = true;
         for a in self.attrs.materialize() {
@@ -3049,6 +3307,7 @@ impl ObjMap {
 
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
+        self.compact();
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
@@ -3390,11 +3649,16 @@ impl ObjMap {
     /// not pay a second hash lookup to remove the same key. Pure refactor: the
     /// body below is `remove`'s former body verbatim, in the same order.
     ///
-    /// `i` MUST be a live slot index (`i < self.keys.len()`).
+    /// `i` MUST be a property's slot. Every later property moves down one
+    /// slot; a map holding holes drops them first, so it holds none after.
     /// B220: returns the removed key's String so a caller with the Heap in
     /// hand can recycle the buffer (`Heap::recycle_key_buf`). Callers that do
     /// not want it simply drop the value, exactly as before.
-    pub fn remove_at(&mut self, i: usize) -> String {
+    pub fn remove_at(&mut self, mut i: usize) -> String {
+        if self.has_holes() {
+            i -= (0..i).filter(|&j| self.is_hole(j)).count();
+            self.compact();
+        }
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
@@ -3402,13 +3666,6 @@ impl ObjMap {
         let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
-        // Removing the last element-naming key must clear the bit, or a
-        // `delete arr[0]` would leave every dense fast path shut off for the
-        // life of the object. Recompute rather than count: deletion is rare
-        // and a stale count is a silent wrong answer.
-        if self.has_element_key && key_names_element(&key) {
-            self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
-        }
         if let Some(numeric) = &mut self.numeric_index {
             if let Some(n) = canonical_array_index_key(&key) {
                 numeric.remove(n);
@@ -3423,7 +3680,158 @@ impl ObjMap {
                 ix.remove(&key, i as u32);
             }
         }
+        self.element_key_removed(&key);
         key
+    }
+
+    /// The delete operator's `remove_at`: the same removal, except that a map
+    /// big enough for the shift to dominate the delete keeps the slot as a
+    /// HOLE — its key emptied, its value [`Value::PROP_HOLE`], its index
+    /// entries gone — so no other property moves and nothing is renumbered.
+    /// Holes are dropped in one pass once they are half the slots (or by any
+    /// `remove_at`), which keeps a delete amortized O(1) where shifting every
+    /// later slot made a dictionary emptied key by key quadratic.
+    ///
+    /// A hole is a slot without a property, so every reader that walks slots
+    /// skips them ([`ObjMap::slots`], [`ObjMap::iter`], [`ObjMap::keys_iter`]);
+    /// a slot from `pos()` or a cache is never one. Only maps that cannot
+    /// carry a shape another object shares hold them: owned keys, a value
+    /// vector, a flat index (which counts them).
+    pub fn delete_at(&mut self, i: usize) -> String {
+        if !self.hole_ok() {
+            return self.remove_at(i);
+        }
+        self.shape_to_dict();
+        let PropKeys::Owned(keys) = &mut self.keys else {
+            unreachable!("hole_ok requires owned keys")
+        };
+        let key = std::mem::take(&mut keys[i]);
+        key_bytes_sub(&mut self.key_bytes, key.capacity());
+        self.vals[i] = Value::PROP_HOLE;
+        if let PropAttrs::Mixed(attrs) = &mut self.attrs {
+            attrs[i] = PropAttrs::DEFAULT;
+        }
+        if let Some(numeric) = &mut self.numeric_index {
+            if let Some(n) = canonical_array_index_key(&key) {
+                numeric.remove(n);
+            }
+        }
+        self.index
+            .as_mut()
+            .expect("hole_ok requires an index")
+            .forget(&key, i as u32);
+        self.element_key_removed(&key);
+        if self.hole_count() * 2 > self.keys.len() {
+            self.compact();
+        }
+        key
+    }
+
+    /// [`ObjMap::remove`] for the delete operator: [`ObjMap::delete_at`]
+    /// at `key`'s slot.
+    pub fn delete_key(&mut self, key: &str) -> bool {
+        match self.pos(key) {
+            Some(i) => {
+                self.delete_at(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether [`ObjMap::delete_at`] may leave a hole here, building the
+    /// index a hole needs first when `ZIPP_PROP_HOLES=all`.
+    fn hole_ok(&mut self) -> bool {
+        let mode = prop_holes_mode();
+        if mode == 0
+            || self.class_proto
+            || !matches!(self.keys, PropKeys::Owned(_))
+            || !matches!(self.vals, ValStore::Vec(_))
+        {
+            return false;
+        }
+        if mode == 2 && self.index.is_none() && self.keys.len() > 1 {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
+        matches!(
+            self.index.as_deref(),
+            Some(PropIndex::Inter { .. } | PropIndex::Split { .. })
+        ) && (mode == 2 || self.keys.len() >= HOLE_MIN_SLOTS)
+    }
+
+    /// Drop every hole in one pass: each property moves down past the holes
+    /// before it, in order, and both indexes are rewritten to match.
+    pub(crate) fn compact(&mut self) {
+        if !self.has_holes() {
+            return;
+        }
+        let ObjMap {
+            keys,
+            vals,
+            attrs,
+            index,
+            numeric_index,
+            ..
+        } = self;
+        let PropKeys::Owned(keys) = keys else {
+            unreachable!("holes are owned-key maps only")
+        };
+        #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+        let ValStore::Vec(vals) = vals
+        else {
+            unreachable!("holes are value-vector maps only")
+        };
+        let n = keys.len();
+        let mut to = vec![PROP_EMPTY; n];
+        let mut w = 0usize;
+        for r in 0..n {
+            if vals[r].bits() == Value::PROP_HOLE.bits() {
+                continue;
+            }
+            to[r] = w as u32;
+            if r != w {
+                // Every slot in `w..r` is a hole's or one already moved out,
+                // so the key swapped back is an empty hole key.
+                keys.swap(r, w);
+                vals[w] = vals[r];
+                if let PropAttrs::Mixed(a) = attrs {
+                    a[w] = a[r];
+                }
+            }
+            w += 1;
+        }
+        keys.truncate(w);
+        vals.truncate(w);
+        match attrs {
+            PropAttrs::Mixed(a) => a.truncate(w),
+            PropAttrs::AllData { len } => *len = w as u32,
+        }
+        if let Some(ix) = index {
+            ix.remap(&to);
+        }
+        if let Some(numeric) = numeric_index {
+            numeric.remap(&to);
+        }
+    }
+
+    /// Clear `has_element_key` when `key`, just removed, was the last key
+    /// naming an element.
+    ///
+    /// Removing the last element-naming key must clear the bit, or a
+    /// `delete arr[0]` would leave every dense fast path shut off for the
+    /// life of the object. Recompute rather than count: deletion is rare
+    /// and a stale count is a silent wrong answer. With the numeric side
+    /// index on, the index holds every canonical index key (`element_pos`
+    /// answers from it alone), so the question is whether it still holds
+    /// one or `"length"` remains, not a scan of every key.
+    fn element_key_removed(&mut self, key: &str) {
+        if self.has_element_key && key_names_element(key) {
+            self.has_element_key = if sparse_num_index_enabled() {
+                self.numeric_index.as_ref().is_some_and(|n| n.len > 0) || self.pos("length").is_some()
+            } else {
+                self.keys_iter().any(|k| key_names_element(k))
+            };
+        }
     }
 
     /// Remove every Array-index key `drop(index, attrs)` selects, in ONE pass:
@@ -11346,6 +11754,86 @@ mod tests {
         }
     }
 
+    /// `delete_at` leaves holes every reader skips and `compact` drops them:
+    /// a dictionary churned by sets, hole-leaving deletes, shifting removes
+    /// and compactions, checked after every step against an ordered model.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn dictionary_holes_track_an_ordered_model() {
+        let mut m = ObjMap::new();
+        let mut model: Vec<(String, i32)> = Vec::new();
+        let mut seed = 0x9E37_79B9u32;
+        let mut rnd = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        let mut saw_holes = false;
+        for step in 0..6000i32 {
+            let k = rnd(160);
+            let key = match k % 11 {
+                0 => (k * 7).to_string(),
+                1 if k == 1 => "length".to_string(),
+                _ => format!("k{k}"),
+            };
+            match rnd(20) {
+                0..=8 => {
+                    m.set(&key, Value::int(step));
+                    match model.iter_mut().find(|(mk, _)| *mk == key) {
+                        Some(e) => e.1 = step,
+                        None => model.push((key.clone(), step)),
+                    }
+                }
+                9..=16 => {
+                    assert_eq!(m.delete_key(&key), model.iter().any(|(mk, _)| *mk == key));
+                    model.retain(|(mk, _)| *mk != key);
+                }
+                17 | 18 => {
+                    assert_eq!(m.remove(&key), model.iter().any(|(mk, _)| *mk == key));
+                    model.retain(|(mk, _)| *mk != key);
+                }
+                _ => m.compact(),
+            }
+            saw_holes |= m.has_holes();
+            assert_eq!(m.live_len(), model.len(), "step {step}");
+            assert_eq!(m.slots().len(), model.len());
+            let seen: Vec<(String, i32)> = m.iter().map(|(k, v, _)| (k.to_owned(), v.as_int())).collect();
+            assert_eq!(seen, model, "step {step}");
+            assert!(m.keys_iter().eq(model.iter().map(|(k, _)| k)));
+            assert_eq!(m.attrs_iter().count(), model.len());
+            for (i, (mk, mv)) in model.iter().enumerate() {
+                let slot = m.pos(mk).expect("a model key is present");
+                assert!(!m.is_hole(slot));
+                assert_eq!(m.key_get(slot), Some(mk.as_str()));
+                assert_eq!(m.val_at(slot), Value::int(*mv));
+                if let Some(n) = canonical_array_index_key(mk) {
+                    assert_eq!(m.element_pos(n as usize), Some(slot), "step {step} key {i}");
+                }
+            }
+            for probe in [format!("k{}", rnd(160)), (rnd(160) * 7).to_string()] {
+                let present = model.iter().any(|(mk, _)| *mk == probe);
+                assert_eq!(m.pos(&probe).is_some(), present);
+                if let Some(n) = canonical_array_index_key(&probe) {
+                    assert_eq!(m.element_pos(n as usize).is_some(), present);
+                }
+            }
+            for s in 0..m.slot_len() {
+                assert_eq!(m.key_get(s).is_none(), m.is_hole(s));
+            }
+            assert_eq!(
+                m.has_element_key(),
+                model.iter().any(|(mk, _)| key_names_element(mk)),
+                "step {step}"
+            );
+            if step % 997 == 0 {
+                let c = m.clone();
+                assert!(c.iter().map(|(k, v, _)| (k.to_owned(), v.as_int())).eq(model.iter().cloned()));
+            }
+        }
+        assert!(saw_holes, "the churn never left a hole");
+    }
+
     #[cfg(not(feature = "safe-sandbox"))]
     #[test]
     fn structural_churn_reuses_one_chunk_and_resident_bytes_plateau() {
@@ -11560,8 +12048,8 @@ mod tests {
                     let i = rng.below(keys.len());
                     let k = keys.remove(i);
                     let tag = prop_tag(&k);
-                    inter.remove_slot(tag, i as u32);
-                    split.remove_slot(tag, i as u32);
+                    inter.remove_slot(tag, i as u32, true);
+                    split.remove_slot(tag, i as u32, true);
                 }
 
                 assert_eq!(
@@ -12874,7 +13362,7 @@ pub fn bench_floor_decompose(
             owner_and_len,
         };
         let m = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
-        keep = keep.wrapping_add(m.len());
+        keep = keep.wrapping_add(m.live_len());
         if let ValStore::Slab { base, .. } = &m.vals {
             slab.free_cell(*base);
         }
@@ -12895,7 +13383,7 @@ pub fn bench_floor_decompose(
             v.push(Value::num((bits ^ (i as u64 ^ j as u64)) as f64));
         }
         *b = ObjMap::finalized_from_store(plan.clone(), ValStore::Vec(v), shape);
-        keep = keep.wrapping_add(b.len());
+        keep = keep.wrapping_add(b.live_len());
     }
     lines.push(format!(
         "pooled-box+vec: {:.1}ns/obj (k{})",
@@ -12932,7 +13420,7 @@ pub fn bench_floor_decompose(
         if let Some(pb) = prev {
             slab.free_cell(pb);
         }
-        keep = keep.wrapping_add(b.len());
+        keep = keep.wrapping_add(b.live_len());
     }
     lines.push(format!(
         "pooled-box+slab: {:.1}ns/obj (k{})",

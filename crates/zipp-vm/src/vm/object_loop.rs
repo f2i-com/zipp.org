@@ -291,7 +291,7 @@ fn exact_plain_slots(map: &ObjMap, keys: [&str; 3], expected_shape: u32) -> bool
         && !map.frozen
         && expected_shape != crate::shape::DICT
         && map.shape() == expected_shape
-        && map.len() == 3
+        && map.slot_len() == 3
         && map.key_at(0) == keys[0]
         && map.key_at(1) == keys[1]
         && map.key_at(2) == keys[2]

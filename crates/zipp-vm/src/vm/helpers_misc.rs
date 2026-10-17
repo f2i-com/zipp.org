@@ -4863,7 +4863,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 let s = slot as usize;
                 // Revalidate bounds, the exact live key and descriptor before
                 // carrying any Value/pointer out of the shared heap view.
-                (map.keys.get(s).is_some_and(|k| k == key)
+                (map.key_get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor))
                 .then(|| (map.val_at(s), map.vals_ptr() as u64, slot, sh))
             })
@@ -5616,7 +5616,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 .copied()
                 .filter(|&slot| {
                     let s = slot as usize;
-                    map.keys.get(s).is_some_and(|k| k == key)
+                    map.key_get(s).is_some_and(|k| k == key)
                         && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable)
                 })
                 .map(|slot| (sh, slot))
@@ -5635,7 +5635,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         let vals_ptr = match vm.heap.get_mut(idx) {
             HeapObj::Object(map)
                 if map.shape() == shape
-                    && map.keys.get(s).is_some_and(|k| k == key)
+                    && map.key_get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor && a.writable) =>
             {
                 map.set_val_at(s, Value::from_bits(val_bits));
@@ -5871,7 +5871,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     if let HeapObj::Object(map) = vm.heap.get(idx) {
         let sh = map.shape();
         if sh != crate::shape::DICT
-            && map.keys.get(slot as usize).is_some_and(|k| k == key)
+            && map.key_get(slot as usize).is_some_and(|k| k == key)
             && map
                 .attr_get(slot as usize)
                 .is_some_and(|a| !a.accessor && a.writable)

@@ -92,15 +92,15 @@ impl<'p> Vm<'p> {
         let mut misses: Vec<(usize, String)> = Vec::new();
         match self.heap.get(idx) {
             HeapObj::Object(m) => {
-                for i in spec_key_order(&m.keys) {
-                    let k = &m.keys[i];
+                for i in spec_key_order_map(&m) {
+                    let k = m.key_at(i);
                     if is_hidden_key(k) || !m.attr_at(i).enumerable {
                         continue;
                     }
-                    match self.key_str_cache.get(k.as_str()) {
+                    match self.key_str_cache.get(k) {
                         Some(&v) => out.push(v),
                         None => {
-                            misses.push((out.len(), k.clone()));
+                            misses.push((out.len(), k.to_owned()));
                             out.push(Value::UNDEFINED);
                         }
                     }
@@ -137,10 +137,10 @@ impl<'p> Vm<'p> {
             return false;
         }
         let texts: Vec<String> = match self.heap.get(idx) {
-            HeapObj::Object(m) => spec_key_order(&m.keys)
+            HeapObj::Object(m) => spec_key_order_map(&m)
                 .into_iter()
-                .filter(|&i| !is_hidden_key(&m.keys[i]) && m.attr_at(i).enumerable)
-                .map(|i| m.keys[i].clone())
+                .filter(|&i| !is_hidden_key(m.key_at(i)) && m.attr_at(i).enumerable)
+                .map(|i| m.key_at(i).to_owned())
                 .collect(),
             _ => return false,
         };
@@ -251,7 +251,7 @@ impl<'p> Vm<'p> {
                 pairs.push((i.to_string(), v));
             }
             if let Some(m) = self.arr_props.get(&idx) {
-                for (i, k) in m.keys.iter().enumerate() {
+                for (i, k) in m.slot_keys() {
                     if m.attr_at(i).enumerable && !is_hidden_key(k) {
                         pairs.push((k.clone(), m.val_at(i)));
                     }
@@ -306,8 +306,8 @@ impl<'p> Vm<'p> {
             let dense_overlaid = !enum_hoist_enabled()
                 || self.arr_props.get(&idx).is_some_and(|m| {
                     m.has_element_key()
-                        && m.keys
-                            .iter()
+                        && m
+                            .keys_iter()
                             .any(|k| canonical_index_str(k).is_some_and(|n| n < len))
                 });
             // Each key carries the canonical index it came from, so the value
@@ -338,7 +338,7 @@ impl<'p> Vm<'p> {
                 // `u32` (an index is below 2^32 - 1): its sort is the one the
                 // other index sorts use.
                 let mut sparse: Vec<u32> = Vec::new();
-                for (j, k) in m.keys.iter().enumerate() {
+                for (j, k) in m.slot_keys() {
                     if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
                     }
@@ -352,7 +352,7 @@ impl<'p> Vm<'p> {
                 }
                 sparse.sort_unstable();
                 ks.extend(sparse.into_iter().map(|n| (Some(n as usize), n.to_string())));
-                for (j, k) in m.keys.iter().enumerate() {
+                for (j, k) in m.slot_keys() {
                     if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
                     }
@@ -430,10 +430,10 @@ impl<'p> Vm<'p> {
             // index past the string's length still sorts ahead of the named
             // keys, ascending (OrdinaryOwnPropertyKeys).
             let extra: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
-                Some(m) => spec_key_order(&m.keys)
+                Some(m) => spec_key_order_map(&m)
                     .into_iter()
-                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
-                    .map(|i| m.keys[i].clone())
+                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(m.key_at(i)))
+                    .map(|i| m.key_at(i).to_owned())
                     .collect(),
                 None => Vec::new(),
             };
@@ -465,9 +465,9 @@ impl<'p> Vm<'p> {
         // value, so it never triggers a getter.
         if obj.is_heap() {
             if let HeapObj::Object(m) = self.heap.get(obj.heap_index()) {
-                let mut names: Vec<String> = spec_key_order(&m.keys)
+                let mut names: Vec<String> = spec_key_order_map(&m)
                     .into_iter()
-                    .map(|i| m.keys[i].clone())
+                    .map(|i| m.key_at(i).to_owned())
                     .filter(|k| !is_hidden_key(k))
                     .collect();
                 // The global object's slot-backed var/function bindings and
@@ -614,10 +614,10 @@ impl<'p> Vm<'p> {
         // (A Class keeps its statics in ClassData, so it stays on the tail path.)
         if obj.is_heap() && !matches!(self.heap.get(obj.heap_index()), HeapObj::Class(_)) {
             let names: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
-                Some(m) => spec_key_order(&m.keys)
+                Some(m) => spec_key_order_map(&m)
                     .into_iter()
-                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
-                    .map(|i| m.keys[i].clone())
+                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(m.key_at(i)))
+                    .map(|i| m.key_at(i).to_owned())
                     .collect(),
                 None => Vec::new(),
             };
@@ -654,7 +654,7 @@ impl<'p> Vm<'p> {
                         .collect();
                     // Enumerable named own properties (arr.foo / match-result fields).
                     if let Some(m) = self.arr_props.get(&obj.heap_index()) {
-                        for (i, k) in m.keys.iter().enumerate() {
+                        for (i, k) in m.slot_keys() {
                             if m.attr_at(i).enumerable && !is_hidden_key(k) {
                                 v.push((k.clone(), m.val_at(i)));
                             }
@@ -673,24 +673,24 @@ impl<'p> Vm<'p> {
                 | HeapObj::NativeClosure { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. } => match self.fn_props.get(&obj.heap_index()) {
-                    Some(m) => spec_key_order(&m.keys)
+                    Some(m) => spec_key_order_map(&m)
                         .into_iter()
-                        .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
-                        .map(|i| (m.keys[i].clone(), m.val_at(i)))
+                        .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(m.key_at(i)))
+                        .map(|i| (m.key_at(i).to_owned(), m.val_at(i)))
                         .collect(),
                     None => Vec::new(),
                 },
                 // A class's own (static) properties live in `ClassData.statics`
                 // (static methods are non-enumerable; static fields / `Cls.s = …`
                 // assignments are enumerable).
-                HeapObj::Class(c) => spec_key_order(&c.statics.keys)
+                HeapObj::Class(c) => spec_key_order_map(&c.statics)
                     .into_iter()
                     .filter(|&i| {
                         c.statics.attr_at(i).enumerable
-                            && !is_hidden_key(&c.statics.keys[i])
-                            && !c.statics.keys[i].starts_with('#')
+                            && !is_hidden_key(c.statics.key_at(i))
+                            && !c.statics.key_at(i).starts_with('#')
                     })
-                    .map(|i| (c.statics.keys[i].clone(), c.statics.val_at(i)))
+                    .map(|i| (c.statics.key_at(i).to_owned(), c.statics.val_at(i)))
                     .collect(),
                 _ => Vec::new(),
             }
@@ -750,7 +750,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         let barren = match self.heap.get(idx) {
-            HeapObj::Object(m) => (0..m.len()).all(|i| !m.attr_at(i).enumerable),
+            HeapObj::Object(m) => m.attrs_iter().all(|a| !a.enumerable),
             _ => false,
         };
         if barren {
@@ -864,8 +864,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(m) => {
                         let mut emit: Vec<usize> = Vec::new();
                         let mut visible = false;
-                        for i in spec_key_order(&m.keys) {
-                            if is_hidden_key(&m.keys[i]) {
+                        for i in spec_key_order_map(&m) {
+                            if is_hidden_key(m.key_at(i)) {
                                 continue;
                             }
                             visible = true;
@@ -887,7 +887,7 @@ impl<'p> Vm<'p> {
                     if seen.is_none() {
                         let cached = match self.heap.get(idx) {
                             HeapObj::Object(m) => {
-                                m.keys.get(i).and_then(|k| self.cached_key_str(k))
+                                m.key_get(i).and_then(|k| self.cached_key_str(k))
                             }
                             _ => None,
                         };
@@ -897,8 +897,8 @@ impl<'p> Vm<'p> {
                         }
                     }
                     let k = match self.heap.get(idx) {
-                        HeapObj::Object(m) => match m.keys.get(i) {
-                            Some(k) => k.clone(),
+                        HeapObj::Object(m) => match m.key_get(i) {
+                            Some(k) => k.to_owned(),
                             None => continue,
                         },
                         _ => continue,
@@ -920,8 +920,7 @@ impl<'p> Vm<'p> {
                     Some(s) if visible => {
                         let ks: Vec<String> = match self.heap.get(idx) {
                             HeapObj::Object(m) => m
-                                .keys
-                                .iter()
+                                .keys_iter()
                                 .filter(|k| !is_hidden_key(k))
                                 .map(|k| guest_key_text(k).to_string())
                                 .collect(),
@@ -1059,7 +1058,7 @@ impl<'p> Vm<'p> {
             return true;
         }
         let silent = match self.heap.get(idx) {
-            HeapObj::Object(m) => (0..m.len()).all(|i| !m.attr_at(i).enumerable),
+            HeapObj::Object(m) => m.attrs_iter().all(|a| !a.enumerable),
             _ => false,
         };
         if silent {
@@ -1074,7 +1073,7 @@ impl<'p> Vm<'p> {
         let mut s = std::collections::HashSet::new();
         for &pl in plain_levels {
             if let HeapObj::Object(m) = self.heap.get(pl) {
-                for k in &m.keys {
+                for k in m.keys_iter() {
                     if !is_hidden_key(k) {
                         s.insert(guest_key_text(k).to_string());
                     }

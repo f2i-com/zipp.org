@@ -178,7 +178,7 @@ impl<'p> Vm<'p> {
         };
         // The class's keys are as when the entry was made (its stamp): the
         // table field is at its slot.
-        if slot >= c.len() {
+        if slot >= c.slot_len() {
             return None;
         }
         let t = c.val_at(slot);
@@ -189,7 +189,7 @@ impl<'p> Vm<'p> {
             return None;
         };
         let pos = pos as usize;
-        (pos < m.len() && !m.is_accessor_at(pos)).then(|| m.val_at(pos))
+        (pos < m.slot_len() && !m.is_accessor_at(pos)).then(|| m.val_at(pos))
     }
 
     /// Whether this site's [`ic::NOT_PLAIN`] (or [`ic::NOT_PLAIN_ASKED`])
@@ -203,7 +203,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(c) = self.heap.get(cls.heap_index()) else {
             return false;
         };
-        if slot >= c.len() {
+        if slot >= c.slot_len() {
             return false;
         }
         let t = c.val_at(slot);
@@ -214,10 +214,10 @@ impl<'p> Vm<'p> {
             return false;
         };
         if e.pos == u32::MAX {
-            return m.len() == e.d as usize;
+            return m.slot_len() == e.d as usize;
         }
         let pos = e.pos as usize;
-        pos < m.len() && !m.is_accessor_at(pos) && m.val_at(pos) != Value::TRUE
+        pos < m.slot_len() && !m.is_accessor_at(pos) && m.val_at(pos) != Value::TRUE
     }
 
     /// Record that the class table at `slot` holds no `true` for `name`.
@@ -240,7 +240,7 @@ impl<'p> Vm<'p> {
                 Ok(s) if s != u32::MAX => (s, 0),
                 _ => return,
             },
-            None => match u32::try_from(m.len()) {
+            None => match u32::try_from(m.slot_len()) {
                 Ok(n) => (u32::MAX, n),
                 Err(_) => return,
             },
@@ -272,7 +272,7 @@ impl<'p> Vm<'p> {
         let entry = match self.heap.get(f.heap_index()) {
             HeapObj::Object(m) if !m.is_ctor => {
                 let s = e.d as usize;
-                if s >= m.len() || !super::py_rt::key_eq(m.key_at(s), entry_key) || m.is_accessor_at(s) {
+                if s >= m.slot_len() || !super::py_rt::key_eq(m.key_at(s), entry_key) || m.is_accessor_at(s) {
                     return None;
                 }
                 m.val_at(s)
@@ -451,7 +451,7 @@ impl<'p> Vm<'p> {
         }
         let pos = e.pos as usize;
         match self.heap.get(fi) {
-            HeapObj::Object(m) if pos < m.len() && !m.is_accessor_at(pos) && m.val_at(pos).bits() == e.b => {}
+            HeapObj::Object(m) if pos < m.slot_len() && !m.is_accessor_at(pos) && m.val_at(pos).bits() == e.b => {}
             _ => return false,
         }
         self.with_argv(base, arg_base, argc, |vm, argv| vm.py_store_call(fid, stores, argv))
@@ -569,7 +569,7 @@ impl<'p> Vm<'p> {
     #[inline(always)]
     fn py_hit_stamp(&self, k: (u32, u32, usize), cls: Value, hver: u32, ver: u64) -> bool {
         let ci = cls.heap_index();
-        self.heap.version_of(ci) == hver && matches!(self.heap.get(ci), HeapObj::Object(m) if k.2 < m.len() && m.val_at(k.2).bits() == ver)
+        self.heap.version_of(ci) == hver && matches!(self.heap.get(ci), HeapObj::Object(m) if k.2 < m.slot_len() && m.val_at(k.2).bits() == ver)
     }
 
     /// [`Vm::py_attr_get`] at a site holding a layout-mode entry
@@ -1276,7 +1276,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
-        let slot = if hint < m.len() && super::py_rt::key_eq(m.key_at(hint), name) { hint } else { m.pos(name)? };
+        let slot = if hint < m.slot_len() && super::py_rt::key_eq(m.key_at(hint), name) { hint } else { m.pos(name)? };
         (!m.is_accessor_at(slot)).then(|| (m.val_at(slot), slot))
     }
 
@@ -1303,7 +1303,7 @@ impl<'p> Vm<'p> {
         }
         if e.kind == ic::NEW_NO && e.a == cls.bits() && self.heap.version_of(ci) == e.hver {
             let same = e.pos == u32::MAX
-                || matches!(self.heap.get(ci), HeapObj::Object(m) if (e.pos as usize) < m.len() && m.val_at(e.pos as usize).bits() == e.b);
+                || matches!(self.heap.get(ci), HeapObj::Object(m) if (e.pos as usize) < m.slot_len() && m.val_at(e.pos as usize).bits() == e.b);
             if same {
                 return None;
             }
@@ -1390,8 +1390,8 @@ impl<'p> Vm<'p> {
         let init = match self.heap.get(cls.heap_index()) {
             HeapObj::Object(m)
                 if !m.is_ctor
-                    && pos < m.len()
-                    && islot < m.len()
+                    && pos < m.slot_len()
+                    && islot < m.slot_len()
                     && !m.is_accessor_at(pos)
                     && !m.is_accessor_at(islot)
                     && want.is_heap()
@@ -1413,7 +1413,7 @@ impl<'p> Vm<'p> {
             }
             let s = (e.c >> 32) as u16 as usize;
             let v = match self.heap.get(init.heap_index()) {
-                HeapObj::Object(m) if !m.is_ctor && s < m.len() && !m.is_accessor_at(s) => m.val_at(s),
+                HeapObj::Object(m) if !m.is_ctor && s < m.slot_len() && !m.is_accessor_at(s) => m.val_at(s),
                 _ => return None,
             };
             if !self.py_callable_fn(v) {
@@ -1505,7 +1505,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(r) = self.heap.get(rt.heap_index()) else {
             return None;
         };
-        if slot >= r.len() || r.key_at(slot) != "mself" {
+        if slot >= r.slot_len() || r.key_at(slot) != "mself" {
             return None;
         }
         let a = r.attr_at(slot);

@@ -336,7 +336,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) if !m.is_ctor => m,
                 _ => return None,
             };
-            if slot >= m.vals_len() || !m.attr_at(slot).accessor {
+            if m.key_get(slot).is_none() || !m.attr_at(slot).accessor {
                 return None;
             }
             if is_set {

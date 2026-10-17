@@ -61,7 +61,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
-        let slot = if field.0 < m.len() && m.key_at(field.0) == field.1 {
+        let slot = if field.0 < m.slot_len() && m.key_at(field.0) == field.1 {
             field.0
         } else {
             m.pos(field.1)?

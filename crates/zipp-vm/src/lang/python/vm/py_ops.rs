@@ -518,7 +518,7 @@ impl<'p> Vm<'p> {
         if e.kind == ic::CALL_ENTRY && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
             if let HeapObj::Object(m) = self.heap.get(fi) {
                 let pos = e.pos as usize;
-                if pos < m.len() && !m.is_accessor_at(pos) {
+                if pos < m.slot_len() && !m.is_accessor_at(pos) {
                     let v = m.val_at(pos);
                     if v.is_heap() {
                         return Some(v);
@@ -693,7 +693,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         let pos = e.pos as usize;
-        if pos >= m.len() || m.is_accessor_at(pos) {
+        if pos >= m.slot_len() || m.is_accessor_at(pos) {
             return false;
         }
         let entry = m.val_at(pos);
@@ -814,7 +814,7 @@ impl<'p> Vm<'p> {
             return None;
         };
         let pos = e.pos as usize;
-        if pos >= m.len() || m.is_accessor_at(pos) {
+        if pos >= m.slot_len() || m.is_accessor_at(pos) {
             return None;
         }
         let entry = m.val_at(pos);
@@ -866,7 +866,7 @@ impl<'p> Vm<'p> {
             return None;
         };
         let pos = e.pos as usize;
-        if pos >= m.len() || m.is_accessor_at(pos) || m.val_at(pos).bits() != e.b {
+        if pos >= m.slot_len() || m.is_accessor_at(pos) || m.val_at(pos).bits() != e.b {
             return None;
         }
         Some(PyLean { fid: e.c as u32, regs: (e.c >> 32) as u16, params: (e.c >> 48) as u16, closure: e.d, entry: Value::from_bits(e.b) })
@@ -1009,7 +1009,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 if let Some(p) = self.py_rt.as_deref() {
                     let (shape, slot) = (m.shape(), p.func_globals_slot.get() as usize);
-                    if shape != crate::shape::DICT && slot < m.len() && p.func_shapes.get().contains(&shape) {
+                    if shape != crate::shape::DICT && slot < m.slot_len() && p.func_shapes.get().contains(&shape) {
                         debug_assert!(
                             m.key_at(slot) == "globals" && !m.is_accessor_at(slot),
                             "a function record of a seen shape has no data `globals` at the seen slot"
@@ -1247,10 +1247,10 @@ impl<'p> Vm<'p> {
         if m.is_ctor || !m.extensible || m.sealed || m.frozen || m.is_raw_json || m.class.is_some() || m.shape() != shape {
             return false;
         }
-        let crate::heap::PropKeys::Planned { all, visible_len } = &m.keys else {
+        let crate::heap::PropKeys::Planned { all, visible_len } = m.prop_keys() else {
             return false;
         };
-        *visible_len == m.len() && all.len() == m.len() && (1..=crate::bytecode::FINALIZE_STAGE_SLOTS).contains(&m.len())
+        *visible_len == m.slot_len() && all.len() == m.slot_len() && (1..=crate::bytecode::FINALIZE_STAGE_SLOTS).contains(&m.slot_len())
     }
 
     /// A new plain record laid out like the literal-born record `tmpl`
@@ -1277,10 +1277,10 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(tmpl.heap_index()) else {
             return None;
         };
-        if m.len() != vals.len() {
+        if m.slot_len() != vals.len() {
             return None;
         }
-        let crate::heap::PropKeys::Planned { all, .. } = &m.keys else {
+        let crate::heap::PropKeys::Planned { all, .. } = m.prop_keys() else {
             return None;
         };
         #[cfg(not(feature = "safe-sandbox"))]

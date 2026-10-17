@@ -833,7 +833,7 @@ impl<'p> Vm<'p> {
         };
         let plain = !m.is_ctor
             && m.shape_guardable()
-            && m.len() == keys.len()
+            && m.slot_len() == keys.len()
             && keys.iter().enumerate().all(|(i, k)| {
                 let a = m.attr_at(i);
                 m.key_at(i) == *k && a.writable && a.enumerable && a.configurable && !a.accessor
@@ -889,7 +889,7 @@ impl<'p> Vm<'p> {
         }
         let cell = self.py_rt.as_deref().map(|p| &p.hints[h]);
         let at = cell.map_or(usize::MAX, |c| c.get() as usize);
-        let slot = if at < m.len() && key_eq(m.key_at(at), key) {
+        let slot = if at < m.slot_len() && key_eq(m.key_at(at), key) {
             at
         } else {
             let s = m.pos(key)?;
@@ -1026,7 +1026,7 @@ impl<'p> Vm<'p> {
         if m.is_ctor {
             return None;
         }
-        let s = if slot < m.len() && key_eq(m.key_at(slot), key) { slot } else { m.pos(key)? };
+        let s = if slot < m.slot_len() && key_eq(m.key_at(slot), key) { slot } else { m.pos(key)? };
         (!m.is_accessor_at(s)).then(|| m.val_at(s))
     }
 
@@ -1041,7 +1041,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(c.heap_index()) else {
             return None;
         };
-        if m.is_ctor || ty.ver >= m.len() || m.key_at(ty.ver) != "ver" || m.is_accessor_at(ty.ver) {
+        if m.is_ctor || ty.ver >= m.slot_len() || m.key_at(ty.ver) != "ver" || m.is_accessor_at(ty.ver) {
             return None;
         }
         let v = m.val_at(ty.ver);
@@ -1065,7 +1065,7 @@ impl<'p> Vm<'p> {
         // The same heap version: the record's keys are as they were when
         // the stamp was taken, `ver` at its slot.
         match self.heap.get(ci) {
-            HeapObj::Object(m) => ty.ver < m.len() && m.val_at(ty.ver).bits() == ver,
+            HeapObj::Object(m) => ty.ver < m.slot_len() && m.val_at(ty.ver).bits() == ver,
             _ => false,
         }
     }

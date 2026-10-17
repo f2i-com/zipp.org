@@ -1709,7 +1709,7 @@ impl<'p> Vm<'p> {
         // re-proof, never a wrong answer.
         let pinned = |m: &ObjMap, key: &str, accessor: bool, (slot, idx, ver): (u32, u32, u32)| {
             let s = slot as usize;
-            m.keys.get(s).is_some_and(|k| k == key)
+            m.key_get(s).is_some_and(|k| k == key)
                 && m.attr_at(s).accessor == accessor
                 && m.val_at(s).is_heap()
                 && m.val_at(s).heap_index() == idx
@@ -1733,7 +1733,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         let cs = c.ctor_slot as usize;
-        if m.keys.get(cs).map_or(true, |k| k != "constructor")
+        if m.key_get(cs).map_or(true, |k| k != "constructor")
             || m.attr_at(cs).accessor
             || !m.val_at(cs).is_heap()
             || m.val_at(cs).heap_index() != self.regexp_ctor
@@ -2901,7 +2901,7 @@ impl<'p> Vm<'p> {
         let old = self.arr_props.remove(&idx);
         let has_indices = p.values[3] != Value::UNDEFINED;
         let mut m = ObjMap::side_table_with_capacity(
-            3 + has_indices as usize + old.as_ref().map_or(0, ObjMap::len),
+            3 + has_indices as usize + old.as_ref().map_or(0, ObjMap::live_len),
         );
         m.push_data("index".to_string(), p.values[0]);
         m.push_data("input".to_string(), p.values[1]);

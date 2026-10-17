@@ -156,7 +156,7 @@ impl<'p> Vm<'p> {
         if kb.starts_with(b"@@") {
             return None;
         }
-        if s >= m.len() || !crate::heap::key_bytes_eq(m.keys[s].as_bytes(), kb) {
+        if !m.key_get(s).is_some_and(|k| crate::heap::key_bytes_eq(k.as_bytes(), kb)) {
             return None;
         }
         let a = m.attr_at(s);

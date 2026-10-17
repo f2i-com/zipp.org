@@ -422,7 +422,9 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-            let freed = m.remove_at(slot);
+            // A big dictionary keeps the slot as a hole rather than shifting
+            // every later one down (see `ObjMap::delete_at`).
+            let freed = m.delete_at(slot);
             // B220: the delete path is the key pool's best feed (see
             // `Heap::recycle_key_buf`).
             #[cfg(not(feature = "safe-sandbox"))]
@@ -703,7 +705,12 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The objects the fast path above leaves to the waterfall for their
+        // own sake keep shifting deletes; every other one may keep a hole
+        // (see `ObjMap::delete_at`), whatever its key.
+        let holes_ok = idx != self.global_this && idx != self.obj_proto && idx != self.arr_proto;
         let removed = match self.heap.get_mut(idx) {
+            HeapObj::Object(map) if holes_ok => map.delete_key(key),
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
                 // A CANONICAL index key never reaches here (the index path above
@@ -1288,8 +1295,7 @@ impl<'p> Vm<'p> {
             let n = u as u32;
             if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
                 let doomed: Vec<String> = m
-                    .keys
-                    .iter()
+                    .keys_iter()
                     .filter(|k| canonical_index_str(k).is_some_and(|i| i >= n as usize))
                     .cloned()
                     .collect();

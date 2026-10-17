@@ -923,8 +923,7 @@ impl<'p> Vm<'p> {
                             {
                                 if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
                                     let s = slot as usize;
-                                    if s < hm.keys.len()
-                                        && hm.keys[s] == key
+                                    if hm.key_get(s) == Some(key)
                                         && !hm.attr_at(s).accessor
                                     {
                                         return GetAct::Value(hm.val_at(s));
@@ -1191,7 +1190,7 @@ impl<'p> Vm<'p> {
                     return GetAct::Value(Value::UNDEFINED); // guarded chain miss
                 }
                 let s = slot as usize;
-                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                     GetAct::Value(hm.val_at(s))
                 } else {
                     GetAct::None
@@ -1237,7 +1236,7 @@ impl<'p> Vm<'p> {
             return GetAct::None;
         };
         let s = slot as usize;
-        if s >= m.keys.len() || m.keys[s] != key || !m.attr_at(s).accessor {
+        if m.key_get(s) != Some(key) || !m.attr_at(s).accessor {
             return GetAct::None;
         }
         self.ic_acc_get_from(m, s)
@@ -1252,7 +1251,7 @@ impl<'p> Vm<'p> {
             _ => return GetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
+        if hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
             return GetAct::None;
         }
         let g = hm.val_at(s);
@@ -1488,7 +1487,7 @@ impl<'p> Vm<'p> {
             }
             Walked::ChainData { first, hops, slot }
                 if matches!(self.heap.get(hops.0[hops.1 as usize - 1].0), HeapObj::Object(hm)
-                    if (slot as usize) < hm.vals_len()
+                    if hm.key_get(slot as usize).is_some()
                         && !hm.attr_at(slot as usize).accessor
                         && hm.attr_at(slot as usize).writable) =>
             {
@@ -1871,8 +1870,7 @@ impl<'p> Vm<'p> {
     fn ic_own_set_plan(&self, recv: Value, key: &str, slot: u32) -> Option<SetPlan> {
         let (idx, m) = self.ic_recv_map(recv)?;
         let s = slot as usize;
-        if s < m.keys.len()
-            && m.keys[s] == key
+        if m.key_get(s) == Some(key)
             && !m.attr_at(s).accessor
             && m.attr_at(s).writable
             && !m.class_proto
@@ -1904,7 +1902,7 @@ impl<'p> Vm<'p> {
             return SetAct::None;
         };
         let s = slot as usize;
-        if s >= m.keys.len() || m.keys[s] != key || !m.attr_at(s).accessor {
+        if m.key_get(s) != Some(key) || !m.attr_at(s).accessor {
             return SetAct::None;
         }
         let setter = m.attr_at(s).setter;
@@ -1927,7 +1925,7 @@ impl<'p> Vm<'p> {
             _ => return SetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
+        if hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
             return SetAct::None;
         }
         let setter = hm.attr_at(s).setter;
@@ -2112,10 +2110,10 @@ impl<'p> Vm<'p> {
                 continue;
             }
             let slot = slot as usize;
-            if slot >= m.keys.len()
+            if m.key_get(slot).is_none()
                 || slot >= m.vals_len()
                 || slot >= m.attrs_len()
-                || &*m.keys[slot] != key
+                || m.key_at(slot) != key
                 || m.attr_at(slot).accessor
             {
                 return None;
@@ -2172,7 +2170,7 @@ impl<'p> Vm<'p> {
                 }
                 let hm = self.ic_chain_ok(idx, first, &hops)?;
                 let s = slot as usize;
-                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                     let v = hm.val_at(s);
                     let (fid, closure) = self.ic_plain_fn(v)?;
                     Some((fid, closure, v))
@@ -2414,7 +2412,7 @@ impl<'p> Vm<'p> {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                             let v = hm.val_at(s);
                             if let Some((fid, _closure)) = self.ic_plain_fn(v) {
                                 return Some(MiSuperResolved {
@@ -2475,7 +2473,7 @@ impl<'p> Vm<'p> {
                         // The key must still name THIS slot and still be an
                         // accessor: a `delete` + re-add shifts slots, and a
                         // redefine to a data property changes what `vals[s]` means.
-                        if s < hm.keys.len() && hm.keys[s] == key && hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && hm.attr_at(s).accessor {
                             let g = hm.val_at(s);
                             // A getter-less accessor (`set` only) reads as
                             // `undefined` rather than calling anything — not
@@ -2537,7 +2535,7 @@ impl<'p> Vm<'p> {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && hm.attr_at(s).accessor {
                             let setter = hm.attr_at(s).setter;
                             // A setter-less accessor (`get` only) is a strict
                             // TypeError / sloppy no-op — helper only.
@@ -2743,7 +2741,7 @@ impl<'p> Vm<'p> {
                             _ => continue,
                         };
                         let s = slot as usize;
-                        if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
                             let v = hm.val_at(s);
                             if let Some((fid, closure)) = self.ic_plain_fn(v) {
                                 return Some((fid, closure, v));
@@ -2812,7 +2810,7 @@ impl<'p> Vm<'p> {
                                 self.heap.get(hops.0[hops.1 as usize - 1].0)
                             {
                                 let s = slot as usize;
-                                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor
+                                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor
                                 {
                                     return GetAct::Value(hm.val_at(s));
                                 }

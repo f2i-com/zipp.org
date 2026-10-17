@@ -17,7 +17,7 @@ impl<'p> Vm<'p> {
     /// regrowth is what we are paying to avoid.
     pub(crate) fn learn_ctor_field_hint(&mut self, fid: u32, obj: Value) {
         let n = match self.heap.get(obj.heap_index()) {
-            HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
+            HeapObj::Object(m) => m.live_len().min(u16::MAX as usize) as u16,
             _ => 0,
         };
         // CAPPED. A high-water mark is unbounded by construction: one

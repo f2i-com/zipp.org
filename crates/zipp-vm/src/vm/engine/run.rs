@@ -1894,7 +1894,7 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn global_obj_has_own_keys(&self) -> bool {
         self.global_this != 0
-            && matches!(self.heap.get(self.global_this), HeapObj::Object(m) if !m.keys.is_empty())
+            && matches!(self.heap.get(self.global_this), HeapObj::Object(m) if !m.is_empty())
     }
 
     /// True when the global OBJECT carries a REAL own property (an ObjMap entry,
@@ -1910,7 +1910,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(self.global_this) else {
             return false;
         };
-        if m.keys.is_empty() {
+        if m.is_empty() {
             return false;
         }
         match self.global_slot_name_ref(idx) {

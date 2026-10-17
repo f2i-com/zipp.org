@@ -1066,7 +1066,7 @@ impl<'p> Vm<'p> {
         // the visible ones, once to walk them — whether or not it is visible;
         // that is work, charged before either scan (ZA-07).
         if let HeapObj::Object(m) = self.heap.get(idx) {
-            if !budget.charge_work(m.keys.len().saturating_mul(2)) {
+            if !budget.charge_work(m.slot_len().saturating_mul(2)) {
                 return false;
             }
         }
@@ -1076,15 +1076,16 @@ impl<'p> Vm<'p> {
             HeapObj::Cons { len, .. } => Shape::Str { units: *len },
             HeapObj::Array(items) => Shape::Array { len: items.len() },
             HeapObj::Object(m) => Shape::Object {
-                keys: m.keys.len(),
+                keys: m.slot_len(),
                 // The same exclusions host_out makes: an accessor is never
                 // invoked, so it contributes nothing to the marshalled value
                 // and must contribute nothing to the digest either; nor does a
                 // Symbol-keyed property.
-                visible: (0..m.keys.len())
+                visible: m
+                    .slots()
                     .filter(|&i| {
                         let a = m.attr_at(i);
-                        a.enumerable && !a.accessor && !is_hidden_key(&m.keys[i])
+                        a.enumerable && !a.accessor && !is_hidden_key(m.key_at(i))
                     })
                     .count(),
             },
@@ -1176,12 +1177,15 @@ impl<'p> Vm<'p> {
                     // Hash the key inside the borrow — no clone — and carry
                     // only the value out for the recursive step.
                     let val = match self.heap.get(idx) {
-                        HeapObj::Object(m) if i < m.keys.len() => {
-                            let a = m.attr_at(i);
-                            if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
+                        HeapObj::Object(m) if i < m.slot_len() => {
+                            if m.has_holes() && m.is_hole(i) {
                                 continue;
                             }
-                            let key = guest_key_text(&m.keys[i]).as_bytes();
+                            let a = m.attr_at(i);
+                            if !a.enumerable || a.accessor || is_hidden_key(m.key_at(i)) {
+                                continue;
+                            }
+                            let key = guest_key_text(m.key_at(i)).as_bytes();
                             if !budget.charge_string_bytes(key.len()) {
                                 ok = false;
                                 break;
@@ -1574,28 +1578,29 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 // Two scans of every entry, visible or not: inspected work,
                 // charged before either (ZA-07).
-                budget.charge_work(m.keys.len().saturating_mul(2))?;
+                budget.charge_work(m.slot_len().saturating_mul(2))?;
                 // Symbol-keyed entries (`is_hidden_key`) are not string keys:
                 // the host's object model has no symbols, so they are not
                 // exported (they used to leak out as "@@…" names).
-                let count = (0..m.keys.len())
+                let count = m
+                    .slots()
                     .filter(|&i| {
                         m.attr_at(i).enumerable
                             && !m.attr_at(i).accessor
-                            && !is_hidden_key(&m.keys[i])
+                            && !is_hidden_key(m.key_at(i))
                     })
                     .count();
                 budget.ensure_nodes(count)?;
                 let mut pairs = Vec::with_capacity(count);
-                for i in 0..m.keys.len() {
+                for i in m.slots() {
                     let a = &m.attr_at(i);
                     // Accessors are not invoked: running user code in the middle
                     // of a marshal would let a getter mutate the graph being walked.
-                    if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
+                    if !a.enumerable || a.accessor || is_hidden_key(m.key_at(i)) {
                         continue;
                     }
-                    budget.charge_string(&m.keys[i])?;
-                    pairs.push((guest_key_text(&m.keys[i]).to_string(), m.val_at(i)));
+                    budget.charge_string(m.key_at(i))?;
+                    pairs.push((guest_key_text(m.key_at(i)).to_string(), m.val_at(i)));
                 }
                 Shape::Object(pairs)
             }
@@ -1763,8 +1768,8 @@ impl<'p> Vm<'p> {
         let (old_props, old_class): (Vec<(String, Value, PropAttr)>, Option<u32>) =
             match self.heap.get(old.heap_index()) {
                 HeapObj::Object(m) => (
-                    (0..m.keys.len())
-                        .map(|i| (m.keys[i].clone(), m.val_at(i), m.attr_at(i)))
+                    m.iter()
+                        .map(|(k, v, a)| (k.to_owned(), v, a))
                         .collect(),
                     m.class,
                 ),

@@ -502,7 +502,7 @@ impl<'p> Vm<'p> {
                 // exact pinned function bits as the independent live proof.
                 HeapObj::Object(map) => {
                     map.shape() == self.dataview_proto_shape
-                        && method < map.len()
+                        && method < map.slot_len()
                         && map.val_at(method).bits() == self.dataview_numeric_getter_bits[method]
                 }
                 _ => false,
@@ -550,7 +550,7 @@ impl<'p> Vm<'p> {
         let intrinsic_live = match self.heap.get(self.dataview_proto) {
             HeapObj::Object(map) => {
                 map.shape() == self.dataview_proto_shape
-                    && slot < map.len()
+                    && slot < map.slot_len()
                     && map.val_at(slot).bits() == self.dataview_numeric_setter_bits[slot - 10]
             }
             _ => false,
@@ -595,7 +595,7 @@ impl<'p> Vm<'p> {
         let intrinsic_live = match self.heap.get(self.dataview_proto) {
             HeapObj::Object(map) => {
                 map.shape() == self.dataview_proto_shape
-                    && slot < map.len()
+                    && slot < map.slot_len()
                     && map.val_at(slot).bits() == self.dataview_bigint_bits[dataview_big_bits_index(slot)]
             }
             _ => false,
@@ -833,7 +833,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         match self.heap.get(self.dataview_proto) {
-            HeapObj::Object(map) if map.shape() == self.dataview_proto_shape && method < map.len() => {
+            HeapObj::Object(map) if map.shape() == self.dataview_proto_shape && method < map.slot_len() => {
                 Some(map.val_at(method).bits())
             }
             _ => None,

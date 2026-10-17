@@ -373,15 +373,21 @@ pub(crate) fn arrkey_fast_enabled() -> bool {
     }
 }
 
-/// Indices into `keys` in spec **OrdinaryOwnPropertyKeys** order: integer-index
-/// keys (canonical array indices `0..2^32-1`, e.g. "0"/"7" but not "01"/"-1")
-/// first in ascending numeric order, then every other key in its original
-/// (insertion) order. Symbols/private keys keep their relative position among
-/// "the rest"; callers filter hidden keys separately.
-pub(crate) fn spec_key_order(keys: &[String]) -> Vec<usize> {
+/// The slots of `m` (holes skipped, see `ObjMap::delete_at`) in spec
+/// **OrdinaryOwnPropertyKeys** order: integer-index keys (canonical array
+/// indices `0..2^32-1`, e.g. "0"/"7" but not "01"/"-1") first in ascending
+/// numeric order, then every other key in its original (insertion) order.
+/// Symbols/private keys keep their relative position among "the rest";
+/// callers filter hidden keys separately.
+pub(crate) fn spec_key_order_map(m: &crate::heap::ObjMap) -> Vec<usize> {
+    spec_key_order_slots(m.slots().map(|i| (i, m.key_at(i))))
+}
+
+/// [`spec_key_order_map`] over `(slot, key)` pairs given in insertion order.
+fn spec_key_order_slots<'a>(keys: impl ExactSizeIterator<Item = (usize, &'a str)>) -> Vec<usize> {
     let mut ints: Vec<(u32, usize)> = Vec::new();
-    let mut rest: Vec<usize> = Vec::new();
-    for (i, k) in keys.iter().enumerate() {
+    let mut rest: Vec<usize> = Vec::with_capacity(keys.len());
+    for (i, k) in keys {
         match canonical_u32_key(k) {
             Some(n) => ints.push((n, i)),
             None => rest.push(i),

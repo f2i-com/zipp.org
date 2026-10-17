@@ -121,9 +121,10 @@ impl<'p> Vm<'p> {
     /// (preserving insertion order) — used by resolvedOptions().
     pub(crate) fn clone_plain_object(&mut self, src: u32) -> Value {
         let pairs: Vec<(String, Value)> = match self.heap.get(src) {
-            HeapObj::Object(m) => (0..m.keys.len())
-                .filter(|&i| !m.attr_at(i).accessor && !is_hidden_key(&m.keys[i]))
-                .map(|i| (m.keys[i].clone(), m.val_at(i)))
+            HeapObj::Object(m) => m
+                .slots()
+                .filter(|&i| !m.attr_at(i).accessor && !is_hidden_key(m.key_at(i)))
+                .map(|i| (m.key_at(i).to_owned(), m.val_at(i)))
                 .collect(),
             _ => vec![],
         };

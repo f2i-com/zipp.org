@@ -470,9 +470,9 @@ impl<'p> Vm<'p> {
                     // getOwnPropertyDescriptor/hasOwnProperty answers.
                     let mut virtual_len =
                         self.arr_proto != 0 && idx == self.arr_proto && m.pos("length").is_none();
-                    for k in spec_key_order(&m.keys)
+                    for k in spec_key_order_map(&m)
                         .into_iter()
-                        .map(|i| &m.keys[i])
+                        .map(|i| m.key_at(i))
                         .filter(|k| !is_hidden_key(k))
                     {
                         if virtual_len
@@ -481,7 +481,7 @@ impl<'p> Vm<'p> {
                             keys.push("length".to_string());
                             virtual_len = false;
                         }
-                        keys.push(k.clone());
+                        keys.push(k.to_owned());
                     }
                     if virtual_len {
                         keys.push("length".to_string());
@@ -577,8 +577,7 @@ impl<'p> Vm<'p> {
                         // the ascending index run before "length"/named keys.
                         // ("4294967295"+ are NOT array indices — named below.)
                         let mut sparse: Vec<u32> = m
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .filter(|k| !is_hidden_key(k))
                             .filter_map(|k| {
                                 canonical_index_str(k)
@@ -599,8 +598,8 @@ impl<'p> Vm<'p> {
                         // Named own props only — index keys in arr_props were
                         // covered by the dense range / sparse run above.
                         keys.extend(
-                            m.keys
-                                .iter()
+                            m
+                                .keys_iter()
                                 .filter(|k| {
                                     if is_hidden_key(k) {
                                         return false;
@@ -621,7 +620,7 @@ impl<'p> Vm<'p> {
                         keys.push(i.to_string());
                     }
                     if let Some(m) = self.arr_props.get(&idx) {
-                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                        keys.extend(m.keys_iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }
                 HeapObj::Class(c) => {
@@ -662,7 +661,7 @@ impl<'p> Vm<'p> {
                                 named.push(k.to_string());
                             }
                         };
-                        for k in &c.statics.keys {
+                        for k in c.statics.keys_iter() {
                             push_key(k);
                         }
                         for (n, _) in &c.static_getters {
@@ -710,11 +709,11 @@ impl<'p> Vm<'p> {
                     // ascending — ahead of even the intrinsic length/name.
                     if let Some(m) = self.fn_props.get(&idx) {
                         keys.extend(
-                            spec_key_order(&m.keys)
+                            spec_key_order_map(&m)
                                 .into_iter()
-                                .map(|i| &m.keys[i])
+                                .map(|i| m.key_at(i))
                                 .take_while(|k| canonical_u32_key(k).is_some())
-                                .cloned(),
+                                .map(str::to_owned),
                         );
                     }
                     if has_length || fp_has("length") {
@@ -735,8 +734,8 @@ impl<'p> Vm<'p> {
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
                         keys.extend(
-                            m.keys
-                                .iter()
+                            m
+                                .keys_iter()
                                 .filter(|k| {
                                     if is_hidden_key(k) || canonical_u32_key(k).is_some() {
                                         return false;
@@ -765,8 +764,7 @@ impl<'p> Vm<'p> {
                         }
                         if let Some(m) = self.arr_props.get(&idx) {
                             let mut extra: Vec<u32> = m
-                                .keys
-                                .iter()
+                                .keys_iter()
                                 .filter(|k| !is_hidden_key(k))
                                 .filter_map(|k| {
                                     canonical_index_str(k)
@@ -780,8 +778,8 @@ impl<'p> Vm<'p> {
                         keys.push("length".to_string());
                         if let Some(m) = self.arr_props.get(&idx) {
                             keys.extend(
-                                m.keys
-                                    .iter()
+                                m
+                                    .keys_iter()
                                     .filter(|k| {
                                         !is_hidden_key(k)
                                             && canonical_index_str(k)
@@ -791,18 +789,18 @@ impl<'p> Vm<'p> {
                             );
                         }
                     } else if let Some(m) = self.arr_props.get(&idx) {
-                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                        keys.extend(m.keys_iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }
                 // A RegExp's only own property is `lastIndex` (plus any assigned);
                 // assigned integer keys still sort first, ascending.
                 HeapObj::RegExp { .. } => {
                     let assigned: Vec<String> = match self.arr_props.get(&idx) {
-                        Some(m) => spec_key_order(&m.keys)
+                        Some(m) => spec_key_order_map(&m)
                             .into_iter()
-                            .map(|i| &m.keys[i])
-                            .filter(|k| !is_hidden_key(k) && k.as_str() != "lastIndex")
-                            .cloned()
+                            .map(|i| m.key_at(i))
+                            .filter(|k| !is_hidden_key(k) && *k != "lastIndex")
+                            .map(str::to_owned)
                             .collect(),
                         None => Vec::new(),
                     };
@@ -828,11 +826,11 @@ impl<'p> Vm<'p> {
                 _ => {
                     if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(
-                            spec_key_order(&m.keys)
+                            spec_key_order_map(&m)
                                 .into_iter()
-                                .map(|i| &m.keys[i])
+                                .map(|i| m.key_at(i))
                                 .filter(|k| !is_hidden_key(k))
-                                .cloned(),
+                                .map(str::to_owned),
                         );
                     }
                 }
@@ -858,8 +856,7 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             let sym_keys: Vec<String> = match self.heap.get(obj.heap_index()) {
                 HeapObj::Object(m) => m
-                    .keys
-                    .iter()
+                    .keys_iter()
                     .filter(|k| k.starts_with("@@"))
                     .cloned()
                     .collect(),
@@ -877,8 +874,8 @@ impl<'p> Vm<'p> {
                     self.fn_props
                         .get(&obj.heap_index())
                         .map_or(Vec::new(), |m| {
-                            m.keys
-                                .iter()
+                            m
+                                .keys_iter()
                                 .filter(|k| k.starts_with("@@"))
                                 .cloned()
                                 .collect()
@@ -888,8 +885,8 @@ impl<'p> Vm<'p> {
                     .arr_props
                     .get(&obj.heap_index())
                     .map_or(Vec::new(), |m| {
-                        m.keys
-                            .iter()
+                        m
+                            .keys_iter()
                             .filter(|k| k.starts_with("@@"))
                             .cloned()
                             .collect()

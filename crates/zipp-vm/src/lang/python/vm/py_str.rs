@@ -275,7 +275,7 @@ impl<'p> Vm<'p> {
     #[inline]
     fn py_strm_prop_at(&self, idx: u32, at: usize, h: usize, key: &str) -> Option<Value> {
         if let HeapObj::Object(m) = self.heap.get(idx) {
-            if !m.is_ctor && at < m.len() && super::py_rt::key_eq(m.key_at(at), key) && !m.is_accessor_at(at) {
+            if !m.is_ctor && at < m.slot_len() && super::py_rt::key_eq(m.key_at(at), key) && !m.is_accessor_at(at) {
                 return Some(m.val_at(at));
             }
         }

@@ -110,7 +110,7 @@ impl<'p> Vm<'p> {
         if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
             return true;
         }
-        let overlay = self.arr_props.get(&arr_idx).map_or(0, |m| m.len());
+        let overlay = self.arr_props.get(&arr_idx).map_or(0, |m| m.live_len());
         (dense_len + overlay + 1) * 2 <= i + 1
     }
 
@@ -201,7 +201,7 @@ impl<'p> Vm<'p> {
                 };
                 let reachable = || {
                     self.js_array_len(arr_idx).saturating_sub(dense_len)
-                        <= m.len().saturating_mul(gap + 1)
+                        <= m.live_len().saturating_mul(gap + 1)
                 };
                 if !(jump || (entered() && reachable())) {
                     None
@@ -269,7 +269,7 @@ impl<'p> Vm<'p> {
         let empty = self
             .arr_props
             .get(&arr_idx)
-            .is_some_and(|m| m.len() == 0 && m.extensible && !m.sealed && !m.frozen);
+            .is_some_and(|m| m.is_empty() && m.extensible && !m.sealed && !m.frozen);
         if empty && !self.array_js_len.contains_key(&arr_idx) {
             self.arr_props.remove(&arr_idx);
         }
@@ -316,9 +316,7 @@ impl<'p> Vm<'p> {
         let m = self.arr_props.get(&arr_idx)?;
         let sealed = m.sealed || m.frozen;
         let keyed = m
-            .keys
-            .iter()
-            .enumerate()
+            .slot_keys()
             .filter_map(|(i, k)| {
                 // A spec array index is < 2^32-1: "4294967295"/"4294967296"
                 // are ORDINARY named properties — they never block a shrink.
@@ -405,17 +403,17 @@ impl<'p> Vm<'p> {
         // the string ones. The difference is observable as the order of the
         // [[DefineOwnProperty]] calls on a Proxy target.
         let enum_keys = |m: &ObjMap| -> Vec<String> {
-            let ordered = spec_key_order(&m.keys);
+            let ordered = spec_key_order_map(&m);
             let live = |i: &usize| m.attr_at(*i).enumerable;
             ordered
                 .iter()
-                .filter(|i| live(i) && !is_hidden_key(&m.keys[**i]))
+                .filter(|i| live(i) && !is_hidden_key(m.key_at(**i)))
                 .chain(
                     ordered
                         .iter()
-                        .filter(|i| live(i) && is_hidden_key(&m.keys[**i])),
+                        .filter(|i| live(i) && is_hidden_key(m.key_at(**i))),
                 )
-                .map(|i| m.keys[*i].clone())
+                .map(|i| m.key_at(*i).to_owned())
                 .collect()
         };
         // A PROXY descriptor bag follows the spec protocol exactly:
@@ -947,7 +945,7 @@ mod dense_gap_tests {
                     HeapObj::Array(items) => items.len(),
                     _ => panic!("{name} is not an array"),
                 };
-                let overlay = vm.arr_props.get(&idx).map(|m| m.len());
+                let overlay = vm.arr_props.get(&idx).map(|m| m.live_len());
                 (dense, overlay, vm.array_js_len.get(&idx).copied())
             })
             .collect()

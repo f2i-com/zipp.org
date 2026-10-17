@@ -498,7 +498,7 @@ impl<'p> Vm<'p> {
             }
             let mut pairs: Vec<(Box<str>, u64)> = Vec::new();
             if let HeapObj::Object(map) = self.heap.get(proto) {
-                for (i, key) in map.keys.iter().enumerate() {
+                for (i, key) in map.slot_keys() {
                     if map.attr_at(i).accessor {
                         continue;
                     }

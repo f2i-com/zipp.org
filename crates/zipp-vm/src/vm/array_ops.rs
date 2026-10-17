@@ -1436,8 +1436,7 @@ impl<'p> Vm<'p> {
                 {
                     let mut keys: Vec<u64> = match self.heap.get(this.heap_index()) {
                         HeapObj::Object(m) => m
-                            .keys
-                            .iter()
+                            .keys_iter()
                             .filter_map(|k| {
                                 k.parse::<u64>()
                                     .ok()
@@ -1636,7 +1635,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let Some(m) = self.arr_props.get(&idx) {
-            for (i, k) in m.keys.iter().enumerate() {
+            for (i, k) in m.slot_keys() {
                 let Some(ki) = canonical_index_str(k) else {
                     continue;
                 };

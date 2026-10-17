@@ -2322,7 +2322,7 @@ impl<'p> Vm<'p> {
                 let shape = m.shape();
                 let mut bits = [Value::UNDEFINED.bits(); 8];
                 let mut valid = m.shape_guardable()
-                    && m.len() >= bits.len()
+                    && m.slot_len() >= bits.len()
                     && native::DV_PROTO_METHODS.len() >= bits.len();
                 if valid {
                     for method in 0..bits.len() {
@@ -2345,7 +2345,7 @@ impl<'p> Vm<'p> {
                 }
                 // The numeric setters, entries 10..18, the same way.
                 let mut set_bits = [Value::UNDEFINED.bits(); 8];
-                if valid && m.len() >= 18 && native::DV_PROTO_METHODS.len() >= 18 {
+                if valid && m.slot_len() >= 18 && native::DV_PROTO_METHODS.len() >= 18 {
                     for (j, slot) in (10..18).enumerate() {
                         let value = m.val_at(slot);
                         let intrinsic = value.is_heap()
@@ -2368,7 +2368,7 @@ impl<'p> Vm<'p> {
                 }
                 // The BigInt accessors, entries 8, 9, 18 and 19, the same way.
                 let mut big_bits = [Value::UNDEFINED.bits(); 4];
-                if valid && m.len() >= 20 && native::DV_PROTO_METHODS.len() >= 20 {
+                if valid && m.slot_len() >= 20 && native::DV_PROTO_METHODS.len() >= 20 {
                     for (j, slot) in [8usize, 9, 18, 19].into_iter().enumerate() {
                         let value = m.val_at(slot);
                         let intrinsic = value.is_heap()

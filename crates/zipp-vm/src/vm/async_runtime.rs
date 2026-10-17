@@ -991,7 +991,8 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(res.heap_index()) else {
             return None;
         };
-        if m.len() != 2
+        if m.slot_len() != 2
+            || m.has_holes()
             || m.key_at(0) != "value"
             || m.key_at(1) != "done"
             || m.attr_at(0).accessor
@@ -1212,9 +1213,7 @@ impl<'p> Vm<'p> {
         let (then_ok, ctor_ok) = match self.heap.get(self.promise_proto) {
             HeapObj::Object(m) => {
                 let check = |key: &str, pred: &dyn Fn(Value) -> bool| {
-                    m.keys
-                        .iter()
-                        .position(|k| k == key)
+                    m.pos(key)
                         .is_some_and(|i| !m.attr_at(i).accessor && pred(m.val_at(i)))
                 };
                 (
@@ -1354,8 +1353,8 @@ impl<'p> Vm<'p> {
         // Belt-and-braces: the versions say the layout is unchanged; verify
         // the slots still name their keys anyway, so an un-bumped structural
         // change could only ever cost a re-proof, never a wrong answer.
-        if m.keys.get(ts).map_or(true, |k| k != "then")
-            || m.keys.get(cs).map_or(true, |k| k != "constructor")
+        if m.key_get(ts).map_or(true, |k| k != "then")
+            || m.key_get(cs).map_or(true, |k| k != "constructor")
         {
             return None;
         }
@@ -1383,7 +1382,7 @@ impl<'p> Vm<'p> {
             None => Some(true),
             Some((slot, getter, getter_version)) => {
                 let s = slot as usize;
-                if mc.keys.get(s).map_or(true, |k| k != "@@species") {
+                if mc.key_get(s).map_or(true, |k| k != "@@species") {
                     return None;
                 }
                 if mc.attr_at(s).accessor
@@ -1455,10 +1454,8 @@ impl<'p> Vm<'p> {
             _ => return false,
         };
         let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
-        if ts >= m.vals_len()
-            || cs >= m.vals_len()
-            || m.val_at(ts) != c.then_val
-            || m.val_at(cs) != c.ctor_val
+        if m.val_get(ts) != Some(c.then_val)
+            || m.val_get(cs) != Some(c.ctor_val)
             || m.is_accessor_at(ts)
             || m.is_accessor_at(cs)
         {
@@ -1474,8 +1471,7 @@ impl<'p> Vm<'p> {
                     _ => return false,
                 };
                 let s = slot as usize;
-                s < mc.vals_len()
-                    && mc.val_at(s) == c.species_val
+                mc.val_get(s) == Some(c.species_val)
                     && mc.is_accessor_at(s)
                     && self.heap.version_of(getter) == getter_version
             }
