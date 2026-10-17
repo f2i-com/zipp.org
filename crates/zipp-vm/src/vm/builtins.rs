@@ -422,6 +422,58 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The `(func id, closure)` a `recv.call(t, …args)` enters directly, as
+    /// the call of `recv` with `this` = `t` that it is: `recv` a plain
+    /// function (not a generator or async one, whose calls allocate rather
+    /// than run) of the running realm, and a Get of `call` on it resolving to
+    /// the pristine `%Function.prototype.call%` ([`Vm::fn_call_apply_pristine`]).
+    #[inline]
+    pub(crate) fn fn_call_plain_target(&self, recv: Value) -> Option<(u32, u32)> {
+        let target = self.plain_fn_entry(recv)?;
+        if !self.fn_call_apply_pristine(recv, "call")
+            || (!self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0)
+        {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// The native id a `recv.call(t, …args)` runs directly, as the call of
+    /// `recv` with `this` = `t`: `recv` a plain native with no other realm in
+    /// existence (a realm-copied native runs with its realm active, which
+    /// `call_value` arranges) and `call` the pristine
+    /// `%Function.prototype.call%`.
+    #[inline]
+    pub(crate) fn fn_call_native_target(&self, recv: Value) -> Option<u16> {
+        if !recv.is_heap() || !self.realm_global_objs.is_empty() {
+            return None;
+        }
+        match self.heap.get(recv.heap_index()) {
+            HeapObj::Native(id) => {
+                let id = *id;
+                self.fn_call_apply_pristine(recv, "call").then_some(id)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `(func id, closure)` of `v` when calling it pushes a frame and
+    /// runs its body: an ordinary function or closure that is not a
+    /// generator or an async function.
+    #[inline]
+    pub(crate) fn plain_fn_entry(&self, v: Value) -> Option<(u32, u32)> {
+        if !v.is_heap() {
+            return None;
+        }
+        let (fid, closure) = match self.heap.get(v.heap_index()) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, v.heap_index()),
+            _ => return None,
+        };
+        let p = self.func(fid as usize);
+        (!p.is_generator && !p.is_async).then_some((fid, closure))
+    }
+
     /// The Value a real Get of `call` / `apply` / `bind` on the callable `recv`
     /// resolves to, when that is provably the pristine `%Function.prototype%`
     /// data slot ([`Vm::fn_call_apply_pristine`]): the captured half of a

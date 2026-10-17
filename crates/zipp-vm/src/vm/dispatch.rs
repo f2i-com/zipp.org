@@ -4183,6 +4183,38 @@ impl<'p> Vm<'p> {
                                 )?;
                                 break;
                             }
+                        } else if callee_v.is_heap()
+                            && matches!(self.heap.get(callee_v.heap_index()),
+                                HeapObj::Native(id) if *id == crate::vm::native::FN_CALL)
+                        {
+                            // `f.call(t, ...)` captured in spec order: the
+                            // callee IS %Function.prototype.call% and the
+                            // receiver a plain function, so the call is `f`
+                            // with `this` = `t`. It enters as a frame of this
+                            // loop, like `f(...)`, rather than through
+                            // `call_value` and the nested run loop the native
+                            // starts for it (deep `.call` recursion was
+                            // native-stack depth, not frames).
+                            let (t, at, n) = if argc == 0 {
+                                (Value::UNDEFINED, arg_base, 0)
+                            } else {
+                                (self.get(base, arg_base), arg_base + 1, argc - 1)
+                            };
+                            if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
+                                self.setup_call(fid, closure, t, base, at, n, dst, ip + 1, this_val)?;
+                                break;
+                            }
+                            // A native receiver, as `call_value` would run it
+                            // with no other realm in existence.
+                            if self.realm_global_objs.is_empty() && this_val.is_heap() {
+                                if let HeapObj::Native(id) = self.heap.get(this_val.heap_index()) {
+                                    let id = *id;
+                                    let r = self.with_argv(base, at, n, |vm, argv| vm.call_native(id, t, argv))?;
+                                    self.set(base, dst, r);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                         }
                         // B289: a captured boot intrinsic (`arr.push(i % 13)`,
                         // `s.charCodeAt(starts[i])` — a member call whose
@@ -4571,6 +4603,31 @@ impl<'p> Vm<'p> {
                                 self.interp_map_method_fast(recv, key, base, arg_base, argc)?
                             {
                                 self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        // `f.call(t, ...args)` on a plain function while a Get
+                        // of `call` finds the pristine %Function.prototype.call%:
+                        // that is the call of `f` with `this` = `t`, so `f`
+                        // enters as a frame of this loop, as `f(...)` would,
+                        // rather than through the builtin dispatcher's
+                        // `call_value` and the nested run loop it starts.
+                        // A native (`hasOwn.call(o, k)`) runs as the same call
+                        // `call_value` would make of it.
+                        if private_callee.is_none() && key == "call" {
+                            let (this_v, args_at, n) = if argc == 0 {
+                                (Value::UNDEFINED, arg_base, 0)
+                            } else {
+                                (self.get(base, arg_base), arg_base + 1, argc - 1)
+                            };
+                            if let Some((fid, closure)) = self.fn_call_plain_target(recv) {
+                                self.setup_call(fid, closure, this_v, base, args_at, n, dst, ip + 1, recv)?;
+                                break;
+                            }
+                            if let Some(id) = self.fn_call_native_target(recv) {
+                                let r = self.with_argv(base, args_at, n, |vm, argv| vm.call_native(id, this_v, argv))?;
+                                self.set(base, dst, r);
                                 ip += 1;
                                 continue;
                             }
