@@ -241,7 +241,7 @@ ffmpeg and the Python WASM build required).
 
 | Fast to start | Modern JavaScript | Ready to embed |
 |---|---|---|
-| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **100% of the documented corrected core Test262 suite:** **95,680 / 95,680**, zero failures or skips. [Original and corrected results](#correctness-and-language-coverage) are reported separately. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
+| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.999% of the unmodified core Test262 suite:** **96,229 / 96,230**, zero skips; the [one failure](#correctness-and-language-coverage) is a documented upstream expectation. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
 
 - **Explore the whole engine.** The lexer, parser, register VM, GC, inline caches
   and JITs live together in this repository.
@@ -1070,34 +1070,36 @@ below.
 
 ## Correctness and language coverage
 
-[Hosted CI at `1539eb4b`](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947)
-confirms **100% of the documented corrected core Test262 suite passes**:
-**95,680 / 95,680 executions, zero failures and zero skips**. This profile applies
-[five documented test corrections](tools/test262-corrections/README.md) covering
-nine inconsistent upstream executions. The original DateTimeFormat ECMA-402
-shard also passes **488 / 488**, without corrections or skips.
-
-For comparison, the unmodified pinned core result is
-**99.991% of test262**: 95,671 / 95,680 executions, with the same nine documented
-upstream inconsistencies and zero skips. [Validation evidence](docs/archive/validation/2026-09-14-ci-readiness.md)
-retains both results; the corrected profile is not an unmodified-upstream claim.
-The corpus is pinned to `4249661388e5d3f92a85186213da140a6481490f`, including
-staging and excluding the separate ECMA-402 suite.
+The unmodified pinned core Test262 corpus passes
+**99.999% of test262**: 96,229 / 96,230 executions, with one documented expected
+failure and zero skips. The original DateTimeFormat ECMA-402 shard also passes
+**490 / 490**, without changes or skips. The corpus is pinned to
+`d53ebc8b1931d9f1541e43d59650776e4b766248` (13 October 2026), including staging
+and excluding the separate ECMA-402 suite; hosted CI runs it once, unmodified.
 
 | Validation profile | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
-| Core with five documented test corrections | 95,680 | 0 | 0 |
-| Original pinned core Test262 | 95,671 | 9 | 0 |
-| Original DateTimeFormat ECMA-402 tests | 488 | 0 | 0 |
+| Original pinned core Test262 | 96,229 | 1 | 0 |
+| Original DateTimeFormat ECMA-402 tests | 490 | 0 | 0 |
 
-Eight original failures expose contradictions in the pinned Error/TypedArray
-harnesses; one Annex B test carries a superseded ES2017 expectation.
-[The corrections](tools/test262-corrections/README.md) retain both original and
-corrected reports, with exact file hashes and no skipped executions. The
-corrected profile permits no expected failures. Its 100% result is explicitly
-separate from unmodified upstream conformance. The German formatting failures
-are fixed in the VM without test changes. Passing the DateTimeFormat shard
-does not establish complete ECMA-402 coverage or universal ICU parity.
+The one failure, `annexB/language/function-code/block-decl-func-skip-arguments.js`
+in sloppy mode, asserts ES2017 wording that ES2018 deleted
+([tc39/test262#5113](https://github.com/tc39/test262/issues/5113)); current Node
+fails it too, and local regression tests cover the current semantics. It is the
+only entry in the [expected-failure manifest](tools/test262-expected-failures.txt):
+the gate fails on any other failure, on an entry that starts passing, and on a
+skip. The previous pin needed five test corrections and a second, patched run;
+upstream has since fixed the Error-harness and immutable-buffer
+inconsistencies four of them addressed, so that profile is retired. The German
+formatting failures are fixed in the VM without test changes. Passing the
+DateTimeFormat shard does not establish complete ECMA-402 coverage or universal
+ICU parity.
+
+Moving the pin found 236 executions the engine failed: the new stage 4
+`Iterator.prototype.chunks`, `windows` and `includes`, the `take`/`drop` limit
+bound, `Promise.try`'s unwrapped result and the test host's module-source
+prototype. All are fixed; the iterator and Promise.try regression tests run in
+every tier and under GC stress.
 
 The [12 September 2026 correctness audit](docs/archive/audits/2026-09-12-correctness.md)
 recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.

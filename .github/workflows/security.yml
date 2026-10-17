@@ -432,7 +432,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tc39/test262
-          ref: 4249661388e5d3f92a85186213da140a6481490f
+          ref: d53ebc8b1931d9f1541e43d59650776e4b766248
           # Keep the external corpus out of the engine's source-identity scan.
           path: target/test262
           persist-credentials: false
@@ -451,17 +451,21 @@ jobs:
           PY
       - name: Test conformance scoring and corpus provenance checks
         run: python3 -m unittest discover -s tools -p 'test_run_test262*.py'
-      # Two workers. Four were tried (3856993d): each corpus (95,680
-      # executions) still took 6.5 minutes, as at two, so the runner's
-      # throughput here is not the worker count.
-      - name: Report upstream and require all documented corrected tests to pass
-        run: >-
-          python3 tools/run_test262_dual.py
-          --t262 target/test262
-          --corrected-tree target/test262-corrected
-          --zipp target/release/zipp
-          --jobs 2 --timeout 120
-          --output-dir target/test262-evidence
+      # One run of the unmodified corpus (96,230 executions), allowed exactly
+      # the failures the manifest documents: an unexpected failure, a stale
+      # entry or a skip fails the gate. Two workers: four were tried
+      # (3856993d) and took as long, so the runner's throughput here is not
+      # the worker count.
+      - name: Require the pinned Test262 corpus to pass
+        run: |
+          mkdir -p target/test262-evidence
+          python3 tools/run_test262.py \
+            --t262 target/test262 \
+            --zipp target/release/zipp \
+            --jobs 2 --timeout 120 \
+            --expected-failures tools/test262-expected-failures.txt \
+            --dump-fails target/test262-evidence/failures.txt \
+            --json target/test262-evidence/test262.json
       - name: Require the original DateTimeFormat ECMA-402 tests to pass
         run: >-
           python3 tools/run_test262.py --t262 target/test262

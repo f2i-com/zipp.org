@@ -116,7 +116,7 @@
             {
               "title": "Test262 conformance",
               "href": "/test262/",
-              "text": "95,680 executions of the pinned ECMAScript suite."
+              "text": "96,230 executions of the pinned ECMAScript suite."
             },
             {
               "title": "Engineering journal",
@@ -132,7 +132,7 @@
     {
       "slug": "javascript-engine",
       "title": "Zipp: A JavaScript Engine Written in Rust",
-      "description": "Zipp is an embeddable JavaScript engine written in Rust with a register VM, x86-64 and ARM64 JITs, a WebAssembly build, and 100% corrected-core Test262 conformance.",
+      "description": "Zipp is an embeddable JavaScript engine written in Rust with a register VM, x86-64 and ARM64 JITs, a WebAssembly build, and 99.999% unmodified Test262 conformance.",
       "h1": "A JavaScript engine written in Rust",
       "breadcrumb": "JavaScript engine",
       "lede": "Zipp is a from-scratch ECMAScript engine: a hand-written parser, a register bytecode compiler, an explicit-frame virtual machine, native JIT tiers and a generational garbage collector, all in Rust. The same engine runs as a native CLI, as an embeddable Rust library, and as a WebAssembly module in the browser.",
@@ -163,9 +163,9 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "95,680 / 95,680",
-                  "label": "Test262 executions passing, corrected core profile",
-                  "note": "95,671 unmodified upstream. Corpus pinned to tc39/test262 4249661."
+                  "value": "96,229 / 96,230",
+                  "label": "Test262 executions passing, unmodified upstream",
+                  "note": "One documented expected failure. Corpus pinned to tc39/test262 d53ebc8."
                 },
                 {
                   "value": "0.703×",
@@ -197,7 +197,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp implements the ES2015 through ES2025 language and runtime, and passes the pinned Test262 corpus including the `staging` directory. The feature list is the boring kind of complete:"
+              "text": "Zipp implements the ES2015 through ES2025 language and runtime, and passes all but one execution of the pinned Test262 corpus, including the `staging` directory. The feature list is the boring kind of complete:"
             },
             {
               "type": "ul",
@@ -220,7 +220,7 @@
               "type": "callout",
               "tone": "warning",
               "title": "What is not complete",
-              "text": "Internationalization is partial. `Intl.DateTimeFormat` ships generated CLDR 48 data for English, German, Japanese, Chinese and Egyptian Arabic and passes its 488-execution Test262 shard; the other Intl services ship English locale data only. Zipp does not claim full ECMA-402 conformance."
+              "text": "Internationalization is partial. `Intl.DateTimeFormat` ships generated CLDR 48 data for English, German, Japanese, Chinese and Egyptian Arabic and passes its 490-execution Test262 shard; the other Intl services ship English locale data only. Zipp does not claim full ECMA-402 conformance."
             }
           ]
         },
@@ -236,7 +236,7 @@
               "items": [
                 {
                   "title": "Parse",
-                  "text": "Hand-written lexer and recursive-descent parser, built primarily for correct early errors. The pinned Test262 corpus contains 8,755 negative executions and every one must fail with the right error type."
+                  "text": "Hand-written lexer and recursive-descent parser, built primarily for correct early errors. Every negative execution in the pinned Test262 corpus must fail with the right error type."
                 },
                 {
                   "title": "Compile to register bytecode",
@@ -336,7 +336,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp runs the pinned tc39/test262 corpus in both sloppy and strict mode: 95,680 executions, including `staging`, with zero skips. Against the unmodified corpus 95,671 pass; the nine remaining executions are contradictions in the pinned harness files and are corrected by five reviewable patches to five test files, giving 95,680 of 95,680. The [Test262 page](/test262/) documents each correction, the CI gate, and how the number climbed from a mis-scored 100% to an honest 96.97% and back up."
+              "text": "Zipp runs the pinned tc39/test262 corpus in both sloppy and strict mode: 96,230 executions, including `staging`, with zero skips. Against the unmodified corpus 96,229 pass. The one remaining execution is an Annex B test whose final assertion is ES2017 wording that ES2018 deleted, and it is the single entry in a checked-in expected-failure manifest; no test file is patched. The [Test262 page](/test262/) documents that failure, the CI gate, and how the number climbed from a mis-scored 100% to an honest 96.97% and back up."
             },
             {
               "type": "p",
@@ -1283,11 +1283,11 @@
     },
     {
       "slug": "test262",
-      "title": "Zipp Test262 Conformance: 95,680 JavaScript Tests",
-      "description": "How Zipp scores the pinned tc39/test262 corpus: 95,680 executions, zero skips, 95,671 passing unmodified and 95,680 with five documented corrections, gated in CI.",
+      "title": "Zipp Test262 Conformance: 96,230 JavaScript Tests",
+      "description": "How Zipp scores the pinned tc39/test262 corpus: 96,230 executions, zero skips, 96,229 passing unmodified and one documented expected failure, gated in CI.",
       "h1": "JavaScript Test262 conformance",
       "breadcrumb": "Test262",
-      "lede": "Test262 is the official ECMAScript conformance suite. Zipp runs the whole pinned corpus, in both sloppy and strict mode, with a scorer that cannot raise the pass rate by skipping tests. This page explains exactly what the numbers mean, what \"corrected\" means, and how the result is gated in CI.",
+      "lede": "Test262 is the official ECMAScript conformance suite. Zipp runs the whole pinned corpus, unmodified, in both sloppy and strict mode, with a scorer that cannot raise the pass rate by skipping tests. This page explains exactly what the numbers mean, what the one expected failure is, and how the result is gated in CI.",
       "keywords": [
         "Test262 conformance",
         "ECMAScript Test262 engine",
@@ -1296,14 +1296,14 @@
         "Rust JavaScript engine Test262"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-10-18",
       "priority": "0.9",
       "extraStructuredData": [
         {
           "@context": "https://schema.org",
           "@type": "Dataset",
-          "name": "Zipp Test262 conformance results, 14 September 2026",
-          "description": "Pass, fail and skip counts for the Zipp JavaScript engine against tc39/test262 at commit 4249661388e5d3f92a85186213da140a6481490f, in the unmodified and corrected-core profiles, plus the ECMA-402 DateTimeFormat shard.",
+          "name": "Zipp Test262 conformance results, tc39/test262 d53ebc8",
+          "description": "Pass, fail and skip counts for the Zipp JavaScript engine against the unmodified tc39/test262 corpus at commit d53ebc8b1931d9f1541e43d59650776e4b766248, plus the ECMA-402 DateTimeFormat shard.",
           "url": "https://www.zipp.org/test262/",
           "license": "https://www.apache.org/licenses/LICENSE-2.0",
           "creator": {
@@ -1311,14 +1311,7 @@
             "name": "f2i",
             "url": "https://f2i.com"
           },
-          "datePublished": "2026-09-14",
-          "distribution": [
-            {
-              "@type": "DataDownload",
-              "encodingFormat": "application/json",
-              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json"
-            }
-          ]
+          "datePublished": "2026-10-17"
         }
       ],
       "sections": [
@@ -1327,9 +1320,9 @@
           "blocks": [
             {
               "type": "table",
-              "caption": "Hosted run at commit 1539eb4b, 14 September 2026, clean build",
+              "caption": "Local run against the pinned corpus d53ebc8, unmodified",
               "head": [
-                "Profile",
+                "Suite",
                 "Pass",
                 "Fail",
                 "Skip",
@@ -1337,35 +1330,28 @@
               ],
               "rows": [
                 [
-                  "Core corpus, five documented corrections",
-                  "**95,680**",
-                  "0",
-                  "0",
-                  "95,680"
-                ],
-                [
                   "Core corpus, unmodified upstream",
-                  "**95,671**",
-                  "9",
+                  "**96,229**",
+                  "1",
                   "0",
-                  "95,680"
+                  "96,230"
                 ],
                 [
                   "`test/intl402/DateTimeFormat`, unmodified",
-                  "**488**",
+                  "**490**",
                   "0",
                   "0",
-                  "488 (244 files)"
+                  "490"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "The unmodified pass rate is 99.991%. The corrected-core result is 100%, and the two are always reported side by side; a patched result is never presented as unmodified upstream conformance."
+              "text": "The unmodified pass rate is 99.999%. There is no corrected profile: no test file is patched, and the one failure stays in the denominator, listed with its reason in a checked-in expected-failure manifest."
             },
             {
               "type": "p",
-              "text": "The corpus is tc39/test262 at commit `4249661388e5d3f92a85186213da140a6481490f`, walking `test/` including the `staging` directory and excluding the separate ECMA-402 suite under `test/intl402/`, which is opt-in. Nothing is excluded by feature flag: Temporal, decorators, iterator helpers, `ShadowRealm`, resizable buffers and every other feature in the pinned corpus are in scope."
+              "text": "The corpus is tc39/test262 at commit `d53ebc8b1931d9f1541e43d59650776e4b766248` (13 October 2026), walking `test/` including the `staging` directory and excluding the separate ECMA-402 suite under `test/intl402/`, which is opt-in. Nothing is excluded by feature flag: Temporal, decorators, iterator helpers, `ShadowRealm`, resizable buffers and every other feature in the pinned corpus are in scope."
             }
           ]
         },
@@ -1374,7 +1360,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "95,680 is a count of executions, not files. Following the suite's own interpretation guide, a test that carries none of the `onlyStrict`, `noStrict`, `raw` or `module` flags runs twice, once as sloppy code and once with `\"use strict\";` prepended. `raw` and `module` tests run once; `onlyStrict` and `noStrict` run once each in their mode."
+              "text": "96,230 is a count of executions, not files. Following the suite's own interpretation guide, a test that carries none of the `onlyStrict`, `noStrict`, `raw` or `module` flags runs twice, once as sloppy code and once with `\"use strict\";` prepended. `raw` and `module` tests run once; `onlyStrict` and `noStrict` run once each in their mode."
             },
             {
               "type": "p",
@@ -1383,41 +1369,19 @@
           ]
         },
         {
-          "heading": "What \"corrected\" means",
+          "heading": "The one expected failure",
           "blocks": [
             {
               "type": "p",
-              "text": "The nine executions that fail against the unmodified corpus are not engine defects; they are places where the pinned test files contradict themselves or a later edition of the specification. Rather than hide them behind an exclusion list, Zipp keeps five reviewable unified patches under `tools/test262-corrections/`, each with the original and corrected SHA-256, a prose reason and a specification link. The patches touch five test files, never the harness, and remove no files, modes or cases."
-            },
-            {
-              "type": "table",
-              "caption": "The five corrections, nine executions",
-              "head": [
-                "Test file",
-                "Executions",
-                "Why"
-              ],
-              "rows": [
-                [
-                  "`staging/sm/Error/constructor-proto.js`, `prototype-properties.js`, `prototype.js`",
-                  "6",
-                  "The pinned `harness/nativeErrors.js` now lists `Error` itself, so the tests demand `Reflect.getPrototypeOf(Error) === Error`, contradicting their own earlier assertions. Node 24.19 fails all three unchanged."
-                ],
-                [
-                  "`built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js`",
-                  "2",
-                  "The harness added an immutable-buffer factory; the test expects a successful write, but the immutable ArrayBuffer proposal requires a mutable destination. Zipp correctly throws `TypeError`."
-                ],
-                [
-                  "`annexB/language/function-code/block-decl-func-skip-arguments.js`",
-                  "1",
-                  "Carries ES2017 wording deleted in ES2018; Node 24.19 fails the same final assertion. Tracked upstream as tc39/test262 issue 5113."
-                ]
-              ]
+              "text": "One execution fails against the unmodified corpus, and it is not an engine defect: `annexB/language/function-code/block-decl-func-skip-arguments.js` in sloppy mode. Its final assertion is ES2017 wording that ES2018 deleted, tracked upstream as tc39/test262 issue 5113, and current Node fails it too; Zipp's own regression tests cover the current semantics. Rather than patch the file or exclude it, `tools/test262-expected-failures.txt` lists it with that reason. The test still runs every time, and the gate fails if it starts passing."
             },
             {
               "type": "p",
-              "text": "Two further failures, both modes of a German-language string test in `staging`, were fixed in the engine with no test patch. That is why the expected-failure manifest has nine entries rather than eleven."
+              "text": "The previous pin, `4249661`, was also reported on a corrected profile, with five reviewable patches to five test files. Four of them are no longer needed, because upstream itself removed or fixed the inconsistent `staging/sm/Error` tests and excluded immutable buffers from the TypedArray `slice` alias-copy test. The fifth is the Annex B test above. The corrected profile, its patches and its separate runner have been retired, so there is now one number, and it is the unmodified one."
+            },
+            {
+              "type": "p",
+              "text": "Moving to this pin was not free. Before the move, the engine failed 237 executions of the new corpus: 218 for the new stage-4 `Iterator.prototype.chunks`, `windows` and `includes` methods, 12 for the 2^53−1 limit bound in `take()` and `drop()`, 4 for `Promise.try` returning an already-resolved promise unwrapped, 2 for the source-phase-imports module-source prototype chain, and the Annex B test. All but the Annex B test are fixed in `1676c9e4`. Zipp's own new tests also found that `IteratorClose` ignored an overridden generator `return`, fixed in `eb93d408`."
             }
           ]
         },
@@ -1426,7 +1390,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "`tools/run_test262.py` is a 566-line Python runner and scorer; `tools/run_test262_dual.py` drives the unmodified and corrected suites together and refuses to score unless the checkout is at the pinned revision, no newline conversion has occurred, the set of changed paths equals the manifest exactly, and there are no untracked files. Both runners have their own unit tests."
+              "text": "`tools/run_test262.py` is a 623-line Python runner and scorer. Given `--expected-failures`, it requires the run's failures to equal the manifest exactly: an unexpected failure, an entry that now passes, or any skip exits nonzero. Its unit tests live in `tools/test_run_test262.py`."
             },
             {
               "type": "ul",
@@ -1446,11 +1410,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The `test262` job in `.github/workflows/security.yml` checks out tc39/test262 at the pin, builds the release CLI with Rust 1.92.0, asserts that the binary's recorded source commit equals `HEAD` and is not dirty, runs the tooling unit tests, runs the dual suite with two workers and a 120-second timeout, then runs the DateTimeFormat shard. Any unexpected failure, stale expectation or skip in the unmodified run, any failure at all in the corrected run, or any DateTimeFormat failure fails the job."
+              "text": "The `test262` job in `.github/workflows/security.yml` checks out tc39/test262 at the pin, builds the release CLI with Rust 1.92.0, asserts that the binary's recorded source commit equals `HEAD` and is not dirty, runs the tooling unit tests, runs the unmodified corpus once with two workers, a 120-second timeout and `--expected-failures tools/test262-expected-failures.txt`, then runs the DateTimeFormat shard. Any unexpected failure, stale expectation or skip in the corpus run, or any DateTimeFormat failure, fails the job."
             },
             {
               "type": "p",
-              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`upstream.json`, `corrected.json`, both failure lists, `comparison.json` and `datetimeformat.json`) is retained for thirty days, and the durable summary lives in the repository."
+              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`test262.json`, `failures.txt`, `datetimeformat.json` and `datetimeformat-failures.txt`) is retained for thirty days. The figures above are from a local run on this pin; hosted CI has not yet run against it."
             }
           ]
         },
@@ -1460,12 +1424,10 @@
             {
               "type": "ul",
               "items": [
-                "[Hosted run at 1539eb4b](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947), the clean-build confirmation of the table above.",
-                "[docs/archive/validation/2026-09-14-test262-datetimeformat.json](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json), the machine-readable summary with engine identity, corpus pin, correction hashes and report hashes.",
-                "[docs/archive/validation/2026-09-14-ci-readiness.md](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-ci-readiness.md), the narrative log with a per-failure analysis.",
-                "[tools/test262-corrections/](https://github.com/f2i-com/zipp.org/tree/main/tools/test262-corrections), the manifest and the five patches.",
-                "[tools/test262-expected-failures.txt](https://github.com/f2i-com/zipp.org/blob/main/tools/test262-expected-failures.txt), the nine-entry manifest with reasons.",
-                "[tools/run_test262.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262.py) and [tools/run_test262_dual.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262_dual.py).",
+                "[tools/test262-expected-failures.txt](https://github.com/f2i-com/zipp.org/blob/main/tools/test262-expected-failures.txt), the one-entry manifest with its reason.",
+                "[tools/run_test262.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262.py), the runner and scorer.",
+                "[tools/CLDR-DATA.md](https://github.com/f2i-com/zipp.org/blob/main/tools/CLDR-DATA.md), the provenance of the generated DateTimeFormat CLDR data.",
+                "For the previous pin, `4249661`: the [hosted run at 1539eb4b](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947), the machine-readable [summary of 14 September 2026](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json), and the [narrative log](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-ci-readiness.md) with a per-failure analysis.",
                 "[The correctness audits of 12 September 2026](https://github.com/f2i-com/zipp.org/tree/main/docs/audits)."
               ]
             }
@@ -1525,6 +1487,11 @@
                   "date": "2026-09-14",
                   "title": "95,671 unmodified, 95,680 corrected, 488 DateTimeFormat",
                   "text": "An Annex B hidden defect fixed behind an obsolete expectation, CLDR 48 DateTimeFormat data generated, the corrected profile documented and gated."
+                },
+                {
+                  "date": "2026-10-18",
+                  "title": "New pin: 96,229 of 96,230 unmodified, 490 DateTimeFormat",
+                  "text": "Corpus d53ebc8: 237 failures before the move, 218 of them the new iterator `chunks`, `windows` and `includes`; all but the Annex B test fixed in `1676c9e4`, and the corrected profile retired."
                 }
               ]
             },
@@ -1540,8 +1507,8 @@
             {
               "type": "ul",
               "items": [
-                "It is not complete ECMA-402 conformance. DateTimeFormat is one 244-file shard, and the other Intl services ship English locale data only. The last full-suite Intl402 figure, 6,502 of 6,714 on an older corpus, is from 29 July 2026.",
-                "It is not a claim about other engines. The corrections document that Node 24.19 fails four of the same executions, but no engine-versus-engine conformance table is published.",
+                "It is not complete ECMA-402 conformance. DateTimeFormat is one shard, and the other Intl services ship English locale data only. The last full-suite Intl402 figure, 6,502 of 6,714 on an older corpus, is from 29 July 2026.",
+                "It is not a claim about other engines. The expected-failure manifest records that current Node fails the same Annex B assertion, but no engine-versus-engine conformance table is published.",
                 "It is a result at one pinned commit. A newer corpus will have a different execution count and may add tests Zipp fails; the number will be re-reported against the new pin, not carried forward."
               ]
             }
@@ -2614,7 +2581,7 @@
                 ],
                 [
                   "Test262",
-                  "95,680 / 95,680 corrected core, 95,671 unmodified, on a pinned corpus",
+                  "96,229 / 96,230 unmodified, one documented expected failure, on a pinned corpus",
                   "High; QuickJS-NG publishes its own results",
                   "Publishes a conformance dashboard",
                   "Targets ES6 plus selected later features",
@@ -3364,7 +3331,7 @@
       "description": "Taking Zipp, a from-scratch Rust JavaScript engine, from its first bytecode VM to 95,680 of 95,680 Test262 executions: the runner, the 96.97% reckoning, the hard corners.",
       "h1": "Building a JavaScript engine in Rust to full Test262 conformance",
       "breadcrumb": "Test262 conformance",
-      "lede": "Zipp passes every execution of the pinned tc39/test262 corpus on a documented corrected profile, and 95,671 of 95,680 unmodified. This article is about how that happened between 30 May and 14 September 2026, with particular attention to the day the number went down.",
+      "lede": "Zipp passed every execution of the then-pinned tc39/test262 corpus on a documented corrected profile, and 95,671 of 95,680 unmodified. This article is about how that happened between 30 May and 14 September 2026, with particular attention to the day the number went down.",
       "keywords": [
         "Test262 conformance",
         "building a JavaScript engine",
@@ -3500,7 +3467,7 @@
             },
             {
               "type": "p",
-              "text": "The longest saga. Annex B's web-compatibility semantics for function declarations in blocks were claimed as \"more conformant than Node\" on 29 July, retracted, re-fixed, and then on 14 September a real hidden defect was found behind an obsolete test expectation: a block function was not visible before its textual declaration. The block binding is now created at block entry, sloppy arrow functions get the same `var` setup, and the one test that still carries ES2017 wording deleted in ES2018 is corrected by a documented patch that Node 24.19 also needs."
+              "text": "The longest saga. Annex B's web-compatibility semantics for function declarations in blocks were claimed as \"more conformant than Node\" on 29 July, retracted, re-fixed, and then on 14 September a real hidden defect was found behind an obsolete test expectation: a block function was not visible before its textual declaration. The block binding is now created at block entry, sloppy arrow functions get the same `var` setup, and the one test that still carries ES2017 wording deleted in ES2018 was corrected by a documented patch that Node 24.19 also needed; on the October pin it is the corpus's one expected failure instead."
             },
             {
               "type": "h3",
@@ -3537,11 +3504,11 @@
           ]
         },
         {
-          "heading": "What \"corrected\" means, and why it is separate",
+          "heading": "What \"corrected\" meant, and why it was separate",
           "blocks": [
             {
               "type": "p",
-              "text": "Nine executions in the pinned corpus contradict themselves or a later edition of the specification: six where the pinned harness now lists `Error` among the native errors so the tests demand `Reflect.getPrototypeOf(Error) === Error`, two where an immutable-buffer factory was added to the harness but the test still expects a write to succeed, and one Annex B test with superseded wording. Zipp keeps five unified patches with before-and-after hashes and a reason for each, applies them in a fresh clone under a driver that verifies the changed paths equal the manifest and nothing else, and reports the corrected result beside the unmodified one. It never reports the corrected number alone. The [Test262 page](/test262/) has the manifest and links to the hosted run."
+              "text": "Nine executions in the then-pinned corpus contradicted themselves or a later edition of the specification: six where the pinned harness listed `Error` among the native errors so the tests demanded `Reflect.getPrototypeOf(Error) === Error`, two where an immutable-buffer factory had been added to the harness but the test still expected a write to succeed, and one Annex B test with superseded wording. Zipp kept five unified patches with before-and-after hashes and a reason for each, applied them in a fresh clone under a driver that verified the changed paths equaled the manifest and nothing else, and reported the corrected result beside the unmodified one. It never reported the corrected number alone. Upstream has since fixed the first eight, so on the October pin the [Test262 page](/test262/) reports one unmodified result with one expected failure."
             }
           ]
         },
@@ -3572,7 +3539,7 @@
       ],
       "related": [
         {
-          "label": "Test262 conformance: results, corrections and CI gate",
+          "label": "Test262 conformance: results, expected failure and CI gate",
           "href": "/test262/"
         },
         {

@@ -99,15 +99,15 @@ test('client rejects malformed data and unsafe links while retaining legitimate 
   assert.deepEqual(readReadmeFacts('A new README format'), {})
 })
 
-test('current README preserves original results and labels the corrected 100% separately', () => {
+test('current README reports the unmodified result, with no corrected profile', () => {
   const facts = readReadmeFacts(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'))
-  assert.equal(facts.test262_pct, 99.991)
-  assert.equal(facts.test262_pass, 95671)
-  assert.equal(facts.test262_corrected_pass, 95680)
-  assert.equal(facts.test262_corrected_total, 95680)
+  assert.equal(facts.test262_pct, 99.999)
+  assert.equal(facts.test262_pass, 96229)
+  assert.equal(facts.test262_total, 96230)
+  assert.equal(facts.test262_corrected_pass, undefined)
+  assert.equal(facts.test262_corrected_total, undefined)
   const summary = test262Summary(parseRepoStats({ ...snapshot, readme: facts }))
-  assert.equal(summary.label, '100% Test262 · corrected suite')
-  assert.match(summary.detail, /Original core: 95,671 \/ 95,680 passed/)
+  assert.equal(summary.label, '99.999% Test262 · original suite')
 })
 
 test('missing or malformed corrected data never relabels the original result', () => {

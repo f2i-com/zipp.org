@@ -1,16 +1,9 @@
-# Superseded ES2017 expectation: current Node also retains the block function
-# in the outer arguments binding. Local regression tests cover current semantics.
+# Expected failures of the pinned Test262 corpus (tc39/test262
+# d53ebc8b1931d9f1541e43d59650776e4b766248, test/ including staging, without
+# intl402). Each entry still RUNS; `run_test262.py --expected-failures` fails on
+# any other failure, on an entry that passes, and on a skip.
+#
+# Superseded ES2017 expectation (tc39/test262 issue 5113): the test's final
+# assertion is ES2017 wording that ES2018 deleted; current Node fails it too.
+# Local regression tests cover the current semantics.
 annexB/language/function-code/block-decl-func-skip-arguments.js [sloppy]
-# Upstream harness inconsistencies at corpus 4249661388e5d3f92a85186213da140a6481490f.
-# See docs/archive/validation/2026-09-14-ci-readiness.md for evidence; these still RUN.
-# nativeErrors.js includes Error, but these tests expect only Error subclasses.
-staging/sm/Error/constructor-proto.js [sloppy]
-staging/sm/Error/constructor-proto.js [strict]
-staging/sm/Error/prototype-properties.js [sloppy]
-staging/sm/Error/prototype-properties.js [strict]
-staging/sm/Error/prototype.js [sloppy]
-staging/sm/Error/prototype.js [strict]
-# The harness also invokes slice's alias-copy test with an immutable buffer,
-# despite TypedArraySpeciesCreate(..., write) requiring a mutable destination.
-built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js [sloppy]
-built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js [strict]

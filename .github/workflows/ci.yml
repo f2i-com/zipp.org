@@ -267,7 +267,7 @@ jobs:
           shard_tests=""
           if [[ -f tools/test_ci_test_shard.py ]]; then shard_tests="tools.test_ci_test_shard"; fi
           # shellcheck disable=SC2086
-          python3 -B -m unittest tools.test_run_test262 tools.test_run_test262_dual tools.test_ci_quarantine $shard_tests
+          python3 -B -m unittest tools.test_run_test262 tools.test_ci_quarantine $shard_tests
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast

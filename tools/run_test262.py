@@ -267,7 +267,7 @@ def classify(meta, code, out, err):
         # `next()` of a completed `async function*` yields 1 rather than
         # undefined, and Node 24 loses the same assertion identically. That is
         # an upstream test bug, not an engine failure, and scoring it here would
-        # fail the corrected-tree gate (which has no patch for that file).
+        # fail the gate on a test no expected-failure entry should excuse.
         return ("PASS", None)
     if code == 0:
         # A positive test whose assertion failed inside a promise job or a

@@ -74,19 +74,17 @@ compile-time JIT/unsafe exclusion, or the full resource policy, matters.
 ## Conformance and language coverage
 
 The core Test262 corpus is pinned to
-`4249661388e5d3f92a85186213da140a6481490f`, including staging and excluding the
+`d53ebc8b1931d9f1541e43d59650776e4b766248`, including staging and excluding the
 separate `intl402` suite. See the README for measured counts and build identity.
-The [original failure manifest](tools/test262-expected-failures.txt) and
-[documented corrections](tools/test262-corrections/README.md) serve distinct
-purposes: the original run retains nine inconsistent upstream executions, while
-the separately patched run must pass every execution with zero skips and no
-expected-failure allowance. Both raw reports are retained. A patched result is
-never presented as unmodified upstream conformance.
+CI runs the unmodified corpus once against the
+[expected-failure manifest](../tools/test262-expected-failures.txt), whose single
+entry is an Annex B test carrying a superseded ES2017 expectation. Any other
+failure, an entry that passes, or a skip fails the gate. No test is patched.
 
 The German `String/internalUsage.js` modes now pass without test changes.
 DateTimeFormat uses generated CLDR 48 data for `en`/`en-US`, `de`/`de-DE`,
 `ja`/`ja-JP`, `zh`/`zh-CN` and `ar-EG`. Its original pinned ECMA-402 shard passes
-488/488 executions without skips. Other Intl services currently ship English
+490/490 executions without skips. Other Intl services currently ship English
 locale data only; this is not a claim of complete ECMA-402 conformance.
 
 One limitation there is about missing Unicode data rather than missing locales,

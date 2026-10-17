@@ -22,7 +22,7 @@ const CAPTURE_README_URL = `${GITHUB_URL}/blob/e6e0f65dd402f1bf75b9675d7acd904cb
 const DOC_LINKS = [
   { href: '/javascript-engine/', title: 'JavaScript engine', text: 'What Zipp is, the language it implements, and how to run it.' },
   { href: '/architecture/', title: 'JavaScript engine architecture', text: 'NaN-boxed values, the explicit-frame register VM, JIT tiers and the nursery GC.' },
-  { href: '/test262/', title: 'Test262 conformance', text: '95,680 executions of the pinned corpus, the corrections, and the CI gate.' },
+  { href: '/test262/', title: 'Test262 conformance', text: '96,230 executions of the pinned corpus, the one expected failure, and the CI gate.' },
   { href: '/benchmarks/', title: 'Zipp benchmarks', text: 'Thirty native rows against Node, Bun and Deno, with hardware, flags and raw data.' },
   { href: '/python/', title: 'Python frontend', text: 'Python 3 compiled to the same register bytecode, natively or in the browser.' },
   { href: '/wasm/', title: 'WebAssembly runtime', text: 'The persistent, interpreter-only browser sandbox and every one of its limits.' },
