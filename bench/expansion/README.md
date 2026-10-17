@@ -5,6 +5,11 @@ spots the canonical suites do not reach. They live in their own versioned
 series (`manifest.json`, schema `zipp-expansion-v1`) and never change the
 canonical 13-row geomean, the five micro kernels or the hostile 17.
 
+Results, one dated record per capture under `results/`:
+[2026-10-17, `a2e02db3`](results/2026-10-17-a2e02db3.md) (the hostile 17,
+these 21 at three sizes, the interpreter 18, the weakness ranking and the
+optimization plan).
+
 ## What exists, and what this adds
 
 Existing coverage, by the operations each row is dominated by:
