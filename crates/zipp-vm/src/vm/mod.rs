@@ -3230,8 +3230,8 @@ pub struct Vm<'p> {
 }
 
 /// B191 memo widths (hot names; anything else takes the full per-call proof).
-pub(crate) const STR_MEMO_NAMES: usize = 16;
-pub(crate) const ARR_MEMO_NAMES: usize = 8;
+pub(crate) const STR_MEMO_NAMES: usize = 32;
+pub(crate) const ARR_MEMO_NAMES: usize = 32;
 
 /// Method-name arity of [`Vm::coll_intrinsic_memo`]: get/set/has/add/delete/clear.
 pub(crate) const COLL_MEMO_NAMES: usize = 6;
