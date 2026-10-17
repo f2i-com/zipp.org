@@ -1467,7 +1467,27 @@ impl<'p> Vm<'p> {
         if !in_probe_reduce_enabled() || !self.enum_loop_observation_free() {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let f = func_id as usize;
+        let proto = self.program.functions.get(f)?;
+        if self.in_probe_sites.get(f).is_none_or(Option::is_none) {
+            if self.in_probe_sites.len() <= f {
+                self.in_probe_sites.resize(f + 1, None);
+            }
+            let sites: Vec<u32> = proto
+                .code
+                .iter()
+                .enumerate()
+                .filter(|&(i, ins)| {
+                    matches!(ins, Instr::HasProp { brand: false, .. })
+                        && recognize_in_probe_reduce(proto, i).is_some()
+                })
+                .map(|(i, _)| i as u32)
+                .collect();
+            self.in_probe_sites[f] = Some(sites.into_boxed_slice());
+        }
+        if !self.in_probe_sites[f].as_deref().is_some_and(|s| s.contains(&(ip as u32))) {
+            return None;
+        }
         let plan = recognize_in_probe_reduce(proto, ip)?;
         let mut globals = vec![plan.source_global, plan.i_global, plan.limit_global];
         globals.extend(plan.probes.iter().map(|p| p.counter_global));

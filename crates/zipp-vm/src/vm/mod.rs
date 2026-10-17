@@ -2359,6 +2359,11 @@ pub struct Vm<'p> {
     /// closure-stamp time, so closures made before the eval call share the
     /// scope the eval later populates.
     sloppy_eval_memo: Vec<u8>,
+    /// Per func id, once computed: the ips of the `HasProp` sites whose
+    /// loop `recognize_in_probe_reduce` accepts (its answer depends on the
+    /// code alone), usually none. `try_in_probe_reduce` ran the recognizer
+    /// on every `in` it saw.
+    pub(crate) in_probe_sites: Vec<Option<Box<[u32]>>>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

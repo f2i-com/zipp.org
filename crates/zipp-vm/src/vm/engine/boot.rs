@@ -451,6 +451,7 @@ impl<'p> Vm<'p> {
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
+            in_probe_sites: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,
@@ -798,6 +799,13 @@ impl<'p> Vm<'p> {
                     .saturating_mul(std::mem::size_of::<(usize, usize)>()),
             )
             .saturating_add(self.sloppy_eval_memo.capacity())
+            .saturating_add(
+                self.in_probe_sites
+                    .iter()
+                    .map(|s| s.as_deref().map_or(0, |s| s.len() * 4))
+                    .sum::<usize>()
+                    .saturating_add(self.in_probe_sites.capacity() * std::mem::size_of::<Option<Box<[u32]>>>()),
+            )
     }
 
     /// Conservative bytes reserved by a hash table's bucket allocation.
