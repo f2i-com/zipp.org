@@ -2057,6 +2057,9 @@ pub struct Vm<'p> {
     /// index only moves when a twin gets built. Holds no `Value`s; cleared
     /// wholesale at a small cap.
     regex_twin_defer: rustc_hash::FxHashMap<u32, u8>,
+    /// Emptied `Frame::handlers` buffers for the next frame's first `try`
+    /// push (see `handler_pool`). Holds no `Value`s.
+    handler_pool: Vec<Vec<Handler>>,
     /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
     /// programs during the periodic resident-memory audit. Regex literals,
     /// species clones, the compile cache, and inline ASCII twins can all hold

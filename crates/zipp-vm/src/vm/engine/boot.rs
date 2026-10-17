@@ -361,6 +361,7 @@ impl<'p> Vm<'p> {
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),
+            handler_pool: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,

@@ -4742,7 +4742,7 @@ impl<'p> Vm<'p> {
                         let hs = &mut self.frames[top].handlers;
                         // A recycled buffer for the frame's first push.
                         if hs.capacity() == 0 {
-                            *hs = super::handler_pool::take();
+                            *hs = super::handler_pool::take(&mut self.handler_pool);
                         }
                         hs.push(Handler::Catch {
                             target: catch_target,
@@ -4763,7 +4763,7 @@ impl<'p> Vm<'p> {
                         let top = self.frames.len() - 1;
                         let hs = &mut self.frames[top].handlers;
                         if hs.capacity() == 0 {
-                            *hs = super::handler_pool::take();
+                            *hs = super::handler_pool::take(&mut self.handler_pool);
                         }
                         hs.push(Handler::Finally {
                             target,
@@ -6114,7 +6114,7 @@ impl<'p> Vm<'p> {
         }
         // Its handler buffer's storage, for another frame's first push.
         if finished.handlers.capacity() != 0 {
-            super::handler_pool::give(std::mem::take(&mut finished.handlers));
+            super::handler_pool::give(&mut self.handler_pool, std::mem::take(&mut finished.handlers));
         }
         // A real pop proves the tail-reuse streak terminated — reset its budget.
         self.tail_reuse_streak = 0;
