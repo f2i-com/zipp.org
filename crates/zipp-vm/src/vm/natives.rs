@@ -531,7 +531,6 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(receiver) {
             return Ok(false);
         }
-        let key = self.key_of(kv);
         let ridx = receiver.heap_index();
         // OrdinarySetWithOwnDescriptor on a Proxy receiver: read its own
         // descriptor ([[GetOwnProperty]] → the gopd trap), then define
@@ -539,7 +538,22 @@ impl<'p> Vm<'p> {
         // trap. A trap that calls `Reflect.set(target, k, v, proxy)` (the
         // forwarding shape every logging proxy uses) would otherwise re-enter
         // itself forever.
-        if self.proxy_parts(ridx).is_some() {
+        if let Some((target, handler, revoked)) = self.proxy_parts(ridx) {
+            // With neither trap, both steps forward to the target, so this
+            // is OrdinarySetWithOwnDescriptor with the target as its own
+            // receiver. When neither trap lookup can find anything or run
+            // code, skipping them is unobservable, and so is the descriptor
+            // object built and read back below for every forwarded write.
+            if !revoked
+                && self.is_object_value(target)
+                && self.proxy_handler_lacks(handler, "getOwnPropertyDescriptor")
+                && self.proxy_handler_lacks(handler, "defineProperty")
+            {
+                return self.with_native_recursion_guard(|vm| {
+                    vm.reflect_set_on_receiver(target, kv, value)
+                });
+            }
+            let key = self.key_of(kv);
             let existing = self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
             let mut m = crate::heap::ObjMap::new();
             m.set("value", value);
@@ -578,6 +592,7 @@ impl<'p> Vm<'p> {
                 Err(e) => Err(e),
             };
         }
+        let key = self.key_of(kv);
         self.materialize_regexp_result_prop_for_key(ridx, &key);
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)

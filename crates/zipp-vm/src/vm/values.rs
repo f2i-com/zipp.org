@@ -1194,13 +1194,24 @@ impl<'p> Vm<'p> {
             }
             return match self.proxy_trap(handler, "has")? {
                 Some(trap) => {
-                    let ks = self.key_of(key);
-                    let kv = self.key_to_value(&ks);
+                    // A string key is the trap's argument as it stands (it
+                    // is what `key_to_value(key_of(key))` spells back).
+                    let kv = if key.is_heap()
+                        && matches!(
+                            self.heap.get(key.heap_index()),
+                            HeapObj::Str(_) | HeapObj::Cons { .. }
+                        ) {
+                        key
+                    } else {
+                        let ks = self.key_of(key);
+                        self.key_to_value(&ks)
+                    };
                     let res = self.call_value(trap, handler, &[target, kv])?;
                     let present = self.truthy(res);
                     // A `false` result is illegal when the target has the own
                     // property non-configurable, or the target is non-extensible.
                     if !present {
+                        let ks = self.key_of(key);
                         let desc = self.object_get_own_property_descriptor(target, &ks);
                         if desc != Value::UNDEFINED {
                             let cfg = self.get_prop(desc, "configurable")?;

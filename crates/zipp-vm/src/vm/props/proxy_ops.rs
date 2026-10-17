@@ -18,6 +18,9 @@ impl<'p> Vm<'p> {
         target: Value,
         key: &str,
     ) -> Result<Option<(bool, Value, bool, bool, bool)>, Thrown> {
+        if let Some(reduced) = self.plain_target_desc(target, key) {
+            return Ok(reduced);
+        }
         let desc = self.object_get_own_property_descriptor(target, key);
         if desc == Value::UNDEFINED {
             return Ok(None);
@@ -44,6 +47,92 @@ impl<'p> Vm<'p> {
                 s != Value::UNDEFINED,
             )))
         }
+    }
+
+    /// [`Self::proxy_target_desc`] for an ordinary object target, read from
+    /// its map: the attributes `object_get_own_property_descriptor` would put
+    /// in the descriptor it builds. Building that object (four properties)
+    /// and reading three of them back was most of the cost of a `get` or
+    /// `set` trap. `None` (use the descriptor) for a target whose own
+    /// properties are not all in its map: a non-object, a constructor (its
+    /// synthesized `name`/`length`/`prototype`), the global object (its slot
+    /// bindings), `%Array.prototype%` (its `length`), a module namespace (its
+    /// live bindings), and every exotic object.
+    fn plain_target_desc(
+        &self,
+        target: Value,
+        key: &str,
+    ) -> Option<Option<(bool, Value, bool, bool, bool)>> {
+        if !target.is_heap() {
+            return None;
+        }
+        let idx = target.heap_index();
+        if (idx == self.global_this && self.global_this != 0)
+            || (idx == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+        {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if m.is_ctor {
+            return None;
+        }
+        let Some(i) = m.pos(key) else {
+            return Some(None);
+        };
+        let a = m.attr_at(i);
+        if a.configurable {
+            return Some(None);
+        }
+        let raw = m.val_at(i);
+        Some(Some(if a.accessor {
+            (
+                false,
+                Value::UNDEFINED,
+                false,
+                raw != Value::UNDEFINED,
+                a.setter != Value::UNDEFINED,
+            )
+        } else {
+            (true, raw, a.writable, false, false)
+        }))
+    }
+
+    /// Whether the Proxy `handler` certainly has no `name` trap, found without
+    /// running code: every object on its chain is an ordinary object that
+    /// does not hold `name`. GetMethod(handler, name) would then be
+    /// undefined, and skipping it unobservable. `false` (look it up) for
+    /// anything else.
+    pub(crate) fn proxy_handler_lacks(&self, handler: Value, name: &str) -> bool {
+        if !self.deferred_ns_state.is_empty() {
+            return false;
+        }
+        let mut cur = handler;
+        for _ in 0..64 {
+            if !cur.is_heap() {
+                return true;
+            }
+            let idx = cur.heap_index();
+            if (idx == self.global_this && self.global_this != 0)
+                || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            {
+                return false;
+            }
+            let HeapObj::Object(m) = self.heap.get(idx) else {
+                return false;
+            };
+            if m.is_ctor || m.class.is_some() || m.pos(name).is_some() {
+                return false;
+            }
+            cur = match self.proto_of.get(&idx) {
+                Some(&p) => p,
+                None if self.obj_proto != 0 && idx != self.obj_proto => Value::heap(self.obj_proto),
+                None => return true,
+            };
+        }
+        false
     }
 
     /// boolean, or the target update when no trap); `None` for a non-proxy.

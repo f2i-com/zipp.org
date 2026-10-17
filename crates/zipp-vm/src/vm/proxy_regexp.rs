@@ -1363,8 +1363,13 @@ impl<'p> Vm<'p> {
                 return sym;
             }
         }
-        // An escaped guest string key reads back as the string it was.
-        self.alloc_str(guest_key_text(key).to_string())
+        // An escaped guest string key reads back as the string it was, one
+        // shared heap string per key text (`alloc_key_str`): a Proxy trap
+        // receives its key through here on every access.
+        if let Some(v) = self.cached_key_str(key) {
+            return v;
+        }
+        self.alloc_key_str(key.to_string())
     }
 
     /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,
