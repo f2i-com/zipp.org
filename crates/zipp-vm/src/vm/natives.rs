@@ -4132,6 +4132,18 @@ impl<'p> Vm<'p> {
                                     self.make_fn_proto_readonly(o);
                                 }
                             }
+                            // A class's own static properties live in its
+                            // `statics` map: their attributes too (the
+                            // extensible flag stays in arr_props). Without
+                            // this a frozen class reported frozen while its
+                            // statics stayed writable.
+                            if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                                match id {
+                                    OBJ_FREEZE => c.statics.freeze(),
+                                    OBJ_SEAL => c.statics.seal(),
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }

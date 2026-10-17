@@ -705,6 +705,13 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Likewise a class's non-configurable static (sealed, frozen, or
+        // defineProperty'd so).
+        if matches!(self.heap.get(idx), HeapObj::Class(c)
+            if c.statics.pos(key).is_some_and(|i| !c.statics.attr_at(i).configurable))
+        {
+            return Value::bool(false);
+        }
         // The objects the fast path above leaves to the waterfall for their
         // own sake keep shifting deletes; every other one may keep a hole
         // (see `ObjMap::delete_at`), whatever its key.
@@ -1848,12 +1855,21 @@ impl<'p> Vm<'p> {
                 }
             } else {
                 // An existing NON-WRITABLE own data property (e.g. a function `name`
-                // set by NamedEvaluation/SetFunctionName) rejects assignment.
-                if let Some(m) = self.fn_props.get(&idx) {
-                    if let Some(i) = m.pos(key) {
-                        if !m.attr_at(i).accessor && !m.attr_at(i).writable {
-                            return self.reject_write(key, strict);
+                // set by NamedEvaluation/SetFunctionName) rejects assignment, and
+                // an own ACCESSOR governs it: its setter runs, and one without a
+                // setter rejects. (Storing the value instead overwrote the
+                // getter, so the next read called the assigned value.)
+                let own = self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attr_at(i)));
+                if let Some(a) = own {
+                    if a.accessor {
+                        if a.setter != Value::UNDEFINED {
+                            self.call_value(a.setter, obj, &[val])?;
+                            return Ok(true);
                         }
+                        return self.reject_write(key, strict);
+                    }
+                    if !a.writable {
+                        return self.reject_write(key, strict);
                     }
                 }
                 // A NEW own property on a non-extensible function is rejected (the
@@ -2102,6 +2118,14 @@ impl<'p> Vm<'p> {
         // which `Object.keys(globalThis)` and for-in then listed). A deleted
         // one is gone: writing it creates an ordinary {w, e, c} property and
         // lifts the deletion record, as `StoreGlobal` does for `delete x; x = 1`.
+        // A non-extensible class value (preventExtensions/seal/freeze record
+        // it in arr_props) takes no new static property: a sloppy no-op, a
+        // strict TypeError, as for an ordinary object below.
+        if matches!(self.heap.get(idx), HeapObj::Class(c) if c.statics.pos(key).is_none())
+            && self.arr_props.get(&idx).is_some_and(|m| !m.extensible)
+        {
+            return self.reject_write(key, strict);
+        }
         let global_builtin = idx == self.global_this
             && self.global_this != 0
             && self.builtin_globals.contains_key(key)
