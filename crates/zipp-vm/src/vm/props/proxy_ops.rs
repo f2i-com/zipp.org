@@ -79,6 +79,12 @@ impl<'p> Vm<'p> {
         if m.is_ctor {
             return None;
         }
+        // Every property of an all-default map is a configurable data
+        // property: no invariant applies, present or not, and no lookup is
+        // needed to say so.
+        if !m.may_deviate_attrs() {
+            return Some(None);
+        }
         let Some(i) = m.pos(key) else {
             return Some(None);
         };

@@ -3619,6 +3619,27 @@ impl<'p> Vm<'p> {
                         // miss on every read. Any receiver the proof does not
                         // answer goes on to the IC exactly as before.
                         if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                            // A Proxy receiver: its [[Get]] (`get` trap or
+                            // target), which is all the member walk does for
+                            // one once the IC misses and both prototype probes
+                            // decline, each of which paid on every trap.
+                            if let Some((target, handler, revoked)) = self.proxy_parts(o.heap_index()) {
+                                let r = match self.proxy_get(target, handler, revoked, &key, o) {
+                                    Ok(v) => v,
+                                    Err(Thrown(msg)) => {
+                                        let f = self.func(func_id as usize);
+                                        let name: &str = if f.name.is_empty() {
+                                            "<anonymous>"
+                                        } else {
+                                            &f.name
+                                        };
+                                        Err(Thrown(format!("{msg} (in {name})")))?
+                                    }
+                                };
+                                self.set(base, dst, r);
+                                ip += 1;
+                                continue;
+                            }
                             if let Some(bits) = self.proto_intrinsic_read(o, &key) {
                                 self.set(base, dst, Value::from_bits(bits));
                                 ip += 1;

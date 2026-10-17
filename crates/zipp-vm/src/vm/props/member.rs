@@ -1079,6 +1079,50 @@ impl<'p> Vm<'p> {
     /// The full (exotic-aware) property GET — see [`Vm::get_member`], whose
     /// fast path handles the plain-Object chain and delegates everything else
     /// (and every chain object it bails on) here.
+    /// A Proxy's [[Get]] (10.5.8) of `key` for `receiver`: the `get` trap
+    /// with its post-call invariant, or, with no trap, the target's [[Get]].
+    /// The proxy's parts come from `proxy_parts`.
+    pub(crate) fn proxy_get(
+        &mut self,
+        target: Value,
+        handler: Value,
+        revoked: bool,
+        key: &str,
+        receiver: Value,
+    ) -> Result<Value, Thrown> {
+        if revoked {
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform 'get' on a revoked proxy",
+            ));
+        }
+        match self.proxy_trap(handler, "get")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                // 10.5.8 [[Get]](P, Receiver): the trap's third argument is
+                // the RECEIVER, which is only the proxy itself for a direct
+                // read — reading through a child (`Object.create(p).x`) or
+                // `Reflect.get(p, k, other)` must hand the trap that object.
+                let r = self.call_value(trap, handler, &[target, kv, receiver])?;
+                // Invariant: a non-configurable, non-writable target data
+                // property must be reported with its actual value; a
+                // non-configurable accessor with no getter must report
+                // undefined.
+                if let Some((is_data, value, writable, has_get, _)) =
+                    self.proxy_target_desc(target, key)?
+                {
+                    if is_data && !writable && !self.same_value(r, value) {
+                        return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"));
+                    }
+                    if !is_data && !has_get && r != Value::UNDEFINED {
+                        return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a non-configurable accessor property on the proxy target and does not have a getter function"));
+                    }
+                }
+                Ok(r)
+            }
+            None => self.with_native_recursion_guard(|vm| vm.get_member(target, key, receiver)),
+        }
+    }
+
     pub(crate) fn get_member_slow(
         &mut self,
         obj: Value,
@@ -1140,39 +1184,7 @@ impl<'p> Vm<'p> {
         // Proxy `get` trap (or fall through to the target).
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
-                if revoked {
-                    return Err(Thrown::from_static(
-                        "TypeError: Cannot perform 'get' on a revoked proxy",
-                    ));
-                }
-                return match self.proxy_trap(handler, "get")? {
-                    Some(trap) => {
-                        let kv = self.key_to_value(key);
-                        // 10.5.8 [[Get]](P, Receiver): the trap's third argument is
-                        // the RECEIVER, which is only the proxy itself for a direct
-                        // read — reading through a child (`Object.create(p).x`) or
-                        // `Reflect.get(p, k, other)` must hand the trap that object.
-                        let r = self.call_value(trap, handler, &[target, kv, receiver])?;
-                        // Invariant: a non-configurable, non-writable target data
-                        // property must be reported with its actual value; a
-                        // non-configurable accessor with no getter must report
-                        // undefined.
-                        if let Some((is_data, value, writable, has_get, _)) =
-                            self.proxy_target_desc(target, key)?
-                        {
-                            if is_data && !writable && !self.same_value(r, value) {
-                                return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value"));
-                            }
-                            if !is_data && !has_get && r != Value::UNDEFINED {
-                                return Err(Thrown::from_static("TypeError: 'get' on proxy: property is a non-configurable accessor property on the proxy target and does not have a getter function"));
-                            }
-                        }
-                        Ok(r)
-                    }
-                    None => {
-                        self.with_native_recursion_guard(|vm| vm.get_member(target, key, receiver))
-                    }
-                };
+                return self.proxy_get(target, handler, revoked, key, receiver);
             }
             // Module Namespace exotic [[Get]]: an exported name reads its LIVE
             // per-module slot (so a re-assignment inside the module is observed),
