@@ -2428,9 +2428,6 @@ impl<'p> Vm<'p> {
                                 "TypeError: Cannot use 'in' operator to search for '{kd}' in a non-object"
                             )));
                         }
-                        // ToPropertyKey: an object key is ToString-coerced (toString/
-                        // valueOf), not rendered "[object Object]".
-                        let k = self.coerce_index_key(k)?;
                         // A private name (`#x`) is not a string property key: a
                         // regular `in` (and Reflect.has) reports it absent. The
                         // ergonomic brand check `#x in obj` sets `brand` and skips
@@ -2440,15 +2437,28 @@ impl<'p> Vm<'p> {
                             // present iff the side table has the entry; a
                             // method/accessor iff the receiver carries the
                             // declaring brand (textual fallback when none
-                            // resolvable).
-                            let key = self.key_of(k);
-                            if let Some((b2, kind, owner)) = self.resolve_private(&key) {
+                            // resolvable). The key is the name's string
+                            // constant, so there is nothing to coerce, and the
+                            // site (this instruction: its name has no constant
+                            // index of its own, hence the high bit) resolves
+                            // through the private memo without spelling it.
+                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                            let site = super::values::private_site(func_id as u32, 0x8000_0000 | ip as u32);
+                            let resolved = match self.private_memo_hit(ctx, site) {
+                                Some(hit) => Some(hit),
+                                None => {
+                                    let key = self.key_of(k);
+                                    self.resolve_private_site(ctx, site, &key)
+                                }
+                            };
+                            if let Some((b2, kind, owner, pid)) = resolved {
                                 if kind & 7 == 0 {
-                                    self.private_field_get(o, b2, &key).is_some()
+                                    self.private_field_get_id(o, b2, pid).is_some()
                                 } else {
                                     self.private_receiver_ok(o, b2, kind, owner)
                                 }
                             } else {
+                                let key = self.key_of(k);
                                 let textual = self.has_property_str(o, &key)
                                     || self.private_field_scan_has(o, &key);
                                 match self.private_brand_ok(o, &key) {
@@ -2462,6 +2472,9 @@ impl<'p> Vm<'p> {
                             // string key is an ordinary property.)
                             // Proxy-aware [[HasProperty]]: dispatches a `has` trap
                             // when the proxy is the receiver OR is in the proto chain.
+                            // ToPropertyKey first: an object key is ToString-coerced
+                            // (toString/valueOf), not rendered "[object Object]".
+                            let k = self.coerce_index_key(k)?;
                             self.has_property_dyn(o, k)?
                         };
                         self.set(base, dst, Value::bool(r));

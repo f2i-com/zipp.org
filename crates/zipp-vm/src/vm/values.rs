@@ -597,7 +597,7 @@ impl<'p> Vm<'p> {
     /// scope: `method(){ const self = this; function inner(){ self.#m = 1; } }`
     /// is legal, and so is an arrow doing the same, because a private name is
     /// lexically scoped rather than tied to being a method. Copy the defining
-    /// code's chain onto the new function value, so `resolve_private` finds
+    /// code's chain onto the new function value, so `resolve_private_in` finds
     /// the declaring class from inside it (the textual fall-back it used
     /// instead could not see a private ACCESSOR at all, and would have
     /// accepted another class's same-named private).
@@ -992,16 +992,6 @@ impl<'p> Vm<'p> {
         true
     }
 
-    /// Declaring-class private resolution (kind-aware): walk the ACCESSING
-    /// code's lexical brand chain innermost-first; for the first brand that
-    /// DECLARES `key`, return (brand, kind, declaring-class heap idx). `None`
-    /// when the chain is unresolvable, the name is foreign to the chain, or
-    /// the declaring class value is unknown — the caller keeps its textual
-    /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
-    pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
-        self.resolve_private_in(self.frames.last()?.callee, key)
-    }
-
     /// `resolve_private_in(ctx, key)` for the private name `key` that the
     /// access site `site` names (`private_site`), remembered in
     /// `Vm::private_memo` with the name's id in `private_name_ids`:
@@ -1042,14 +1032,29 @@ impl<'p> Vm<'p> {
         Some((brand, kind, owner, id))
     }
 
+    /// What `resolve_private_site` remembers for `site` under `ctx`'s chain,
+    /// if anything; never resolves. For a caller that can then skip spelling
+    /// the name, which only a miss needs.
+    #[inline]
+    pub(crate) fn private_memo_hit(&self, ctx: Value, site: u64) -> Option<(u64, u8, u32, u32)> {
+        let head = *self.private_brands_of(ctx)?.first()?;
+        let e = self.private_memo[private_memo_index(head, site)];
+        (e.head == head && e.site == site).then_some((e.brand, e.kind, e.owner, e.id))
+    }
+
     /// Forget every remembered private resolution (see
     /// `resolve_private_site`): a class's `brand_owner` entry was dropped.
     pub(crate) fn clear_private_memo(&mut self) {
         self.private_memo.fill(PrivateMemo::EMPTY);
     }
 
-    /// `resolve_private` against the brand chain of `ctx` (see
-    /// `private_brands_of`) rather than the running frame's.
+    /// Declaring-class private resolution (kind-aware): walk the brand chain
+    /// of `ctx`, the ACCESSING code (see `private_brands_of`), innermost
+    /// first; for the first brand that DECLARES `key`, return (brand, kind,
+    /// declaring-class heap idx). `None` when the chain is unresolvable, the
+    /// name is foreign to the chain, or the declaring class value is unknown
+    /// — the caller keeps its textual path. kind bits: 1 = method, 2 =
+    /// getter, 4 = setter; 0 = field.
     pub(crate) fn resolve_private_in(&self, ctx: Value, key: &str) -> Option<(u64, u8, u32)> {
         let chain = self.private_brands_of(ctx)?;
         for &b in chain.iter() {
