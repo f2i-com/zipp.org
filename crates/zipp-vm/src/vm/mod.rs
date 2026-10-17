@@ -2083,6 +2083,11 @@ pub struct Vm<'p> {
     /// class's brand. A private access threaded with lexical DEPTH d checks the
     /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
     method_brand: crate::slot_table::SlotTable<Vec<u64>>,
+    /// The class a kept constructor or field-thunk callable (`class_body_fn`)
+    /// belongs to, for a class with a brand chain: what `running_class_value`
+    /// finds through `method_brand` and `brand_owner`, in one load. Pruned
+    /// when either the callable or the class dies.
+    pub(crate) ctor_owner: crate::slot_table::SlotTable<u32>,
     /// Extra private brands installed on a specific INSTANCE that its `map.class`
     /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
     /// receives a class's private fields/brand without becoming an instanceof that

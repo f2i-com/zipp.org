@@ -36,6 +36,7 @@ impl<'p> Vm<'p> {
         // The class body's private scope: the class's lexical brand chain.
         if let Some(brands) = self.method_brand.get(&ci).cloned() {
             self.method_brand.insert(f.heap_index(), brands);
+            self.ctor_owner.insert(f.heap_index(), ci);
         }
         // An old class may now hold a young function.
         self.heap.write_barrier_val(ci, f);
@@ -329,6 +330,14 @@ impl<'p> Vm<'p> {
         let callee = f.callee;
         if !callee.is_heap() {
             return None;
+        }
+        // The kept constructor callables answer in one load (`ctor_owner`).
+        if let Some(&owner) = self.ctor_owner.get(&callee.heap_index()) {
+            if let HeapObj::Class(c) = self.heap.get(owner) {
+                if c.ctor == Some(f.func) {
+                    return Some(Value::heap(owner));
+                }
+            }
         }
         let brand = *self.method_brand.get(&callee.heap_index())?.first()?;
         let owner = *self.brand_owner.get(&brand)?;

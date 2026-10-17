@@ -366,6 +366,7 @@ impl<'p> Vm<'p> {
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
             method_brand: crate::slot_table::SlotTable::default(),
+            ctor_owner: crate::slot_table::SlotTable::default(),
             instance_brand: crate::slot_table::SlotTable::default(),
             brand_private_names: rustc_hash::FxHashMap::default(),
             brand_owner: rustc_hash::FxHashMap::default(),
@@ -836,6 +837,7 @@ impl<'p> Vm<'p> {
             .resident_bytes()
             .saturating_add(Self::hash_map_resident_bytes(&self.private_name_ids))
             .saturating_add(self.method_brand.resident_bytes())
+            .saturating_add(self.ctor_owner.resident_bytes())
             .saturating_add(self.instance_brand.resident_bytes())
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
             .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));

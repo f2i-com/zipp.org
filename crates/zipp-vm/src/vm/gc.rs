@@ -1051,6 +1051,8 @@ impl Vm<'_> {
             self.regex_subject_units = None;
         }
         self.method_brand.retain_marked(&marks);
+        // A kept constructor's class (see `Vm::ctor_owner`): gone with either.
+        self.ctor_owner.retain(|&k, &mut c| marks[k as usize] && marks[c as usize]);
         self.instance_brand.retain_marked(&marks);
         let owners = self.brand_owner.len();
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
@@ -1375,6 +1377,9 @@ impl Vm<'_> {
         prune_map!(self.matchall_batches);
         let brand_entries = self.method_brand.len() + self.instance_brand.len();
         prune_map!(self.method_brand);
+        if !self.ctor_owner.is_empty() {
+            self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
+        }
         prune_map!(self.instance_brand);
         // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
