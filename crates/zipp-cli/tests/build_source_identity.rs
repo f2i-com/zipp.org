@@ -56,12 +56,18 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        // Tests run in parallel in one process, and two of them read the
+        // same clock value often enough on Windows (its clock is coarse) to
+        // collide on the directory: a per-process sequence number keeps the
+        // names apart.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock is after epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "zipp-build-source-identity-{}-{nonce}",
+            "zipp-build-source-identity-{}-{seq}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir(&path).expect("create scratch repository");
