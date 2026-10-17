@@ -3471,6 +3471,47 @@ pub struct JsStr {
     /// keeps the one-byte constructor initialization.
     memo_state: u8,
     cursor: Cell<u64>,
+    /// Code-point boundaries every [`SEEK_MARK_STRIDE`] units, packed like
+    /// `cursor`, made by `seek` the first time it has to walk farther than
+    /// [`SEEK_MARKS_DISTANCE`] from every anchor: the boundary at or before
+    /// unit `k * SEEK_MARK_STRIDE` is entry `k`. Like `cursor` an
+    /// accelerator, and kept to the same rule: appends leave every recorded
+    /// boundary in place (entries past the end at the time are simply
+    /// absent), and the seam merge that rewrites a tail drops them.
+    marks: std::cell::OnceCell<Box<Vec<u64>>>,
+}
+
+/// Unit distance between the boundaries [`JsStr`]'s `marks` record.
+const SEEK_MARK_STRIDE: usize = 128;
+
+/// How far `JsStr::seek` walks from its nearest anchor before it records
+/// the string's boundaries instead: a scan that moves by small steps never
+/// pays for them, and a random search in a long non-ASCII string walks at
+/// most a stride.
+const SEEK_MARKS_DISTANCE: usize = 1024;
+
+/// The boundaries of WTF-8 `bytes` that `JsStr::marks` holds.
+fn seek_marks(bytes: &[u8]) -> Vec<u64> {
+    let mut marks = Vec::new();
+    let (mut pos, mut bi) = (0usize, 0usize);
+    let mut prev = 0u64;
+    loop {
+        let cur = ((pos as u64) << 32) | bi as u64;
+        while marks.len() * SEEK_MARK_STRIDE <= pos {
+            // Short of `pos` only when an astral scalar stepped over the
+            // target; the boundary before it is then the one at or before.
+            let target = marks.len() * SEEK_MARK_STRIDE;
+            marks.push(if target == pos { cur } else { prev });
+        }
+        if bi >= bytes.len() {
+            break;
+        }
+        let (cp, blen) = wtf8_decode(bytes, bi);
+        prev = cur;
+        pos += cp_units(cp);
+        bi += blen;
+    }
+    marks
 }
 
 /// The bytes of a [`JsStr`].
@@ -3821,10 +3862,61 @@ pub fn wtf8_decode(b: &[u8], i: usize) -> (u32, usize) {
 
 /// UTF-16 unit count of a WTF-8 buffer: one per lead byte, plus one extra per
 /// 4-byte (astral) sequence. A 3-byte lone-surrogate encoding counts 1.
+///
+/// On x86_64 (outside the safe-sandbox profile, which has no unsafe code)
+/// the count runs sixteen bytes at a time with SSE2, in byte
+/// lanes summed every 127 blocks: left to the vectorizer, the `usize` sum
+/// widened each byte to a 64-bit lane, two bytes per instruction, and
+/// converting a search's byte offset back to a unit index over a long
+/// non-ASCII string was most of its cost.
 pub fn wtf8_units(b: &[u8]) -> usize {
-    b.iter()
-        .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
-        .sum()
+    fn scalar(b: &[u8]) -> usize {
+        b.iter()
+            .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
+            .sum()
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_add_epi64, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_cvtsi128_si64,
+            _mm_loadu_si128, _mm_max_epu8, _mm_sad_epu8, _mm_set1_epi8, _mm_setzero_si128,
+            _mm_srli_si128, _mm_sub_epi8,
+        };
+        let mut blocks = b.chunks_exact(16);
+        let mut total = 0usize;
+        // SAFETY: SSE2 is in every x86_64 target's baseline; each unaligned
+        // load reads one 16-byte block inside `b`.
+        unsafe {
+            // As i8, continuation bytes 0x80..=0xBF are -128..=-65 and every
+            // other byte is above -65; a 4-byte lead is 0xF0 or more unsigned.
+            let continuation_max = _mm_set1_epi8(-65);
+            let astral_lead = _mm_set1_epi8(0xF0u8 as i8);
+            let zero = _mm_setzero_si128();
+            loop {
+                // Each block adds at most 2 to a lane: 127 blocks fit a byte.
+                let mut acc = _mm_setzero_si128();
+                let mut n = 0;
+                while n < 127 {
+                    let Some(block) = blocks.next() else { break };
+                    let v = _mm_loadu_si128(block.as_ptr().cast::<__m128i>());
+                    let lead = _mm_cmpgt_epi8(v, continuation_max);
+                    let astral = _mm_cmpeq_epi8(_mm_max_epu8(v, astral_lead), v);
+                    // A set lane is -1, so subtracting it counts one.
+                    acc = _mm_sub_epi8(_mm_sub_epi8(acc, lead), astral);
+                    n += 1;
+                }
+                if n == 0 {
+                    break;
+                }
+                let sums = _mm_sad_epu8(acc, zero);
+                let both = _mm_add_epi64(sums, _mm_srli_si128::<8>(sums));
+                total += _mm_cvtsi128_si64(both) as usize;
+            }
+        }
+        total + scalar(blocks.remainder())
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+    scalar(b)
 }
 
 /// Whether WTF-8 buffer `b` contains NO surrogate encodings — for engine-built
@@ -4036,6 +4128,7 @@ impl JsStr {
             wellformed: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4059,6 +4152,7 @@ impl JsStr {
             ascii: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4075,6 +4169,7 @@ impl JsStr {
             wellformed: true,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4113,6 +4208,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4131,6 +4227,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4155,6 +4252,7 @@ impl JsStr {
             bytes,
             memo_state: 0,
             cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
         }
     }
 
@@ -4295,6 +4393,14 @@ impl JsStr {
         self.bytes.capacity()
     }
 
+    /// The bytes the seek marks hold, if made: at most a sixteenth of the
+    /// string's own (one u64 per 128 units, each at least a byte).
+    pub(crate) fn marks_bytes(&self) -> usize {
+        self.marks.get().map_or(0, |m| {
+            std::mem::size_of::<Vec<u64>>().saturating_add(vec_capacity_bytes(m))
+        })
+    }
+
     /// The byte buffer itself (the sweep's `Heap::byte_pool` keeps it).
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
@@ -4410,8 +4516,9 @@ impl JsStr {
             self.wellformed = self.bytes.settle(wellformed);
             // A seam merge rewrites the tail, and the memo may name a
             // boundary at the old end that now falls inside the merged
-            // scalar: start over from byte zero.
+            // scalar: start over from byte zero. The marks may name it too.
             self.cursor.set(0);
+            self.marks = std::cell::OnceCell::new();
         }
     }
 
@@ -4427,7 +4534,10 @@ impl JsStr {
     /// non-ASCII text quadratic: on the wasm build a 64K-unit sequential
     /// scan took 4.5 s against 2.5 ms for the same loop over ASCII, and a
     /// word tokenizer over 64K mostly-ASCII units with a few accents 7.6 s.
-    /// Random access still costs the distance to the nearest anchor.
+    /// Random access far from every anchor walks from the nearest of the
+    /// string's `marks` instead, made the first time it is needed:
+    /// `indexOf` from scattered positions in a 16,000-unit document had
+    /// walked a quarter of it on every call.
     fn seek(&self, i: usize) -> (usize, usize) {
         debug_assert!(!self.ascii);
         let units = self.units as usize;
@@ -4442,6 +4552,13 @@ impl JsStr {
         } else {
             (units, self.bytes.len())
         };
+        if pos.abs_diff(i) > SEEK_MARKS_DISTANCE {
+            let marks = self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes)));
+            if let Some(&m) = marks.get(i / SEEK_MARK_STRIDE) {
+                // At or before `i`, by at most a stride and a pair.
+                (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+            }
+        }
         while pos < i {
             let (cp, blen) = wtf8_decode(&self.bytes, bi);
             let n = cp_units(cp);
@@ -4517,6 +4634,7 @@ impl JsStr {
                 bytes,
                 memo_state: 0,
                 cursor: Cell::new(0),
+                marks: std::cell::OnceCell::new(),
             };
         }
         let units = self.units as usize;
@@ -6114,7 +6232,7 @@ impl HeapObj {
             | HeapObj::Boxed { .. }
             | HeapObj::BigInt(_)
             | HeapObj::WeakRef(_) => 0,
-            HeapObj::Str(s) => s.byte_capacity(),
+            HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Array(items) => vec_capacity_bytes(items),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
             HeapObj::Promise { reactions, .. } => match reactions {
@@ -6133,7 +6251,7 @@ impl HeapObj {
     /// its reserved address space back to the host allocator.
     fn resident_payload_bytes(&self) -> usize {
         match self {
-            HeapObj::Str(s) => s.byte_capacity(),
+            HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
             HeapObj::EvalScope(bindings) => bindings
                 .capacity()
@@ -10866,11 +10984,12 @@ mod tests {
         // `safe-sandbox` keeps a string's bytes behind a tag (see `StrBytes`).
         // On a 64-bit host that is one word more; on wasm32, the target that
         // profile ships for, the tag fits the padding and the size is 32
-        // either way.
+        // either way. The seek marks are one pointer more, which HeapObj's
+        // largest variants already cover.
         #[cfg(not(feature = "safe-sandbox"))]
-        assert_eq!(std::mem::size_of::<JsStr>(), 40);
-        #[cfg(feature = "safe-sandbox")]
         assert_eq!(std::mem::size_of::<JsStr>(), 48);
+        #[cfg(feature = "safe-sandbox")]
+        assert_eq!(std::mem::size_of::<JsStr>(), 56);
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
         assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
@@ -11563,6 +11682,91 @@ mod tests {
         assert!(m.remove("7"));
         assert_eq!(m.element_pos(7), None);
         assert_eq!(m.element_pos(123456), m.pos("123456"));
+    }
+
+    /// The SSE2 unit count against the per-byte formula, on buffers mixing
+    /// ASCII, two- and three-byte scalars, astral pairs and lone surrogates,
+    /// at lengths on and off its 16-byte blocks and 127-block batches.
+    #[test]
+    fn wtf8_units_counts_like_the_per_byte_formula() {
+        let mut bytes = Vec::new();
+        let mut x = 7u32;
+        while bytes.len() < 40_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let cp = match (x >> 24) % 6 {
+                0 | 1 => (x >> 8) % 0x80,
+                2 => 0x80 + (x >> 8) % 0x780,
+                3 => 0x800 + (x >> 8) % 0xD000,
+                4 => 0x10000 + (x >> 8) % 0xF_0000,
+                _ => 0xD800 + (x >> 8) % 0x800,
+            };
+            push_cp_raw(&mut bytes, cp);
+        }
+        let want = |b: &[u8]| -> usize {
+            b.iter()
+                .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
+                .sum()
+        };
+        for len in (0..64).chain([127 * 16 - 1, 127 * 16, 127 * 16 + 1, 254 * 16 + 7, 40_000]) {
+            let b = &bytes[..len.min(bytes.len())];
+            assert_eq!(wtf8_units(b), want(b), "len {len}");
+            assert_eq!(wtf8_units(&b[b.len().min(3)..]), want(&b[b.len().min(3)..]), "offset len {len}");
+        }
+        assert_eq!(wtf8_units(&[0xFF; 5000]), 10_000);
+    }
+
+    /// Random positions in a long non-ASCII string with astral pairs, which
+    /// make the seek marks, against a plain walk of its code points: the
+    /// unit there and the byte bounds of its scalar. Again after an append
+    /// (the marks stay and cover the old part only) and after a surrogate
+    /// seam merge (which drops them).
+    #[test]
+    fn seek_marks_answer_random_positions_like_a_walk() {
+        fn check(js: &JsStr, salt: u32) {
+            let bytes = js.as_bytes();
+            let mut want: Vec<(u16, (usize, usize))> = Vec::new();
+            let mut bi = 0;
+            while bi < bytes.len() {
+                let (cp, blen) = wtf8_decode(bytes, bi);
+                if cp > 0xFFFF {
+                    let v = cp - 0x10000;
+                    want.push(((0xD800 + (v >> 10)) as u16, (bi, bi)));
+                    want.push(((0xDC00 + (v & 0x3FF)) as u16, (bi, bi + blen)));
+                } else {
+                    want.push((cp as u16, (bi, bi)));
+                }
+                bi += blen;
+            }
+            assert_eq!(want.len(), js.units());
+            let mut x = 12345u32 ^ salt;
+            for _ in 0..4000 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let i = (x >> 8) as usize % want.len();
+                assert_eq!(js.unit_at(i), Some(want[i].0), "unit {i}");
+                assert_eq!(js.unit_byte_bounds(i), want[i].1, "bounds {i}");
+            }
+            assert_eq!(js.unit_byte_bounds(want.len()), (bytes.len(), bytes.len()));
+        }
+        let mut s = String::new();
+        for i in 0..12_000u32 {
+            s.push(match i % 7 {
+                0 => '\u{1F600}',
+                1 | 2 => '\u{E9}',
+                3 => '\u{65E5}',
+                _ => char::from(b'a' + (i % 26) as u8),
+            });
+        }
+        let mut js = JsStr::new(s);
+        check(&js, 1);
+        assert!(js.marks.get().is_some(), "random access far from every anchor made the marks");
+        js.push_str("tail \u{FC} \u{1F600} and more text past the marks");
+        assert!(js.marks.get().is_some(), "a well-formed append keeps them");
+        check(&js, 2);
+        js.push_wtf8(&[0xED, 0xA0, 0xBD]);
+        assert!(js.marks.get().is_none(), "a lone-surrogate append drops them");
+        js.push_wtf8(&[0xED, 0xB8, 0x80]);
+        assert!(js.as_bytes().ends_with("\u{1F600}".as_bytes()), "the halves merged");
+        check(&js, 3);
     }
 
     /// The SSE2 sweep and its scalar tail against the plain predicate, over
