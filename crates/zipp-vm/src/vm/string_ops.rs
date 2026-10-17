@@ -636,6 +636,134 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 }));
             }
+            // No-clone trims of a well-formed receiver: the result is a part of
+            // it, read in place, and the receiver itself when nothing is
+            // trimmed (strings have no identity). The general path below
+            // copied the receiver first, and copied the result again.
+            "trim" | "trimStart" | "trimEnd" => {
+                let trimmed = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_wellformed() => {
+                        let s = js.as_str_wf();
+                        let ws = crate::vm::helpers_numeric::str_white_space;
+                        let t = match name {
+                            "trim" => s.trim_matches(ws),
+                            "trimStart" => s.trim_start_matches(ws),
+                            _ => s.trim_end_matches(ws),
+                        };
+                        Some((t.len() != s.len()).then(|| t.to_string()))
+                    }
+                    _ => None,
+                };
+                match trimmed {
+                    Some(None) => return Ok(Some(Value::heap(idx))),
+                    Some(Some(t)) => return Ok(Some(self.alloc_str(t))),
+                    None => {}
+                }
+            }
+            // No-clone case mapping: ASCII maps byte for byte (the receiver
+            // itself when no letter changes), and short well-formed text in
+            // one pass (`case_map_one_pass`). Arguments are ignored, as the
+            // general path does.
+            "toUpperCase" | "toLowerCase" => {
+                let upper = name == "toUpperCase";
+                let mapped = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() => {
+                        let b = js.as_bytes();
+                        let changes = if upper {
+                            b.iter().any(u8::is_ascii_lowercase)
+                        } else {
+                            b.iter().any(u8::is_ascii_uppercase)
+                        };
+                        if !changes {
+                            return Ok(Some(Value::heap(idx)));
+                        }
+                        let out = if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
+                        // ASCII is UTF-8.
+                        Some(String::from_utf8(out).unwrap_or_default())
+                    }
+                    HeapObj::Str(js) if case_map_one_pass(js) => {
+                        let s = js.as_str_wf();
+                        Some(if upper {
+                            crate::vm::special_casing::str_to_uppercase(s)
+                        } else {
+                            crate::vm::special_casing::str_to_lowercase(s)
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(m) = mapped {
+                    self.preflight_guest_string_size(m.len())?;
+                    return Ok(Some(Value::heap(self.heap.alloc_js(crate::heap::JsStr::new(m)))));
+                }
+            }
+            // No-clone padding of an ASCII receiver to an integer length with
+            // an ASCII string filler (or the default space): no coercion can
+            // run, so StringPad is built straight from the two strings. A long
+            // target (its RangeError included) takes the general path.
+            "padStart" | "padEnd" if arg0.is_int() => {
+                let fill = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let target = arg0.as_int().max(0) as usize;
+                let built = match self.heap.get(idx) {
+                    HeapObj::Str(js) if js.is_ascii() && target <= SHORT_STRING_BUILD_BYTES => {
+                        let cur = js.as_bytes();
+                        let filler: Option<&[u8]> = if fill == Value::UNDEFINED {
+                            Some(b" ")
+                        } else if fill.is_heap() {
+                            match self.heap.get(fill.heap_index()) {
+                                HeapObj::Str(f) if f.is_ascii() => Some(f.as_bytes()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match filler {
+                            _ if target <= cur.len() => Some(None),
+                            Some(f) if f.is_empty() => Some(None),
+                            Some(f) => {
+                                let mut out = Vec::with_capacity(target);
+                                let pad = f.iter().cycle().take(target - cur.len());
+                                if name == "padStart" {
+                                    out.extend(pad);
+                                    out.extend_from_slice(cur);
+                                } else {
+                                    out.extend_from_slice(cur);
+                                    out.extend(pad);
+                                }
+                                Some(Some(out))
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match built {
+                    Some(None) => return Ok(Some(Value::heap(idx))),
+                    Some(Some(out)) => {
+                        // ASCII is UTF-8.
+                        let s = String::from_utf8(out).unwrap_or_default();
+                        return Ok(Some(self.alloc_str(s)));
+                    }
+                    None => {}
+                }
+            }
+            // No-clone `repeat` of a well-formed receiver by a small integer
+            // count; a negative count's RangeError and long results take the
+            // general path.
+            "repeat" if arg0.is_int() && arg0.as_int() >= 0 => {
+                let n = arg0.as_int() as usize;
+                let out = match self.heap.get(idx) {
+                    HeapObj::Str(js)
+                        if js.is_wellformed()
+                            && js.as_bytes().len().saturating_mul(n) <= SHORT_STRING_BUILD_BYTES =>
+                    {
+                        Some(js.as_str_wf().repeat(n))
+                    }
+                    _ => None,
+                };
+                if let Some(s) = out {
+                    return Ok(Some(self.alloc_str(s)));
+                }
+            }
             // No-clone `replace`/`replaceAll` of a plain string by a plain
             // string with no `$` pattern: no user code can run (neither
             // operand is an object, so no `@@replace`, `toString` or RegExp
@@ -746,16 +874,6 @@ impl<'p> Vm<'p> {
         // a bound splitting a surrogate pair keeps the REAL covered half).
         let subu = |a: usize, b: usize| -> crate::heap::JsStr { js_recv.slice_units(a, b) };
         match name {
-            "toUpperCase" | "toLowerCase" if case_map_one_pass(&js_recv) => {
-                let s = js_recv.as_str_wf();
-                let mapped = if name == "toUpperCase" {
-                    crate::vm::special_casing::str_to_uppercase(s)
-                } else {
-                    crate::vm::special_casing::str_to_lowercase(s)
-                };
-                self.preflight_guest_string_size(mapped.len())?;
-                Ok(Some(Value::heap(self.heap.alloc_js(crate::heap::JsStr::new(mapped)))))
-            }
             "toUpperCase" => {
                 let mapped_len = case_map_exact_len(js_recv.as_bytes(), true)?;
                 self.preflight_guest_string_size(mapped_len)?;
@@ -2303,6 +2421,11 @@ fn extend_chars(out: &mut String, iter: impl Iterator<Item = char>) {
 /// rest are measured exactly first ([`case_map_exact_len`]), which mapped
 /// every character twice.
 const CASE_MAP_ONE_PASS_BYTES: usize = 64 * 1024;
+
+/// The largest result the no-clone `padStart`/`padEnd`/`repeat` arms of
+/// `string_method` build; longer ones, and their size checks, take the
+/// general path.
+const SHORT_STRING_BUILD_BYTES: usize = 4096;
 
 fn case_map_one_pass(s: &crate::heap::JsStr) -> bool {
     s.is_wellformed() && !s.is_ascii() && s.as_bytes().len() <= CASE_MAP_ONE_PASS_BYTES
