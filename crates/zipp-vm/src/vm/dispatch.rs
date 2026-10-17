@@ -6311,7 +6311,7 @@ impl<'p> Vm<'p> {
     /// everything else (coercion, BigInt, the TypeErrors) through
     /// `numeric_binop`.
     #[inline(always)]
-    fn fused_bitwise(&mut self, va: Value, vb: Value, op: crate::bytecode::BitwiseOp) -> Result<Value, Thrown> {
+    pub(crate) fn fused_bitwise(&mut self, va: Value, vb: Value, op: crate::bytecode::BitwiseOp) -> Result<Value, Thrown> {
         use crate::bytecode::BitwiseOp as B;
         let ints = if va.is_int() && vb.is_int() {
             Some((va.as_int(), vb.as_int()))

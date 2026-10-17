@@ -75,14 +75,34 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::FuseAddLoadInt { .. }
             | Instr::FuseAddIntMove { .. }
             | Instr::FuseLoadGlobal2 { .. }
+            // A loop's: element and property reads and stores through the
+            // caches, the bitwise ops, strict equality and the branches on
+            // it, and the counter step that closes a loop.
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Bitwise { .. }
+            | Instr::FuseLoadIntBitwise { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::FuseEqJump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::FuseAddIntJump { .. }
+            | Instr::GetIndex { .. }
+            | Instr::GetProp { .. }
+            | Instr::SetProp { .. }
     )
 }
 
+/// Hand-overs a function may take before it stays in the main loop for
+/// good. A hand-over sends the rest of the activation to the main loop, to
+/// its next frame transition; a loop that does that on every iteration (a
+/// call to a function the lite loop does not run, a cache that never
+/// answers) would pay both loops' transitions each time.
+const LITE_HANDOVER_BUDGET: u16 = 64;
+
 /// Whether `code` has a loop: a jump to its own position or an earlier one.
-/// The lite loop takes only loop-free functions. A loop is where the main
-/// loop's projections live (`counted_loop`, the enumeration reductions, the
-/// OSR tier's back-edge counting), and a loop running here skipped them:
-/// sparse-array took 19% longer.
+#[cfg(test)]
 fn has_back_edge(code: &[Instr]) -> bool {
     code.iter().enumerate().any(|(ip, i)| {
         let target = match *i {
@@ -90,7 +110,8 @@ fn has_back_edge(code: &[Instr]) -> bool {
             | Instr::JumpIfFalse { target, .. }
             | Instr::JumpIfTrue { target, .. }
             | Instr::JumpIfNotLt { target, .. }
-            | Instr::JumpIfNotLe { target, .. } => target,
+            | Instr::JumpIfNotLe { target, .. }
+            | Instr::FuseAddIntJump { target, .. } => target,
             _ => return false,
         };
         target as usize <= ip
@@ -128,6 +149,9 @@ pub(crate) struct LiteState<'p> {
     /// Per function id the lite loop runs: what it dispatches (`lite_code`),
     /// found once so a frame transition is one load.
     code: Vec<&'p [Instr]>,
+    /// Per function id the lite loop runs: the hand-overs it has left
+    /// (`LITE_HANDOVER_BUDGET`).
+    budget: Vec<u16>,
     calls: Box<[LiteCall]>,
 }
 
@@ -136,6 +160,7 @@ impl Default for LiteState<'_> {
         LiteState {
             ok: Vec::new(),
             code: Vec::new(),
+            budget: Vec::new(),
             calls: vec![LiteCall::EMPTY; LITE_CALL_SLOTS].into_boxed_slice(),
         }
     }
@@ -189,16 +214,37 @@ impl<'p> Vm<'p> {
             && p.arguments_reg.is_none()
             && p.code.iter().all(lite_instr)
             && Self::lite_code(p).iter().all(lite_instr)
-            && !has_back_edge(&p.code);
+            // A private member's read or write is the main arm's before any
+            // cache (brand checks, the private side table).
+            && !p.code.iter().any(|i| match *i {
+                Instr::GetProp { name, .. } | Instr::SetProp { name, .. } => {
+                    is_private_key(&p.string_constants[name as usize])
+                }
+                _ => false,
+            });
         if self.lite.ok.len() <= i {
             self.lite.ok.resize(i + 1, 0);
             self.lite.code.resize(i + 1, &[]);
+            self.lite.budget.resize(i + 1, 0);
         }
         self.lite.ok[i] = if ok { 1 } else { 2 };
         if ok {
             self.lite.code[i] = Self::lite_code(p);
+            self.lite.budget[i] = LITE_HANDOVER_BUDGET;
         }
         ok
+    }
+
+    /// `fid` handed its frame to the main loop: one less hand-over left,
+    /// and with none left the main loop runs it from now on.
+    #[cold]
+    #[inline(never)]
+    fn lite_handed_over(&mut self, fid: u32) {
+        let b = &mut self.lite.budget[fid as usize];
+        *b = b.saturating_sub(1);
+        if *b == 0 {
+            self.lite.ok[fid as usize] = 2;
+        }
     }
 
     /// What the lite loop dispatches for `fid`, which it runs.
@@ -257,6 +303,7 @@ impl<'p> Vm<'p> {
         macro_rules! hand_over {
             () => {{
                 self.frames[top].ip = ip;
+                self.lite_handed_over(func_id);
                 return Ok(LiteExit::Resume);
             }};
         }
@@ -420,6 +467,201 @@ impl<'p> Vm<'p> {
                     }
                     ip = t;
                 }
+                Instr::FuseAddIntJump { dst, a, imm, upd, target } => {
+                    let va = self.get(base, a);
+                    let r = self.add_int_value(va, imm, upd)?;
+                    self.set(base, dst, r);
+                    // The back-edge `Jump` at `ip + 1`: its GC safe point.
+                    self.maybe_gc();
+                    ip = target as usize;
+                }
+                Instr::JumpIfFalse { cond, target } => {
+                    let v = self.get(base, cond);
+                    let t = if v.is_bool() {
+                        v.bits() == Value::TRUE.bits()
+                    } else {
+                        self.truthy(v)
+                    };
+                    if !t {
+                        // A taken backward branch closes a loop (`do … while`).
+                        if (target as usize) < ip {
+                            self.maybe_gc();
+                        }
+                        ip = target as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Instr::JumpIfTrue { cond, target } => {
+                    let v = self.get(base, cond);
+                    let t = if v.is_bool() {
+                        v.bits() == Value::TRUE.bits()
+                    } else {
+                        self.truthy(v)
+                    };
+                    if t {
+                        if (target as usize) < ip {
+                            self.maybe_gc();
+                        }
+                        ip = target as usize;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Instr::Sub { dst, a, b } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = if va.is_int() && vb.is_int() {
+                        match va.as_int().checked_sub(vb.as_int()) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
+                        }
+                    } else if va.is_number() && vb.is_number() {
+                        Value::num(va.as_f64() - vb.as_f64())
+                    } else {
+                        self.numeric_binop(super::helpers_misc::BigOp::Sub, va, vb)?
+                    };
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::Mul { dst, a, b } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = if va.is_int() && vb.is_int() {
+                        // A zero product with a negative operand is -0 (see
+                        // the main arm).
+                        let (ia, ib) = (va.as_int(), vb.as_int());
+                        match ia.checked_mul(ib) {
+                            Some(v) if v != 0 || (ia | ib) >= 0 => Value::int(v),
+                            _ => Value::num(ia as f64 * ib as f64),
+                        }
+                    } else if va.is_number() && vb.is_number() {
+                        Value::num(va.as_f64() * vb.as_f64())
+                    } else {
+                        self.numeric_binop(super::helpers_misc::BigOp::Mul, va, vb)?
+                    };
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::Bitwise { dst, a, b, op } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = self.fused_bitwise(va, vb, op)?;
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } => {
+                    self.set(base, ldst, Value::int(val));
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = self.fused_bitwise(va, vb, op)?;
+                    self.set(base, dst, r);
+                    ip += 2;
+                }
+                Instr::Eq { dst, a, b } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = if va.is_int() && vb.is_int() {
+                        va.bits() == vb.bits()
+                    } else {
+                        self.strict_eq(base, a, b)
+                    };
+                    self.set(base, dst, Value::bool(r));
+                    ip += 1;
+                }
+                Instr::Ne { dst, a, b } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = if va.is_int() && vb.is_int() {
+                        va.bits() == vb.bits()
+                    } else {
+                        self.strict_eq(base, a, b)
+                    };
+                    self.set(base, dst, Value::bool(!r));
+                    ip += 1;
+                }
+                Instr::FuseEqJump { dst, a, b, ne, when, target } => {
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let eq = if va.is_int() && vb.is_int() {
+                        va.bits() == vb.bits()
+                    } else {
+                        self.strict_eq(base, a, b)
+                    };
+                    let r = eq != ne;
+                    self.set(base, dst, Value::bool(r));
+                    // Forward only (see the variant).
+                    ip = if r == when { target as usize } else { ip + 2 };
+                }
+                Instr::GetIndex { dst, obj, key } => {
+                    let (o, k) = (self.get(base, obj), self.get(base, key));
+                    // The main arm's two leaves, in its order: a numeric
+                    // typed array's element, then a present dense element.
+                    if o.is_heap() {
+                        let ta_idx = o.heap_index();
+                        if let HeapObj::TypedArray {
+                            buffer,
+                            kind,
+                            byte_offset,
+                            length,
+                        } = self.heap.get(ta_idx)
+                        {
+                            if native::TA_KINDS[*kind as usize].2 {
+                                hand_over!();
+                            }
+                            let Some(i) = array_index(k) else {
+                                hand_over!();
+                            };
+                            let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                                ta_idx,
+                                *buffer,
+                                *kind,
+                                *byte_offset,
+                                *length,
+                            );
+                            let Some(r) = self.ta_interp_numeric_get_view(view, i) else {
+                                hand_over!();
+                            };
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
+                    }
+                    let Some(r) = self.interp_dense_int_get(o, k) else {
+                        hand_over!();
+                    };
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::GetProp { dst, obj, name } => {
+                    let o = self.get(base, obj);
+                    if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
+                        self.set(base, dst, v);
+                        ip += 1;
+                        continue;
+                    }
+                    // The caches answer only plain objects, for which the
+                    // main arm's steps before its cache (a string's, an
+                    // array's or a typed array's `length`, a shapeless
+                    // receiver's intrinsic) answer nothing, and a function
+                    // here names no private member (`lite_decide`). Any
+                    // other receiver, and anything the cache does not
+                    // answer with a value, is the main loop's.
+                    if !o.is_heap() || !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                        hand_over!();
+                    }
+                    let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                    match self.ic_get_prop(func_id, ip, o, key) {
+                        GetAct::Value(v) => {
+                            self.set(base, dst, v);
+                            ip += 1;
+                        }
+                        _ => hand_over!(),
+                    }
+                }
+                Instr::SetProp { obj, val, .. } => {
+                    let o = self.get(base, obj);
+                    let v = self.get(base, val);
+                    // The cache's own-data hit, the main arm's first step for
+                    // a name that is not private (`lite_decide`).
+                    if !self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                        hand_over!();
+                    }
+                    ip += 1;
+                }
                 Instr::Call {
                     dst,
                     callee,
@@ -444,6 +686,9 @@ impl<'p> Vm<'p> {
                     // The main loop's frame-transition safe point.
                     self.maybe_gc();
                     if !self.lite_eligible(fid) {
+                        // The callee runs in the main loop, and the caller
+                        // after it until its next frame transition.
+                        self.lite_handed_over(func_id);
                         return Ok(LiteExit::Resume);
                     }
                     top = self.frames.len() - 1;
@@ -484,29 +729,35 @@ impl<'p> Vm<'p> {
 mod tests {
     use super::*;
 
-    /// A counted loop is made of instructions the lite set runs, its jumps
-    /// included, so `has_back_edge` alone keeps it in the main loop; this
-    /// keeps that so if the set grows.
+    /// A loop runs in the lite loop. One that hands over on every iteration
+    /// (here a call to a function the lite loop does not run) runs there only
+    /// for its hand-over budget, then in the main loop for good.
     #[test]
-    fn loops_stay_in_the_main_loop() {
+    fn loops_run_here_until_they_hand_over_too_often() {
         let src = "function loopSum(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + i; } return s; } \
+                   function other(o) { return typeof o === 'number' ? 1 : 0; } \
+                   function callsOut(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + other(i); } return s; } \
                    function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
-                   console.log(loopSum(10) + fib(10));";
+                   console.log(loopSum(10) + callsOut(200) + fib(10));";
         let ast = crate::front::parse_auto(src).expect("parse");
         let program = crate::compile::compile_program(&ast, src).expect("compile");
-        let fid = |name: &str| program.functions.iter().position(|f| f.name == name).expect(name);
-        let (lp, fb) = (fid("loopSum"), fid("fib"));
-        assert!(program.functions[lp].code.iter().all(lite_instr), "the loop is in the lite set");
-        assert!(has_back_edge(&program.functions[lp].code));
-        assert!(!has_back_edge(&program.functions[fb].code));
+        let fid = |name: &str| program.functions.iter().position(|f| f.name == name).expect(name) as u32;
+        let (lp, out, fb) = (fid("loopSum"), fid("callsOut"), fid("fib"));
+        assert!(has_back_edge(&program.functions[lp as usize].code), "loopSum has a loop");
         let mut vm = Vm::new(&program);
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         vm.set_jit_enabled(false);
         vm.run().expect("run");
-        assert_eq!(vm.output, ["100"]);
+        assert_eq!(vm.output, ["300"]);
         if lite_enabled() {
-            assert!(!vm.lite_eligible(lp as u32), "loopSum runs in the main loop");
-            assert!(vm.lite_eligible(fb as u32), "fib runs in the lite loop");
+            assert!(vm.lite_eligible(lp), "loopSum runs in the lite loop");
+            assert!(vm.lite_eligible(fb), "fib runs in the lite loop");
+            assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
+            // Eligible by its instructions, so only the budget sent it back.
+            let p = &program.functions[out as usize];
+            assert!(p.code.iter().chain(Vm::lite_code(p)).all(lite_instr), "callsOut is in the lite set");
+            assert_eq!(vm.lite.ok[out as usize], 2, "callsOut spent its hand-overs");
+            assert_eq!(vm.lite.budget[out as usize], 0);
         }
     }
 }
