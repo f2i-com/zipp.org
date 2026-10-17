@@ -961,8 +961,28 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = recv.heap_index();
-        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
-            return Ok(None);
+        match self.heap.get(idx) {
+            HeapObj::Map { .. } => {}
+            // `wm.get(o)`, `wm.set(o, v)`, `wm.has(o)` and `wm.delete(o)`:
+            // the dispatcher's WeakMap arm, on the same terms.
+            HeapObj::WeakMap { .. } => {
+                let expected_argc = match name {
+                    "get" | "has" | "delete" => 1,
+                    "set" => 2,
+                    _ => return Ok(None),
+                };
+                if argc != expected_argc || !self.weakmap_method_is_intrinsic(idx, name) {
+                    return Ok(None);
+                }
+                builtin_stats_count(self, recv, name);
+                let n = arg_base as usize;
+                let args = [
+                    self.regs[base + n],
+                    if argc == 2 { self.regs[base + n + 1] } else { Value::UNDEFINED },
+                ];
+                return self.weakmap_method(recv, name, &args[..argc as usize]).map(Some);
+            }
+            _ => return Ok(None),
         }
         let expected_argc = match name {
             "get" | "has" => 1,
@@ -1226,6 +1246,52 @@ impl<'p> Vm<'p> {
                         self.str_intrinsic_memo[nid] = entry;
                     }
                 }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `wm.<name>` on the WeakMap `idx` finds %WeakMap.prototype%'s
+    /// own intrinsic `get`/`set`/`has`/`delete`: no own property of that
+    /// name, the default prototype, and its slot holding that native as a
+    /// data property. The prototype half is memoized as
+    /// [`Vm::collection_method_is_intrinsic`]'s, under the prototype's version
+    /// and the slot's value bits.
+    fn weakmap_method_is_intrinsic(&mut self, idx: u32, name: &str) -> bool {
+        let (nid, id) = match name {
+            "get" => (0, native::WM_GET),
+            "set" => (1, native::WM_SET),
+            "has" => (2, native::WM_HAS),
+            "delete" => (3, native::WM_DELETE),
+            _ => return false,
+        };
+        let proto = self.weakmap_proto;
+        if proto == 0
+            || (!self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some()))
+            || (!self.proto_of.is_empty()
+                && self.proto_of.get(&idx).is_some_and(|&actual| actual != Value::heap(proto)))
+        {
+            return false;
+        }
+        let HeapObj::Object(map) = self.heap.get(proto) else {
+            return false;
+        };
+        if let Some((ver, slot, bits)) = self.weakmap_intrinsic_memo[nid] {
+            if self.heap.version_of(proto) == ver && map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == bits) {
+                return true;
+            }
+        }
+        let proven = map.pos(name).and_then(|slot| {
+            let v = map.val_at(slot);
+            (!map.attr_at(slot).accessor
+                && v.is_heap()
+                && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id))
+            .then(|| (slot as u32, v.bits()))
+        });
+        match proven {
+            Some((slot, bits)) => {
+                self.weakmap_intrinsic_memo[nid] = Some((self.heap.version_of(proto), slot, bits));
                 true
             }
             None => false,

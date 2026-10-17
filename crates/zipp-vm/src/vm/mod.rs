@@ -2427,6 +2427,9 @@ pub struct Vm<'p> {
     /// version cache sound here, exactly as the string-method doc warns).
     /// Pure cache: entries self-validate, nothing invalidates them.
     coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
+    /// The same memo for %WeakMap.prototype%'s get/set/has/delete
+    /// (`weakmap_method_is_intrinsic`).
+    weakmap_intrinsic_memo: [Option<(u32, u32, u64)>; 4],
     /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
     /// own method slots (`name` → the installed native's Value bits, captured
     /// at the end of `setup_globals`, when the native heap slots are pinned

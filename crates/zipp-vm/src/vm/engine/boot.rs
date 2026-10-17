@@ -472,6 +472,7 @@ impl<'p> Vm<'p> {
             str_proto: 0,
             map_proto: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
+            weakmap_intrinsic_memo: [None; 4],
             str_proto_baseline: rustc_hash::FxHashMap::default(),
             arr_proto_baseline: rustc_hash::FxHashMap::default(),
             str_intrinsic_memo: [None; crate::vm::STR_MEMO_NAMES],
