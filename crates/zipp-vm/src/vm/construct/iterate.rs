@@ -1883,9 +1883,11 @@ impl<'p> Vm<'p> {
         }
         // A generator's `return` resumes the suspended body with a RETURN completion
         // so any `finally` spanning the yield runs (GeneratorResume semantics) — not
-        // a no-op. The {value,done} result is discarded.
+        // a no-op. The {value,done} result is discarded. Only while a Get of
+        // `return` finds the intrinsic: an own or prototype override is the
+        // GetMethod below's, as for any iterator.
         match self.heap.get(iter.heap_index()) {
-            HeapObj::Generator { .. } => {
+            HeapObj::Generator { .. } if self.gen_method_pristine(iter.heap_index(), "return") => {
                 self.generator_method(iter.heap_index(), "return", &[])?;
                 return Ok(());
             }
