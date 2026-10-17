@@ -3205,9 +3205,13 @@ impl<'p> Vm<'p> {
         // `Promise.all` of that width. The length is a hint and the entries
         // are still pushed one step at a time; it is bounded, so a huge array
         // does not reserve before the lane has looked at an element.
-        let expected = match (fast_pos, self.heap.get(iterable.heap_index())) {
-            (Some(_), HeapObj::Array(items)) => items.len().min(COMBINATOR_PRESIZE_MAX),
-            _ => 0,
+        // (The inline lane implies a heap Array; `Promise.all(0)` is neither.)
+        let expected = match fast_pos {
+            Some(_) => match self.heap.get(iterable.heap_index()) {
+                HeapObj::Array(items) => items.len().min(COMBINATOR_PRESIZE_MAX),
+                _ => 0,
+            },
+            None => 0,
         };
         let comb = self
             .heap
