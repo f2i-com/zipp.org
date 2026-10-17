@@ -2268,6 +2268,54 @@ impl<'p> Vm<'p> {
         Ok(ta)
     }
 
+    /// Whether the species `c` is this realm's own constructor for `kind`
+    /// (`%Uint8Array%` for a Uint8Array): constructing with it builds
+    /// exactly the default view, whose prototype `alloc_typed_array` sets
+    /// (that constructor's `prototype` is non-writable and non-configurable)
+    /// and whose argument checks the default path makes, so a species
+    /// lookup that finds it takes that path rather than a full [[Construct]].
+    /// Another realm's constructor is not it: its views have its prototype.
+    fn ta_species_is_intrinsic(&self, c: Value, kind: u8) -> bool {
+        let ctor = self.ta_ctors[kind as usize];
+        ctor != 0 && c.is_heap() && c.heap_index() == ctor
+    }
+
+    /// Whether SpeciesConstructor for the typed array `idx` of `kind` is this
+    /// realm's constructor for `kind` with nothing observable on the way: no
+    /// own `constructor`, the intrinsic prototype for the kind with that
+    /// constructor as its `constructor` data property, the constructor with
+    /// no own `@@species` and %TypedArray% as its prototype, and
+    /// %TypedArray%'s `@@species` the intrinsic getter (which returns
+    /// `this`). Its two Gets would read exactly those and run nothing else,
+    /// so a caller may skip them for the default path.
+    fn ta_species_default(&self, idx: u32, kind: u8) -> bool {
+        let (proto, ctor, base) = (self.ta_protos[kind as usize], self.ta_ctors[kind as usize], self.ta_base_ctor);
+        if proto == 0 || ctor == 0 || base == 0 {
+            return false;
+        }
+        if !self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos("constructor").is_some()) {
+            return false;
+        }
+        if self.proto_of.get(&idx).copied() != Some(Value::heap(proto))
+            || self.proto_of.get(&ctor).copied() != Some(Value::heap(base))
+        {
+            return false;
+        }
+        let (HeapObj::Object(pm), HeapObj::Object(cm), HeapObj::Object(bm)) =
+            (self.heap.get(proto), self.heap.get(ctor), self.heap.get(base))
+        else {
+            return false;
+        };
+        pm.pos("constructor").is_some_and(|s| !pm.attr_at(s).accessor && pm.val_at(s) == Value::heap(ctor))
+            && cm.pos("@@species").is_none()
+            && bm.pos("@@species").is_some_and(|s| {
+                let g = bm.val_at(s);
+                bm.attr_at(s).accessor
+                    && g.is_heap()
+                    && matches!(self.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
+            })
+    }
+
     /// TypedArraySpeciesCreate(exemplar, «count»): the result TypedArray that
     /// slice/map/filter/etc. build. SpeciesConstructor reads exemplar.constructor
     /// then its [[Symbol.species]] — undefined/null (or no constructor) yields a
@@ -2280,7 +2328,11 @@ impl<'p> Vm<'p> {
         count: usize,
     ) -> Result<Value, Thrown> {
         let (_, kind) = self.ta_len_kind(exemplar_idx);
-        let ctor = self.get_prop(Value::heap(exemplar_idx), "constructor")?;
+        let ctor = if self.ta_species_default(exemplar_idx, kind) {
+            Value::UNDEFINED
+        } else {
+            self.get_prop(Value::heap(exemplar_idx), "constructor")?
+        };
         let species = if ctor == Value::UNDEFINED {
             Value::UNDEFINED
         } else if !self.is_object_value(ctor) {
@@ -2295,7 +2347,7 @@ impl<'p> Vm<'p> {
                 s
             }
         };
-        if species == Value::UNDEFINED {
+        if species == Value::UNDEFINED || self.ta_species_is_intrinsic(species, kind) {
             // Default constructor: a fresh zero-filled view of the exemplar's kind.
             let size = native::TA_KINDS[kind as usize].1;
             let buf = self.alloc_array_buffer(count * size)?;
@@ -2879,7 +2931,11 @@ impl<'p> Vm<'p> {
                 let new_offset = byte_offset + start * size;
                 // TypedArraySpeciesCreate(O, «buffer, beginByteOffset, newLength»):
                 // a custom constructor[@@species] builds the sub-view.
-                let ctor = self.get_prop(recv, "constructor")?;
+                let ctor = if self.ta_species_default(idx, kind) {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(recv, "constructor")?
+                };
                 let species = if ctor == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else if !self.is_object_value(ctor) {
@@ -2894,7 +2950,7 @@ impl<'p> Vm<'p> {
                         s
                     }
                 };
-                if species == Value::UNDEFINED {
+                if species == Value::UNDEFINED || self.ta_species_is_intrinsic(species, kind) {
                     // The default TypedArrayCreate runs the buffer constructor, which
                     // throws on a detached buffer — mirror that for the fast path.
                     if matches!(
