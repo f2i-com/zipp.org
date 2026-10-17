@@ -7822,6 +7822,9 @@ impl<'p> Vm<'p> {
         }
     }
 
+    // Inlined so that a constant namespace (every caller's `"Math"`) folds
+    // to its slot.
+    #[inline]
     pub(crate) fn static_builtin_is_intrinsic(
         &self,
         namespace: &str,

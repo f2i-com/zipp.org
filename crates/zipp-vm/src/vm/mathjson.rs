@@ -988,11 +988,34 @@ impl<'p> Vm<'p> {
         //
         // Those calls are nearly always two int32s, whose ToUint32 is their
         // own bits: the product needs no snapshot and no coercion.
-        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
-            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
-            if a.is_int() && b.is_int() {
-                return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+        use crate::bytecode::MathFn as M;
+        match op {
+            M::Imul if argc >= 2 => {
+                let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+                if a.is_int() && b.is_int() {
+                    return Ok(a.as_int().wrapping_mul(b.as_int()) as f64);
+                }
+                if a.is_number() && b.is_number() {
+                    return Ok(math_binary(op, a.as_f64(), b.as_f64()));
+                }
             }
+            // Numbers coerce without running anything, so they need no
+            // snapshot either: the one operand of a unary op (any further
+            // argument is never read), the two of a binary one.
+            M::Pow | M::Atan2 if argc >= 2 => {
+                let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+                if a.is_number() && b.is_number() {
+                    return Ok(math_binary(op, a.as_f64(), b.as_f64()));
+                }
+            }
+            M::Min | M::Max | M::Hypot | M::Pow | M::Atan2 | M::Imul => {}
+            _ if argc >= 1 => {
+                let x = self.get(base, arg_base);
+                if x.is_number() {
+                    return Ok(math_unary(op, x.as_f64()));
+                }
+            }
+            _ => {}
         }
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
@@ -1072,26 +1095,10 @@ impl<'p> Vm<'p> {
                 acc
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
-            M::Pow => {
+            M::Pow | M::Atan2 | M::Imul => {
                 let a = self.to_number_strict(at(args, 0))?;
                 let b = self.to_number_strict(at(args, 1))?;
-                // Spec: base of magnitude 1 with a NaN/±Infinity exponent is NaN
-                // (C/Rust powf returns 1 for these — a deliberate deviation).
-                if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) {
-                    f64::NAN
-                } else {
-                    a.powf(b)
-                }
-            }
-            M::Atan2 => {
-                let a = self.to_number_strict(at(args, 0))?;
-                let b = self.to_number_strict(at(args, 1))?;
-                a.atan2(b)
-            }
-            M::Imul => {
-                let a = self.to_number_strict(at(args, 0))?;
-                let b = self.to_number_strict(at(args, 1))?;
-                (to_uint32(a).wrapping_mul(to_uint32(b)) as i32) as f64
+                math_binary(op, a, b)
             }
             _ => {
                 let x = self.to_number_strict(at(args, 0))?;

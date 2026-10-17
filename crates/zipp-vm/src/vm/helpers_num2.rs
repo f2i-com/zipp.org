@@ -122,6 +122,21 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
     }
 }
 
+/// `Math.pow`, `Math.atan2` and `Math.imul` on their two (already ToNumber'd)
+/// operands.
+pub(crate) fn math_binary(op: crate::bytecode::MathFn, a: f64, b: f64) -> f64 {
+    use crate::bytecode::MathFn as M;
+    match op {
+        // Spec: base of magnitude 1 with a NaN/±Infinity exponent is NaN
+        // (C/Rust powf returns 1 for these — a deliberate deviation).
+        M::Pow if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) => f64::NAN,
+        M::Pow => a.powf(b),
+        M::Atan2 => a.atan2(b),
+        M::Imul => (to_uint32(a).wrapping_mul(to_uint32(b)) as i32) as f64,
+        _ => math_unary(op, a),
+    }
+}
+
 /// `Math.acosh(x)`.
 ///
 /// Rust's `f64::acosh` is `ln(x + sqrt(x-1)*sqrt(x+1))`, whose argument is
