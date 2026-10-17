@@ -4460,6 +4460,27 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                            // The BigInt accessors (`getBigInt64(pos, le)`,
+                            // `setBigUint64(pos, v, le)`, ...), likewise.
+                            if key.len() > 6 && key.as_bytes()[3..6] == *b"Big" {
+                                let a1 = if argc < 2 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base + 1)
+                                };
+                                let a2 = if argc < 3 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base + 2)
+                                };
+                                if let Some(result) =
+                                    self.dataview_interp_big_fast(recv.heap_index(), key, position, a1, a2)?
+                                {
+                                    self.set(base, dst, result);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                         }
                         // `g.next(v)` on a generator whose `next` is the
                         // intrinsic: its resume, as the native would run it.

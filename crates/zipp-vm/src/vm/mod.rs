@@ -2497,6 +2497,9 @@ pub struct Vm<'p> {
     /// prototype's entries 10..18), proving `dataview_interp_set_fast`'s
     /// callee.
     dataview_numeric_setter_bits: [u64; 8],
+    /// The BigInt accessors' boot bits (prototype entries 8, 9, 18 and 19),
+    /// proving `dataview_interp_big_fast`'s callee as the numeric ones do.
+    dataview_bigint_bits: [u64; 4],
     /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
     /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
     /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as

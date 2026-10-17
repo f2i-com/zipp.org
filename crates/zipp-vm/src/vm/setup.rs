@@ -2366,11 +2366,35 @@ impl<'p> Vm<'p> {
                 } else {
                     valid = false;
                 }
+                // The BigInt accessors, entries 8, 9, 18 and 19, the same way.
+                let mut big_bits = [Value::UNDEFINED.bits(); 4];
+                if valid && m.len() >= 20 && native::DV_PROTO_METHODS.len() >= 20 {
+                    for (j, slot) in [8usize, 9, 18, 19].into_iter().enumerate() {
+                        let value = m.val_at(slot);
+                        let intrinsic = value.is_heap()
+                            && matches!(
+                                self.heap.get(value.heap_index()),
+                                HeapObj::Native(id)
+                                    if *id == native::DV_METHOD_BASE + slot as u16
+                            );
+                        if !intrinsic
+                            || m.key_at(slot) != native::DV_PROTO_METHODS[slot]
+                            || m.attr_at(slot).accessor
+                        {
+                            valid = false;
+                            break;
+                        }
+                        big_bits[j] = value.bits();
+                    }
+                } else {
+                    valid = false;
+                }
                 debug_assert!(valid, "DataView prototype boot layout drifted");
                 if valid {
                     self.dataview_proto_shape = shape;
                     self.dataview_numeric_getter_bits = bits;
                     self.dataview_numeric_setter_bits = set_bits;
+                    self.dataview_bigint_bits = big_bits;
                 }
             }
         }

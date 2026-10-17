@@ -996,6 +996,12 @@ impl<'p> Vm<'p> {
             HeapObj::DataView { .. } => {
                 let at = base + arg_base as usize;
                 let position = if argc > 0 { self.regs[at] } else { Value::UNDEFINED };
+                // The BigInt accessors' lane, on the same proof.
+                if matches!(native_id.wrapping_sub(native::DV_METHOD_BASE), 8 | 9 | 18 | 19) {
+                    let a1 = if argc > 1 { self.regs[at + 1] } else { Value::UNDEFINED };
+                    let a2 = if argc > 2 { self.regs[at + 2] } else { Value::UNDEFINED };
+                    return self.dataview_captured_big(idx, native_id, position, a1, a2);
+                }
                 // `dv.setUint32(o, v, le)`: the setters' lane, on the same proof.
                 if argc >= 2 && key.as_bytes().first() == Some(&b's') {
                     let value = self.regs[at + 1];
