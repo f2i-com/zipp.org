@@ -3,7 +3,7 @@
 //! once and then loaded, instead of compiled, by every later process.
 //!
 //! The encoding is private to one build of the engine: [`FORMAT`] and the
-//! caller's key (see `frontend::python::runtime_cache`) decide whether bytes
+//! caller's key (see `lang::python::frontend::runtime_cache`) decide whether bytes
 //! may be decoded at all. Decoding reproduces the program exactly —
 //! `decode(encode(p))` prints (`{:?}`) the same as `p` — and a truncated or
 //! mangled input is an error, never a panic. `Instr` is encoded by code

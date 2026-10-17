@@ -2053,7 +2053,7 @@ pub enum Instr {
     },
 
     // ---- Python frontend fast paths ---------------------------------------
-    // Emitted only by `frontend::python`. Each is the fused form of a guarded
+    // Emitted only by `lang::python::frontend`. Each is the fused form of a guarded
     // inline sequence the Python emitter used to spell out (`typeof` tests,
     // the operation, a jump over the slow path): it performs the operation
     // when its operands are of the types listed, and otherwise jumps to

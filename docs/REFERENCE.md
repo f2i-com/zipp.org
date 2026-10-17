@@ -306,7 +306,8 @@ are in [`SECURITY.md`](SECURITY.md) and the two runner READMEs.
 
 ```text
 crates/zipp-vm/src/
-  lang/             the languages; lang/mod.rs selects a frontend
+  lang/             the languages (see LANGUAGES.md); lang/mod.rs holds
+                    the `Language` trait and the table of languages
     js/parse/       JavaScript source -> owned AST
     js/compile/     AST -> register bytecode
     js/front.rs     the parse entry points, one per grammar

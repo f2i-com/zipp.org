@@ -89,9 +89,10 @@ mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
-/// Language selection: which language's frontend compiles a source.
-#[path = "lang/mod.rs"]
-pub mod frontend;
+/// The languages, and which one's frontend compiles a source.
+pub mod lang;
+/// The earlier name of [`lang`], kept for embedders.
+pub use lang as frontend;
 /// Python packages a host adds at run time (the torch package of the
 /// WebAssembly `python` artifact).
 #[cfg(feature = "python")]

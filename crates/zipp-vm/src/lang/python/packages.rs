@@ -3,7 +3,7 @@
 //! without it.
 //!
 //! A package is an archive of Python modules (compiled on first import, like
-//! the bundled library, see `frontend::python`), runtime JavaScript compiled
+//! the bundled library, see `lang::python::frontend`), runtime JavaScript compiled
 //! into the Python runtime ahead of `entry.js` (trusted code with the
 //! runtime's own reach, like the bundled runtime), and optionally the native
 //! tensor kernels, which run in the package's own WebAssembly module: the
@@ -22,7 +22,7 @@
 //! `runtime <file> <offset> <length> <sha256>` (runtime JavaScript, in
 //! order) and `module <name> <file> <offset> <length> <sha256> <imports>`
 //! (a Python module and its import statements, `-` for none, in the form
-//! `frontend::python::Bundled::imports` takes). Offsets count from the first
+//! `lang::python::frontend::Bundled::imports` takes). Offsets count from the first
 //! byte after `end\n`.
 use std::sync::Mutex;
 

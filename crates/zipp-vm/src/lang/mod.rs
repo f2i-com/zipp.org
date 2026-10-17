@@ -1,14 +1,59 @@
-//! Explicit, additive language selection. Existing JavaScript APIs are unchanged.
+//! The languages, and explicit, additive language selection. Existing
+//! JavaScript APIs are unchanged.
+//!
+//! Zipp is one engine for several languages. The core (`bytecode`, `heap`,
+//! `vm`, `codegen`) is the base language's, JavaScript's; each language
+//! lives in `lang/<name>/` and is one entry of [`languages`]. A language
+//! compiles its source to the shared bytecode, using the base instructions
+//! where its semantics agree and adding its own where they differ. See
+//! `docs/LANGUAGES.md` for the extension points and for adding a language.
 //!
 //! Python is an experimental, feature-gated subset, not CPython compatibility.
 //! Detection is a caller-side policy and never a compiler fallback.
-use crate::embed::{CompileOptions, ScriptGoal, ScriptState};
+use crate::embed::{ScriptGoal, ScriptState};
 use std::path::Path;
 use std::str::FromStr;
 
-#[cfg(feature = "python")]
-#[path = "python/frontend/mod.rs"]
+mod js;
 mod python;
+
+/// A language the runtime runs: its names, how a file is recognised as its,
+/// and its frontend. Every language implements it once, in `lang/<name>/`,
+/// and is listed in [`languages`]; language detection, the `--lang` names
+/// and single-file compiles go through that table.
+pub trait Language: Sync {
+    /// The identity a compiled source carries.
+    fn id(&self) -> LanguageId;
+    /// The names a host may select it by (`--lang`), lowercase; the first
+    /// is its name in messages.
+    fn names(&self) -> &'static [&'static str];
+    /// File extensions that select it, lowercase, without the dot.
+    fn extensions(&self) -> &'static [&'static str];
+    /// Whether a `#!` line whose command is `command` (a basename, the
+    /// command after `env` when the line uses it) selects it.
+    fn shebang(&self, command: &str) -> bool;
+    /// Compile a single-file program with the language's default options.
+    /// A language this build leaves out is still listed, so a source is
+    /// still recognised as its; compiling it is the error.
+    fn compile(&self, source: &str) -> Result<ScriptState, String>;
+    /// Developer-only inspection: the compiled program as text, with no
+    /// guest execution.
+    fn compile_to_text(&self, source: &str) -> Result<String, String>;
+}
+
+/// Every language, the base language first.
+pub fn languages() -> &'static [&'static dyn Language] {
+    &[&js::JavaScript, &python::Python]
+}
+
+/// The language `id` names.
+pub fn language(id: LanguageId) -> &'static dyn Language {
+    languages()
+        .iter()
+        .copied()
+        .find(|l| l.id() == id)
+        .expect("every LanguageId is in the table")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageId {
@@ -18,10 +63,10 @@ pub enum LanguageId {
 impl FromStr for LanguageId {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "js" | "javascript" => Ok(Self::JavaScript),
-            "py" | "python" => Ok(Self::Python),
-            _ => Err(format!(
+        let key = value.trim().to_ascii_lowercase();
+        match languages().iter().find(|l| l.names().contains(&key.as_str())) {
+            Some(l) => Ok(l.id()),
+            None => Err(format!(
                 "unknown language {value:?}; expected javascript or python"
             )),
         }
@@ -64,26 +109,10 @@ impl CompiledSource {
 pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource, String> {
     let language = frontend.language();
     let state = match frontend {
-        Frontend::JavaScript { goal } => {
-            crate::embed::compile_script_with_options(source, &CompileOptions { goal })?
-        }
+        Frontend::JavaScript { goal } => js::compile(source, goal)?,
         Frontend::Python {
             mode: PythonMode::Module,
-        } => {
-            #[cfg(feature = "python")]
-            {
-                let program = python::compile(source)?;
-                let mut state = ScriptState::from_program(program);
-                python_jit_default(&mut state);
-                state
-            }
-            #[cfg(not(feature = "python"))]
-            {
-                return Err(
-                    "Python support is not built; enable the `python` Cargo feature".into(),
-                );
-            }
-        }
+        } => self::language(language).compile(source)?,
     };
     Ok(CompiledSource { language, state })
 }
@@ -266,27 +295,8 @@ fn compile_python_entry_files<S: AsRef<str>>(
 /// Developer-only bytecode inspection, with no guest execution.
 pub fn compile_source_to_text(source: &str, frontend: Frontend) -> Result<String, String> {
     match frontend {
-        Frontend::JavaScript { goal } => {
-            // Do not ignore the per-call script goal when inspecting bytecode.
-            let allow_return = match goal {
-                ScriptGoal::Pure => false,
-                ScriptGoal::Compat => true,
-                ScriptGoal::Inherit => !crate::front::pure_script_goal(),
-            };
-            let ast = crate::front::parse_script_with(source, allow_return, false)?;
-            let program = crate::compile::compile_main_program(&ast, source)?;
-            Ok(format!("{program:#?}"))
-        }
-        Frontend::Python { .. } => {
-            #[cfg(feature = "python")]
-            {
-                Ok(format!("{:#?}", python::compile(source)?))
-            }
-            #[cfg(not(feature = "python"))]
-            {
-                Err("Python support is not built; enable the `python` Cargo feature".into())
-            }
-        }
+        Frontend::JavaScript { goal } => js::compile_to_text(source, goal),
+        Frontend::Python { .. } => language(LanguageId::Python).compile_to_text(source),
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,13 +323,9 @@ pub fn detect_language(
         return found(language, DetectionReason::Explicit);
     }
     if let Some(ext) = filename.and_then(Path::extension).and_then(|s| s.to_str()) {
-        let lang = match ext.to_ascii_lowercase().as_str() {
-            "js" | "cjs" | "mjs" => Some(LanguageId::JavaScript),
-            "py" | "pyw" => Some(LanguageId::Python),
-            _ => None,
-        };
-        if let Some(lang) = lang {
-            return found(lang, DetectionReason::Extension);
+        let ext = ext.to_ascii_lowercase();
+        if let Some(l) = languages().iter().find(|l| l.extensions().contains(&ext.as_str())) {
+            return found(l.id(), DetectionReason::Extension);
         }
     }
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
@@ -337,16 +343,8 @@ pub fn detect_language(
             None => None,
         };
         if let Some(command) = command {
-            let suffix = command.strip_prefix("python");
-            let python = suffix.is_some_and(|s| {
-                s.is_empty()
-                    || (s.starts_with('3') && s.chars().all(|c| c.is_ascii_digit() || c == '.'))
-            });
-            if python {
-                return found(LanguageId::Python, DetectionReason::Shebang);
-            }
-            if matches!(command.as_str(), "node" | "nodejs" | "qjs") {
-                return found(LanguageId::JavaScript, DetectionReason::Shebang);
+            if let Some(l) = languages().iter().find(|l| l.shebang(&command)) {
+                return found(l.id(), DetectionReason::Shebang);
             }
         }
     }
@@ -407,6 +405,21 @@ mod tests {
         assert!(detect_language(None, None, "#!/usr/bin/python-malware\n").is_err());
         assert!(detect_language(None, None, "x = 1\n# zipp:language=python\n").is_err());
         assert!(detect_language(None, None, "# zipp:language=typo\n").is_err());
+    }
+    #[test]
+    fn the_table_lists_each_language_once() {
+        for id in [LanguageId::JavaScript, LanguageId::Python] {
+            assert_eq!(languages().iter().filter(|l| l.id() == id).count(), 1);
+            for name in language(id).names() {
+                assert_eq!(name.parse::<LanguageId>().unwrap(), id, "{name}");
+            }
+        }
+        let mut exts: Vec<&str> = languages().iter().flat_map(|l| l.extensions().iter().copied()).collect();
+        let n = exts.len();
+        exts.sort_unstable();
+        exts.dedup();
+        assert_eq!(exts.len(), n, "an extension selects two languages");
+        assert_eq!(languages()[0].id(), LanguageId::JavaScript, "the base language first");
     }
     #[test]
     fn independent_javascript_goals() {

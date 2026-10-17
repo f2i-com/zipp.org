@@ -183,7 +183,7 @@ fn library() -> Vec<LibModule> {
 }
 
 /// A single-file program: the source is the `main` module.
-pub(super) fn compile(source: &str) -> R<Program> {
+pub(in crate::lang) fn compile(source: &str) -> R<Program> {
     compile_project("main", None, &[("main".to_owned(), source)], Vec::new(), &[], false)
 }
 
@@ -386,7 +386,7 @@ fn imported_modules(suite: &[ast::Stmt], here: &str, out: &mut BTreeSet<String>)
 /// module (its `__file__`, `sys.argv[0]` and traceback frames) when it is
 /// not the file its module name implies: a script run from a subfolder, or
 /// one whose file name is not a module name (`my-script.py`, `tool`).
-pub(super) fn compile_project<S: AsRef<str>>(
+pub(in crate::lang) fn compile_project<S: AsRef<str>>(
     entry: &str,
     entry_file: Option<&str>,
     modules: &[(String, S)],
@@ -949,12 +949,12 @@ struct RuntimeSeed {
 static SEED_MEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// See [`super::prewarm_python`].
-pub(super) fn prewarm() -> R<()> {
+pub(in crate::lang) fn prewarm() -> R<()> {
     runtime_seed().map(drop)
 }
 
 /// See [`super::set_python_runtime_cache`].
-pub(super) fn set_runtime_cache(dir: Option<std::path::PathBuf>) {
+pub(in crate::lang) fn set_runtime_cache(dir: Option<std::path::PathBuf>) {
     #[cfg(not(target_arch = "wasm32"))]
     code_cache::set_dir(dir);
     #[cfg(target_arch = "wasm32")]
@@ -962,7 +962,7 @@ pub(super) fn set_runtime_cache(dir: Option<std::path::PathBuf>) {
 }
 
 /// See [`super::set_python_runtime_memo`].
-pub(super) fn set_runtime_memo(enabled: bool) {
+pub(in crate::lang) fn set_runtime_memo(enabled: bool) {
     SEED_MEMO.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
