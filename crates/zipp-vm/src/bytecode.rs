@@ -2579,6 +2579,26 @@ pub enum Instr {
         when: bool,
         target: u32,
     },
+    /// `LoadInt { dst: ldst, val }`, `Eq { dst, a, b: ldst }`, then
+    /// `JumpIfTrue { cond: dst, target }` with `target` past the three: a
+    /// `switch` case on an integer literal, in one dispatch.
+    FuseIntEqJump {
+        ldst: Reg,
+        val: i32,
+        a: Reg,
+        dst: Reg,
+        target: u32,
+    },
+    /// `LoadConst { dst: ldst, idx }`, `Eq { dst, a, b: ldst }`, then
+    /// `JumpIfTrue { cond: dst, target }`, as [`Instr::FuseIntEqJump`]: a
+    /// `switch` case on a string literal.
+    FuseConstEqJump {
+        ldst: Reg,
+        idx: u32,
+        a: Reg,
+        dst: Reg,
+        target: u32,
+    },
     /// `TypeOfIs { dst, a, code, neg }` then the conditional jump on `dst`,
     /// as [`Instr::FuseEqJump`].
     FuseTypeOfJump {
@@ -2879,6 +2899,28 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
     let mut out: Option<Vec<Instr>> = None;
     let mut i = 0;
     while i + 1 < code.len() {
+        // A `switch` case: a literal loaded, compared with the discriminant,
+        // and the branch to its body (forward, past the three).
+        if i + 2 < code.len() {
+            if let (Instr::Eq { dst, a, b }, Instr::JumpIfTrue { cond, target }) = (code[i + 1], code[i + 2]) {
+                if cond == dst && a != b && target as usize > i + 2 {
+                    let triple = match code[i] {
+                        Instr::LoadInt { dst: ldst, val } if b == ldst && a != ldst => {
+                            Some(Instr::FuseIntEqJump { ldst, val, a, dst, target })
+                        }
+                        Instr::LoadConst { dst: ldst, idx } if b == ldst && a != ldst => {
+                            Some(Instr::FuseConstEqJump { ldst, idx, a, dst, target })
+                        }
+                        _ => None,
+                    };
+                    if let Some(f) = triple {
+                        out.get_or_insert_with(|| code.to_vec())[i] = f;
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
         let fused = match (code[i], code[i + 1]) {
             (Instr::AddInt { dst, a, imm, upd }, Instr::Move { dst: mdst, src: msrc }) => {
                 Some(Instr::FuseAddIntMove { dst, a, imm, upd, mdst, msrc })
@@ -3048,6 +3090,39 @@ mod fused_code_tests {
         assert!(matches!(fused[0], Instr::FuseLoadGlobalAddInt { gdst: 5, idx: 0, dst: 6, a: 1, imm: -1, upd: false }));
         assert!(matches!(fused[2], Instr::Call { .. }));
         assert!(matches!(fused[3], Instr::FuseAddReturn { dst: 3, a: 4, b: 5, src: 3 }));
+    }
+
+    /// A `switch` case's literal load, `===` and branch fuse as one only
+    /// when the comparison reads the register just loaded, the branch tests
+    /// the comparison and goes forward past the three; otherwise the pair
+    /// rules apply.
+    #[test]
+    fn switch_case_triples() {
+        let code = [
+            Instr::LoadInt { dst: 4, val: 7 },
+            Instr::Eq { dst: 5, a: 1, b: 4 },
+            Instr::JumpIfTrue { cond: 5, target: 12 },
+            Instr::LoadConst { dst: 4, idx: 3 },
+            Instr::Eq { dst: 5, a: 1, b: 4 },
+            Instr::JumpIfTrue { cond: 5, target: 12 },
+            // The literal is the left operand: the pair rule only.
+            Instr::LoadInt { dst: 4, val: 7 },
+            Instr::Eq { dst: 5, a: 4, b: 1 },
+            Instr::JumpIfTrue { cond: 5, target: 12 },
+            // A backward branch: no fusion at all.
+            Instr::LoadInt { dst: 4, val: 7 },
+            Instr::Eq { dst: 5, a: 1, b: 4 },
+            Instr::JumpIfTrue { cond: 5, target: 0 },
+            Instr::Return { src: 1 },
+        ];
+        let fused = fuse_for_interpreter(&code).expect("cases fuse");
+        assert!(matches!(fused[0], Instr::FuseIntEqJump { ldst: 4, val: 7, a: 1, dst: 5, target: 12 }));
+        assert!(matches!(fused[1], Instr::Eq { .. }) && matches!(fused[2], Instr::JumpIfTrue { .. }));
+        assert!(matches!(fused[3], Instr::FuseConstEqJump { ldst: 4, idx: 3, a: 1, dst: 5, target: 12 }));
+        assert!(matches!(fused[6], Instr::LoadInt { .. }));
+        assert!(matches!(fused[7], Instr::FuseEqJump { dst: 5, a: 4, b: 1, ne: false, when: true, target: 12 }));
+        assert!(matches!(fused[9], Instr::LoadInt { .. }));
+        assert!(matches!(fused[10], Instr::Eq { .. }) && matches!(fused[11], Instr::JumpIfTrue { .. }));
     }
 
     /// A program run on the interpreter builds the copies of the code that

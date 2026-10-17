@@ -114,6 +114,7 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::FuseEqJump { .. }
+            | Instr::FuseIntEqJump { .. }
             | Instr::JumpIfFalse { .. }
             | Instr::JumpIfTrue { .. }
             | Instr::FuseAddIntJump { .. }
@@ -688,6 +689,18 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, Value::bool(r));
                     // Forward only (see the variant).
                     ip = if r == when { target as usize } else { ip + 2 };
+                }
+                Instr::FuseIntEqJump { ldst, val, a, dst, target } if FULL => {
+                    self.set(base, ldst, Value::int(val));
+                    let va = self.get(base, a);
+                    // As the main arm: an Int or a Number of that value.
+                    let r = if va.is_int() {
+                        va.as_int() == val
+                    } else {
+                        va.is_double() && va.as_f64() == val as f64
+                    };
+                    self.set(base, dst, Value::bool(r));
+                    ip = if r { target as usize } else { ip + 3 };
                 }
                 Instr::GetIndex { dst, obj, key } if FULL => {
                     let (o, k) = (self.get(base, obj), self.get(base, key));
