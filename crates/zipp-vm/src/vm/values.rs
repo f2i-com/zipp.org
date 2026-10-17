@@ -16,6 +16,50 @@ const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
     setter: Value::UNDEFINED,
 };
 
+/// `Vm::private_memo`'s size, a power of two.
+pub(crate) const PRIVATE_MEMO_SLOTS: usize = 256;
+
+/// One answer of `Vm::resolve_private_in`: at the access site `site` (see
+/// `private_site`), code whose chain's innermost brand is `head` resolves
+/// its private name to `(brand, kind, owner)`, and the name's id in
+/// `private_name_ids` is `id`. A site never has every bit set, so `EMPTY`
+/// matches nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct PrivateMemo {
+    head: u64,
+    site: u64,
+    brand: u64,
+    owner: u32,
+    id: u32,
+    kind: u8,
+}
+
+impl PrivateMemo {
+    pub(crate) const EMPTY: PrivateMemo = PrivateMemo {
+        head: 0,
+        site: u64::MAX,
+        brand: 0,
+        owner: 0,
+        id: 0,
+        kind: 0,
+    };
+}
+
+/// The access site of a private name: the function and the index of the
+/// name among its string constants.
+#[inline]
+pub(crate) fn private_site(func_id: u32, name: u32) -> u64 {
+    (u64::from(func_id) << 32) | u64::from(name)
+}
+
+#[inline]
+fn private_memo_index(head: u64, site: u64) -> usize {
+    let h = (head as u32).wrapping_mul(0x9E37_79B1)
+        ^ ((site >> 32) as u32).wrapping_mul(0x85EB_CA77)
+        ^ (site as u32).wrapping_mul(0xC2B2_AE3D);
+    (h >> 24) as usize & (PRIVATE_MEMO_SLOTS - 1)
+}
+
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
@@ -816,11 +860,16 @@ impl<'p> Vm<'p> {
     /// PrivateFieldFind: the field's value for the EXACT (instance, brand,
     /// name), or None (spec: empty -> TypeError at the access site).
     pub(crate) fn private_field_get(&self, inst: Value, brand: u64, key: &str) -> Option<Value> {
+        self.private_field_get_id(inst, brand, *self.private_name_ids.get(key)?)
+    }
+
+    /// `private_field_get` with the name's id in `private_name_ids` known.
+    #[inline]
+    pub(crate) fn private_field_get_id(&self, inst: Value, brand: u64, id: u32) -> Option<Value> {
         if !inst.is_heap() {
             return None;
         }
         let fields = self.private_fields.get(&inst.heap_index())?;
-        let id = *self.private_name_ids.get(key)?;
         fields
             .iter()
             .find(|&&(b, n, _)| b == brand && n == id)
@@ -864,6 +913,21 @@ impl<'p> Vm<'p> {
                 None => return false,
             }
         };
+        self.private_field_set_id(inst, brand, id, v, add)
+    }
+
+    /// `private_field_set` with the name's id in `private_name_ids` known.
+    pub(crate) fn private_field_set_id(
+        &mut self,
+        inst: Value,
+        brand: u64,
+        id: u32,
+        v: Value,
+        add: bool,
+    ) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
         let m = if add {
             self.private_fields.entry(inst.heap_index()).or_default()
         } else {
@@ -926,6 +990,52 @@ impl<'p> Vm<'p> {
     /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
     pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
         self.resolve_private_in(self.frames.last()?.callee, key)
+    }
+
+    /// `resolve_private_in(ctx, key)` for the private name `key` that the
+    /// access site `site` names (`private_site`), remembered in
+    /// `Vm::private_memo` with the name's id in `private_name_ids`:
+    /// `(brand, kind, owner, id)`.
+    ///
+    /// The search compares `key` with the private names of each class on the
+    /// accessing chain, on every `this.#x`, and its answer depends only on
+    /// the chain and the name. The chain's innermost brand names the chain:
+    /// each class evaluation mints a fresh brand from a counter that never
+    /// repeats, and every function of its body carries the same chain. A
+    /// brand's declared names are fixed when its class is made, and kept
+    /// while a live chain holds the brand, as the running one does. What can
+    /// change is `brand_owner`: the declaring class can die while one of its
+    /// methods lives on, which makes the search answer `None`; the collector
+    /// clears the memo whenever it drops an entry there.
+    pub(crate) fn resolve_private_site(
+        &mut self,
+        ctx: Value,
+        site: u64,
+        key: &str,
+    ) -> Option<(u64, u8, u32, u32)> {
+        let head = *self.private_brands_of(ctx)?.first()?;
+        let slot = private_memo_index(head, site);
+        let e = self.private_memo[slot];
+        if e.head == head && e.site == site {
+            return Some((e.brand, e.kind, e.owner, e.id));
+        }
+        let (brand, kind, owner) = self.resolve_private_in(ctx, key)?;
+        let id = self.private_name_id(key);
+        self.private_memo[slot] = PrivateMemo {
+            head,
+            site,
+            brand,
+            owner,
+            id,
+            kind,
+        };
+        Some((brand, kind, owner, id))
+    }
+
+    /// Forget every remembered private resolution (see
+    /// `resolve_private_site`): a class's `brand_owner` entry was dropped.
+    pub(crate) fn clear_private_memo(&mut self) {
+        self.private_memo.fill(PrivateMemo::EMPTY);
     }
 
     /// `resolve_private` against the brand chain of `ctx` (see
@@ -1062,17 +1172,25 @@ impl<'p> Vm<'p> {
     /// the receiver passes the textual presence check without a private field
     /// value; the caller then takes its ordinary property lookup.
     ///
-    /// The interpreter's `CallMethod` passes the running frame's callee. The JIT
-    /// region-call fallback passes the callee of the code that is actually
-    /// running: it used to look `#m` up as a plain property, so one class could
-    /// call another class's same-named `#m`.
+    /// The interpreter's `CallMethod` passes the running frame's callee, and
+    /// its access site (`private_site`) so the resolution is remembered. The
+    /// JIT region-call fallback passes the callee of the code that is
+    /// actually running: it used to look `#m` up as a plain property, so one
+    /// class could call another class's same-named `#m`.
     pub(crate) fn private_method_callee(
         &mut self,
         ctx: Value,
         recv: Value,
         key: &str,
+        site: Option<u64>,
     ) -> Result<Option<Value>, Thrown> {
-        if let Some((b, kind, owner)) = self.resolve_private_in(ctx, key) {
+        let resolved = match site {
+            Some(site) => self
+                .resolve_private_site(ctx, site, key)
+                .map(|(b, kind, owner, _)| (b, kind, owner)),
+            None => self.resolve_private_in(ctx, key),
+        };
+        if let Some((b, kind, owner)) = resolved {
             // Declaring-class-resolved, KIND-aware (FIX-3).
             if !self.private_receiver_ok(recv, b, kind, owner) {
                 return Err(Thrown(format!(

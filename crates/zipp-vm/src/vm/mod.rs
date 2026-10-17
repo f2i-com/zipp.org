@@ -2078,6 +2078,10 @@ pub struct Vm<'p> {
     /// getter/setter errors). NOT a GC root: pruned when the class dies (no
     /// live accessor can then need it).
     brand_owner: rustc_hash::FxHashMap<u64, u32>,
+    /// Remembered answers of `resolve_private_in`, keyed by the innermost
+    /// brand of the accessing chain and the private name's id (see
+    /// `Vm::resolve_private_memo`).
+    private_memo: Box<[values::PrivateMemo]>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

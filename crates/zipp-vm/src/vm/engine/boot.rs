@@ -363,6 +363,11 @@ impl<'p> Vm<'p> {
             instance_brand: crate::slot_table::SlotTable::default(),
             brand_private_names: rustc_hash::FxHashMap::default(),
             brand_owner: rustc_hash::FxHashMap::default(),
+            private_memo: vec![
+                crate::vm::values::PrivateMemo::EMPTY;
+                crate::vm::values::PRIVATE_MEMO_SLOTS
+            ]
+            .into_boxed_slice(),
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),

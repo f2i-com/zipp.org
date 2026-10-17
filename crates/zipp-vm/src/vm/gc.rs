@@ -1052,7 +1052,11 @@ impl Vm<'_> {
         }
         self.method_brand.retain_marked(&marks);
         self.instance_brand.retain_marked(&marks);
+        let owners = self.brand_owner.len();
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
+        if self.brand_owner.len() != owners {
+            self.clear_private_memo();
+        }
         self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
         self.eval_scope_parent.retain_marked(&marks);
         self.shadow_fn_realm.retain_marked(&marks);
@@ -1060,7 +1064,7 @@ impl Vm<'_> {
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
         if !self.brand_private_names.is_empty() {
-            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
@@ -1374,7 +1378,13 @@ impl Vm<'_> {
         prune_map!(self.instance_brand);
         // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
+            let owners = self.brand_owner.len();
             self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
+            // A remembered private resolution may name a class just freed
+            // (see `Vm::resolve_private_site`).
+            if self.brand_owner.len() != owners {
+                self.private_memo.fill(super::values::PrivateMemo::EMPTY);
+            }
         }
         // A guarded wrapper with its own `retain` and `remove`, not a std
         // map: pruned here as the macro used to prune every table.
@@ -1399,7 +1409,7 @@ impl Vm<'_> {
         if !self.brand_private_names.is_empty()
             && self.method_brand.len() + self.instance_brand.len() != brand_entries
         {
-            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }

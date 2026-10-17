@@ -3516,7 +3516,9 @@ impl<'p> Vm<'p> {
                         // half rejects a wholly-absent member, the brand half rejects a
                         // same-named member of a DIFFERENT class evaluation.
                         if is_private_key(&key) {
-                            if let Some((b, kind, owner)) = self.resolve_private(&key) {
+                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                            let site = super::values::private_site(func_id as u32, name as u32);
+                            if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
                                 // Declaring-class-resolved, KIND-aware access
                                 // (spec PrivateGet): brand first, then dispatch
                                 // on the DECLARING class's member kind.
@@ -3546,7 +3548,7 @@ impl<'p> Vm<'p> {
                                 }
                                 // Private FIELD: PrivateFieldFind in the
                                 // side table (empty -> TypeError).
-                                match self.private_field_get(o, b, &key) {
+                                match self.private_field_get_id(o, b, pid) {
                                     Some(v) => {
                                         self.set(base, dst, v);
                                         ip += 1;
@@ -3680,7 +3682,9 @@ impl<'p> Vm<'p> {
                         // (field-init emission, compound/update writes). One
                         // byte-compare on the hot path.
                         if matches!(key.as_bytes().first(), Some(b'#')) {
-                            if let Some((b2, kind, owner)) = self.resolve_private(&key) {
+                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                            let site = super::values::private_site(func_id as u32, name as u32);
+                            if let Some((b2, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
                                 if !self.private_receiver_ok(o, b2, kind, owner) {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
@@ -3697,14 +3701,14 @@ impl<'p> Vm<'p> {
                                     // an existing entry is PrivateFieldSet and
                                     // unaffected.
                                     if o.is_heap()
-                                        && !self.private_field_has(o, b2, &key)
+                                        && self.private_field_get_id(o, b2, pid).is_none()
                                         && !self.target_is_extensible(o)
                                     {
                                         return Err(Thrown(
                                             "TypeError: cannot define private elements on a non-extensible object".into(),
                                         ));
                                     }
-                                    self.private_field_set(o, b2, &key, v, true);
+                                    self.private_field_set_id(o, b2, pid, v, true);
                                 } else if kind & 4 != 0 {
                                     let s = self
                                         .private_member_from_owner(owner, &key, (kind & 8) | 4)
@@ -3853,7 +3857,9 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
                         let key = strs[name as usize].as_str();
-                        if let Some((b, kind, owner)) = self.resolve_private(&key) {
+                        let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+                        let site = super::values::private_site(func_id as u32, name as u32);
+                        if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
                             // Declaring-class-resolved, KIND-aware write (spec
                             // PrivateSet).
                             if !self.private_receiver_ok(o, b, kind, owner) {
@@ -3863,7 +3869,7 @@ impl<'p> Vm<'p> {
                             }
                             if kind & 7 == 0 {
                                 // PrivateFieldSet: the entry must EXIST.
-                                if !self.private_field_set(o, b, &key, v, false) {
+                                if !self.private_field_set_id(o, b, pid, v, false) {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                     )));
@@ -4440,7 +4446,8 @@ impl<'p> Vm<'p> {
                         let mut private_callee: Option<Value> = None;
                         if is_private_key(key) {
                             let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                            private_callee = self.private_method_callee(ctx, recv, key)?;
+                            let site = super::values::private_site(func_id as u32, name as u32);
+                            private_callee = self.private_method_callee(ctx, recv, key, Some(site))?;
                         }
                         // `map.get(k)` / `map.set(k, v)` / `map.has(k)` on a
                         // Map receiver: the receiver-kind dispatcher's Map
