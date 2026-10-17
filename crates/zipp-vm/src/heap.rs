@@ -3355,6 +3355,13 @@ impl ObjMap {
         }
     }
 
+    /// Whether a lookup here hashes the key (the map has its index): a
+    /// caller that may append can then hash once for both.
+    #[inline]
+    pub(crate) fn is_indexed(&self) -> bool {
+        self.index.is_some()
+    }
+
     /// B219: `pos` with the key's tag supplied by the caller, for the append
     /// path that will re-use the same tag for the table insert. The unindexed
     /// arm ignores it (a linear scan hashes nothing).

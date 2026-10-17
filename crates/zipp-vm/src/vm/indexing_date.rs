@@ -959,7 +959,11 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            // hit: own writable data slot; add: proven-clean new key.
+            // hit: own writable data slot; add: proven-clean new key, owned,
+            // with its tag. B219 as in `try_set_index_concat_prebuilt`: an
+            // indexed map's key is hashed once for its probe, the chain's
+            // probes and the insert, and an unindexed map's only to append.
+            let once = crate::heap::hash_once_enabled();
             let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
                 // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
                 Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
@@ -967,24 +971,26 @@ impl<'p> Vm<'p> {
                         // (A class prototype's writes must reach `set_prop`,
                         // which records when they retire its member tables.)
                         (Ok(k), HeapObj::Object(m)) if k != "__proto__" && !m.class_proto => {
-                            match m.pos(k) {
+                            let tag = (once && m.is_indexed()).then(|| crate::heap::prop_tag_of(k));
+                            match tag.map_or_else(|| m.pos(k), |t| m.pos_tagged(k, t)) {
                                 Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
-                                    (Some(i), false)
+                                    (Some(i), None)
                                 }
-                                Some(_) => (None, false),
-                                None => (
-                                    None,
-                                    m.extensible
+                                Some(_) => (None, None),
+                                None => {
+                                    let tag = once.then(|| tag.unwrap_or_else(|| crate::heap::prop_tag_of(k)));
+                                    let clear = m.extensible
                                         && m.class.is_none()
                                         && !m.is_ctor
-                                        && self.plain_add_chain_clear(idx, k),
-                                ),
+                                        && self.plain_add_chain_clear_tagged(idx, k, tag);
+                                    (None, clear.then(|| (k.to_owned(), tag)))
+                                }
                             }
                         }
-                        _ => (None, false),
+                        _ => (None, None),
                     }
                 }
-                _ => (None, false),
+                _ => (None, None),
             };
             if let Some(i) = hit {
                 self.keyed_memo_put(idx, key.heap_index(), i);
@@ -993,19 +999,14 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            if add {
-                let ks: Option<String> = match self.heap.str_wtf8_cow(key.heap_index()) {
-                    Some(std::borrow::Cow::Borrowed(b)) => {
-                        std::str::from_utf8(b).ok().map(|s| s.to_string())
+            if let Some((ks, tag)) = add {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    match tag {
+                        Some(tag) => m.push_data_tagged(ks, val, tag),
+                        None => m.push_data(ks, val),
                     }
-                    _ => None,
-                };
-                if let Some(ks) = ks {
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.push_data(ks, val);
-                        self.heap.bump_version(idx); // key add reallocs vals (IC)
-                        return Ok(());
-                    }
+                    self.heap.bump_version(idx); // key add reallocs vals (IC)
+                    return Ok(());
                 }
             }
         }
