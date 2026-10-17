@@ -1116,6 +1116,55 @@ impl<'p> Vm<'p> {
         Ok(self.private_field_scan(recv, key))
     }
 
+    /// `key in obj` for a flat string `key` and a plain object `idx`, read off
+    /// the key string where it lies: the answer `has_property_dyn`'s
+    /// plain-object arm gives, level for level, when every level of the chain
+    /// takes that arm. That arm spelled the key afresh with `key_of` at the
+    /// receiver and again at each prototype it recursed into, so a miss on a
+    /// dictionary paid two allocations and two copies of the key.
+    ///
+    /// `None` leaves it to that arm: a Symbol or `@@`-escaped key, a string
+    /// with a lone surrogate (`key_of` spells it lossily), a deferred
+    /// namespace anywhere, and any level that is not an ordinary object, is a
+    /// class instance (its member tables answer), the global object (its
+    /// slot-backed properties) or `%Array.prototype%` (its exotic `length`).
+    fn plain_string_key_has(&self, idx: u32, key: Value) -> Option<bool> {
+        if !key.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return None;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return None;
+        }
+        let key = js.as_str_wf();
+        let mut cur = idx;
+        for _ in 0..64 {
+            if (cur == self.global_this && self.global_this != 0)
+                || (cur == self.arr_proto && self.arr_proto != 0)
+            {
+                return None;
+            }
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return None;
+            };
+            if m.pos(key).is_some() {
+                return Some(true);
+            }
+            if m.class.is_some() {
+                return None;
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(false),
+                None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
+                None => return Some(false),
+            };
+        }
+        None
+    }
+
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
     /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
     /// Proxy AND when a Proxy sits in the prototype chain (e.g.
@@ -1172,6 +1221,12 @@ impl<'p> Vm<'p> {
         // via has_property_dyn, using has_property's proto resolution. Each
         // `self.heap.get` borrow is scoped so the recursive &mut call is free.
         if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            if key.is_heap() {
+                self.heap.flatten(key.heap_index());
+            }
+            if let Some(found) = self.plain_string_key_has(idx, key) {
+                return Ok(found);
+            }
             let k = self.key_of(key);
             if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
                 return Ok(true);

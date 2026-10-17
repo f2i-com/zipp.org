@@ -2078,7 +2078,11 @@ impl<'p> Vm<'p> {
                     self.require_object_coercible(this)?;
                     return Ok(Value::bool(b));
                 }
-                // An object receiver: ToObject cannot throw.
+                // An object receiver: ToObject cannot throw. A rope key is
+                // flattened first so that it too is read in place.
+                if a0.is_heap() {
+                    self.heap.flatten(a0.heap_index());
+                }
                 if let Some(b) = self.has_own_str_fast(this, a0) {
                     return Ok(Value::bool(b));
                 }
@@ -3725,8 +3729,21 @@ impl<'p> Vm<'p> {
             }
             OBJ_HAS_OWN => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let p = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // hasOwnProperty's fast paths: both take an object `o`, for
+                // which ToObject cannot throw, and a key whose ToPropertyKey
+                // runs no code.
+                if let Some(b) = self.has_own_index_fast(o, p) {
+                    return Ok(Value::bool(b));
+                }
+                if p.is_heap() {
+                    self.heap.flatten(p.heap_index());
+                }
+                if let Some(b) = self.has_own_str_fast(o, p) {
+                    return Ok(Value::bool(b));
+                }
                 self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
-                let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let k = self.to_property_key(p)?;
                 Value::bool(self.has_own_property_dyn(o, &k)?)
             }
             OBJ_SET_PROTO_OF => {

@@ -753,15 +753,16 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
-        let Some(std::borrow::Cow::Borrowed(bytes)) = self.heap.str_wtf8_cow(key.heap_index())
-        else {
+        // A flat string's own record says whether it is well-formed, which
+        // is what viewing it as `&str` needs; validating its bytes again was
+        // a tenth of the call.
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
             return None;
         };
-        if bytes.starts_with(b"@@") {
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
             return None;
         }
-        let key = std::str::from_utf8(bytes).ok()?;
-        Some(m.pos(key).is_some())
+        Some(m.pos(js.as_str_wf()).is_some())
     }
 
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {

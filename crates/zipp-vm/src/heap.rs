@@ -232,6 +232,171 @@ fn prop_tag(key: &str) -> u32 {
     ((h ^ (h >> 31)) >> 32) as u32
 }
 
+/// Decrement every occupied entry of `slots` above `slot`: the renumbering a
+/// removal owes the entries the owning map's `Vec::remove` shifted down.
+///
+/// Live slots are positions in a property list, far below 2^31, and
+/// `PROP_EMPTY` is `u32::MAX`, which is -1 as an `i32`; so one SIGNED compare
+/// against `slot` selects exactly the occupied entries above it, and its
+/// all-ones lanes are -1, so adding the mask decrements them. On x86_64 that
+/// is written with SSE2 (part of the baseline; not in the safe-sandbox
+/// profile, which has no unsafe code) rather than left to the loop vectorizer: a profile-guided build whose training only removed from small
+/// maps compiled the plain loop one entry at a time, which made a removal
+/// from a 2,000-key dictionary four times slower than without the profile.
+#[inline]
+fn renumber_above(slots: &mut [u32], slot: u32) {
+    debug_assert!(slot < 1 << 31, "renumber_above: slot {slot} is not a position");
+    #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_add_epi32, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_set1_epi32,
+            _mm_storeu_si128,
+        };
+        let mut chunks = slots.chunks_exact_mut(8);
+        // SAFETY: SSE2 is in every x86_64 target's baseline. Each unaligned
+        // load and store covers four u32s inside one 8-element chunk.
+        unsafe {
+            let pivot = _mm_set1_epi32(slot as i32);
+            for chunk in &mut chunks {
+                let lo = chunk.as_mut_ptr().cast::<__m128i>();
+                let hi = chunk.as_mut_ptr().add(4).cast::<__m128i>();
+                let a = _mm_loadu_si128(lo);
+                let b = _mm_loadu_si128(hi);
+                _mm_storeu_si128(lo, _mm_add_epi32(a, _mm_cmpgt_epi32(a, pivot)));
+                _mm_storeu_si128(hi, _mm_add_epi32(b, _mm_cmpgt_epi32(b, pivot)));
+            }
+        }
+        for s in chunks.into_remainder() {
+            *s -= ((*s as i32) > slot as i32) as u32;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+    for s in slots.iter_mut() {
+        *s -= ((*s as i32) > slot as i32) as u32;
+    }
+}
+
+/// [`ObjMap`]'s side index for canonical Array-index keys: index -> slot, in
+/// [`PropIndex::Split`]'s layout (parallel arrays, linear probing,
+/// backward-shift removal) so that a removal renumbers it with the same
+/// contiguous [`renumber_above`] sweep. It was a hash map, whose values sit
+/// between its keys: renumbering them walked every bucket one at a time, and
+/// cost a dictionary with a few hundred integer-like keys half a microsecond
+/// per `delete` of any key. Buckets come from Fibonacci hashing (the high bits
+/// of the product), so indices that share their low bits, such as multiples
+/// of 1024, still spread.
+#[derive(Clone, Debug)]
+struct NumIndex {
+    idx: Vec<u32>,
+    /// `PROP_EMPTY` marks a free bucket; `idx[i]` is meaningful only otherwise.
+    slots: Vec<u32>,
+    /// `32 - log2(capacity)`.
+    shift: u32,
+    len: usize,
+}
+
+impl NumIndex {
+    fn with_capacity(cap: usize) -> NumIndex {
+        debug_assert!(cap.is_power_of_two() && cap >= 16);
+        NumIndex {
+            idx: vec![0; cap],
+            slots: vec![PROP_EMPTY; cap],
+            shift: 32 - cap.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    fn new() -> NumIndex {
+        NumIndex::with_capacity(16)
+    }
+
+    #[inline]
+    fn bucket(&self, n: u32) -> usize {
+        (n.wrapping_mul(0x9E37_79B9) >> self.shift) as usize
+    }
+
+    #[inline]
+    fn get(&self, n: u32) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.bucket(n);
+        loop {
+            let s = self.slots[i];
+            if s == PROP_EMPTY {
+                return None;
+            }
+            if self.idx[i] == n {
+                return Some(s);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Record `n` at `slot`, replacing any entry `n` already has.
+    fn insert(&mut self, n: u32, slot: u32) {
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            let mut grown = NumIndex::with_capacity(self.slots.len() * 2);
+            for (&k, &s) in self.idx.iter().zip(&self.slots) {
+                if s != PROP_EMPTY {
+                    grown.insert(k, s);
+                }
+            }
+            *self = grown;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.bucket(n);
+        loop {
+            if self.slots[i] == PROP_EMPTY {
+                self.idx[i] = n;
+                self.slots[i] = slot;
+                self.len += 1;
+                return;
+            }
+            if self.idx[i] == n {
+                self.slots[i] = slot;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Forget `n` (absent is fine), backward-shift-deleting its bucket as
+    /// [`PropIndex::remove_slot`] does.
+    fn remove(&mut self, n: u32) {
+        let mask = self.slots.len() - 1;
+        let mut j = self.bucket(n);
+        loop {
+            if self.slots[j] == PROP_EMPTY {
+                return;
+            }
+            if self.idx[j] == n {
+                break;
+            }
+            j = (j + 1) & mask;
+        }
+        self.slots[j] = PROP_EMPTY;
+        self.len -= 1;
+        let mut k = (j + 1) & mask;
+        loop {
+            let ks = self.slots[k];
+            if ks == PROP_EMPTY {
+                break;
+            }
+            let ideal = self.bucket(self.idx[k]);
+            if (j.wrapping_sub(ideal) & mask) < (k.wrapping_sub(ideal) & mask) {
+                self.idx[j] = self.idx[k];
+                self.slots[j] = ks;
+                self.slots[k] = PROP_EMPTY;
+                j = k;
+            }
+            k = (k + 1) & mask;
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        vec_capacity_bytes(&self.idx).saturating_add(vec_capacity_bytes(&self.slots))
+    }
+}
+
 /// Hash index over an [`ObjMap`]'s `keys`: a flat open-addressing table of
 /// `(tag, slot)` pairs with linear probing (the CollIndex shape — 8-byte
 /// entries pack eight to a cache line, so a lookup is typically one random
@@ -693,15 +858,8 @@ impl PropIndex {
                 }
                 *len -= 1;
                 // The renumber sweep, and the whole point of the split: one
-                // contiguous u32 store per entry, written UNCONDITIONALLY so the
-                // loop vectorizes. `PROP_EMPTY` is `u32::MAX`, so it satisfies
-                // `v > slot` and must be excluded explicitly — the second
-                // conjunct is not redundant.
-                for s in slots.iter_mut() {
-                    let v = *s;
-                    let dec = ((v > slot) as u32) & ((v != PROP_EMPTY) as u32);
-                    *s = v - dec;
-                }
+                // contiguous u32 store per entry.
+                renumber_above(slots, slot);
             }
         }
     }
@@ -1421,7 +1579,7 @@ pub struct ObjMap {
     /// created lazily only for maps that actually acquire an Array index, so an
     /// ordinary named-property object pays one nullable pointer and no heap
     /// allocation. Slots point into the authoritative parallel vectors.
-    numeric_index: Option<Box<rustc_hash::FxHashMap<u32, u32>>>,
+    numeric_index: Option<Box<NumIndex>>,
     /// Does any key in this map name an ELEMENT of the exotic object it hangs
     /// off — a canonical decimal index, or `"length"`? Maintained by the same
     /// three appends and one removal that maintain `shape`, and read only
@@ -2074,13 +2232,7 @@ impl ObjMap {
             n = n.saturating_add(index.resident_bytes());
         }
         if let Some(index) = &self.numeric_index {
-            // Hash table control bytes are implementation-private. Two buckets'
-            // worth per reported entry is a conservative stable approximation.
-            n = n.saturating_add(
-                index
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(u32, u32)>() * 2),
-            );
+            n = n.saturating_add(index.resident_bytes());
         }
         n
     }
@@ -2657,7 +2809,7 @@ impl ObjMap {
         // The same cold tails `finalized_from_store` builds, on the same
         // conditions.
         if self.has_element_key && sparse_num_index_enabled() {
-            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            let mut numeric = Box::new(NumIndex::new());
             for (slot, key) in self.keys.as_ref().iter().enumerate() {
                 if let Some(idx) = canonical_array_index_key(key) {
                     numeric.insert(idx, slot as u32);
@@ -2707,7 +2859,7 @@ impl ObjMap {
         // numeric side index for element-naming keys, and the key index past
         // the probe threshold. Both are rare for finalize-eligible literals.
         if has_element_key && sparse_num_index_enabled() {
-            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            let mut numeric = Box::new(NumIndex::new());
             for (slot, key) in m.keys.as_ref().iter().enumerate() {
                 if let Some(idx) = canonical_array_index_key(key) {
                     numeric.insert(idx, slot as u32);
@@ -2957,8 +3109,7 @@ impl ObjMap {
             return self
                 .numeric_index
                 .as_ref()?
-                .get(&index)
-                .copied()
+                .get(index)
                 .map(|slot| slot as usize);
         }
         let mut buf = [0u8; 20];
@@ -2985,7 +3136,7 @@ impl ObjMap {
         if sparse_num_index_enabled() {
             if let Some(n) = canonical_array_index_key(&self.keys[slot]) {
                 self.numeric_index
-                    .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()))
+                    .get_or_insert_with(|| Box::new(NumIndex::new()))
                     .insert(n, slot as u32);
             }
         }
@@ -3226,16 +3377,10 @@ impl ObjMap {
         }
         if let Some(numeric) = &mut self.numeric_index {
             if let Some(n) = canonical_array_index_key(&key) {
-                numeric.remove(&n);
+                numeric.remove(n);
             }
-            // `Vec::remove` shifted every later property down by one. Deletes
-            // are cold; updating the compact u32 slots in place avoids hashing
-            // every surviving decimal key again.
-            for slot in numeric.values_mut() {
-                if (*slot as usize) > i {
-                    *slot -= 1;
-                }
-            }
+            // `Vec::remove` shifted every later property down by one.
+            renumber_above(&mut numeric.slots, i as u32);
         }
         if let Some(ix) = &mut self.index {
             if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
@@ -11418,6 +11563,84 @@ mod tests {
         assert!(m.remove("7"));
         assert_eq!(m.element_pos(7), None);
         assert_eq!(m.element_pos(123456), m.pos("123456"));
+    }
+
+    /// The SSE2 sweep and its scalar tail against the plain predicate, over
+    /// lengths that are and are not multiples of its 8-entry chunk, with free
+    /// buckets (`PROP_EMPTY`) mixed in.
+    #[test]
+    fn renumber_above_decrements_exactly_the_occupied_slots_above() {
+        for len in [0usize, 1, 7, 8, 9, 31, 32, 33, 4096] {
+            let mut slots: Vec<u32> = (0..len as u32)
+                .map(|i| if i % 5 == 3 { PROP_EMPTY } else { (i * 7919) % 5000 })
+                .collect();
+            for pivot in [0u32, 1, 2500, 4999, 5000] {
+                let want: Vec<u32> = slots
+                    .iter()
+                    .map(|&v| if v != PROP_EMPTY && v > pivot { v - 1 } else { v })
+                    .collect();
+                renumber_above(&mut slots, pivot);
+                assert_eq!(slots, want, "len {len} pivot {pivot}");
+            }
+        }
+    }
+
+    /// NumIndex against a reference map through growth, replacement and
+    /// backward-shift removal, on keys that share their low bits.
+    #[test]
+    fn num_index_matches_a_reference_map() {
+        let mut ix = NumIndex::new();
+        let mut want = std::collections::HashMap::new();
+        let keys: Vec<u32> = (0..3000u32)
+            .map(|i| if i % 3 == 0 { i * 1024 } else { i.wrapping_mul(2_654_435_761) >> 1 })
+            .collect();
+        for (slot, &k) in keys.iter().enumerate() {
+            ix.insert(k, slot as u32);
+            want.insert(k, slot as u32);
+        }
+        ix.insert(keys[10], 99_999);
+        want.insert(keys[10], 99_999);
+        for &k in keys.iter().step_by(4) {
+            ix.remove(k);
+            want.remove(&k);
+        }
+        ix.remove(7); // absent
+        assert_eq!(ix.len, want.len());
+        for &k in &keys {
+            assert_eq!(ix.get(k), want.get(&k).copied(), "key {k}");
+        }
+        assert_eq!(ix.get(u32::MAX - 1), None);
+    }
+
+    /// A dictionary with integer-like keys stays consistent through deletes
+    /// of both kinds of key in a scattered order: every survivor is found at
+    /// its position by name and by index.
+    #[test]
+    fn deletes_from_a_mixed_dictionary_keep_both_indexes() {
+        let mut m = ObjMap::new();
+        let keys: Vec<String> = (0..2100u32)
+            .map(|i| if i % 7 < 2 { (100_000 + i * 13).to_string() } else { format!("key_{i}") })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            m.set(k, Value::int(i as i32));
+        }
+        let mut live = vec![true; keys.len()];
+        for step in (0..keys.len()).step_by(2) {
+            let i = (step * 1031) % keys.len();
+            assert!(m.remove(&keys[i]));
+            live[i] = false;
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let pos = m.pos(k);
+            assert_eq!(pos.is_some(), live[i], "{k}");
+            if let Some(p) = pos {
+                assert_eq!(m.vals[p], Value::int(i as i32), "{k}");
+                assert_eq!(&m.keys[p], k);
+            }
+            if let Some(n) = canonical_array_index_key(k) {
+                assert_eq!(m.element_pos(n as usize), pos, "{k}");
+            }
+        }
     }
 
     /// The renumber sweep after a delete must leave EVERY surviving key
