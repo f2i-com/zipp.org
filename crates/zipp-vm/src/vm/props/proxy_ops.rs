@@ -74,7 +74,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let HeapObj::Object(m) = self.heap.get(idx) else {
-            return None;
+            return self.plain_array_target_desc(idx, key);
         };
         if m.is_ctor {
             return None;
@@ -98,6 +98,28 @@ impl<'p> Vm<'p> {
         } else {
             (true, raw, a.writable, false, false)
         }))
+    }
+
+    /// [`Self::plain_target_desc`] for an array target with nothing in a side
+    /// table: its elements are configurable (no invariant applies, present
+    /// or not), and its `length` is the non-configurable data property whose
+    /// writability `array_length_nonwritable` records. `None` for anything
+    /// else: an arguments object (configurable `length`, mapped elements),
+    /// any other kind of object, and any other key. Out of line, so the
+    /// ordinary-object path compiles as it did.
+    #[inline(never)]
+    fn plain_array_target_desc(&self, idx: u32, key: &str) -> Option<Option<(bool, Value, bool, bool, bool)>> {
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.arguments_objs.contains_key(&idx)
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+        {
+            return None;
+        }
+        if key == "length" {
+            let writable = !self.array_length_nonwritable.contains(&idx);
+            return Some(Some((true, len_value(self.js_array_len(idx)), writable, false, false)));
+        }
+        crate::heap::canonical_array_index_key(key).map(|_| None)
     }
 
     /// Whether the Proxy `handler` certainly has no `name` trap, found without

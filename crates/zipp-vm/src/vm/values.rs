@@ -1283,6 +1283,63 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// `Reflect.get(target, key, receiver)` for a flat string `key` that
+    /// `target`, an ordinary object or array, holds as an own data property:
+    /// its value, which no receiver can change (only an accessor would see
+    /// one). A trap forwarding with `Reflect.get(t, k, recv)` spelled the key
+    /// afresh as a String for every read. `None` leaves it to the general
+    /// path, with the exclusions of [`Vm::plain_string_key_has`], a module
+    /// namespace's or class instance's own tables, and an array with a side
+    /// table or an arguments object.
+    pub(crate) fn plain_own_data_get(&self, target: Value, key: Value) -> Option<Value> {
+        if !target.is_heap() || !key.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let idx = target.heap_index();
+        if (idx == self.global_this && self.global_this != 0)
+            || (idx == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+        {
+            return None;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return None;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return self.plain_array_own_data_get(idx, js.as_str_wf());
+        };
+        if m.class.is_some() {
+            return None;
+        }
+        let slot = m.pos(js.as_str_wf())?;
+        let v = m.val_at(slot);
+        (!m.attr_at(slot).accessor && !v.is_uninitialized()).then_some(v)
+    }
+
+    /// [`Vm::plain_own_data_get`] for an array with nothing in a side table: a
+    /// present element or its `length`. `None` for anything else: an
+    /// arguments object (its elements are mapped to its frame, its `length`
+    /// is its own), a hole (the read goes on to the chain), any other kind of
+    /// object, any other key. Out of line, so the ordinary-object path
+    /// compiles as it did.
+    #[inline(never)]
+    fn plain_array_own_data_get(&self, idx: u32, key: &str) -> Option<Value> {
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        if self.arguments_objs.contains_key(&idx) || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx)) {
+            return None;
+        }
+        if key == "length" {
+            return Some(len_value(self.js_array_len(idx)));
+        }
+        let v = *items.get(crate::heap::canonical_array_index_key(key)? as usize)?;
+        (!v.is_hole()).then_some(v)
+    }
+
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
     /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
     /// Proxy AND when a Proxy sits in the prototype chain (e.g.

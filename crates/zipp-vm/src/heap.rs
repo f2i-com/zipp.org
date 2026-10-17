@@ -1015,7 +1015,7 @@ pub(crate) fn key_names_element(key: &str) -> bool {
 /// allocating.  `2^32 - 1` is deliberately excluded: it is a named property,
 /// not an Array index, even though it is all decimal digits.
 #[inline]
-fn canonical_array_index_key(key: &str) -> Option<u32> {
+pub(crate) fn canonical_array_index_key(key: &str) -> Option<u32> {
     let b = key.as_bytes();
     if b.is_empty() || (b.len() > 1 && b[0] == b'0') || b.len() > 10 {
         return None;

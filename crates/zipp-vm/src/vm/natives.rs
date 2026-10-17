@@ -4427,6 +4427,8 @@ impl<'p> Vm<'p> {
                 let receiver = args.get(2).copied().unwrap_or(a0);
                 if receiver == a0 {
                     self.get_index(a0, a1)?
+                } else if let Some(v) = self.plain_own_data_get(a0, a1) {
+                    v
                 } else {
                     let key = self.to_property_key(a1)?;
                     self.get_member(a0, &key, receiver)?
