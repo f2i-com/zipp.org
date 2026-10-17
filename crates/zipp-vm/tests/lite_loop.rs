@@ -92,6 +92,39 @@ var sparse = []; sparse[100000] = 9; sparse[3] = 4;
 function sumSparse(a) { var s = 0; for (var i = 0; i < 6; i++) { var v = a[i]; if (v !== undefined) s = s + v; } return s + a[100000]; }
 log("sparse", sumSparse(sparse));
 
+// Closures: captured state read and written, arrows (a captured `this`),
+// a default parameter, `Math` methods (and one replaced mid-run), a captured
+// `const`, a binding read before its initialisation, a named function
+// expression assigning its own name.
+function makeCounter(seed) {
+  let calls = 0, offset = seed | 0;
+  function rot(v, amount = 5) { return (v << amount) | (v >>> (32 - amount)); }
+  return (v, salt) => { calls = (calls + 1) | 0; if ((calls & 7) === 0) offset = (offset + seed) | 0; v = Math.imul(v ^ salt ^ offset, 1664525); return (rot(v, (seed & 7) + 1) + calls) | 0; };
+}
+var counters = [makeCounter(3), makeCounter(17)], cs = 1;
+for (var ci = 0; ci < 50; ci++) cs = counters[ci & 1](cs, ci);
+log("closures-captured", cs);
+var arrowHost = { k: 4, run: function (n) { var add = (x) => x + this.k; var s = 0; for (var i = 0; i < n; i++) s = s + add(i); return s; } };
+log("arrow-this", arrowHost.run(10));
+function mathMix(n) { var s = 0; for (var i = 1; i <= n; i++) { s = s + Math.imul(i, 2654435761) + Math.max(i, 3) + Math.floor(i / 3) + Math.abs(-i); } return s; }
+log("math", mathMix(20));
+var realMax = Math.max; Math.max = function (a, b) { return -1; };
+log("math-replaced", mathMix(3));
+Math.max = realMax;
+function constCapture() { const k = 1; return function () { var s = 0; for (var i = 0; i < 3; i++) s = s + k; k = 2; return s; }; }
+log("const-capture", catchName(constCapture()));
+function tdzCapture() { var f = function () { return later + 1; }; var r = catchName(f); let later = 1; return r + " " + f(); }
+log("tdz-capture", tdzCapture());
+var named = function self(n) { var s = 0; for (var i = 0; i < n; i++) s = s + i; self = null; return s + (typeof self); };
+log("fn-name", named(4));
+
+// `length` of every receiver kind, the bound of most loops.
+function lens(xs) { var s = 0; for (var i = 0; i < xs.length; i++) { var x = xs[i]; s = s + x.length; } return s; }
+var sparseLen = []; sparseLen[9] = 1;
+log("lengths", lens(["ab", [1, 2, 3], new Uint8Array(4), "", { length: 7 }, sparseLen, new Float32Array(new ArrayBuffer(16), 4)]));
+function fnLen(f) { var n = 0; for (var i = 0; i < 2; i++) n = n + f.length; return n; }
+log("fn-length", fnLen(function (a, b) {}), fnLen(Math.max));
+
 // Bitwise, equality and branches on every kind of operand.
 function bits(a, b) { return [a | b, a & b, a ^ b, a << b, a >> b, a >>> b].join(","); }
 log("bits", bits(5, 3), bits(-1, 31), bits(2.9, 1.1), bits("6", "1"), bits(4294967296, 0), bits(NaN, 1));

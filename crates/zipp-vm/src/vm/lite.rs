@@ -91,6 +91,12 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::GetIndex { .. }
             | Instr::GetProp { .. }
             | Instr::SetProp { .. }
+            // A closure's: its captured variables, an absent argument's
+            // default, a `Math` method.
+            | Instr::LoadUndefined { .. }
+            | Instr::UpvalGet { .. }
+            | Instr::UpvalSet { .. }
+            | Instr::MathOp { .. }
     )
 }
 
@@ -100,6 +106,13 @@ fn lite_instr(i: &Instr) -> bool {
 /// call to a function the lite loop does not run, a cache that never
 /// answers) would pay both loops' transitions each time.
 const LITE_HANDOVER_BUDGET: u16 = 64;
+
+/// Instructions an entry into the lite loop must run, before it returns to
+/// a caller in the main loop, to pay for entering and leaving it. A shorter
+/// entry spends one of the entered function's hand-overs: a small function a
+/// main-loop caller calls millions of times (a closure handed to a loop) ran
+/// 13% slower in the lite loop than in the main loop.
+const LITE_MIN_ENTRY_STEPS: u64 = 128;
 
 /// Whether `code` has a loop: a jump to its own position or an earlier one.
 #[cfg(test)]
@@ -209,7 +222,8 @@ impl<'p> Vm<'p> {
         let ok = lite_enabled()
             && !p.is_generator
             && !p.is_async
-            && !p.lexical_this
+            // An arrow's frame takes its captured `this` (`setup_call`; the
+            // lean push hands it there), and its body is ordinary code.
             && p.rest_reg.is_none()
             && p.arguments_reg.is_none()
             && p.code.iter().all(lite_instr)
@@ -299,6 +313,17 @@ impl<'p> Vm<'p> {
         let mut base = self.frames[top].base;
         let mut ip = self.frames[top].ip;
         let mut code: &'p [Instr] = self.lite_fn_code(func_id);
+        // The entered function and the instructions this entry has run
+        // (`LITE_MIN_ENTRY_STEPS`).
+        let entry_fid = func_id;
+        let mut steps: u64 = 0;
+        macro_rules! short_entry {
+            () => {
+                if steps < LITE_MIN_ENTRY_STEPS {
+                    self.lite_handed_over(entry_fid);
+                }
+            };
+        }
         // Hand the instruction at `ip` to the main loop.
         macro_rules! hand_over {
             () => {{
@@ -323,12 +348,14 @@ impl<'p> Vm<'p> {
             ($v:expr) => {{
                 let v = $v;
                 if self.pop_frame_fast(v, stop_depth) {
+                    short_entry!();
                     return Ok(LiteExit::Done(v));
                 }
                 self.maybe_gc();
                 top = self.frames.len() - 1;
                 func_id = self.frames[top].func;
                 if !self.lite_eligible(func_id) {
+                    short_entry!();
                     return Ok(LiteExit::Resume);
                 }
                 base = self.frames[top].base;
@@ -337,6 +364,7 @@ impl<'p> Vm<'p> {
             }};
         }
         loop {
+            steps = steps.wrapping_add(1);
             match code[ip] {
                 Instr::LoadInt { dst, val } => {
                     self.set(base, dst, Value::int(val));
@@ -588,17 +616,21 @@ impl<'p> Vm<'p> {
                 }
                 Instr::GetIndex { dst, obj, key } => {
                     let (o, k) = (self.get(base, obj), self.get(base, key));
-                    // The main arm's two leaves, in its order: a numeric
-                    // typed array's element, then a present dense element.
-                    if o.is_heap() {
-                        let ta_idx = o.heap_index();
-                        if let HeapObj::TypedArray {
+                    if !o.is_heap() {
+                        hand_over!();
+                    }
+                    // The main arm's two leaves from one look at the object:
+                    // a numeric typed array's element, then (as
+                    // `interp_dense_int_get`) a present dense element of an
+                    // array with no element override and no arguments map.
+                    let idx = o.heap_index();
+                    let r = match self.heap.get(idx) {
+                        HeapObj::TypedArray {
                             buffer,
                             kind,
                             byte_offset,
                             length,
-                        } = self.heap.get(ta_idx)
-                        {
+                        } => {
                             if native::TA_KINDS[*kind as usize].2 {
                                 hand_over!();
                             }
@@ -606,7 +638,7 @@ impl<'p> Vm<'p> {
                                 hand_over!();
                             };
                             let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                                ta_idx,
+                                idx,
                                 *buffer,
                                 *kind,
                                 *byte_offset,
@@ -615,13 +647,24 @@ impl<'p> Vm<'p> {
                             let Some(r) = self.ta_interp_numeric_get_view(view, i) else {
                                 hand_over!();
                             };
-                            self.set(base, dst, r);
-                            ip += 1;
-                            continue;
+                            r
                         }
-                    }
-                    let Some(r) = self.interp_dense_int_get(o, k) else {
-                        hand_over!();
+                        HeapObj::Array(items) => {
+                            if !k.is_int() || k.as_int() < 0 {
+                                hand_over!();
+                            }
+                            let Some(&v) = items.get(k.as_int() as usize) else {
+                                hand_over!();
+                            };
+                            if v.is_hole()
+                                || self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
+                                || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx))
+                            {
+                                hand_over!();
+                            }
+                            v
+                        }
+                        _ => hand_over!(),
                     };
                     self.set(base, dst, r);
                     ip += 1;
@@ -634,16 +677,33 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                     // The caches answer only plain objects, for which the
-                    // main arm's steps before its cache (a string's, an
-                    // array's or a typed array's `length`, a shapeless
-                    // receiver's intrinsic) answer nothing, and a function
-                    // here names no private member (`lite_decide`). Any
-                    // other receiver, and anything the cache does not
-                    // answer with a value, is the main loop's.
-                    if !o.is_heap() || !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                    // main arm's steps before its cache answer nothing, and
+                    // a function here names no private member
+                    // (`lite_decide`). For any other receiver those steps
+                    // are the answer: a string's, an array's or a typed
+                    // array's `length`, a shapeless receiver's prototype
+                    // intrinsic (`arr.push`). Anything else, and anything
+                    // the cache does not answer with a value, is the main
+                    // loop's.
+                    if !o.is_heap() {
                         hand_over!();
                     }
                     let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                    if !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                        if key == "length" {
+                            if let Some(v) = self.length_fast(o) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        if let Some(bits) = self.proto_intrinsic_read(o, key) {
+                            self.set(base, dst, Value::from_bits(bits));
+                            ip += 1;
+                            continue;
+                        }
+                        hand_over!();
+                    }
                     match self.ic_get_prop(func_id, ip, o, key) {
                         GetAct::Value(v) => {
                             self.set(base, dst, v);
@@ -651,6 +711,58 @@ impl<'p> Vm<'p> {
                         }
                         _ => hand_over!(),
                     }
+                }
+                Instr::LoadUndefined { dst } => {
+                    self.set(base, dst, Value::UNDEFINED);
+                    ip += 1;
+                }
+                Instr::UpvalGet { dst, idx } => {
+                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
+                    let v = self.heap.cell_get(cell);
+                    // A binding still in its TDZ throws, in the main arm.
+                    if v.is_uninitialized() {
+                        hand_over!();
+                    }
+                    self.set(base, dst, v);
+                    ip += 1;
+                }
+                Instr::UpvalSet { idx, src } => {
+                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
+                    // A captured `const`, a named function expression's own
+                    // name and a binding in its TDZ are the main arm's (it
+                    // throws or, for the name in sloppy code, does nothing).
+                    if (!self.const_cells.is_empty() && self.const_cells.contains(&cell))
+                        || (!self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell))
+                        || self.heap.cell_get(cell).is_uninitialized()
+                    {
+                        hand_over!();
+                    }
+                    let v = self.get(base, src);
+                    self.heap.cell_set(cell, v);
+                    ip += 1;
+                }
+                Instr::MathOp {
+                    dst,
+                    op,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                } => {
+                    // The main arm's intrinsic checks; a `Math` method that is
+                    // no longer the builtin is its ordinary call, there.
+                    let intrinsic = if callee == crate::bytecode::NO_REG {
+                        self.math_bare_is_intrinsic(op, this_v as u32)
+                    } else {
+                        let (c, t) = (self.get(base, callee), self.get(base, this_v));
+                        self.static_builtin_is_intrinsic("Math", native::MATH_METHOD_BASE + op as u16, c, t)
+                    };
+                    if !intrinsic {
+                        hand_over!();
+                    }
+                    let r = self.eval_math(op, base, arg_base, argc)?;
+                    self.set(base, dst, Value::num(r));
+                    ip += 1;
                 }
                 Instr::SetProp { obj, val, .. } => {
                     let o = self.get(base, obj);
@@ -738,7 +850,9 @@ mod tests {
                    function other(o) { return typeof o === 'number' ? 1 : 0; } \
                    function callsOut(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + other(i); } return s; } \
                    function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
-                   console.log(loopSum(10) + callsOut(200) + fib(10));";
+                   function tiny(x) { return x + 1; } \
+                   for (var t = 0, u = 0; t < 200; t++) u = tiny(u); \
+                   console.log(loopSum(10) + callsOut(200) + fib(10) + u);";
         let ast = crate::front::parse_auto(src).expect("parse");
         let program = crate::compile::compile_program(&ast, src).expect("compile");
         let fid = |name: &str| program.functions.iter().position(|f| f.name == name).expect(name) as u32;
@@ -748,10 +862,11 @@ mod tests {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         vm.set_jit_enabled(false);
         vm.run().expect("run");
-        assert_eq!(vm.output, ["300"]);
+        assert_eq!(vm.output, ["500"]);
         if lite_enabled() {
             assert!(vm.lite_eligible(lp), "loopSum runs in the lite loop");
-            assert!(vm.lite_eligible(fb), "fib runs in the lite loop");
+            assert!(vm.lite_eligible(fb), "fib runs in the lite loop (its entry is long)");
+            assert!(!vm.lite_eligible(fid("tiny")), "tiny's short entries from the main program spent its budget");
             assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
             // Eligible by its instructions, so only the budget sent it back.
             let p = &program.functions[out as usize];
