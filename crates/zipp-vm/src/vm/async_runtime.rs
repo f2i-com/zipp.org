@@ -2657,6 +2657,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// PromiseResolve(C, x), the body of `Promise.resolve` and of a normally
+    /// completing `Promise.try`: `x` itself when it is a promise whose
+    /// `constructor` is `C`, else a new promise of `C` resolved with `x`
+    /// (the native `Promise` takes the internal path; any other `C` runs
+    /// NewPromiseCapability and observably calls its resolve).
+    pub(crate) fn promise_resolve_with(&mut self, c: Value, x: Value) -> Result<Value, Thrown> {
+        let is_promise = x.is_heap() && matches!(self.heap.get(x.heap_index()), HeapObj::Promise { .. });
+        if c == self.promise_ctor_value() {
+            // Step 2: `x` is returned as is only when Get(x, "constructor")
+            // is C; a promise whose constructor was changed is adopted.
+            if is_promise && self.get_prop(x, "constructor")? != c {
+                let p = self.alloc_promise();
+                self.resolve_fresh_promise(p, x);
+                return Ok(Value::heap(p));
+            }
+            return Ok(Value::heap(self.to_promise(x)));
+        }
+        if is_promise && self.get_prop(x, "constructor")? == c {
+            return Ok(x);
+        }
+        let (promise, resolve, _) = self.new_promise_capability(c)?;
+        self.with_promise_operation_roots(&[promise, resolve], |vm| vm.call_value(resolve, Value::UNDEFINED, &[x]))?;
+        Ok(promise)
+    }
+
     /// `Promise.resolve` as an internal helper: a Promise passes through (identity
     /// preserved); any other value is wrapped in a fulfilled promise. The basis of
     /// awaiting a non-promise (`await 5` still yields a microtask tick).

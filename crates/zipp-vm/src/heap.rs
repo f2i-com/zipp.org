@@ -6621,9 +6621,11 @@ pub enum HeapObj {
         live: Option<(u32, u8)>,
     },
     /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
-    /// take,drop,flatMap}`). `source` is the underlying iterator; `kind` selects
-    /// the transform (0=map,1=filter,2=take,3=drop,4=flatMap); `arg` is the
-    /// callback (map/filter/flatMap); `n` is the remaining count (take/drop);
+    /// take,drop,flatMap,chunks,windows}`). `source` is the underlying iterator;
+    /// `kind` selects the transform (0=map,1=filter,2=take,3=drop,4=flatMap,
+    /// 8=chunks,9=windows); `arg` is the callback (map/filter/flatMap) or the
+    /// windows buffer; `n` is the remaining count (take/drop) or the chunk or
+    /// window size (negative: windows' `allow-partial`);
     /// `idx` is the 0-based counter passed to callbacks; `done` marks exhaustion;
     /// `inner` is flatMap's current inner iterator (or UNDEFINED).
     IterHelper {

@@ -1353,7 +1353,18 @@ impl<'p> Vm<'p> {
                         if let Some(e) = opt_err {
                             Err(e) // bad options / import attributes
                         } else if phase == 2 {
-                            Err(self.make_error(3, None)) // SyntaxError: source phase
+                            // import.source: a source text module has no
+                            // source phase (SyntaxError); the test262 host's
+                            // `<module source>` names one that has, the same
+                            // shared object a static `import source` binds.
+                            if spec_str == "<module source>" {
+                                match self.module_source_slot(std::path::Path::new("<module source>")) {
+                                    Ok(s) => Ok(self.globals[s as usize]),
+                                    Err(Thrown(msg)) => Err(self.error_from_thrown(&msg)),
+                                }
+                            } else {
+                                Err(self.make_error(3, None)) // SyntaxError: source phase
+                            }
                         } else if phase == 1 {
                             // import.defer(): the DEFERRED namespace —
                             // loaded, not evaluated. An ASYNC target

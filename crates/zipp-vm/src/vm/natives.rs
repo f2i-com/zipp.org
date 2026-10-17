@@ -4365,9 +4365,14 @@ impl<'p> Vm<'p> {
                 self.alloc_object_current_realm(map)
             }
             PROMISE_TRY => {
-                if !self.is_constructor(this) {
+                // Promise.try(callbackfn, ...args): C must be an Object; the
+                // callback runs first. A normal completion is PromiseResolve(C,
+                // value), so a promise of C comes back unwrapped; a throw
+                // rejects a NewPromiseCapability(C) (either rejects a C that is
+                // not a constructor, after the callback ran).
+                if !self.is_object_value(this) {
                     return Err(Thrown::from_static(
-                        "TypeError: Promise.try called on a non-constructor",
+                        "TypeError: Promise.try called on a non-object",
                     ));
                 }
                 let rest: Vec<Value> = if args.len() > 1 {
@@ -4375,43 +4380,29 @@ impl<'p> Vm<'p> {
                 } else {
                     Vec::new()
                 };
-                if this == self.promise_ctor_value() {
-                    let p = self.alloc_promise();
-                    self.with_promise_resolution_root(p, |vm| {
-                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
-                            Ok(v) => vm.resolve(p, v),
-                            Err(Thrown(msg)) => {
-                                // Preserve the actual thrown VALUE, not a reconstructed
-                                // error from its message string.
-                                let e = match vm.pending_throw.take() {
-                                    Some(v) => v,
-                                    None => vm.alloc_error_from_message(&msg),
-                                };
-                                vm.reject(p, e);
-                            }
+                match self.call_value(a0, Value::UNDEFINED, &rest) {
+                    Ok(v) => self.with_host_roots(&[v], |vm| vm.promise_resolve_with(this, v))?,
+                    Err(Thrown(msg)) => {
+                        // Preserve the actual thrown VALUE, not a reconstructed
+                        // error from its message string.
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        if this == self.promise_ctor_value() {
+                            let p = self.alloc_promise();
+                            self.reject(p, e);
+                            Value::heap(p)
+                        } else {
+                            self.with_host_roots(&[e], |vm| -> Result<Value, Thrown> {
+                                let (promise, _, reject) = vm.new_promise_capability(this)?;
+                                vm.with_promise_operation_roots(&[promise, reject], |vm| {
+                                    vm.call_value(reject, Value::UNDEFINED, &[e])
+                                })?;
+                                Ok(promise)
+                            })?
                         }
-                    });
-                    Value::heap(p)
-                } else {
-                    // NewPromiseCapability(C): settle through C's captured resolve/reject.
-                    let (promise, resolve, reject) = self.new_promise_capability(this)?;
-                    let roots = [promise, resolve, reject];
-                    self.with_promise_operation_roots(&roots, |vm| -> Result<(), Thrown> {
-                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
-                            Ok(v) => {
-                                vm.call_value(resolve, Value::UNDEFINED, &[v])?;
-                            }
-                            Err(Thrown(msg)) => {
-                                let e = match vm.pending_throw.take() {
-                                    Some(v) => v,
-                                    None => vm.alloc_error_from_message(&msg),
-                                };
-                                vm.call_value(reject, Value::UNDEFINED, &[e])?;
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    promise
+                    }
                 }
             }
             // Reflect namespace. apply/construct accept any callable target; the
@@ -5004,7 +4995,8 @@ impl<'p> Vm<'p> {
             }
             // ES2025 Iterator Helpers (%Iterator.prototype%).
             ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
-            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN => {
+            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN | ITER_CHUNKS
+            | ITER_WINDOWS | ITER_INCLUDES => {
                 self.iter_helper_method(id, this, args)?
             }
             ITER_HELPER_NEXT => {
@@ -5921,33 +5913,7 @@ impl<'p> Vm<'p> {
                         // path; a custom `this` runs NewPromiseCapability(this) and
                         // observably Calls its resolve — returning x unchanged when x
                         // is already a promise whose .constructor === this.
-                        if this == self.promise_ctor_value() {
-                            // PromiseResolve step 2: x is returned AS-IS only when
-                            // Get(x, "constructor") is C — a promise whose
-                            // constructor was changed gets a fresh adopting promise.
-                            let is_native_promise = a.is_heap()
-                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. });
-                            if is_native_promise && self.get_prop(a, "constructor")? != this {
-                                let p = self.alloc_promise();
-                                self.resolve_fresh_promise(p, a);
-                                Value::heap(p)
-                            } else {
-                                Value::heap(self.to_promise(a))
-                            }
-                        } else {
-                            let already = a.is_heap()
-                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. })
-                                && self.get_prop(a, "constructor")? == this;
-                            if already {
-                                a
-                            } else {
-                                let (promise, resolve, _) = self.new_promise_capability(this)?;
-                                self.with_promise_operation_roots(&[promise, resolve], |vm| {
-                                    vm.call_value(resolve, Value::UNDEFINED, &[a])
-                                })?;
-                                promise
-                            }
-                        }
+                        self.promise_resolve_with(this, a)?
                     }
                     PROMISE_REJECT => {
                         // As PROMISE_RESOLVE: a custom `this` settles through its own

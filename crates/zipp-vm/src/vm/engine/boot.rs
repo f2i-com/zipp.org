@@ -562,6 +562,7 @@ impl<'p> Vm<'p> {
             shadow_fn_realm: std::collections::HashMap::new(),
             abstractmodulesource_ctor: 0,
             abstractmodulesource_proto: 0,
+            module_source_proto: 0,
             resolver_pair_next: 1,
             resolved_pairs: Vec::new(),
             promise_ctor_intrinsic: 0,

@@ -899,6 +899,9 @@ impl<'p> Vm<'p> {
                 ("every", ITER_EVERY),
                 ("find", ITER_FIND),
                 ("join", ITER_JOIN),
+                ("chunks", ITER_CHUNKS),
+                ("windows", ITER_WINDOWS),
+                ("includes", ITER_INCLUDES),
                 ("@@iterator", ITER_SELF),
                 ("@@dispose", ITER_DISPOSE),
             ],
@@ -2682,6 +2685,13 @@ impl<'p> Vm<'p> {
             self.setup_define(ctor, "length", Value::num(0.0), nameish);
             self.abstractmodulesource_ctor = ctor;
             self.setup_define(p, "constructor", Value::heap(ctor), method_attr);
+            // A source text module's ModuleSource objects inherit from a
+            // host prototype that inherits from %AbstractModuleSource%.prototype
+            // (the [[ModuleSource]] field's requirement, as WebAssembly.Module
+            // objects do from theirs).
+            let host = build(self, &[], None);
+            self.proto_of.insert(host, Value::heap(p));
+            self.module_source_proto = host;
         }
         // Bare global functions as first-class values (the call form is GlobalFn).
         // parse_int_fn/parse_float_fn were allocated up front (shared with Number.*).

@@ -2927,6 +2927,9 @@ pub struct Vm<'p> {
     /// called/constructed and the prototype carries the @@toStringTag accessor.
     abstractmodulesource_ctor: u32,
     abstractmodulesource_proto: u32,
+    /// The prototype of the ModuleSource objects `import source` yields: its own
+    /// [[Prototype]] is `abstractmodulesource_proto`.
+    module_source_proto: u32,
     /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
     /// hands out fresh pair ids; a pair id's bit in `resolved_pairs` is set the
     /// first time either function of the pair fires (ids only — no `Value`s,

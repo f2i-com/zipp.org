@@ -187,6 +187,12 @@ pub const ITER_ZIPKEYED: u16 = 682;
 pub const ITER_DISPOSE: u16 = 683;
 /// `Iterator.prototype.join(separator)`.
 pub const ITER_JOIN: u16 = 684;
+/// `Iterator.prototype.chunks(chunkSize)` (iterator chunking).
+pub const ITER_CHUNKS: u16 = 685;
+/// `Iterator.prototype.windows(windowSize[, undersized])` (iterator chunking).
+pub const ITER_WINDOWS: u16 = 686;
+/// `Iterator.prototype.includes(searchElement[, skippedElements])`.
+pub const ITER_INCLUDES: u16 = 687;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
@@ -1710,6 +1716,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_EVERY => ("every", 1),
         ITER_FIND => ("find", 1),
         ITER_JOIN => ("join", 1),
+        ITER_CHUNKS => ("chunks", 1),
+        ITER_WINDOWS => ("windows", 1),
+        ITER_INCLUDES => ("includes", 1),
         ITER_HELPER_NEXT => ("next", 0),
         ITER_HELPER_RETURN => ("return", 0),
         ITER_FROM => ("from", 1),

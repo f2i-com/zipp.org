@@ -207,8 +207,9 @@ impl<'p> Vm<'p> {
     }
 
     /// The CANONICAL live slot of `key`'s ModuleSource binding (`import
-    /// source`), creating the %AbstractModuleSource%-prototype-linked source
-    /// object on first request. `key` is the canonical target path, or the
+    /// source`), creating the source object on first request (its prototype
+    /// is `module_source_proto`, whose own is %AbstractModuleSource%.prototype).
+    /// `key` is the canonical target path, or the
     /// synthetic `<module source>` host-module key (test262: every
     /// `<module source>` request resolves to ONE shared module record).
     pub(crate) fn module_source_slot(&mut self, key: &std::path::Path) -> Result<u32, Thrown> {
@@ -219,9 +220,9 @@ impl<'p> Vm<'p> {
         let idx = self
             .heap
             .alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new())));
-        if self.abstractmodulesource_proto != 0 {
+        if self.module_source_proto != 0 {
             self.proto_of
-                .insert(idx, Value::heap(self.abstractmodulesource_proto));
+                .insert(idx, Value::heap(self.module_source_proto));
         }
         self.globals[s as usize] = Value::heap(idx);
         self.bump_global_gen(s);

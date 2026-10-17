@@ -936,9 +936,10 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         // GetIteratorDirect(source): read `next` ONCE now (a getter fires once, and a
         // throwing `next` getter propagates here at creation). Single-source helpers
-        // (kinds 0..=5) then step via this cached method; a generator uses the internal
-        // step path, and zip/concat (6/7) hold an Array of sub-iterators.
-        let next = if kind <= 5
+        // (kinds 0..=5, chunks 8, windows 9) then step via this cached method; a
+        // generator uses the internal step path, and zip/concat (6/7) hold an Array
+        // of sub-iterators.
+        let next = if (kind <= 5 || kind == 8 || kind == 9)
             && source.is_heap()
             && !matches!(
                 self.heap.get(source.heap_index()),
@@ -1010,6 +1011,102 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// One step of chunks (kind 8, `n` values a chunk, the chunk being filled
+    /// held in `inner`) or windows (kind 9, the sliding buffer in `arg`, `n`
+    /// the window size, negative for "allow-partial"). Exhaustion yields a
+    /// partial chunk, or under "allow-partial" a never-filled window, as the
+    /// last value; a throw from the underlying iterator ends the helper.
+    fn ih_chunk_step(&mut self, idx: u32, source: Value, next: Value, kind: u8, n: i64) -> Result<Value, Thrown> {
+        let size = n.unsigned_abs() as usize;
+        let buf = match self.heap.get(idx) {
+            HeapObj::IterHelper { arg, inner, .. } => {
+                if kind == 8 {
+                    *inner
+                } else {
+                    *arg
+                }
+            }
+            _ => Value::UNDEFINED,
+        };
+        // The buffer is made here, and stored in the helper (which roots it)
+        // before any guest code can run.
+        let buf = if buf.is_heap() {
+            buf
+        } else {
+            let a = self.alloc_array_current_realm(Vec::new());
+            if kind == 8 {
+                self.ih_set_inner(idx, a);
+            } else {
+                self.heap.write_barrier_val(idx, a);
+                if let HeapObj::IterHelper { arg, .. } = self.heap.get_mut(idx) {
+                    *arg = a;
+                }
+            }
+            a
+        };
+        let bi = buf.heap_index();
+        let mut work = 0;
+        loop {
+            let stepped = match self.ih_step(source, next) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.ih_set_done(idx);
+                    return Err(e);
+                }
+            };
+            let len = match self.heap.get(bi) {
+                HeapObj::Array(items) => items.len(),
+                _ => 0,
+            };
+            let Some(v) = stepped else {
+                self.ih_set_done(idx);
+                let last = if kind == 8 { len > 0 } else { n < 0 && len > 0 && len < size };
+                if !last {
+                    return Ok(self.iter_result(Value::UNDEFINED, true));
+                }
+                self.ih_inc_idx(idx);
+                let out = self.ih_chunk_out(idx, kind, buf);
+                return Ok(self.iter_result(out, false));
+            };
+            if let Err(e) = self.iter_native_work_or_close(source, Value::UNDEFINED, &mut work) {
+                self.ih_set_done(idx);
+                return Err(e);
+            }
+            self.heap.write_barrier_val(bi, v);
+            let new_len = match self.heap.get_mut(bi) {
+                HeapObj::Array(items) => {
+                    // A full window slides: its oldest value leaves first.
+                    if kind == 9 && items.len() == size {
+                        items.remove(0);
+                    }
+                    items.push(v);
+                    items.len()
+                }
+                _ => 0,
+            };
+            if new_len == size {
+                self.ih_inc_idx(idx);
+                let out = self.ih_chunk_out(idx, kind, buf);
+                return Ok(self.iter_result(out, false));
+            }
+        }
+    }
+
+    /// The Array a chunks/windows step yields: the filled chunk itself (the
+    /// next step starts a fresh one), or a copy of the window, whose buffer
+    /// stays.
+    fn ih_chunk_out(&mut self, idx: u32, kind: u8, buf: Value) -> Value {
+        if kind == 8 {
+            self.ih_set_inner(idx, Value::UNDEFINED);
+            return buf;
+        }
+        let items = match self.heap.get(buf.heap_index()) {
+            HeapObj::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        self.alloc_array_current_realm(items)
+    }
+
     /// take()/drop() count (spec 27.1.4.3/.7): numLimit = ToNumber(limit); a NaN
     /// numLimit is a RangeError; integerLimit = ToIntegerOrInfinity(numLimit) (so a
     /// fraction truncates toward zero — `take(-0.5)` → 0, not negative); a negative
@@ -1031,6 +1128,13 @@ impl<'p> Vm<'p> {
             } else {
                 Ok(i64::MAX)
             };
+        }
+        // A finite limit past 2^53 - 1 is a RangeError too (only +∞ means
+        // "all").
+        if n > 9_007_199_254_740_991.0 {
+            return Err(Thrown::from_static(
+                "RangeError: take/drop limit must not exceed 2^53 - 1",
+            ));
         }
         // ToIntegerOrInfinity truncates toward zero BEFORE the sign check, so
         // `-0.5` → -0 (allowed) but `-1` → -1 (RangeError).
@@ -1180,6 +1284,78 @@ impl<'p> Vm<'p> {
             ITER_DROP => {
                 let n = self.iter_limit_or_close(a0, this)?;
                 self.make_iter_helper(this, 3, Value::UNDEFINED, n)
+            }
+            ITER_CHUNKS | ITER_WINDOWS => {
+                // The size, then (windows) `undersized`, are validated before
+                // GetIteratorDirect; a failure closes the iterator, its own
+                // error winning over the close's.
+                let size = match iter_chunk_size(a0) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.iterator_close_quiet(this);
+                        return Err(e);
+                    }
+                };
+                if id == ITER_CHUNKS {
+                    return self.make_iter_helper(this, 8, Value::UNDEFINED, size);
+                }
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let partial = if a1 == Value::UNDEFINED {
+                    false
+                } else if self.is_string_value(a1) {
+                    match self.to_js_string(a1)?.as_str() {
+                        "only-full" => false,
+                        "allow-partial" => true,
+                        _ => {
+                            self.iterator_close_quiet(this);
+                            return Err(Thrown::from_static(
+                                "TypeError: windows undersized must be \"only-full\" or \"allow-partial\"",
+                            ));
+                        }
+                    }
+                } else {
+                    self.iterator_close_quiet(this);
+                    return Err(Thrown::from_static(
+                        "TypeError: windows undersized must be \"only-full\" or \"allow-partial\"",
+                    ));
+                };
+                // A negative count marks "allow-partial". The sliding buffer is
+                // made by the first step: allocated here it would be held only
+                // by a Rust local across GetIteratorDirect's `next` getter.
+                self.make_iter_helper(this, 9, Value::UNDEFINED, if partial { -size } else { size })
+            }
+            ITER_INCLUDES => {
+                // skippedElements: undefined (0), or a Number that is ±∞ or
+                // integral, with no coercion; not below -0 nor finite past
+                // 2^53 - 1. A failure closes the iterator before `next` is read.
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let to_skip = if a1 == Value::UNDEFINED {
+                    0.0
+                } else if a1.is_number() && (a1.as_f64().is_infinite() || a1.as_f64().fract() == 0.0) {
+                    a1.as_f64()
+                } else {
+                    self.iterator_close_quiet(this);
+                    return Err(Thrown::from_static(
+                        "TypeError: includes skippedElements must be an integral Number or Infinity",
+                    ));
+                };
+                if to_skip < 0.0 || (to_skip.is_finite() && to_skip > 9_007_199_254_740_991.0) {
+                    self.iterator_close_quiet(this);
+                    return Err(Thrown::from_static("RangeError: includes skippedElements is out of range"));
+                }
+                let next = self.iter_direct_next(this)?;
+                let mut skipped = 0.0;
+                let mut work = 0;
+                while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
+                    if skipped < to_skip {
+                        skipped += 1.0;
+                    } else if self.same_value_zero(v, a0) {
+                        self.iterator_close(this)?;
+                        return Ok(Value::TRUE);
+                    }
+                }
+                Ok(Value::FALSE)
             }
             ITER_TOARRAY => {
                 let next = self.iter_direct_next(this)?;
@@ -1517,6 +1693,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                8 | 9 => return self.ih_chunk_step(idx, source, next, kind, n),
                 6 => {
                     // concat: `source` is an Array of [iterable, method] pairs;
                     // `cidx` is the next pair to open; `inner` is the currently-open
@@ -1606,4 +1783,17 @@ impl<'p> Vm<'p> {
         // never re-reads it, so a later mutation of `iterator.next` is not observed.
         self.alloc_iter_helper(it, 5, Value::UNDEFINED, 0, next)
     }
+}
+
+/// chunks/windows size: an integral Number (no coercion; anything else, NaN
+/// and ±∞ included, is a TypeError) from 1 to 2^32 - 1 (else a RangeError).
+fn iter_chunk_size(v: Value) -> Result<i64, Thrown> {
+    if !v.is_number() || !v.as_f64().is_finite() || v.as_f64().fract() != 0.0 {
+        return Err(Thrown::from_static("TypeError: the size must be an integral Number"));
+    }
+    let n = v.as_f64();
+    if !(1.0..=4_294_967_295.0).contains(&n) {
+        return Err(Thrown::from_static("RangeError: the size must be from 1 to 2^32 - 1"));
+    }
+    Ok(n as i64)
 }
