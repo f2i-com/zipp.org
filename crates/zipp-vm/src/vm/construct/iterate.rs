@@ -194,13 +194,16 @@ impl<'p> Vm<'p> {
     }
 
     /// One source of `Object.assign` that is a plain object holding only
-    /// ordinary data properties (no index key, no symbol key, no accessor),
-    /// into a plain extensible target: its own keys are its insertion order
-    /// and each Get is its slot, so the copy is each key's Set made where it
-    /// is — a store into the target's own writable data property, or the
-    /// append of a key no level of the target's chain intercepts
-    /// (`plain_add_chain_clear`); an empty target takes the source's whole
-    /// store, as an object spread does. `false`, with nothing written, for
+    /// ordinary data properties (no symbol key, no accessor), into a plain
+    /// extensible target: each Get is its slot and no Set can run code, so
+    /// the copy is each key's Set made where it is — a store into the
+    /// target's own writable data property, or the append of a key no level
+    /// of the target's chain intercepts (`plain_add_chain_clear`). The order
+    /// of those Sets is unobservable, and the target's index keys enumerate
+    /// in index order whatever order they arrive in, so the source's slot
+    /// order serves for its [[OwnPropertyKeys]] order; an empty target takes
+    /// the source's whole store, as an object spread does. `false`, with
+    /// nothing written, for
     /// anything else (a Proxy, a getter, a setter or a read-only property in
     /// the way, a class instance or prototype as the target, the global, a
     /// namespace, Object.prototype or Array.prototype): the general loop
@@ -221,40 +224,35 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let keys: Vec<String> = match self.heap.get(sidx) {
-            HeapObj::Object(sm)
-                if !sm.is_ctor
-                    && !sm.has_element_key()
-                    && sm.attrs_all_data()
-                    && !sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__") =>
-            {
-                sm.keys.iter().cloned().collect()
-            }
-            _ => return false,
+        let (HeapObj::Object(sm), HeapObj::Object(tm)) = (self.heap.get(sidx), self.heap.get(tidx)) else {
+            return false;
         };
-        let target_ok = matches!(
-            self.heap.get(tidx),
-            HeapObj::Object(tm)
-                if tm.extensible && tm.class.is_none() && !tm.class_proto && !tm.is_ctor
-        );
-        if !target_ok || keys.iter().any(|k| !self.plain_add_chain_clear(tidx, k)) {
+        if sm.is_ctor
+            || !sm.attrs_all_data()
+            || !tm.extensible
+            || tm.class.is_some()
+            || tm.class_proto
+            || tm.is_ctor
+            || sm.keys.iter().any(|k| k.starts_with("@@") || k == "__proto__")
+        {
             return false;
         }
-        // Every key's Set is now an own store or an ordinary append.
-        let own_ok = match self.heap.get(tidx) {
-            HeapObj::Object(tm) => keys.iter().all(|k| match tm.pos(k) {
-                Some(i) => {
-                    let a = tm.attr_at(i);
-                    !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
-                }
-                None => true,
-            }),
-            _ => false,
-        };
-        if !own_ok {
+        // Every key's Set must be an own store or an ordinary append.
+        let target_empty = tm.keys.is_empty();
+        let sets_plain = sm.keys.iter().all(|k| {
+            self.plain_add_chain_clear(tidx, k)
+                && (target_empty
+                    || match tm.pos(k) {
+                        Some(i) => {
+                            let a = tm.attr_at(i);
+                            !a.accessor && a.writable && !tm.val_at(i).is_uninitialized()
+                        }
+                        None => true,
+                    })
+        });
+        if !sets_plain {
             return false;
         }
-        let target_empty = matches!(self.heap.get(tidx), HeapObj::Object(tm) if tm.keys.is_empty());
         if target_empty {
             let copy = match self.heap.get(sidx) {
                 HeapObj::Object(sm) => sm.spread_copy(),
@@ -272,8 +270,8 @@ impl<'p> Vm<'p> {
                 return true;
             }
         }
-        let vals: Vec<Value> = match self.heap.get(sidx) {
-            HeapObj::Object(sm) => sm.vals_slice().to_vec(),
+        let (keys, vals): (Vec<String>, Vec<Value>) = match self.heap.get(sidx) {
+            HeapObj::Object(sm) => (sm.keys.iter().cloned().collect(), sm.vals_slice().to_vec()),
             _ => return false,
         };
         for (k, v) in keys.into_iter().zip(vals) {

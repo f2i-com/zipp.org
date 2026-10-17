@@ -2592,16 +2592,15 @@ impl ObjMap {
 
     /// The map `{ ...self }` makes when `self`'s properties can be copied as
     /// they stand: every one a default data property (writable, enumerable,
-    /// configurable) and none naming an element or a symbol, so the keys'
-    /// insertion order is their [[OwnPropertyKeys]] order. The same keys in
-    /// the same order (a planned list is shared, not copied), the same values,
-    /// the same shape and index. `None` otherwise: the caller copies property
-    /// by property.
+    /// configurable) and none a symbol. Creating them on an empty object in
+    /// [[OwnPropertyKeys]] order (the element keys ascending, then the rest
+    /// in insertion order) leaves the rest in this map's order, and every
+    /// enumeration orders the element keys itself, so the same keys in the
+    /// same order (a planned list is shared, not copied), the same values,
+    /// the same shape and indexes are that object. `None` otherwise: the
+    /// caller copies property by property.
     pub(crate) fn spread_copy(&self) -> Option<ObjMap> {
-        if !matches!(self.attrs, PropAttrs::AllData { .. })
-            || self.has_element_key
-            || self.keys.iter().any(|k| k.starts_with("@@"))
-        {
+        if !matches!(self.attrs, PropAttrs::AllData { .. }) || self.keys.iter().any(|k| k.starts_with("@@")) {
             return None;
         }
         let mut m = ObjMap::new();
@@ -2612,6 +2611,8 @@ impl ObjMap {
         };
         m.shape = self.shape;
         m.index = self.index.clone();
+        m.numeric_index = self.numeric_index.clone();
+        m.has_element_key = self.has_element_key;
         m.planned_append_failed = self.planned_append_failed;
         Some(m)
     }
