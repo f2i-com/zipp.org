@@ -151,6 +151,7 @@ dependencies = [
 name = "zipp-vm"
 version = "0.0.25"
 dependencies = [
+ "memchr",
  "num-bigint",
  "num-traits",
  "rustc-hash",
