@@ -3,7 +3,7 @@
 Status: Zipp's own Python 3 implementation, integrated and validated on 13
 September 2026 (Rust 1.92.0, Windows x86-64 native CLI and the wasm32
 build). Python source is parsed by Zipp's own front end,
-`crates/zipp-pyparse` (a byte-oriented lexer, an arena AST and a
+`zipp-pyparse` (`crates/zipp-vm/src/lang/python/parser`; a byte-oriented lexer, an arena AST and a
 recursive-descent parser for Python 3.13 syntax: PEP 701 f-strings, PEP 695
 type parameters, `except*`; see its README), which lays each module out as a
 tree in a bump arena. No RustPython code remains: the tree keeps the shape of

@@ -35,7 +35,7 @@ use zipp_pyparse::tree::{self, Bump};
 use zipp_pyparse::{Limits, Mode};
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../../..")
 }
 
 fn collect_py(dir: &Path, out: &mut Vec<PathBuf>) {

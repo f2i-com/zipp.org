@@ -311,7 +311,8 @@ crates/zipp-vm/src/
     js/parse/       JavaScript source -> owned AST
     js/compile/     AST -> register bytecode
     js/front.rs     the parse entry points, one per grammar
-    python/         frontend/, runtime/ (JS), lib/ (bundled modules),
+    python/         parser/ (the zipp-pyparse crate), frontend/,
+                    runtime/ (JS), lib/ (bundled modules),
                     vm/ (Py* instructions, tables, tensors), jit/
   bytecode.rs       instruction definitions
   value.rs          NaN-boxed Value

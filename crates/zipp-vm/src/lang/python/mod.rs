@@ -6,6 +6,8 @@
 //! the base instructions where they agree (constants, moves, jumps, plain
 //! calls, returns, handlers). Its parts:
 //!
+//! - `parser/`: the lexer, syntax tree and parser, a crate of its own
+//!   (`zipp-pyparse`) the compiler reads.
 //! - `frontend/`: the compiler (symbol table, emitter, statements,
 //!   expressions) and the compiled-code cache.
 //! - `runtime/`: the runtime, written in JavaScript and compiled by the

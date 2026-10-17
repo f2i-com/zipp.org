@@ -63,6 +63,9 @@ for crate in ../*/; do
     flags+=("--remap-path-prefix=${repo}${sep}crates${sep}${crate}${sep}src${sep}=${crate}${sep}")
   fi
 done
+# The Python parser is a crate of its own inside the engine's source tree;
+# after the engine's prefix, so it wins, its files keep their crate name.
+flags+=("--remap-path-prefix=${repo}${sep}crates${sep}zipp-vm${sep}src${sep}lang${sep}python${sep}parser${sep}src${sep}=zipp-pyparse${sep}")
 
 # Registry sources. The index directory's name is a hash cargo derives from
 # the registry, so it is read from disk; fetch first, or a cold cache would

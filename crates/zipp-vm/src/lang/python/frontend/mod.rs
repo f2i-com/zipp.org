@@ -911,7 +911,7 @@ fn is_module_name(name: &str) -> bool {
     })
 }
 
-/// Parse one module (with ZIPP's own front end, crates/zipp-pyparse) under
+/// Parse one module (with ZIPP's own front end, the zipp-pyparse crate in lang/python/parser) under
 /// the conservative compiler limits (additional to host execution limits).
 /// The lexer counts them as it goes: the token stream ends as soon as a limit
 /// is crossed, before the parser sees a deeper token.

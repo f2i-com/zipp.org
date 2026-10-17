@@ -107,14 +107,14 @@ jobs:
         run: |
           cargo +1.92.0 test --locked -p zipp-cli
           cargo +1.92.0 test --locked -p zipp-gpu
-      # ZIPP's Python front end (crates/zipp-pyparse): whatever the runner's
+      # ZIPP's Python front end (crates/zipp-vm/src/lang/python/parser): whatever the runner's
       # CPython (3.12+) accepts, from every Python source in the repository,
       # mutated token streams of them and every file of the runner's own
       # CPython Lib, it accepts with CPython's `ast` tree; syntax errors keep
       # the messages and offsets recorded in tests/golden. See its README.
       - name: Test ZIPP's Python front end against CPython
         if: ${{ matrix.group == 'cli-gpu-parser' }}
-        working-directory: crates/zipp-pyparse
+        working-directory: crates/zipp-vm/src/lang/python/parser
         run: |
           cargo +1.92.0 test --locked --release -- --include-ignored --skip throughput
 

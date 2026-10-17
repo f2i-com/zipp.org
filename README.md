@@ -395,7 +395,7 @@ runtime data-file dependency.
 ### Run Python (experimental)
 
 The CLI also runs Python: Zipp's own Python 3 implementation, parsed by its
-own front end ([`crates/zipp-pyparse`](crates/zipp-pyparse)) and lowered
+own front end ([`zipp-pyparse`](crates/zipp-vm/src/lang/python/parser)) and lowered
 straight to the engine's register bytecode (no transpilation to JavaScript and
 no second interpreter), so a `.py` file runs on the same VM. On the command
 line hot Python loops are JIT-compiled (x86-64), and over the 36 programs of
@@ -1169,7 +1169,7 @@ Workspace map:
 | [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` / `zipp py` command line. |
 | [`crates/regress-fork`](crates/regress-fork) | ECMAScript regex engine fork and conformance fixes. |
 | [`crates/zipp-wasm`](crates/zipp-wasm/README.md) | Browser/Worker embedding. |
-| [`crates/zipp-pyparse`](crates/zipp-pyparse) | Zipp's own Python 3.13 lexer, arena syntax tree and parser, read directly by the Python compiler. |
+| [`zipp-pyparse`](crates/zipp-vm/src/lang/python/parser) (in `zipp-vm/src/lang/python/parser`) | Zipp's own Python 3.13 lexer, arena syntax tree and parser, read directly by the Python compiler. |
 | [`crates/zipp-gpu`](crates/zipp-gpu) | Native GPU for `zipp py`: gpu-lab's runtime over wgpu (Vulkan, Direct3D 12, Metal). |
 | [`crates/zipp-sandbox`](crates/zipp-sandbox/README.md) | Separately resolved hardened native runner. |
 

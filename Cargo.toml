@@ -17,7 +17,7 @@ members = [
     "crates/zipp-cli",     # `zipp js file.js` / `zipp mjs file.mjs`
     "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
     "crates/zipp-gpu",     # native GPU host for `zipp py`: gpu-lab's runtime over wgpu (CLI feature `gpu`)
-    "crates/zipp-pyparse", # ZIPP's Python front end: lexer, arena AST, parser (see its README)
+    "crates/zipp-vm/src/lang/python/parser", # ZIPP's Python front end: lexer, arena AST, parser (see its README)
     "crates/zipp-numparse", # decimal text to f64 without core's table, for zipp-vm and zipp-pyparse
 ]
 # The hardened native runner and WebAssembly embedding intentionally live in

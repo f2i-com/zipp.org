@@ -63,9 +63,10 @@ mod tests {
         }
         let vm = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut found = Vec::new();
+        // The engine's source tree holds the Python parser's crate too
+        // (src/lang/python/parser).
         visit(&vm.join("src"), &mut found);
         visit(&vm.join("../zipp-wasm/src"), &mut found);
-        visit(&vm.join("../zipp-pyparse/src"), &mut found);
         assert!(
             found.is_empty(),
             "core's float parser links a 10 KB table into every WebAssembly module; use \

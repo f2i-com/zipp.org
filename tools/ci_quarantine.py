@@ -57,9 +57,12 @@ def top_level_fn(name: str) -> re.Pattern[str]:
 def test_roots(crates: pathlib.Path) -> list[pathlib.Path]:
     """Files whose top-level test functions have bare libtest paths: each
     integration-test file and each crate root."""
-    roots = sorted(crates.glob("*/tests/*.rs"))
+    # A language's own crates live in the engine's source tree
+    # (`zipp-vm/src/lang/<name>/<crate>/`).
+    roots = sorted(crates.glob("*/tests/*.rs")) + sorted(crates.glob("zipp-vm/src/lang/*/*/tests/*.rs"))
     for name in ("lib.rs", "main.rs"):
         roots.extend(sorted(crates.glob(f"*/src/{name}")))
+        roots.extend(sorted(crates.glob(f"zipp-vm/src/lang/*/*/src/{name}")))
     return roots
 
 

@@ -8,7 +8,7 @@ description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM 
 [dependencies]
 # ZIPP's own Python front end (lexer, parser, and the tree the emitter walks).
 # Optional and off by default: it backs the `frontend::python` compiler.
-zipp-pyparse = { path = "../zipp-pyparse", optional = true }
+zipp-pyparse = { path = "src/lang/python/parser", optional = true }
 # Decimal text to f64 without core's 10 KB power-of-five table (`num_parse`).
 # A crate of its own because zipp-pyparse uses it too.
 zipp-numparse = { path = "../zipp-numparse" }

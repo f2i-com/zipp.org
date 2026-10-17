@@ -15,4 +15,4 @@ unicode-properties = { version = "=0.1.4", default-features = false, features = 
 bumpalo = "3.20"
 # Float literal values: the engine's decimal parser, so that a module with the
 # Python front end does not link core's (and its 10 KB power-of-five table).
-zipp-numparse = { path = "../zipp-numparse" }
+zipp-numparse = { path = "../../../../../zipp-numparse" }

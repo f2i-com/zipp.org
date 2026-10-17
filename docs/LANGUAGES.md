@@ -19,7 +19,8 @@ crates/zipp-vm/src/
   lang/
     mod.rs                  the `Language` trait and the table of languages
     js/                     JavaScript: parse/, compile/, front.rs, mod.rs
-    python/                 Python: frontend/, runtime/, lib/, vm/, jit/, mod.rs
+    python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
+                            vm/, jit/, mod.rs
 ```
 
 The module tree is older than the folders: each language's files keep the
