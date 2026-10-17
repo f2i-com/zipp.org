@@ -763,6 +763,38 @@ impl<'p> Vm<'p> {
         self.proto_intrinsic_bits(name, is_arr)
     }
 
+    /// `C.key` on a built-in constructor object (`Object.hasOwn`,
+    /// `Array.isArray`, `Number.MAX_SAFE_INTEGER`): an own data property of
+    /// its map, read where it lies. The property caches decline constructor
+    /// maps, so every such read took the general member walk, which reaches
+    /// the same map lookup after synthesizing `prototype`, `name` and
+    /// `length` and handling realms and deferred namespaces. `None` for those
+    /// three keys, an accessor, an uninitialised slot or a miss, and while a
+    /// realm or a deferred namespace exists.
+    #[inline]
+    pub(crate) fn ctor_own_data_read(&self, o: Value, key: &str) -> Option<Value> {
+        if !o.is_heap()
+            || matches!(key, "prototype" | "name" | "length")
+            || self.active_realm.is_some()
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(o.heap_index()) else {
+            return None;
+        };
+        if !m.is_ctor {
+            return None;
+        }
+        let i = m.pos(key)?;
+        if m.attr_at(i).accessor {
+            return None;
+        }
+        let v = m.val_at(i);
+        (!v.is_uninitialized()).then_some(v)
+    }
+
     /// Whether a Get of `name` on WeakMap / WeakSet `idx` resolves to the boot
     /// native `want` (`WM_GET`, `WS_ADD`, ...): no own property of that name,
     /// the default prototype in the running realm, and the prototype's data

@@ -3666,6 +3666,13 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // `Object.hasOwn`, `Array.isArray`: a constructor's
+                            // own data property, which the IC declines.
+                            if let Some(v) = self.ctor_own_data_read(o, &key) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // Name the enclosing function when a property read
                         // fails. "Cannot read properties of undefined (reading
@@ -4229,6 +4236,22 @@ impl<'p> Vm<'p> {
                                 func_id, base, this_val, callee_v, name, arg_base, argc,
                             )? {
                                 self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        // A plain native callee (`Object.hasOwn(o, k)`, captured
+                        // in spec order) runs as `call_value` would run it with
+                        // no other realm and no realm function in existence:
+                        // every earlier arm of its cascade is for another kind
+                        // of callee.
+                        if self.realm_global_objs.is_empty() && self.realm_fns.is_empty() && callee_v.is_heap() {
+                            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
+                                let id = *id;
+                                let r = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_native(id, this_val, argv)
+                                })?;
+                                self.set(base, dst, r);
                                 ip += 1;
                                 continue;
                             }
