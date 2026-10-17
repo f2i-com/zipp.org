@@ -3533,14 +3533,19 @@ impl<'p> Vm<'p> {
                             let site = super::values::private_site(func_id as u32, name as u32);
                             if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
                                 // Declaring-class-resolved, KIND-aware access
-                                // (spec PrivateGet): brand first, then dispatch
-                                // on the DECLARING class's member kind.
-                                if !self.private_receiver_ok(o, b, kind, owner) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                                    )));
-                                }
+                                // (spec PrivateGet): a method or accessor
+                                // checks the receiver's brand, then dispatches
+                                // on the DECLARING class's member kind. A
+                                // field needs no brand check of its own: its
+                                // entry exists for this brand on this receiver
+                                // only once the brand is installed, and a
+                                // missing one is the same TypeError below.
                                 if kind & 7 != 0 {
+                                    if !self.private_receiver_ok(o, b, kind, owner) {
+                                        return Err(Thrown(format!(
+                                            "TypeError: Cannot read private member {key} from an object whose class did not declare it"
+                                        )));
+                                    }
                                     let r = if kind & 1 != 0 {
                                         self.private_member_from_owner(owner, &key, (kind & 8) | 1)
                                             .unwrap_or(Value::UNDEFINED)
