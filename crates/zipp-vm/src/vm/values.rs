@@ -1380,6 +1380,41 @@ impl<'p> Vm<'p> {
     /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
     /// Proxy AND when a Proxy sits in the prototype chain (e.g.
     /// `Object.create(proxy)`), which the immutable `has_property` cannot do.
+    /// Whether a `has` trap may answer `false` for the flat string `key`
+    /// without its invariant applying, read from a plain `target`'s map: the
+    /// target has no own `key`, or has a configurable one and is extensible.
+    /// `false` (check the descriptor) for anything else. The check spelled
+    /// the key as a String and built a descriptor object to read back.
+    fn proxy_has_false_unconstrained(&self, target: Value, key: Value) -> bool {
+        if !target.is_heap() || !key.is_heap() {
+            return false;
+        }
+        let ti = target.heap_index();
+        if (ti == self.global_this && self.global_this != 0)
+            || (ti == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&ti))
+            || !self.deferred_ns_state.is_empty()
+        {
+            return false;
+        }
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return false;
+        };
+        if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+            return false;
+        }
+        let HeapObj::Object(m) = self.heap.get(ti) else {
+            return false;
+        };
+        if m.is_ctor {
+            return false;
+        }
+        match m.pos(js.as_str_wf()) {
+            None => true,
+            Some(i) => m.attr_at(i).configurable && m.extensible,
+        }
+    }
+
     pub(crate) fn has_property_dyn(&mut self, obj: Value, key: Value) -> Result<bool, Thrown> {
         if !obj.is_heap() {
             return Ok(false);
@@ -1421,7 +1456,7 @@ impl<'p> Vm<'p> {
                     let present = self.truthy(res);
                     // A `false` result is illegal when the target has the own
                     // property non-configurable, or the target is non-extensible.
-                    if !present {
+                    if !present && !self.proxy_has_false_unconstrained(target, key) {
                         let ks = self.key_of(key);
                         let desc = self.object_get_own_property_descriptor(target, &ks);
                         if desc != Value::UNDEFINED {

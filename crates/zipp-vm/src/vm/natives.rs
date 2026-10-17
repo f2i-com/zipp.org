@@ -192,6 +192,67 @@ impl<'p> Vm<'p> {
     /// literally `GetSuperBase().[[Set]](x, v, this)` — can share it instead of
     /// approximating it with `Set(this, …)`. `kv` is the ALREADY-coerced
     /// property key (ToPropertyKey runs once, at the call site).
+    /// `Reflect.set(o, k, v, receiver)` writing a property `o` already has:
+    /// `o` a plain object, `k` a flat string, the property a writable data
+    /// property, and `receiver` either `o` or a Proxy over `o` with neither
+    /// a `getOwnPropertyDescriptor` nor a `defineProperty` trap (the shape a
+    /// forwarding `set` trap passes). OrdinarySet then finds the property on
+    /// `o` and the receiver's own descriptor is the same one, so the write
+    /// is a store into its slot. The general path spelled `k` as a fresh
+    /// String first. `None` for anything else.
+    fn reflect_set_present_fast(&mut self, o: Value, kv: Value, value: Value, receiver: Value) -> Option<bool> {
+        if !o.is_heap() || !kv.is_heap() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let oi = o.heap_index();
+        if (oi == self.global_this && self.global_this != 0)
+            || (oi == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oi))
+            || (!self.realm_global_objs.is_empty() && self.realm_global_objs.contains_key(&oi))
+        {
+            return None;
+        }
+        if receiver != o {
+            if !receiver.is_heap() {
+                return None;
+            }
+            let (target, handler, revoked) = self.proxy_parts(receiver.heap_index())?;
+            if revoked
+                || target != o
+                || !self.proxy_handler_lacks(handler, "getOwnPropertyDescriptor")
+                || !self.proxy_handler_lacks(handler, "defineProperty")
+            {
+                return None;
+            }
+        }
+        let slot = {
+            let HeapObj::Str(js) = self.heap.get(kv.heap_index()) else {
+                return None;
+            };
+            if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
+                return None;
+            }
+            let key = js.as_str_wf();
+            let HeapObj::Object(m) = self.heap.get(oi) else {
+                return None;
+            };
+            if m.is_ctor || m.class.is_some() || m.class_proto {
+                return None;
+            }
+            let i = m.pos(key)?;
+            let a = m.attr_at(i);
+            if a.accessor || !a.writable || m.val_at(i).is_uninitialized() {
+                return None;
+            }
+            i
+        };
+        self.store_barrier(crate::heap::gcoracle::SET_PROP, oi, value);
+        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+            m.set_val_at(slot, value);
+        }
+        Some(true)
+    }
+
     pub(crate) fn ordinary_set_with_receiver(
         &mut self,
         a0: Value,
@@ -199,6 +260,9 @@ impl<'p> Vm<'p> {
         value: Value,
         receiver: Value,
     ) -> Result<bool, Thrown> {
+        if let Some(done) = self.reflect_set_present_fast(a0, kv, value, receiver) {
+            return Ok(done);
+        }
         let key = self.key_of(kv);
         // Module Namespace exotic [[Set]]: always false.
         if self.module_namespaces.contains_key(&a0.heap_index()) {
