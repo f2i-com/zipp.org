@@ -3260,9 +3260,18 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
                 };
+                // Only a hole inside the range is read through the prototype
+                // chain, so only the range is scanned: scanning the whole
+                // array made a 16-element slice of a 160k-element array cost
+                // the 160k.
                 let clean = live_len == len
                     && !self.arr_props.contains_key(&idx)
-                    && !self.array_has_holes(idx);
+                    && match self.heap.get(idx) {
+                        HeapObj::Array(items) => {
+                            start >= end || !items[start as usize..end as usize].iter().any(|v| v.is_hole())
+                        }
+                        _ => false,
+                    };
                 let slice: Vec<Value> = if start < end {
                     if clean {
                         match self.heap.get(idx) {

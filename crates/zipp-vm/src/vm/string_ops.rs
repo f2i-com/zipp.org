@@ -1506,14 +1506,21 @@ impl<'p> Vm<'p> {
                 _ => Value::bool(true),
             });
         }
-        let lossy_exact = ned.is_wellformed()
-            && (hay.is_wellformed() || !bytes_contain_replacement_char(ned.as_bytes()));
-        if lossy_exact {
-            let s = hay.as_str_lossy();
-            let n = ned.as_str_wf();
+        // A well-formed needle is searched for in the receiver's own bytes. A
+        // lone surrogate in the receiver is `ED A0..BF xx` in WTF-8, bytes
+        // well-formed UTF-8 never holds, and the needle starts on a lead byte,
+        // so a match can neither start inside one nor cross it: the byte
+        // search is the code-unit search, a U+FFFD in the needle included.
+        // Searching a lossy copy instead cost a copy of the whole receiver on
+        // every call, which made a find-all loop over a string with one lone
+        // surrogate quadratic.
+        if ned.is_wellformed() {
+            let s = hay.as_bytes();
+            let n = ned.as_bytes();
+            let is_char_boundary = |i: usize| i >= s.len() || (s[i] & 0xC0) != 0x80;
             let (lo, hi) = hay.unit_byte_bounds(pos);
             return Ok(match name {
-                "indexOf" => match s[hi..].find(n) {
+                "indexOf" => match memchr::memmem::find(&s[hi..], n) {
                     Some(b) if hay.is_ascii() => Value::int((hi + b) as i32),
                     Some(b) => {
                         // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
@@ -1523,7 +1530,7 @@ impl<'p> Vm<'p> {
                     }
                     None => Value::int(-1),
                 },
-                "includes" => Value::bool(s[hi..].contains(n)),
+                "includes" => Value::bool(memchr::memmem::find(&s[hi..], n).is_some()),
                 // Anchored positions: a start or end between the halves of a
                 // pair leaves a lone surrogate at the edge of the spec's
                 // substring, which a well-formed needle cannot match.
@@ -1532,15 +1539,15 @@ impl<'p> Vm<'p> {
                 _ => {
                     // lastIndexOf: the last match starting at or before `lo`.
                     let mut end = (lo + n.len()).min(s.len());
-                    while !s.is_char_boundary(end) {
+                    while !is_char_boundary(end) {
                         end += 1;
                     }
                     let found = loop {
-                        match s[..end].rfind(n) {
+                        match memchr::memmem::rfind(&s[..end], n) {
                             Some(b) if b <= lo => break Some(b),
                             Some(b) => {
                                 end = b + n.len() - 1;
-                                while !s.is_char_boundary(end) {
+                                while !is_char_boundary(end) {
                                     end -= 1;
                                 }
                             }

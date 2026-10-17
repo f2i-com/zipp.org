@@ -13,6 +13,10 @@ zipp-pyparse = { path = "src/lang/python/parser", optional = true }
 # A crate of its own because zipp-pyparse uses it too.
 zipp-numparse = { path = "../zipp-numparse" }
 rustc-hash = { workspace = true }
+# Substring search over a string's own WTF-8 bytes (`indexOf` and friends on a
+# string holding a lone surrogate). Already in the graph through the regex and
+# allocator crates; the version Cargo.lock pins.
+memchr = "2.8"
 # The regex engine. A DIRECT path dependency on our fork rather than a
 # crates.io version rewritten by `[patch.crates-io]`: zipp-vm calls
 # `Regex::from_unicode_byteopt`, which exists only in the fork, so the upstream

@@ -1400,6 +1400,7 @@ version = "0.0.25"
 dependencies = [
  "dynasm",
  "dynasmrt",
+ "memchr",
  "num-bigint",
  "num-traits",
  "rustc-hash 2.1.3",
