@@ -36,6 +36,22 @@ pub(crate) enum LiteExit {
     Resume,
 }
 
+/// How one copy of the lite loop ended (`run_lite_in`).
+enum LiteStep {
+    Exit(LiteExit),
+    /// The top frame is a full-class function: run it in the full copy.
+    Full,
+}
+
+/// A function's class in the lite loop (`LiteState::ok`).
+const LITE_UNDECIDED: u8 = 0;
+/// Runs in the small copy: only `lite_small_instr` instructions.
+const LITE_SMALL: u8 = 1;
+/// The main loop's.
+const LITE_NO: u8 = 2;
+/// Runs in the full copy.
+const LITE_FULL: u8 = 3;
+
 /// `ZIPP_NO_LITE=1`: every frame runs in the main loop (for A/B).
 #[inline]
 fn lite_enabled() -> bool {
@@ -52,9 +68,12 @@ fn lite_enabled() -> bool {
     }
 }
 
-/// The instructions the lite loop runs, the interpreter's superinstructions
-/// for them included (it dispatches the function's `FusedCode` copy).
-fn lite_instr(i: &Instr) -> bool {
+/// The instructions of the lite loop's small copy, the superinstructions over
+/// them included: a recursive integer function's (`fib`). The loop is
+/// compiled twice (`run_lite_in`) because each arm added for loops and
+/// property code cost such a function's calls in register allocation: fib
+/// ran 1.16x QuickJS with only these and 1.25x with every arm.
+fn lite_small_instr(i: &Instr) -> bool {
     matches!(
         i,
         Instr::LoadInt { .. }
@@ -75,6 +94,16 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::FuseAddLoadInt { .. }
             | Instr::FuseAddIntMove { .. }
             | Instr::FuseLoadGlobal2 { .. }
+    )
+}
+
+/// The instructions the lite loop runs (its full copy), the interpreter's
+/// superinstructions for them included (it dispatches the function's
+/// `FusedCode` copy).
+fn lite_instr(i: &Instr) -> bool {
+    lite_small_instr(i)
+        || matches!(
+            i,
             // A loop's: element and property reads and stores through the
             // caches, the bitwise ops, strict equality and the branches on
             // it, and the counter step that closes a loop.
@@ -205,10 +234,16 @@ impl<'p> Vm<'p> {
     #[inline(always)]
     pub(crate) fn lite_eligible(&mut self, fid: u32) -> bool {
         match self.lite.ok.get(fid as usize) {
-            Some(&1) => true,
-            Some(&2) => false,
+            Some(&LITE_SMALL) | Some(&LITE_FULL) => true,
+            Some(&LITE_NO) => false,
             _ => self.lite_decide(fid),
         }
+    }
+
+    /// Whether `fid` (which the lite loop runs) runs in the full copy.
+    #[inline(always)]
+    fn lite_is_full(&self, fid: u32) -> bool {
+        self.lite.ok[fid as usize] == LITE_FULL
     }
 
     /// Every instruction of `fid`, in its code and its superinstruction copy,
@@ -236,12 +271,17 @@ impl<'p> Vm<'p> {
                 }
                 _ => false,
             });
+        let small = ok && p.code.iter().all(lite_small_instr) && Self::lite_code(p).iter().all(lite_small_instr);
         if self.lite.ok.len() <= i {
-            self.lite.ok.resize(i + 1, 0);
+            self.lite.ok.resize(i + 1, LITE_UNDECIDED);
             self.lite.code.resize(i + 1, &[]);
             self.lite.budget.resize(i + 1, 0);
         }
-        self.lite.ok[i] = if ok { 1 } else { 2 };
+        self.lite.ok[i] = match (ok, small) {
+            (false, _) => LITE_NO,
+            (true, true) => LITE_SMALL,
+            (true, false) => LITE_FULL,
+        };
         if ok {
             self.lite.code[i] = Self::lite_code(p);
             self.lite.budget[i] = LITE_HANDOVER_BUDGET;
@@ -257,7 +297,7 @@ impl<'p> Vm<'p> {
         let b = &mut self.lite.budget[fid as usize];
         *b = b.saturating_sub(1);
         if *b == 0 {
-            self.lite.ok[fid as usize] = 2;
+            self.lite.ok[fid as usize] = LITE_NO;
         }
     }
 
@@ -305,18 +345,50 @@ impl<'p> Vm<'p> {
     }
 
     /// Run the top frame, and the eligible frames it calls or returns to, in
-    /// the lite loop (see the module doc).
+    /// the lite loop (see the module doc): in the small copy while the
+    /// functions are small-class, then in the full copy, which runs both
+    /// classes, from the first full-class function on.
     #[inline(never)]
     pub(crate) fn run_lite(&mut self, stop_depth: usize) -> Result<LiteExit, Thrown> {
+        // The entered function and the instructions this entry has run
+        // (`LITE_MIN_ENTRY_STEPS`), across both copies.
+        let entry_fid = self.frames[self.frames.len() - 1].func;
+        let mut steps: u64 = 0;
+        if !self.lite_is_full(entry_fid) {
+            match self.run_lite_in::<false>(stop_depth, entry_fid, &mut steps)? {
+                LiteStep::Exit(e) => return Ok(e),
+                LiteStep::Full => {}
+            }
+        }
+        match self.run_lite_in::<true>(stop_depth, entry_fid, &mut steps)? {
+            LiteStep::Exit(e) => Ok(e),
+            // The full copy runs every class; it never asks for itself.
+            LiteStep::Full => unreachable!("the full lite copy switched to itself"),
+        }
+    }
+
+    /// One copy of the lite loop: `FULL` runs every lite instruction, the
+    /// small copy only `lite_small_instr`'s and returns `LiteStep::Full` at a
+    /// call into or a return to a full-class function.
+    #[inline(never)]
+    fn run_lite_in<const FULL: bool>(
+        &mut self,
+        stop_depth: usize,
+        entry_fid: u32,
+        steps_total: &mut u64,
+    ) -> Result<LiteStep, Thrown> {
         let mut top = self.frames.len() - 1;
         let mut func_id = self.frames[top].func;
         let mut base = self.frames[top].base;
         let mut ip = self.frames[top].ip;
         let mut code: &'p [Instr] = self.lite_fn_code(func_id);
-        // The entered function and the instructions this entry has run
-        // (`LITE_MIN_ENTRY_STEPS`).
-        let entry_fid = func_id;
-        let mut steps: u64 = 0;
+        let mut steps: u64 = *steps_total;
+        macro_rules! exit {
+            ($e:expr) => {{
+                *steps_total = steps;
+                return Ok($e);
+            }};
+        }
         macro_rules! short_entry {
             () => {
                 if steps < LITE_MIN_ENTRY_STEPS {
@@ -329,7 +401,7 @@ impl<'p> Vm<'p> {
             () => {{
                 self.frames[top].ip = ip;
                 self.lite_handed_over(func_id);
-                return Ok(LiteExit::Resume);
+                exit!(LiteStep::Exit(LiteExit::Resume));
             }};
         }
         // A global's value, or the main loop's slow path for it.
@@ -349,14 +421,17 @@ impl<'p> Vm<'p> {
                 let v = $v;
                 if self.pop_frame_fast(v, stop_depth) {
                     short_entry!();
-                    return Ok(LiteExit::Done(v));
+                    exit!(LiteStep::Exit(LiteExit::Done(v)));
                 }
                 self.maybe_gc();
                 top = self.frames.len() - 1;
                 func_id = self.frames[top].func;
                 if !self.lite_eligible(func_id) {
                     short_entry!();
-                    return Ok(LiteExit::Resume);
+                    exit!(LiteStep::Exit(LiteExit::Resume));
+                }
+                if !FULL && self.lite_is_full(func_id) {
+                    exit!(LiteStep::Full);
                 }
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
@@ -364,7 +439,7 @@ impl<'p> Vm<'p> {
             }};
         }
         loop {
-            steps = steps.wrapping_add(1);
+            steps += 1;
             match code[ip] {
                 Instr::LoadInt { dst, val } => {
                     self.set(base, dst, Value::int(val));
@@ -495,7 +570,7 @@ impl<'p> Vm<'p> {
                     }
                     ip = t;
                 }
-                Instr::FuseAddIntJump { dst, a, imm, upd, target } => {
+                Instr::FuseAddIntJump { dst, a, imm, upd, target } if FULL => {
                     let va = self.get(base, a);
                     let r = self.add_int_value(va, imm, upd)?;
                     self.set(base, dst, r);
@@ -503,7 +578,7 @@ impl<'p> Vm<'p> {
                     self.maybe_gc();
                     ip = target as usize;
                 }
-                Instr::JumpIfFalse { cond, target } => {
+                Instr::JumpIfFalse { cond, target } if FULL => {
                     let v = self.get(base, cond);
                     let t = if v.is_bool() {
                         v.bits() == Value::TRUE.bits()
@@ -520,7 +595,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                 }
-                Instr::JumpIfTrue { cond, target } => {
+                Instr::JumpIfTrue { cond, target } if FULL => {
                     let v = self.get(base, cond);
                     let t = if v.is_bool() {
                         v.bits() == Value::TRUE.bits()
@@ -536,7 +611,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                 }
-                Instr::Sub { dst, a, b } => {
+                Instr::Sub { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
                         match va.as_int().checked_sub(vb.as_int()) {
@@ -551,7 +626,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::Mul { dst, a, b } => {
+                Instr::Mul { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
                         // A zero product with a negative operand is -0 (see
@@ -569,20 +644,20 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::Bitwise { dst, a, b, op } => {
+                Instr::Bitwise { dst, a, b, op } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = self.fused_bitwise(va, vb, op)?;
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } => {
+                Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } if FULL => {
                     self.set(base, ldst, Value::int(val));
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = self.fused_bitwise(va, vb, op)?;
                     self.set(base, dst, r);
                     ip += 2;
                 }
-                Instr::Eq { dst, a, b } => {
+                Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
                         va.bits() == vb.bits()
@@ -592,7 +667,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, Value::bool(r));
                     ip += 1;
                 }
-                Instr::Ne { dst, a, b } => {
+                Instr::Ne { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
                         va.bits() == vb.bits()
@@ -602,7 +677,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, Value::bool(!r));
                     ip += 1;
                 }
-                Instr::FuseEqJump { dst, a, b, ne, when, target } => {
+                Instr::FuseEqJump { dst, a, b, ne, when, target } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let eq = if va.is_int() && vb.is_int() {
                         va.bits() == vb.bits()
@@ -614,7 +689,7 @@ impl<'p> Vm<'p> {
                     // Forward only (see the variant).
                     ip = if r == when { target as usize } else { ip + 2 };
                 }
-                Instr::GetIndex { dst, obj, key } => {
+                Instr::GetIndex { dst, obj, key } if FULL => {
                     let (o, k) = (self.get(base, obj), self.get(base, key));
                     if !o.is_heap() {
                         hand_over!();
@@ -669,7 +744,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::GetProp { dst, obj, name } => {
+                Instr::GetProp { dst, obj, name } if FULL => {
                     let o = self.get(base, obj);
                     if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
                         self.set(base, dst, v);
@@ -712,11 +787,11 @@ impl<'p> Vm<'p> {
                         _ => hand_over!(),
                     }
                 }
-                Instr::LoadUndefined { dst } => {
+                Instr::LoadUndefined { dst } if FULL => {
                     self.set(base, dst, Value::UNDEFINED);
                     ip += 1;
                 }
-                Instr::UpvalGet { dst, idx } => {
+                Instr::UpvalGet { dst, idx } if FULL => {
                     let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     let v = self.heap.cell_get(cell);
                     // A binding still in its TDZ throws, in the main arm.
@@ -726,7 +801,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, v);
                     ip += 1;
                 }
-                Instr::UpvalSet { idx, src } => {
+                Instr::UpvalSet { idx, src } if FULL => {
                     let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     // A captured `const`, a named function expression's own
                     // name and a binding in its TDZ are the main arm's (it
@@ -748,7 +823,7 @@ impl<'p> Vm<'p> {
                     this_v,
                     arg_base,
                     argc,
-                } => {
+                } if FULL => {
                     // The main arm's intrinsic checks; a `Math` method that is
                     // no longer the builtin is its ordinary call, there.
                     let intrinsic = if callee == crate::bytecode::NO_REG {
@@ -764,7 +839,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, Value::num(r));
                     ip += 1;
                 }
-                Instr::SetProp { obj, val, .. } => {
+                Instr::SetProp { obj, val, .. } if FULL => {
                     let o = self.get(base, obj);
                     let v = self.get(base, val);
                     // The cache's own-data hit, the main arm's first step for
@@ -801,7 +876,10 @@ impl<'p> Vm<'p> {
                         // The callee runs in the main loop, and the caller
                         // after it until its next frame transition.
                         self.lite_handed_over(func_id);
-                        return Ok(LiteExit::Resume);
+                        exit!(LiteStep::Exit(LiteExit::Resume));
+                    }
+                    if !FULL && self.lite_is_full(fid) {
+                        exit!(LiteStep::Full);
                     }
                     top = self.frames.len() - 1;
                     func_id = fid;
@@ -852,7 +930,8 @@ mod tests {
                    function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
                    function tiny(x) { return x + 1; } \
                    for (var t = 0, u = 0; t < 200; t++) u = tiny(u); \
-                   console.log(loopSum(10) + callsOut(200) + fib(10) + u);";
+                   function readP(o) { var s = 0; for (var i = 0; i < 50; i++) s = s + o.p; return s; } \
+                   console.log(loopSum(10) + callsOut(200) + fib(10) + u + readP({ p: 2 }));";
         let ast = crate::front::parse_auto(src).expect("parse");
         let program = crate::compile::compile_program(&ast, src).expect("compile");
         let fid = |name: &str| program.functions.iter().position(|f| f.name == name).expect(name) as u32;
@@ -862,10 +941,12 @@ mod tests {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         vm.set_jit_enabled(false);
         vm.run().expect("run");
-        assert_eq!(vm.output, ["500"]);
+        assert_eq!(vm.output, ["600"]);
         if lite_enabled() {
             assert!(vm.lite_eligible(lp), "loopSum runs in the lite loop");
             assert!(vm.lite_eligible(fb), "fib runs in the lite loop (its entry is long)");
+            assert_eq!(vm.lite.ok[fb as usize], LITE_SMALL, "fib runs in the small copy");
+            assert_eq!(vm.lite.ok[fid("readP") as usize], LITE_FULL, "a property read needs the full copy");
             assert!(!vm.lite_eligible(fid("tiny")), "tiny's short entries from the main program spent its budget");
             assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
             // Eligible by its instructions, so only the budget sent it back.
