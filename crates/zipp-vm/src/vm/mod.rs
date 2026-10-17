@@ -1776,6 +1776,19 @@ pub struct Vm<'p> {
     /// `new Function` & kin, by the exact source they assembled: the installed
     /// eval program's base function, re-run on a repeat (see `do_eval`).
     fn_ctor_cache: rustc_hash::FxHashMap<Box<[u8]>, u32>,
+    /// Declaration-free direct evals, by (caller function, eval site, which of
+    /// the site's caller bindings were live, compile flags, source hash), each
+    /// with its exact sources and the installed program's base function: a
+    /// repeat re-runs that program over the caller's cells instead of
+    /// parsing, compiling and installing the same code again (see the
+    /// `DirectEval` arm of `dispatch_cold`).
+    direct_eval_cache: rustc_hash::FxHashMap<(u32, u16, u64, u8, u64), Vec<(Box<str>, u32)>>,
+    direct_eval_cache_len: usize,
+    /// One-shot request from that arm to `do_eval`: report in
+    /// `direct_eval_installed` the base function of the program it installs,
+    /// if the program declares nothing.
+    direct_eval_want: bool,
+    direct_eval_installed: Option<u32>,
     /// Host policy for a VM that may execute its already-compiled main program
     /// but must not compile or load any additional source. This is independent
     /// of instrumentation and leaves every JIT tier enabled. All runtime source

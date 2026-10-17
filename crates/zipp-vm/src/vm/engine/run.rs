@@ -162,6 +162,23 @@ console.log("module-rec:" + sum);
 const FN_CTOR_CACHE_MAX_SOURCE: usize = 64 * 1024;
 const FN_CTOR_CACHE_MAX_ENTRIES: usize = 4096;
 
+/// Whether an eval program creates no binding when it is installed: no
+/// `var`, function, `let`/`const` or class declaration, at its top level or
+/// into the caller's EvalScope. Everything such a program does on a run
+/// happens in `execute_eval_program`.
+fn eval_program_declares_nothing(p: &crate::bytecode::Program) -> bool {
+    p.eval_dynamic_names.is_empty()
+        && p.hoisted_globals.is_empty()
+        && p.decl_globals.is_empty()
+        && p.lexical_globals.is_empty()
+        && p.const_globals.is_empty()
+        && p.classes.is_empty()
+        && p.module_decl_globals.is_empty()
+        && p.module_imports.is_empty()
+        && p.module_exports.is_empty()
+        && p.functions.iter().all(|f| f.name_global.is_none())
+}
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -2085,6 +2102,9 @@ impl<'p> Vm<'p> {
         // assembled source before standalone parameter parsing/allocation, so
         // the marker also suppresses exactly this matching second charge.
         let fn_ctor = std::mem::take(&mut self.pending_fn_ctor_eval);
+        // Likewise one-shot: the DirectEval arm asking which program this
+        // compile installs (see `direct_eval_cache`).
+        let report_install = std::mem::take(&mut self.direct_eval_want);
         self.require_external_code_enabled()?;
         // This is the common gate for every runtime compiler entry: direct and
         // indirect eval, Function constructors, ShadowRealm.evaluate, and the
@@ -2292,6 +2312,13 @@ impl<'p> Vm<'p> {
                 None,
                 None,
             );
+        }
+        // A program that declares nothing does all its per-run work in
+        // `execute_eval_program`; installing it again would install the same
+        // code. Report where it lands (the base `prepare_eval_program`
+        // assigns) so the caller can re-run it.
+        if report_install && eval_program_declares_nothing(&eval_prog) {
+            self.direct_eval_installed = Some((self.main_func_count + self.eval_funcs.len()) as u32);
         }
         self.run_eval_program(
             eval_prog,

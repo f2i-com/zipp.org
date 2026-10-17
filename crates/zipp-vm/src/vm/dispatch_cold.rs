@@ -34,7 +34,48 @@ pub(crate) enum ColdFlow {
     Done(Value),
 }
 
+/// The longest direct-eval source `Vm::direct_eval_cache` keeps, and how
+/// many sources it keeps.
+const DIRECT_EVAL_CACHE_MAX_SOURCE: usize = 1024;
+const DIRECT_EVAL_CACHE_MAX_ENTRIES: usize = 4096;
+
 impl<'p> Vm<'p> {
+    /// The cell of a direct-eval site's caller binding `(kind, idx)` (see
+    /// `FuncProto::eval_sites`): kind 0 is a cell of this frame in register
+    /// `idx`, and so is kind 3, a catch parameter (an eval'd `var` of its name
+    /// still goes to the function's varEnv, Annex B.3.5, but cannot shadow
+    /// the parameter's cell); kinds 1 and 2 are this frame's closure upvalue
+    /// `idx` (an eval root forwarding its caller scope, or a binding of a
+    /// function enclosing the caller). Not a heap value when the binding has
+    /// no cell yet.
+    fn eval_site_cell(&self, base: usize, kind: u8, idx: u16) -> Value {
+        if kind == 0 || kind == 3 {
+            return self.get(base, idx);
+        }
+        let cl = self.frames.last().map(|f| f.closure).unwrap_or(NO_CLOSURE);
+        if cl == NO_CLOSURE {
+            return Value::UNDEFINED;
+        }
+        match self.heap.get(cl) {
+            HeapObj::Closure { upvalues, .. } => upvalues
+                .get(idx as usize)
+                .map(|&c| Value::heap(c))
+                .unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
+        }
+    }
+
+    /// Whether nothing outside a direct eval's own site could change what it
+    /// compiles to: no realm, `$262.evalScript` or prelude compile in
+    /// progress, and no private names in the running class body.
+    fn direct_eval_cacheable_now(&self) -> bool {
+        self.active_realm.is_none()
+            && self.realm_global_objs.is_empty()
+            && !self.eval_script_gdi
+            && !self.eval_prelude_mode
+            && self.current_private_brands().is_none()
+    }
+
     /// Run one cold instruction for `dispatch_body` (see the module docs).
     #[inline(never)]
     #[allow(clippy::too_many_arguments, unused_variables, unused_mut)]
@@ -1825,7 +1866,79 @@ impl<'p> Vm<'p> {
                     } else {
                         None
                     };
-                    self.do_eval(
+                    // A declaration-free eval this site has run before, with
+                    // the same caller bindings live, re-runs the program it
+                    // installed then (`direct_eval_cache`). Not for a caller
+                    // with a home class or object, private names or a realm
+                    // in play, a source with lone surrogates, or one with a
+                    // template literal (each eval's tagged templates are
+                    // their own objects, and template objects are cached by
+                    // function).
+                    let flags = (strict_caller as u8)
+                        | (new_target_ok as u8) << 1
+                        | (ban_arguments as u8) << 2
+                        | (var_env_is_global as u8) << 3
+                        | (eval_scope_idx.is_some() as u8) << 4;
+                    let cacheable = site != u16::MAX
+                        && inherit.is_none()
+                        && caller_home.is_none()
+                        && exact.is_none()
+                        && code.len() <= DIRECT_EVAL_CACHE_MAX_SOURCE
+                        && !code.contains('`')
+                        && self.direct_eval_cacheable_now();
+                    let live_cells = if cacheable {
+                        let map = &self.func(func_id as usize).eval_sites[site as usize].0;
+                        (map.len() <= 64).then(|| {
+                            let mut mask = 0u64;
+                            let mut cells = Vec::with_capacity(map.len());
+                            for (i, &(_, kind, idx)) in map.iter().enumerate() {
+                                let cv = self.eval_site_cell(base, kind, idx);
+                                if cv.is_heap() {
+                                    mask |= 1 << i;
+                                    cells.push(cv);
+                                }
+                            }
+                            (mask, cells)
+                        })
+                    } else {
+                        None
+                    };
+                    let source_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = rustc_hash::FxHasher::default();
+                        code.hash(&mut h);
+                        h.finish()
+                    };
+                    if let Some((mask, cells)) = live_cells.as_ref() {
+                        let key = (func_id, site, *mask, flags, source_hash);
+                        let hit = self
+                            .direct_eval_cache
+                            .get(&key)
+                            .and_then(|v| v.iter().find(|(s, _)| **s == *code))
+                            .map(|&(_, base_func)| base_func);
+                        if let Some(base_func) = hit {
+                            // What `do_eval` charges every runtime compile.
+                            self.require_external_code_enabled()?;
+                            #[cfg(feature = "instrument")]
+                            self.instrument_dynamic_code_attempt(code.len())
+                                .map_err(|message| Thrown(message.into()))?;
+                            let r = self.execute_eval_program(
+                                base_func,
+                                Some(caller_this),
+                                None,
+                                caller_nt,
+                                None,
+                                Some(cells.clone()),
+                                eval_scope_idx,
+                            )?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            return Ok(ColdFlow::Next(ip));
+                        }
+                        self.direct_eval_want = true;
+                        self.direct_eval_installed = None;
+                    }
+                    let evaled = self.do_eval(
                         &code,
                         strict_caller,
                         new_target_ok,
@@ -1866,40 +1979,7 @@ impl<'p> Vm<'p> {
                                 let mut outer = Vec::new();
                                 let mut catch_params = Vec::new();
                                 for (n, kind, idx) in map {
-                                    let cv = if kind == 0 || kind == 3 {
-                                        // kind 0: a cell of THIS frame;
-                                        // kind 3: the same, but the
-                                        // binding is a CATCH PARAMETER —
-                                        // an eval'd `var` of that name
-                                        // still goes to the function's
-                                        // varEnv (Annex B.3.5), it just
-                                        // can't shadow the param cell.
-                                        self.get(base, idx)
-                                    } else {
-                                        // kind 1/2: this frame's closure
-                                        // upvalue cell (an eval root
-                                        // forwarding its caller scope,
-                                        // or — kind 2 — a binding of a
-                                        // function ENCLOSING the caller).
-                                        let cl = self
-                                            .frames
-                                            .last()
-                                            .map(|f| f.closure)
-                                            .unwrap_or(NO_CLOSURE);
-                                        if cl != NO_CLOSURE {
-                                            match self.heap.get(cl) {
-                                                HeapObj::Closure { upvalues, .. } => {
-                                                    upvalues
-                                                        .get(idx as usize)
-                                                        .map(|&c| Value::heap(c))
-                                                        .unwrap_or(Value::UNDEFINED)
-                                                }
-                                                _ => Value::UNDEFINED,
-                                            }
-                                        } else {
-                                            Value::UNDEFINED
-                                        }
-                                    };
+                                    let cv = self.eval_site_cell(base, kind, idx);
                                     if cv.is_heap() {
                                         if kind == 2 || kind == 3 {
                                             outer.push(n.clone());
@@ -1918,7 +1998,25 @@ impl<'p> Vm<'p> {
                         },
                         eval_scope_idx,
                         exact.as_deref(),
-                    )?
+                    );
+                    // `direct_eval_installed` is set only by the `do_eval` this
+                    // arm asked, and taken here even when that eval threw: a
+                    // nested eval's arm clears it before its own `do_eval`, so
+                    // a stale report never names another eval's program.
+                    let installed = self.direct_eval_installed.take();
+                    let r = evaled?;
+                    if let (Some((mask, _)), Some(base_func)) = (live_cells, installed) {
+                        if self.direct_eval_cache_len
+                            < DIRECT_EVAL_CACHE_MAX_ENTRIES
+                        {
+                            self.direct_eval_cache
+                                .entry((func_id, site, mask, flags, source_hash))
+                                .or_default()
+                                .push((code.as_str().into(), base_func));
+                            self.direct_eval_cache_len += 1;
+                        }
+                    }
+                    r
                 } else {
                     a0
                 };

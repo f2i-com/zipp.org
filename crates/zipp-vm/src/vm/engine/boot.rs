@@ -299,6 +299,10 @@ impl<'p> Vm<'p> {
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
             fn_ctor_cache: rustc_hash::FxHashMap::default(),
+            direct_eval_cache: rustc_hash::FxHashMap::default(),
+            direct_eval_cache_len: 0,
+            direct_eval_want: false,
+            direct_eval_installed: None,
             external_code_disabled: false,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
@@ -968,6 +972,15 @@ impl<'p> Vm<'p> {
         n = self.fn_ctor_cache.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.fn_ctor_cache)),
             |n, key| n.saturating_add(key.len()),
+        );
+        n = self.direct_eval_cache.values().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.direct_eval_cache)),
+            |n, sources| {
+                sources.iter().fold(
+                    n.saturating_add(sources.capacity() * std::mem::size_of::<(Box<str>, u32)>()),
+                    |n, (src, _)| n.saturating_add(src.len()),
+                )
+            },
         );
         n = self.pool_slot_names.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.pool_slot_names)),
