@@ -2051,6 +2051,12 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Short-subject ASCII execs each RegExp without a byte-optimized twin
+    /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
+    /// keyed by heap index; an entry leaves when its twin is built. A reused
+    /// index only moves when a twin gets built. Holds no `Value`s; cleared
+    /// wholesale at a small cap.
+    regex_twin_defer: rustc_hash::FxHashMap<u32, u8>,
     /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
     /// programs during the periodic resident-memory audit. Regex literals,
     /// species clones, the compile cache, and inline ASCII twins can all hold

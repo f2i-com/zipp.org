@@ -1019,6 +1019,44 @@ fn slim_exec_enabled() -> bool {
     }
 }
 
+/// Short-subject ASCII execs a RegExp runs on its base program before its
+/// byte-optimized twin is built (`Vm::ensure_regexp_ascii_twin_deferred`).
+const TWIN_DEFER_EXECS: u8 = 3;
+/// Subjects this long or longer build the twin at their first exec.
+const TWIN_DEFER_MAX_SUBJECT: usize = 4096;
+/// Entries `Vm::regex_twin_defer` holds before it is cleared.
+const TWIN_DEFER_TABLE_CAP: usize = 1024;
+
+/// Whether the pattern `src` under `flags` can only name ASCII code points,
+/// so that its base program's byte search over an ASCII subject answers as
+/// the twin's does (`Vm::ensure_regexp_ascii_twin_deferred`): ASCII text, no
+/// `u` or `v` flag, and no escape that can spell a non-ASCII code point or a
+/// lone surrogate (`\u`, `\x`, `\p`, `\P`, `\c`, a digit escape longer than
+/// one digit, which may be an octal one). Errs towards `false`.
+fn twin_deferrable(src: &[u8], flags: &[u8]) -> bool {
+    if flags.iter().any(|&f| f == b'u' || f == b'v') {
+        return false;
+    }
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            0x80.. => return false,
+            b'\\' => {
+                match src.get(i + 1) {
+                    None | Some(b'u' | b'x' | b'p' | b'P' | b'c') => return false,
+                    Some(d) if d.is_ascii_digit() && src.get(i + 2).is_some_and(u8::is_ascii_digit) => {
+                        return false
+                    }
+                    _ => {}
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// `ZIPP_NO_TWIN_AT_CREATE=1` stops the fused matchAll creation arm from
 /// building the SOURCE regex's `ascii_twin` up front: the first slim step's
 /// cold arm builds it on the per-call MATCHER instead — which dies with the
@@ -3079,10 +3117,11 @@ impl<'p> Vm<'p> {
         let found = if start > subj_units {
             None
         } else if is_ascii {
-            self.ensure_regexp_ascii_twin(re_idx);
+            self.ensure_regexp_ascii_twin_deferred(re_idx, subj_units);
             // Both the subject string and the regex/twin are shared borrows of
             // `self.heap` — they coexist. Prefer the byte-optimized twin; fall
-            // back to the base program when the twin compile failed.
+            // back to the base program while it is deferred or when its
+            // compile failed.
             let subj: &str = match self.heap.get(s_idx) {
                 HeapObj::Str(js) => js.as_str_wf(),
                 _ => "",
@@ -4210,6 +4249,36 @@ impl<'p> Vm<'p> {
         Ok(Some(result))
     }
 
+    /// [`Self::ensure_regexp_ascii_twin`] for one exec over a `subject_len`
+    /// byte ASCII subject. The twin is a second compile with its own
+    /// optimizer passes, which a regex made and run once or twice never earns
+    /// back: for a short subject and a plainly ASCII pattern
+    /// (`twin_deferrable`), the first [`TWIN_DEFER_EXECS`] execs search with
+    /// the base program and the twin is built on the next. A long subject
+    /// builds it at once, as its search may need the byte-optimized start
+    /// predicates; so does any other pattern, since the base program's byte
+    /// search is not exact for every one that can name a non-ASCII code point
+    /// (a case-folded non-ASCII literal under `i`, a lone-surrogate escape, a
+    /// `v`-mode class).
+    pub(crate) fn ensure_regexp_ascii_twin_deferred(&mut self, re_idx: u32, subject_len: usize) {
+        if subject_len < TWIN_DEFER_MAX_SUBJECT
+            && matches!(self.heap.get(re_idx), HeapObj::RegExp { ascii_twin: None, source, flags, .. }
+                if twin_deferrable(source.as_bytes(), flags.as_bytes()))
+            && (self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&re_idx))
+        {
+            if self.regex_twin_defer.len() >= TWIN_DEFER_TABLE_CAP {
+                self.regex_twin_defer.clear();
+            }
+            let seen = self.regex_twin_defer.entry(re_idx).or_insert(0);
+            if *seen < TWIN_DEFER_EXECS {
+                *seen += 1;
+                return;
+            }
+            self.regex_twin_defer.remove(&re_idx);
+        }
+        self.ensure_regexp_ascii_twin(re_idx);
+    }
+
     /// Ensure the BYTE-OPTIMIZED twin compile (`HeapObj::RegExp::ascii_twin`)
     /// for the RegExp at `re_idx` exists — built once, lazily, from the SAME
     /// pattern characters and flags as the heap regex (mirrors
@@ -5168,8 +5237,13 @@ impl<'p> Vm<'p> {
             ),
             _ => return RegexpScalarExecStep::Decline,
         };
-        if !flags_ok || !last_index_ok || !matcher_ok || !twin_ready {
+        if !flags_ok || !last_index_ok || !matcher_ok {
             return RegexpScalarExecStep::Decline;
+        }
+        // Compiled code runs this, so the regex is hot: build its twin now
+        // rather than defer it as a first ordinary exec would.
+        if !twin_ready {
+            self.ensure_regexp_ascii_twin(re_idx);
         }
         let s_idx = input.heap_index();
         let subj_units = match self.heap.get(s_idx) {
@@ -7410,6 +7484,42 @@ mod subject_unit_tests {
                 assert!(!push_wtf8_units(&bytes, &mut short, limit), "limit {limit}");
                 assert!(short.len() <= limit && expected.starts_with(&short));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod twin_deferral_tests {
+    use super::twin_deferrable;
+
+    /// Only a pattern that can name nothing but ASCII code points defers its
+    /// twin; everything that might spell a non-ASCII one builds it at once.
+    #[test]
+    fn deferral_takes_only_plainly_ascii_patterns() {
+        for (src, flags) in [
+            ("(\\w+)=(\\d+)", ""),
+            ("[a-z]+\\s*(?:get|put)", "gi"),
+            ("(\\w)\\1x", "g"),
+            ("^line\\d$", "m"),
+            ("a.b", "sy"),
+            ("(?<k>[a-z]{3})\\k<k>", "d"),
+        ] {
+            assert!(twin_deferrable(src.as_bytes(), flags.as_bytes()), "{src} /{flags}");
+        }
+        for (src, flags) in [
+            ("abc", "u"),
+            ("abc", "v"),
+            ("c\\uDE00*", ""),
+            ("\\x41\\xff", ""),
+            ("\\p{L}", ""),
+            ("\\cJ", ""),
+            ("\\377", ""),
+            ("\\12", ""),
+            ("caf\u{e9}", ""),
+            ("\u{1d400}", "i"),
+            ("trailing\\", ""),
+        ] {
+            assert!(!twin_deferrable(src.as_bytes(), flags.as_bytes()), "{src} /{flags}");
         }
     }
 }
