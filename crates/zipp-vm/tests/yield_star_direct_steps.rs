@@ -57,6 +57,11 @@ reenter.next();
 try { reenter.next(); } catch (e) { log("re-entry", e.constructor.name); }
 var done = acc(0); done.next();
 log("completed inner", JSON.stringify([...(function* () { return yield* done; })()]), JSON.stringify((function* () { return yield* done; })().next()));
+var gg = acc(3);
+Object.defineProperty(gg, "next", { get: function () { log("next getter ran"); return function () { return { value: "from getter", done: true }; }; } });
+log("next getter", JSON.stringify(gg.next()));
+var two2 = acc(3);
+log("extra arguments", JSON.stringify(two2.next(5, 6)), JSON.stringify(two2.next(7, 8, 9)), JSON.stringify(Object.freeze(acc(1)).next()));
 var chainOut = [];
 for (var v of (function* () { yield* [1, 2]; yield* "ab"; yield* new Set([3]); yield* acc(2); })()) chainOut.push(v);
 log("mixed inners", chainOut.join());

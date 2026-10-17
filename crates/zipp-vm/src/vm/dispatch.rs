@@ -4461,6 +4461,31 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        // `g.next(v)` on a generator whose `next` is the
+                        // intrinsic: its resume, as the native would run it.
+                        // A generator has no shape for the property cache, so
+                        // the member walk to %GeneratorPrototype% and the
+                        // native dispatcher were most of a step's cost. Main
+                        // realm only: a child realm's `next` would make its
+                        // result object in that realm.
+                        if key == "next"
+                            && self.realm_global_objs.is_empty()
+                            && recv.is_heap()
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Generator { .. })
+                            && self.gen_method_pristine(recv.heap_index(), "next")
+                        {
+                            let sent = if argc == 0 {
+                                Value::UNDEFINED
+                            } else {
+                                self.get(base, arg_base)
+                            };
+                            super::builtins::builtin_stats_count(self, recv, "next");
+                            if let Some(result) = self.generator_method(recv.heap_index(), "next", &[sent])? {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // An exact allocation-only loop of
                         // `sum += array.slice(...).length` or
                         // `sum += array.concat([literal...]).length` can be
