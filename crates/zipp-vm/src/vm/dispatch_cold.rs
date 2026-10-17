@@ -828,6 +828,16 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let fv = self.materialize_callable(func, base, cur_closure);
+                // A class-body callable carries the class's lexical brand
+                // chain, as MakeClass gave every named member: without it a
+                // computed-key member's private accesses fell back to the
+                // textual path, which accepted another evaluation's
+                // same-named private and cost a key spelling per access.
+                if fv.is_heap() {
+                    if let Some(chain) = self.method_brand.get(&cv.heap_index()).cloned() {
+                        self.method_brand.insert(fv.heap_index(), chain);
+                    }
+                }
                 // SetFunctionName from the evaluated key (NamedEvaluation):
                 // the compile-time proto carried only a "<class>.[computed]"
                 // placeholder. A Symbol key â†’ "[description]" (or "" when it

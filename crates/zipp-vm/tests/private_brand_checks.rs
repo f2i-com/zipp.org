@@ -57,6 +57,28 @@ log("proxy", A.hasF(px), A.hasM(px), A.hasF(a));
 var frozenLater = new A();
 Object.freeze(frozenLater);
 log("frozen instance", A.hasF(frozenLater), A.hasM(frozenLater));
+var sym = Symbol("k");
+function makeComputed() {
+  return class {
+    #f = "field";
+    get #g() { return "getter"; }
+    #m() { return "method"; }
+    [sym](o) { return [o.#f, o.#g, o.#m()].join("/"); }
+    ["str" + "Key"](o) { return o.#g; }
+    *[Symbol.iterator]() { yield this.#f; yield this.#g; }
+    get [sym.description + "Acc"]() { return this.#m(); }
+    static [sym](o) { return #f in o; }
+  };
+}
+var C1 = makeComputed(), C2 = makeComputed();
+var c1 = new C1(), c2 = new C2();
+var computedRows = [];
+for (var r = 0; r < 10; r++) {
+  computedRows.push(c1[sym](c1), c1.strKey(c1), [...c1].join("+"), c1.kAcc, C1[sym](c1), C1[sym](c2), C2[sym](c1));
+  try { computedRows.push(c1[sym](c2)); } catch (e) { computedRows.push(e.constructor.name); }
+  try { computedRows.push(C1.prototype[Symbol.iterator].call(c2).next().value); } catch (e) { computedRows.push(e.constructor.name); }
+}
+log("computed keys", computedRows.slice(0, 9).join(), computedRows.slice(-9).join());
 var key = { toString: function () { log("toString ran"); return "f"; } };
 log("ordinary in still coerces", key in plain, "#f" in plain, "#f" in a);
 console.log(out.join("\n"));
