@@ -241,7 +241,7 @@ impl<'p> Vm<'p> {
         gmap: &[u32],
     ) -> Vec<(String, u32)> {
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
-        let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut own_map = super::super::ExportSlots::default();
         for (exported, local) in exports {
             if let Some(i) = names.iter().position(|n| n == local) {
                 full.push((exported.clone(), gmap[i]));
@@ -589,7 +589,7 @@ impl<'p> Vm<'p> {
         let decl_set: std::collections::HashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
         let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-        let mut own_pre: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut own_pre = super::super::ExportSlots::default();
         if !early_prepare {
             for (exported, local) in &exports {
                 if let Some(i) = names.iter().position(|n| n == local) {
@@ -2047,7 +2047,7 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
     ) -> Result<Vec<(String, u32)>, Thrown> {
         let dep = self.resolve_module_path(raw_path)?;
-        let collect = |m: &std::collections::HashMap<String, u32>| -> Vec<(String, u32)> {
+        let collect = |m: &super::super::ExportSlots| -> Vec<(String, u32)> {
             m.iter()
                 .filter(|(n, _)| n.as_str() != "default")
                 .map(|(n, s)| (n.clone(), *s))

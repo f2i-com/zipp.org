@@ -364,6 +364,9 @@ pub const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
 
+/// A module's export names and the global slots holding their live bindings.
+pub(crate) type ExportSlots = rustc_hash::FxHashMap<String, u32>;
+
 /// An active `try` handler within a frame.
 /// One activation record.
 struct Frame {
@@ -2618,14 +2621,17 @@ pub struct Vm<'p> {
     /// global slots (see run_eval_program module mode), so a namespace's [[Get]]
     /// reads the LIVE binding without colliding with another module's same-named
     /// export. [[Set]] is a no-op. Pruned on GC sweep.
-    module_namespaces: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    ///
+    /// Fx-hashed, both levels: every property cache check asks whether its
+    /// receiver is a namespace (`ic_obj_ok`) once any module is loaded, and
+    /// SipHash there was a fifth of a module program's run.
+    module_namespaces: rustc_hash::FxHashMap<u32, ExportSlots>,
     /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
     /// export name→live-slot map (re-exports not yet resolved). Present only during
     /// `import_module`; a re-export back into an in-progress module (a self/mutual
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
-    module_own:
-        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    module_own: std::collections::HashMap<std::path::PathBuf, ExportSlots>,
     /// Per-namespace AMBIGUOUS export names (a name supplied by two different
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.

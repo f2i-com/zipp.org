@@ -518,7 +518,7 @@ impl<'p> Vm<'p> {
             module_total_bytes: 0,
             module_load_depth: 0,
             module_cache: std::collections::HashMap::new(),
-            module_namespaces: std::collections::HashMap::new(),
+            module_namespaces: Default::default(),
             module_own: std::collections::HashMap::new(),
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),

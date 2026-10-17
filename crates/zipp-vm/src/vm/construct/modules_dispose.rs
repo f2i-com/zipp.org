@@ -803,7 +803,7 @@ impl<'p> Vm<'p> {
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
         self.module_namespaces
-            .insert(idx, std::collections::HashMap::new());
+            .insert(idx, Default::default());
         idx
     }
 
@@ -839,7 +839,7 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        let mut slot_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut slot_map = super::super::ExportSlots::default();
         for (name, val, slot) in pairs {
             m.define(&name, val, data_attr);
             slot_map.insert(name, slot);
