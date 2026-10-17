@@ -679,6 +679,39 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// One `next(sent)` step of a `yield*` whose inner iterator is the sync
+    /// generator `iter` with the intrinsic `next` (`gen_method_pristine`):
+    /// the generator run as that call would run it, but as a [`GenStep`]. A
+    /// plain yield stays a value: the result object `next` would have made
+    /// for it is seen only by the delegating generator, which forwards it
+    /// unread but for `done`, so whichever consumer finally takes the value
+    /// makes it (a `for-of` makes none). A raw step (the inner itself
+    /// forwarding a user iterator's result) stays raw. `None` for anything
+    /// else, which `IterDelegate` steps through the protocol.
+    pub(crate) fn generator_delegate_step(&mut self, iter: Value, sent: Value) -> Result<Option<GenStep>, Thrown> {
+        if !iter.is_heap() {
+            return Ok(None);
+        }
+        let idx = iter.heap_index();
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        if !self.gen_method_pristine(idx, "next") {
+            return Ok(None);
+        }
+        match state {
+            GenState::Completed => Ok(Some(GenStep::Done(Value::UNDEFINED))),
+            GenState::Running => Err(Thrown::from_static("TypeError: generator is already running")),
+            GenState::Suspended(ip) => self.gen_resume_step(idx, fid, closure, ip, GenResumeMode::Next(sent)),
+        }
+    }
+
     /// [`Self::gen_resume_step`] with its step as the iterator result
     /// `generator_method` returns.
     fn gen_resume(

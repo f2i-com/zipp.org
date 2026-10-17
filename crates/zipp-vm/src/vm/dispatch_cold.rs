@@ -2303,6 +2303,24 @@ impl<'p> Vm<'p> {
                 let iter_v = self.get(base, iter);
                 let mode_code = self.get(base, mode).as_int();
                 let sent_v = self.get(base, sent);
+                // A `next` step into a generator with the intrinsic `next`
+                // runs it directly; a plain yield comes back as its value,
+                // which the YieldDelegate then yields as a value too.
+                if mode_code == 0 {
+                    if let Some(step) = self.generator_delegate_step(iter_v, sent_v)? {
+                        let (val, done_b, raw) = match step {
+                            crate::vm::async_runtime::GenStep::Yield(y) => (y, false, false),
+                            crate::vm::async_runtime::GenStep::Raw(r) => (r, false, true),
+                            crate::vm::async_runtime::GenStep::Done(v) => (v, true, false),
+                        };
+                        self.pending_yield_raw = raw;
+                        self.set(base, value_dst, val);
+                        self.set(base, done_dst, Value::bool(done_b));
+                        self.set(base, ret_dst, Value::bool(false));
+                        ip += 1;
+                        return Ok(ColdFlow::Next(ip));
+                    }
+                }
                 let (val, done_b, ret_b) =
                     self.iter_delegate_step(iter_v, mode_code, sent_v)?;
                 // Not done ⇒ `val` is the inner iterator's RAW result object
