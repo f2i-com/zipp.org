@@ -94,6 +94,12 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// Most keys a map's shape is rebuilt for after `seal`/`freeze`
+/// (`ObjMap::reshape_after_integrity`): each rebuild walks a fresh path of
+/// the shape tree, so a large frozen dictionary goes DICT rather than spend
+/// the tree's node budget on a layout no cache will share.
+const SHAPE_REBUILD_MAX: usize = 64;
+
 /// What a heap audit charges a `PropIndex::HashTree` entry: its 12 bytes in
 /// a B-tree node and the node overhead around it, overcounted.
 #[cfg(feature = "safe-sandbox")]
@@ -3033,17 +3039,16 @@ impl ObjMap {
 
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
     pub fn seal(&mut self) {
-        self.shape_to_dict(); // every property's `configurable` changes
         self.extensible = false;
         self.sealed = true;
         for a in self.attrs.materialize() {
             a.configurable = false;
         }
+        self.reshape_after_integrity(); // every property's `configurable` changed
     }
 
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
-        self.shape_to_dict(); // every property's `configurable`/`writable` changes
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
@@ -3053,6 +3058,34 @@ impl ObjMap {
                 a.writable = false;
             }
         }
+        self.reshape_after_integrity(); // every property's `configurable`/`writable` changed
+    }
+
+    /// After `seal`/`freeze` changed every property's descriptor bits at
+    /// once: the shape an object built with these keys and bits from the
+    /// start has, rebuilt by appending them from the root. Shapes carry the
+    /// bits, so the rebuilt shape is no writable layout's; and they do not
+    /// carry extensibility, which every append path checks for itself (as it
+    /// must for `Object.preventExtensions`, which keeps the shape). A frozen
+    /// configuration object therefore keeps the shape-keyed property caches
+    /// instead of a key lookup per read. A map that was already DICT (a side
+    /// table, a deleted key), a class prototype (pinned DICT) and one past
+    /// [`SHAPE_REBUILD_MAX`] keys go DICT.
+    fn reshape_after_integrity(&mut self) {
+        if !self.shape_guardable() || self.class_proto || self.keys.len() > SHAPE_REBUILD_MAX {
+            self.shape_to_dict();
+            return;
+        }
+        let mut shape = crate::shape::EMPTY;
+        for i in 0..self.keys.len() {
+            let a = self.attrs.at(i);
+            shape = crate::shape::add(
+                shape,
+                &self.keys[i],
+                crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
+            );
+        }
+        self.shape = shape;
     }
 
     #[inline]
@@ -12019,20 +12052,52 @@ mod tests {
     }
 
     /// `seal` and `freeze` change every property's descriptor at once, so they
-    /// must leave DICT rather than a shape that claims the old bits.
+    /// must leave a shape that claims the NEW bits, never the old ones: the
+    /// shape of an object defined with those bits from the start. A map that
+    /// was DICT, or is past the rebuild bound, stays DICT.
     #[test]
     fn seal_and_freeze_leave_a_shape_that_cannot_lie() {
         for op in [0u8, 1] {
             let mut m = ObjMap::new();
             m.set("a", Value::num(1.0));
             m.set("b", Value::num(2.0));
+            let open = m.shape();
             if op == 0 {
                 m.seal();
             } else {
                 m.freeze();
             }
-            assert!(!m.shape_guardable());
+            assert!(m.shape_guardable());
+            assert_ne!(m.shape(), open);
             assert!(m.verify_shape().is_ok());
+            let attr = PropAttr {
+                writable: op == 0,
+                enumerable: true,
+                configurable: false,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let mut direct = ObjMap::new();
+            direct.define("a", Value::num(1.0), attr);
+            direct.define("b", Value::num(2.0), attr);
+            assert_eq!(m.shape(), direct.shape());
+
+            let mut churned = ObjMap::new();
+            churned.set("a", Value::num(1.0));
+            churned.set("b", Value::num(2.0));
+            churned.remove("a");
+            let mut big = ObjMap::new();
+            for i in 0..SHAPE_REBUILD_MAX + 1 {
+                big.set(&format!("k{i}"), Value::num(i as f64));
+            }
+            for map in [&mut churned, &mut big] {
+                if op == 0 {
+                    map.seal();
+                } else {
+                    map.freeze();
+                }
+                assert!(!map.shape_guardable());
+            }
         }
     }
 
@@ -12074,13 +12139,18 @@ mod tests {
         deleted.remove("a");
         assert!(!deleted.shape_guardable(), "delete shifts later slots");
 
+        // Seal and freeze rewrite every attr: they leave the shape of the new
+        // bits (see `seal_and_freeze_leave_a_shape_that_cannot_lie`), never
+        // the old one.
         let mut resealed = base();
         resealed.seal();
-        assert!(!resealed.shape_guardable(), "seal rewrites every attr");
+        assert_ne!(resealed.shape(), base().shape(), "seal rewrites every attr");
+        assert!(resealed.verify_shape().is_ok());
 
         let mut frozen = base();
         frozen.freeze();
-        assert!(!frozen.shape_guardable(), "freeze rewrites every attr");
+        assert_ne!(frozen.shape(), base().shape(), "freeze rewrites every attr");
+        assert!(frozen.verify_shape().is_ok());
 
         let mut redefined = base();
         redefined.define(
