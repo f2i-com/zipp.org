@@ -857,6 +857,24 @@ impl<'p> Vm<'p> {
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
+        // FAST PATH: a present element of an ordinary array with nothing in a
+        // side table (`counts[0]++`). Every check the general path makes
+        // before its own `items[i] = val` passes for it: no defineProperty'd
+        // index, frozen or sealed state, or extensibility record (all in
+        // `arr_props`), no arguments object's mapped formal, and an own
+        // element, so no prototype step.
+        if let Some(i) = array_index(key) {
+            if (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
+                && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&idx))
+            {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if i < items.len() && !items[i].is_hole() {
+                        items[i] = val;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // A rope key is flattened in place first, as `get_index` does: the
         // fast path below views the key's bytes.
         if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Object(_)) {
