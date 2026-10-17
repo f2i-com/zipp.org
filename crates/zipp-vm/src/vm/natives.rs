@@ -5465,9 +5465,9 @@ impl<'p> Vm<'p> {
                 // coercion above hides it (U+FFFD) — check the exact bytes.
                 self.uri_check_wellformed(a0)?;
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
-                let out_len = uri_encode_output_len(&s, b"#;/?:@&=+$,")?;
+                let out_len = uri_encode_output_len(&s, URI_KEEP)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
-                uri_encode_into(&s, b"#;/?:@&=+$,", &mut out);
+                uri_encode_into(&s, URI_KEEP, &mut out);
                 debug_assert_eq!(out.len(), out_len);
                 self.alloc_str(out)
             }
@@ -5475,9 +5475,9 @@ impl<'p> Vm<'p> {
                 let s = self.to_js_string(a0)?;
                 self.uri_check_wellformed(a0)?; // lone surrogate -> URIError
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
-                let out_len = uri_encode_output_len(&s, b"")?;
+                let out_len = uri_encode_output_len(&s, URI_COMPONENT_KEEP)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
-                uri_encode_into(&s, b"", &mut out);
+                uri_encode_into(&s, URI_COMPONENT_KEEP, &mut out);
                 debug_assert_eq!(out.len(), out_len);
                 self.alloc_str(out)
             }
@@ -7888,34 +7888,51 @@ fn unescape_str(s: &str) -> Result<crate::heap::JsStr, Thrown> {
     Ok(crate::heap::JsStr::from_wtf8(out))
 }
 
-fn uri_encode_output_len(s: &str, extra: &[u8]) -> Result<usize, Thrown> {
-    let mut total = 0usize;
-    for c in s.chars() {
-        let additional =
-            if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
-                1
-            } else {
-                c.len_utf8()
-                    .checked_mul(3)
-                    .ok_or_else(invalid_native_string_length)?
-            };
-        total = checked_native_output_add(total, additional)?;
+/// The ASCII bytes of `URI_UNESCAPED` and of `extra` as a bit set, bit `b`
+/// for byte `b`: what an encoder keeps as itself.
+const fn uri_keep_mask(extra: &[u8]) -> u128 {
+    let mut mask = 0u128;
+    let mut i = 0;
+    while i < URI_UNESCAPED.len() {
+        mask |= 1 << URI_UNESCAPED[i];
+        i += 1;
     }
-    Ok(total)
+    let mut i = 0;
+    while i < extra.len() {
+        mask |= 1 << extra[i];
+        i += 1;
+    }
+    mask
 }
 
-fn uri_encode_into(s: &str, extra: &[u8], out: &mut String) {
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
-            out.push(c);
+/// What encodeURIComponent keeps, and encodeURI (uriReserved and "#" too).
+const URI_COMPONENT_KEEP: u128 = uri_keep_mask(b"");
+const URI_KEEP: u128 = uri_keep_mask(b"#;/?:@&=+$,");
+
+#[inline]
+fn uri_keeps(keep: u128, b: u8) -> bool {
+    b < 0x80 && keep >> b & 1 != 0
+}
+
+/// The length of `uri_encode_into`'s output. A character outside `keep` is
+/// its UTF-8 bytes each as `%XX`, so the encoding is per byte.
+fn uri_encode_output_len(s: &str, keep: u128) -> Result<usize, Thrown> {
+    let kept = s.bytes().filter(|&b| uri_keeps(keep, b)).count();
+    let escaped = (s.len() - kept)
+        .checked_mul(3)
+        .ok_or_else(invalid_native_string_length)?;
+    checked_native_output_add(escaped, kept)
+}
+
+fn uri_encode_into(s: &str, keep: u128, out: &mut String) {
+    for b in s.bytes() {
+        if uri_keeps(keep, b) {
+            out.push(b as char);
         } else {
-            for &b in c.encode_utf8(&mut buf).as_bytes() {
-                let h = hex_upper(b);
-                out.push('%');
-                out.push(h[0] as char);
-                out.push(h[1] as char);
-            }
+            let h = hex_upper(b);
+            out.push('%');
+            out.push(h[0] as char);
+            out.push(h[1] as char);
         }
     }
 }

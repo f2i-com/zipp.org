@@ -746,6 +746,16 @@ impl<'p> Vm<'p> {
         // a bound splitting a surrogate pair keeps the REAL covered half).
         let subu = |a: usize, b: usize| -> crate::heap::JsStr { js_recv.slice_units(a, b) };
         match name {
+            "toUpperCase" | "toLowerCase" if case_map_one_pass(&js_recv) => {
+                let s = js_recv.as_str_wf();
+                let mapped = if name == "toUpperCase" {
+                    crate::vm::special_casing::str_to_uppercase(s)
+                } else {
+                    crate::vm::special_casing::str_to_lowercase(s)
+                };
+                self.preflight_guest_string_size(mapped.len())?;
+                Ok(Some(Value::heap(self.heap.alloc_js(crate::heap::JsStr::new(mapped)))))
+            }
             "toUpperCase" => {
                 let mapped_len = case_map_exact_len(js_recv.as_bytes(), true)?;
                 self.preflight_guest_string_size(mapped_len)?;
@@ -2284,6 +2294,18 @@ fn extend_chars(out: &mut String, iter: impl Iterator<Item = char>) {
     for c in iter {
         out.push(c);
     }
+}
+
+/// Receivers whose case mapping is built in one pass and admitted after:
+/// well-formed (no lone surrogate to copy through) and short enough that
+/// the result, at most three times the bytes (U+0390 uppercases to three
+/// code points), is a small allocation to make before the size check. The
+/// rest are measured exactly first ([`case_map_exact_len`]), which mapped
+/// every character twice.
+const CASE_MAP_ONE_PASS_BYTES: usize = 64 * 1024;
+
+fn case_map_one_pass(s: &crate::heap::JsStr) -> bool {
+    s.is_wellformed() && !s.is_ascii() && s.as_bytes().len() <= CASE_MAP_ONE_PASS_BYTES
 }
 
 /// `toUpperCase`/`toLowerCase` over the receiver's EXACT WTF-8 bytes. The
