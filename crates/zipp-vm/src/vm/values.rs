@@ -16,6 +16,16 @@ const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
     setter: Value::UNDEFINED,
 };
 
+/// What `Vm::plain_chain_get` found for a key on a chain of ordinary objects.
+pub(crate) enum PlainGet {
+    /// A data property's value.
+    Data(Value),
+    /// An accessor's getter, UNDEFINED for a setter-only one.
+    Getter(Value),
+    /// No level holds the key.
+    Absent,
+}
+
 /// `Vm::private_memo`'s size, a power of two.
 pub(crate) const PRIVATE_MEMO_SLOTS: usize = 256;
 
@@ -1283,23 +1293,23 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// `Reflect.get(target, key, receiver)` for a flat string `key` that
-    /// `target`, an ordinary object or array, holds as an own data property:
-    /// its value, which no receiver can change (only an accessor would see
-    /// one). A trap forwarding with `Reflect.get(t, k, recv)` spelled the key
-    /// afresh as a String for every read. `None` leaves it to the general
-    /// path, with the exclusions of [`Vm::plain_string_key_has`], a module
-    /// namespace's or class instance's own tables, and an array with a side
-    /// table or an arguments object.
-    pub(crate) fn plain_own_data_get(&self, target: Value, key: Value) -> Option<Value> {
+    /// `Reflect.get(target, key, receiver)` for a flat string `key` where
+    /// `target` and its chain are ordinary objects: what [[Get]] finds, read
+    /// through the key where it lies. A data property's value, which no
+    /// receiver changes; an accessor's getter, which the caller calls with
+    /// the receiver; or nothing, at an explicit null prototype or the end of
+    /// the default chain. A trap forwarding with `Reflect.get(t, k, recv)`
+    /// spelled the key afresh as a String for every read, and an inherited
+    /// getter read that way (`Reflect.get(proto, "x", obj)`) did the same.
+    ///
+    /// `None` leaves it to the general path. The levels are those of
+    /// [`Vm::plain_string_key_miss`]: an exotic or live-slot object
+    /// (`ic_obj_ok`), a class instance and a constructor's map decline. So do
+    /// a Symbol, an `@@`-spelled key, a lone surrogate, `__proto__`, and an
+    /// uninitialized slot. The target alone may be an array with nothing in a
+    /// side table, for a present element or its `length`.
+    pub(crate) fn plain_chain_get(&self, target: Value, key: Value) -> Option<PlainGet> {
         if !target.is_heap() || !key.is_heap() || !self.deferred_ns_state.is_empty() {
-            return None;
-        }
-        let idx = target.heap_index();
-        if (idx == self.global_this && self.global_this != 0)
-            || (idx == self.arr_proto && self.arr_proto != 0)
-            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
-        {
             return None;
         }
         let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
@@ -1308,18 +1318,39 @@ impl<'p> Vm<'p> {
         if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
             return None;
         }
-        let HeapObj::Object(m) = self.heap.get(idx) else {
-            return self.plain_array_own_data_get(idx, js.as_str_wf());
-        };
-        if m.class.is_some() {
+        let key = js.as_str_wf();
+        if key == "__proto__" {
             return None;
         }
-        let slot = m.pos(js.as_str_wf())?;
-        let v = m.val_at(slot);
-        (!m.attr_at(slot).accessor && !v.is_uninitialized()).then_some(v)
+        let mut cur = target.heap_index();
+        for depth in 0..64 {
+            if !self.ic_obj_ok(cur) {
+                return None;
+            }
+            let m = match self.heap.get(cur) {
+                HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => m,
+                _ if depth == 0 => return self.plain_array_own_data_get(cur, key).map(PlainGet::Data),
+                _ => return None,
+            };
+            if let Some(slot) = m.pos(key) {
+                let v = m.val_at(slot);
+                if m.attr_at(slot).accessor {
+                    return Some(PlainGet::Getter(v));
+                }
+                return (!v.is_uninitialized()).then_some(PlainGet::Data(v));
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                // An explicit null prototype: a true miss.
+                Some(_) => return Some(PlainGet::Absent),
+                None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
+                None => return Some(PlainGet::Absent),
+            };
+        }
+        None
     }
 
-    /// [`Vm::plain_own_data_get`] for an array with nothing in a side table: a
+    /// [`Vm::plain_chain_get`] for an array with nothing in a side table: a
     /// present element or its `length`. `None` for anything else: an
     /// arguments object (its elements are mapped to its frame, its `length`
     /// is its own), a hole (the read goes on to the chain), any other kind of

@@ -60,6 +60,35 @@ attempt("non-configurable element, lie", function () { return lying(sealedEl, 99
 attempt("plain element, lie", function () { return lying([1, 2], 99)[0]; });
 function argsTarget() { return arguments; }
 attempt("arguments length, lie", function () { return lying(argsTarget(1, 2), 99).length; });
+var base = { data: "base data", get scaled() { return this.raw * 3; }, set onlySet(v) {} };
+var mid = Object.create(base);
+mid.midData = "mid data";
+var leaf = Object.create(mid);
+leaf.raw = 5;
+var other = { raw: 7 };
+log("chain getters", Reflect.get(base, "scaled", leaf), Reflect.get(base, "scaled", other), Reflect.get(leaf, "scaled", other),
+  Reflect.get(leaf, "data", other), Reflect.get(leaf, "midData", other), String(Reflect.get(leaf, "onlySet", other)),
+  String(Reflect.get(leaf, "nowhere", other)));
+var bare = Object.create(null);
+bare.x = "bare x";
+var overBare = Object.create(bare);
+log("null chains", Reflect.get(overBare, "x", other), String(Reflect.get(overBare, "toString", other)), String(Reflect.get(bare, "missing", other)));
+class Shape { area() { return "area of " + this.raw; } get kind() { return "kind " + this.raw; } }
+var viaClass = Object.create(Shape.prototype);
+log("class prototype", typeof Reflect.get(viaClass, "area", other), Reflect.get(viaClass, "kind", other), Reflect.get(new Shape(), "kind", other));
+var trapped = [];
+var proxyProto = new Proxy({ fromProxy: "p" }, { get: function (t, k, r) { trapped.push(String(k)); return Reflect.get(t, k, r); } });
+var overProxy = Object.create(proxyProto);
+log("proxy in the chain", Reflect.get(overProxy, "fromProxy", other), String(Reflect.get(overProxy, "absent", other)), trapped.join());
+var overArray = Object.create([1, 2, 3]);
+log("array in the chain", Reflect.get(overArray, "1", other), Reflect.get(overArray, "length", other), typeof Reflect.get(overArray, "map", other));
+var thrower = Object.create({ get boom() { throw new RangeError("from getter"); } });
+attempt("throwing getter", function () { return Reflect.get(thrower, "boom", other); });
+log("__proto__", Reflect.get(leaf, "__proto__", other) === Object.prototype, Reflect.get(leaf, "__proto__", leaf) === mid);
+Object.defineProperty(Object.prototype, "everywhere", { get: function () { return "seen " + this.raw; }, configurable: true });
+log("Object.prototype getter", Reflect.get(leaf, "everywhere", other), Reflect.get({}, "everywhere", leaf));
+delete Object.prototype.everywhere;
+log("after removal", String(Reflect.get(leaf, "everywhere", other)));
 console.log(out.join("\n"));
 "##;
 

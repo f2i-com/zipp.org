@@ -4427,8 +4427,14 @@ impl<'p> Vm<'p> {
                 let receiver = args.get(2).copied().unwrap_or(a0);
                 if receiver == a0 {
                     self.get_index(a0, a1)?
-                } else if let Some(v) = self.plain_own_data_get(a0, a1) {
-                    v
+                } else if let Some(found) = self.plain_chain_get(a0, a1) {
+                    match found {
+                        crate::vm::values::PlainGet::Data(v) => v,
+                        crate::vm::values::PlainGet::Getter(g) if g != Value::UNDEFINED => {
+                            self.call_value(g, receiver, &[])?
+                        }
+                        _ => Value::UNDEFINED,
+                    }
                 } else {
                     let key = self.to_property_key(a1)?;
                     self.get_member(a0, &key, receiver)?
