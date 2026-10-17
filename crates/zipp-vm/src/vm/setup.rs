@@ -2343,10 +2343,34 @@ impl<'p> Vm<'p> {
                         bits[method] = value.bits();
                     }
                 }
+                // The numeric setters, entries 10..18, the same way.
+                let mut set_bits = [Value::UNDEFINED.bits(); 8];
+                if valid && m.len() >= 18 && native::DV_PROTO_METHODS.len() >= 18 {
+                    for (j, slot) in (10..18).enumerate() {
+                        let value = m.val_at(slot);
+                        let intrinsic = value.is_heap()
+                            && matches!(
+                                self.heap.get(value.heap_index()),
+                                HeapObj::Native(id)
+                                    if *id == native::DV_METHOD_BASE + slot as u16
+                            );
+                        if !intrinsic
+                            || m.key_at(slot) != native::DV_PROTO_METHODS[slot]
+                            || m.attr_at(slot).accessor
+                        {
+                            valid = false;
+                            break;
+                        }
+                        set_bits[j] = value.bits();
+                    }
+                } else {
+                    valid = false;
+                }
                 debug_assert!(valid, "DataView prototype boot layout drifted");
                 if valid {
                     self.dataview_proto_shape = shape;
                     self.dataview_numeric_getter_bits = bits;
+                    self.dataview_numeric_setter_bits = set_bits;
                 }
             }
         }

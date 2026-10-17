@@ -500,6 +500,7 @@ impl<'p> Vm<'p> {
             dataview_proto: 0,
             dataview_proto_shape: crate::shape::DICT,
             dataview_numeric_getter_bits: [Value::UNDEFINED.bits(); 8],
+            dataview_numeric_setter_bits: [Value::UNDEFINED.bits(); 8],
             sab_ctor: 0,
             sab_proto: 0,
             shared_buffers: std::collections::HashSet::new(),

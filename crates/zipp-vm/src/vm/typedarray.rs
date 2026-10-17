@@ -87,6 +87,23 @@ fn dataview_get_kind(name: &str) -> Option<(usize, u8)> {
     }
 }
 
+/// The prototype entry and `TA_KINDS` index of each non-BigInt numeric
+/// DataView setter (entries 10..18 of `DV_PROTO_METHODS`).
+#[inline]
+fn dataview_set_kind(name: &str) -> Option<(usize, u8)> {
+    match name {
+        "setInt8" => Some((10, 0)),
+        "setUint8" => Some((11, 1)),
+        "setInt16" => Some((12, 3)),
+        "setUint16" => Some((13, 4)),
+        "setInt32" => Some((14, 5)),
+        "setUint32" => Some((15, 6)),
+        "setFloat32" => Some((16, 7)),
+        "setFloat64" => Some((17, 8)),
+        _ => None,
+    }
+}
+
 impl<'p> Vm<'p> {
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
@@ -473,6 +490,141 @@ impl<'p> Vm<'p> {
         self.dataview_get_leaf(view_idx, method, position, little_endian)
     }
 
+    /// `dataview_interp_get_fast`'s twin for the pristine numeric setters:
+    /// `view.setUint32(pos, v, le)` with a non-negative integral `pos` and a
+    /// Number `v`, so that neither ToIndex nor ToNumber can run code, on a
+    /// buffer that is not immutable. The callee is proved the same way (the
+    /// view's own properties and prototype untouched since construction, the
+    /// prototype's boot shape, the setter's exact bits). `Ok(None)`: nothing
+    /// observable happened; the caller makes the generic call. From the
+    /// proof on it is SetViewValue: the detached or out-of-bounds TypeError,
+    /// the bounds RangeError, the write.
+    pub(crate) fn dataview_interp_set_fast(
+        &mut self,
+        view_idx: u32,
+        name: &str,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        let Some((slot, kind)) = dataview_set_kind(name) else {
+            return Ok(None);
+        };
+        let pristine_version = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                pristine_version, ..
+            } => *pristine_version,
+            _ => return Ok(None),
+        };
+        if !self.realm_global_objs.is_empty()
+            || self.dataview_proto == 0
+            || self.heap.version_of(view_idx) != pristine_version
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            return Ok(None);
+        }
+        let intrinsic_live = match self.heap.get(self.dataview_proto) {
+            HeapObj::Object(map) => {
+                map.shape() == self.dataview_proto_shape
+                    && slot < map.len()
+                    && map.val_at(slot).bits() == self.dataview_numeric_setter_bits[slot - 10]
+            }
+            _ => false,
+        };
+        if !intrinsic_live {
+            return Ok(None);
+        }
+        self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
+    }
+
+    /// The split member-call form's setter lane (see `dataview_captured_get`):
+    /// `native_id` is the main realm's intrinsic numeric setter, so the call
+    /// is that setter's. `Ok(None)`: nothing observable happened.
+    pub(crate) fn dataview_captured_set(
+        &mut self,
+        view_idx: u32,
+        native_id: u16,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        if !self.realm_global_objs.is_empty() {
+            return Ok(None);
+        }
+        let slot = native_id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        if !(10..18).contains(&slot) {
+            return Ok(None);
+        }
+        let name = native::DV_PROTO_METHODS[slot];
+        let Some((_, kind)) = dataview_set_kind(name) else {
+            return Ok(None);
+        };
+        self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
+    }
+
+    /// The numeric setter `name` (`TA_KINDS` index `kind`) on `view_idx`, for
+    /// a caller that has proved it is the function being called: SetViewValue
+    /// for a non-negative integral `position` and a Number `value` on a buffer
+    /// that is not immutable, else `Ok(None)` with nothing done.
+    fn dataview_set_leaf(
+        &mut self,
+        view_idx: u32,
+        kind: u8,
+        name: &str,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        if !value.is_number() {
+            return Ok(None);
+        }
+        let (buffer, byte_offset, byte_length) = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+                ..
+            } => (*buffer, *byte_offset, *byte_length),
+            _ => return Ok(None),
+        };
+        if !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&buffer) {
+            return Ok(None);
+        }
+        let Some(pos) = array_index(position) else {
+            return Ok(None);
+        };
+        let size = native::TA_KINDS[kind as usize].1;
+        let view_len = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                self.dv_effective_len_at(view_idx, byte_offset, byte_length, data.len())
+            }
+            HeapObj::ArrayBuffer { .. } => None,
+            _ => return Ok(None),
+        };
+        super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
+        let Some(view_len) = view_len else {
+            return Err(Thrown::from_static(
+                "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer",
+            ));
+        };
+        if size > view_len || pos > view_len - size {
+            return Err(Thrown::from_static(
+                "RangeError: Offset is outside the bounds of the DataView",
+            ));
+        }
+        let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
+        if !self.truthy(little_endian) {
+            bytes[..size].reverse();
+        }
+        let abs = byte_offset + pos;
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+            if abs + size <= data.len() {
+                data[abs..abs + size].copy_from_slice(&bytes[..size]);
+            }
+        }
+        Ok(Some(()))
+    }
+
     /// What `Get(view, name)` finds when `name` is one of the numeric getters
     /// and `view` is still default-constructed (no own property, the default
     /// prototype): that prototype's slot, read in place. `None` sends the
@@ -480,7 +632,8 @@ impl<'p> Vm<'p> {
     /// property cache to key on, so `dv.getUint32` otherwise walked to the
     /// prototype and searched it by name on every read.
     pub(crate) fn dataview_proto_read(&self, view_idx: u32, name: &str) -> Option<u64> {
-        let (method, _) = dataview_get_kind(name)?;
+        // The numeric setters sit at their own boot entries; the proof is the same.
+        let (method, _) = dataview_get_kind(name).or_else(|| dataview_set_kind(name))?;
         let HeapObj::DataView {
             pristine_version, ..
         } = self.heap.get(view_idx)

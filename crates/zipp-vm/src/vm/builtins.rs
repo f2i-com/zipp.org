@@ -996,6 +996,14 @@ impl<'p> Vm<'p> {
             HeapObj::DataView { .. } => {
                 let at = base + arg_base as usize;
                 let position = if argc > 0 { self.regs[at] } else { Value::UNDEFINED };
+                // `dv.setUint32(o, v, le)`: the setters' lane, on the same proof.
+                if argc >= 2 && key.as_bytes().first() == Some(&b's') {
+                    let value = self.regs[at + 1];
+                    let little_endian = if argc > 2 { self.regs[at + 2] } else { Value::UNDEFINED };
+                    return Ok(self
+                        .dataview_captured_set(idx, native_id, position, value, little_endian)?
+                        .map(|()| Value::UNDEFINED));
+                }
                 let little_endian = if argc > 1 { self.regs[at + 1] } else { Value::UNDEFINED };
                 return self.dataview_captured_get(idx, native_id, position, little_endian);
             }

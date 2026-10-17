@@ -4424,6 +4424,29 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // The setters, likewise (`set*(pos, value, le)`).
+                            if argc >= 2 && key.as_bytes().first() == Some(&b's') {
+                                let little_endian = if argc < 3 {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get(base, arg_base + 2)
+                                };
+                                let value = self.get(base, arg_base + 1);
+                                if self
+                                    .dataview_interp_set_fast(
+                                        recv.heap_index(),
+                                        key,
+                                        position,
+                                        value,
+                                        little_endian,
+                                    )?
+                                    .is_some()
+                                {
+                                    self.set(base, dst, Value::UNDEFINED);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                         }
                         // An exact allocation-only loop of
                         // `sum += array.slice(...).length` or

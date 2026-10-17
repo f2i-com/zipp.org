@@ -2487,6 +2487,10 @@ pub struct Vm<'p> {
     /// function object (a native id alone would not prove realm identity).
     dataview_proto_shape: u32,
     dataview_numeric_getter_bits: [u64; 8],
+    /// The same for the numeric setters (`setInt8`..`setFloat64`, the
+    /// prototype's entries 10..18), proving `dataview_interp_set_fast`'s
+    /// callee.
+    dataview_numeric_setter_bits: [u64; 8],
     /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
     /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
     /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as

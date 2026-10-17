@@ -28,6 +28,14 @@ pub(crate) fn ta_encode(kind: u8, f: f64) -> [u8; 8] {
 
 /// JS ToUintN modular reduction (the low `bits` bits of trunc(f)), NaN/±∞ → 0.
 pub(crate) fn to_uint_modular(f: f64, bits: u32) -> u64 {
+    // Below 2^63 in magnitude the conversion to i64 truncates toward zero
+    // exactly, and its two's-complement bits are trunc(f) modulo 2^64, so
+    // their low `bits` bits are the answer: no power, no remainder (NaN
+    // fails the comparison and takes the path below).
+    if f.abs() < 9_223_372_036_854_775_808.0 {
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        return (f as i64) as u64 & mask;
+    }
     if !f.is_finite() {
         return 0;
     }
@@ -411,5 +419,35 @@ pub(crate) fn array_index(key: Value) -> Option<usize> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The direct reduction against the remainder formula it stands in for,
+    /// at every width, around each power-of-two edge, for fractions,
+    /// negatives, -0, NaN and the infinities.
+    #[test]
+    fn to_uint_modular_matches_the_remainder_formula() {
+        fn slow(f: f64, bits: u32) -> u64 {
+            if !f.is_finite() {
+                return 0;
+            }
+            f.trunc().rem_euclid(2f64.powi(bits as i32)) as u64
+        }
+        let mut values = vec![0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 255.9, -255.9, f64::NAN, f64::INFINITY,
+            f64::NEG_INFINITY, f64::MAX, f64::MIN, 5e-324, 1e300, -1e300];
+        for e in 0..70 {
+            let p = 2f64.powi(e);
+            for d in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
+                values.push(p + d);
+                values.push(-(p + d));
+            }
+        }
+        for &f in &values {
+            for bits in [8, 16, 32] {
+                assert_eq!(super::to_uint_modular(f, bits), slow(f, bits), "{f} at {bits} bits");
+            }
+        }
     }
 }
