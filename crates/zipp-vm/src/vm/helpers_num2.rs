@@ -1092,14 +1092,216 @@ fn read_uint(b: &[u8], i: &mut usize) -> Option<i64> {
     }
 }
 
+/// Powers of five and of ten up to the largest that fits a u128.
+const POW5_U128: [u128; 56] = pow_table(5);
+const POW10_U128: [u128; 39] = pow_table(10);
+
+const fn pow_table<const N: usize>(base: u128) -> [u128; N] {
+    let mut table = [1u128; N];
+    let mut i = 1;
+    while i < N {
+        table[i] = table[i - 1] * base;
+        i += 1;
+    }
+    table
+}
+
+/// A positive finite `a` as `m × 2^e` with `m` odd.
+fn odd_binary(a: f64) -> (u64, i32) {
+    let bits = a.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (m, e) = if biased == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased - 1075)
+    };
+    let tz = m.trailing_zeros();
+    (m >> tz, e + tz as i32)
+}
+
+/// `m × 2^e × 10^k`, exactly, as its floor and whether what the floor drops
+/// is at least one half; None when the operands do not fit a u128. With
+/// 10^k = 5^k × 2^k only the power of five is ever multiplied in, so any
+/// value of moderate magnitude fits at twenty-odd digits.
+fn scale_pow10(m: u64, e: i32, k: i32) -> Option<(u128, bool)> {
+    let m = m as u128;
+    let s = e + k;
+    if k >= 0 {
+        // a × 10^k = (m × 5^k) × 2^s.
+        let num = m.checked_mul(*POW5_U128.get(k as usize)?)?;
+        if s >= 0 {
+            return (s < num.leading_zeros() as i32).then(|| (num << s, false));
+        }
+        let sh = s.unsigned_abs();
+        if sh > 128 {
+            return Some((0, false));
+        }
+        if sh == 128 {
+            return Some((0, num >> 127 != 0));
+        }
+        let rest = num & ((1u128 << sh) - 1);
+        Some((num >> sh, rest >= 1u128 << (sh - 1)))
+    } else {
+        // a × 10^k = m × 2^s / 5^-k.
+        let five = *POW5_U128.get(k.unsigned_abs() as usize)?;
+        let (num, den) = if s >= 0 {
+            if s >= m.leading_zeros() as i32 {
+                return None;
+            }
+            (m << s, five)
+        } else {
+            let sh = s.unsigned_abs();
+            if sh >= five.leading_zeros() {
+                return None;
+            }
+            (m, five << sh)
+        };
+        let rest = num % den;
+        Some((num / den, rest >= den - rest))
+    }
+}
+
+/// A positive finite `a` rounded to `sig` (1..=101) significant digits,
+/// halves away from zero as toExponential and toPrecision round: the digits
+/// and the decimal exponent of the first. Exact integer arithmetic answers
+/// whenever it fits; otherwise Rust's precision formatting, which is exact
+/// too but settles a tie to even, so a possible tie takes the guard-digit
+/// rounding instead.
+pub(crate) fn sig_digits_half_up(a: f64, sig: usize) -> (String, i32) {
+    let (m, e) = odd_binary(a);
+    if sig <= 38 {
+        let mut x = a.log10().floor() as i32;
+        for _ in 0..3 {
+            let Some((floor, up)) = scale_pow10(m, e, sig as i32 - 1 - x) else {
+                break;
+            };
+            // The estimate of the exponent can be one off either way.
+            if floor >= POW10_U128[sig] {
+                x += 1;
+                continue;
+            }
+            if floor < POW10_U128[sig - 1] {
+                x -= 1;
+                continue;
+            }
+            let mut n = floor + up as u128;
+            if n == POW10_U128[sig] {
+                n = POW10_U128[sig - 1];
+                x += 1;
+            }
+            return (n.to_string(), x);
+        }
+    }
+    let text = format!("{:.*e}", sig - 1, a);
+    let epos = text.find('e').unwrap();
+    let x: i32 = text[epos + 1..].parse().unwrap_or(0);
+    // A tie ends the exact expansion (whose last digit sits at 10^e) with a
+    // 5 in the first dropped place, 10^(X - sig) for the exponent X before
+    // rounding: Rust's, or one less if the rounding carried.
+    if e == x - sig as i32 || e == x - 1 - sig as i32 {
+        let (mant, x) = round_exp_half_away(a, sig - 1);
+        return (mant.replace('.', ""), x);
+    }
+    (text[..epos].replace('.', ""), x)
+}
+
+/// Round a POSITIVE finite `a` to `d` fractional mantissa digits in exponential
+/// form, rounding half-AWAY-from-zero, returning ("D.FFFF", exponent). Works on
+/// the exact decimal digits (formatted at high precision, so the (d+1)th digit is
+/// exact) to avoid the f64 round-trip drift a `*10^d` reconstruction would cause.
+pub(crate) fn round_exp_half_away(a: f64, d: usize) -> (String, i32) {
+    // High-precision digits — exact for the first d+1 fractional places.
+    let guard = d + 25;
+    let raw = format!("{a:.guard$e}");
+    let epos = raw.find('e').unwrap();
+    let mantissa = &raw[..epos]; // "D.FFFF…"
+    let mut exp: i32 = raw[epos + 1..].parse().unwrap_or(0);
+    // Digit string without the '.': 1 leading (integer) digit + `guard` fractional.
+    let mut ds: Vec<u8> = mantissa
+        .bytes()
+        .filter(|&b| b != b'.')
+        .map(|b| b - b'0')
+        .collect();
+    // For a positive value, nearest-rounding (half-away) rounds the kept prefix up
+    // iff the first dropped digit is >= 5 (the >= folds the exact-tie case to up).
+    let keep = 1 + d;
+    let round_up = ds.get(keep).is_some_and(|&dig| dig >= 5);
+    ds.truncate(keep);
+    if round_up {
+        let mut i = ds.len();
+        loop {
+            if i == 0 {
+                ds.insert(0, 1); // carry past the leading digit: 9.. -> 10..
+                break;
+            }
+            i -= 1;
+            if ds[i] == 9 {
+                ds[i] = 0;
+            } else {
+                ds[i] += 1;
+                break;
+            }
+        }
+    }
+    // A carry that grew the integer part to two digits (e.g. 9.99 -> 10.0)
+    // renormalises: drop the extra trailing digit and bump the exponent.
+    if ds.len() > 1 + d {
+        ds.truncate(1 + d);
+        exp += 1;
+    }
+    let int_digit = (b'0' + ds[0]) as char;
+    let mant = if d == 0 {
+        int_digit.to_string()
+    } else {
+        let frac: String = ds[1..].iter().map(|&x| (b'0' + x) as char).collect();
+        format!("{int_digit}.{frac}")
+    };
+    (mant, exp)
+}
+
 /// `Number.prototype.toFixed(f)`. JS rounds half AWAY from zero — `(0.5).toFixed(0)`
 /// is "1", `(2.5).toFixed(0)` is "3" — whereas Rust's `{:.*}` formatter rounds
-/// half-to-even. We round the EXACT decimal of the f64 (not `x*10^f`, whose
+/// half-to-even. We round the EXACT value of the f64 (not `x*10^f`, whose
 /// product error would mis-round e.g. `0.15` whose true value is `0.14999…`):
-/// format with guard digits to expose the exact value, then round the decimal
-/// string half-up at `f` places. Huge magnitudes (≥1e21) defer to the default
-/// rendering (JS switches to exponential there too).
+/// in integer arithmetic when it fits, else with Rust's formatter when no tie
+/// is possible, else from guard digits. Huge magnitudes (≥1e21) defer to the
+/// default rendering (JS switches to exponential there too).
 pub(crate) fn to_fixed(n: f64, f: usize) -> String {
+    if n.is_finite() && n.abs() < 1e21 && n != 0.0 {
+        let neg = n < 0.0;
+        let a = n.abs();
+        let (m, e) = odd_binary(a);
+        let mut out = String::with_capacity(f + 24);
+        if neg {
+            out.push('-');
+        }
+        if let Some((floor, up)) = scale_pow10(m, e, f as i32) {
+            let mut digits = (floor + up as u128).to_string();
+            // At least one digit before the point.
+            if digits.len() <= f {
+                digits.insert_str(0, &"0".repeat(f + 1 - digits.len()));
+            }
+            let (int_part, frac) = digits.split_at(digits.len() - f);
+            out.push_str(int_part);
+            if f > 0 {
+                out.push('.');
+                out.push_str(frac);
+            }
+            return out;
+        }
+        // The exact expansion ends at 10^e with a 5: a tie only there.
+        if e != -(f as i32 + 1) {
+            use std::fmt::Write;
+            let _ = write!(out, "{a:.f$}");
+            return out;
+        }
+    }
+    to_fixed_guarded(n, f)
+}
+
+/// `to_fixed` from guard digits: exact for every value it is given.
+fn to_fixed_guarded(n: f64, f: usize) -> String {
     if n.is_nan() {
         return "NaN".into();
     }
@@ -1709,6 +1911,83 @@ mod binary_fraction_tests {
             let mut s = String::new();
             fmt_f64_into(&mut s, n);
             assert_eq!(s, text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_rounding_tests {
+    use super::{round_exp_half_away, sig_digits_half_up, to_fixed, to_fixed_guarded};
+
+    /// Random bit patterns, the bench's kinds of value, and values built to
+    /// sit on a tie at some digit count: dyadic fractions, integers
+    /// 2^c × 5^(c+1) × odd, the classic decimal near-ties, the extremes.
+    fn values() -> Vec<f64> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut v = Vec::new();
+        while v.len() < 300 {
+            let x = f64::from_bits(next() & !(1u64 << 63));
+            if x.is_finite() && x > 0.0 {
+                v.push(x);
+            }
+        }
+        for _ in 0..200 {
+            let r = next();
+            let k = (r >> 8) % 1_000_000_000;
+            v.push(match r % 6 {
+                0 => k as f64 / 1000.0,
+                1 => (k % 1_000_000) as f64 * 1.1 + 1.0,
+                2 => (k % 100_000 + 1) as f64 * 1e-9,
+                3 => (k % 1000 + 1) as f64 * 1e18 + (k % 997) as f64,
+                4 => 1.0 / (1 + k % 1000) as f64,
+                _ => ((k % 100_000) as f64 + 0.5) / 128.0,
+            });
+        }
+        for k in 0..60u32 {
+            v.push((2 * k + 1) as f64 / 2f64.powi(k as i32 % 20 + 1));
+        }
+        for c in 0..21i32 {
+            for odd in [1u64, 3, 7, 11] {
+                let x = odd as f64 * 5f64.powi(c + 1) * 2f64.powi(c);
+                if x < 9e15 {
+                    v.push(x);
+                }
+            }
+        }
+        v.extend([
+            1.005, 1.45, 0.5, 1.5, 2.5, 9.5, 0.125, 0.375, 1.25, 8.345, 1.255, 123.456, 0.000001, 0.1, 0.3,
+            9.995, 99.5, 999.5, 5e-324, 2.2250738585072014e-308, f64::MAX, 1e21 - 65536.0, 999999999999999900000.0,
+            1e20, 4.35, 1e-7, 2f64.powi(-60), 2f64.powi(70), 2f64.powi(100) * 5f64.powi(22), 1e23, 9007199254740993.0,
+        ]);
+        let mut ten = 1e-30;
+        for _ in 0..50 {
+            v.push(ten);
+            v.push(ten.next_up());
+            v.push(ten.next_down());
+            ten *= 10.0;
+        }
+        v
+    }
+
+    #[test]
+    fn exact_rounding_matches_the_guard_digit_rounding() {
+        for a in values() {
+            for sig in 1..=101 {
+                let (mant, x) = round_exp_half_away(a, sig - 1);
+                assert_eq!(sig_digits_half_up(a, sig), (mant.replace('.', ""), x), "{a:e} to {sig} digits");
+            }
+            if a < 1e21 {
+                for f in 0..=100 {
+                    assert_eq!(to_fixed(a, f), to_fixed_guarded(a, f), "{a:e} fixed {f}");
+                    assert_eq!(to_fixed(-a, f), to_fixed_guarded(-a, f), "-{a:e} fixed {f}");
+                }
+            }
         }
     }
 }

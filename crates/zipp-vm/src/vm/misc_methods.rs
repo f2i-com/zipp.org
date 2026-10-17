@@ -660,67 +660,21 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
             };
             (mant, exp)
         }
-        Some(d) => round_exp_half_away(a, d),
+        Some(d) => {
+            let (digits, exp) = crate::vm::helpers_num2::sig_digits_half_up(a, d + 1);
+            let mant = if d > 0 {
+                format!("{}.{}", &digits[..1], &digits[1..])
+            } else {
+                digits
+            };
+            (mant, exp)
+        }
     };
     format!(
         "{sign}{mant}e{}{}",
         if exp >= 0 { "+" } else { "-" },
         exp.abs()
     )
-}
-
-/// Round a POSITIVE finite `a` to `d` fractional mantissa digits in exponential
-/// form, rounding half-AWAY-from-zero, returning ("D.FFFF", exponent). Works on
-/// the exact decimal digits (formatted at high precision, so the (d+1)th digit is
-/// exact) to avoid the f64 round-trip drift a `*10^d` reconstruction would cause.
-fn round_exp_half_away(a: f64, d: usize) -> (String, i32) {
-    // High-precision digits — exact for the first d+1 fractional places.
-    let guard = d + 25;
-    let raw = format!("{a:.guard$e}");
-    let epos = raw.find('e').unwrap();
-    let mantissa = &raw[..epos]; // "D.FFFF…"
-    let mut exp: i32 = raw[epos + 1..].parse().unwrap_or(0);
-    // Digit string without the '.': 1 leading (integer) digit + `guard` fractional.
-    let mut ds: Vec<u8> = mantissa
-        .bytes()
-        .filter(|&b| b != b'.')
-        .map(|b| b - b'0')
-        .collect();
-    // For a positive value, nearest-rounding (half-away) rounds the kept prefix up
-    // iff the first dropped digit is >= 5 (the >= folds the exact-tie case to up).
-    let keep = 1 + d;
-    let round_up = ds.get(keep).is_some_and(|&dig| dig >= 5);
-    ds.truncate(keep);
-    if round_up {
-        let mut i = ds.len();
-        loop {
-            if i == 0 {
-                ds.insert(0, 1); // carry past the leading digit: 9.. -> 10..
-                break;
-            }
-            i -= 1;
-            if ds[i] == 9 {
-                ds[i] = 0;
-            } else {
-                ds[i] += 1;
-                break;
-            }
-        }
-    }
-    // A carry that grew the integer part to two digits (e.g. 9.99 -> 10.0)
-    // renormalises: drop the extra trailing digit and bump the exponent.
-    if ds.len() > 1 + d {
-        ds.truncate(1 + d);
-        exp += 1;
-    }
-    let int_digit = (b'0' + ds[0]) as char;
-    let mant = if d == 0 {
-        int_digit.to_string()
-    } else {
-        let frac: String = ds[1..].iter().map(|&x| (b'0' + x) as char).collect();
-        format!("{int_digit}.{frac}")
-    };
-    (mant, exp)
 }
 
 /// `Number.prototype.toPrecision` formatting (significant digits → fixed or
@@ -745,23 +699,24 @@ fn fmt_precision(n: f64, p: usize) -> String {
     // either form. Step 10 picks the LARGER candidate on an exact tie
     // ((2.5).toPrecision(1) is "3", (1.25).toPrecision(2) is "1.3"); Rust's
     // `{:.*e}` / `{:.N}` formatters round such ties to even, so both forms
-    // come from `round_exp_half_away` (which also carries 9.99 → 1.00e+1).
+    // come from `sig_digits_half_up` (which also carries 9.99 → 1.00e+1).
     // Reparsing the digits into an f64 and reformatting would re-introduce a
     // rounding error (1.2345e27 → 1.2344999…e27).
-    let (mant, exp) = round_exp_half_away(a, p - 1);
+    let (digits, exp) = crate::vm::helpers_num2::sig_digits_half_up(a, p);
     let body = if exp < -6 || exp >= p as i32 {
         let sign = if exp < 0 { "-" } else { "+" };
-        format!("{mant}e{sign}{}", exp.abs())
-    } else {
-        let digits: String = mant.chars().filter(|&c| c != '.').collect();
-        if exp < 0 {
-            format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
-        } else if exp as usize + 1 == p {
-            digits
+        if p > 1 {
+            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], exp.abs())
         } else {
-            let int_len = exp as usize + 1;
-            format!("{}.{}", &digits[..int_len], &digits[int_len..])
+            format!("{digits}e{sign}{}", exp.abs())
         }
+    } else if exp < 0 {
+        format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+    } else if exp as usize + 1 == p {
+        digits
+    } else {
+        let int_len = exp as usize + 1;
+        format!("{}.{}", &digits[..int_len], &digits[int_len..])
     };
     if neg {
         format!("-{body}")
