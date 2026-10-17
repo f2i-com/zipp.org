@@ -4060,10 +4060,22 @@ impl<'p> Vm<'p> {
                         // falls through to the Call+Return emitted after.
                         let callee_v = self.get(base, callee);
                         // Args live above `base` — copy them out BEFORE the
-                        // window is rebuilt in place.
-                        let argv: Vec<Value> =
-                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        if self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &argv)? {
+                        // window is rebuilt in place: into a stack buffer for
+                        // the usual few (a `Vec` here was an allocator round
+                        // trip per tail call), a `Vec` past that.
+                        const INLINE_ARGS: usize = 8;
+                        let reused = if (argc as usize) <= INLINE_ARGS {
+                            let mut buf = [Value::UNDEFINED; INLINE_ARGS];
+                            for (i, slot) in buf[..argc as usize].iter_mut().enumerate() {
+                                *slot = self.get(base, arg_base + i as u16);
+                            }
+                            self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &buf[..argc as usize])?
+                        } else {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &argv)?
+                        };
+                        if reused {
                             break; // re-snapshot the frame coordinates
                         }
                         ip += 1;
