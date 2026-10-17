@@ -3671,6 +3671,17 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // A class value's static data property
+                            // (`Entity.count`, `new.target.kind`), or a
+                            // function's own one (`counter.calls`).
+                            if let Some(v) = self
+                                .class_static_data_read(o, &key)
+                                .or_else(|| self.fn_own_data_read(o, &key))
+                            {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
                             if let Some(bits) = self.proto_intrinsic_read(o, &key) {
                                 self.set(base, dst, Value::from_bits(bits));
                                 ip += 1;
@@ -3852,6 +3863,13 @@ impl<'p> Vm<'p> {
                         // else is the full `ic_set_prop` call below.
                         #[cfg(not(feature = "safe-sandbox"))]
                         if self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                            ip += 1;
+                            continue;
+                        }
+                        // A class value's own writable static data property
+                        // (`Entity.count++`), or a function's, which the
+                        // cache declines.
+                        if self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v) {
                             ip += 1;
                             continue;
                         }
@@ -4742,6 +4760,22 @@ impl<'p> Vm<'p> {
                                     callee,
                                 )?;
                                 break;
+                            }
+                        }
+                        // A class value's static method or a function's own
+                        // method property (`Probe.make(s)`, `util.fmt(x)`):
+                        // the plain function that data property holds, entered
+                        // as a frame of this loop with the receiver as `this`,
+                        // as the general Get-then-call would call it.
+                        if private_callee.is_none() && recv.is_heap() {
+                            if let Some(f) = self
+                                .class_static_data_read(recv, key)
+                                .or_else(|| self.fn_own_data_read(recv, key))
+                            {
+                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
+                                    break;
+                                }
                             }
                         }
                         // Hot fast path: `arr.push(x)` â€” the most common

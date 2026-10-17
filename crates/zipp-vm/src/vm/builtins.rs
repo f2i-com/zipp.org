@@ -795,6 +795,150 @@ impl<'p> Vm<'p> {
         (!v.is_uninitialized()).then_some(v)
     }
 
+    /// `C.key` on a class value: a static data property of `C`, or of a class
+    /// it extends through unmodified `extends` links, read where it lies. The
+    /// property caches decline a class value, so every such read took the
+    /// general member walk, whose class arm reaches this same `statics`
+    /// lookup after the realm, namespace and Proxy probes (vacuous here) and
+    /// the synthesized `name`/`length`/`prototype` (excluded). `None` for an
+    /// accessor, a static getter or setter of the key, an uninitialized slot,
+    /// a level whose `[[Prototype]]` was set explicitly, a non-class parent,
+    /// a chain end, and while a realm or a deferred namespace exists.
+    #[inline]
+    pub(crate) fn class_static_data_read(&self, o: Value, key: &str) -> Option<Value> {
+        if !self.class_static_fast_ok(o, key) {
+            return None;
+        }
+        let mut cur = o.heap_index();
+        for _ in 0..8 {
+            let HeapObj::Class(c) = self.heap.get(cur) else {
+                return None;
+            };
+            if let Some(i) = c.statics.pos(key) {
+                let v = c.statics.val_at(i);
+                return (!c.statics.attr_at(i).accessor && !v.is_uninitialized()).then_some(v);
+            }
+            if c.static_getters.iter().any(|(k, _)| k == key)
+                || c.static_setters.iter().any(|(k, _)| k == key)
+                || self.proto_of.get(&cur).is_some()
+            {
+                return None;
+            }
+            cur = c.parent?;
+        }
+        None
+    }
+
+    /// `C.key = v` on a class value with an own writable static data property
+    /// `key`: the store `set_prop` ends in for it (an own data property
+    /// shadows every inherited accessor; no side-table record such as an
+    /// integrity level is consulted, there being none). `false` has done
+    /// nothing; the caller takes the general path.
+    #[inline]
+    pub(crate) fn class_static_data_write(&mut self, o: Value, key: &str, v: Value) -> bool {
+        if !self.class_static_fast_ok(o, key) {
+            return false;
+        }
+        let idx = o.heap_index();
+        if self.arr_props.get(&idx).is_some() {
+            return false;
+        }
+        let slot = match self.heap.get(idx) {
+            HeapObj::Class(c) => c.statics.pos(key).filter(|&i| {
+                let a = c.statics.attr_at(i);
+                !a.accessor && a.writable && !c.statics.val_at(i).is_uninitialized()
+            }),
+            _ => None,
+        };
+        let Some(i) = slot else {
+            return false;
+        };
+        self.store_barrier_v(crate::heap::gcoracle::SET_PROP, o, v);
+        if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+            c.statics.set_val_at(i, v);
+        }
+        true
+    }
+
+    /// The conditions both class-static lanes share: a class value, none of
+    /// the keys the member walk synthesizes, and no realm or deferred
+    /// namespace whose probes the walk would run first.
+    #[inline]
+    fn class_static_fast_ok(&self, o: Value, key: &str) -> bool {
+        o.is_heap()
+            && self.callable_member_lane_ok(key)
+            && matches!(self.heap.get(o.heap_index()), HeapObj::Class(_))
+    }
+
+    /// The key and VM conditions of the class-static and function-property
+    /// lanes: none of the keys the member walk synthesizes or guards for a
+    /// callable, and no realm or deferred namespace.
+    #[inline]
+    fn callable_member_lane_ok(&self, key: &str) -> bool {
+        !matches!(key, "prototype" | "name" | "length" | "caller" | "arguments")
+            && self.active_realm.is_none()
+            && self.realm_global_objs.is_empty()
+            && self.deferred_ns_state.is_empty()
+    }
+
+    /// The function `o`'s own property bag (`fn_props`) when `o` is a
+    /// non-class callable and the lanes' conditions hold.
+    #[inline]
+    fn fn_props_lane(&self, o: Value, key: &str) -> Option<&ObjMap> {
+        if !o.is_heap() || !self.callable_member_lane_ok(key) {
+            return None;
+        }
+        let idx = o.heap_index();
+        if !matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
+        ) {
+            return None;
+        }
+        self.fn_props.get(&idx)
+    }
+
+    /// `f.key` on a function with an own data property `key`
+    /// (`counter.calls`): the member walk's callable arm, which reaches the
+    /// same `fn_props` lookup after the probes and synthesized keys the
+    /// lanes exclude. `None` for an accessor, an uninitialized slot or a
+    /// miss.
+    #[inline]
+    pub(crate) fn fn_own_data_read(&self, o: Value, key: &str) -> Option<Value> {
+        let m = self.fn_props_lane(o, key)?;
+        let i = m.pos(key)?;
+        let v = m.val_at(i);
+        (!m.attr_at(i).accessor && !v.is_uninitialized()).then_some(v)
+    }
+
+    /// `f.key = v` on a function with an own writable data property `key`:
+    /// the `fn_props` store `set_prop` ends in for it. `false` has done
+    /// nothing.
+    #[inline]
+    pub(crate) fn fn_own_data_write(&mut self, o: Value, key: &str, v: Value) -> bool {
+        let slot = self.fn_props_lane(o, key).and_then(|m| {
+            m.pos(key).filter(|&i| {
+                let a = m.attr_at(i);
+                !a.accessor && a.writable && !m.val_at(i).is_uninitialized()
+            })
+        });
+        let Some(i) = slot else {
+            return false;
+        };
+        self.store_barrier_v(crate::heap::gcoracle::SET_PROP, o, v);
+        if let Some(m) = self.fn_props.get_mut(&o.heap_index()) {
+            m.set_val_at(i, v);
+        }
+        true
+    }
+
     /// Whether a Get of `name` on WeakMap / WeakSet `idx` resolves to the boot
     /// native `want` (`WM_GET`, `WS_ADD`, ...): no own property of that name,
     /// the default prototype in the running realm, and the prototype's data
