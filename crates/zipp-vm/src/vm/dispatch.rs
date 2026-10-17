@@ -4539,6 +4539,20 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // Any other method of a primitive string: the builtin
+                        // dispatcher's string arm, reached before the probes
+                        // below, none of which a string receiver can match.
+                        if recv.is_heap()
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+                        {
+                            if let Some(result) =
+                                self.interp_string_method_fast(recv.heap_index(), key, base, arg_base, argc)?
+                            {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // Pristine non-BigInt DataView getters are a sufficiently
                         // hot interpreter primitive to bypass the generic
                         // receiver-kind dispatcher and argument stack buffer.

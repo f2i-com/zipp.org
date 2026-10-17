@@ -1012,6 +1012,44 @@ impl<'p> Vm<'p> {
         self.map_method(idx, name, &args[..argc as usize])
     }
 
+    /// The interpreter's direct lane for `s.name(args)` on a primitive string
+    /// `idx`: `dispatch_builtin_method`'s string arm, without the receiver
+    /// probes, the method cache's miss probe and the dispatcher's preamble
+    /// the general path runs first, none of which a string can match. Its
+    /// conditions are that arm's (the root realm, none of the deferred
+    /// `toString`/`valueOf` family, no own property of the name, the B191
+    /// intrinsic proof and the case and RegExp-method proofs), so it answers
+    /// exactly when the arm would. `None` has done nothing observable:
+    /// `string_method` declines only names it does not serve, before any
+    /// coercion.
+    pub(crate) fn interp_string_method_fast(
+        &mut self,
+        idx: u32,
+        name: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        const MAX_ARGS: usize = 4;
+        if argc as usize > MAX_ARGS
+            || !self.realm_global_objs.is_empty()
+            || matches!(name, "toString" | "valueOf" | "toLocaleString" | "toJSON")
+            || (!self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some()))
+            || (matches!(name, "matchAll" | "replace") && !self.string_regexp_method_is_intrinsic(name))
+            || (matches!(name, "toUpperCase" | "toLowerCase") && !self.string_case_method_is_intrinsic(name))
+            || !self.string_method_is_intrinsic(name)
+        {
+            return Ok(None);
+        }
+        builtin_stats_count(self, Value::heap(idx), name);
+        let mut args = [Value::UNDEFINED; MAX_ARGS];
+        let n = arg_base as usize;
+        for (i, a) in args[..argc as usize].iter_mut().enumerate() {
+            *a = self.regs[base + n + i];
+        }
+        self.string_method(idx, name, &args[..argc as usize])
+    }
+
     /// B289: the spec-order lowering of `recv.name(args)` — `GetProp` of the
     /// callee before the arguments, `CallWithThis` after them — reaches the
     /// same builtin lanes as the fused `CallMethod` when the captured callee
