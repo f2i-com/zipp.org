@@ -3703,25 +3703,29 @@ impl<'p> Vm<'p> {
                             let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
                             let site = super::values::private_site(func_id as u32, name as u32);
                             if let Some((b2, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
+                                // PrivateFieldSet on a field already present:
+                                // its entry for this brand exists on this
+                                // receiver only once the brand is installed,
+                                // and private fields ignore integrity levels,
+                                // so the store needs no other check.
+                                if kind & 7 == 0 && self.private_field_set_id(o, b2, pid, v, false) {
+                                    ip += 1;
+                                    continue;
+                                }
                                 if !self.private_receiver_ok(o, b2, kind, owner) {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                     )));
                                 }
                                 if kind & 7 == 0 {
-                                    // PrivateFieldAdd/Set: upsert (the add case
-                                    // is the field initializer's first store).
+                                    // PrivateFieldAdd: the field initializer's
+                                    // first store, the entry known absent.
                                     // Adding a NEW entry to a non-extensible
                                     // object is a TypeError, checked AT ADD time
                                     // — the initializer itself may have sealed
                                     // the instance (`#g = (Object.
-                                    // preventExtensions(this), v)`). Re-assigning
-                                    // an existing entry is PrivateFieldSet and
-                                    // unaffected.
-                                    if o.is_heap()
-                                        && self.private_field_get_id(o, b2, pid).is_none()
-                                        && !self.target_is_extensible(o)
-                                    {
+                                    // preventExtensions(this), v)`).
+                                    if o.is_heap() && !self.target_is_extensible(o) {
                                         return Err(Thrown(
                                             "TypeError: cannot define private elements on a non-extensible object".into(),
                                         ));
@@ -3879,19 +3883,21 @@ impl<'p> Vm<'p> {
                         let site = super::values::private_site(func_id as u32, name as u32);
                         if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
                             // Declaring-class-resolved, KIND-aware write (spec
-                            // PrivateSet).
-                            if !self.private_receiver_ok(o, b, kind, owner) {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                                )));
-                            }
+                            // PrivateSet). A field's entry must EXIST, which
+                            // is also its brand check: the entry for this
+                            // brand is on this receiver only once the brand
+                            // is installed. A method or accessor checks the
+                            // receiver's brand.
                             if kind & 7 == 0 {
-                                // PrivateFieldSet: the entry must EXIST.
                                 if !self.private_field_set_id(o, b, pid, v, false) {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                     )));
                                 }
+                            } else if !self.private_receiver_ok(o, b, kind, owner) {
+                                return Err(Thrown(format!(
+                                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
+                                )));
                             } else if kind & 4 != 0 {
                                 let s = self
                                     .private_member_from_owner(owner, &key, (kind & 8) | 4)
