@@ -1604,6 +1604,43 @@ impl<'p> Vm<'p> {
     /// * Otherwise both sides are mapped to one `char` per UTF-16 code unit
     ///   ([`unit_chars_into`]) and searched there, which is the spec's
     ///   code-unit comparison: a lone-surrogate needle can match half of a pair.
+    /// `memchr::memmem::find` for `string_search`: memmem builds a searcher
+    /// (its SIMD prefilter) on every call, which costs more than the scan
+    /// itself when the match is near, as in a find-the-next-delimiter loop.
+    /// A needle of up to [`SHORT_NEEDLE`] bytes is found by `memchr` on its
+    /// first byte and a compare (at most that many compares per byte); a
+    /// longer one keeps memmem's linear bound.
+    fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+        let Some((first, rest)) = n.split_first().filter(|_| n.len() <= SHORT_NEEDLE) else {
+            return memchr::memmem::find(h, n);
+        };
+        let mut from = 0;
+        while let Some(off) = memchr::memchr(*first, &h[from..]) {
+            let at = from + off;
+            if h[at + 1..].starts_with(rest) {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
+    /// [`Self::find_bytes`]'s `memmem::rfind` twin: the last start of `n` in
+    /// `h` (the whole needle within `h`).
+    fn rfind_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+        let Some((first, rest)) = n.split_first().filter(|_| n.len() <= SHORT_NEEDLE) else {
+            return memchr::memmem::rfind(h, n);
+        };
+        let mut end = h.len();
+        while let Some(at) = memchr::memrchr(*first, &h[..end]) {
+            if h[at + 1..].starts_with(rest) {
+                return Some(at);
+            }
+            end = at;
+        }
+        None
+    }
+
     fn string_search(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Value, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if name != "indexOf" && name != "lastIndexOf" && self.is_regexp(arg0)? {
@@ -1648,7 +1685,7 @@ impl<'p> Vm<'p> {
             let is_char_boundary = |i: usize| i >= s.len() || (s[i] & 0xC0) != 0x80;
             let (lo, hi) = hay.unit_byte_bounds(pos);
             return Ok(match name {
-                "indexOf" => match memchr::memmem::find(&s[hi..], n) {
+                "indexOf" => match Self::find_bytes(&s[hi..], n) {
                     Some(b) if hay.is_ascii() => Value::int((hi + b) as i32),
                     Some(b) => {
                         // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
@@ -1658,7 +1695,7 @@ impl<'p> Vm<'p> {
                     }
                     None => Value::int(-1),
                 },
-                "includes" => Value::bool(memchr::memmem::find(&s[hi..], n).is_some()),
+                "includes" => Value::bool(Self::find_bytes(&s[hi..], n).is_some()),
                 // Anchored positions: a start or end between the halves of a
                 // pair leaves a lone surrogate at the edge of the spec's
                 // substring, which a well-formed needle cannot match.
@@ -1671,7 +1708,7 @@ impl<'p> Vm<'p> {
                         end += 1;
                     }
                     let found = loop {
-                        match memchr::memmem::rfind(&s[..end], n) {
+                        match Self::rfind_bytes(&s[..end], n) {
                             Some(b) if b <= lo => break Some(b),
                             Some(b) => {
                                 end = b + n.len() - 1;
@@ -2350,6 +2387,10 @@ fn invalid_string_length() -> Thrown {
 /// A `split` receiver at most this long never takes the counting pass: its
 /// result is bounded by its length and admitted after the ranges are found.
 const SPLIT_ADMIT_BYTES: usize = 4096;
+
+/// The longest needle `find_bytes` / `rfind_bytes` search by first byte and
+/// compare rather than through `memmem`'s per-call searcher.
+const SHORT_NEEDLE: usize = 8;
 
 /// Whether WTF-8 `bytes` hold a U+FFFD. A needle without one can be searched
 /// for in a receiver's LOSSY view exactly: the view differs from the content
