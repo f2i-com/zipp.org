@@ -826,7 +826,55 @@ impl<'p> Vm<'p> {
     /// three loads and a compare. This is exactly `ic_get_prop`'s first check:
     /// the same answer, or `None` and the full call. The safe profile inlines
     /// `ic_get_prop` whole and does not use it.
-    #[cfg(not(feature = "safe-sandbox"))]
+    ///
+    /// With the JIT compiled in, the receiver is read through its hot mirror:
+    /// `objs[idx]`, the boxed map and its value column were three dependent
+    /// loads, a miss each on a large heap, where the mirror's record holds
+    /// the shape and the column's base side by side. The mirror's discipline
+    /// (`Heap::hot_mirror`) is the soundness argument the emitted shape-way
+    /// probes rely on: a matching shape proves the record was settled after
+    /// the map's last version-bumping mutation, so the base is live. The
+    /// receivers the caches exclude never match: the exotic ones are pinned
+    /// (`Heap::pin_mirror_dict`) and a constructor's map carries
+    /// `FID_MIRROR_CTOR`; a string or an array has no shape there at all. A
+    /// receiver whose mirror holds none (an object built by appends, whose
+    /// every append's bump cleared it) takes the full call, whose way-0 hit
+    /// settles the mirror (`ic_get_prop`). Only the mirror check is inline:
+    /// with the map's check beside it, the larger arm slowed unrelated rows
+    /// by up to 12%.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if !recv.is_heap() {
+            return None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT
+            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !self.deferred_ns_state.is_empty()
+            || !self.ic_func_eligible(func_id)
+        {
+            return None;
+        }
+        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        let IcEntry::OwnData { shape, slot } = site.entries[0] else {
+            return None;
+        };
+        if shape != mir.shape {
+            return None;
+        }
+        // SAFETY: the matching shape proves `vals` is the map's live value
+        // column and that it holds `slot` (the way was filled against a map
+        // of this shape, which has that many slots).
+        Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
+    }
+
+    /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
+    /// shape.
+    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
         // The receiver first: the dispatch loop asks before its `length` and
@@ -959,7 +1007,11 @@ impl<'p> Vm<'p> {
                     if sh != crate::shape::DICT && site.n > 0 {
                         match site.entries[0] {
                             IcEntry::OwnData { shape, slot } if shape == sh => {
-                                return GetAct::Value(m.val_at(slot as usize));
+                                let v = m.val_at(slot as usize);
+                                // Settle the mirror, so the next read of this
+                                // receiver is `ic_get_prop_own_hit`'s.
+                                self.heap.refresh_mirror(idx);
+                                return GetAct::Value(v);
                             }
                             IcEntry::OwnAcc { shape, slot } if shape == sh => {
                                 return self.ic_acc_get_from(m, slot as usize);
@@ -1354,7 +1406,63 @@ impl<'p> Vm<'p> {
     /// profile's dispatch loop (see [`Self::ic_get_prop_own_hit`]): the same
     /// shape guard and the same store `ic_apply_set`'s `WriteOwn` makes.
     /// `false` leaves the write to the full call.
-    #[cfg(not(feature = "safe-sandbox"))]
+    ///
+    /// With the JIT compiled in, through the receiver's hot mirror, on the
+    /// argument and exclusions `ic_get_prop_own_hit` gives for the read: the
+    /// way's shape carries the slot's attributes, so a match also proves the
+    /// property writable data, and the emitted shape-way stores write the
+    /// same base after the same barrier.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_set_prop_own_hit(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        val: Value,
+    ) -> bool {
+        if !recv.is_heap() {
+            return false;
+        }
+        let idx = recv.heap_index();
+        let mir = self.heap.hot_mirror_of(idx);
+        if mir.shape == crate::shape::DICT
+            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !self.deferred_ns_state.is_empty()
+            || !self.ic_func_eligible(func_id)
+        {
+            return false;
+        }
+        let Some(site) = self
+            .site_ics
+            .get(func_id as usize)
+            .and_then(|f| f.as_ref())
+            .and_then(|f| f.get(ip))
+            .and_then(|s| s.as_deref())
+        else {
+            return false;
+        };
+        if site.n == 0 {
+            return false;
+        }
+        let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
+            return false;
+        };
+        if cached != mir.shape {
+            return false;
+        }
+        if val.is_heap() {
+            self.heap.write_barrier_val(idx, val);
+        }
+        // SAFETY: as for the read in `ic_get_prop_own_hit`; the barrier above
+        // allocates nothing and moves no column.
+        unsafe { *(mir.vals as *mut Value).add(slot as usize) = val };
+        true
+    }
+
+    /// [`Self::ic_set_prop_own_hit`] without the JIT's mirrors: the map's own
+    /// shape.
+    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn ic_set_prop_own_hit(
         &mut self,
@@ -1946,6 +2054,10 @@ impl<'p> Vm<'p> {
                     }
                 }
                 self.heap.bump_version(idx);
+                // The append is complete, so this is a settling event: the
+                // instance a constructor builds reads through its mirror
+                // from its first read on (`ic_get_prop_own_hit`).
+                self.heap.refresh_mirror(idx);
                 SetAct::Done
             }
             SetPlan::WriteOwn { idx, slot } => {

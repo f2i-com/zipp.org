@@ -111,6 +111,14 @@ const HASH_TREE_ENTRY_BYTES: usize = 48;
 #[cfg(feature = "jit")]
 pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 
+/// The fid-mirror word of a built-in constructor's map (`ObjMap::is_ctor`):
+/// no plain callable either, so the emitted call guard never matches it,
+/// but distinct from [`FID_MIRROR_NONE`] so the interpreter's mirror-guarded
+/// property read (`Vm::ic_get_prop_own_hit`) declines the receivers its
+/// caches exclude without loading the map.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_CTOR: u32 = u32::MAX - 1;
+
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
 /// position, far below `u32::MAX`).
 const PROP_EMPTY: u32 = u32::MAX;
@@ -6375,9 +6383,21 @@ fn no_hot_mirror() -> HotMirrorHint {}
 fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
     Some(HotMirror {
         shape,
-        fid: FID_MIRROR_NONE,
+        fid: object_mirror_fid(map),
         vals: map.vals.as_ptr() as u64,
     })
+}
+
+/// An object's fid-mirror word: [`FID_MIRROR_CTOR`] for a built-in
+/// constructor's map, else [`FID_MIRROR_NONE`].
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn object_mirror_fid(map: &ObjMap) -> u32 {
+    if map.is_ctor {
+        FID_MIRROR_CTOR
+    } else {
+        FID_MIRROR_NONE
+    }
 }
 
 #[cfg(not(feature = "jit"))]
@@ -7963,6 +7983,15 @@ impl Heap {
         self.upvals_mirror[idx as usize]
     }
 
+    /// Slot `idx`'s hot mirror record, for the interpreter's mirror-guarded
+    /// own-data read (`Vm::ic_get_prop_own_hit`), which relies on exactly
+    /// the discipline the field documents for the emitted shape-way probes.
+    #[cfg(feature = "jit")]
+    #[inline(always)]
+    pub(crate) fn hot_mirror_of(&self, idx: u32) -> HotMirror {
+        self.hot_mirror[idx as usize]
+    }
+
     /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
     /// `ic_obj_ok` excludes from every property cache (the global object,
     /// %Array.prototype%, realm globals, module namespaces): their live
@@ -8612,7 +8641,7 @@ impl Heap {
         let hot = match &self.objs[idx as usize] {
             HeapObj::Object(m) => HotMirror {
                 shape: m.shape(),
-                fid: FID_MIRROR_NONE,
+                fid: object_mirror_fid(m),
                 vals: m.vals.as_ptr() as u64,
             },
             HeapObj::Func(f) => HotMirror {
