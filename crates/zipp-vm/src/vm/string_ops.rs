@@ -585,13 +585,15 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The position is an i64 ToIntegerOrInfinity: `usize::try_from` (not
+        // `as usize`, which wraps 2^32 to 0 on a 32-bit host) makes a negative
+        // or unaddressable one simply out of range.
         match name {
             "charCodeAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 {
-                    self.heap_unit_at(idx, i as usize)
-                } else {
-                    None
+                let u = match usize::try_from(i) {
+                    Ok(i) => self.heap_unit_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match u {
                     Some(u) => Value::int(u as i32),
@@ -600,10 +602,9 @@ impl<'p> Vm<'p> {
             }
             "codePointAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 {
-                    self.heap_code_point_at(idx, i as usize)
-                } else {
-                    None
+                let c = match usize::try_from(i) {
+                    Ok(i) => self.heap_code_point_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match c {
                     Some(cp) => Value::int(cp as i32),
@@ -612,10 +613,9 @@ impl<'p> Vm<'p> {
             }
             "charAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 {
-                    self.heap_unit_at(idx, i as usize)
-                } else {
-                    None
+                let u = match usize::try_from(i) {
+                    Ok(i) => self.heap_unit_at(idx, i),
+                    Err(_) => None,
                 };
                 return Ok(Some(match u {
                     Some(u) => self.str_from_unit(u),
@@ -1280,7 +1280,9 @@ impl<'p> Vm<'p> {
                     if c < 0 {
                         0
                     } else {
-                        (c as usize).min(avail)
+                        // Clamped in i64: `c as usize` wraps 2^32 to 0 on a
+                        // 32-bit host.
+                        c.min(avail as i64) as usize
                     }
                 };
                 let sub = subu(start, start + count);
@@ -1403,10 +1405,9 @@ impl<'p> Vm<'p> {
             "padStart" | "padEnd" => {
                 let cur = unit_len(&s);
                 let t = self.to_integer_strict(arg0)?;
-                let target = if t > 0 { t as usize } else { 0 };
-                if target > MAX_STRING_UNITS {
-                    return Err(Thrown::from_static("RangeError: Invalid string length"));
-                }
+                // Saturating: `t as usize` wraps 2^32 to 0 on a 32-bit host,
+                // which returned the string unpadded instead of throwing.
+                let target = if t > 0 { usize::try_from(t).unwrap_or(usize::MAX) } else { 0 };
                 if cur >= target {
                     return Ok(Some(Value::heap(idx)));
                 }
@@ -1422,6 +1423,12 @@ impl<'p> Vm<'p> {
                 };
                 if pad.units() == 0 {
                     return Ok(Some(Value::heap(idx)));
+                }
+                // The length cap is the first step that builds anything, so it
+                // follows the fill's ToString and the empty-fill return, as in
+                // StringPad: `"abc".padStart(2 ** 32, "")` is "abc".
+                if target > MAX_STRING_UNITS {
+                    return Err(Thrown::from_static("RangeError: Invalid string length"));
                 }
                 // StringPad truncates the repeated filler to (target - cur)
                 // UNITS; a truncation that splits an astral filler char keeps

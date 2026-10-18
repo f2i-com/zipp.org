@@ -2663,10 +2663,12 @@ impl<'p> Vm<'p> {
             return Ok(def);
         }
         let n = self.to_integer_strict(v)?;
+        // Clamp in i64 BEFORE narrowing: on a 32-bit host `n as usize`
+        // truncates, so 2^32 read as 0 and `slice(2, 2**32)` was empty.
         Ok(if n < 0 {
             ((len as i64) + n).max(0) as usize
         } else {
-            (n as usize).min(len)
+            n.min(len as i64) as usize
         })
     }
 
@@ -2723,7 +2725,9 @@ impl<'p> Vm<'p> {
                 // ToInteger(index): throws on a Symbol, honours a valueOf.
                 let n = self.to_integer_strict(a0)?;
                 let i = if n < 0 { len as i64 + n } else { n };
-                Ok(Some(if i >= 0 && (i as usize) < len {
+                // Bounds-checked in i64: a cast first truncates 2^32 to 0 on a
+                // 32-bit host.
+                Ok(Some(if i >= 0 && i < len as i64 {
                     self.ta_element_get(idx, i as usize)
                 } else {
                     Value::UNDEFINED
@@ -3336,7 +3340,11 @@ impl<'p> Vm<'p> {
                     if n < 0 {
                         return Err(Thrown::from_static("RangeError: offset is out of bounds"));
                     }
-                    n as usize
+                    // Saturate, never truncate: an offset past the host's
+                    // range still fails the bounds checks below (after the
+                    // detached TypeError, in spec order), where `as usize`
+                    // wrapped 2^32 to 0 on a 32-bit host and wrote at 0.
+                    usize::try_from(n).unwrap_or(usize::MAX)
                 };
                 // ToInteger(offset)'s valueOf may have detached the TARGET buffer:
                 // re-check (SetTypedArrayFromArrayLike / FromTypedArray step).
@@ -3682,7 +3690,9 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot resize a detached ArrayBuffer",
                     ));
                 }
-                if n as usize > max {
+                // Compared in 64 bits: `n as usize` wraps 2^32 to 0 on a 32-bit
+                // host, which resized the buffer to empty instead of throwing.
+                if n as u64 > max as u64 {
                     return Err(Thrown::from_static(
                         "RangeError: ArrayBuffer resize length out of range",
                     ));
@@ -3709,7 +3719,8 @@ impl<'p> Vm<'p> {
                 };
                 let n =
                     self.to_integer_strict(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                if n < 0 || n as usize > max {
+                // In 64 bits, as for `resize`: a cast first wraps 2^32 to 0.
+                if n < 0 || n as u64 > max as u64 {
                     return Err(Thrown::from_static(
                         "RangeError: SharedArrayBuffer grow length out of range",
                     ));

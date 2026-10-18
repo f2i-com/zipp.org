@@ -2469,7 +2469,8 @@ impl<'p> Vm<'p> {
                 // bits = ToIndex(bits) (RangeError if negative / > 2^53-1) FIRST,
                 // then x = ToBigInt(value) — STRICT: a Number value is a TypeError
                 // (unlike the lenient BigInt() ctor coercion `to_bigint` allows).
-                let bits = self.to_index(a0)?;
+                // (The exact u64: a 32-bit `usize` saturates 2^32 to 2^32-1.)
+                let bits = self.to_index_u64(a0)?;
                 if a1.is_number() {
                     return Err(Thrown::from_static(
                         "TypeError: cannot convert a Number to a BigInt",
@@ -2477,9 +2478,9 @@ impl<'p> Vm<'p> {
                 }
                 let x = self.to_bigint(a1)?;
                 if id == BIGINT_AS_INTN {
-                    self.bigint_as_intn_val(bits as u64, x)?
+                    self.bigint_as_intn_val(bits, x)?
                 } else {
-                    self.bigint_as_uintn_val(bits as u64, x)?
+                    self.bigint_as_uintn_val(bits, x)?
                 }
             }
             REGEXP_EXEC => {
@@ -3023,10 +3024,10 @@ impl<'p> Vm<'p> {
                 let li_v = self.get_prop(this, "lastIndex")?;
                 let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
                 // A value beyond the host's addressable string range is still
-                // just an out-of-range RegExp index; saturate instead of
-                // wrapping 2^32 to zero on wasm32.
-                let li = usize::try_from(li_u64).unwrap_or(usize::MAX);
-                self.set_regexp_last_index(matcher_idx, li);
+                // just an out-of-range RegExp index, and the matcher's
+                // lastIndex is that exact value: kept as u64, never narrowed
+                // (wrapping 2^32 to zero, or saturating at 2^32-1, on wasm32).
+                self.set_regexp_last_index(matcher_idx, li_u64);
                 // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
                 // exec/lastIndex side effects are observable per step, not up front.
@@ -3335,7 +3336,7 @@ impl<'p> Vm<'p> {
                     let _gc = self.gc_lock_guard();
                     let target = self.construct(this, &[Value::num(n as f64)])?;
                     for (i, v) in items.into_iter().enumerate() {
-                        self.create_data_property_or_throw(target, i, v)?;
+                        self.create_data_property_or_throw(target, i as u64, v)?;
                     }
                     self.set_prop(target, "length", Value::num(n as f64), true)?;
                     target

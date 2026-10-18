@@ -2664,7 +2664,18 @@ impl<'p> Vm<'p> {
     /// byteOffset/length arguments of the TypedArray/DataView constructors, so
     /// `new Int8Array(buf, -1)` throws rather than silently clamping to 0 (a bare
     /// `as usize` cast saturates a negative float to 0).
+    ///
+    /// The `usize` saturates: on a 32-bit host (wasm32, armv7) every index
+    /// from 2^32 up reads as 2^32-1. That is exact for a bounds check against
+    /// a real length; a caller that computes with the index itself uses
+    /// [`Self::to_index_u64`].
+    #[inline]
     pub(crate) fn to_index(&mut self, v: Value) -> Result<usize, Thrown> {
+        Ok(usize::try_from(self.to_index_u64(v)?).unwrap_or(usize::MAX))
+    }
+
+    /// ToIndex(v) as its exact value, up to 2^53-1 (see [`Self::to_index`]).
+    pub(crate) fn to_index_u64(&mut self, v: Value) -> Result<u64, Thrown> {
         // ToIndex = ToIntegerOrInfinity(value) clamped to 0..=2^53-1. The integer
         // conversion goes through ToNumber, so a BigInt or Symbol is a TypeError
         // (not silently coerced); `undefined` is 0 and NaN truncates to 0.
@@ -2676,7 +2687,7 @@ impl<'p> Vm<'p> {
         if n < 0.0 || n > ((1i128 << 53) - 1) as f64 {
             return Err(Thrown("RangeError: index is out of range".into()));
         }
-        Ok(n as usize)
+        Ok(n as u64)
     }
 
     pub(crate) fn to_number_coerce(&mut self, v: Value) -> Result<f64, Thrown> {

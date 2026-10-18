@@ -2338,7 +2338,7 @@ impl<'p> Vm<'p> {
                 } else {
                     v
                 };
-                self.create_data_property_or_throw(a, i, mapped)?;
+                self.create_data_property_or_throw(a, i as u64, mapped)?;
             }
             self.set_prop(a, "length", Value::num(n as f64), true)?;
             return Ok(a);
@@ -2617,7 +2617,7 @@ impl<'p> Vm<'p> {
                     {
                         close_and_throw!(e);
                     }
-                    if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
+                    if let Err(e) = self.create_data_property_or_throw(a, k as u64, mapped) {
                         close_and_throw!(e);
                     }
                 }

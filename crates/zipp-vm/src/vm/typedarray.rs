@@ -2312,7 +2312,7 @@ impl<'p> Vm<'p> {
             // byteOffset/length are ToIndex: a negative or out-of-range value is a
             // RangeError (a bare `as usize` would silently saturate -1 to 0).
             let byte_offset = match args.get(1) {
-                Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
+                Some(&v) if v != Value::UNDEFINED => self.to_index_u64(v)?,
                 _ => 0,
             };
             // InitializeTypedArrayFromArrayBuffer order: the offset-alignment
@@ -2320,11 +2320,15 @@ impl<'p> Vm<'p> {
             // TypeError (the buffer may have been detached at entry, or by a
             // ToIndex valueOf above) precedes the byte-length RangeErrors --
             // detaching clears the data, which would otherwise mask it.
-            if byte_offset % size != 0 {
+            // The alignment is of the EXACT offset: a 32-bit `usize` saturates
+            // 2^32 to 2^32-1, which is misaligned for every element size > 1.
+            if byte_offset % size as u64 != 0 {
                 return Err(Thrown::from_static(
                     "RangeError: invalid TypedArray length/offset",
                 ));
             }
+            // Past `usize` it can only fail the bounds checks below.
+            let byte_offset = usize::try_from(byte_offset).unwrap_or(usize::MAX);
             let explicit: Option<usize> = match args.get(2) {
                 Some(&v) if v != Value::UNDEFINED => Some(self.to_index(v)?),
                 _ => None,
@@ -2515,7 +2519,10 @@ impl<'p> Vm<'p> {
         } else {
             self.to_index(args[2])?
         };
-        if byte_offset + byte_length > buf_len {
+        // Against the room left (`byte_offset <= buf_len` above), not as a
+        // sum: on a 32-bit host `1 + (2^32 - 1)` wrapped to 0 and built a
+        // 4 GB view of an 8-byte buffer.
+        if byte_length > buf_len - byte_offset {
             return Err(Thrown::from_static("RangeError: invalid DataView offset/length"));
         }
         let idx = self.heap.alloc(HeapObj::DataView {

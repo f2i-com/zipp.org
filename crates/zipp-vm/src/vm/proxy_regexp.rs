@@ -1430,7 +1430,8 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn set_regexp_last_index(&mut self, idx: u32, n: usize) {
+    /// `n` is u64: `lastIndex` holds a ToLength, up to 2^53.
+    pub(crate) fn set_regexp_last_index(&mut self, idx: u32, n: u64) {
         if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
             *last_index = Value::num(n as f64);
         }
@@ -2156,10 +2157,8 @@ impl<'p> Vm<'p> {
             if match_is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = host_index_saturating(
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
-                );
-                let next = advance_string_index(&u16s, this_index, full_unicode);
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                let next = advance_string_index_u64(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
@@ -2587,10 +2586,8 @@ impl<'p> Vm<'p> {
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = host_index_saturating(
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
-                );
-                let next = advance_string_index(&u16s, this_index, full_unicode);
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                let next = advance_string_index_u64(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
@@ -4771,7 +4768,7 @@ impl<'p> Vm<'p> {
                     rxstats::count_scalar_elided();
                 }
                 if p.mstart == p.mend {
-                    self.set_regexp_last_index(regexp, p.mend as usize + 1);
+                    self.set_regexp_last_index(regexp, p.mend as u64 + 1);
                 }
                 rxstats::count_step_fused();
                 rxstats::count_scalar_success();
@@ -5513,7 +5510,7 @@ impl<'p> Vm<'p> {
             if let Some(end) = empty_end {
                 // `lastIndex` was just written by the exec (== the match
                 // end); ASCII subject ⇒ the advance is exactly +1.
-                self.set_regexp_last_index(regexp, end + 1);
+                self.set_regexp_last_index(regexp, end as u64 + 1);
             }
             return Some(Ok((r, false)));
         }
@@ -5543,7 +5540,7 @@ impl<'p> Vm<'p> {
             // `lastIndex` was just written by the exec above (a number, ==
             // the match end); ASCII subject ⇒ the advance is exactly +1.
             let cur = match self.heap.get(regexp) {
-                HeapObj::RegExp { last_index, .. } => last_index.as_f64().max(0.0) as usize,
+                HeapObj::RegExp { last_index, .. } => last_index.as_f64().max(0.0) as u64,
                 _ => 0,
             };
             self.set_regexp_last_index(regexp, cur + 1);
@@ -5629,7 +5626,7 @@ impl<'p> Vm<'p> {
                             // `lastIndex` was just written by the publish (==
                             // the match end); ASCII subject ⇒ the advance is
                             // exactly +1.
-                            self.set_regexp_last_index(regexp, mend + 1);
+                            self.set_regexp_last_index(regexp, mend as u64 + 1);
                         }
                         return Some(Ok((r, false)));
                     }
@@ -5814,10 +5811,9 @@ impl<'p> Vm<'p> {
                     let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
                     // ToLength(Get(R,"lastIndex")) — a throwing
                     // lastIndex.valueOf must propagate, not be swallowed; the
-                    // 2^53-1 clamp applies BEFORE the advance.
-                    let cur = host_index_saturating(
-                        self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1),
-                    );
+                    // 2^53-1 clamp applies BEFORE the advance, which stays in
+                    // u64 (a `usize` stops at 2^32-1 on a 32-bit host).
+                    let cur = self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1) as u64;
                     #[cfg(feature = "safe-sandbox")]
                     let next = self.advance_index_on_value(string, cur, full_unicode)?;
                     #[cfg(not(feature = "safe-sandbox"))]
@@ -5837,26 +5833,25 @@ impl<'p> Vm<'p> {
 
     /// AdvanceStringIndex reading the units from heap string `s` (for the lazy
     /// matchAll driver, which doesn't keep an encoded unit buffer around).
+    /// `index` is a ToLength, so it is u64 (see `advance_string_index_u64`).
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) fn advance_index_on_value(
         &mut self,
         s: Value,
-        index: usize,
+        index: u64,
         unicode: bool,
-    ) -> usize {
-        if unicode && s.is_heap() {
+    ) -> u64 {
+        if let (true, Ok(i)) = (unicode && s.is_heap(), usize::try_from(index)) {
             self.heap.flatten(s.heap_index());
             if let HeapObj::Str(js) = self.heap.get(s.heap_index()) {
-                if let (Some(hi), Some(lo)) =
-                    (js.unit_at(index), js.unit_at(index.saturating_add(1)))
-                {
+                if let (Some(hi), Some(lo)) = (js.unit_at(i), js.unit_at(i.saturating_add(1))) {
                     if (0xD800..=0xDBFF).contains(&hi) && (0xDC00..=0xDFFF).contains(&lo) {
-                        return index.saturating_add(2);
+                        return index + 2;
                     }
                 }
             }
         }
-        index.saturating_add(1)
+        index + 1
     }
 
     /// Safe-profile AdvanceStringIndex without flattening a rope or rebuilding
@@ -5865,20 +5860,20 @@ impl<'p> Vm<'p> {
     pub(crate) fn advance_index_on_value(
         &mut self,
         s: Value,
-        index: usize,
+        index: u64,
         unicode: bool,
-    ) -> Result<usize, Thrown> {
-        if unicode && s.is_heap() {
-            if let Some(hi) = regex_value_unit_at(self, s, index)? {
+    ) -> Result<u64, Thrown> {
+        if let (true, Ok(i)) = (unicode && s.is_heap(), usize::try_from(index)) {
+            if let Some(hi) = regex_value_unit_at(self, s, i)? {
                 if (0xD800..=0xDBFF).contains(&hi)
-                    && regex_value_unit_at(self, s, index.saturating_add(1))?
+                    && regex_value_unit_at(self, s, i.saturating_add(1))?
                         .is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo))
                 {
-                    return Ok(index.saturating_add(2));
+                    return Ok(index + 2);
                 }
             }
         }
-        Ok(index.saturating_add(1))
+        Ok(index + 1)
     }
 
     /// Regex-backed `String.prototype.replace`/`replaceAll`. `repl` is a function
@@ -6951,6 +6946,17 @@ pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -
         index.saturating_add(2)
     } else {
         index.saturating_add(1)
+    }
+}
+
+/// AdvanceStringIndex for a ToLength'd `lastIndex` (up to 2^53-1), whose
+/// result is written back: computed in u64, because a `usize` saturates at
+/// 2^32-1 on a 32-bit host and `lastIndex` 2^53-1 advanced to 2^32-1 there
+/// instead of 2^53. An index at or past the end advances by one.
+pub(crate) fn advance_string_index_u64(units: &[u16], index: u64, unicode: bool) -> u64 {
+    match usize::try_from(index) {
+        Ok(i) if i < units.len() => advance_string_index(units, i, unicode) as u64,
+        _ => index + 1,
     }
 }
 
