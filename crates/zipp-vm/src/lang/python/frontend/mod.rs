@@ -715,13 +715,17 @@ fn lazy_file(name: &str) -> String {
 /// against the program's module names exactly as `compile_project` compiles
 /// an eager module, with function ids from `base`. Compiled modules are kept
 /// per process (when the runtime seed is, see [`set_runtime_memo`]), keyed on
-/// everything their code depends on; each program gets its own copy.
-fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::FuncProto>> {
+/// everything their code depends on, with the `base` they were last
+/// installed at: a program that installs one at that `base` again (the same
+/// program run again, or any with as many functions before the import)
+/// shares those prototypes, and any other gets a copy with its function ids
+/// moved. Copying torch's modules was a tenth of every later `import torch`.
+fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<std::sync::Arc<[crate::bytecode::FuncProto]>> {
     use crate::bytecode::FuncProto;
     use std::collections::HashMap;
     use std::fmt::Write;
     use std::sync::{Arc, Mutex};
-    static CACHE: Mutex<Option<HashMap<String, Arc<Vec<FuncProto>>>>> = Mutex::new(None);
+    static CACHE: Mutex<Option<HashMap<String, (u32, Arc<[FuncProto]>)>>> = Mutex::new(None);
     const CACHE_MAX: usize = 1024;
     let module = lazy.modules.get(k).ok_or("Python: no such library module")?;
     let module_index = k;
@@ -769,17 +773,18 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
     } else {
         None
     };
-    let cached = key
+    // The code and the function id its first function has.
+    let cached: Option<(u32, Arc<[FuncProto]>)> = key
         .as_ref()
         .filter(|_| memo)
         .and_then(|key| CACHE.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.get(key).cloned())));
     #[cfg(not(target_arch = "wasm32"))]
     let cached = cached.or_else(|| {
         let key = key.as_deref().filter(|_| disk)?;
-        code_cache::load_module(key, module.source).map(Arc::new)
+        code_cache::load_module(key, module.source).map(|functions| (0, Arc::from(functions)))
     });
-    let functions = match cached {
-        Some(functions) => functions,
+    let (first, mut functions) = match cached {
+        Some(cached) => cached,
         None => {
             let _phase = prof::enter(Phase::PyFrontend);
             let name = module.name.as_str();
@@ -807,31 +812,48 @@ fn compile_lazy(lazy: &PyLazy, k: usize, base: u32) -> R<Vec<crate::bytecode::Fu
             emit_module(name, unit, &suite, &table, &project, &fragment, lazy.rt_slot, lazy.line_slot)?;
             let fragment = fragment.into_inner();
             relocatable(name, &fragment, lazy.rt_slot, lazy.line_slot)?;
-            let functions: Arc<Vec<FuncProto>> = Arc::new(fragment.functions.into_iter().collect());
+            let functions: Vec<FuncProto> = fragment.functions.into_iter().collect();
+            // On disk with ids from 0, as `load_module` reads them back.
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(key) = key.as_deref().filter(|_| disk) {
                 code_cache::store_module(key, module.source, &functions);
             }
-            if let Some(key) = key.filter(|_| memo) {
-                if let Ok(mut cache) = CACHE.lock() {
-                    let cache = cache.get_or_insert_with(HashMap::new);
-                    if cache.len() >= CACHE_MAX {
-                        cache.clear();
-                    }
-                    cache.insert(key, functions.clone());
-                }
-            }
-            functions
+            (0, Arc::from(functions))
         }
     };
     if (base as usize).saturating_add(functions.len()) > MAX_FUNCTIONS {
         return Err(format!("Python: importing {}: function count limit exceeded", module.name));
     }
-    let mut functions = (*functions).clone();
-    for f in &mut functions {
-        for ins in &mut f.code {
-            if let Instr::MakeFunc { func_id, .. } = ins {
-                *func_id += base;
+    if first != base {
+        // In place when nothing else holds the code (just compiled or
+        // loaded), else in a copy. Either way the interpreter's fused copy
+        // of each function (built from the old ids) is dropped.
+        let moved = base.wrapping_sub(first);
+        let relocate = |functions: &mut [FuncProto]| {
+            for f in functions {
+                for ins in &mut f.code {
+                    if let Instr::MakeFunc { func_id, .. } = ins {
+                        *func_id = func_id.wrapping_add(moved);
+                    }
+                }
+                f.fused = Default::default();
+            }
+        };
+        match Arc::get_mut(&mut functions) {
+            Some(only) => relocate(only),
+            None => {
+                let mut copy = functions.to_vec();
+                relocate(&mut copy);
+                functions = Arc::from(copy);
+            }
+        }
+        if let Some(key) = key.filter(|_| memo) {
+            if let Ok(mut cache) = CACHE.lock() {
+                let cache = cache.get_or_insert_with(HashMap::new);
+                if cache.len() >= CACHE_MAX {
+                    cache.clear();
+                }
+                cache.insert(key, (base, functions.clone()));
             }
         }
     }

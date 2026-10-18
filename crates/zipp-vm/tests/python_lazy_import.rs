@@ -111,6 +111,33 @@ fn tracebacks_name_project_and_library_files_alike() {
 }
 
 #[test]
+fn a_library_module_shared_or_moved_makes_its_own_functions() {
+    // A module installed at the function id it was last installed at shares
+    // that code; installed elsewhere (more functions before it, or another
+    // module imported first) it is a copy with its function ids moved. Each
+    // way, every function it makes must be its own, run after run.
+    let program = |extra: usize, pathlib_first: bool| {
+        let mut src = String::new();
+        for i in 0..extra {
+            src.push_str(&format!("def f{i}(x):\n    return x + {i}\n"));
+        }
+        let (a, b) = if pathlib_first { ("pathlib", "pickle") } else { ("pickle", "pathlib") };
+        src.push_str(&format!("import {a}\nimport {b}\n"));
+        src.push_str(
+            "print(pickle.loads(pickle.dumps({'a': [1, 2.5, 'x'], 'b': (True, None)})))\n\
+             p = pathlib.PurePath('a/b/c.txt')\nprint(p.name, p.suffix, p.stem)\n",
+        );
+        src
+    };
+    let expected = ["{'a': [1, 2.5, 'x'], 'b': (True, None)}", "c.txt .txt c"];
+    for (extra, pathlib_first) in [(0, false), (0, false), (3, false), (0, true), (0, false), (40, true), (3, false), (0, true)] {
+        let src = program(extra, pathlib_first);
+        let out = run(&[("main", src.as_str())]).unwrap_or_else(|e| panic!("{extra}, {pathlib_first}: {e}"));
+        assert_eq!(out, expected, "{extra} functions before the imports, pathlib first: {pathlib_first}");
+    }
+}
+
+#[test]
 fn a_library_module_compiled_for_one_project_serves_another() {
     // The per-process compile is keyed on what the module's code depends
     // on; a project defining a module the library imports gets its own.

@@ -7,8 +7,9 @@
 //! its functions past every function already installed, the way dynamic code
 //! is (`eval_funcs`), and answers the module's top-level code object, which
 //! the runtime keeps and runs exactly as it runs an eagerly compiled module.
-//! The functions are owned by the program (`PyLazyModule::installed`), so
-//! they live as long as the program does and are freed with it. The native
+//! The functions are held by the program (`PyLazyModule::installed`), so
+//! they live as long as the program does; another program that installs the
+//! module at the same function id shares them (`compile_lazy`). The native
 //! is bound by slot only in the program the Python frontend built, like the
 //! other `__zipp_py_*` natives.
 //!
@@ -48,7 +49,7 @@ impl<'p> Vm<'p> {
                 if functions.is_empty() {
                     return Err(Thrown(format!("ImportError: {name}: no code")));
                 }
-                module.installed.get_or_init(|| (base, functions.into_boxed_slice()))
+                module.installed.get_or_init(|| (base, functions))
             }
         };
         // Installed once per program: the runtime keeps the code object.

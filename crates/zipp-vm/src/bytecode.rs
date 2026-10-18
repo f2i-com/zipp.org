@@ -4254,8 +4254,10 @@ pub struct Program {
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
 pub struct PyLazy {
     /// Compile `modules[k]` for a program whose next function id is `base`:
-    /// the module's functions, top level last, function ids absolute.
-    pub compile: fn(&PyLazy, usize, u32) -> Result<Vec<FuncProto>, String>,
+    /// the module's functions, top level last, function ids absolute. They
+    /// may be shared with another program that installed the module at the
+    /// same `base` (prototypes are immutable, as [`FuncTable`]'s are).
+    pub compile: fn(&PyLazy, usize, u32) -> Result<std::sync::Arc<[FuncProto]>, String>,
     /// Every module name of the program by module index (the traceback file
     /// index): `modules` in order, then the eagerly compiled modules.
     pub names: Vec<String>,
@@ -4326,8 +4328,8 @@ pub struct PyLazyModule {
     pub file: String,
     pub source: &'static str,
     /// Once compiled: the first function id and the module's functions,
-    /// owned here so they live exactly as long as the program does.
-    pub installed: std::sync::OnceLock<(u32, Box<[FuncProto]>)>,
+    /// held here so they live at least as long as the program does.
+    pub installed: std::sync::OnceLock<(u32, std::sync::Arc<[FuncProto]>)>,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),
