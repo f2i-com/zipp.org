@@ -54,6 +54,7 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
         if !p.is_null() {
             zipp_vm::note_every_block(0, layout.size());
         }
+        growth::check();
         p
     }
 
@@ -63,6 +64,7 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
         if !p.is_null() {
             zipp_vm::note_every_block(0, layout.size());
         }
+        growth::check();
         p
     }
 
@@ -78,9 +80,83 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
         if !p.is_null() {
             zipp_vm::note_every_block(layout.size(), new_size);
         }
+        growth::check();
         p
     }
 }
+
+/// Linear memory grows in steps of half its size (at most 64 MiB), not by
+/// what each allocation lacks.
+///
+/// The platform allocator (dlmalloc) asks `memory.grow` for just what the
+/// request it cannot serve needs, rounded to 64 KiB, so a program that comes
+/// to hold 170 MB grew the memory up to 2,700 times: the first `import
+/// torch` does (41 to 211 MB). A grow is not cheap. In Node and Chromium
+/// those grows (and the JavaScript collections the growing memory set off)
+/// were 600 of the import's 900 ms; in WebKit, which appears to copy the
+/// whole memory into a new buffer on a grow, they were nearly all of its
+/// 37 s, and 1.5 of the 1.75 s that compiling the Python runtime takes.
+///
+/// So when a call into the allocator has grown the memory, a block of half
+/// the new size is allocated and freed at once: dlmalloc takes it from fresh
+/// pages adjacent to the top of its heap, and freed it merges back into the
+/// top, where the next allocations are carved from without a grow (the
+/// WebAssembly allocator never returns memory). Growing is then two grows
+/// per step, and a step is half the memory: the memory after compiling the
+/// Python runtime is 43 MB (41.5 before), after the first `import torch` 213
+/// MB (211). Untouched, the extra pages cost no resident memory, and what is
+/// outstanding (`note_every_block`) does not include them. A step the 1 GiB
+/// maximum cannot fit is halved until it fits, or skipped.
+mod growth {
+    #[cfg(target_arch = "wasm32")]
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    #[cfg(target_arch = "wasm32")]
+    const PAGE: usize = 65536;
+    /// The smallest and largest step.
+    #[cfg(target_arch = "wasm32")]
+    const MIN_STEP: usize = 1 << 20;
+    #[cfg(target_arch = "wasm32")]
+    const MAX_STEP: usize = 64 << 20;
+    /// The memory's size in pages after the last call into the allocator.
+    #[cfg(target_arch = "wasm32")]
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// After a call into the allocator that may have grown the memory.
+    #[inline]
+    pub(super) fn check() {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let pages = core::arch::wasm32::memory_size(0);
+            if pages != SEEN.load(Relaxed) {
+                grew(pages);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[cold]
+    #[inline(never)]
+    fn grew(pages: usize) {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        let mut step = (pages * PAGE / 2).clamp(MIN_STEP, MAX_STEP);
+        while step >= MIN_STEP {
+            if let Ok(layout) = Layout::from_size_align(step, 16) {
+                // SAFETY: a fresh block of a valid layout, freed with it.
+                unsafe {
+                    let block = System.alloc(layout);
+                    if !block.is_null() {
+                        System.dealloc(block, layout);
+                        break;
+                    }
+                }
+            }
+            step /= 2;
+        }
+        SEEN.store(core::arch::wasm32::memory_size(0), Relaxed);
+    }
+}
+
 // `parse_f64` is the engine's decimal parser. Use it for every number read
 // here: one `str::parse::<f64>()` in this crate links core's 10 KB
 // power-of-five table back into every module.
