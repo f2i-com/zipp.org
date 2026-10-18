@@ -103,23 +103,30 @@ test('every journal entry and page is dated within the repository history', () =
   }
 })
 
-test('release install snippets run the binary from inside its archive folder', () => {
-  // release.yml packages each native binary as <bundle>/zipp, <bundle> being
-  // the archive name without its extension.
-  const workflow = readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8')
-  assert.ok(workflow.includes('bundle="zipp-$RELEASE_VERSION-$RUST_TARGET"'))
-  assert.ok(workflow.includes('install -m 0755 "$binary" "dist/$bundle/zipp"'))
+test('release install snippets run the Linux CLI the way releases package it', () => {
+  // From 0.0.26 a release publishes the Linux CLI as the binary itself,
+  // zipp-<version>-linux-<arch> (tools/release/package-native.sh), so a
+  // snippet that downloads it must make it executable before running it.
+  // 0.0.25 and earlier shipped <bundle>.tar.gz holding <bundle>/zipp, so a
+  // snippet that extracts one runs ./<bundle>/zipp, and no ./zipp exists.
+  const packager = readFileSync(new URL('../../tools/release/package-native.sh', import.meta.url), 'utf8')
+  assert.ok(packager.includes('asset="$out/zipp-$version-linux-$arch"'))
+  assert.ok(packager.includes('install -m 0755 "$binary" "$asset"'))
   const snippets = []
   const walk = value => {
-    if (typeof value === 'string') { if (/tar x\w*f zipp-/.test(value)) snippets.push(value) }
+    if (typeof value === 'string') { if (/tar x\w*f zipp-|zipp-[\w.$-]*linux-/.test(value)) snippets.push(value) }
     else if (value && typeof value === 'object') Object.values(value).forEach(walk)
   }
   walk(content)
   assert.ok(snippets.length > 0)
   for (const code of snippets) {
-    for (const [, bundle] of code.matchAll(/tar x\w*f (zipp-[\w.-]+?)\.tar\.gz/g)) {
+    const archives = [...code.matchAll(/tar x\w*f (zipp-[\w.-]+?)\.tar\.gz/g)]
+    for (const [, bundle] of archives) {
       assert.ok(code.includes(`./${bundle}/zipp `), `${bundle}: run the extracted ./${bundle}/zipp`)
       assert.ok(!/(^|\n)\.\/zipp /.test(code), `${bundle}: no ./zipp exists after extraction`)
+    }
+    if (archives.length === 0 && /(^|\n)\.\/zipp /.test(code)) {
+      assert.ok(/chmod \+x zipp/.test(code), 'a downloaded Linux binary is made executable before it runs')
     }
   }
 })

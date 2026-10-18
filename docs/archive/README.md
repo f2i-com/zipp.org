@@ -7,6 +7,7 @@ current documents (see [`docs/README.md`](../README.md)).
 
 | Archive | Scope | Status |
 |---|---|---|
+| [`README-through-0.0.25.md`](README-through-0.0.25.md) | The whole project README before 0.0.26, when it was shortened and its detail moved into `docs/` pages |
 | [`HANDOFF-through-0.0.25.md`](HANDOFF-through-0.0.25.md) | Dated session log, newest first, from 13 September to the 0.0.25 release (15 October 2026) | Historical; its verification commands and working rules continue in [`DEVELOPMENT.md`](../DEVELOPMENT.md) |
 | [`HANDOFF-through-B252.md`](HANDOFF-through-B252.md) | Cumulative continuation snapshots through the B252 campaign | Historical; continued by `HANDOFF-through-0.0.25.md` |
 | [`PERF_LEDGER-B001-B252.md`](PERF_LEDGER-B001-B252.md) | Full append-only experiment ledger, including refutations and old gates | Historical evidence; current priorities are in [`PERF_ROADMAP.md`](../PERF_ROADMAP.md) |
