@@ -9,10 +9,13 @@ name: Release
 # toolchain, the safe profile, the Windows x86-64 CLI and JIT VM, native and
 # WASM sandboxes, production boundary suite, real browser Workers, the landing
 # site, dependency audit, and the pinned Test262 corpus with exact expected
-# failures, in addition to this workflow's validation and release builds. A
-# green `main` at some other revision is not a release gate. The Node boundary
-# checks the WASM job runs come from the one shared list
-# (tests/node/run-boundary-suite.cjs) so this lane cannot drift from CI.
+# failures, in addition to this workflow's validation and the release builds
+# (release-build.yml, which also smoke-tests every binary, installs and
+# uninstalls the Windows installer, runs Test262 on the Arm CLIs and checks
+# the embed kit in three browsers). A green `main` at some other revision is
+# not a release gate. The Node boundary checks the WASM jobs run come from the
+# one shared list (tests/node/run-boundary-suite.cjs) so this lane cannot
+# drift from CI.
 #
 # The SOURCE is bound to the tag; the GATE DEFINITIONS are not. A dispatched
 # run uses this file — and resolves `uses: ./.github/workflows/{ci,security}.yml`
@@ -185,668 +188,22 @@ jobs:
       # jobs for a docs-only retag (see the input's description).
       skip_heavy: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_heavy == true }}
 
-  native:
-    name: Native CLI (${{ matrix.rust_target }})
+  # Every asset, built and checked by release-build.yml at the tagged commit
+  # (the same workflow a pre-tag dispatch runs): the Windows portable exe and
+  # installer, the three Linux CLIs, the five WebAssembly modules and the
+  # embed kit, as `release-*` artifacts.
+  build:
+    name: Build the release assets
     needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            rust_target: x86_64-unknown-linux-gnu
-            archive_suffix: .tar.gz
-          - os: windows-2022
-            rust_target: x86_64-pc-windows-msvc
-            archive_suffix: .zip
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    env:
-      RUSTUP_TOOLCHAIN: "1.92.0"
-      RUSTFLAGS: -Dwarnings
-    steps:
-      - name: Check out the tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          persist-credentials: false
-
-      - name: Install the pinned Rust toolchain and target
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
-          rustup target add ${{ matrix.rust_target }} --toolchain 1.92.0
-
-      - name: Build the release CLI from the locked workspace
-        run: >-
-          cargo build --locked --release --package zipp-cli --bin zipp
-          --target ${{ matrix.rust_target }}
-
-      # Run the PACKAGED-ARCHITECTURE binary through a JIT tier and the
-      # recursion limit. A bare `console.log` never leaves the interpreter, so
-      # the Win64 ABI, the unwind/stack-probe interaction with the 256 MiB main
-      # thread, and VirtualProtect code publication went untested in the gate
-      # that ships them. The expected line is what `node` prints for this file.
-      - name: Smoke-test the release CLI at a JIT tier
-        shell: bash
-        env:
-          RUST_TARGET: ${{ matrix.rust_target }}
-          SMOKE_EXPECTED: zipp-release-smoke 520003 100 RangeError
-        run: |
-          set -euo pipefail
-          # target/ is ignored, and a relative path avoids Windows/bash path
-          # translation for the shared step.
-          cat > target/zipp-release-smoke.js <<'SMOKE'
-          let total = 0;
-          for (let i = 0; i < 200000; i++) total = (total + i * 3) % 1000003;
-          function depth(n) { return n === 0 ? 0 : depth(n - 1) + 1; }
-          let guarded = "no-range-error";
-          try { depth(1e7); } catch (e) { guarded = e.constructor.name; }
-          console.log(`zipp-release-smoke ${total} ${depth(100)} ${guarded}`);
-          SMOKE
-          binary="target/$RUST_TARGET/release/zipp"
-          [[ "$RUNNER_OS" != "Windows" ]] || binary="$binary.exe"
-          actual="$(ZIPP_JIT_THRESHOLD=1 "$binary" js target/zipp-release-smoke.js | tr -d '\r')"
-          if [[ "$actual" != "$SMOKE_EXPECTED" ]]; then
-            echo "smoke output: $actual (expected: $SMOKE_EXPECTED)" >&2
-            exit 1
-          fi
-          # Prove a tier really compiled rather than trusting the loop count.
-          # Captured, not piped: `| grep -q` closes the pipe at its first
-          # match, and the engine next log write then hits EPIPE, where the
-          # print macros panic — this step aborted (signal 6) rather than
-          # reporting a result.
-          jitlog="$(ZIPP_JIT_THRESHOLD=1 ZIPP_JITLOG=1 "$binary" js target/zipp-release-smoke.js 2>&1)"
-          grep -q 'compiled' <<<"$jitlog"
-
-      - name: Package Linux CLI
-        if: runner.os == 'Linux'
-        shell: bash
-        env:
-          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: |
-          set -euo pipefail
-          binary="target/$RUST_TARGET/release/zipp"
-          bundle="zipp-$RELEASE_VERSION-$RUST_TARGET"
-          mkdir -p "dist/$bundle"
-          install -m 0755 "$binary" "dist/$bundle/zipp"
-          install -m 0644 README.md LICENSE-APACHE "dist/$bundle/"
-          "$binary" --version --json > "dist/$bundle/BUILD-INFO.json"
-          # The commit and clean-tree fields are checked HERE, on first publish,
-          # not only on the idempotent re-run path: an archive reporting another
-          # commit, or dirty:true (build.rs reports dirty whenever its `git
-          # status` probe fails), used to be published immutably and then fail
-          # every later re-run.
-          jq -e --arg version "$RELEASE_VERSION" --arg commit "$EXPECTED_COMMIT" \
-            '.name == "zipp" and .version == $version and
-             .commit == $commit and .dirty == false' \
-            "dist/$bundle/BUILD-INFO.json" >/dev/null
-          (
-            cd dist
-            tar -czf "$bundle.tar.gz" "$bundle"
-          )
-
-      - name: Package Windows CLI
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $binary = Join-Path $PWD "target/$env:RUST_TARGET/release/zipp.exe"
-
-          $bundle = "zipp-$env:RELEASE_VERSION-$env:RUST_TARGET"
-          $bundlePath = Join-Path $PWD "dist/$bundle"
-          New-Item -ItemType Directory -Path $bundlePath -Force | Out-Null
-          $packagedBinary = Join-Path $bundlePath 'zipp.exe'
-          Copy-Item -LiteralPath $binary -Destination $packagedBinary
-
-          # The Windows CLI runs the VM on its process main thread, so the PE
-          # stack fields are a runtime safety contract. Inspect the exact copy
-          # that will be archived rather than assuming the link argument took
-          # effect on the release-profile binary.
-          function Get-PeStackSizes([string] $Path) {
-            [byte[]] $bytes = [IO.File]::ReadAllBytes($Path)
-            if ($bytes.LongLength -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
-              throw "packaged zipp.exe has no valid DOS header"
-            }
-
-            [uint64] $peOffset64 = [BitConverter]::ToUInt32($bytes, 0x3c)
-            if ($peOffset64 + 26 -gt [uint64] $bytes.LongLength) {
-              throw "packaged zipp.exe has a truncated PE header"
-            }
-            [int] $peOffset = $peOffset64
-            if ($bytes[$peOffset] -ne 0x50 -or
-                $bytes[$peOffset + 1] -ne 0x45 -or
-                $bytes[$peOffset + 2] -ne 0 -or
-                $bytes[$peOffset + 3] -ne 0) {
-              throw "packaged zipp.exe has no valid PE signature"
-            }
-
-            # The optional header follows the 4-byte signature and 20-byte
-            # COFF header. PE32+ stores the two stack fields as u64; PE32 uses
-            # u32 fields at the corresponding offsets.
-            [int] $optional = $peOffset + 24
-            [uint16] $magic = [BitConverter]::ToUInt16($bytes, $optional)
-            if ($magic -eq 0x20b) {
-              if ([uint64] $optional + 0x58 -gt [uint64] $bytes.LongLength) {
-                throw "packaged zipp.exe has a truncated PE32+ optional header"
-              }
-              [uint64] $reserve = [BitConverter]::ToUInt64($bytes, $optional + 0x48)
-              [uint64] $commit = [BitConverter]::ToUInt64($bytes, $optional + 0x50)
-            } elseif ($magic -eq 0x10b) {
-              if ([uint64] $optional + 0x50 -gt [uint64] $bytes.LongLength) {
-                throw "packaged zipp.exe has a truncated PE32 optional header"
-              }
-              [uint64] $reserve = [BitConverter]::ToUInt32($bytes, $optional + 0x48)
-              [uint64] $commit = [BitConverter]::ToUInt32($bytes, $optional + 0x4c)
-            } else {
-              throw ('packaged zipp.exe has unexpected optional-header magic 0x{0:x}' -f $magic)
-            }
-
-            return [pscustomobject]@{ Reserve = $reserve; Commit = $commit }
-          }
-
-          $stack = Get-PeStackSizes $packagedBinary
-          if ($stack.Reserve -ne 268435456 -or $stack.Commit -ne 4096) {
-            throw "packaged zipp.exe has stack reserve=$($stack.Reserve), commit=$($stack.Commit); expected reserve=268435456, commit=4096"
-          }
-          Write-Host "verified packaged PE stack: reserve=$($stack.Reserve), commit=$($stack.Commit)"
-
-          Copy-Item -LiteralPath @('README.md', 'LICENSE-APACHE') -Destination $bundlePath
-          $buildInfo = & $binary --version --json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $identity = $buildInfo | ConvertFrom-Json
-          # The commit and clean-tree fields are checked HERE, on first publish,
-          # not only on the idempotent re-run path: an archive reporting another
-          # commit, or dirty:true (build.rs reports dirty whenever its `git
-          # status` probe fails), used to be published immutably and then fail
-          # every later re-run.
-          if ($identity.name -ne 'zipp' -or
-              $identity.version -ne $env:RELEASE_VERSION -or
-              $identity.commit -ne $env:EXPECTED_COMMIT -or
-              $identity.dirty -ne $false) {
-            throw "binary identity does not match release $env:RELEASE_VERSION at $env:EXPECTED_COMMIT (commit=$($identity.commit), dirty=$($identity.dirty))"
-          }
-          [IO.File]::WriteAllText(
-            (Join-Path $bundlePath 'BUILD-INFO.json'),
-            ($buildInfo + "`n"),
-            [Text.UTF8Encoding]::new($false)
-          )
-          $archivePath = Join-Path $PWD "dist/$bundle.zip"
-          Compress-Archive -LiteralPath $bundlePath -DestinationPath $archivePath -CompressionLevel Optimal
-
-      - name: Upload native release archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-native-${{ matrix.rust_target }}
-          path: dist/zipp-${{ needs.validate.outputs.version }}-${{ matrix.rust_target }}${{ matrix.archive_suffix }}
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
-  wasm:
-    name: Browser WebAssembly (${{ matrix.variant }})
-    needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: javascript
-            suffix: web
-            features: ""
-            profile: release
-            optimize_flags: ""
-            stack_bytes: 1048576
-            languages: '["javascript"]'
-          # ZIPP Lite: the JavaScript core without Intl, Temporal, Python or
-          # torch, in the size-first `lite` Cargo profile. optimize-wasm.sh
-          # takes the smaller raw module for it, as build-variants.sh does.
-          - variant: lite
-            suffix: web-lite
-            features: "--features lite"
-            profile: lite
-            optimize_flags: "--prefer-raw-size"
-            stack_bytes: 1048576
-            languages: '["javascript"]'
-          - variant: javascript-python
-            suffix: web-python
-            features: "--features python"
-            profile: release
-            optimize_flags: ""
-            stack_bytes: 16777216
-            languages: '["javascript","python"]'
-          # Python without torch: torch ships separately as the web-torch
-          # package (zipp_torch.wasm), which a host adds with addPythonPackage.
-          - variant: javascript-python-base
-            suffix: web-python-base
-            features: "--features python-base"
-            profile: release
-            optimize_flags: ""
-            stack_bytes: 16777216
-            languages: '["javascript","python"]'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    defaults:
-      run:
-        working-directory: crates/zipp-wasm
-    env:
-      RUSTUP_TOOLCHAIN: "1.92.0"
-    steps:
-      - name: Check out the tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          persist-credentials: false
-
-      - name: Install the pinned Rust toolchain and wasm32 target
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
-          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
-
-      - name: Select the Node.js smoke-test runtime
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-
-      - name: Test the exact-suite WASM comparison harness
-        run: node --no-warnings --test ../../bench/comparison/test_run_wasm_suites.mjs
-
-      - name: Test the isolated host workspace
-        env:
-          RUSTFLAGS: -Dwarnings
-        run: cargo test --locked
-
-      - name: Test artifact-only VM specializations
-        env:
-          RUSTFLAGS: -Dwarnings
-        run: >-
-          cargo test --locked --manifest-path ../zipp-vm/Cargo.toml
-          --no-default-features
-          --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
-          --test no_fs_loader --test wasm_single_agent
-
-      - name: Build zipp-vm in the configurations its manifest advertises
-        # Every other job builds this crate with `meter-only`, which pulls in
-        # `instrument`. That hid a `renew_step_budget` reaching straight for
-        # `instr_rec` — a field that only exists under that feature — so the
-        # crate did not compile on its own, nor as the `--no-default-features`
-        # pure interpreter its Cargo.toml offers. Feature unification in the
-        # workspace build meant nothing ever noticed.
-        env:
-          RUSTFLAGS: -Dwarnings
-        run: |
-          set -euo pipefail
-          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml
-          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml --no-default-features
-          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml             --no-default-features --features safe-sandbox
-
-      - name: Install the exact matching wasm-bindgen CLI
-        run: |
-          set -euo pipefail
-          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
-          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
-
-      - name: Install the measured WASM optimizer
-        run: npm install --global binaryen@125.0.0
-
-      - name: Build the locked production WebAssembly module
-        # RUSTFLAGS overrides target config, so repeat both security-critical
-        # linker limits while making compiler warnings fatal. The tagged
-        # commit is stamped into zippProfile().source.sha so a loaded artifact
-        # names the revision it came from; the artifact hashes stay external
-        # (SHA256SUMS), never embedded.
-        env:
-          RUSTFLAGS: >-
-            -Dwarnings
-            -C link-arg=--max-memory=1073741824
-            -C link-arg=-zstack-size=${{ matrix.stack_bytes }}
-          ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
-        # remap-paths.sh adds the --remap-path-prefix flags that keep the
-        # runner's checkout, registry and toolchain directories out of the
-        # module's panic locations. cargo reads the encoded variable in
-        # preference to RUSTFLAGS, so the flags above are passed through it.
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2086
-          CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh $RUSTFLAGS)" \
-            cargo build --locked --profile ${{ matrix.profile }} --target wasm32-unknown-unknown ${{ matrix.features }}
-
-      # The one shared list (tests/node/run-boundary-suite.cjs): the same
-      # checks CI runs, including the parse-shape limits calibrated against
-      # the JS artifact's 1 MiB stack (Python uses 16 MiB; v0.0.1 shipped limits that
-      # rejected two working applications because the only browser check at
-      # the time parsed three tokens) and the audit regression suites the
-      # release lane used to omit.
-      - name: Prepare the production module for Node checks
-        run: |
-          set -euo pipefail
-          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
-            --remove-name-section --remove-producers-section \
-            target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
-          node tests/node/strip-target-features.cjs \
-            tests/node/pkg/zipp_wasm_bg.wasm tests/node/pkg/stripped.wasm
-          mv tests/node/pkg/stripped.wasm tests/node/pkg/zipp_wasm_bg.wasm
-          bash optimize-wasm.sh tests/node/pkg/zipp_wasm_bg.wasm ${{ matrix.optimize_flags }}
-
-      - name: Exercise the production host boundary under Node
-        if: matrix.variant != 'javascript-python-base'
-        run: |
-          node tests/node/run-boundary-suite.cjs
-
-      # Lite's own contract: the profile names the variant and what it
-      # omits, Intl and Temporal are absent, and the JavaScript core is whole.
-      - name: Exercise the Lite feature contract under Node
-        if: matrix.variant == 'lite'
-        run: node tests/node/lite.cjs
-
-      # The base Python artifact has no torch until a host adds the package;
-      # the torch job below proves base + package against the complete one.
-      - name: Exercise the Python frontend without torch under Node
-        if: matrix.variant == 'javascript-python-base'
-        run: |
-          set -euo pipefail
-          node tests/node/python-frontend.cjs
-          node tests/node/sort-semantics.cjs
-
-      - name: Exercise the combined artifact's Torch and interop contracts
-        if: matrix.variant == 'javascript-python'
-        run: |
-          node tests/node/python-conv2d.cjs
-          node tests/node/python-training.cjs
-          node tests/node/python-javascript.cjs
-
-      - name: Package browser JS, TypeScript declarations, and WebAssembly
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
-          WASM_VARIANT: ${{ matrix.variant }}
-          WASM_SUFFIX: ${{ matrix.suffix }}
-          EXPECTED_LANGUAGES: ${{ matrix.languages }}
-          STACK_BYTES: ${{ matrix.stack_bytes }}
-        run: |
-          set -euo pipefail
-          export WASM_VARIANT
-          bundle="zipp-wasm-$RELEASE_VERSION-$WASM_SUFFIX"
-          archive="$bundle.zip"
-          mkdir -p "dist/$bundle"
-          # Use the same stripping and guarded Binaryen 125 -O1 -O1 pass as the
-          # Node checks above. Stronger -O3/-Oz passes increased wire size;
-          # optimize-wasm.sh accepts only a raw AND Brotli size improvement.
-          wasm-bindgen --target web --out-dir "dist/$bundle" \
-            --remove-name-section --remove-producers-section \
-            target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
-          node tests/node/strip-target-features.cjs \
-            "dist/$bundle/zipp_wasm_bg.wasm" \
-            "dist/$bundle/zipp_wasm_bg.stripped.wasm"
-          mv "dist/$bundle/zipp_wasm_bg.stripped.wasm" \
-            "dist/$bundle/zipp_wasm_bg.wasm"
-          bash optimize-wasm.sh "dist/$bundle/zipp_wasm_bg.wasm" ${{ matrix.optimize_flags }}
-          # wasm-bindgen's Node and browser glue use the same module. Prove
-          # the shipped bytes are exactly the bytes the boundary tests ran.
-          cmp tests/node/pkg/zipp_wasm_bg.wasm "dist/$bundle/zipp_wasm_bg.wasm"
-          node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
-          # Validation on the artifact AFTER stripping: memory/import surface,
-          # and that the shipped module reports the tagged revision.
-          node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
-          # Pin all generated type surfaces as well as the runtime smoke below:
-          # a mutually stale JS+WASM pair can execute successfully while
-          # silently omitting an API added by the tagged Rust source.
-          grep -Fq 'getGlobalsFingerprint(indices: any): any;' \
-            "dist/$bundle/zipp_wasm.d.ts"
-          grep -Fq 'readonly engine_getGlobalsFingerprint:' \
-            "dist/$bundle/zipp_wasm.d.ts"
-          grep -Fq 'export const engine_getGlobalsFingerprint:' \
-            "dist/$bundle/zipp_wasm_bg.wasm.d.ts"
-          BUNDLE_PATH="$(pwd)/dist/$bundle" EXPECTED_COMMIT="$EXPECTED_COMMIT" node --input-type=module <<'JS'
-          import fs from "node:fs";
-          import path from "node:path";
-          import { pathToFileURL } from "node:url";
-
-          const bundle = process.env.BUNDLE_PATH;
-          const zipp = await import(pathToFileURL(path.join(bundle, "zipp_wasm.js")));
-          const wasmBytes = fs.readFileSync(path.join(bundle, "zipp_wasm_bg.wasm"));
-          const wasmModule = new WebAssembly.Module(wasmBytes);
-          if (!WebAssembly.Module.exports(wasmModule).some(
-            entry => entry.kind === "function" && entry.name === "engine_getGlobalsFingerprint"
-          )) {
-            throw new Error("browser package lacks raw engine_getGlobalsFingerprint export");
-          }
-          if (typeof zipp.Engine?.prototype?.getGlobalsFingerprint !== "function") {
-            throw new Error("browser package lacks Engine.getGlobalsFingerprint glue");
-          }
-          await zipp.default({
-            module_or_path: wasmModule,
-          });
-          const profile = JSON.parse(zipp.zippProfile());
-          if (profile.source?.sha !== process.env.EXPECTED_COMMIT) {
-            throw new Error(`browser package reports source ${profile.source?.sha}, expected ${process.env.EXPECTED_COMMIT}`);
-          }
-          if (profile.version !== process.env.RELEASE_VERSION) {
-            throw new Error(`browser package reports version ${profile.version}, expected ${process.env.RELEASE_VERSION}`);
-          }
-          if (JSON.stringify(profile.languages) !== process.env.EXPECTED_LANGUAGES) {
-            throw new Error(`wrong language variant: ${JSON.stringify(profile.languages)}`);
-          }
-          const wantLite = process.env.WASM_VARIANT === "lite";
-          if ((profile.variant === "lite") !== wantLite) {
-            throw new Error(`wrong build variant: ${profile.variant}`);
-          }
-          fs.writeFileSync(path.join(bundle, "PROFILE.json"), JSON.stringify(profile, null, 2) + "\n");
-          if (profile.languages.includes("python") && process.env.WASM_VARIANT === "javascript-python-base") {
-            const python = new zipp.Engine();
-            try {
-              python.initSource("try:\n    import torch\nexcept ModuleNotFoundError as e:\n    print(e.name)\nprint(sum(x * x for x in range(4)))", "python");
-              if (JSON.stringify(python.takeOutput()) !== '["torch","14"]') {
-                throw new Error("packaged Python (without torch) smoke failed");
-              }
-            } finally { python.dispose(); python.free(); }
-          } else if (profile.languages.includes("python")) {
-            const python = new zipp.Engine();
-            try {
-              python.initSource("import torch\nx = torch.tensor([1.0, 2.0, 3.0])\nprint((x * 2).tolist())", "python");
-              if (JSON.stringify(python.takeOutput()) !== '["[2.0, 4.0, 6.0]"]') {
-                throw new Error("packaged Python/Torch smoke failed");
-              }
-            } finally { python.dispose(); python.free(); }
-          }
-          const engine = new zipp.Engine();
-          try {
-            const symbols = engine.initScript(`
-              let fingerprintProbe = { items: [1] };
-              function mutateFingerprintProbe() { fingerprintProbe.items.push(2); }
-              console.log("zipp-web-release-smoke");
-            `);
-            const indices = [symbols.fingerprintProbe.index];
-            const beforeValue = engine.getGlobalsBatch(indices);
-            const before = engine.getGlobalsFingerprint(indices);
-            const stable = engine.getGlobalsFingerprint(indices);
-            if (!Array.isArray(before)
-                || before.length !== 1
-                || !Number.isSafeInteger(before[0])
-                || before[0] < 0
-                || stable[0] !== before[0]) {
-              throw new Error(`invalid globals fingerprint binding: ${JSON.stringify({ before, stable })}`);
-            }
-            engine.callFunction("mutateFingerprintProbe", []);
-            const afterValue = engine.getGlobalsBatch(indices);
-            const after = engine.getGlobalsFingerprint(indices);
-            if (JSON.stringify(beforeValue) === JSON.stringify(afterValue)
-                || !Array.isArray(after)
-                || before[0] === after[0]) {
-              throw new Error(
-                `globals fingerprint did not follow an in-place mutation: ${JSON.stringify({ before, after })}`
-              );
-            }
-            const output = engine.takeOutput();
-            if (JSON.stringify(output) !== '["zipp-web-release-smoke"]') {
-              throw new Error(`unexpected browser-package output: ${JSON.stringify(output)}`);
-            }
-          } finally {
-            engine.dispose();
-            engine.free();
-          }
-          JS
-          install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
-          # The reference host adapter ships WITH the bindings it was written
-          # against, at this exact revision: the README's host-adapter section
-          # used to refer to a directory the archive did not contain (the
-          # 11 September 2026 close audit's ZA-14). Its version is recorded
-          # beside the commit so a consumer can check SDK/API compatibility.
-          mkdir -p "dist/$bundle/host-sdk"
-          install -m 0644 host-sdk/zipp-host.mjs host-sdk/zipp-host.worker.mjs host-sdk/README.md \
-            "dist/$bundle/host-sdk/"
-          # gpu-lab's runtime and kernels ship; model-plugins/ deliberately does
-          # not. It is an experimental, private, source-only package, tested in
-          # CI from the tree (ci.yml's python-wasm job) and used from a checkout.
-          # Shipping it needs it copied here and a test against the unpacked
-          # archive, the way the smoke test above loads the engine.
-          if [[ "$WASM_VARIANT" == "javascript-python" ]]; then
-            mkdir -p "dist/$bundle/gpu-lab/wasm" "dist/$bundle/docs"
-            cp -R gpu-lab/src "dist/$bundle/gpu-lab/"
-            install -m 0644 gpu-lab/wasm/kernels.wasm "dist/$bundle/gpu-lab/wasm/"
-            install -m 0644 gpu-lab/LICENSE gpu-lab/NOTICE "dist/$bundle/gpu-lab/"
-            install -m 0644 ../../docs/python/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
-          fi
-          sdk_version="$(node -e 'import("./host-sdk/zipp-host.mjs").then((m) => console.log(m.ZIPP_HOST_SDK_VERSION))')"
-          node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.mjs"
-          node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.worker.mjs"
-          {
-            printf 'version=%s\n' "$RELEASE_VERSION"
-            printf 'commit=%s\n' "$(git rev-parse HEAD)"
-            printf 'rustc=%s\n' "$(rustc --version)"
-            printf 'wasm-bindgen=%s\n' "$(wasm-bindgen --version)"
-            printf 'variant=%s\n' "$WASM_VARIANT"
-            printf 'languages=%s\n' "$EXPECTED_LANGUAGES"
-            printf 'stack-bytes=%s\n' "$STACK_BYTES"
-            printf 'target=wasm32-unknown-unknown\n'
-            printf 'host-sdk=%s\n' "$sdk_version"
-          } > "dist/$bundle/BUILD-INFO.txt"
-          (
-            cd "dist/$bundle"
-            find . -type f ! -name SHA256SUMS -printf '%P\0' \
-              | sort -z \
-              | xargs -0 sha256sum > SHA256SUMS
-          )
-          (
-            cd dist
-            zip -q -9 -r "$archive" "$bundle"
-          )
-
-      - name: Upload browser WebAssembly release archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-wasm-${{ matrix.suffix }}
-          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-${{ matrix.suffix }}.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
-  torch:
-    name: Browser WebAssembly (torch package)
-    needs: validate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    defaults:
-      run:
-        working-directory: crates/zipp-wasm
-    env:
-      RUSTUP_TOOLCHAIN: "1.92.0"
-    steps:
-      - name: Check out the tagged source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          persist-credentials: false
-
-      - name: Install the pinned Rust toolchain and wasm32 target
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
-          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
-
-      - name: Select the Node.js smoke-test runtime
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-
-      - name: Install the exact matching wasm-bindgen CLI
-        run: |
-          set -euo pipefail
-          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
-          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
-
-      # build-variants.sh post-processes each engine with optimize-wasm.sh,
-      # which refuses any Binaryen but the one the sizes were measured with.
-      - name: Install the measured WASM optimizer
-        run: npm install --global binaryen@125.0.0
-
-      # The package and the two engines it is checked against, from the same
-      # locked source: `python` (without torch) + zipp_torch.wasm must print
-      # what the complete `all` artifact prints, byte for byte.
-      - name: Build the torch package and the engines it pairs with
-        env:
-          ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
-        run: ./build-variants.sh all python torch
-
-      - name: Prove the package against the complete artifact under Node
-        run: |
-          set -euo pipefail
-          wasm-bindgen --target nodejs --out-dir /tmp/pkg-all \
-            target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          wasm-bindgen --target nodejs --out-dir /tmp/pkg-python \
-            target/variants/python/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          node tests/node/python-plugin.cjs /tmp/pkg-all /tmp/pkg-python
-
-      - name: Package the torch module and its loader
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-        run: |
-          set -euo pipefail
-          bundle="zipp-wasm-$RELEASE_VERSION-web-torch"
-          archive="$bundle.zip"
-          mkdir -p "dist/$bundle"
-          install -m 0644 dist/torch/zipp_torch.wasm dist/torch/zipp_torch.js "dist/$bundle/"
-          install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
-          mkdir -p "dist/$bundle/docs"
-          install -m 0644 ../../docs/python/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
-          node --input-type=module --check < "dist/$bundle/zipp_torch.js"
-          {
-            printf 'version=%s\n' "$RELEASE_VERSION"
-            printf 'commit=%s\n' "$(git rev-parse HEAD)"
-            printf 'rustc=%s\n' "$(rustc --version)"
-            printf 'variant=torch\n'
-            printf 'pairs-with=zipp-wasm-%s-web-python-base\n' "$RELEASE_VERSION"
-            printf 'target=wasm32-unknown-unknown\n'
-          } > "dist/$bundle/BUILD-INFO.txt"
-          (
-            cd "dist/$bundle"
-            find . -type f ! -name SHA256SUMS -printf '%P\0' \
-              | sort -z \
-              | xargs -0 sha256sum > SHA256SUMS
-          )
-          (
-            cd dist
-            zip -q -9 -r "$archive" "$bundle"
-          )
-
-      - name: Upload the torch package release archive
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-wasm-web-torch
-          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+    uses: ./.github/workflows/release-build.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit }}
 
   publish:
     name: Publish GitHub Release
     # Both reusable gates run at the validated tag commit. Publishing waits
     # for the full native, safe-profile, sandbox, Worker and Test262 matrix.
-    needs: [validate, ci, security, native, wasm, torch]
+    needs: [validate, ci, security, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The one job with write access. The environment is where the repository
@@ -884,9 +241,9 @@ jobs:
           fi
 
       # docs/releases/<version>.md becomes the release body verbatim, and
-      # README.md is copied into both native archives, so a leftover
+      # README.md is what the Windows installer installs, so a leftover
       # "release candidate" line or an older `version=` in a download command
-      # ships as the published release's own instructions. A relative link in
+      # ships as the release's own instructions. A relative link in
       # the notes is also broken: GitHub resolves it against the repository
       # root with no ref, which 404s.
       - name: Refuse pre-release notes and stale download instructions
@@ -932,26 +289,37 @@ jobs:
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           set -euo pipefail
-          expected=(
-            "zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu.tar.gz"
-            "zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
-            "zipp-wasm-$RELEASE_VERSION-web.zip"
-            "zipp-wasm-$RELEASE_VERSION-web-lite.zip"
-            "zipp-wasm-$RELEASE_VERSION-web-python.zip"
-            "zipp-wasm-$RELEASE_VERSION-web-python-base.zip"
-            "zipp-wasm-$RELEASE_VERSION-web-torch.zip"
-          )
-          for asset in "${expected[@]}"; do
-            test -f "dist/$asset"
-          done
+          v="$RELEASE_VERSION"
+          printf '%s\n' \
+            "zipp-$v-windows-x86_64-portable.exe" \
+            "zipp-$v-windows-x86_64-installer.msi" \
+            "zipp-$v-linux-x86_64" \
+            "zipp-$v-linux-arm64" \
+            "zipp-$v-linux-armv7" \
+            "zipp-$v-javascript.wasm" \
+            "zipp-$v-javascript-lite.wasm" \
+            "zipp-$v-javascript-python.wasm" \
+            "zipp-$v-javascript-python-base.wasm" \
+            "zipp-$v-torch-package.wasm" \
+            "zipp-$v-wasm-embed-kit.zip" > expected-assets.txt
+          mapfile -t expected < expected-assets.txt
           mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
-          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
-          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+          if [[ "${actual[*]}" != "$(sort expected-assets.txt | tr '\n' ' ' | sed 's/ $//')" ]]; then
             printf 'unexpected release asset set:\n%s\n' "${actual[*]}" >&2
             exit 1
           fi
+          # Every binary and module names the tagged commit (the build checked
+          # each one's reported identity; this checks the uploaded bytes).
+          for asset in "${expected[@]}"; do
+            case "$asset" in
+              *.msi) ;; # a compressed cabinet; its zipp.exe is the portable exe, byte for byte
+              *.zip) unzip -p "dist/$asset" "${asset%.zip}/BUILD-INFO.txt" | grep -Fxq "commit=$EXPECTED_COMMIT" ;;
+              *) LC_ALL=C grep -aqF "$EXPECTED_COMMIT" "dist/$asset" ;;
+            esac
+          done
           (
             cd dist
             sha256sum "${expected[@]}" > SHA256SUMS
@@ -982,139 +350,37 @@ jobs:
           verify_remote_tag
           if gh release view "$RELEASE_TAG" \
               --json isDraft,isImmutable,isPrerelease,url > existing-release.json 2>/dev/null; then
-            is_draft="$(jq -r .isDraft existing-release.json)"
-            is_prerelease="$(jq -r .isPrerelease existing-release.json)"
-            if [[ "$is_draft" == "true" ]]; then
+            if [[ "$(jq -r .isDraft existing-release.json)" == "true" ]]; then
               # A previous upload may have stopped midway. Drafts are not
               # public or immutable, so remove that partial attempt and
               # recreate it from the newly verified complete asset set.
               gh release delete "$RELEASE_TAG" --yes
             else
-              if [[ "$is_prerelease" == "true" ]]; then
+              if [[ "$(jq -r .isPrerelease existing-release.json)" == "true" ]]; then
                 echo "existing $RELEASE_TAG is a prerelease; refusing to mutate it" >&2
                 exit 1
               fi
+              # A published release is never changed: a re-run only proves it
+              # complete, checksum-valid and built from the tagged commit.
               mkdir existing-assets
               gh release download "$RELEASE_TAG" --dir existing-assets
-              lite_asset="zipp-wasm-${{ needs.validate.outputs.version }}-web-lite.zip"
-              expected_existing=(
-                "SHA256SUMS"
-                "zipp-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz"
-                "zipp-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip"
-                "zipp-wasm-${{ needs.validate.outputs.version }}-web.zip"
-                "$lite_asset"
-                "zipp-wasm-${{ needs.validate.outputs.version }}-web-python.zip"
-                "zipp-wasm-${{ needs.validate.outputs.version }}-web-python-base.zip"
-                "zipp-wasm-${{ needs.validate.outputs.version }}-web-torch.zip"
-              )
-              mapfile -t actual_existing < <(
-                find existing-assets -maxdepth 1 -type f -printf '%f\n' | sort
-              )
-              mapfile -t wanted_existing < <(
-                printf '%s\n' "${expected_existing[@]}" | sort
-              )
-              # A release published before this workflow built ZIPP Lite has
-              # every asset but that one. It is the only asset this job ever
-              # adds to a published release, and only when it is absent: the
-              # archives already there are checked and never replaced, and the
-              # checksum list gains one line and keeps the others as they are
-              # (decided below, once every archive has been checked).
-              mapfile -t wanted_before_lite < <(
-                printf '%s\n' "${expected_existing[@]}" | grep -Fxv "$lite_asset" | sort
-              )
-              add_lite=false
-              if [[ "${actual_existing[*]}" == "${wanted_before_lite[*]}" ]]; then
-                add_lite=true
-              elif [[ "${actual_existing[*]}" != "${wanted_existing[*]}" ]]; then
-                printf 'existing release has an unexpected asset set:\n%s\n' \
-                  "${actual_existing[*]}" >&2
+              mapfile -t actual_existing < <(find existing-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+              mapfile -t wanted_existing < <({ echo SHA256SUMS; cat expected-assets.txt; } | sort)
+              if [[ "${actual_existing[*]}" != "${wanted_existing[*]}" ]]; then
+                printf 'existing release has an unexpected asset set:\n%s\n' "${actual_existing[*]}" >&2
                 exit 1
               fi
               (cd existing-assets && sha256sum --check SHA256SUMS)
-              cp existing-assets/SHA256SUMS published-SHA256SUMS
-              if [[ "$add_lite" == "true" ]]; then
-                if [[ "$(jq -r .isImmutable existing-release.json)" == "true" ]]; then
-                  echo "existing $RELEASE_TAG is immutable; $lite_asset cannot be added to it" >&2
-                  exit 1
-                fi
-                cp "dist/$lite_asset" existing-assets/
-              fi
-
-              linux_bundle="zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu"
-              windows_bundle="zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc"
-              linux_info="$(
-                tar -xOf "existing-assets/$linux_bundle.tar.gz" \
-                  "$linux_bundle/BUILD-INFO.json"
-              )"
-              windows_info="$(
-                unzip -p "existing-assets/$windows_bundle.zip" \
-                  "$windows_bundle/BUILD-INFO.json"
-              )"
-              for info in "$linux_info" "$windows_info"; do
-                jq -e \
-                  --arg version "$RELEASE_VERSION" \
-                  --arg commit "$EXPECTED_COMMIT" \
-                  '.name == "zipp" and .version == $version and
-                   .commit == $commit and .dirty == false' \
-                  <<< "$info" >/dev/null
-              done
-              for suffix in web web-lite web-python web-python-base; do
-                wasm_bundle="zipp-wasm-$RELEASE_VERSION-$suffix"
-                wasm_info="$(unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/BUILD-INFO.txt")"
-                grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
-                grep -Fxq "commit=$EXPECTED_COMMIT" <<< "$wasm_info"
-                languages='["javascript"]'
-                variant=javascript
-                if [[ "$suffix" == web-python ]]; then
-                  languages='["javascript","python"]'
-                  variant=javascript-python
-                elif [[ "$suffix" == web-python-base ]]; then
-                  languages='["javascript","python"]'
-                  variant=javascript-python-base
-                elif [[ "$suffix" == web-lite ]]; then
-                  variant=lite
-                  unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/PROFILE.json" \
-                    | jq -e '.variant == "lite"' >/dev/null
-                fi
-                grep -Fxq "variant=$variant" <<< "$wasm_info"
-                grep -Fxq "languages=$languages" <<< "$wasm_info"
-                unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/PROFILE.json" \
-                  | jq -e --arg version "$RELEASE_VERSION" --arg commit "$EXPECTED_COMMIT" \
-                      --argjson languages "$languages" \
-                      '.version == $version and .source.sha == $commit and .languages == $languages' >/dev/null
-              done
+              while read -r asset; do
+                case "$asset" in
+                  *.msi) ;;
+                  *.zip) unzip -p "existing-assets/$asset" "${asset%.zip}/BUILD-INFO.txt" | grep -Fxq "commit=$EXPECTED_COMMIT" ;;
+                  *) LC_ALL=C grep -aqF "$EXPECTED_COMMIT" "existing-assets/$asset" ;;
+                esac
+              done < expected-assets.txt
               verify_remote_tag
-
-              release_url="$(jq -r .url existing-release.json)"
-              # The checksum list this asset set should carry, in this
-              # workflow's order. The published list is either that one, and
-              # nothing changes, or that one without the Lite line: the
-              # release predates Lite, or a run stopped between uploading the
-              # archive and its checksum. Any other difference is refused.
-              mkdir lite-upload
-              (
-                cd existing-assets
-                sha256sum "${expected_existing[@]:1}" > ../lite-upload/SHA256SUMS
-              )
-              if [[ "$add_lite" != "true" ]] \
-                  && cmp -s <(sort published-SHA256SUMS) <(sort lite-upload/SHA256SUMS); then
-                printf 'Existing [%s](%s) is complete and checksum-valid; no changes made.\n' \
-                  "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              lite_line="$(grep -F -- "  $lite_asset" lite-upload/SHA256SUMS)"
-              if ! cmp -s <(sort published-SHA256SUMS) \
-                  <(grep -Fxv -- "$lite_line" lite-upload/SHA256SUMS | sort); then
-                echo "existing $RELEASE_TAG has a checksum list that does not match its assets" >&2
-                exit 1
-              fi
-              if [[ "$add_lite" == "true" ]]; then
-                gh release upload "$RELEASE_TAG" "existing-assets/$lite_asset"
-              fi
-              gh release upload "$RELEASE_TAG" lite-upload/SHA256SUMS --clobber
-              verify_remote_tag
-              printf 'Existing [%s](%s) now carries %s and its checksum; its other assets are unchanged and checksum-valid.\n' \
-                "$RELEASE_TAG" "$release_url" "$lite_asset" >> "$GITHUB_STEP_SUMMARY"
+              printf 'Existing [%s](%s) is complete and checksum-valid; no changes made.\n' \
+                "$RELEASE_TAG" "$(jq -r .url existing-release.json)" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
           fi

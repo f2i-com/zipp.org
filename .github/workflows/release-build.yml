@@ -1,0 +1,573 @@
+name: Release build
+
+# Every release asset, built and checked at one commit, uploaded as
+# `release-*` artifacts (and the per-variant WebAssembly glue as `build-*`):
+#
+#   zipp-<v>-windows-x86_64-portable.exe   the Windows CLI
+#   zipp-<v>-windows-x86_64-installer.msi  the same binary, a per-user install on PATH
+#   zipp-<v>-linux-x86_64 / -linux-arm64 / -linux-armv7   the Linux CLIs
+#   zipp-<v>-javascript.wasm, -javascript-lite.wasm, -javascript-python.wasm,
+#     -javascript-python-base.wasm, -torch-package.wasm   the WebAssembly modules,
+#     each engine carrying its own bindings (crates/zipp-wasm/embed-kit)
+#   zipp-<v>-wasm-embed-kit.zip            the loader, host SDK, types, docs and examples
+#
+# release.yml calls this at a tag and publishes exactly these files after its
+# gates. Dispatch it on its own to build and check a commit before tagging:
+#   gh workflow run release-build.yml --ref main -f ref=<sha>
+# The packaging steps are the repository's own scripts (tools/release/,
+# crates/zipp-wasm/embed-kit/), which run the same way on a workstation.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit to build
+        required: true
+        type: string
+    outputs:
+      version:
+        value: ${{ jobs.identify.outputs.version }}
+      commit:
+        value: ${{ jobs.identify.outputs.commit }}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The commit to build (a SHA, branch or tag)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  WASM_BINDGEN_CLI: "0.2.126"
+  # The Test262 corpus security.yml pins; keep the two in step.
+  TEST262_REF: d53ebc8b1931d9f1541e43d59650776e4b766248
+
+jobs:
+  identify:
+    name: Identify the commit and version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.identify.outputs.commit }}
+      version: ${{ steps.identify.outputs.version }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Read the commit and the workspace version
+        id: identify
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])' >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Native CLI (${{ matrix.name }})
+    needs: identify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+          # The Linux CLIs build on 22.04 for glibc 2.35 compatibility.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          # Natively on an Arm runner, with the whole pinned Test262 corpus:
+          # the aarch64 JIT ships for the first time here.
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            test262: full
+          # 32-bit Arm, no JIT: cross-built, run under QEMU user emulation.
+          - name: linux-armv7
+            os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            run_prefix: qemu-arm -L /usr/arm-linux-gnueabihf
+            test262: slice
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+      RUSTFLAGS: -Dwarnings
+      RUN_PREFIX: ${{ matrix.run_prefix }}
+      RELEASE_VERSION: ${{ needs.identify.outputs.version }}
+      EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.identify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }} --toolchain 1.92.0
+
+      - name: Install the armv7 cross toolchain and emulator
+        if: matrix.arch == 'armv7'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
+          {
+            echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc"
+            echo "CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the release CLI from the locked workspace
+        run: >-
+          cargo build --locked --release --package zipp-cli --bin zipp
+          --target ${{ matrix.target }}
+
+      # JavaScript through a JIT tier and the recursion limit, then Python
+      # (tools/release/smoke-native.sh says what each architecture proves).
+      - name: Smoke-test the release CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$PWD/target/${{ matrix.target }}/release/zipp"
+          [[ "$RUNNER_OS" != "Windows" ]] || binary="$binary.exe"
+          read -r -a prefix <<<"${RUN_PREFIX:-}"
+          bash tools/release/smoke-native.sh "${{ matrix.arch == 'arm64' && 'aarch64' || matrix.arch }}" \
+            ${prefix[@]+"${prefix[@]}"} "$binary"
+
+      - name: Install WiX Toolset 3.14 (pinned by hash)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            -Uri 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($hash -ne '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31') {
+            throw "wix314-binaries.zip has SHA-256 $hash"
+          }
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'wix314')
+
+      # The portable exe and the installer from one binary; the runner is
+      # disposable, so the installer is also installed, run and uninstalled.
+      # Windows PowerShell: the installer check loads WiX's .NET Framework
+      # Windows Installer API (Microsoft.Deployment.WindowsInstaller).
+      - name: Package the Windows CLI
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: >-
+          ./tools/release/package-windows.ps1
+          -Binary target/${{ matrix.target }}/release/zipp.exe -OutDir dist
+          -Version $env:RELEASE_VERSION -Commit $env:EXPECTED_COMMIT
+          -WixBin (Join-Path $env:RUNNER_TEMP 'wix314') -TestInstall
+
+      - name: Package the Linux CLI
+        if: runner.os == 'Linux'
+        run: >-
+          bash tools/release/package-native.sh ${{ matrix.arch }}
+          target/${{ matrix.target }}/release/zipp dist
+          "$RELEASE_VERSION" "$EXPECTED_COMMIT"
+
+      - name: Check out the pinned Test262 corpus
+        if: matrix.test262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tc39/test262
+          ref: ${{ env.TEST262_REF }}
+          path: target/test262
+          persist-credentials: false
+
+      # The packaged binary, against the same exact expected-failure manifest
+      # as the x86-64 gate.
+      - name: Require the pinned Test262 corpus to pass
+        if: matrix.test262 == 'full'
+        run: >-
+          python3 tools/run_test262.py --t262 target/test262
+          --zipp "dist/zipp-$RELEASE_VERSION-linux-${{ matrix.arch }}"
+          --jobs 4 --timeout 120
+          --expected-failures tools/test262-expected-failures.txt
+
+      # Under emulation the whole corpus would take hours: the areas where a
+      # 32-bit target differs (number and integer conversion, typed arrays,
+      # DataView, BigInt, Math, JSON, dates, strings, regular expressions),
+      # every execution of which must pass.
+      - name: Require a Test262 slice to pass under emulation
+        if: matrix.test262 == 'slice'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wrapper="$PWD/target/zipp-emulated"
+          printf '#!/bin/sh\nexec %s "%s" "$@"\n' "$RUN_PREFIX" "$PWD/dist/zipp-$RELEASE_VERSION-linux-${{ matrix.arch }}" > "$wrapper"
+          chmod +x "$wrapper"
+          for sub in built-ins/Math built-ins/Number built-ins/JSON built-ins/DataView built-ins/BigInt \
+                     built-ins/TypedArray built-ins/TypedArrayConstructors built-ins/Date built-ins/parseInt \
+                     built-ins/parseFloat built-ins/String/prototype built-ins/RegExp/prototype/exec \
+                     language/expressions/exponentiation language/types; do
+            python3 tools/run_test262.py --t262 target/test262 --sub "test/$sub" \
+              --zipp "$wrapper" --jobs 4 --timeout 300 | tail -n 1
+          done
+
+      - name: Upload the native release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-native-${{ matrix.name }}
+          path: dist/zipp-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  wasm:
+    name: Browser WebAssembly (${{ matrix.variant }})
+    needs: identify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: javascript
+            suffix: web
+            features: ""
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 1048576
+            languages: '["javascript"]'
+          # ZIPP Lite: the JavaScript core without Intl, Temporal, Python or
+          # torch, in the size-first `lite` Cargo profile. optimize-wasm.sh
+          # takes the smaller raw module for it, as build-variants.sh does.
+          - variant: lite
+            suffix: web-lite
+            features: "--features lite"
+            profile: lite
+            optimize_flags: "--prefer-raw-size"
+            stack_bytes: 1048576
+            languages: '["javascript"]'
+          - variant: javascript-python
+            suffix: web-python
+            features: "--features python"
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 16777216
+            languages: '["javascript","python"]'
+          # Python without torch: torch ships separately as the web-torch
+          # package (zipp_torch.wasm), which a host adds with addPythonPackage.
+          - variant: javascript-python-base
+            suffix: web-python-base
+            features: "--features python-base"
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 16777216
+            languages: '["javascript","python"]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: crates/zipp-wasm
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.identify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+
+      - name: Select the Node.js smoke-test runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Test the exact-suite WASM comparison harness
+        run: node --no-warnings --test ../../bench/comparison/test_run_wasm_suites.mjs
+
+      - name: Test the isolated host workspace
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo test --locked
+
+      - name: Test artifact-only VM specializations
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: >-
+          cargo test --locked --manifest-path ../zipp-vm/Cargo.toml
+          --no-default-features
+          --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
+          --test no_fs_loader --test wasm_single_agent
+
+      - name: Build zipp-vm in the configurations its manifest advertises
+        # Every other job builds this crate with `meter-only`, which pulls in
+        # `instrument`. That hid a `renew_step_budget` reaching straight for
+        # `instr_rec` — a field that only exists under that feature — so the
+        # crate did not compile on its own, nor as the `--no-default-features`
+        # pure interpreter its Cargo.toml offers. Feature unification in the
+        # workspace build meant nothing ever noticed.
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: |
+          set -euo pipefail
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml --no-default-features
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml             --no-default-features --features safe-sandbox
+
+      - name: Install the exact matching wasm-bindgen CLI
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
+
+      - name: Install the measured WASM optimizer
+        run: npm install --global binaryen@125.0.0
+
+      - name: Build the locked production WebAssembly module
+        # RUSTFLAGS overrides target config, so repeat both security-critical
+        # linker limits while making compiler warnings fatal. The tagged
+        # commit is stamped into zippProfile().source.sha so a loaded artifact
+        # names the revision it came from; the artifact hashes stay external
+        # (SHA256SUMS), never embedded.
+        env:
+          RUSTFLAGS: >-
+            -Dwarnings
+            -C link-arg=--max-memory=1073741824
+            -C link-arg=-zstack-size=${{ matrix.stack_bytes }}
+          ZIPP_SOURCE_SHA: ${{ needs.identify.outputs.commit }}
+        # remap-paths.sh adds the --remap-path-prefix flags that keep the
+        # runner's checkout, registry and toolchain directories out of the
+        # module's panic locations. cargo reads the encoded variable in
+        # preference to RUSTFLAGS, so the flags above are passed through it.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          CARGO_ENCODED_RUSTFLAGS="$(bash ./remap-paths.sh $RUSTFLAGS)" \
+            cargo build --locked --profile ${{ matrix.profile }} --target wasm32-unknown-unknown ${{ matrix.features }}
+
+      # The one shared list (tests/node/run-boundary-suite.cjs): the same
+      # checks CI runs, including the parse-shape limits calibrated against
+      # the JS artifact's 1 MiB stack (Python uses 16 MiB; v0.0.1 shipped limits that
+      # rejected two working applications because the only browser check at
+      # the time parsed three tokens) and the audit regression suites the
+      # release lane used to omit.
+      - name: Prepare the production module for Node checks
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
+            --remove-name-section --remove-producers-section \
+            target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
+          node tests/node/strip-target-features.cjs \
+            tests/node/pkg/zipp_wasm_bg.wasm tests/node/pkg/stripped.wasm
+          mv tests/node/pkg/stripped.wasm tests/node/pkg/zipp_wasm_bg.wasm
+          bash optimize-wasm.sh tests/node/pkg/zipp_wasm_bg.wasm ${{ matrix.optimize_flags }}
+
+      - name: Exercise the production host boundary under Node
+        if: matrix.variant != 'javascript-python-base'
+        run: |
+          node tests/node/run-boundary-suite.cjs
+
+      # Lite's own contract: the profile names the variant and what it
+      # omits, Intl and Temporal are absent, and the JavaScript core is whole.
+      - name: Exercise the Lite feature contract under Node
+        if: matrix.variant == 'lite'
+        run: node tests/node/lite.cjs
+
+      # The base Python artifact has no torch until a host adds the package;
+      # the torch job below proves base + package against the complete one.
+      - name: Exercise the Python frontend without torch under Node
+        if: matrix.variant == 'javascript-python-base'
+        run: |
+          set -euo pipefail
+          node tests/node/python-frontend.cjs
+          node tests/node/sort-semantics.cjs
+
+      - name: Exercise the combined artifact's Torch and interop contracts
+        if: matrix.variant == 'javascript-python'
+        run: |
+          node tests/node/python-conv2d.cjs
+          node tests/node/python-training.cjs
+          node tests/node/python-javascript.cjs
+
+      # The release module: wasm-bindgen's web bindings for the same cargo
+      # output, byte-compared with the module the Node checks above ran, then
+      # the bindings embedded and the module exercised through zipp.mjs
+      # (crates/zipp-wasm/embed-kit/package-variant.sh).
+      - name: Package the release module
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.identify.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
+        run: >-
+          bash embed-kit/package-variant.sh ${{ matrix.variant }}
+          target/wasm32-unknown-unknown/${{ matrix.profile }}/zipp_wasm.wasm
+          tests/node/pkg/zipp_wasm_bg.wasm dist ${{ matrix.optimize_flags }}
+
+      - name: Upload the release module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-wasm-${{ matrix.variant }}
+          path: crates/zipp-wasm/dist/zipp-*.wasm
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload the generated bindings and profile
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-glue-${{ matrix.variant }}
+          path: crates/zipp-wasm/dist/glue-${{ matrix.variant }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  torch:
+    name: Browser WebAssembly (torch package)
+    needs: identify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: crates/zipp-wasm
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.identify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+
+      - name: Select the Node.js smoke-test runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install the exact matching wasm-bindgen CLI
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
+
+      # build-variants.sh post-processes each engine with optimize-wasm.sh,
+      # which refuses any Binaryen but the one the sizes were measured with.
+      - name: Install the measured WASM optimizer
+        run: npm install --global binaryen@125.0.0
+
+      # The package and the two engines it is checked against, from the same
+      # locked source: `python` (without torch) + zipp_torch.wasm must print
+      # what the complete `all` artifact prints, byte for byte.
+      - name: Build the torch package and the engines it pairs with
+        env:
+          ZIPP_SOURCE_SHA: ${{ needs.identify.outputs.commit }}
+        run: ./build-variants.sh all python torch
+
+      - name: Prove the package against the complete artifact under Node
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-all \
+            target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          wasm-bindgen --target nodejs --out-dir /tmp/pkg-python \
+            target/variants/python/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/python-plugin.cjs /tmp/pkg-all /tmp/pkg-python
+
+      - name: Package the torch module
+        env:
+          RELEASE_VERSION: ${{ needs.identify.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
+        run: >-
+          node embed-kit/package.mjs embed-torch "$RELEASE_VERSION" "$EXPECTED_COMMIT"
+          dist/torch/zipp_torch.wasm dist/release
+
+      - name: Upload the torch module
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-wasm-torch-package
+          path: crates/zipp-wasm/dist/release/zipp-*.wasm
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  kit:
+    name: WebAssembly embed kit
+    needs: [identify, wasm, torch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ needs.identify.outputs.version }}
+      EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.identify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Select the Node.js runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Download the release modules
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-wasm-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download the complete engine's bindings (for the kit's types)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-glue-javascript-python
+          path: glue
+
+      - name: Assemble the kit
+        run: >-
+          ENGINE_DTS=glue/zipp_wasm.d.ts
+          node crates/zipp-wasm/embed-kit/package.mjs kit "$RELEASE_VERSION" dist dist
+
+      # Every module through the kit's own loader: records, checksums, both
+      # languages, the engine API, and the base Python engine plus the torch
+      # package against the complete engine.
+      - name: Check the kit and every module under Node
+        run: node crates/zipp-wasm/embed-kit/test-kit.mjs "dist/zipp-$RELEASE_VERSION-wasm-embed-kit" dist
+
+      # Default-deny, each permission, the network rules (against a local
+      # server), host functions, the step and time limits, Python modules and
+      # torch, in-process and in worker threads.
+      - name: Check the sandbox under Node
+        run: node crates/zipp-wasm/embed-kit/test-sandbox.mjs "dist/zipp-$RELEASE_VERSION-wasm-embed-kit" dist
+
+      # The examples, every module (served as application/wasm and as the
+      # octet-stream GitHub downloads send), the host SDK in a Worker and the
+      # README's Content-Security-Policy, in Playwright's image pinned by
+      # digest (as security.yml's Worker smoke test).
+      - name: Check the kit in Chromium, Firefox and WebKit
+        run: |
+          set -euo pipefail
+          docker run --rm --ipc=host -v "$PWD:/repo" -w /repo \
+            -e RELEASE_VERSION \
+            mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27 \
+            sh -c 'npm install --no-save --no-audit --no-fund --prefix /tmp/pw playwright@1.63.0 && NODE_PATH=/tmp/pw/node_modules node crates/zipp-wasm/embed-kit/test-browser.mjs "dist/zipp-$RELEASE_VERSION-wasm-embed-kit" dist --browsers chromium,firefox,webkit'
+
+      - name: Upload the embed kit
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-kit
+          path: dist/zipp-*-wasm-embed-kit.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

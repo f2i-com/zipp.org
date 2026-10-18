@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The Windows installer, zipp-<version>-windows-x86_64-installer.msi, built
+  by tools/release/package-windows.ps1 with WiX Toolset 3.14 (candle/light).
+
+  A per-user install, so it needs no administrator rights: zipp.exe, the
+  README and the licence go to %LOCALAPPDATA%\Programs\ZIPP, which is
+  appended to the user's PATH; uninstalling (Settings > Apps, or
+  `msiexec /x`) removes both. Installing a newer version replaces an older
+  one in place (the UpgradeCode never changes). The portable
+  zipp-<version>-windows-x86_64-portable.exe is the same zipp.exe.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="ZIPP $(var.Version)" Language="1033" Version="$(var.Version)"
+           Manufacturer="ZIPP" UpgradeCode="4425434E-1415-4E56-ACCC-377115F64F20">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" InstallPrivileges="limited"
+             Platform="x64" Description="ZIPP $(var.Version): JavaScript and Python engine (command line)"
+             Comments="Commit $(var.Commit)" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of ZIPP is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/f2i-com/zipp.org" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/f2i-com/zipp.org/blob/v$(var.Version)/README.md" />
+    <Property Id="ARPCOMMENTS" Value="zipp.exe on your PATH: run `zipp js file.js` or `zipp py file.py` in a new terminal." />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="UserPrograms" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="ZIPP" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- A per-user component's key path is a registry value under HKCU, so
+         its GUID is fixed here; keep both for every release (the component
+         rules tie them to these paths). -->
+    <ComponentGroup Id="Zipp" Directory="INSTALLFOLDER">
+      <Component Id="ZippExe" Guid="48F1AA5D-4442-414F-B1FB-B1B6448D7A85" Win64="yes">
+        <RegistryValue Root="HKCU" Key="Software\ZIPP\CLI" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <File Id="ZippExe" Name="zipp.exe" Source="$(var.Exe)" />
+        <Environment Id="UserPath" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="no" Permanent="no" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveUserPrograms" Directory="UserPrograms" On="uninstall" />
+      </Component>
+      <Component Id="ZippDocs" Guid="E5950BB8-5E32-4549-B716-A1A1DEE39305" Win64="yes">
+        <RegistryValue Root="HKCU" Key="Software\ZIPP\CLI" Name="Docs" Type="integer" Value="1" KeyPath="yes" />
+        <File Id="Readme" Name="README.md" Source="$(var.Readme)" />
+        <File Id="License" Name="LICENSE-APACHE" Source="$(var.License)" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="ZIPP" Level="1">
+      <ComponentGroupRef Id="Zipp" />
+    </Feature>
+  </Product>
+</Wix>
