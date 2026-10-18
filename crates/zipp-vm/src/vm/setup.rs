@@ -2900,6 +2900,12 @@ impl<'p> Vm<'p> {
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
             (native::HOST_CALL_NAME, host_call_fn),
         ];
+        // The WebAssembly engines' guest surface has no shared-memory globals
+        // (the host boundary contract lists them with process, require, fetch
+        // and WebAssembly). The native safe-sandbox profile keeps them, backed
+        // by agent-local bytes (#61).
+        #[cfg(feature = "wasm-single-agent")]
+        all.retain(|(name, _)| !matches!(*name, "SharedArrayBuffer" | "Atomics"));
         // The test262 harness object, only when the host asked for it. Omitted
         // rather than zeroed: the loop below installs whatever index it is
         // handed, so a sentinel would bind `$262` to heap slot 0.

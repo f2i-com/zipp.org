@@ -31,7 +31,13 @@ fn direct_eval_register_exhaustion_returns_an_error() {
         Err(error) => error,
         Ok(_) => panic!("the DirectEval site index cannot represent this source"),
     };
-    assert!(error.contains("registers"), "{error}");
+    // Either limit is a clean compile error, never a wrapped index. Since a
+    // large function's statements give their scratch registers back (#56),
+    // the site index runs out before the registers do.
+    assert!(
+        error.contains("direct eval call sites") || error.contains("registers"),
+        "{error}"
+    );
 }
 
 #[test]

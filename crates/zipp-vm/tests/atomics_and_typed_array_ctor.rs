@@ -14,6 +14,10 @@
 //! - GitHub #61: SharedArrayBuffer and Atomics exist in the safe-sandbox
 //!   profile too (agent-local bytes there), with the same observable results
 //!   for one agent.
+//!
+//! Off in the WebAssembly engines' profile (`wasm-single-agent`), whose guest
+//! surface has no shared-memory globals at all.
+#![cfg(not(feature = "wasm-single-agent"))]
 
 const SOURCE: &str = r##"
 var out = [];
