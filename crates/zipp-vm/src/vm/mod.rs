@@ -1078,6 +1078,8 @@ impl RegisterFile {
         feature = "jit",
         all(feature = "instrument", not(feature = "meter-only"))
     ))]
+    // The plan builders are x86-64 only; an aarch64 test build has no reader.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -1110,8 +1112,10 @@ impl RegisterFile {
     /// a semantically valid `Value`. The hard bound check keeps this operation
     /// memory-safe in release builds as well as debug builds.
     #[inline(always)]
-    // Only the x86-64 JIT call protocol resizes the file without initialising.
+    // Only the x86-64 JIT call protocol resizes the file without initialising;
+    // elsewhere (an aarch64 build has no JIT) its unit test is the one caller.
     #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(
             new_len <= self.storage.len(),

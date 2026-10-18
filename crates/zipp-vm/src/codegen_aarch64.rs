@@ -728,6 +728,7 @@ mod tests {
             upvalues: Vec::new(),
             eval_sites: Vec::new(),
             source: String::new(),
+            fused: Default::default(),
         }
     }
 
