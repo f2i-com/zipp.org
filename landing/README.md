@@ -201,8 +201,8 @@ needs no hand edits there; the `/benchmarks/` page in `site/content.json`,
 canonical pair (`fa8e3b86`, 15 October 2026, recorded as v0.0.24) stays in
 `../bench/` as a prior series point.
 
-The optional JavaScript story scratchpad's browser engine is v0.0.26, 4,621,320 raw bytes, SHA-256
-`db19933b2412c642daad507ccc1cfd6cf515ddb27ca4b1eeb3d47f91600f3418`.
+The optional JavaScript story scratchpad's browser engine is v0.0.27, 4,629,094 raw bytes, SHA-256
+`890124724f252d4458c2c0c02278c938659bdf4b9290471c6d0ebabbdb510b7b`.
 Its file pair is fingerprinted together in Vite configuration to avoid loading
 mismatched glue and WASM files. Each run uses a disposable Worker, a 6-second
 host deadline, and the module's instruction and heap limits.

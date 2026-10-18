@@ -154,10 +154,16 @@ test('every benchmark capture the page cites is in the repository, and the data 
   const artifacts = [data.jit.artifacts, data.interp.artifacts, data.python.artifacts, data.release.artifacts].flatMap(Object.values)
   assert.equal(artifacts.length, 8)
   for (const file of artifacts) assert.ok(existsSync(new URL(`../../${file}`, import.meta.url)), `${file} is missing`)
+  // The captures measure one released engine, which may trail the release the
+  // site serves (a fix release reuses its predecessor's measurements).
   const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  for (const version of [data.jit.zipp.version, data.python.zipp.version, data.release.zipp.version]) {
-    assert.equal(version, `zipp ${site.zippEngineRelease}`)
-  }
+  const versions = [data.jit.zipp.version, data.python.zipp.version, data.release.zipp.version]
+  assert.equal(new Set(versions).size, 1, `one engine version: ${versions}`)
+  const parts = v => v.replace(/^zipp /, '').split('.').map(Number)
+  const [measured, served] = [parts(versions[0]), parts(site.zippEngineRelease)]
+  assert.ok(measured.every((n, i) => Number.isInteger(n)) && measured.length === 3, versions[0])
+  assert.ok(measured[0] < served[0] || (measured[0] === served[0] && (measured[1] < served[1] || (measured[1] === served[1] && measured[2] <= served[2]))),
+    `the measured engine ${versions[0]} is not newer than the served release ${site.zippEngineRelease}`)
   assert.equal(data.jit.nodeWins, [...data.jit.normal.rows, ...data.jit.hostile.rows].filter(row => row.ratio < 1).length)
 })
 

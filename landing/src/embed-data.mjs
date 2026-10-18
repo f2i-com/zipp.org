@@ -8,7 +8,7 @@
 // The release named here is the one the embed section links to; package.json's
 // zippEngineRelease must match it (tests/embed.test.mjs).
 
-export const EMBED_RELEASE = '0.0.26'
+export const EMBED_RELEASE = '0.0.27'
 export const REPOSITORY_URL = 'https://github.com/f2i-com/zipp.org'
 export const RELEASE_TAG_URL = `${REPOSITORY_URL}/releases/tag/v${EMBED_RELEASE}`
 export const releaseAssetUrl = (name) => `${REPOSITORY_URL}/releases/download/v${EMBED_RELEASE}/${name}`
@@ -17,7 +17,7 @@ export const releaseAssetUrl = (name) => `${REPOSITORY_URL}/releases/download/v$
 export const KIT = {
   file: `zipp-${EMBED_RELEASE}-wasm-embed-kit.zip`,
   folder: `zipp-${EMBED_RELEASE}-wasm-embed-kit`,
-  bytes: 212_300,
+  bytes: 212_266,
   loader: 'zipp.mjs',
 }
 
@@ -27,12 +27,12 @@ export const STARTER = {
   path: `/embed/zipp-starter-${EMBED_RELEASE}.zip`,
 }
 
-// Release asset sizes in bytes, from the v0.0.26 release: each plain module and
+// Release asset sizes in bytes, from the v0.0.27 release: each plain module and
 // its Brotli-compressed `.wasm.br` copy.
 const asset = (variant, bytes, brBytes) => ({ file: `zipp-${EMBED_RELEASE}-${variant}.wasm`, bytes, brBytes })
 
-export const PYTHON_BASE = asset('javascript-python-base', 6_406_177, 1_588_216)
-export const TORCH_PACKAGE = asset('torch-package', 2_162_843, 403_240)
+export const PYTHON_BASE = asset('javascript-python-base', 6_413_933, 1_590_974)
+export const TORCH_PACKAGE = asset('torch-package', 2_162_843, 403_260)
 
 export const ENGINES = [
   {
@@ -40,21 +40,21 @@ export const ENGINES = [
     label: 'JavaScript',
     summary: 'The full JavaScript engine, with Intl and Temporal.',
     language: 'javascript',
-    ...asset('javascript', 4_673_483, 1_196_785),
+    ...asset('javascript', 4_681_257, 1_199_466),
   },
   {
     id: 'lite',
     label: 'JavaScript Lite',
     summary: 'JavaScript without Intl and Temporal, built for size.',
     language: 'javascript',
-    ...asset('javascript-lite', 2_649_331, 723_299),
+    ...asset('javascript-lite', 2_652_720, 724_650),
   },
   {
     id: 'javascript-python',
     label: 'JavaScript + Python',
     summary: 'Both languages, with torch built in.',
     language: 'python',
-    ...asset('javascript-python', 8_445_061, 1_964_927),
+    ...asset('javascript-python', 8_452_811, 1_966_220),
   },
 ]
 
