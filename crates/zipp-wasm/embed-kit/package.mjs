@@ -326,7 +326,13 @@ function kit(version, assetsDir, outDir) {
   entries.push({ name: "modules.json", data: Buffer.from(JSON.stringify({ version, commit, modules }, null, 2) + "\n") });
   entries.push({
     name: "BUILD-INFO.txt",
-    data: Buffer.from(`version=${version}\ncommit=${commit}\nloader=${loader}\nhost-sdk=${sdk}\n`),
+    // KIT_SOURCE names the commit the kit's own files came from when that is
+    // not the modules' (a kit rebuilt for a published release).
+    data: Buffer.from(
+      `version=${version}\ncommit=${commit}\n` +
+        (process.env.KIT_SOURCE ? `kit-source=${process.env.KIT_SOURCE}\n` : "") +
+        `loader=${loader}\nhost-sdk=${sdk}\n`,
+    ),
   });
   const sums = entries
     .map(e => e.name)
