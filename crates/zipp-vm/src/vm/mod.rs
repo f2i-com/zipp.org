@@ -2674,7 +2674,9 @@ pub struct Vm<'p> {
     ///
     /// Fx-hashed, both levels: every property cache check asks whether its
     /// receiver is a namespace (`ic_obj_ok`) once any module is loaded, and
-    /// SipHash there was a fifth of a module program's run.
+    /// SipHash there was a fifth of a module program's run. (A `SlotTable`
+    /// here was tried: it made every program 4-6% slower, modules or not,
+    /// by moving the `Vm`'s hot fields; this struct's layout is load-bearing.)
     module_namespaces: rustc_hash::FxHashMap<u32, ExportSlots>,
     /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
     /// export name→live-slot map (re-exports not yet resolved). Present only during

@@ -68,6 +68,23 @@ fn lite_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_LITE_ASYNC=1`: no async function (and no module's top level)
+/// runs in the lite loop, for A/B.
+#[inline]
+fn lite_async_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_LITE_ASYNC").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
 /// runs in the lite loop (`loops_are_lite`), for A/B.
 #[inline]
@@ -327,9 +344,15 @@ impl<'p> Vm<'p> {
         // Every instruction the lite loop's, or (`loops_are_lite`) every
         // instruction of its loops, the rest handed over where they stand.
         let all = p.code.iter().all(lite_instr) && Self::lite_code(p).iter().all(lite_instr);
+        // An async function's activation is an ordinary frame between its
+        // awaits (`drive_async` pushes one per resumption and runs it here);
+        // its `Await` is handed over, and its return pops the frame its driver
+        // stopped at, as a call's does. A module's top level is one, so its
+        // loops ran in the main loop always. A generator's frame is not: its
+        // registers move in and out of the heap object at every resume.
         let ok = lite_enabled()
             && !p.is_generator
-            && !p.is_async
+            && (!p.is_async || lite_async_enabled())
             // An arrow's frame takes its captured `this` (`setup_call`; the
             // lean push hands it there), and its body is ordinary code.
             && p.rest_reg.is_none()

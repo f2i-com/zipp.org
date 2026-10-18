@@ -887,6 +887,26 @@ impl<'p> Vm<'p> {
         (hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
     }
 
+    /// `ns.name` on the module namespace `recv` (`import * as ns`): its
+    /// export's live slot, the namespace [[Get]]'s answer, without the member
+    /// walk's realm, proxy and global probes in front of it. A binding still
+    /// in its TDZ, and any key that is not an export, take that walk. Out of
+    /// line: `ic_get_prop` is on every uncached read, and only module code
+    /// asks this.
+    #[cold]
+    #[inline(never)]
+    fn ic_namespace_get(&self, recv: Value, key: &str) -> GetAct {
+        if let Some(slots) = self.module_namespaces.get(&recv.heap_index()) {
+            if let Some(&slot) = slots.get(key) {
+                let v = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+                if !v.is_uninitialized() {
+                    return GetAct::Value(v);
+                }
+            }
+        }
+        GetAct::None
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     ///
     /// The safe profile's dispatch loop takes it inline. Left to the
@@ -1019,6 +1039,9 @@ impl<'p> Vm<'p> {
         // only because no such site holds one.
         if is_private_key(key) {
             return GetAct::None;
+        }
+        if !self.module_namespaces.is_empty() && recv.is_heap() && self.module_namespaces.contains_key(&recv.heap_index()) {
+            return self.ic_namespace_get(recv, key);
         }
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
