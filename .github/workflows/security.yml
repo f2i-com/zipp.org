@@ -428,6 +428,10 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
+      # Git on a Windows runner converts checkouts to CRLF; the corpus's
+      # import-bytes tests import their fixtures as raw bytes and count them.
+      - name: Keep checkouts byte for byte
+        run: git config --global core.autocrlf false
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
