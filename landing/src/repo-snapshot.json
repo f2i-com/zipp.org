@@ -1,25 +1,31 @@
 {
-  "generated_at": "2026-10-15T12:29:09.179Z",
+  "generated_at": "2026-10-18T03:33:05.770Z",
   "stale": false,
   "source": {
     "repo": "f2i-com/zipp.org",
     "branch": "main",
-    "commit": "ddbd02721d2fc6ce179cbf59222e91727d1123df"
+    "commit": "5f1c0578d6d6e4a8bc68d6108b67029782be5fe8"
   },
   "repo": {
     "stars": 7,
     "forks": 0,
     "open_issues": 0,
-    "pushed_at": "2026-10-15T12:06:17Z",
+    "pushed_at": "2026-10-18T03:06:17Z",
     "license": "Apache-2.0"
   },
   "release": {
-    "tag": "v0.0.25",
-    "name": "ZIPP v0.0.25",
-    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.25",
-    "published_at": "2026-10-15T12:24:25Z"
+    "tag": "v0.0.26",
+    "name": "ZIPP v0.0.26",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.26",
+    "published_at": "2026-10-18T03:28:50Z"
   },
   "releases": [
+    {
+      "tag": "v0.0.26",
+      "name": "ZIPP v0.0.26",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.26",
+      "published_at": "2026-10-18T03:28:50Z"
+    },
     {
       "tag": "v0.0.25",
       "name": "ZIPP v0.0.25",
@@ -31,28 +37,20 @@
       "name": "ZIPP v0.0.24",
       "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.24",
       "published_at": "2026-10-14T09:53:42Z"
-    },
-    {
-      "tag": "v0.0.23",
-      "name": "ZIPP v0.0.23",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.23",
-      "published_at": "2026-10-12T18:44:25Z"
     }
   ],
   "commits": {
     "latest": {
-      "sha": "ddbd02721d2fc6ce179cbf59222e91727d1123df",
-      "message": "Prepare 0.0.25 [skip ci]",
-      "date": "2026-10-15T12:05:51Z",
-      "url": "https://github.com/f2i-com/zipp.org/commit/ddbd02721d2fc6ce179cbf59222e91727d1123df"
+      "sha": "5f1c0578d6d6e4a8bc68d6108b67029782be5fe8",
+      "message": "Prepare 0.0.26 [skip ci]",
+      "date": "2026-10-18T03:05:57Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/5f1c0578d6d6e4a8bc68d6108b67029782be5fe8"
     }
   },
-  "version": "0.0.25",
+  "version": "0.0.26",
   "readme": {
-    "test262_pct": 99.991,
-    "test262_pass": 95671,
-    "test262_total": 95680,
-    "test262_corrected_pass": 95680,
-    "test262_corrected_total": 95680
+    "test262_pct": 99.999,
+    "test262_pass": 96229,
+    "test262_total": 96230
   }
 }
