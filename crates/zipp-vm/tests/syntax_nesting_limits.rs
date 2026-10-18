@@ -5,6 +5,12 @@ use zipp_vm::safe_syntax_limits::{MAX_SAFE_SYNTAX_CHAIN, MAX_SAFE_SYNTAX_RECURSI
 
 const PROBE_ENV: &str = "ZIPP_HOSTILE_SYNTAX_PROBE";
 
+/// Shapes that are long but not nested. The probe compiles them, ten times
+/// as long as the nested shapes, inside the same bounded stack instead of
+/// expecting a limit: a regex disjunction is a balanced IR tree (issue #57),
+/// so a keyword list costs no more stack than a short alternation.
+const FLAT_SHAPES: &[&str] = &["regex-alternatives"];
+
 fn hostile_source(shape: &str, depth: usize) -> String {
     match shape {
         "parentheses" => format!("{}0{};", "(".repeat(depth), ")".repeat(depth)),
@@ -63,7 +69,8 @@ fn hostile_syntax_child() {
     let Ok(shape) = std::env::var(PROBE_ENV) else {
         return;
     };
-    let source = hostile_source(&shape, 2_000);
+    let flat = FLAT_SHAPES.contains(&shape.as_str());
+    let source = hostile_source(&shape, if flat { 20_000 } else { 2_000 });
     let result = std::thread::Builder::new()
         .name(format!("syntax-probe-{shape}"))
         // Sized for THIS build's frames, not for the shipped artifact's. The
@@ -80,6 +87,10 @@ fn hostile_syntax_child() {
         .expect("spawn bounded-stack parser probe")
         .join()
         .expect("parser/compiler must return instead of overflowing its stack");
+    if flat {
+        result.unwrap_or_else(|error| panic!("{shape} is not nesting and must compile: {error}"));
+        return;
+    }
     let error = result.expect_err("hostile nesting must fail closed");
     assert!(
         error.contains("sandbox limit"),
@@ -133,10 +144,39 @@ fn iterative_parser_chains_cannot_create_unbounded_recursive_asts() {
 }
 
 #[test]
-fn regex_ir_nesting_and_alternation_fail_closed() {
-    for shape in ["regex-groups", "regex-alternatives"] {
-        assert_probe_is_contained(shape);
-    }
+fn regex_ir_nesting_fails_closed() {
+    assert_probe_is_contained("regex-groups");
+}
+
+#[test]
+fn regex_alternation_compiles_within_the_bounded_stack() {
+    assert_probe_is_contained("regex-alternatives");
+}
+
+/// Issue #57: the 65th alternative was a SyntaxError ("alternatives exceed
+/// the sandbox limit"). Every line is Node 24's output. The last pattern is
+/// 5,000 alternatives in 10,000 bytes, inside the 16 KiB pattern limit.
+#[test]
+fn dynamic_regexp_constructor_accepts_long_alternations() {
+    let outcome = zipp_vm::run(
+        r#"
+        for (const n of [64, 65, 200]) {
+            const src = Array.from({ length: n }, (_, i) => "w" + i).join("|");
+            const re = new RegExp(src);
+            console.log(n, re.test("w5"), re.exec("xw" + (n - 1))[0],
+                        new RegExp("(?:" + src + ")+$").test("w0w1w" + (n - 1)));
+        }
+        const filler = Array(4999).fill("x").concat(["w5"]).join("|");
+        console.log(filler.length, new RegExp(filler).exec("zw5").index,
+                    new RegExp("^(?:" + filler + ")+$").test("xxw5x"));
+        "#,
+    )
+    .expect("script compiles");
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(
+        outcome.output,
+        ["64 true w6 true", "65 true w6 true", "200 true w1 true", "10000 1 true"]
+    );
 }
 
 #[test]

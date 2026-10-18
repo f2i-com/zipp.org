@@ -20,7 +20,8 @@ enum Mode {
 /// (pattern, flags, subject, mode, steps over every match in the checked
 /// profile (`prohibit-unsafe`, the WebAssembly modules), the same without
 /// it, number of matches). The two differ where an alternation of three or
-/// more is built as a balanced tree in the checked profile (`parse::make_alt`).
+/// more is built as a balanced tree in the checked profile (`parse::make_alt`;
+/// the ordinary profile balances only alternations longer than 64).
 const CASES: &[(&str, &str, &str, Mode, u64, u64, usize)] = &[
     (r"needle", "", "hay hay needle hay needle", Mode::Ascii, 4, 4, 2),
     (r"[a-z]+\d", "", "abc1 de2 fgh", Mode::Ascii, 20, 20, 2),

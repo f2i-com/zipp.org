@@ -289,6 +289,31 @@ ZIPP's JavaScript lexer calls them instead of linking a crate of its own for
 the same two properties, so a module carries each property once and the
 lexer, the regex properties and group names are on one Unicode version.
 
+## Alternation is a shallow tree, with no limit on alternatives (issue #57)
+
+Upstream builds `a|b|c|…` as a right spine, `Alt(a, Alt(b, Alt(c, …)))`, and
+the optimizer's IR walks (`ir::walk_mut`, `contains_capture_groups`, the
+start predicate, `Drop`) recurse down it. A spine is as deep as the
+alternation is long: a 5,000-word list overflowed a 1 MiB stack, 10,000 words
+a 2 MiB one. The hardened profile had already switched to a balanced tree,
+but kept a limit of 64 alternatives from before it did, so keyword lists and
+tokenizers were SyntaxErrors there.
+
+- `src/parse.rs`: `make_alt` folds each run of `ALT_SPINE_LEAVES` consecutive
+  alternatives into a right spine and joins the spines in a balanced tree,
+  keeping their order (the leftmost alternative that leads to a match still
+  wins). The ordinary profile uses 64, so an alternation of up to 64 is the
+  upstream tree, instruction for instruction and step for step; the hardened
+  profile uses 1, the fully balanced tree it already had. The limit on
+  alternatives is gone in both: the depth is at most 64 + log2(n).
+- `src/optimizer.rs`: `propagate_early_fails` asked `contains_capture_groups`
+  of every node before looking for anything to replace, walking the whole
+  subtree each time, so the pass was quadratic in the depth of the tree
+  (20,000 alternatives took 682 ms). It now asks only when it has found an
+  always-failing child, with the same answers.
+- `tests/compile_limits.rs`: 65 to 50,000 alternatives, their order, capture
+  numbering across them, and a 1 MiB stack.
+
 ## Removed: the PikeVM backend
 
 Upstream ships a second, PikeVM-style executor (`src/pikevm.rs`, feature

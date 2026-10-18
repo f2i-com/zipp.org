@@ -192,16 +192,15 @@ fn contains_capture_groups(node: &Node) -> bool {
 
 // If a node can never match, replace it with an always fails node.
 fn propagate_early_fails(n: &mut Node, _w: &Walk) -> PassAction {
-    // Don't optimize nodes containing capture groups to preserve user-visible group numbers
-    if contains_capture_groups(n) {
-        return PassAction::Keep;
-    }
-
+    // Don't optimize nodes containing capture groups to preserve user-visible
+    // group numbers. Each arm asks only once it has found something to
+    // replace: asking first walked the whole subtree of every node, which made
+    // the pass quadratic in the depth of the tree.
     match n {
         Node::Cat(nodes) => {
             // If any child is an early fail, we are an early fail.
             // Note this assumes that there is no node after a Goal node.
-            if nodes.iter().any(|nn| nn.match_always_fails()) {
+            if nodes.iter().any(|nn| nn.match_always_fails()) && !contains_capture_groups(n) {
                 PassAction::Replace(Node::make_always_fails())
             } else {
                 PassAction::Keep
@@ -211,6 +210,11 @@ fn propagate_early_fails(n: &mut Node, _w: &Walk) -> PassAction {
             // If both sides are early fails, we are an early fail.
             let left_fails = left.match_always_fails();
             let right_fails = right.match_always_fails();
+            if (left_fails || right_fails)
+                && (contains_capture_groups(left) || contains_capture_groups(right))
+            {
+                return PassAction::Keep;
+            }
             match (left_fails, right_fails) {
                 (true, true) => PassAction::Replace(Node::make_always_fails()),
                 (false, false) => PassAction::Keep,

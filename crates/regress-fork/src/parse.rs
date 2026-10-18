@@ -297,11 +297,20 @@ where
 #[cfg(feature = "prohibit-unsafe")]
 const MAX_SAFE_REGEX_NESTING: usize = 32;
 
-/// Alternation is represented as a binary IR tree.  Its parser loop is flat,
-/// but an unbounded number of `|` branches would hand the recursive optimizer
-/// and emitter an unbounded right spine.
+/// Alternation is a binary IR tree, and the optimizer's walks recurse down
+/// it. `make_alt` folds each run of this many consecutive alternatives into a
+/// right spine (`a|(b|(c|…))`, the shape upstream builds) and joins the
+/// spines in a balanced tree, so a disjunction of n alternatives is at most
+/// `ALT_SPINE_LEAVES + log2(n)` deep however flat its source is. A plain right
+/// spine was n deep: a keyword list of 5,000 words overflowed a 1 MiB stack
+/// and 10,000 a 2 MiB one. The ordinary profile keeps the upstream shape, and
+/// with it every instruction sequence and step count, for alternations of up
+/// to 64. The checked profile, whose groups may nest `MAX_SAFE_REGEX_NESTING`
+/// deep on a 1 MiB Wasm stack, balances from the first alternative.
+#[cfg(not(feature = "prohibit-unsafe"))]
+const ALT_SPINE_LEAVES: usize = 64;
 #[cfg(feature = "prohibit-unsafe")]
-const MAX_SAFE_REGEX_ALTERNATIVES: usize = 64;
+const ALT_SPINE_LEAVES: usize = 1;
 
 /// Aggregate Unicode-property expansion admitted by one safe-profile compile.
 /// Property tables are static, but the parser copies their ranges into owned
@@ -330,42 +339,39 @@ fn make_cat(nodes: ir::NodeList) -> ir::Node {
 }
 
 fn make_alt(nodes: ir::NodeList) -> ir::Node {
-    #[cfg(feature = "prohibit-unsafe")]
-    {
-        // Properties-of-strings such as `\p{RGI_Emoji}` expand one source atom
-        // into thousands of alternatives. A right spine makes every later IR
-        // walk recurse thousands of frames even though the source itself has
-        // no visible nesting. Keep the same left-to-right alternative order in
-        // a balanced tree so its native/Wasm stack cost is logarithmic.
-        let mut level = nodes;
-        if level.is_empty() {
-            return ir::Node::Empty;
+    // Alternation is associative, so any tree over the alternatives in their
+    // left-to-right order matches the same way (the leftmost alternative that
+    // leads to a match still wins). Its shape bounds the depth of every later
+    // IR walk: see `ALT_SPINE_LEAVES`. A source disjunction is flat, and
+    // properties of strings such as `\p{RGI_Emoji}` expand one atom into
+    // thousands of alternatives.
+    let mut level = Vec::with_capacity(nodes.len().div_ceil(ALT_SPINE_LEAVES));
+    let mut spine = None;
+    for (index, node) in nodes.into_iter().enumerate().rev() {
+        spine = Some(match spine {
+            None => node,
+            Some(right) => ir::Node::Alt(Box::new(node), Box::new(right)),
+        });
+        if index % ALT_SPINE_LEAVES == 0 {
+            level.extend(spine.take());
         }
-        while level.len() > 1 {
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            let mut it = level.into_iter();
-            while let Some(left) = it.next() {
-                next.push(match it.next() {
-                    Some(right) => ir::Node::Alt(Box::new(left), Box::new(right)),
-                    None => left,
-                });
-            }
-            level = next;
-        }
-        return level.pop().unwrap();
     }
-
-    #[cfg(not(feature = "prohibit-unsafe"))]
-    {
-        let mut mright = None;
-        for node in nodes.into_iter().rev() {
-            match mright {
-                None => mright = Some(node),
-                Some(right) => mright = Some(ir::Node::Alt(Box::new(node), Box::new(right))),
-            }
-        }
-        mright.unwrap_or(ir::Node::Empty)
+    if level.is_empty() {
+        return ir::Node::Empty;
     }
+    level.reverse();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut it = level.into_iter();
+        while let Some(left) = it.next() {
+            next.push(match it.next() {
+                Some(right) => ir::Node::Alt(Box::new(left), Box::new(right)),
+                None => left,
+            });
+        }
+        level = next;
+    }
+    level.pop().unwrap()
 }
 
 /// \return a CodePointSet for a given character escape (positive or negative).
@@ -610,12 +616,10 @@ where
     }
 
     fn consume_disjunction_inner(&mut self) -> Result<ir::Node, Error> {
+        // No limit on the number of alternatives, in either profile: `make_alt`
+        // keeps the tree they become shallow.
         let mut terms = vec![self.consume_term()?];
         while self.try_consume('|') {
-            #[cfg(feature = "prohibit-unsafe")]
-            if terms.len() >= MAX_SAFE_REGEX_ALTERNATIVES {
-                return error("Regular expression alternatives exceed the sandbox limit");
-            }
             terms.push(self.consume_term()?)
         }
         Ok(make_alt(terms))
