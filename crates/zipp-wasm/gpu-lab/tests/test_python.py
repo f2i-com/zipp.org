@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import unittest
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "zipp-vm" / "src" / "frontend" / "python" / "lib" / "shared"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "zipp-vm" / "src" / "lang" / "python" / "lib" / "shared"))
 from zipp_gpu import Graph, GraphError, ComputeError
 LAB = Path(__file__).resolve().parents[1]
 
