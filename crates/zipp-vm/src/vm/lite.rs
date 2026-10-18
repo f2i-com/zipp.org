@@ -1341,7 +1341,7 @@ mod tests {
                    function callsOut(n) { var s = 0; for (var i = 0; i < n; i++) { s = s + other(i); } return s; } \
                    function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
                    function tiny(x) { return x + 1; } \
-                   for (var t = 0, u = 0; t < 200; t++) u = tiny(u); \
+                   for (var t = 0, u = 0; t < 200; t++) u = tiny(u) + (typeof t === 'number' ? 0 : 1); \
                    function readP(o) { var s = 0; for (var i = 0; i < 50; i++) s = s + o.p; return s; } \
                    console.log(loopSum(10) + callsOut(200) + fib(10) + u + readP({ p: 2 }));";
         let ast = crate::front::parse_auto(src).expect("parse");
@@ -1359,6 +1359,8 @@ mod tests {
             assert!(vm.lite_eligible(fb), "fib runs in the lite loop (its entry is long)");
             assert_eq!(vm.lite.ok[fb as usize], LITE_SMALL, "fib runs in the small copy");
             assert_eq!(vm.lite.ok[fid("readP") as usize], LITE_FULL, "a property read needs the full copy");
+            // Its caller's loop holds a `typeof`, so the main program runs in
+            // the main loop and every call of `tiny` is a short entry.
             assert!(!vm.lite_eligible(fid("tiny")), "tiny's short entries from the main program spent its budget");
             assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
             // Eligible by its instructions, so only the budget sent it back.
