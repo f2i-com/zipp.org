@@ -5563,6 +5563,9 @@ pub struct AsyncGenState {
 #[derive(Clone, Debug)]
 pub enum AbData {
     Local(Vec<u8>),
+    /// Never built in a single-agent safe-sandbox build (WebAssembly), whose
+    /// SharedArrayBuffer is agent-local.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     Shared(std::sync::Arc<SharedMem>),
 }
 

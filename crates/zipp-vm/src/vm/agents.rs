@@ -19,7 +19,9 @@
 use super::*;
 #[cfg(not(feature = "wasm-single-agent"))]
 use crate::heap::SharedMem;
-use crate::heap::{AbData, HeapObj};
+#[cfg(not(feature = "wasm-single-agent"))]
+use crate::heap::AbData;
+use crate::heap::HeapObj;
 use crate::value::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,11 +174,14 @@ impl<'p> Vm<'p> {
     /// per agent; acks precede callback invocation, so a callback that
     /// immediately enters a blocking wait cannot deadlock this).
     pub(crate) fn agent_broadcast(&mut self, sab: Value, id: f64) -> Result<(), Thrown> {
+        // The brand decides what a SharedArrayBuffer is; the safe-sandbox
+        // profile backs one with agent-local bytes, which no agent can share.
         let mem = match sab.is_heap().then(|| self.heap.get(sab.heap_index())) {
             Some(HeapObj::ArrayBuffer {
                 data: AbData::Shared(m),
                 ..
-            }) => Arc::clone(m),
+            }) => Some(Arc::clone(m)),
+            Some(HeapObj::ArrayBuffer { .. }) if self.shared_buffers.contains(&sab.heap_index()) => None,
             _ => {
                 return Err(Thrown::from_static(
                     "TypeError: $262.agent.broadcast requires a SharedArrayBuffer",
@@ -185,6 +190,11 @@ impl<'p> Vm<'p> {
         };
         let Some(shared) = self.agent_shared.clone() else {
             return Ok(()); // no agent ever started — nothing to retrieve
+        };
+        let Some(mem) = mem else {
+            return Err(Thrown::from_static(
+                "TypeError: $262.agent.broadcast cannot share an agent-local SharedArrayBuffer",
+            ));
         };
         // Send every message first (each with a fresh ack channel), THEN
         // collect the acks with the agents lock released.
@@ -259,16 +269,19 @@ impl<'p> Vm<'p> {
     }
 
     /// With no child agents, broadcast has no recipients. Preserve the
-    /// ordinary API's SharedArrayBuffer brand check before succeeding.
+    /// ordinary API's SharedArrayBuffer brand check before succeeding: the
+    /// brand (`shared_buffers`), since a SharedArrayBuffer here may be backed
+    /// by agent-local bytes (the safe-sandbox profile's).
     pub(crate) fn agent_broadcast(&mut self, sab: Value, _id: f64) -> Result<(), Thrown> {
-        match sab.is_heap().then(|| self.heap.get(sab.heap_index())) {
-            Some(HeapObj::ArrayBuffer {
-                data: AbData::Shared(_),
-                ..
-            }) => Ok(()),
-            _ => Err(Thrown::from_static(
+        if sab.is_heap()
+            && matches!(self.heap.get(sab.heap_index()), HeapObj::ArrayBuffer { .. })
+            && self.shared_buffers.contains(&sab.heap_index())
+        {
+            Ok(())
+        } else {
+            Err(Thrown::from_static(
                 "TypeError: $262.agent.broadcast requires a SharedArrayBuffer",
-            )),
+            ))
         }
     }
 
