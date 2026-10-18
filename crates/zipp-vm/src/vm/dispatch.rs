@@ -381,12 +381,19 @@ impl<'p> Vm<'p> {
             // Values are in regs/frames/globals/side-tables (the GC root set).
             self.maybe_gc();
             // Snapshot the current frame's coordinates. `ip` is advanced as a
-            // local and written back only on frame transitions / loops.
+            // local and written back only on frame transitions / loops. (They
+            // stay immutable here: switching frames inside the inner loop by
+            // reassigning them was tried and made every call 4-10% slower, as
+            // the loop then carried them all.)
             let frame_idx = self.frames.len() - 1;
             let func_id = self.frames[frame_idx].func;
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
+            // This activation's upvalue list (`closure_upvalue_cached`),
+            // taken on its first upvalue access.
+            #[cfg(not(feature = "safe-sandbox"))]
+            let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
             // `func()` returns a reference with the immutable PROGRAM lifetime,
             // so the hardened interpreter can cache the current function's
             // bytecode once per frame transition without extending a borrow of
@@ -3222,6 +3229,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalGet { dst, idx } => {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
+                        #[cfg(feature = "safe-sandbox")]
                         let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
                         if v.is_uninitialized() {
@@ -3234,6 +3244,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::UpvalSet { idx, src } => {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
+                        #[cfg(feature = "safe-sandbox")]
                         let cell = self.closure_upvalue(cur_closure, idx);
                         // Assignment to a captured `const` (PutValue on an
                         // immutable binding) throws in sloppy code too, so this
@@ -3266,7 +3279,7 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let v = self.get(base, src);
-                        self.heap.cell_set(cell, v);
+                        self.heap.upval_cell_set(cell, v);
                         ip += 1;
                     }
                     Instr::NewArray {
@@ -3491,7 +3504,7 @@ impl<'p> Vm<'p> {
                                             o,
                                             v,
                                         );
-                                        if self.ta_interp_numeric_set_view(view, i, v.as_f64()) {
+                                        if self.ta_interp_numeric_set_view(view, i, v) {
                                             ip += 1;
                                             continue;
                                         }
@@ -3549,7 +3562,26 @@ impl<'p> Vm<'p> {
                     }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
+                        // The cache's way-0 own-data hit, inline and first: the
+                        // steps below answer only names and receivers that hit
+                        // never serves (a private name fills no way, and a
+                        // string, array or typed array has no shape), and they
+                        // read the key's text first. Anything else is the full
+                        // `ic_get_prop` call further down.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         let key = strs[name as usize].as_str();
+                        // Its inherited-data hit, likewise.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -3688,14 +3720,6 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // The cache's way-0 own-data hit, inline; anything
-                        // else is the full `ic_get_prop` call below.
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
-                        }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
                         // own / chain GETTER frame-calls on THIS dispatch loop
@@ -3765,6 +3789,14 @@ impl<'p> Vm<'p> {
                     } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
+                        // The cache's way-0 own-data hit, inline and first (a
+                        // private name fills no way: `ic_set_prop`); anything
+                        // else is the full `ic_set_prop` call below.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                            ip += 1;
+                            continue;
+                        }
                         let key = strs[name as usize].as_str();
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
@@ -3859,17 +3891,15 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        // The cache's way-0 own-data hit, inline; anything
-                        // else is the full `ic_set_prop` call below.
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
-                            ip += 1;
-                            continue;
-                        }
                         // A class value's own writable static data property
                         // (`Entity.count++`), or a function's, which the
-                        // cache declines.
-                        if self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v) {
+                        // cache declines. Neither is ever an ordinary
+                        // object's, whose adds (`this.x = x` in a
+                        // constructor) paid both lanes' key tests first.
+                        if o.is_heap()
+                            && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_))
+                            && (self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v))
+                        {
                             ip += 1;
                             continue;
                         }
@@ -4543,6 +4573,23 @@ impl<'p> Vm<'p> {
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str = &strs[name as usize];
+                        // A method of an ordinary object or class instance: the
+                        // method cache first. None of the receiver-kind leaves
+                        // below can serve such a receiver (they want a string,
+                        // a DataView, a generator, an array, a Map or a
+                        // function), and each paid a key compare or a heap read
+                        // before the cache on every `o.m()`.
+                        let object_recv = recv.is_heap()
+                            && !is_private_key(key)
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_));
+                        if object_recv {
+                            if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                                self.setup_call_lean_this(
+                                    fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee,
+                                )?;
+                                break;
+                            }
+                        }
                         // `charCodeAt` dominates the parser/tokenizer-shaped
                         // interpreter workload. Its exact flat-string + Int
                         // leaf bypasses the method IC, argument stack buffer,
@@ -4744,7 +4791,7 @@ impl<'p> Vm<'p> {
                         // per-site cache (validated; see vm/ic.rs), skipping
                         // the builtin probe, the class/proto chain walk, and
                         // resolve_callable — straight to the frame push.
-                        if private_callee.is_none() {
+                        if private_callee.is_none() && !object_recv {
                             if let Some((fid, closure, callee)) =
                                 self.ic_call_method(func_id, ip, recv, key)
                             {
@@ -6311,9 +6358,16 @@ impl<'p> Vm<'p> {
         }
         let mut finished = self.frames.pop().expect("frame underflow");
         // A flat `new`: an object result replaces the instance, anything else
-        // returns it ([[Construct]] step 10-12 for an ordinary function).
-        if finished.construct_this && !self.is_object_value(ret) {
-            ret = self.regs[finished.base];
+        // returns it ([[Construct]] step 10-12 for an ordinary function). The
+        // instance's size is what the constructor's next one reserves.
+        if finished.construct_this {
+            let instance = self.regs[finished.base];
+            if instance.is_heap() {
+                self.learn_ctor_field_hint(finished.func, instance);
+            }
+            if !self.is_object_value(ret) {
+                ret = instance;
+            }
         }
         // Its handler buffer's storage, for another frame's first push.
         if finished.handlers.capacity() != 0 {
@@ -6935,6 +6989,31 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::closure_upvalue`] through `cache`, the running activation's
+    /// upvalue list as (address, length), filled on its first upvalue access
+    /// and reset by the dispatch loops at every frame change. A closure's list
+    /// is fixed when `MakeClosure` makes it and its buffer stays where it is
+    /// as the heap grows, and the running frame roots the closure, so the
+    /// address holds for the whole activation. The access was a heap fetch
+    /// and the list's header on every `UpvalGet` / `UpvalSet`: three
+    /// dependent loads more than the cell itself.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn closure_upvalue_cached(&self, cache: &mut (*const u32, usize), closure: u32, idx: u16) -> u32 {
+        if cache.0.is_null() {
+            match self.heap.get(closure) {
+                HeapObj::Closure { upvalues, .. } => *cache = (upvalues.as_ptr(), upvalues.len()),
+                _ => panic!("UpvalGet/Set in a frame without a closure"),
+            }
+        }
+        let i = idx as usize;
+        assert!(i < cache.1, "upvalue index out of range");
+        // SAFETY: `cache` was taken from this activation's closure, whose
+        // list never changes and outlives the activation (see above), and
+        // `i` is in its bounds.
+        unsafe { *cache.0.add(i) }
+    }
+
     /// The running activation's [[NewTarget]]. An ARROW frame has none of its own,
     /// so it falls back to the one its closure captured lexically at MakeArrow —
     /// without this, `new.target` reads `undefined` for every arrow.
@@ -7358,13 +7437,47 @@ impl<'p> Vm<'p> {
         caller_ip_next: usize,
         callee_val: Value,
     ) -> Result<(), Thrown> {
+        self.setup_call_lean_this(
+            func_id,
+            closure,
+            this_val,
+            false,
+            caller_base,
+            arg_base,
+            argc,
+            dst,
+            caller_ip_next,
+            callee_val,
+        )
+    }
+
+    /// [`Self::setup_call_lean`] for a caller that knows whether `this_val`
+    /// is an object (`this_is_object`): a method the method cache resolved
+    /// for an ordinary object or class instance. Such a `this` needs no
+    /// boxing, so a sloppy callee takes the lean entry too; it fell to the
+    /// whole of `setup_call` on every object-literal method call.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_lean_this(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this_val: Value,
+        this_is_object: bool,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
         let proto = self.func(func_id as usize);
         let callee_regs = (proto.reg_count as usize).max(1);
         let new_base = self.regs.len();
         let lean = proto.rest_reg.is_none()
             && proto.arguments_reg.is_none()
             && !proto.lexical_this
-            && (proto.is_strict || this_val.is_nullish())
+            && (proto.is_strict || this_is_object || this_val.is_nullish())
             && self.frames.len() < MAX_FRAMES
             && self.regs_fit_now(new_base + callee_regs)
             && lean_calls_enabled();
@@ -7383,7 +7496,7 @@ impl<'p> Vm<'p> {
                 callee_val,
             );
         }
-        let this_val = if !proto.is_strict && self.global_this != 0 {
+        let this_val = if !proto.is_strict && !this_is_object && self.global_this != 0 {
             Value::heap(self.callee_this_global(callee_val))
         } else {
             this_val

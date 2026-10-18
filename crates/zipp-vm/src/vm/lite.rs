@@ -387,6 +387,10 @@ impl<'p> Vm<'p> {
         let mut base = self.frames[top].base;
         let mut ip = self.frames[top].ip;
         let mut code: &'p [Instr] = self.lite_fn_code(func_id);
+        // The top frame's upvalue list (`closure_upvalue_cached`): taken on
+        // its first upvalue access, reset at every frame change.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut upv: (*const u32, usize) = (std::ptr::null(), 0);
         let mut steps: u64 = *steps_total;
         macro_rules! exit {
             ($e:expr) => {{
@@ -441,6 +445,10 @@ impl<'p> Vm<'p> {
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
                 code = self.lite_fn_code(func_id);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    upv = (std::ptr::null(), 0);
+                }
             }};
         }
         loop {
@@ -805,6 +813,12 @@ impl<'p> Vm<'p> {
                         hand_over!();
                     }
                     let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                        self.set(base, dst, v);
+                        ip += 1;
+                        continue;
+                    }
                     if !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
                         if key == "length" {
                             if let Some(v) = self.length_fast(o) {
@@ -833,6 +847,9 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::UpvalGet { dst, idx } if FULL => {
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
+                    #[cfg(feature = "safe-sandbox")]
                     let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     let v = self.heap.cell_get(cell);
                     // A binding still in its TDZ throws, in the main arm.
@@ -843,6 +860,9 @@ impl<'p> Vm<'p> {
                     ip += 1;
                 }
                 Instr::UpvalSet { idx, src } if FULL => {
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
+                    #[cfg(feature = "safe-sandbox")]
                     let cell = self.closure_upvalue(self.frames[top].closure, idx);
                     // A captured `const`, a named function expression's own
                     // name and a binding in its TDZ are the main arm's (it
@@ -854,7 +874,7 @@ impl<'p> Vm<'p> {
                         hand_over!();
                     }
                     let v = self.get(base, src);
-                    self.heap.cell_set(cell, v);
+                    self.heap.upval_cell_set(cell, v);
                     ip += 1;
                 }
                 Instr::MathOp {
@@ -927,6 +947,10 @@ impl<'p> Vm<'p> {
                     base = self.frames[top].base;
                     ip = 0;
                     code = self.lite_fn_code(func_id);
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    {
+                        upv = (std::ptr::null(), 0);
+                    }
                 }
                 Instr::Return { src } => {
                     if !self.frames[top].handlers.is_empty() {

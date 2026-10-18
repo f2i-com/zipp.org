@@ -331,7 +331,6 @@ impl<'p> Vm<'p> {
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             shape_key_plans: Vec::new(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             for_in_silent: rustc_hash::FxHashMap::default(),

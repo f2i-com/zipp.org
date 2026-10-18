@@ -921,13 +921,11 @@ impl<'p> Vm<'p> {
         if let Some(i) = array_index(key) {
             if (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
                 && (self.arguments_objs.is_empty() || !self.arguments_objs.contains_key(&idx))
+                // An overwrite moves no storage and changes nothing present,
+                // so it skips `get_mut`'s array-snapshot invalidation.
+                && self.heap.array_overwrite_present(idx, i, val)
             {
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    if i < items.len() && !items[i].is_hole() {
-                        items[i] = val;
-                        return Ok(());
-                    }
-                }
+                return Ok(());
             }
         }
         // A rope key is flattened in place first, as `get_index` does: the

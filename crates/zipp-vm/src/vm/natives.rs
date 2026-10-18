@@ -1721,13 +1721,23 @@ impl<'p> Vm<'p> {
 
     /// `this` for OrdinaryCallBindThis's global substitution: the CALLEE realm's
     /// global object (a createRealm child function binds the CHILD's global).
+    /// Inline: every sloppy-mode call binds it, and out of line the call was
+    /// 3% of a plain sloppy call for one emptiness test.
+    #[inline]
     pub(crate) fn callee_this_global(&self, callee: Value) -> u32 {
         if !self.realm_global_objs.is_empty() {
-            let r = self.get_function_realm(callee);
-            if r != 0 {
-                if let Some(g) = self.realm_global_obj(r) {
-                    return g;
-                }
+            return self.callee_this_global_realm(callee);
+        }
+        self.global_this
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn callee_this_global_realm(&self, callee: Value) -> u32 {
+        let r = self.get_function_realm(callee);
+        if r != 0 {
+            if let Some(g) = self.realm_global_obj(r) {
+                return g;
             }
         }
         self.global_this

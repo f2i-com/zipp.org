@@ -26,6 +26,25 @@ pub(crate) fn ta_encode(kind: u8, f: f64) -> [u8; 8] {
     out
 }
 
+/// [`ta_encode`] of an integer Number: the same bytes, without the round trip
+/// through `f64`. An `i32`'s low bits are its ToUint8/16/32 result, and its
+/// conversion to `f32` rounds as the exact `f64` would.
+#[inline]
+pub(crate) fn ta_encode_int(kind: u8, n: i32) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    match kind {
+        0 | 1 => out[0] = n as u8,
+        2 => out[0] = n.clamp(0, 255) as u8,
+        3 | 4 => out[..2].copy_from_slice(&(n as u16).to_le_bytes()),
+        5 | 6 => out[..4].copy_from_slice(&(n as u32).to_le_bytes()),
+        7 => out[..4].copy_from_slice(&(n as f32).to_le_bytes()),
+        8 => out.copy_from_slice(&(n as f64).to_le_bytes()),
+        11 => out[..2].copy_from_slice(&crate::vm::helpers_num2::f64_to_f16_bits(n as f64).to_le_bytes()),
+        _ => {}
+    }
+    out
+}
+
 /// JS ToUintN modular reduction (the low `bits` bits of trunc(f)), NaN/±∞ → 0.
 pub(crate) fn to_uint_modular(f: f64, bits: u32) -> u64 {
     // Below 2^63 in magnitude the conversion to i64 truncates toward zero

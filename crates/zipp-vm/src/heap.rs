@@ -2849,6 +2849,26 @@ impl ObjMap {
         m
     }
 
+    /// [`ObjMap::with_capacity`] for a constructor's instance, whose adds
+    /// take their shape's shared key list (`Vm::ic_apply_set`): the values
+    /// and attributes are reserved, the key list is not, since the first add
+    /// replaces it and a reserved one would be allocated only to be freed.
+    pub fn with_value_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new();
+        if n > 0 {
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
+                v.reserve_exact(n);
+            }
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     /// The map `{ ...self }` makes when `self`'s properties can be copied as
     /// they stand: every one a default data property (writable, enumerable,
     /// configurable) and none a symbol. Creating them on an empty object in
@@ -3523,6 +3543,55 @@ impl ObjMap {
         self.shape = shape_after;
         self.has_element_key |= key_names_element(key);
         self.index_appended();
+    }
+
+    /// [`ObjMap::append_data_shaped`] for an append whose shape has a shared
+    /// key list: `plan` is `shape::keys_of(shape_after)` as a plan (so this
+    /// map's keys are its prefix) and names no element (`shape_key_plan`
+    /// refuses one that does). The map takes it borrowed when `borrow` is set,
+    /// and so pays no reference count, and skips the element-key parse and
+    /// numeric index an owned key needs: a constructor's adds spent a tenth
+    /// of `new F()` on the count and the parse alone.
+    ///
+    /// # Safety
+    ///
+    /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s
+    /// contract.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn append_data_planned(
+        &mut self,
+        key: &str,
+        val: Value,
+        shape_after: u32,
+        plan: &StaticKeyPlan,
+        borrow: bool,
+    ) {
+        let n = self.keys.len();
+        debug_assert!(self.pos(key).is_none());
+        debug_assert!(plan.len() == n + 1 && !plan.has_element_key());
+        debug_assert!(plan.keys()[..n] == *self.keys.as_ref() && plan.keys()[n] == key);
+        match &mut self.keys {
+            PropKeys::Planned { all, visible_len } if all.is(plan) => *visible_len = n + 1,
+            _ => self.set_keys(PropKeys::Planned {
+                all: if borrow {
+                    // SAFETY: this function's contract.
+                    unsafe { PlanHandle::borrowed(plan) }
+                } else {
+                    PlanHandle::owned(plan.clone())
+                },
+                visible_len: n + 1,
+            }),
+        }
+        self.vals.push(val);
+        self.attrs.push(PropAttr::data());
+        self.shape = shape_after;
+        if let Some(ix) = &mut self.index {
+            if !ix.insert_tagged(key, n as u32, prop_tag(key)) {
+                self.index = Some(PropIndex::collided(&self.keys));
+            }
+        } else if n + 1 >= PROP_INDEX_THRESHOLD {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
     }
 
     /// [`ObjMap::set`] for a caller that already OWNS the key string: on the
@@ -10473,6 +10542,25 @@ impl Heap {
         }
     }
 
+    /// [`Heap::array_store_in_place`] for a PRESENT element only (in range and
+    /// not a hole), in every build: the overwrite `set_index`'s first path
+    /// makes, which neither moves the storage nor changes what is present, so
+    /// no array snapshot needs to be invalidated. `false`, with nothing
+    /// written, for anything else.
+    #[inline]
+    pub(crate) fn array_overwrite_present(&mut self, idx: u32, i: usize, v: Value) -> bool {
+        match &mut self.objs[idx as usize] {
+            HeapObj::Array(items) => match items.get_mut(i) {
+                Some(slot) if !slot.is_hole() => {
+                    *slot = v;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Visit every compiled RegExp program held directly by a live heap slot.
     /// Both the authoritative Unicode program and its optional ASCII byte-opt
     /// twin participate. Callers deduplicate the shared `Arc` identities.
@@ -10999,6 +11087,24 @@ impl Heap {
             // `UpvalGet` and the emitted cell writes address.
             self.cell_vals_mirror[idx as usize] = v.bits();
         }
+    }
+
+    /// [`Heap::cell_set`] for a slot known to hold a cell: one a closure's
+    /// upvalue list names (an `UpvalSet`), which only ever holds cells the
+    /// closure keeps alive. Skips the occupant check, a read of the cell's
+    /// heap slot on every captured-variable write.
+    #[inline]
+    pub(crate) fn upval_cell_set(&mut self, idx: u32, v: Value) {
+        debug_assert!(matches!(self.get(idx), HeapObj::Cell));
+        self.write_barrier_val(idx, v);
+        if self.oracle
+            && v.is_heap()
+            && !self.oracle_young(idx)
+            && self.oracle_young(v.heap_index())
+        {
+            gcoracle::hit(gcoracle::CELL_SET);
+        }
+        self.cell_vals_mirror[idx as usize] = v.bits();
     }
 
     /// Cell-payload write for a caller that has ALREADY performed the nursery

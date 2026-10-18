@@ -1491,12 +1491,19 @@ impl<'p> Vm<'p> {
     /// internal slots. The caller has also excluded immutable buffers. Numeric
     /// conversion cannot execute JS, so encoding before the live bounds check
     /// preserves TypedArraySetElement's coerce-before-valid-index order.
-    #[inline]
+    ///
+    /// Takes the Number as its `Value` so an integer stores without the round
+    /// trip through `f64` and `to_uint_modular` (`ta_encode_int`), and writes
+    /// the element at its fixed width, where the slice copy of a runtime width
+    /// was a `memcpy` call per element. Out of line: the dispatch loop's
+    /// `SetIndex` arm calls it, and inlined there it slowed every interpreted
+    /// call by a few percent.
+    #[inline(never)]
     pub(crate) fn ta_interp_numeric_set_view(
         &mut self,
         view: TaInterpNumericView,
         i: usize,
-        number: f64,
+        number: Value,
     ) -> bool {
         let TaInterpNumericView {
             ta_idx,
@@ -1506,7 +1513,11 @@ impl<'p> Vm<'p> {
             stored_len,
         } = view;
         let size = native::TA_KINDS[kind as usize].1;
-        let bytes = ta_encode(kind, number);
+        let bytes = if number.is_int() {
+            ta_encode_int(kind, number.as_int())
+        } else {
+            ta_encode(kind, number.as_f64())
+        };
         let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let data = match self.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => data,
@@ -1536,7 +1547,12 @@ impl<'p> Vm<'p> {
             return true;
         }
         let off = byte_offset + i * size;
-        data[off..off + size].copy_from_slice(&bytes[..size]);
+        match size {
+            1 => data[off] = bytes[0],
+            2 => data[off..off + 2].copy_from_slice(&bytes[..2]),
+            4 => data[off..off + 4].copy_from_slice(&bytes[..4]),
+            _ => data[off..off + 8].copy_from_slice(&bytes),
+        }
         true
     }
 

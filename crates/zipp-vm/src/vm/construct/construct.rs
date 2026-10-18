@@ -71,7 +71,7 @@ impl<'p> Vm<'p> {
         }
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-            ObjMap::with_capacity(hint as usize),
+            ObjMap::with_value_capacity(hint as usize),
         ))));
         if proto.is_heap() {
             self.proto_of.insert(obj.heap_index(), proto);
@@ -164,7 +164,8 @@ impl<'p> Vm<'p> {
         (fid, closure, f): (u32, u32, Value),
     ) -> Result<(u32, u32, Value, Value), Thrown> {
         let ci = cv.heap_index();
-        let mut map = ObjMap::new();
+        let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
+        let mut map = ObjMap::with_value_capacity(hint as usize);
         map.class = Some(ci);
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
         // The base class's InitializeInstanceElements, before its body.

@@ -1933,9 +1933,9 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_framefree: Vec<u8>,
     /// Each shape's key list as a shared plan, by shape id, for the objects
-    /// the JIT's add ways append to (`helpers_misc::shape_key_plan`): built
-    /// once a way reaches the shape, `None` where the list is too long.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// the JIT's add ways and the interpreter's cached adds append to
+    /// (`helpers_misc::shape_key_plan`): built once an add reaches the
+    /// shape, `None` where the list is too long.
     shape_key_plans: Vec<Option<crate::bytecode::StaticKeyPlan>>,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
     /// is enumerable, and none can shadow a farther level because the walk ends

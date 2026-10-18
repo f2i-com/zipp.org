@@ -133,7 +133,10 @@ pub(crate) enum IcEntry {
     /// class chain. `callee` is the materialized member function (stable for
     /// the life of the class — ClassData is immutable post-definition).
     /// `epoch` is `class_proto_epoch` at fill: the tables it was read from
-    /// still described the prototype chain then.
+    /// still described the prototype chain then. `recv_shape` is the
+    /// receiver's hidden class at fill (or [`crate::shape::DICT`]): a live
+    /// match proves the receiver has no own property of the key, so a hit
+    /// needs no key lookup (`ic_call_method`).
     ClassMethod {
         class: u32,
         ver: u32,
@@ -141,6 +144,7 @@ pub(crate) enum IcEntry {
         callee: Value,
         fid: u32,
         closure: u32,
+        recv_shape: u32,
     },
     ClassGetter {
         class: u32,
@@ -692,17 +696,19 @@ impl<'p> Vm<'p> {
     /// 10% of a property-read loop's samples on the WebAssembly build.
     #[inline(always)]
     fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
-        if !recv.is_heap() || !self.deferred_ns_state.is_empty() {
+        if !recv.is_heap() {
             return None;
         }
         let idx = recv.heap_index();
-        if !self.ic_obj_ok(idx) {
+        // The kind first: a string's or an array's read leaves here on the
+        // one load its own path makes anyway.
+        let HeapObj::Object(m) = self.heap.get_for_ic(idx) else {
+            return None;
+        };
+        if m.is_ctor || !self.deferred_ns_state.is_empty() || !self.ic_obj_ok(idx) {
             return None;
         }
-        match self.heap.get_for_ic(idx) {
-            HeapObj::Object(m) if !m.is_ctor => Some((idx, m)),
-            _ => None,
-        }
+        Some((idx, m))
     }
 
     /// The receiver's hidden class, or [`crate::shape::DICT`] when it has none
@@ -823,6 +829,10 @@ impl<'p> Vm<'p> {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        // The receiver first: the dispatch loop asks before its `length` and
+        // shapeless-receiver leaves, so a string's or an array's `.length`
+        // must fail here before the site lookup, not after it.
+        let (_, m) = self.ic_recv_map(recv)?;
         if !self.ic_func_eligible(func_id) {
             return None;
         }
@@ -833,9 +843,48 @@ impl<'p> Vm<'p> {
         let IcEntry::OwnData { shape, slot } = site.entries[0] else {
             return None;
         };
-        let (_, m) = self.ic_recv_map(recv)?;
         let sh = m.shape();
         (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
+    }
+
+    /// The way-0 inherited-data hit of [`Self::ic_get_prop`], for the
+    /// dispatch loops to take inline after the own-data one misses: the same
+    /// guards (the receiver's complete shape, an unchanged chain, the holder's
+    /// slot still the key's data property), so the same answer or `None` and
+    /// the full call. `o.m` through a prototype took the full call's site
+    /// probe and way scan on every read: 11 ns against QuickJS's 1.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_proto_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
+        let (idx, m) = self.ic_recv_map(recv)?;
+        if !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        let IcEntry::ProtoData {
+            recv_shape,
+            first,
+            hops,
+            slot,
+        } = site.entries[0]
+        else {
+            return None;
+        };
+        let sh = m.shape();
+        if slot == u32::MAX
+            || sh == crate::shape::DICT
+            || recv_shape != sh
+            || m.class.is_some()
+            || !self.interp_own_resolve_vm_is_interpreter()
+        {
+            return None;
+        }
+        let hm = self.ic_chain_ok(idx, first, &hops)?;
+        let s = slot as usize;
+        (hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
     }
 
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
@@ -965,6 +1014,12 @@ impl<'p> Vm<'p> {
                 return GetAct::None;
             }
         }
+        // A private name never fills a way: the dispatch loop takes a site's
+        // way-0 own-data hit before its private-member checks, which is sound
+        // only because no such site holds one.
+        if is_private_key(key) {
+            return GetAct::None;
+        }
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
                 // Deliver from the freshly-validated walk (same read the
@@ -1026,6 +1081,7 @@ impl<'p> Vm<'p> {
                     // history here so its captured-call inline plan can build
                     // the same polymorphic arms as the legacy fused call.
                     self.mi_record_recv(func_id, ip, recv);
+                    let recv_shape = self.ic_recv_shape(recv);
                     self.ic_install(
                         func_id,
                         ip,
@@ -1036,6 +1092,7 @@ impl<'p> Vm<'p> {
                             callee,
                             fid,
                             closure,
+                            recv_shape,
                         },
                     );
                 } else {
@@ -1283,6 +1340,10 @@ impl<'p> Vm<'p> {
         recv: Value,
         val: Value,
     ) -> bool {
+        // The receiver first, as `ic_get_prop_own_hit` checks it.
+        let Some((idx, m)) = self.ic_recv_map(recv) else {
+            return false;
+        };
         if !self.ic_func_eligible(func_id) {
             return false;
         }
@@ -1299,9 +1360,6 @@ impl<'p> Vm<'p> {
             return false;
         }
         let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
-            return false;
-        };
-        let Some((idx, m)) = self.ic_recv_map(recv) else {
             return false;
         };
         let sh = m.shape();
@@ -1390,7 +1448,13 @@ impl<'p> Vm<'p> {
         }
         // Keys with exotic write interception never cache: `__proto__`
         // (the inherited setter), restricted names, and canonical-index-ish
-        // keys (`note_array_proto_index`).
+        // keys (`note_array_proto_index`). Nor does a private name: the
+        // dispatch loop takes a site's way-0 own-data hit before its
+        // private-member routing, which is sound only because no such site
+        // holds one.
+        if is_private_key(key) {
+            return SetAct::None;
+        }
         if key == "__proto__"
             || key == "caller"
             || key == "arguments"
@@ -1828,10 +1892,35 @@ impl<'p> Vm<'p> {
         match p {
             SetPlan::Append { idx, after } => {
                 // What `set_prop`'s ordinary add does: its barrier, the
-                // append, and the version bump the JIT's caches need.
+                // append, and the version bump the JIT's caches need. The
+                // object takes the shape's shared key list, as the JIT's add
+                // ways do, rather than a new `String` per key: a constructor's
+                // `this.a = a; this.b = b` was two allocations per instance.
                 self.store_barrier_v(crate::heap::gcoracle::SET_PROP, Value::heap(idx), val);
-                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.append_data_shaped(key, val, after, None);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    if !self.shape_key_plans.get(after as usize).is_some_and(Option::is_some) {
+                        super::helpers_misc::shape_key_plan(self, after);
+                    }
+                    let borrow = crate::bytecode::plan_borrow_enabled();
+                    let plan = self.shape_key_plans.get(after as usize).and_then(Option::as_ref);
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        match plan {
+                            // SAFETY: the VM's shape plans are never removed
+                            // or replaced, and its heap's maps die with it.
+                            Some(p) if p.len() == m.slot_len() + 1 => unsafe {
+                                m.append_data_planned(key, val, after, p, borrow)
+                            },
+                            _ => m.append_data_shaped(key, val, after, None),
+                        }
+                    }
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    let plan = super::helpers_misc::shape_key_plan(self, after);
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.append_data_shaped(key, val, after, plan);
+                    }
                 }
                 self.heap.bump_version(idx);
                 SetAct::Done
@@ -1954,6 +2043,63 @@ impl<'p> Vm<'p> {
         if let Some(site) = self.ic_site(func_id, ip) {
             if site.n > 0 {
                 if let Some((idx, m)) = self.ic_recv_map(recv) {
+                    // The ways by hidden class: a matching shape proves where
+                    // the key is (an own data slot) or that the receiver has
+                    // no own property of it (a class or inherited method), so
+                    // the hit needs no key lookup. That lookup was a fifth of a
+                    // monomorphic `o.m()`, and a site cycling a few classes
+                    // (`objs[i & 3].area()`) paid it on every call that missed
+                    // the first way. Every way is tried, unlike `ic_get_prop`'s
+                    // first-way probe: a method site that outruns its ways
+                    // stops filling them (`IC_MISS_LIMIT`), and a receiver with
+                    // a fresh shape per object rarely calls methods at one site.
+                    let sh = m.shape();
+                    if sh != crate::shape::DICT {
+                        for e in &site.entries[..site.n as usize] {
+                            match *e {
+                                IcEntry::OwnData { shape, slot } if shape == sh => {
+                                    let v = m.val_at(slot as usize);
+                                    if let Some((fid, closure)) = self.ic_plain_fn(v) {
+                                        return Some((fid, closure, v));
+                                    }
+                                    break;
+                                }
+                                IcEntry::ClassMethod {
+                                    class,
+                                    ver,
+                                    epoch,
+                                    callee,
+                                    fid,
+                                    closure,
+                                    recv_shape,
+                                } if recv_shape == sh => {
+                                    if m.class == Some(class)
+                                        && self.heap.version_of(class) == ver
+                                        && self.class_proto_epoch == epoch
+                                    {
+                                        return Some((fid, closure, callee));
+                                    }
+                                }
+                                IcEntry::ProtoData {
+                                    recv_shape,
+                                    first,
+                                    hops,
+                                    slot,
+                                } if recv_shape == sh && slot != u32::MAX && m.class.is_none() => {
+                                    if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                                        let s = slot as usize;
+                                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
+                                            let v = hm.val_at(s);
+                                            if let Some((fid, closure)) = self.ic_plain_fn(v) {
+                                                return Some((fid, closure, v));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     let own = m.pos(key);
                     for e in &site.entries[..site.n as usize] {
                         if let Some(hit) = self.ic_validate_method(e, idx, m, own, key) {
@@ -2006,6 +2152,7 @@ impl<'p> Vm<'p> {
                 Some((fid, closure)) => {
                     let ver = self.heap.version_of(class);
                     let epoch = self.class_proto_epoch;
+                    let recv_shape = self.ic_recv_shape(recv);
                     self.mi_record_recv(func_id, ip, recv);
                     self.ic_install(
                         func_id,
@@ -2017,6 +2164,7 @@ impl<'p> Vm<'p> {
                             callee,
                             fid,
                             closure,
+                            recv_shape,
                         },
                     );
                     Some((fid, closure, callee))
@@ -2151,6 +2299,7 @@ impl<'p> Vm<'p> {
                 callee,
                 fid,
                 closure,
+                ..
             } => {
                 if own.is_none()
                     && m.class == Some(class)

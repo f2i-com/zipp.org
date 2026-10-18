@@ -5427,14 +5427,12 @@ pub(crate) struct AddWay {
 /// Longest key list a shape gets a shared plan for, and the most key bytes it
 /// may hold: plans live outside the heap, one per shape reached by an add way
 /// (shapes are capped at 4,096), so a long or wide one stays on owned keys.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const SHAPE_PLAN_MAX_KEYS: u32 = 16;
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const SHAPE_PLAN_MAX_BYTES: usize = 512;
 
-/// `shape`'s key list as a shared plan, built the first time an add way
-/// reaches the shape; `None` for a dictionary shape or a list past the caps.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// `shape`'s key list as a shared plan, built the first time an add way (or
+/// the interpreter's cached add) reaches the shape; `None` for a dictionary
+/// shape or a list past the caps.
 pub(crate) fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode::StaticKeyPlan> {
     let s = shape as usize;
     if shape == crate::shape::DICT || s >= 1 << 14 {
