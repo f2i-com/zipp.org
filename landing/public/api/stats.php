@@ -362,8 +362,8 @@ if ($readme !== null && $readme[0] === 200) {
             $facts['test262_corrected_total'] = $total;
         }
     }
-    // Zipp has\n21 of 30 Node point wins.
-    if (preg_match('/Zipp has\s+(\d+) of 30 Node point wins/', $text, $m)) {
+    // ZIPP has\n23 of 30 Node point wins. (Older READMEs spell it "Zipp".)
+    if (preg_match('/(?:Zipp|ZIPP) has\s+(\d+) of 30 Node point wins/', $text, $m)) {
         $facts['node_wins'] = (int) $m[1];
     }
     // ... clean PGO capture at engine commit\n`c28781cf`:

@@ -562,7 +562,12 @@ export function renderSite(content, assets) {
   const { site, journal } = content
   const entries = sortedEntries(journal.entries)
   const files = new Map()
-  const urls = [{ path: '/', lastmod: site.homeDateModified, priority: '1.0' }, { path: '/playground/', lastmod: site.homeDateModified, priority: '0.6' }]
+  // The two interactive pages are static files in public/, not content pages.
+  const urls = [
+    { path: '/', lastmod: site.homeDateModified, priority: '1.0' },
+    { path: '/playground/', lastmod: site.homeDateModified, priority: '0.6' },
+    { path: '/sandbox/playground/', lastmod: site.homeDateModified, priority: '0.6' },
+  ]
 
   for (const page of content.pages) {
     const path = `/${page.slug}/`

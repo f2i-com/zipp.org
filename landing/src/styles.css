@@ -361,6 +361,18 @@ svg {
   line-height: 1.6;
 }
 
+.hero-intro a {
+  color: #ddd6fe;
+  text-decoration: underline;
+  text-decoration-color: rgba(221, 214, 254, 0.45);
+  text-underline-offset: 4px;
+}
+
+.hero-intro a:hover {
+  color: #fff;
+  text-decoration-color: currentColor;
+}
+
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1285,6 +1297,11 @@ svg {
 
 .security-note strong {
   color: #2a211e;
+}
+
+.controls-copy > .controls-try {
+  margin-top: 22px;
+  color: #3f5600;
 }
 
 .code-window {

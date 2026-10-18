@@ -1,11 +1,11 @@
 # ZIPP landing page
 
 React + TypeScript, with Vite and a Cloudflare Worker. The landing page introduces
-Python, JavaScript and browser GPU compute. It embeds
-the full folder playground, provides a dedicated `/playground/` route, and includes
-a recorded Python Game of Life GIF. Existing Softn/Outerstead
-showcases, repository activity, dated native benchmarks and the optional JavaScript
-story scratchpad remain available.
+ZIPP, the Zippy Interpreter for Polyglot Programming: a portable polyglot runtime
+that runs JavaScript and Python today. It embeds the full folder playground and
+provides a dedicated `/playground/` route and a `/sandbox/playground/` route.
+Existing Softn/Outerstead showcases, repository activity, dated native benchmarks
+and the optional JavaScript story scratchpad remain available.
 
 ## Documentation pages, sitemap and journal feed
 
@@ -57,13 +57,33 @@ The landing's iframe and dedicated route load the same public files. The old
 JavaScript-only story scratchpad loads only when expanded. The native NCA research
 project is maintained separately at https://github.com/f2i-com/neuralautomata.com.
 
+## Sandbox playground
+
+`/sandbox/playground/` (`public/sandbox/playground/`, static files like
+`/playground/`) edits JavaScript and runs it in a sandbox made by the embed kit's
+loader, `zipp.mjs`, with a switch for each permission (storage, files, network,
+host functions) and each limit (steps, time), and shows the output and any
+refusal or timeout. It needs a release that publishes single-file engines
+(0.0.26 or later). Copy one in from the release files, then build:
+
+```sh
+node scripts/sync-sandbox.mjs <dir>   # zipp-<v>-javascript.wasm and zipp.mjs or the unpacked embed kit
+node scripts/sync-sandbox.mjs --check # the files match public/sandbox/manifest.json
+```
+
+The script checks the module's own `zipp.meta` record and the kit's
+`modules.json` and `SHA256SUMS`, copies `zipp.mjs` and the module into
+`public/sandbox/`, and writes `manifest.json` (`version`, `file`, `sha256`, the
+commit and the loader's hash); the page reads it to find the module. Without a
+manifest the page says the sandbox is available once 0.0.26 is published. The
+landing tests check that `public/sandbox/` holds a complete engine or none.
+
 ## Recorded examples
 
 `public/demos/` contains the actual local browser captures, still posters, an SVG
-explaining Python on Zipp WASM, and `provenance.json`. Both README and landing reuse
-these same files. GIFs autoplay and loop continuously. The landing honors
-reduced-motion settings and lets readers pause GIFs by switching to static posters.
-Regenerate from the repository root:
+explaining Python on Zipp WASM, and `provenance.json`. The `/python/` and
+`/webgpu/` documentation pages use them; the landing page does not, since its
+embedded playground runs the real thing. Regenerate from the repository root:
 
 ```sh
 python crates/zipp-wasm/playground/capture-demos.py

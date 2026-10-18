@@ -1,13 +1,13 @@
 {
   "site": {
-    "name": "Zipp",
+    "name": "ZIPP",
     "origin": "https://www.zipp.org",
-    "tagline": "A JavaScript and Python engine written in Rust",
-    "description": "Zipp is a from-scratch JavaScript and Python engine written in Rust. Run the same register VM natively or in WebAssembly, with JIT compilation and WebGPU/WebGL2 compute.",
+    "tagline": "Portable Polyglot Runtime",
+    "description": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime: one Rust register VM that runs JavaScript and Python today, natively, embedded or in WebAssembly.",
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-10-14",
+    "homeDateModified": "2026-10-18",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -50,7 +50,7 @@
       }
     ],
     "footer": {
-      "text": "Zipp is a JavaScript and Python engine written in Rust, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 14 September 2026.",
+      "text": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime written in Rust: one VM for JavaScript and Python today, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 18 October 2026.",
       "links": [
         {
           "label": "Home",
@@ -67,6 +67,10 @@
         {
           "label": "Sandbox",
           "href": "/sandbox/"
+        },
+        {
+          "label": "Sandbox playground",
+          "href": "/sandbox/playground/"
         },
         {
           "label": "Comparisons",
@@ -145,12 +149,16 @@
         "ECMAScript Test262 engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-14",
+      "dateModified": "2026-10-18",
       "priority": "0.9",
       "sections": [
         {
           "heading": "What Zipp is",
           "blocks": [
+            {
+              "type": "p",
+              "text": "ZIPP, the **Zippy Interpreter for Polyglot Programming**, is a portable polyglot runtime: one Rust register-bytecode VM that several languages compile to, so programs in different languages share one runtime, one sandbox and one set of embeddings, from the native CLI and a Rust library to WebAssembly in browsers, Node, Deno and Bun. JavaScript and Python are the languages it supports today. JavaScript is ES2025, passing 99.999% of the pinned Test262 corpus unmodified; Python is an experimental subset with a bundled torch subset. The design is for more languages: [docs/LANGUAGES.md](https://github.com/f2i-com/zipp.org/blob/main/docs/LANGUAGES.md) describes how one plugs in. This page is about the JavaScript engine."
+            },
             {
               "type": "p",
               "text": "Zipp began on 29 May 2026 as a small typed language and became a JavaScript engine the next day. Since then it has grown into roughly 424,000 lines of Rust in the `zipp-vm` crate, tests included, plus a CLI, a WebAssembly embedding, a hardened sandbox runner and an experimental Python frontend that compiles to the same bytecode."
@@ -405,7 +413,7 @@
       "description": "How Zipp executes JavaScript and Python: NaN-boxed values, an explicit-frame register VM, shapes and inline caches, x86-64 and ARM64 JIT tiers, and a nursery GC.",
       "h1": "Zipp engine architecture",
       "breadcrumb": "Architecture",
-      "lede": "Zipp is designed so a JIT can keep unboxed values in machine registers across call boundaries, and so every optimization has an exact, cheap way back to the interpreter. This page walks the pipeline from source to native code and explains the decisions behind it.",
+      "lede": "ZIPP is one register VM shared by every language it runs: JavaScript and Python compile to the same bytecode, values, objects and collector today, and a language plugs in by emitting its own instructions only where its semantics differ. It is designed so a JIT can keep unboxed values in machine registers across call boundaries, and so every optimization has an exact, cheap way back to the interpreter. This page walks the pipeline from source to native code and explains the decisions behind it.",
       "keywords": [
         "JavaScript engine architecture",
         "register VM",
@@ -415,7 +423,7 @@
         "generational garbage collector Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-14",
+      "dateModified": "2026-10-18",
       "sections": [
         {
           "heading": "The pipeline",
@@ -423,6 +431,10 @@
             {
               "type": "p",
               "text": "JavaScript or Python source → front end → register bytecode → interpreter → hot-loop OSR or whole-function JIT → x86-64 or ARM64 native code. The garbage collector, object shapes and inline caches sit beside every stage. On `wasm32`, and on native targets without a JIT, the same bytecode runs on the pure interpreter."
+            },
+            {
+              "type": "p",
+              "text": "Each language has its own folder under `src/lang/` and is one entry of a table, `languages()`, that the CLI's `--lang` names, file extensions, shebang detection and compile dispatch all go through. JavaScript is the base language: its instruction set is the one every language uses where the semantics agree. Python adds its own `Instr::Py*` instructions where they differ, run by its own executor and native tier, and its runtime is written in JavaScript that the same VM runs. [docs/LANGUAGES.md](https://github.com/f2i-com/zipp.org/blob/main/docs/LANGUAGES.md) lists the steps for adding a language and the rules every language keeps."
             },
             {
               "type": "table",
@@ -842,7 +854,7 @@
         "wasm-bindgen Rust engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-14",
+      "dateModified": "2026-10-18",
       "sections": [
         {
           "heading": "Why a JavaScript engine inside JavaScript",
@@ -1034,6 +1046,64 @@
             {
               "type": "p",
               "text": "Each [release](/releases/) ships `zipp-wasm-<version>-web.zip` (JavaScript) and `zipp-wasm-<version>-web-python.zip` (JavaScript and Python with torch built in); from v0.0.21 also `zipp-wasm-<version>-web-python-base.zip` (Python without torch) and `zipp-wasm-<version>-web-torch.zip`, the torch package and its loader; and from v0.0.22 `zipp-wasm-<version>-web-lite.zip`, ZIPP Lite. Each carries the wasm-bindgen glue, the module, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`; serve the module Brotli-compressed, since the sizes above are what it costs on the wire. The glue and the `.wasm` are one artifact in two files, so serve them with matching cache keys; this site stamps both URLs with a content hash so a cached glue can never meet a new module. Pin `zipp_torch.wasm` by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, and since v0.0.24 the package's wire version is 3, so take it from the same release as the engine."
+            }
+          ]
+        },
+        {
+          "id": "from-0-0-26",
+          "heading": "From 0.0.26",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The section above is how to get v0.0.25, the current release. ZIPP 0.0.26, which is not published yet, changes the WebAssembly assets. Every engine becomes one `.wasm` file that carries the JavaScript bindings generated for exactly that build in a custom section, beside a record of its version, commit and variant, so there is no separate glue file to keep in step with it. One loader, `zipp.mjs`, reads that record and those bindings and runs any of the engines in a page, a Worker, Node, Deno or Bun."
+            },
+            {
+              "type": "table",
+              "caption": "WebAssembly assets from 0.0.26 (`<v>` is the version)",
+              "head": [
+                "Asset",
+                "Contents"
+              ],
+              "rows": [
+                [
+                  "`zipp-<v>-javascript.wasm`",
+                  "JavaScript, with `Intl` and `Temporal`"
+                ],
+                [
+                  "`zipp-<v>-javascript-lite.wasm`",
+                  "JavaScript without `Intl` and `Temporal`, built for size"
+                ],
+                [
+                  "`zipp-<v>-javascript-python.wasm`",
+                  "JavaScript and Python, torch built in"
+                ],
+                [
+                  "`zipp-<v>-javascript-python-base.wasm`",
+                  "JavaScript and Python without torch"
+                ],
+                [
+                  "`zipp-<v>-torch-package.wasm`",
+                  "torch, added to the `-javascript-python-base` engine when a program needs it"
+                ],
+                [
+                  "`zipp-<v>-wasm-embed-kit.zip`",
+                  "The loader `zipp.mjs` and its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
+                ]
+              ]
+            },
+            {
+              "type": "code",
+              "caption": "Running a program in a sandbox with the 0.0.26 loader",
+              "lang": "javascript",
+              "code": "import { loadZipp } from \"./zipp.mjs\"\n\nconst zipp = await loadZipp(\"./zipp-0.0.26-javascript.wasm\")\nconst sandbox = await zipp.createSandbox({\n  limits: { instructions: 50_000_000, timeoutMs: 5000 },\n  permissions: {\n    storage: { initial: { theme: \"dark\" } },        // a private, in-memory localStorage\n    files: { \"notes.txt\": \"hello\" },                 // read with host.callSync(\"fs.read\", ...)\n    network: [\"https://api.example.com/\"],          // the only URLs its fetch() may reach\n  },\n  host: { \"clock.now\": () => Date.now() },          // answers host.call(\"clock.now\", ...)\n})\nconst { output } = await sandbox.run(source)       // throws a ZippSandboxError on failure\nawait sandbox.close()"
+            },
+            {
+              "type": "p",
+              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw a `SecurityError`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) lets you switch each permission and limit and see the result."
+            },
+            {
+              "type": "p",
+              "text": "Native downloads change in the same release: a Windows portable `.exe`, a Windows `.msi` installer that installs per user and adds `zipp` to the user's PATH, and plain Linux binaries for x86-64, arm64 and armv7, in place of the archives v0.0.25 ships."
             }
           ]
         }
@@ -2240,7 +2310,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-14",
+      "dateModified": "2026-10-18",
       "sections": [
         {
           "heading": "The embedding model",
@@ -2298,6 +2368,10 @@
             {
               "type": "p",
               "text": "The Worker is the lifetime boundary: a deadline timer in the page calls `worker.terminate()` and creates a fresh one. `host-sdk/` in the repository is a reference adapter tested in real Chromium, Firefox and WebKit Workers, and the [WebAssembly page](/wasm/) lists every limit the module enforces."
+            },
+            {
+              "type": "p",
+              "text": "From 0.0.26 each engine also loads through `zipp.mjs`, a one-file loader whose sandboxes are default-deny and run in their own Worker by default, with a time limit that terminates it; the [WebAssembly page](/wasm/#from-0-0-26) describes it, and the [sandbox playground](/sandbox/playground/) runs it."
             }
           ]
         },
@@ -2381,7 +2455,7 @@
         "capability-based scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-09-14",
+      "dateModified": "2026-10-18",
       "sections": [
         {
           "heading": "Three profiles",
@@ -2424,6 +2498,15 @@
             {
               "type": "p",
               "text": "Everything a guest can reach outside itself is defined in one preamble. There is no DOM, no `require`, no filesystem and no network unless the host installs a host call and, in the browser, grants the capability name per engine. `window.dispatchEvent` exists as a deliberately limited facade with no `Event` class, bubbling, capture or default actions. Installing a bridge object does not grant authority."
+            }
+          ]
+        },
+        {
+          "heading": "Try it in your browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.26 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it."
             }
           ]
         },
@@ -2731,7 +2814,7 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-15",
+      "dateModified": "2026-10-18",
       "sections": [
         {
           "heading": "Latest: v0.0.25, 15 October 2026",
@@ -2816,6 +2899,10 @@
             {
               "type": "p",
               "text": "Zipp is not on crates.io or npm yet. The WebAssembly archives are meant to be served by your own host; the [WebAssembly page](/wasm/) explains the Worker model and cache-key discipline."
+            },
+            {
+              "type": "p",
+              "text": "From 0.0.26, not yet published, the downloads are plain files: `zipp-<v>-windows-x86_64-portable.exe`, `zipp-<v>-windows-x86_64-installer.msi` (a per-user install that adds `zipp` to your PATH), and `zipp-<v>-linux-x86_64`, `zipp-<v>-linux-arm64` and `zipp-<v>-linux-armv7`; the WebAssembly engines become single `.wasm` files with an embed kit, described on the [WebAssembly page](/wasm/#from-0-0-26). The commands above are right for v0.0.25."
             }
           ]
         },
@@ -5475,6 +5562,341 @@
           {
             "label": "Embedding",
             "href": "/embedding/"
+          }
+        ]
+      },
+      {
+        "slug": "property-caches-inline-sorts-without-calls-and-an-eval-fix",
+        "date": "2026-10-16",
+        "title": "Property caches inline, sorts without calls, and an eval fix",
+        "summary": "After v0.0.25: the hostile bytecode-vm row back from 170 to 49 ms, a property cache's own-data hit taken inline in the interpreter, sorts and bitwise array callbacks without a call per element, and eval code that sees a replaced builtin.",
+        "tags": [
+          "javascript",
+          "performance",
+          "correctness"
+        ],
+        "commits": [
+          "fdb0222f",
+          "082d4a21",
+          "bdbec963",
+          "d9290e55",
+          "95fbe2dd",
+          "df840d75",
+          "879d7cf8",
+          "fc54b5a9",
+          "786be5b4",
+          "b628f56d",
+          "a34c60e6"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The 15 October capture had the hostile `bytecode-vm` row at 3.13× Node's time, from 0.98× on 2 September. Since the strict call order, its helper-table loop needed nine spill slots where a compiled integer region may use eight, so the whole loop fell to the slowest tier; a region holding a computed-call splice may now spill up to twelve (`fdb0222f`), and the row runs in 49 ms instead of 170. In the interpreter, a property cache's own-data read and store are taken inline instead of through the full cache call (`082d4a21`, `bdbec963`), which moved the 18-row interpreter geomean against Bellard's QuickJS from 0.903× to 0.866×. A sort by the exact comparator `(x, y) => x - y` over Numbers computes each comparison without calling it in every unmetered profile (`d9290e55`; 200,000 Numbers in 18 ms instead of 90, interpreted), the fused map, filter and reduce kernels learned the bitwise operators (`95fbe2dd`), a compiled `Map.get` went from 24 to 14 ns (`df840d75`, `879d7cf8`), and narrowing a double to an int and DataView member calls got cheaper (`fc54b5a9`, `786be5b4`)."
+          },
+          {
+            "type": "p",
+            "text": "One wrong result came from the same embedding style as v0.0.25's reports: a program that silenced `print` with `globalThis.print = function () {}` still printed from `eval`, indirect eval, `new Function` and an embedder's later scripts, because code compiled after the program started seeded its slot with the original builtin. The slot now takes the builtin only while the global object still holds it, and the first write of a builtin through the global object keeps its non-enumerable attributes, as OrdinarySet does (`b628f56d`). `a34c60e6` pins those writes on a non-extensible, a frozen and a sealed global against Node."
+          }
+        ],
+        "related": [
+          {
+            "label": "Benchmarks",
+            "href": "/benchmarks/"
+          },
+          {
+            "label": "JavaScript engine",
+            "href": "/javascript-engine/"
+          }
+        ]
+      },
+      {
+        "slug": "torch-kernels-native-and-python-allocations-trimmed",
+        "date": "2026-10-16",
+        "title": "Torch kernels in native loops, and Python allocation trimmed",
+        "summary": "Torch matrix products use AVX2 when the CPU has it, slice stores and index gradients run in native loops, short-lived tensor buffers are reclaimed by minor collections, and Python strings and instances recycle their buffers.",
+        "tags": [
+          "python",
+          "torch",
+          "performance",
+          "gc"
+        ],
+        "commits": [
+          "8a602902",
+          "fea13f06",
+          "d718caa9",
+          "4775d646",
+          "5cc98944",
+          "ec5d4f4c",
+          "38d627e0",
+          "883dc185",
+          "938235c9",
+          "3ca7f378",
+          "0f2d10ae",
+          "98e7e725",
+          "b12ce570"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "When the CPU has AVX2, `pt_matmul` multiplies four rows by eight columns at a time in four-lane registers, fusing the multiply and add only where every product is exact in an f64, so no value changes (`8a602902`; `torch_matmul` 0.72 ms instead of 0.91). Two element loops in tensor.js were 17% of the instructions a transformer training step ran: the store behind a slice assignment and the accumulation behind an index gather's gradient. Both now try a native loop first (`4775d646`; a 512 × 512 slice store into every other column in 0.28 ms instead of 3.5). TypedArray `fill` and cross-kind `set` store in bulk (`5cc98944`), `x.__class__` is read natively instead of through an interpreted `getattr` call (`d718caa9`), and installed code answers its cache and JIT eligibility without a range search (`fea13f06`)."
+          },
+          {
+            "type": "p",
+            "text": "The collector requested a major collection for every 8 MiB of large payloads, on the belief that the nursery pretenured them. It does not: tensor buffers are born young and die young. The schedule now asks for a minor and makes every fourth one a major (`ec5d4f4c`), and `torch_transformer` at 44 steps took 1 major and 12 minors in 16.2 ms where it took 6 majors and 2 minors in 28.7. The heap also recycles a dead Python instance's attribute buffer (`38d627e0`; 240,000 instances make 122,381 allocations instead of 335,620) and small string buffers for the str methods' results (`3ca7f378`), a literal's keys borrow their site's plan instead of counting references to it (`883dc185`), and a method site keeps the method itself in its cache entry (`b12ce570`). Each change was measured against its parent, mostly a few percent at a time, with the Python suites passing."
+          }
+        ],
+        "related": [
+          {
+            "label": "Python",
+            "href": "/python/"
+          }
+        ]
+      },
+      {
+        "slug": "superinstructions-and-a-second-interpreter-loop",
+        "date": "2026-10-17",
+        "title": "Superinstructions and a second, smaller interpreter loop",
+        "summary": "The interpreter runs common instruction pairs as one dispatch, pushes and pops the common frame inline, and runs simple functions and loops in a small second loop that keeps its state in registers.",
+        "tags": [
+          "javascript",
+          "performance",
+          "vm"
+        ],
+        "commits": [
+          "330a9118",
+          "98b4d769",
+          "b2b8f5ca",
+          "1b04c9bb",
+          "af87a2c7",
+          "702ad388",
+          "11c60356",
+          "d0a110be",
+          "4c16fc70",
+          "a2e02db3",
+          "16034c8c"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The first attempt was reverted the same day. Dropping a discarded assignment's result copy whenever the JIT was off (`330a9118`) made a metered program charge different steps with the JIT off than with it on, and the CI-full test that pins that parity failed (`98b4d769`). A JIT-capable build compiles the same bytecode in both modes again, and interpreter-only rewrites now go into a copy of each function's code instead. That copy is `b2b8f5ca`'s: adjacent pairs such as a loop bound's load and compare-branch, `x + 1`, or a counter step and its back-edge run as one superinstruction, while the original instructions stay in place for jumps, inline caches, the JIT and every recorder. `1b04c9bb` pushes and pops the common frame inline, and `af87a2c7` moved the choice of the copy past the native tiers, which had cost a JIT row about 7%."
+          },
+          {
+            "type": "p",
+            "text": "`702ad388` adds `vm/lite.rs`, a second interpreter loop small enough to keep its state in registers, for functions made only of loads, adds, compare-branches, calls and returns; it works on the real frames, so handing an instruction back to the main loop is free. `11c60356` then stopped re-checking the register file's live prefix on every read and write, a check the PC profile showed before each register write of `fib`. Later commits let the lite loop run loops with cached property and element access (`d0a110be`) and closures and Math methods (`4c16fc70`), and compiled it twice so a small copy keeps recursive integer functions fast (`a2e02db3`). In the commits' profile-guided measurements against Bellard's QuickJS 2026-06-04, the 18-row interpreter geomean went from 0.681× to 0.630× with the superinstructions and inline frames, and to 0.576× after the register-file change, faster on 16 of 18 rows; [the expansion suite's entry](/journal/twenty-one-new-workloads-against-quickjs/) explains why the held-out recipe's numbers are the ones to quote. Module namespaces also moved from SipHash to FxHash (`16034c8c`; `module-hot-graph` in 0.78× its previous time, interpreted)."
+          }
+        ],
+        "related": [
+          {
+            "label": "Engine architecture",
+            "href": "/architecture/"
+          },
+          {
+            "label": "Zipp compared with QuickJS",
+            "href": "/comparisons/"
+          }
+        ]
+      },
+      {
+        "slug": "one-folder-per-language",
+        "date": "2026-10-17",
+        "title": "One folder per language, and a table of languages",
+        "summary": "Each language's parser, compiler, runtime and native tier now live under src/lang/, a language is one entry of a table, docs/LANGUAGES.md describes how a language plugs into the shared VM, and the documentation moves under docs/.",
+        "tags": [
+          "vm",
+          "python",
+          "languages"
+        ],
+        "commits": [
+          "da8427b6",
+          "f89d51b8",
+          "3c39f3a8",
+          "06164d14",
+          "9f6dd66b",
+          "6c2bf933"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "JavaScript's parser and compiler sat at the top of `src/`, and Python was spread across `frontend/python`, `vm/py_*.rs`, `codegen/` and `vm/engine/`. `da8427b6` gathers each language under `src/lang/`: `lang/js/` holds the parser, the compiler and the front end, and `lang/python/` the frontend, its runtime and bundled library, its VM side and its native tier. Only files moved. Every module kept its name and its place in the module tree, so no item, symbol or visibility changed; `f89d51b8` fixed the one path the torch package's build still spelled the old way, and `06164d14` moved the Python parser crate under `lang/python/parser/`, still a crate of its own."
+          },
+          {
+            "type": "p",
+            "text": "`3c39f3a8` makes a language one entry of a table. A `Language` has its names, file extensions, shebang commands, a single-file compile and its bytecode dump, and detection, `--lang` and the compile dispatch all go through `languages()`, the base language first. [docs/LANGUAGES.md](https://github.com/f2i-com/zipp.org/blob/main/docs/LANGUAGES.md) describes the model it serves: the base instruction set is JavaScript's, a language emits its own instructions where its semantics differ (Python's `Instr::Py*`) and the base ones where they agree, and the document lists the steps for adding a language and the rules every language keeps. The same day the root's working documents moved under `docs/`, with an index and an archive of the dated records (`9f6dd66b`), and 425 old benchmark captures became rows of CSV files in `bench/history/` (`6c2bf933`)."
+          }
+        ],
+        "related": [
+          {
+            "label": "Engine architecture",
+            "href": "/architecture/"
+          },
+          {
+            "label": "How Python and JavaScript run on the same register VM",
+            "href": "/articles/python-and-javascript-on-one-register-vm/"
+          }
+        ]
+      },
+      {
+        "slug": "twenty-one-new-workloads-against-quickjs",
+        "date": "2026-10-17",
+        "title": "Twenty-one new workloads against Bellard's QuickJS",
+        "summary": "A diagnostic expansion suite of 21 workloads, run with the hostile suite against QuickJS, found where Zipp's interpreter still loses; Proxy traps, private names, Unicode strings, number formatting and eval were the first fixes.",
+        "tags": [
+          "performance",
+          "methodology",
+          "javascript"
+        ],
+        "commits": [
+          "37da4030",
+          "46f8cafe",
+          "a638d95a",
+          "c6b1354a",
+          "9eed4926",
+          "33e3d1be",
+          "93850fc6",
+          "cccb86d1",
+          "44abf49c",
+          "07b09f9c",
+          "0ecf155e",
+          "86088292"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "The canonical suites cover 35 workloads. `37da4030` adds `bench/expansion/`, a separate, versioned series of 21 deterministic workloads for what they do not reach: regex compilation, string building and Unicode scanning, small JSON messages, Proxy and accessors, objects as dictionaries, private class members, generators, a DataView codec, `new Function` and eval, and more. Every case prints byte-identical output on Node 24, Zipp and QuickJS at three sizes, and the harness records process cycles and peak memory and reports each row with a bootstrap interval. The first record (`46f8cafe`) needed a correction the same day: its build came from an ad-hoc profile-guided recipe trained on the rows it measured, so `a638d95a` added the canonical, held-out recipe's numbers as the ones to quote. Against QuickJS those are 0.674× its time on real13, 0.666× on micro5 and 0.834× on hostile17, and 1.199× on the expansion suite at its medium size, where QuickJS was faster on 14 of the 21 workloads."
+          },
+          {
+            "type": "p",
+            "text": "The weaknesses the record ranked became the next commits, each checked against Node and timed against QuickJS: dictionary deletes and key probes (`c6b1354a`); Proxy traps that built descriptor objects on every call (`9eed4926`; a forwarding store's get, set and has traps in 154 ms instead of 336, QuickJS 40); private names resolved once per access site (`33e3d1be`); positions in long non-ASCII strings found in bounded time and case maps done in one pass (`93850fc6`, `cccb86d1`), which took the Unicode scanning workload from 374 to 176 ms against QuickJS's 192; a repeated declaration-free direct eval re-run instead of compiled again (`44abf49c`; 27 ms instead of 165, QuickJS 65); `toFixed` and its siblings rounded exactly without guard digits (`07b09f9c`); and `yield*` stepping a generator directly (`86088292`). `0ecf155e` fixed a real bug found on the way: a class member with a computed key had no private brand chain, so it accepted another evaluation's private names where it must throw a TypeError."
+          }
+        ],
+        "related": [
+          {
+            "label": "Benchmarks",
+            "href": "/benchmarks/"
+          },
+          {
+            "label": "Zipp compared with QuickJS",
+            "href": "/comparisons/"
+          }
+        ]
+      },
+      {
+        "slug": "dictionary-holes-one-dispatch-switches-and-direct-statics",
+        "date": "2026-10-18",
+        "title": "Dictionary holes, one-dispatch switches and direct statics",
+        "summary": "Deleting from a large dictionary leaves a hole instead of shifting every later slot, a switch case on a literal dispatches once, and f.call, class statics, WeakMap methods and private fields skip the general paths.",
+        "tags": [
+          "javascript",
+          "performance",
+          "correctness"
+        ],
+        "commits": [
+          "944169e5",
+          "5793b4c8",
+          "47c13227",
+          "894a1ba9",
+          "4d498c5c",
+          "3e9df5d9",
+          "e789a836",
+          "c97d6247",
+          "66bccdb4",
+          "5d012480",
+          "9fa097ec",
+          "35f73b1a",
+          "8ec943a0",
+          "5f86d140"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "`delete` removed a property's slot with `Vec::remove` and renumbered every slot above it in both indexes, so emptying a 2,100-key dictionary key by key was quadratic. In a map of at least 32 slots the slot now stays as a hole, and holes are compacted in one pass once they are half the slots (`944169e5`). Every reader that walks slots has to skip them, which meant converting about 300 sites by meaning, and the suites were also run with a hole left by every delete to reach them all. Dict-churn's delete phase takes 15 ms instead of 56 (QuickJS 9). A `switch` case on an integer or string literal now runs its load, `===` and branch as one superinstruction (`5793b4c8`; a 15-case integer switch in 87 ms instead of 133, QuickJS 95), and `if (m === 0)` does the same with the other branch sense (`47c13227`)."
+          },
+          {
+            "type": "p",
+            "text": "The rest of the day took general paths out of common calls. `f.call(t, ...)` enters `f` as a frame of the same loop rather than through the builtin dispatcher (`894a1ba9`; a million calls in 30 ms instead of 50, level with QuickJS); class statics and a function's own properties are read and written without the member walk (`4d498c5c`; two million `A.count++` in 44 ms instead of 97); a WeakMap's methods are called directly (`3e9df5d9`); private field reads and writes skip a brand check the field lookup already answers (`e789a836`, `c97d6247`); a Proxy read goes straight to its `[[Get]]` and a forwarded `Reflect.set` stores into the slot (`66bccdb4`, `5d012480`); a typed array's default species view skips the constructor reads (`9fa097ec`); a key added by `o[k] = v` is hashed once (`35f73b1a`); and a present element of a plain array is stored directly (`8ec943a0`). Writing the tests for the class-static lanes found three integrity bugs, fixed in `5f86d140`: `Object.freeze` of a class left its statics writable, a non-extensible class still took new statics, and assigning to a function's own accessor overwrote the getter instead of calling the setter."
+          }
+        ],
+        "related": [
+          {
+            "label": "JavaScript engine",
+            "href": "/javascript-engine/"
+          },
+          {
+            "label": "Benchmarks",
+            "href": "/benchmarks/"
+          }
+        ]
+      },
+      {
+        "slug": "the-latest-test262-run-once-unmodified",
+        "date": "2026-10-18",
+        "title": "The latest Test262, run once and unmodified",
+        "summary": "The Test262 pin moves to tc39/test262 d53ebc8b of 13 October 2026, with iterator chunks, windows and includes, Promise.try and module sources passing: 96,229 of 96,230 executions, one documented expected failure, no corrections.",
+        "tags": [
+          "conformance",
+          "javascript",
+          "arm64",
+          "python"
+        ],
+        "commits": [
+          "a57c51b4",
+          "6739da17",
+          "67a7e1cc",
+          "1fb485f3",
+          "57374b30",
+          "57068197",
+          "bdbdc2b1"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Upstream test262 at `d53ebc8b` adds 236 executions the engine failed, and `6739da17` implements what they test: `Iterator.prototype.chunks` and `windows` from the stage 4 iterator chunking proposal, `Iterator.prototype.includes`, the 2^53-1 limit on `take` and `drop`, `Promise.try` returning through PromiseResolve, and the test262 host's module-source object. `a57c51b4` fixed iterator closing beside it: it resumed every generator with the intrinsic `return`, so an overridden `return` was never called. `67a7e1cc` moves the security workflow's Test262 job to the new pin and runs the corpus once, unmodified: 96,229 of 96,230 executions pass with zero skips, and the DateTimeFormat ECMA-402 shard 490 of 490. The one expected failure is `annexB/language/function-code/block-decl-func-skip-arguments.js` in sloppy mode, whose final assertion is ES2017 wording that ES2018 deleted (Node fails it too). The other eight expected-failure entries went with upstream's own fixes, and with them the five correction patches and the second, patched run. A debug-assertion run of the corpus found one more defect, a meaningless heap read when `Promise.all` steps a primitive iterable (`1fb485f3`)."
+          },
+          {
+            "type": "p",
+            "text": "Two other checks came back. The engine's tests no longer compiled on arm64 after the superinstruction pass added a field the aarch64 JIT's tests did not set, and two register-file accessors were dead code off x86-64, which `-Dwarnings` turns into an error (`57374b30`). The engine and its tests now build warning-free for aarch64 Linux and macOS, and the engine with the CLI's features for armv7 Linux. And the Python corpus now runs on the CPU path and expects CPython 3.13's rule for a final `**` glob, so all 196 programs match CPython 3.13.14, in the default, no-fast-path, interpreter and no-Python-JIT modes (`57068197`). `bdbdc2b1` recorded a dependency edge the sandbox and WebAssembly lockfiles were missing."
+          }
+        ],
+        "related": [
+          {
+            "label": "Test262 conformance",
+            "href": "/test262/"
+          },
+          {
+            "label": "Python",
+            "href": "/python/"
+          }
+        ]
+      },
+      {
+        "slug": "release-packaging-one-wasm-per-engine-and-plain-native-files",
+        "date": "2026-10-18",
+        "title": "Release packaging: one .wasm per engine and plain native files",
+        "summary": "In progress for 0.0.26: each WebAssembly engine ships as one .wasm carrying its own bindings, one loader runs any of them in a default-deny sandbox, and native downloads become plain files, Linux arm64 and armv7 included.",
+        "tags": [
+          "release",
+          "wasm",
+          "embedding",
+          "security"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Work in progress for 0.0.26, not yet released, changes what a release ships. Every WebAssembly engine becomes a single file, `zipp-<version>-javascript.wasm`, `-javascript-lite.wasm`, `-javascript-python.wasm` or `-javascript-python-base.wasm`, beside `zipp-<version>-torch-package.wasm`. Each engine carries the JavaScript bindings generated for exactly that build in a custom section, with a record of its version, commit and variant, so a glue file can no longer meet another build's module. One loader, `zipp.mjs`, reads that record and those bindings and runs any of the engines in a page, a Worker, Node, Deno or Bun. It ships in `zipp-<version>-wasm-embed-kit.zip` with its types, the host SDK, the GPU lab, the docs and examples."
+          },
+          {
+            "type": "p",
+            "text": "A sandbox made by that loader starts with no storage, no files, no network and no host functions, and each is granted explicitly: a private in-memory `localStorage`, a map of files to read (and to write, if allowed), a `fetch` that reaches only listed origins or URL prefixes and sends no cookies, and named host functions. An instruction budget stops runaway computation inside the engine, and each sandbox runs in its own Worker by default, which a time limit terminates. Native downloads become plain files: a Windows portable `.exe`, a Windows `.msi` that installs per user and adds `zipp` to the user's PATH, and Linux binaries for x86-64, arm64 and armv7. This site gains a [sandbox playground](/sandbox/playground/) for the new loader, which runs once 0.0.26 is published."
+          }
+        ],
+        "related": [
+          {
+            "label": "WebAssembly runtime",
+            "href": "/wasm/"
+          },
+          {
+            "label": "Sandboxing untrusted code",
+            "href": "/sandbox/"
           }
         ]
       }

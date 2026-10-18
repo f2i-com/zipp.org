@@ -30,8 +30,11 @@ test('content.json passes validation and every page has unique SEO metadata', ()
   }
 })
 
+// Interactive pages served from public/ rather than rendered from content.json.
+const publicPages = ['/playground/', '/sandbox/playground/']
+
 test('internal links resolve to a route or a known public file', () => {
-  const known = new Set([...routes, '/', '/playground/', '/journal/feed.xml', '/journal/index.json', '/sitemap.xml', '/robots.txt', '/zipp-bolt.svg', '/zipp-og-card.png'])
+  const known = new Set([...routes, '/', ...publicPages, '/journal/feed.xml', '/journal/index.json', '/sitemap.xml', '/robots.txt', '/zipp-bolt.svg', '/zipp-og-card.png'])
   const publicFiles = ['/demos/python-wasm-flow.svg', '/demos/python-life.png', '/demos/python-life.gif']
   for (const file of publicFiles) known.add(file)
   const broken = []
@@ -52,11 +55,11 @@ test('inline markup escapes HTML and renders bold, code and links', () => {
 
 test('sitemap lists every route once with a lastmod, and robots points at it', () => {
   const sitemap = files.get('sitemap.xml')
-  for (const route of [...routes, '/', '/playground/']) {
+  for (const route of [...routes, '/', ...publicPages]) {
     const occurrences = sitemap.split(`<loc>${content.site.origin}${route}</loc>`).length - 1
     assert.equal(occurrences, 1, `${route} appears once in the sitemap`)
   }
-  assert.equal((sitemap.match(/<url>/g) || []).length, routes.length + 2)
+  assert.equal((sitemap.match(/<url>/g) || []).length, routes.length + 1 + publicPages.length)
   assert.ok(/<lastmod>\d{4}-\d{2}-\d{2}<\/lastmod>/.test(sitemap))
   assert.ok(!sitemap.includes('404.html'))
   assert.equal(files.get('robots.txt'), `User-agent: *\nAllow: /\nDisallow: /api/\n\nSitemap: ${content.site.origin}/sitemap.xml\n`)
@@ -133,7 +136,8 @@ test('release install snippets run the Linux CLI the way releases package it', (
 
 test('the home page keeps the site identity and links to the documentation without JavaScript', () => {
   const home = readFileSync(new URL('../index.html', import.meta.url), 'utf8')
-  assert.ok(home.includes('<title>Zipp: Rust JavaScript &amp; Python Engine</title>'))
+  assert.ok(home.includes('<title>ZIPP: Portable Polyglot Runtime for JavaScript and Python</title>'))
+  assert.ok(home.includes('Zippy Interpreter for Polyglot Programming'), 'home spells out the name')
   assert.ok(new RegExp(`<link rel="canonical" href="${content.site.origin}/" ?/?>`).test(home))
   assert.ok(home.includes('"SoftwareApplication"') && home.includes('"WebSite"'))
   for (const item of content.site.nav) assert.ok(home.includes(`href="${item.href}"`), `home links to ${item.href}`)

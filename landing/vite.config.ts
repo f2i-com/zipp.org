@@ -47,10 +47,14 @@ export default defineConfig(({ command }) => ({
         server.middlewares.use((request, response, next) => {
           const routedRequest = request as typeof request & { url?: string }
           const [pathname, query] = (routedRequest.url || '').split('?')
-          if (pathname === '/playground') {
-            response.writeHead(302, { location: '/playground/' + (query ? `?${query}` : '') }); response.end(); return
+          // The two interactive pages are folders in public/; production serves
+          // their index.html for the folder URL, so the dev server does too.
+          for (const page of ['/playground', '/sandbox/playground']) {
+            if (pathname === page) {
+              response.writeHead(302, { location: `${page}/` + (query ? `?${query}` : '') }); response.end(); return
+            }
+            if (pathname === `${page}/`) routedRequest.url = `${page}/index.html` + (query ? `?${query}` : '')
           }
-          if (pathname === '/playground/') routedRequest.url = '/playground/index.html' + (query ? `?${query}` : '')
           next()
         })
       },

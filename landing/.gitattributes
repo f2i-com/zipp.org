@@ -1,0 +1,7 @@
+# The sandbox playground's engine files are recorded by SHA-256 in
+# public/sandbox/manifest.json (scripts/sync-sandbox.mjs); never convert their
+# line endings, as the repository root does for public/wasm and
+# public/playground-runtime.
+public/sandbox/zipp.mjs -text
+public/sandbox/*.wasm -text
+public/sandbox/manifest.json -text

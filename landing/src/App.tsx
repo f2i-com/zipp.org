@@ -3,13 +3,14 @@ import { formatCount, relativeTime, useRepoStats, type RepoStats, type RepoStatu
 import { SandboxStack, ProjectShowcase } from './Experience'
 import { RepositoryActivity } from './RepositoryActivity'
 import { ProjectPlayground } from './ProjectPlayground'
-import { RecordedDemos } from './RecordedDemos'
 import { test262Summary } from './repoData'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
 const DOCS_URL = '/javascript-engine/'
 const EMBEDDING_URL = '/embedding/'
+const SANDBOX_PLAYGROUND_URL = '/sandbox/playground/'
+const LANGUAGES_URL = `${GITHUB_URL}/blob/main/docs/LANGUAGES.md`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
 const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
@@ -29,6 +30,7 @@ const DOC_LINKS = [
   { href: '/webgpu/', title: 'GPU compute', text: 'Float32 graphs from Python and JavaScript on WebGPU, WebGL2 or WASM kernels.' },
   { href: '/embedding/', title: 'Embedding guide', text: 'The Rust embed API, the browser Engine class, and the CLI as a host.' },
   { href: '/sandbox/', title: 'Sandboxing untrusted code', text: 'Three execution profiles, their guarantees, and their non-guarantees.' },
+  { href: SANDBOX_PLAYGROUND_URL, title: 'Sandbox playground', text: 'Run JavaScript in a default-deny sandbox, with a switch for every permission and limit.' },
   { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
   { href: '/journey/', title: 'The Zipp story', text: '1,927 commits in 108 days, told in five acts with the mistakes left in.' },
   { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
@@ -549,8 +551,8 @@ const controls = [
 ]
 
 const pipeline = [
-  ['01', 'Source', 'Modern JavaScript'],
-  ['02', 'Front end', 'Own lexer + parser'],
+  ['01', 'Source', 'JavaScript or Python'],
+  ['02', 'Front end', 'One per language'],
   ['03', 'Bytecode', 'Register-based VM'],
   ['04', 'Hot loops', 'x86-64 OSR JIT'],
 ]
@@ -578,7 +580,7 @@ function Brand() {
         </defs>
         <path d="M92 0 0 122h58l-25 86L142 69h-62z" fill={`url(#${gradientId})`} />
       </svg>
-      <span>Zipp</span>
+      <span>ZIPP</span>
     </span>
   )
 }
@@ -931,7 +933,7 @@ function App() {
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
           <a href="/javascript-engine/">Docs</a>
           <a href="#playground" onClick={closeMenu}>Playground</a>
-          <a href="#recorded-demos" onClick={closeMenu}>Python &amp; GPU</a>
+          <a href="/webgpu/">Python &amp; GPU</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
           <a href="#updates" onClick={closeMenu}>What’s new</a>
           <a href="#controls" onClick={closeMenu}>Controls</a>
@@ -952,24 +954,26 @@ function App() {
       <main id="main-content">
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
-            <a className="result-pill" href="#recorded-demos">
-              <span>PYTHON · JAVASCRIPT · GPU</span>
-              <strong>See the real programs run</strong>
+            <a className="result-pill" href="#playground">
+              <span>ZIPPY INTERPRETER FOR POLYGLOT PROGRAMMING</span>
+              <strong>Run JavaScript or Python here</strong>
               <span aria-hidden="true">↗</span>
             </a>
 
             <h1>
-              Two languages.<br /><em>More to explore.</em>
+              One runtime.<br /><em>Polyglot by design.</em>
             </h1>
 
             <p className="hero-intro">
-              Zipp is a JavaScript and Python engine written in Rust: one register VM with native
-              JITs, a WebAssembly playground, and browser GPU compute.
-              <strong> Write code, run it, and watch your simulations come alive.</strong>
+              ZIPP is a portable polyglot runtime: one Rust register-bytecode VM that languages compile to,
+              so programs share one runtime, one sandbox and one set of embeddings, from the native CLI
+              and Rust to WebAssembly in browsers, Node, Deno and Bun.
+              <strong> JavaScript (ES2025, 99.999% of Test262) and Python (an experimental subset, with torch) run on it today.</strong>
+              {' '}The VM is built for more: <a href={LANGUAGES_URL} target="_blank" rel="noreferrer">how a language plugs in</a>.
             </p>
 
             <div className="hero-actions">
-              <a className="button button-primary" href="#recorded-demos">Watch the examples <span aria-hidden="true">↗</span></a>
+              <a className="button button-primary" href="#playground">Try the playground <span aria-hidden="true">↗</span></a>
               <ExternalLink className="button button-secondary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
             </div>
 
@@ -986,7 +990,7 @@ function App() {
         </section>
 
         <section className="proof-band" aria-label="Measured native Zipp results">
-          <div className="proof-caption section-wrap"><span>NATIVE BENCHMARK SNAPSHOT</span><a href="#benchmarks">2 Sep 2026 · v0.0.12 · see the evidence ↗</a></div>
+          <div className="proof-caption section-wrap"><span>NATIVE BENCHMARK SNAPSHOT</span><a href="#benchmarks">15 Oct 2026 · capture fa8e3b86 · see the evidence ↗</a></div>
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
@@ -1010,8 +1014,6 @@ function App() {
             </div>
           </div>
         </section>
-
-        <RecordedDemos />
 
         <ProjectPlayground />
 
@@ -1075,6 +1077,8 @@ function App() {
                 <span aria-hidden="true">!</span>
                 <p><strong>One layer, honestly described.</strong> Use the separately resolved, no-JIT <code>zipp-sandbox</code> runner for hostile native code, then add OS/process isolation when the threat model requires it.</p>
               </div>
+
+              <a className="text-link controls-try" href={SANDBOX_PLAYGROUND_URL}>Switch each permission on and off in the sandbox playground<ArrowIcon /></a>
             </div>
 
             <div className="code-window" aria-label="Rust embedding example">
@@ -1280,8 +1284,8 @@ function App() {
                 <h2>Own the path from source to native code.</h2>
               </div>
               <p>
-                Zipp’s lexer, parser, bytecode compiler, register VM, collector, inline caches,
-                and native JIT live in this repository. No parser or runtime is hiding in the middle.
+                ZIPP’s parsers, bytecode compilers, register VM, collector, inline caches and native JIT
+                live in this repository, shared by every language it runs. No parser or runtime is hiding in the middle.
               </p>
             </div>
 
@@ -1347,7 +1351,7 @@ function App() {
           <div className="section-heading">
             <p className="section-kicker">Documentation</p>
             <h2 id="docs-heading">Read how it works.</h2>
-            <p>Static, linkable pages for every part of the engine, all rendered from one content file.</p>
+            <p>Static, linkable pages for every part of the runtime, and a sandbox to try it in.</p>
           </div>
           <div className="docs-grid">
             {DOC_LINKS.map((doc) => (
@@ -1381,7 +1385,7 @@ function App() {
       <footer className="site-footer section-wrap">
         <a className="brand" href="#top" aria-label="Back to top"><Brand /></a>
         <p>
-          Python + JavaScript · one VM · browser GPU compute · part of{' '}
+          Portable polyglot runtime · JavaScript + Python today · one VM · part of{' '}
           <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
         </p>
         <div>

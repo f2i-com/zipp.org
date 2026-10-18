@@ -43,16 +43,9 @@ def main():
         page.on('response', lambda response: failed.append((response.status, response.url)) if response.status >= 400 else None)
         page.on('request', lambda request: posts.append(request.url) if request.method == 'POST' else None)
         page.goto(BASE + '/')
-        page.locator('#recorded-demos').scroll_into_view_if_needed()
-        page.get_by_role('button', name='Play animations', exact=True).wait_for()
-        assert page.locator('.recorded-card img[src$=".png"]').count() == 1
-        page.locator('#recorded-demos').screenshot(path=str(OUT / 'recorded-demos.png'))
-        page.get_by_role('button', name='Play animations', exact=True).click()
-        assert page.locator('.recorded-card img[src$=".gif"]').count() == 1
-        page.get_by_role('button', name='Pause animations', exact=True).click()
-        page.emulate_media(reduced_motion='no-preference')
-        expect(page.get_by_role('button', name='Pause animations', exact=True)).to_be_visible()
-        assert page.locator('.recorded-card img[src$=".gif"]').count() == 1
+        # The real playground is the demonstration; no recording of it sits above it.
+        assert page.locator('#recorded-demos').count() == 0
+        assert page.locator('img[src$=".gif"]').count() == 0
         page.locator('#playground').scroll_into_view_if_needed()
         frame = page.locator('iframe.project-playground-frame').content_frame
         frame.locator('#status').filter(has_text='languages: javascript, python').wait_for(timeout=60000)
@@ -70,7 +63,7 @@ def main():
         page.set_viewport_size(dict(width=390, height=844))
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'mobile landing overflow'
         page.locator('#playground').screenshot(path=str(OUT / 'embedded-mobile.png'))
-        print('Landing media controls, embedded Python, desktop/mobile layout passed.', flush=True)
+        print('Landing page, embedded Python, desktop/mobile layout passed.', flush=True)
 
         page.goto(BASE + '/playground')
         expect(page.locator('#status')).to_contain_text('languages:', timeout=60000)

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<!-- The loader compiles the engine module here and imports the module's own
+     bindings from a blob: URL, then starts each sandbox's Worker from
+     /sandbox/zipp.mjs. connect-src stays 'self', so a sandbox granted another
+     origin is still stopped by the browser on this page. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data:; script-src 'self' blob: 'wasm-unsafe-eval' https://static.cloudflareinsights.com; worker-src 'self'; style-src 'self'; connect-src 'self' https://cloudflareinsights.com">
+<title>ZIPP Sandbox Playground: Permissions and Limits in the Browser</title>
+<meta name="description" content="Run JavaScript in a default-deny ZIPP sandbox in your browser: switch storage, files, network and host functions on and off, set step and time limits, and see the result.">
+<link rel="canonical" href="https://www.zipp.org/sandbox/playground/">
+<link rel="icon" href="/zipp-bolt.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/sandbox/playground/sandbox.css">
+<meta name="theme-color" content="#101016">
+<meta name="color-scheme" content="dark">
+<meta property="og:site_name" content="Zipp">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://www.zipp.org/sandbox/playground/">
+<meta property="og:title" content="ZIPP Sandbox Playground: Permissions and Limits in the Browser">
+<meta property="og:description" content="Run JavaScript in a default-deny ZIPP sandbox: switch each permission and limit, and see what the program printed or why it was stopped.">
+<meta property="og:image" content="https://www.zipp.org/zipp-og-card.png">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header">
+  <a class="brand" href="/"><img src="/zipp-bolt.svg" alt="" width="28" height="28"><span>Zipp</span></a>
+  <nav class="site-nav" aria-label="Documentation">
+    <a href="/sandbox/">Sandbox</a>
+    <a href="/wasm/">WebAssembly</a>
+    <a href="/embedding/">Embedding</a>
+    <a href="/playground/">Playground</a>
+    <a href="/journal/">Journal</a>
+  </nav>
+</header>
+<main id="main" class="page">
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><ol><li><a href="/">Zipp</a></li><li><a href="/sandbox/">Sandbox</a></li><li aria-current="page">Playground</li></ol></nav>
+  <header class="page-header">
+    <h1>Sandbox playground</h1>
+    <p class="lede">Edit JavaScript and run it in a ZIPP sandbox. Nothing outside the program is permitted until you switch it on: storage, files, the network and host functions each have a switch, and steps and time each have a limit. The output shows what the program printed, and the refusal or limit that stopped it.</p>
+  </header>
+
+  <p class="engine-status" id="engine-status" role="status" data-state="loading">Loading the ZIPP sandbox…</p>
+  <div class="notice" id="unavailable" hidden>
+    <strong>Available once ZIPP 0.0.26 is published.</strong>
+    <p>This page runs the single-file WebAssembly engine and the <code>zipp.mjs</code> loader that ZIPP 0.0.26 introduces, and those files are not on this site yet. Until then, the <a href="/playground/">playground</a> runs ZIPP 0.0.25 in your browser, and the <a href="/wasm/#from-0-0-26">WebAssembly page</a> describes the sandbox this page will run.</p>
+  </div>
+  <noscript><div class="notice"><strong>JavaScript is off.</strong><p>The sandbox playground runs ZIPP in your browser, so it needs JavaScript. The <a href="/sandbox/">sandbox page</a> describes the model.</p></div></noscript>
+
+  <div class="workbench">
+    <section class="pane editor-pane" aria-labelledby="program-heading">
+      <div class="pane-head">
+        <h2 id="program-heading">Program</h2>
+        <label class="inline-field">Example <select id="example"></select></label>
+      </div>
+      <p class="hint" id="example-hint"></p>
+      <label class="sr-only" for="source">JavaScript source</label>
+      <textarea id="source" class="source" spellcheck="false" autocapitalize="off" autocomplete="off" rows="18"></textarea>
+      <div class="call-row">
+        <label for="call-name">Then call</label>
+        <input id="call-name" type="text" spellcheck="false" autocomplete="off" placeholder="a function name">
+        <label for="call-args">with</label>
+        <input id="call-args" type="text" spellcheck="false" autocomplete="off" placeholder="JSON arguments, e.g. [&quot;visitor&quot;]">
+      </div>
+      <div class="actions">
+        <button id="run" type="button" class="button-primary" disabled>Run in a sandbox <kbd>Ctrl+Enter</kbd></button>
+        <button id="stop" type="button" disabled>Stop</button>
+        <button id="reset" type="button">Reset example</button>
+      </div>
+    </section>
+
+    <section class="pane output-pane" aria-labelledby="output-heading">
+      <div class="pane-head">
+        <h2 id="output-heading">Output</h2>
+        <span class="run-state" id="run-state" data-state="idle">Not run yet</span>
+      </div>
+      <div class="verdict" id="verdict" hidden><strong id="verdict-title"></strong><p id="verdict-text"></p></div>
+      <pre class="output" id="output" tabindex="0" aria-live="polite" aria-label="Sandbox console output"></pre>
+      <div class="snapshot" id="snapshot-box" hidden>
+        <h3>What the page reads back</h3>
+        <p class="hint"><code>await sandbox.snapshot()</code> after the run:</p>
+        <pre class="output" id="snapshot"></pre>
+      </div>
+    </section>
+
+    <section class="pane settings-pane" aria-labelledby="settings-heading">
+      <h2 id="settings-heading">Permissions and limits</h2>
+      <fieldset>
+        <legend>Permissions</legend>
+        <div class="permission">
+          <label class="switch"><input type="checkbox" id="perm-storage"><span>Storage</span></label>
+          <p class="hint">A private, in-memory <code>localStorage</code>, seeded with this data. Without it, <code>localStorage</code> throws a <code>SecurityError</code>.</p>
+          <label class="sr-only" for="storage-initial">Initial storage, as a JSON object of strings</label>
+          <textarea id="storage-initial" class="json" rows="2" spellcheck="false"></textarea>
+        </div>
+        <div class="permission">
+          <label class="switch"><input type="checkbox" id="perm-files"><span>Files</span></label>
+          <p class="hint">Paths and their text, read with <code>host.callSync("fs.read", path)</code>, <code>"fs.list"</code> and <code>"fs.exists"</code>.</p>
+          <label class="sr-only" for="files-map">Files, as a JSON object of paths to text</label>
+          <textarea id="files-map" class="json" rows="2" spellcheck="false"></textarea>
+          <label class="check"><input type="checkbox" id="files-writable"> Writable: also <code>"fs.write"</code> and <code>"fs.remove"</code></label>
+        </div>
+        <div class="permission">
+          <label class="switch"><input type="checkbox" id="perm-network"><span>Network</span></label>
+          <p class="hint">A <code>fetch</code> that reaches only these origins or URL prefixes, one per line, with no cookies. Without it, <code>fetch</code> does not exist. This page's own security policy lets the browser reach only this site, so another allowed origin still fails here.</p>
+          <label class="sr-only" for="network-allow">Allowed URLs, one per line</label>
+          <textarea id="network-allow" class="json" rows="2" spellcheck="false"></textarea>
+        </div>
+        <div class="permission">
+          <label class="switch"><input type="checkbox" id="perm-host"><span>Host functions</span></label>
+          <p class="hint">The page answers <code>host.call("page.time", …)</code> and <code>host.call("dice.roll", …)</code>. Without them, every <code>host.call</code> answers <code>denied</code>.</p>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Limits</legend>
+        <label class="field" for="limit-steps">Steps</label>
+        <input id="limit-steps" type="number" min="1" max="2000000000" step="1" inputmode="numeric">
+        <p class="hint">Instructions the engine may run in total, at most 2,000,000,000. Past it the engine stops the program with a <code>resource</code> error.</p>
+        <label class="field" for="limit-time">Time limit, in milliseconds</label>
+        <input id="limit-time" type="number" min="100" max="60000" step="100" inputmode="numeric">
+        <p class="hint">How long the run may take. Each sandbox runs in its own Worker, and the page terminates the Worker when the time is up (<code>timeout</code>). With the default 50,000,000 steps an endless loop usually runs out of steps first.</p>
+      </fieldset>
+    </section>
+
+    <section class="pane code-pane" aria-labelledby="code-heading">
+      <h2 id="code-heading">The same sandbox in your page</h2>
+      <p class="hint">With the files of a release beside your page: the loader <code>zipp.mjs</code> from <code>zipp-&lt;version&gt;-wasm-embed-kit.zip</code>, and the engine module.</p>
+      <pre class="code"><code id="options-code"></code></pre>
+    </section>
+  </div>
+</main>
+<footer class="site-footer">
+  <p>ZIPP, the Zippy Interpreter for Polyglot Programming: a portable polyglot runtime, JavaScript and Python today. Built in the open by <a href="https://f2i.com">f2i</a>.</p>
+  <nav aria-label="Footer"><a href="/">Home</a><a href="/sandbox/">Sandbox</a><a href="/wasm/">WebAssembly</a><a href="/embedding/">Embedding</a><a href="/releases/">Releases</a><a href="/journal/">Journal</a><a href="https://github.com/f2i-com/zipp.org">GitHub</a></nav>
+</footer>
+<script type="module" src="/sandbox/playground/sandbox.js"></script>
+</body>
+</html>
