@@ -46,8 +46,15 @@ async function handle(msg) {
       // Module and bridge loading are HOST failures: nothing the guest wrote
       // is involved, and the engine does not exist yet (or is unconfigured).
       try {
-        zipp = await import(msg.moduleUrl);
-        await zipp.default({ module_or_path: msg.wasmUrl });
+        if (msg.moduleUrl) {
+          zipp = await import(msg.moduleUrl);
+          await zipp.default({ module_or_path: msg.wasmUrl });
+        } else {
+          // The embed kit's loader: any ZIPP release module, which carries
+          // its own bindings.
+          const { loadZipp } = await import(msg.loaderUrl);
+          zipp = (await loadZipp(msg.wasmUrl)).bindings;
+        }
       } catch (error) {
         dead = fail("host", `engine module failed to load: ${describeThrownError(error).message}`, undefined, true);
         return { error: dead };

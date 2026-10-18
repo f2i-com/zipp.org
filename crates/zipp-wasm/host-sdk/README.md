@@ -1,6 +1,7 @@
-# zipp-host: the reference host adapter (v1.2.0)
+# zipp-host: the reference host adapter (v1.3.0)
 
-Two ES modules a browser application copies next to the released web package:
+Two ES modules, shipped in the release's embed kit (`zipp-<version>-wasm-embed-kit.zip`)
+as `host-sdk/`, beside the kit's loader `zipp.mjs`:
 
 - `zipp-host.mjs` — the main-thread API: `createZippHost(config)`.
 - `zipp-host.worker.mjs` — the Worker it spawns, one per guest (it imports
@@ -14,9 +15,7 @@ contract (the 11 September 2026 audit's ZIPP-17) instead of writing its own.
 import { createZippHost } from "./host-sdk/zipp-host.mjs";
 
 const host = createZippHost({
-  moduleUrl: "/zipp/zipp_wasm.js",
-  wasmUrl: "/zipp/zipp_wasm_bg.wasm",
-  workerUrl: "/host-sdk/zipp-host.worker.mjs",
+  wasmUrl: "/zipp/zipp-0.0.26-javascript.wasm",  // any ZIPP engine module
   capabilities: ["ls.getItem", "ls.setItem"],   // exact sync grants; default none
   bridgeModuleUrl: "/my/bridges.mjs",           // default export builds { db, localStorage, clipboard, app } IN the Worker
   instructionBudget: 200_000_000,               // optional, applied before initScript
@@ -36,11 +35,15 @@ for (;;) {
 host.terminate();                               // the Worker and its WASM instance end
 ```
 
-**Distribution.** The released web archive (`zipp-wasm-<version>-web.zip`)
-ships this directory as `host-sdk/` beside the generated bindings, at the
-exact revision the module was built from (`BUILD-INFO.txt` names both the
-commit and this SDK version). Serve the two files from one directory; the
-Worker resolves `./zipp-host.mjs` relative to its own URL.
+**Distribution.** The embed kit ships this directory as `host-sdk/`, with
+`zipp.mjs` one level up, at the exact revision of the release's modules
+(`BUILD-INFO.txt` names the commit and this SDK version). With no
+`moduleUrl`, the Worker loads `wasmUrl` through that loader, which reads the
+bindings out of the module itself, so any ZIPP release module works; a
+relative `wasmUrl` resolves against the page. `workerUrl` and `loaderUrl`
+default to the kit's own files; serve the kit's directory as it is, or pass
+both. `moduleUrl` (a separately served wasm-bindgen `zipp_wasm.js`) still
+selects the pair loading of SDK 1.2.0, with `wasmUrl` as its module.
 
 **Lifecycle.** `created → initializing → ready → dead`, forwards only. Every
 guest runs in its own dedicated Worker and WASM instance, so `terminate()` is

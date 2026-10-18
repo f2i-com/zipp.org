@@ -312,5 +312,30 @@ await test("the configuration is frozen at creation", async (ctx) => {
   host.terminate();
 });
 
+await test("without moduleUrl the Worker gets the kit's loader and string URLs", async () => {
+  // SDK 1.3: the embed kit layout is host-sdk/zipp-host.mjs beside zipp.mjs,
+  // so the defaults are this file's sibling Worker and its parent's loader.
+  const host = createZippHost({ wasmUrl: new URL("https://example.test/zipp.wasm"), deadlineMs: 50 });
+  const worker = FakeWorker.instances.at(-1);
+  const p = host.init("1");
+  const sent = worker.sent.at(-1);
+  assert.equal(sent.moduleUrl, null);
+  assert.equal(sent.wasmUrl, "https://example.test/zipp.wasm");
+  assert.equal(sent.loaderUrl, new URL("../zipp.mjs", new URL("../../host-sdk/zipp-host.mjs", import.meta.url)).href);
+  worker.reply(sent, { value: {} });
+  await p;
+  host.terminate();
+  assert.throws(() => createZippHost({ deadlineMs: 50 }), (e) => e.category === "usage");
+  // An explicit glue file keeps the 1.2 pair loading: no loader is sent.
+  const pair = createZippHost({ moduleUrl: "m", wasmUrl: "w", workerUrl: "k", deadlineMs: 50 });
+  const w2 = FakeWorker.instances.at(-1);
+  const p2 = pair.init("1");
+  assert.equal(w2.sent.at(-1).loaderUrl, null);
+  assert.equal(w2.sent.at(-1).moduleUrl, "m");
+  w2.reply(w2.sent.at(-1), { value: {} });
+  await p2;
+  pair.terminate();
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

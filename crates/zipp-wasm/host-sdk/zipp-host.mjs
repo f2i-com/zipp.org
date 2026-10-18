@@ -1,14 +1,17 @@
 // zipp-host: a small reference host adapter for the zipp-wasm engine in a
-// browser, version 1.2.0. The 11 September 2026 audit's ZIPP-17 asked for one
+// browser, version 1.3.0. The 11 September 2026 audit's ZIPP-17 asked for one
 // consistent lifecycle/error/capability contract for embedders; this is it,
 // kept deliberately small so an application can read it in one sitting.
 //
 // The shape:
 //
 //   const host = createZippHost({
-//     moduleUrl: "/zipp/zipp_wasm.js",      // the web-target wasm-bindgen glue
-//     wasmUrl: "/zipp/zipp_wasm_bg.wasm",   // its module
+//     wasmUrl: "/zipp/zipp-<version>-javascript.wasm", // any ZIPP engine module
+//     // Optional. The Worker and the embed kit's loader default to their
+//     // places in the kit, beside and above this file; `moduleUrl` (a
+//     // separately served wasm-bindgen glue file) replaces the loader.
 //     workerUrl: "/host-sdk/zipp-host.worker.mjs",
+//     loaderUrl: "/zipp/zipp.mjs",
 //     capabilities: ["ls.getItem"],         // exact sync grants; default none
 //     bridgeModuleUrl: "/my/bridges.mjs",   // optional: builds db/ls/clipboard
 //                                           // objects INSIDE the Worker
@@ -62,7 +65,7 @@
 // afterwards — the engine enforces that, this adapter merely never asks
 // twice. Nothing here widens the engine's authority.
 
-export const ZIPP_HOST_SDK_VERSION = "1.2.0";
+export const ZIPP_HOST_SDK_VERSION = "1.3.0";
 
 /** The longest deadline a timer can hold exactly (2^31 − 1 ms). */
 export const MAX_DEADLINE_MS = 2147483647;
@@ -121,18 +124,27 @@ function validDeadline(ms) {
 
 export function createZippHost(config) {
   const {
-    moduleUrl,
+    moduleUrl = null,
     wasmUrl,
-    workerUrl,
+    workerUrl = new URL("./zipp-host.worker.mjs", import.meta.url),
+    // The embed kit's zipp.mjs, which reads the bindings out of the module
+    // itself; unused when `moduleUrl` names a separate glue file.
+    loaderUrl = moduleUrl ? null : new URL("../zipp.mjs", import.meta.url),
     capabilities = [],
     bridgeModuleUrl = null,
     instructionBudget = null,
     fingerprintSeed = null,
     deadlineMs = 5000,
   } = config;
-  if (!moduleUrl || !wasmUrl || !workerUrl) {
-    throw new ZippHostError("usage", "createZippHost needs moduleUrl, wasmUrl and workerUrl");
+  if (!wasmUrl) {
+    throw new ZippHostError("usage", "createZippHost needs wasmUrl");
   }
+  // URLs cross to the Worker as strings (a URL object does not clone). With
+  // the loader, a relative module URL means the page's, not the Worker's.
+  const pageBase = typeof document !== "undefined" ? document.baseURI : undefined;
+  const moduleHref = moduleUrl ? String(moduleUrl) : null;
+  const loaderHref = moduleHref ? null : String(loaderUrl);
+  const wasmHref = moduleHref || !pageBase ? String(wasmUrl) : new URL(String(wasmUrl), pageBase).href;
   if (!validDeadline(deadlineMs)) {
     throw new ZippHostError("usage", `deadlineMs must be a finite number of milliseconds in (0, ${MAX_DEADLINE_MS}], not ${String(deadlineMs)}`);
   }
@@ -242,7 +254,7 @@ export function createZippHost(config) {
       state = "initializing";
       try {
         const symbols = await request("init", {
-          moduleUrl, wasmUrl, capabilities: grants, bridgeModuleUrl, instructionBudget, fingerprintSeed: seed, source,
+          moduleUrl: moduleHref, loaderUrl: loaderHref, wasmUrl: wasmHref, capabilities: grants, bridgeModuleUrl, instructionBudget, fingerprintSeed: seed, source,
         }, { deadlineMs: options.deadlineMs ?? Math.max(deadlineMs, 30000) });
         // The reply may have been in flight when this host died; a dead
         // host never becomes ready (ZA-03).

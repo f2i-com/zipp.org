@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ZIPP sandbox permissions</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 48rem; padding: 0 1rem; }
+  pre { background: #f4f4f4; padding: 1rem; white-space: pre-wrap; }
+</style>
+<h1>ZIPP {{VERSION}}: what a sandbox may reach</h1>
+<p>One program, run twice: first with nothing permitted, then with private storage, one file and this site's <code>/examples/</code> folder on the network. Last, a loop that never ends is stopped by its time limit.</p>
+<pre id="out">Loading…</pre>
+<script type="module">
+  import { loadZipp } from "../zipp.mjs";
+
+  const out = document.getElementById("out");
+  const log = line => { out.textContent += `${line}\n`; };
+  out.textContent = "";
+  const zipp = await loadZipp(new URL("../zipp-{{VERSION}}-javascript.wasm", import.meta.url));
+  const here = new URL("./", import.meta.url).href;
+
+  const program = `
+    const attempt = (what, f) => { try { console.log(what + ": " + f()); } catch (e) { console.log(what + ": refused"); } };
+    attempt("storage", () => { localStorage.setItem("visits", "1"); return "saved"; });
+    attempt("file", () => host.callSync("fs.read", "greeting.txt"));
+    if (typeof fetch === "function") {
+      fetch("${here}sandbox.html").then(r => console.log("network: HTTP " + r.status), e => console.log("network: " + e.message));
+      fetch("https://example.com/").then(() => console.log("other site: reached"), () => console.log("other site: refused"));
+    } else {
+      console.log("network: no fetch here");
+    }
+  `;
+
+  log("--- nothing permitted");
+  let sandbox = await zipp.createSandbox();
+  for (const line of (await sandbox.run(program)).output) log(line);
+  await sandbox.close();
+
+  log("--- storage, one file, and this folder on the network");
+  sandbox = await zipp.createSandbox({
+    permissions: {
+      storage: true,
+      files: { "greeting.txt": "hello from a file" },
+      network: [here],
+    },
+  });
+  for (const line of (await sandbox.run(program)).output) log(line);
+  log(`the page sees the sandbox's storage: ${JSON.stringify((await sandbox.snapshot()).storage)}`);
+  await sandbox.close();
+
+  // The default step budget (50 million) would stop it first: allow more
+  // steps, so the time limit is what ends it.
+  log("--- a loop that never ends, with a 500 ms limit");
+  sandbox = await zipp.createSandbox({ limits: { timeoutMs: 500, instructions: 2_000_000_000 } });
+  try {
+    await sandbox.run("for (;;) {}");
+  } catch (error) {
+    log(`${error.category}: ${error.message}`);
+  }
+  window.zippExample = { ready: true, text: () => out.textContent };
+</script>

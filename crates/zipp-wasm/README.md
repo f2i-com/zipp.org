@@ -65,10 +65,10 @@ Unicode regex and normalization, BigInt, eval/Function, collections, proxies,
 typed arrays, promises and the Engine host API, including resource limits.
 `Intl`, `Temporal`, and `Date.prototype.toTemporalInstant` are absent. Python
 and Torch are excluded at compile time; combining `lite` and `python` is an error.
-Full variants keep their existing language features. Releases from 0.0.22
-carry it as `zipp-wasm-<version>-web-lite.zip`, with the bindings,
-`BUILD-INFO.txt`, `PROFILE.json` and host SDK the other browser archives have;
-`./build-variants.sh lite` builds it from the source.
+Full variants keep their existing language features. Releases carry it as
+`zipp-<version>-javascript-lite.wasm` (0.0.22 to 0.0.25:
+`zipp-wasm-<version>-web-lite.zip`); `./build-variants.sh lite` builds it from
+the source.
 
 Without ECMA-402, locale arguments are ignored: Number and BigInt format as
 ordinary decimal strings; Date's locale methods use the corresponding UTC
@@ -154,21 +154,48 @@ the JavaScript-only gate proves the refusal path.
 
 ### Release downloads (0.0.18)
 
-The release workflow builds and tests both archives from the exact release tag:
+The release workflow### Release downloads
 
-| archive | languages | linker stack |
+From 0.0.26 a release publishes each module as one `.wasm` file, and the
+[embed kit](embed-kit/README.md) (`zipp-<version>-wasm-embed-kit.zip`) as the
+one way to load any of them:
+
+| module | languages | linker stack |
 | --- | --- | --- |
-| `zipp-wasm-0.0.18-web.zip` | JavaScript | 1 MiB |
-| `zipp-wasm-0.0.18-web-python.zip` | JavaScript + experimental Python | 16 MiB |
+| `zipp-<version>-javascript.wasm` | JavaScript | 1 MiB |
+| `zipp-<version>-javascript-lite.wasm` | JavaScript, without `Intl` and `Temporal` | 1 MiB |
+| `zipp-<version>-javascript-python.wasm` | JavaScript + experimental Python, torch built in | 16 MiB |
+| `zipp-<version>-javascript-python-base.wasm` | JavaScript + experimental Python, no torch | 16 MiB |
+| `zipp-<version>-torch-package.wasm` | the torch package for `-python-base` | |
 
-Both contain browser bindings, TypeScript declarations, `host-sdk/`, a runtime
-`PROFILE.json`, build identity and SHA-256 checksums. The combined archive also
-includes `gpu-lab/src/`, its CPU WASM kernels and the Torch compatibility guide.
-Select GPU backends through that host adapter; the engine itself does not access
-WebGL/WebGPU without a browser host. The source build above uses a 16 MiB stack
-for either variant; release builds explicitly use the sizes in this table.
+Each engine module carries the wasm-bindgen bindings generated for it in a
+`zipp.glue` custom section, and a `zipp.meta` record (format, variant,
+version, commit, languages); the torch package carries the record alone.
+The kit's `zipp.mjs` reads both, so it loads every module without a separate
+glue file, and a module and its bindings cannot come from different builds.
+Custom sections do not change what a module runs: the release workflow strips
+them again and byte-compares the result with the module its Node boundary
+suite tested (`embed-kit/package-variant.sh`). A host that wants the usual
+wasm-bindgen pair recovers it exactly:
 
-Neither release archive enables the separate `python-js-interop` feature.
+```sh
+node embed-kit/package.mjs extract zipp-<version>-javascript.wasm out/
+# out/zipp_wasm.js, out/zipp_wasm_bg.wasm (the module as built), out/meta.json
+```
+
+The kit also holds the host SDK, the complete engine's TypeScript
+declarations, `gpu-lab/` (the browser GPU adapter and its CPU WASM kernels) and
+the Torch compatibility guide. Select GPU backends through that host adapter;
+the engine itself does not access WebGL/WebGPU without a browser host. The
+source build above uses a 16 MiB stack for every variant; release builds use
+the sizes in this table. `embed-kit/build-release.sh <out-dir>` builds and
+checks every module and the kit on a workstation the way the release does.
+
+Releases 0.0.18 to 0.0.25 shipped each variant as a
+`zipp-wasm-<version>-web*.zip` archive of the bindings, the module, the host
+SDK and their checksums.
+
+-js-interop` feature.
 Python and Torch are experimental subsets, and GPU `torch.compile()` uses the
 nonstandard asynchronous `submit()` callback contract. It captures and uploads
 on each call; persistent GPU models and GPU Conv2d training are not implemented.
