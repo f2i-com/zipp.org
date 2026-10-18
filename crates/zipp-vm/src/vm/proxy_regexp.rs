@@ -4317,9 +4317,14 @@ impl<'p> Vm<'p> {
         {
             Some(rc) => Some(rc.clone()),
             None => {
-                let compiled = regress::Regex::from_unicode_byteopt(
+                // Stops at the cap the preflight below applies (issue #58).
+                let limits = regress::CompileLimits {
+                    max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
+                };
+                let compiled = regress::Regex::from_unicode_byteopt_with_limits(
                     compile_cps.iter().copied(),
                     rflags.as_str(),
+                    limits,
                 )
                 .ok()
                 .and_then(|program| {

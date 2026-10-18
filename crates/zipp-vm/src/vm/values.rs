@@ -2560,12 +2560,25 @@ impl<'p> Vm<'p> {
                         &source.encode_utf16().collect::<Vec<u16>>(),
                     ),
                 };
-                let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
-                    .map_err(|e| {
-                        Thrown(format!(
-                            "SyntaxError: Invalid regular expression: /{source}/: {e}"
-                        ))
-                    })?;
+                // The program cap is passed down so the emitter stops as soon
+                // as the program outgrows it, rather than finishing a program
+                // only for the preflight to refuse it (issue #58).
+                let limits = regress::CompileLimits {
+                    max_program_bytes: MAX_REGEX_PROGRAM_BYTES,
+                };
+                let r = regress::Regex::from_unicode_with_limits(
+                    compile_cps.iter().copied(),
+                    rflags.as_str(),
+                    limits,
+                )
+                .map_err(|e| match e {
+                    regress::CompileError::ProgramTooLarge => Thrown::from_static(
+                        "RangeError: compiled regular expression exceeds the sandbox limit",
+                    ),
+                    regress::CompileError::Syntax(e) => Thrown(format!(
+                        "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                    )),
+                })?;
                 self.preflight_regex_program(&r)?;
                 let rc = std::sync::Arc::new(r);
                 if let Some(k) = cache_key {

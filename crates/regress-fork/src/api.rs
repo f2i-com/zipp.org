@@ -175,6 +175,74 @@ impl MatchLimits {
     };
 }
 
+/// A ceiling on the program one compile builds, checked while it is built.
+///
+/// A caller that refuses programs over some size after compiling them can
+/// pass that size here instead, and the emitter stops as soon as the program
+/// outgrows it. The count is a lower bound of [`Regex::resident_bytes`], so a
+/// program the caller's own check would accept is never refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileLimits {
+    pub max_program_bytes: usize,
+}
+
+impl CompileLimits {
+    pub const UNLIMITED: Self = Self {
+        max_program_bytes: usize::MAX,
+    };
+}
+
+/// Why a compile under [`CompileLimits`] failed.
+#[derive(Debug, Clone)]
+pub enum CompileError {
+    /// The pattern is not a valid regular expression, or exceeds one of the
+    /// parser's limits.
+    Syntax(Error),
+    /// The program would retain more than `max_program_bytes`. It was not
+    /// finished, and nothing of it is kept.
+    ProgramTooLarge,
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CompileError::Syntax(error) => error.fmt(f),
+            CompileError::ProgramTooLarge => f.write_str("Regular expression program is too large"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CompileError {}
+
+impl From<Error> for CompileError {
+    fn from(error: Error) -> Self {
+        CompileError::Syntax(error)
+    }
+}
+
+impl CompileError {
+    fn from_emit(error: emit::EmitError) -> Self {
+        match error {
+            emit::EmitError::ProgramTooLarge => CompileError::ProgramTooLarge,
+            // The parser's message for the same limit.
+            emit::EmitError::TooManyLoops => CompileError::Syntax(Error {
+                text: "Loop count limit exceeded".into(),
+            }),
+        }
+    }
+
+    /// The error an unlimited compile reports.
+    fn into_error(self) -> Error {
+        match self {
+            CompileError::Syntax(error) => error,
+            CompileError::ProgramTooLarge => Error {
+                text: CompileError::ProgramTooLarge.to_string(),
+            },
+        }
+    }
+}
+
 /// The first hard regex-execution ceiling crossed by a search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchLimitError {
@@ -598,6 +666,21 @@ impl Regex {
         I: Iterator<Item = u32> + Clone,
         F: Into<Flags>,
     {
+        Self::from_unicode_with_limits(pattern, flags, CompileLimits::UNLIMITED)
+            .map_err(CompileError::into_error)
+    }
+
+    /// PATCH (see FORK.md): [`Self::from_unicode`], stopping as soon as the
+    /// program outgrows `limits`.
+    pub fn from_unicode_with_limits<I, F>(
+        pattern: I,
+        flags: F,
+        limits: CompileLimits,
+    ) -> Result<Regex, CompileError>
+    where
+        I: Iterator<Item = u32> + Clone,
+        F: Into<Flags>,
+    {
         let flags = flags.into();
         #[cfg(feature = "linear-ascii")]
         let linear_candidate = crate::linear::collect_candidate(pattern.clone(), flags);
@@ -605,7 +688,8 @@ impl Regex {
         if !flags.no_opt {
             optimizer::optimize(&mut ire);
         }
-        let cr = emit::emit(&ire);
+        let cr = emit::emit_limited(&ire, limits.max_program_bytes)
+            .map_err(CompileError::from_emit)?;
         Ok(Regex {
             cr,
             #[cfg(feature = "linear-ascii")]
@@ -626,6 +710,21 @@ impl Regex {
         I: Iterator<Item = u32> + Clone,
         F: Into<Flags>,
     {
+        Self::from_unicode_byteopt_with_limits(pattern, flags, CompileLimits::UNLIMITED)
+            .map_err(CompileError::into_error)
+    }
+
+    /// PATCH (see FORK.md): [`Self::from_unicode_byteopt`], stopping as soon
+    /// as the program outgrows `limits`.
+    pub fn from_unicode_byteopt_with_limits<I, F>(
+        pattern: I,
+        flags: F,
+        limits: CompileLimits,
+    ) -> Result<Regex, CompileError>
+    where
+        I: Iterator<Item = u32> + Clone,
+        F: Into<Flags>,
+    {
         let flags = flags.into();
         #[cfg(feature = "linear-ascii")]
         let linear_candidate = crate::linear::collect_candidate(pattern.clone(), flags);
@@ -636,7 +735,8 @@ impl Regex {
         if !flags.no_opt {
             optimizer::optimize_bytes(&mut ire);
         }
-        let mut cr = emit::emit(&ire);
+        let mut cr = emit::emit_limited(&ire, limits.max_program_bytes)
+            .map_err(CompileError::from_emit)?;
         cr.suffix_start = suffix_start;
         Ok(Regex {
             cr,

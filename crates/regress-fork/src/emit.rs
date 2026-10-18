@@ -44,6 +44,15 @@ fn bracket_as_ascii(bc: &BracketContents) -> Option<AsciiBitmap> {
     Some(result)
 }
 
+/// Why emission stopped before the program was complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitError {
+    /// The program grew past the byte limit it was emitted under.
+    ProgramTooLarge,
+    /// The program has more loops than a 16-bit loop id can number.
+    TooManyLoops,
+}
+
 /// Type which wraps up the context needed to emit a CompiledRegex.
 struct Emitter {
     result: CompiledRegex,
@@ -56,6 +65,13 @@ struct Emitter {
 
     // Whether the current node is within a lookbehind.
     in_lookbehind: bool,
+
+    // Bytes emitted so far, counted the way `CompiledRegex::resident_bytes`
+    // counts them but by length rather than capacity, so never more than it
+    // will report: stopping at `max_bytes` cannot refuse a program the
+    // caller's own check of the finished program would accept.
+    bytes: usize,
+    max_bytes: usize,
 }
 
 impl Emitter {
@@ -82,10 +98,12 @@ impl Emitter {
     /// depends on the direction is wrapped to run right to left.
     fn emit_insn(&mut self, insn: Insn) {
         let insn = if self.in_lookbehind && insn.runs_backward_wrapped() {
+            self.bytes = self.bytes.saturating_add(core::mem::size_of::<Insn>());
             Insn::Back(Box::new(insn))
         } else {
             insn
         };
+        self.bytes = self.bytes.saturating_add(core::mem::size_of::<Insn>());
         self.result.insns.push(insn);
     }
 
@@ -105,8 +123,9 @@ impl Emitter {
         ret
     }
 
-    /// Emit instructions corresponding to a given node.
-    fn emit_node(&mut self, node: &Node) {
+    /// Emit instructions corresponding to a given node, stopping as soon as
+    /// the program outgrows `max_bytes`.
+    fn emit_node(&mut self, node: &Node) -> Result<(), EmitError> {
         enum Emitter<'a> {
             Node(&'a Node),
             NodeLoopFinish {
@@ -133,6 +152,9 @@ impl Emitter {
         let mut stack = vec![Emitter::Node(node)];
 
         while let Some(inst) = stack.pop() {
+            if self.bytes > self.max_bytes {
+                return Err(EmitError::ProgramTooLarge);
+            }
             match inst {
                 Emitter::NodeLoopFinish {
                     loop_instruction_index,
@@ -228,6 +250,10 @@ impl Emitter {
                         } else {
                             let idx = self.result.brackets.len();
                             self.result.brackets.push(contents.clone());
+                            self.bytes = self
+                                .bytes
+                                .saturating_add(core::mem::size_of::<BracketContents>())
+                                .saturating_add(self.result.brackets[idx].cps.resident_bytes());
                             self.emit_insn(Insn::Bracket(idx))
                         }
                     }
@@ -244,8 +270,11 @@ impl Emitter {
                         quant,
                         enclosed_groups,
                     } => {
+                        // The optimizer keeps the loops it copies within
+                        // `MAX_LOOPS`; refuse rather than reuse an id.
                         let loop_id = self.next_loop_id;
-                        self.next_loop_id += 1;
+                        self.next_loop_id =
+                            loop_id.checked_add(1).ok_or(EmitError::TooManyLoops)?;
                         let loop_insn = self.emit_insn_offset(Insn::EnterLoop(LoopFields {
                             loop_id,
                             min_iters: quant.min,
@@ -338,16 +367,20 @@ impl Emitter {
                             icase,
                         })
                     }
-                    Node::NamedBackRef { groups, icase } => self.emit_insn(Insn::BackRefMulti {
-                        groups: groups
-                            .iter()
-                            .map(|&group| {
-                                debug_assert!(group >= 1, "Group should not be zero");
-                                group - 1
-                            })
-                            .collect(),
-                        icase: *icase,
-                    }),
+                    Node::NamedBackRef { groups, icase } => {
+                        let ids = groups.len().saturating_mul(core::mem::size_of::<u32>());
+                        self.bytes = self.bytes.saturating_add(ids);
+                        self.emit_insn(Insn::BackRefMulti {
+                            groups: groups
+                                .iter()
+                                .map(|&group| {
+                                    debug_assert!(group >= 1, "Group should not be zero");
+                                    group - 1
+                                })
+                                .collect(),
+                            icase: *icase,
+                        })
+                    }
 
                     Node::ByteSet(bytes) => self.emit_byte_set_insn(bytes),
 
@@ -383,15 +416,28 @@ impl Emitter {
                 },
             }
         }
+        if self.bytes > self.max_bytes {
+            return Err(EmitError::ProgramTooLarge);
+        }
+        Ok(())
     }
 }
 
 /// Compile the given IR to a CompiledRegex.
 pub fn emit(n: &ir::Regex) -> CompiledRegex {
+    emit_limited(n, usize::MAX).expect("the optimizer keeps loops within MAX_LOOPS")
+}
+
+/// Compile the given IR to a CompiledRegex, giving up as soon as the program
+/// would retain more than `max_bytes` (as `CompiledRegex::resident_bytes`
+/// counts, before possessification and the lazily built tiers).
+pub(crate) fn emit_limited(n: &ir::Regex, max_bytes: usize) -> Result<CompiledRegex, EmitError> {
     let mut emitter = Emitter {
         next_loop_id: 0,
         group_names: Vec::new(),
         in_lookbehind: false,
+        bytes: 0,
+        max_bytes,
         result: CompiledRegex {
             insns: Vec::new(),
             brackets: Vec::new(),
@@ -406,7 +452,7 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
             rxjit: Default::default(),
         },
     };
-    emitter.emit_node(&n.node);
+    emitter.emit_node(&n.node)?;
     let mut result = emitter.result;
     // PATCH (see VENDORED.md): auto-possessify one-char greedy loops with a
     // provably disjoint follow; `ZIPP_NO_RX_POSSESS=1` disables the pass.
@@ -427,5 +473,5 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
             .as_deref()
             .is_none_or(|names| names.len() == result.groups as usize)
     );
-    result
+    Ok(result)
 }

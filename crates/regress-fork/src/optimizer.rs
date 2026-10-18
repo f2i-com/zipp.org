@@ -2,13 +2,99 @@
 
 use crate::insn::{MAX_BYTE_SET_LENGTH, MAX_CHAR_SET_LENGTH};
 use crate::ir::*;
-use crate::types::BracketContents;
+use crate::types::{BracketContents, MAX_LOOPS};
 use crate::unicode;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
 /// When unrolling a loop, the largest minimum count we will unroll.
 const LOOP_UNROLL_THRESHOLD: usize = 5;
+
+/// Unrolling copies a loop's body `min` times, and an unrolled loop inside
+/// another is copied again with each copy of the outer body. Unbounded, that
+/// multiplied the IR by `min + 1` per level of nesting: 31 levels of
+/// `(?:…|)+` never finished compiling (issue #58). The copies one regex may
+/// make cost at most this many nodes plus `LOOP_UNROLL_THRESHOLD` times the
+/// regex's own size, which covers every loop of a regex without nested
+/// unrolled loops; a loop the budget cannot pay for stays a loop, which
+/// matches the same way.
+const UNROLL_BUDGET_BASE: usize = 1 << 10;
+
+/// What unrolling may still add to one regex. Sizes count one per node plus
+/// one per interval a bracket's set holds, as copying the set costs that.
+struct UnrollBudget {
+    /// Size the copies may still add.
+    size: usize,
+
+    /// Loops the copies may still add: the emitter gives each loop a 16-bit
+    /// id, and the parser's `MAX_LOOPS` only counts the loops in the source.
+    loops: usize,
+}
+
+impl UnrollBudget {
+    fn new(r: &Regex) -> Self {
+        let (mut size, mut loops) = (0usize, 0usize);
+        walk(false, r.flags.unicode, &r.node, &mut |n: &Node, _: &mut Walk| {
+            size = size.saturating_add(copy_size(n));
+            loops += matches!(n, Node::Loop { .. }) as usize;
+        });
+        UnrollBudget {
+            size: size
+                .saturating_mul(LOOP_UNROLL_THRESHOLD)
+                .saturating_add(UNROLL_BUDGET_BASE),
+            loops: MAX_LOOPS.saturating_sub(loops),
+        }
+    }
+
+    /// The (size, loops) that `copies` copies of `body` would add, or None if
+    /// the budget cannot pay for them. Stops measuring once over budget, so a
+    /// declined loop costs no more than the budget left.
+    fn price(&self, body: &Node, copies: usize) -> Option<(usize, usize)> {
+        let allowance = self.size / copies;
+        let mut left = allowance;
+        let mut loops = 0;
+        if !measure_copy(body, &mut left, &mut loops) {
+            return None;
+        }
+        let loops = loops * copies;
+        (loops <= self.loops).then_some(((allowance - left) * copies, loops))
+    }
+
+    fn spend(&mut self, (size, loops): (usize, usize)) {
+        self.size -= size;
+        self.loops -= loops;
+    }
+}
+
+/// The size of copying `n` itself, without its children.
+fn copy_size(n: &Node) -> usize {
+    match n {
+        Node::Bracket(bc) => 1 + bc.cps.intervals().len(),
+        _ => 1,
+    }
+}
+
+/// Subtract the size of copying `n` from `left` and count its loops in
+/// `loops`; false, part-way, if `left` runs out.
+fn measure_copy(n: &Node, left: &mut usize, loops: &mut usize) -> bool {
+    let Some(rest) = left.checked_sub(copy_size(n)) else {
+        return false;
+    };
+    *left = rest;
+    match n {
+        Node::Cat(nodes) => nodes.iter().all(|nn| measure_copy(nn, left, loops)),
+        Node::Alt(a, b) => measure_copy(a, left, loops) && measure_copy(b, left, loops),
+        Node::Loop { loopee, .. } => {
+            *loops += 1;
+            measure_copy(loopee, left, loops)
+        }
+        Node::Loop1CharBody { loopee, .. } => measure_copy(loopee, left, loops),
+        Node::CaptureGroup { contents, .. } | Node::LookaroundAssertion { contents, .. } => {
+            measure_copy(contents, left, loops)
+        }
+        _ => true,
+    }
+}
 
 /// Things that a Pass may do.
 pub enum PassAction {
@@ -333,15 +419,13 @@ fn unfold_icase_chars(n: &mut Node, w: &Walk) -> PassAction {
 }
 
 // Perform simple unrolling of loops that have a minimum.
-fn unroll_loops(n: &mut Node, _w: &Walk) -> PassAction {
+fn unroll_loops(n: &mut Node, _w: &Walk, budget: &mut UnrollBudget) -> PassAction {
     match n {
         Node::Loop {
             loopee,
             quant,
             enclosed_groups,
         } => {
-            // TODO: consider ignoring loops with nested sub-loops?
-
             // Do not unroll loops with enclosed groups.
             if enclosed_groups.start < enclosed_groups.end {
                 return PassAction::Keep;
@@ -350,6 +434,11 @@ fn unroll_loops(n: &mut Node, _w: &Walk) -> PassAction {
             if quant.min == 0 || quant.min > LOOP_UNROLL_THRESHOLD {
                 return PassAction::Keep;
             }
+            // Nor loops whose copies the budget cannot pay for. The pass is
+            // postorder, so inner loops, the ones run most, are paid for first.
+            let Some(price) = budget.price(loopee, quant.min) else {
+                return PassAction::Keep;
+            };
 
             // We made it through. Replace us with a cat.
             let mut unrolled = Vec::new();
@@ -359,6 +448,7 @@ fn unroll_loops(n: &mut Node, _w: &Walk) -> PassAction {
                 };
                 unrolled.push(node);
             }
+            budget.spend(price);
 
             // We unrolled 'min' elements.
             // Maybe our loop is now empty.
@@ -544,13 +634,16 @@ pub fn optimize_bytes(r: &mut Regex) {
 
 fn optimize_impl(r: &mut Regex, byte_input: bool) {
     run_pass(r, &mut simplify_brackets);
+    let mut unroll_budget = UnrollBudget::new(r);
     loop {
         let mut changed = false;
         changed |= run_pass(r, &mut decat);
         if r.flags.icase {
             changed |= run_pass(r, &mut unfold_icase_chars);
         }
-        changed |= run_pass(r, &mut unroll_loops);
+        changed |= run_pass(r, &mut |n: &mut Node, w: &Walk| {
+            unroll_loops(n, w, &mut unroll_budget)
+        });
         changed |= run_pass(r, &mut promote_1char_loops);
         if byte_input {
             changed |= run_pass(r, &mut form_literal_bytes);
