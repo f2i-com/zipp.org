@@ -3,11 +3,31 @@
 This is a **diagnostic ecosystem comparison**, separate from Zipp's canonical
 Node/Bun/Deno publication series.
 
+## Interpreter versus interpreter, 2026-10-18
+
+The 0.0.26 engine's canonical PGO binary (`f1739644`) ran the same way over
+both suites, 8 counterbalanced repetitions each:
+
+- [`interp_real13_f1739644_2026-10-18.json`](interp_real13_f1739644_2026-10-18.json):
+  the 13 normal rows. Zipp's interpreter is 0.648× Bellard's QuickJS [0.645, 0.653] (10 / 13 point wins), 0.409× QuickJS-NG [0.408, 0.412] (13 / 13 point wins), 0.887× Bun no-JIT, 1.233× Deno jitless, 1.280× Node jitless.
+- [`interp_hostile17_f1739644_2026-10-18.json`](interp_hostile17_f1739644_2026-10-18.json):
+  the 17 hostile rows. 0.780× Bellard's QuickJS [0.774, 0.785] (11 / 17 point wins), 0.411× QuickJS-NG [0.410, 0.417] (17 / 17 point wins), 0.833× Bun no-JIT, 0.944× Deno jitless, 1.055× Node jitless.
+
+Over all 30 rows that is 0.720× Bellard's QuickJS and 0.410× QuickJS-NG
+([`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#interpreter-versus-interpreter)
+has the tables).
+
+The same directory holds the release-build check
+([`release_real13_5f1c0578_2026-10-18.json`](release_real13_5f1c0578_2026-10-18.json), the published 0.0.26 CLI
+against Node, Bun and Deno) and the A/B of that build against the PGO one
+([`pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json`](pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json):
+the PGO build takes 0.901× the release build's time).
+
 ## Interpreter versus interpreter, 2026-10-15
 
-The current interpreter table in the root README compares Zipp's interpreter
+The first native interpreter table compared Zipp's interpreter
 with other interpreters and with JIT engines running JIT-off. The canonical
-PGO binary at `fa8e3b86` runs with `ZIPP_NOJIT=1` (`zipp-interp`) against:
+PGO binary at `fa8e3b86` ran with `ZIPP_NOJIT=1` (`zipp-interp`) against:
 
 | Engine name | What runs | No-JIT check |
 |---|---|---|
