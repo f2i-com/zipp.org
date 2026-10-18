@@ -81,16 +81,64 @@ fn direct_cond_return_parts(expr: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr,
 // `string_literal_key(&StrVal) -> String`,
 // `capture::collect_pattern_names(&ast::Pattern, &mut HashSet<String>)`.
 
+/// Registers of each class a function may hold before its statements start
+/// giving their scratch back (see `FnCompiler::stmt`). Hand-written functions
+/// stay below it, so their bytecode is unchanged.
+const STMT_RECLAIM_FLOOR: Reg = 1024;
+
 impl<'a> FnCompiler<'a> {
     // ── statements ──
     /// Every statement passes through here, which is what lets the `typeof`
     /// alias lane (`typeof_alias.rs`) see statement nesting: a fact recorded
     /// inside `s` dies with it, and a re-entering `s` starts clean.
+    ///
+    /// A statement keeps the scratch registers it evaluated into (ordinary,
+    /// boolean and global-receiver ones) until its scope ends, and
+    /// `pop_scope` subtracts only the scope's own locals, so a flat body of
+    /// about 33,000 statements ran out of registers ("function needs more than
+    /// 32768 registers"); bundlers that flatten every module into one function
+    /// produce such bodies. Once a function's frame is large
+    /// (`STMT_RECLAIM_FLOOR`), a statement outside any loop that bound no name
+    /// gives its scratch back, so such a body plateaus a little above the
+    /// floor. Below the floor, and anywhere inside a loop, labelled statement
+    /// or switch, the registers are allocated exactly as before: the JIT's
+    /// region planner counts definitions per register (loop-invariant
+    /// constants, pinned receivers), and sharing registers between the
+    /// statements of a loop body would cost it those.
     pub(crate) fn stmt(&mut self, s: &ast::Stmt) -> R<()> {
         self.typeof_alias_stmt_enter(s);
+        let save = (self.next_reg, self.bool_regs, self.recv_regs);
+        let shape = self.scope_shape();
         let r = self.stmt_inner(s);
         self.typeof_alias_stmt_exit();
+        if r.is_ok() && self.loop_ctx.is_empty() && self.scope_shape() == shape {
+            if save.0 >= STMT_RECLAIM_FLOOR && self.next_reg > save.0 {
+                self.set_next_reg(save.0);
+            }
+            // The class registers keep their one rule (a boolean register only
+            // ever holds booleans, a receiver register one global receiver per
+            // statement); a statement's are dead once it has run.
+            if save.1 >= STMT_RECLAIM_FLOOR && self.bool_regs > save.1 {
+                self.bool_regs = save.1;
+            }
+            if save.2 >= STMT_RECLAIM_FLOOR && self.recv_regs > save.2 {
+                self.recv_regs = save.2;
+            }
+        }
         r
+    }
+
+    /// The depth of the scope stack and the sizes of the two scopes a
+    /// statement can leave a binding in: the innermost open one (its own
+    /// declarations) and the function's (`scopes[0]`, where hoists go). Any
+    /// scope the statement opens is closed again before it returns. Constant
+    /// time, so a body of many statements and many bindings stays linear.
+    fn scope_shape(&self) -> (usize, usize, usize) {
+        (
+            self.scopes.len(),
+            self.scopes.last().map_or(0, Vec::len),
+            self.scopes.first().map_or(0, Vec::len),
+        )
     }
 
     fn stmt_inner(&mut self, s: &ast::Stmt) -> R<()> {

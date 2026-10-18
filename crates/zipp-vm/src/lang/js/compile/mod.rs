@@ -484,6 +484,11 @@ struct FnCompiler<'a> {
     /// register tiers' xmm pools were sized for.
     bool_regs: Reg,
     recv_regs: Reg,
+    /// The most class registers of each kind live at once: what the frame
+    /// reserves (`check_regs`). A large function's statements give theirs
+    /// back (`stmt`), so the current counts can end below these.
+    bool_regs_max: Reg,
+    recv_regs_max: Reg,
     /// Per ordinary register, the kinds of value written so far (`KIND_BOOL`
     /// / `KIND_NUM` bits, recorded in `emit`). A contiguous argument window
     /// (`alloc_block`) is placed where no slot would receive a boolean

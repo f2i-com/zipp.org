@@ -35,6 +35,8 @@ impl<'a> FnCompiler<'a> {
             max_reg: 0,
             bool_regs: 0,
             recv_regs: 0,
+            bool_regs_max: 0,
+            recv_regs_max: 0,
             reg_kinds: Vec::new(),
             reg_overflow: false,
             rest_reg: None,
@@ -225,7 +227,8 @@ impl<'a> FnCompiler<'a> {
         if self.upvalues.borrow().len() > u16::MAX as usize + 1 {
             return Err("function captures more than 65536 upvalues".into());
         }
-        let total = self.max_reg as usize + self.bool_regs as usize + self.recv_regs as usize;
+        let total =
+            self.max_reg as usize + self.bool_regs_max as usize + self.recv_regs_max as usize;
         if self.reg_overflow || total > BOOL_BASE as usize {
             return Err(format!(
                 "function needs more than {} registers (too many locals, \
@@ -233,9 +236,9 @@ impl<'a> FnCompiler<'a> {
                 BOOL_BASE
             ));
         }
-        if self.bool_regs > 0 || self.recv_regs > 0 {
+        if self.bool_regs_max > 0 || self.recv_regs_max > 0 {
             let base = self.max_reg;
-            let bools = self.bool_regs;
+            let bools = self.bool_regs_max;
             // `NO_REG` / `BARE_MATH_BY_NAME` ride in `Reg` fields as sentinels
             // (`MathOp`'s bare form also carries a global index in `this_v`,
             // which is below `BOOL_BASE` and so untouched).
@@ -419,6 +422,7 @@ impl<'a> FnCompiler<'a> {
         }
         let r = BOOL_BASE.saturating_add(self.bool_regs);
         self.bool_regs = self.bool_regs.saturating_add(1);
+        self.bool_regs_max = self.bool_regs_max.max(self.bool_regs);
         r
     }
 
@@ -432,6 +436,7 @@ impl<'a> FnCompiler<'a> {
         }
         let r = RECV_BASE.saturating_add(self.recv_regs);
         self.recv_regs = self.recv_regs.saturating_add(1);
+        self.recv_regs_max = self.recv_regs_max.max(self.recv_regs);
         r
     }
 
