@@ -374,8 +374,8 @@ if ($readme !== null && $readme[0] === 200) {
     if (preg_match('/\*\*([0-9.]+) ms\*\* median process launch/', $text, $m)) {
         $facts['startup_ms'] = (float) $m[1];
     }
-    // Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.11 canonical PGO
-    if (preg_match('/Node (v[0-9.]+) · Bun ([0-9.]+) · Deno ([0-9.]+) · Zipp ([0-9.]+) canonical PGO/u', $text, $m)) {
+    // Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · ZIPP 0.0.26 canonical PGO (older: "Zipp")
+    if (preg_match('/Node (v[0-9.]+) · Bun ([0-9.]+) · Deno ([0-9.]+) · (?:Zipp|ZIPP) ([0-9.]+) canonical PGO/u', $text, $m)) {
         $facts['engines'] = ['node' => $m[1], 'bun' => $m[2], 'deno' => $m[3], 'zipp' => $m[4]];
     }
     $out['readme'] = $facts;

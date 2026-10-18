@@ -1611,8 +1611,8 @@
     },
     {
       "slug": "benchmarks",
-      "title": "Zipp Benchmarks: Rust JavaScript Engine vs Node, Bun and Deno",
-      "description": "Reproducible native benchmarks of Zipp against Node 24.19, Bun 1.3.14 and Deno 2.6.10: 30 rows, hardware, flags, PGO, bootstrap intervals, losses, and raw JSON.",
+      "title": "Zipp Benchmarks: vs Node, Bun, Deno, QuickJS and CPython",
+      "description": "Zipp 0.0.26 measured: its JIT against Node 24, Bun and Deno on 30 rows, its interpreter against QuickJS, its Python against CPython 3.13, with intervals and raw JSON.",
       "h1": "Zipp benchmarks",
       "breadcrumb": "Benchmarks",
       "lede": "This is the canonical home for Zipp's performance numbers. Every table below comes from a checked-in JSON capture with engine hashes, competitor hashes, per-repetition schedules and bootstrap replicates, so anyone can re-run it and anyone can cite it. Ratios are Zipp divided by the competitor: lower is faster.",
@@ -1622,7 +1622,10 @@
         "Zipp vs Node",
         "Zipp vs Bun",
         "Zipp vs Deno",
-        "JavaScript startup time"
+        "JavaScript startup time",
+        "Zipp vs QuickJS",
+        "JavaScript interpreter benchmark",
+        "Python vs CPython benchmark"
       ],
       "datePublished": "2026-09-14",
       "dateModified": "2026-10-18",
@@ -1631,8 +1634,8 @@
         {
           "@context": "https://schema.org",
           "@type": "Dataset",
-          "name": "Zipp native benchmark capture fa8e3b86, 15 October 2026",
-          "description": "Cold wall-clock timings of the Zipp JavaScript engine versus Node v24.19.0, Bun 1.3.14 and Deno 2.6.10 on 30 benchmark rows (13 normal, 17 hostile), 15 counterbalanced repetitions each, with 10,000-sample bootstrap intervals.",
+          "name": "Zipp native benchmark captures f1739644, 2026-10-18",
+          "description": "Cold wall-clock timings of the Zipp 0.0.26 engine: with its JIT against Node v24.19.0, Bun 1.3.14 and Deno 2.6.10 on 30 rows (13 normal, 17 hostile, 15 counterbalanced repetitions, 10,000-sample bootstrap intervals); as an interpreter against QuickJS 2026-06-04, QuickJS-NG 0.17.0 and the JIT-off modes of Node, Deno and Bun; and its Python frontend against CPython 3.13.14.",
           "url": "https://www.zipp.org/benchmarks/",
           "license": "https://www.apache.org/licenses/LICENSE-2.0",
           "creator": {
@@ -1640,17 +1643,47 @@
             "name": "f2i",
             "url": "https://f2i.com"
           },
-          "datePublished": "2026-10-15",
+          "datePublished": "2026-10-18",
           "distribution": [
             {
               "@type": "DataDownload",
               "encodingFormat": "application/json",
-              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/real13_fa8e3b86_pgo_2026-10-15.json"
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/real13_f1739644_pgo_2026-10-18.json"
             },
             {
               "@type": "DataDownload",
               "encodingFormat": "application/json",
-              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json"
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_f1739644_pgo_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_real13_f1739644_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_hostile17_f1739644_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_5f1c0578_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_nojit_5f1c0578_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/release_real13_5f1c0578_2026-10-18.json"
+            },
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json"
             }
           ]
         }
@@ -1663,36 +1696,36 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "0.703×",
+                  "value": "0.634×",
                   "label": "Zipp/Node, all 30 rows, geometric mean",
-                  "note": "95% bootstrap interval 0.700 to 0.707"
+                  "note": "normal 13 0.542×, hostile 17 0.715×"
                 },
                 {
-                  "value": "0.548×",
+                  "value": "0.503×",
                   "label": "Zipp/Bun, all 30 rows",
-                  "note": "0.544 to 0.551"
+                  "note": "normal 0.462×, hostile 0.537×"
                 },
                 {
-                  "value": "0.473×",
+                  "value": "0.438×",
                   "label": "Zipp/Deno, all 30 rows",
-                  "note": "0.470 to 0.477"
+                  "note": "normal 0.471×, hostile 0.414×"
                 },
                 {
-                  "value": "23 / 30",
+                  "value": "24 / 30",
                   "label": "Rows where Zipp's median beats Node's",
-                  "note": "7 rows are slower; they are listed below"
+                  "note": "6 rows are slower; they are listed below"
                 }
               ]
             },
             {
               "type": "p",
-              "text": "Capture: 15 October 2026, engine commit `fa8e3b86`, a clean profile-guided-optimization build recorded as `zipp 0.0.24`. Native Windows x86-64, four engines, 15 repetitions per row, exact output on every observation. Every engine runs with its production JIT; the [interpreter-versus-interpreter table](https://github.com/f2i-com/zipp.org/blob/main/docs/PERFORMANCE.md#interpreter-versus-interpreter) in `docs/PERFORMANCE.md` compares Zipp's interpreter separately."
+              "text": "Capture: 18 October 2026, the 0.0.26 engine as a clean profile-guided-optimization build recorded as `zipp 0.0.26` from source `f1739644` (which differs from the release tag `5f1c0578` only in the website). Native Windows x86-64, four engines, 15 repetitions per row, exact output on every observation, and both artifacts record `publishable:true`. Every engine runs with its production JIT; [Interpreter versus interpreter](#interpreter-versus-interpreter) compares Zipp's interpreter with QuickJS and the JIT-off modes, and [Python versus CPython](#python-versus-cpython) its Python frontend. The all-30 figures weight the 30 rows equally, `exp((13 ln G13 + 17 ln G17) / 30)` of the two suites' geometric means, whose intervals are given with each suite."
             },
             {
               "type": "callout",
               "tone": "warning",
               "title": "The goal is not met",
-              "text": "The stated goal is to be faster than Node, Bun and Deno on every maintained row with exact output. The artifacts emit `FASTER_THAN_NODE_ON_EVERY_ROW=0`: Zipp now beats Node on all 13 normal rows, but 7 of the 17 hostile rows are still slower; see Where Zipp loses."
+              "text": "The stated goal is to be faster than Node, Bun and Deno on every maintained row with exact output. The artifacts emit `FASTER_THAN_NODE_ON_EVERY_ROW=0`: Zipp beats Node on all 13 normal rows, but 6 of the 17 hostile rows are still slower; see Where Zipp loses."
             }
           ]
         },
@@ -1732,7 +1765,7 @@
                 ],
                 [
                   "Zipp binary",
-                  "`zipp 0.0.24`, SHA-256 `318619b2…5699f3`, source `fa8e3b86`, not dirty"
+                  "`zipp 0.0.26`, SHA-256 `b9947268…c2c763`, source `f1739644`, not dirty"
                 ],
                 [
                   "Node",
@@ -1748,7 +1781,7 @@
                 ],
                 [
                   "Harness",
-                  "`tools/bench.py` and `tools/bench_hostile.py`, Python 3.13.14, seed `0x5A172026`, 300-second timeout"
+                  "`tools/bench.py` and `tools/bench_hostile.py`, Python 3.11.6, seed `0x5A172026`, 300-second timeout"
                 ]
               ]
             }
@@ -1771,19 +1804,19 @@
               "rows": [
                 [
                   "**Zipp**",
-                  "**8.3**"
+                  "**7.1**"
                 ],
                 [
                   "Node",
-                  "33.0"
+                  "31.7"
                 ],
                 [
                   "Bun",
-                  "50.8"
+                  "49.4"
                 ],
                 [
                   "Deno",
-                  "79.0 (79.7 in the hostile capture)"
+                  "79.2"
                 ]
               ]
             }
@@ -1798,7 +1831,7 @@
             },
             {
               "type": "table",
-              "caption": "real13, capture fa8e3b86, 15 October 2026",
+              "caption": "real13, capture f1739644, 18 October 2026",
               "head": [
                 "Row",
                 "Node",
@@ -1812,133 +1845,133 @@
               "rows": [
                 [
                   "async-promise-chain",
-                  "336.6",
-                  "374.5",
-                  "358.9",
-                  "266.2",
-                  "0.798* [0.792, 0.810]",
-                  "0.712",
-                  "0.743"
+                  "330.3",
+                  "371.3",
+                  "351.7",
+                  "259.0",
+                  "0.783* [0.777, 0.789]",
+                  "0.696",
+                  "0.740"
                 ],
                 [
                   "class-prototype-hot",
-                  "299.3",
-                  "340.2",
-                  "324.1",
-                  "235.2",
-                  "0.785* [0.780, 0.793]",
-                  "0.692",
-                  "0.730"
+                  "301.5",
+                  "339.0",
+                  "319.6",
+                  "232.9",
+                  "0.773* [0.764, 0.782]",
+                  "0.690",
+                  "0.731"
                 ],
                 [
                   "json-large",
-                  "256.5",
-                  "201.1",
-                  "310.8",
-                  "216.1",
-                  "0.846* [0.820, 0.870]",
-                  "1.080",
-                  "0.699"
+                  "265.2",
+                  "195.7",
+                  "309.9",
+                  "209.2",
+                  "0.795* [0.768, 0.799]",
+                  "1.072",
+                  "0.677"
                 ],
                 [
                   "map-set-heavy",
-                  "625.8",
-                  "782.8",
-                  "1099.3",
-                  "533.5",
-                  "0.837 [0.794, 0.921]",
-                  "0.699",
-                  "0.489"
+                  "620.4",
+                  "755.8",
+                  "1132.6",
+                  "449.8",
+                  "0.716* [0.691, 0.759]",
+                  "0.595",
+                  "0.398"
                 ],
                 [
                   "markdown-render",
-                  "269.7",
-                  "219.2",
-                  "317.2",
-                  "188.4",
-                  "0.695* [0.681, 0.702]",
-                  "0.861",
-                  "0.596"
+                  "271.4",
+                  "214.3",
+                  "310.0",
+                  "194.7",
+                  "0.726* [0.695, 0.730]",
+                  "0.902",
+                  "0.648"
                 ],
                 [
                   "parse-large-js",
-                  "273.3",
-                  "236.2",
-                  "280.5",
-                  "239.3",
-                  "0.884* [0.863, 0.887]",
-                  "1.011",
-                  "0.850"
+                  "273.5",
+                  "231.0",
+                  "286.1",
+                  "237.5",
+                  "0.872* [0.859, 0.886]",
+                  "1.027",
+                  "0.831"
                 ],
                 [
                   "polymorphic-objects",
-                  "330.3",
-                  "339.3",
-                  "330.7",
-                  "233.2",
-                  "0.708* [0.703, 0.719]",
-                  "0.685",
-                  "0.700"
-                ],
-                [
-                  "regex-log-scan",
-                  "468.3",
-                  "566.2",
-                  "461.8",
-                  "405.6",
-                  "0.859* [0.833, 0.881]",
-                  "0.719",
-                  "0.878"
-                ],
-                [
-                  "sparse-array",
-                  "81.2",
-                  "106.4",
-                  "123.6",
-                  "72.3",
-                  "0.894* [0.859, 0.907]",
-                  "0.682",
-                  "0.587"
-                ],
-                [
-                  "typedarray-math",
-                  "203.9",
-                  "918.2",
-                  "166.8",
-                  "139.6",
-                  "0.682* [0.673, 0.697]",
-                  "0.151",
-                  "0.848"
+                  "327.8",
+                  "335.2",
+                  "330.8",
+                  "211.9",
+                  "0.640* [0.636, 0.650]",
+                  "0.626",
+                  "0.633"
                 ],
                 [
                   "polymorphic-objects-v2",
-                  "83.5",
-                  "94.8",
-                  "125.6",
-                  "22.1",
-                  "0.266* [0.253, 0.270]",
-                  "0.235",
-                  "0.176"
+                  "84.0",
+                  "92.0",
+                  "126.5",
+                  "20.8",
+                  "0.251* [0.238, 0.262]",
+                  "0.227",
+                  "0.168"
                 ],
                 [
                   "property-ic-shapes",
-                  "258.4",
-                  "164.7",
-                  "308.7",
-                  "10.3",
-                  "0.040* [0.040, 0.040]",
-                  "0.063",
-                  "0.033"
+                  "258.9",
+                  "160.8",
+                  "308.5",
+                  "9.2",
+                  "0.035* [0.034, 0.038]",
+                  "0.057",
+                  "0.030"
+                ],
+                [
+                  "regex-log-scan",
+                  "461.8",
+                  "558.8",
+                  "460.3",
+                  "395.1",
+                  "0.847* [0.840, 0.875]",
+                  "0.708",
+                  "0.865"
+                ],
+                [
+                  "sparse-array",
+                  "81.9",
+                  "103.2",
+                  "122.7",
+                  "71.5",
+                  "0.893* [0.845, 0.905]",
+                  "0.699",
+                  "0.587"
                 ],
                 [
                   "sparse-array-v2",
-                  "173.2",
-                  "375.9",
-                  "181.6",
-                  "99.8",
-                  "0.574* [0.569, 0.579]",
-                  "0.265",
-                  "0.546"
+                  "172.9",
+                  "370.7",
+                  "180.2",
+                  "94.1",
+                  "0.544* [0.536, 0.554]",
+                  "0.253",
+                  "0.522"
+                ],
+                [
+                  "typedarray-math",
+                  "202.1",
+                  "911.7",
+                  "164.9",
+                  "138.7",
+                  "0.685* [0.681, 0.688]",
+                  "0.152",
+                  "0.852"
                 ]
               ]
             },
@@ -1953,18 +1986,18 @@
               "rows": [
                 [
                   "Headline 10",
-                  "0.795×",
-                  "[0.790, 0.801]"
+                  "0.769×",
+                  "[0.762, 0.775]"
                 ],
                 [
                   "Diagnostics 3",
-                  "0.182×",
-                  "[0.180, 0.184]"
+                  "0.169×",
+                  "[0.165, 0.175]"
                 ],
                 [
                   "All 13",
-                  "0.566×",
-                  "[0.563, 0.570]"
+                  "0.542×",
+                  "[0.537, 0.547]"
                 ]
               ]
             },
@@ -1983,7 +2016,7 @@
             },
             {
               "type": "table",
-              "caption": "hostile17, capture fa8e3b86, Zipp/Node cold ratio",
+              "caption": "hostile17, capture f1739644, Zipp/Node cold ratio",
               "head": [
                 "Row",
                 "Zipp/Node",
@@ -1993,55 +2026,55 @@
               "rows": [
                 [
                   "calls-baseline",
-                  "0.473",
+                  "0.439",
                   "calls-closures",
-                  "**1.107**"
+                  "**1.070**"
                 ],
                 [
                   "shapes-stable",
-                  "**1.081**",
+                  "**1.014**",
                   "shapes-megamorphic",
-                  "**1.132**"
+                  "**1.028**"
                 ],
                 [
                   "types-stable",
-                  "0.499",
+                  "0.454",
                   "types-churn",
-                  "0.687"
+                  "0.645"
                 ],
                 [
                   "branch-control",
-                  "0.805",
+                  "0.775",
                   "throw-catch",
-                  "0.494"
+                  "0.368"
                 ],
                 [
                   "allocation-ephemeral",
-                  "0.366",
+                  "0.314",
                   "allocation-survival",
-                  "**1.367**"
+                  "**1.355**"
                 ],
                 [
                   "async-burst",
-                  "0.543",
+                  "0.530",
                   "async-lived",
-                  "0.827"
+                  "0.723"
                 ],
                 [
                   "reactish-reconcile",
-                  "**1.276**",
+                  "**1.160**",
                   "warm-router",
-                  "**1.381**"
+                  "**1.306**"
                 ],
                 [
                   "bytecode-vm",
-                  "**3.135**",
+                  "0.972",
                   "module-hot-graph",
-                  "0.401"
+                  "0.367"
                 ],
                 [
                   "npm-nanoid",
-                  "0.955",
+                  "0.932",
                   "",
                   ""
                 ]
@@ -2049,7 +2082,7 @@
             },
             {
               "type": "p",
-              "text": "Ordinary geometric mean 0.829× Node [0.824, 0.837], 0.611× Bun, 0.461× Deno; category-balanced 0.895× Node. The suite's aspirational gate (category-balanced at most 1.05×, no category above 1.15×, no row above 1.50×) passes its category-balanced bound but fails on both the per-category and the row bounds (the bytecode VM is 3.13× Node)."
+              "text": "Ordinary geometric mean 0.715× Node [0.705, 0.722], 0.537× Bun, 0.414× Deno; category-balanced 0.748× Node. The suite's aspirational gate (category-balanced at most 1.05×, no category above 1.15×, no row above 1.50×) passes its category-balanced bound, fails the per-category bound (server 1.306×, applications 1.160×), and passes the row bound (the worst row, allocation-survival, is 1.355×)."
             }
           ]
         },
@@ -2058,16 +2091,794 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Seven of thirty rows have a Node point gap, all of them in the hostile suite: bytecode-vm 3.135×, warm-router 1.381×, allocation-survival 1.367×, reactish-reconcile 1.276×, shapes-megamorphic 1.132×, calls-closures 1.107×, shapes-stable 1.081×. The pattern: the JavaScript bytecode VM (a large `switch` dispatcher), long-lived allocation, megamorphic and churning property access, and closure-heavy application code are where V8's optimizing tiers still win."
+              "text": "Six of the thirty rows have a Node point gap, all of them in the hostile suite: allocation-survival 1.355×, warm-router 1.306×, reactish-reconcile 1.160×, calls-closures 1.070×, shapes-megamorphic 1.028×, shapes-stable 1.014×. The pattern: long-lived allocation, megamorphic and churning property access, and closure-heavy application code are where V8's optimizing tiers still win. The JavaScript bytecode VM (a large `switch` dispatcher), 3.135× Node in the previous capture, is now 0.972×."
             },
             {
               "type": "p",
-              "text": "Against Bun, Zipp loses bytecode-vm (2.270×), throw-catch (1.497×), json-large (1.080×), parse-large-js (1.011×), allocation-survival (1.004×). Against Deno, Zipp loses bytecode-vm (1.550×), throw-catch (1.484×). On the normal suite Bun is the absolute fastest engine on json-large and parse-large-js; Zipp is fastest on every other normal row."
+              "text": "Against Bun, Zipp loses throw-catch (1.113×), json-large (1.072×), parse-large-js (1.027×). Against Deno, Zipp loses throw-catch (1.141×). On the normal suite Bun is the absolute fastest engine on json-large and parse-large-js; Zipp is fastest on every other normal row."
             }
           ]
         },
         {
-          "heading": "WebAssembly, Python and GPU",
+          "heading": "Interpreter versus interpreter",
+          "id": "interpreter-versus-interpreter",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The tables above compare production JITs. This one asks how fast Zipp is as a pure interpreter: the same PGO binary with `ZIPP_NOJIT=1`, which emits no native code, against Bellard's QuickJS 2026-06-04 and QuickJS-NG 0.17.0 (neither has a JIT), and against Node `--jitless` (V8's Ignition), Deno `--v8-flags=--jitless` and Bun with `BUN_JSC_useJIT=0` (JavaScriptCore's LLInt). [`run_native.py`](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/run_native.py) staged identical sources for every engine, checked every output against Node's and ran 8 counterbalanced repetitions; cold medians in milliseconds, launch included. It is a diagnostic, not a canonical capture. This interpreter is what the WebAssembly build and the safe-sandbox profile run."
+            },
+            {
+              "type": "table",
+              "caption": "Zipp interpreter / engine, geometric means and rows won",
+              "head": [
+                "Engine",
+                "Normal 13",
+                "Hostile 17",
+                "All 30",
+                "Zipp faster"
+              ],
+              "rows": [
+                [
+                  "QuickJS",
+                  "0.648× [0.645, 0.653]",
+                  "0.780× [0.774, 0.785]",
+                  "0.720×",
+                  "21 / 30"
+                ],
+                [
+                  "QuickJS-NG",
+                  "0.409× [0.408, 0.412]",
+                  "0.411× [0.410, 0.417]",
+                  "0.410×",
+                  "30 / 30"
+                ],
+                [
+                  "Node jitless",
+                  "1.280× [1.273, 1.292]",
+                  "1.055× [1.051, 1.066]",
+                  "1.147×",
+                  "7 / 30"
+                ],
+                [
+                  "Deno jitless",
+                  "1.233× [1.227, 1.242]",
+                  "0.944× [0.918, 0.961]",
+                  "1.060×",
+                  "14 / 30"
+                ],
+                [
+                  "Bun no-JIT",
+                  "0.887× [0.883, 0.893]",
+                  "0.833× [0.826, 0.839]",
+                  "0.856×",
+                  "20 / 30"
+                ]
+              ]
+            },
+            {
+              "type": "table",
+              "caption": "Normal 13, interpreters, capture f1739644",
+              "head": [
+                "Row",
+                "Zipp interpreter",
+                "QuickJS",
+                "QuickJS-NG",
+                "Node jitless",
+                "Deno jitless",
+                "Bun no-JIT",
+                "Zipp/QuickJS"
+              ],
+              "rows": [
+                [
+                  "async-promise-chain",
+                  "408.9",
+                  "3,930",
+                  "3,842",
+                  "446.2",
+                  "445.3",
+                  "553.0",
+                  "0.104"
+                ],
+                [
+                  "class-prototype-hot",
+                  "3,769",
+                  "3,793",
+                  "7,254",
+                  "1,726",
+                  "1,711",
+                  "4,964",
+                  "0.994"
+                ],
+                [
+                  "json-large",
+                  "548.1",
+                  "782.4",
+                  "1,403",
+                  "541.1",
+                  "550.6",
+                  "630.6",
+                  "0.701"
+                ],
+                [
+                  "map-set-heavy",
+                  "675.6",
+                  "1,421",
+                  "2,098",
+                  "728.0",
+                  "1,164",
+                  "999.3",
+                  "0.475"
+                ],
+                [
+                  "markdown-render",
+                  "688.6",
+                  "1,065",
+                  "2,062",
+                  "772.7",
+                  "792.5",
+                  "967.9",
+                  "0.647"
+                ],
+                [
+                  "parse-large-js",
+                  "1,761",
+                  "2,009",
+                  "3,635",
+                  "1,368",
+                  "1,356",
+                  "1,581",
+                  "0.877"
+                ],
+                [
+                  "polymorphic-objects",
+                  "845.4",
+                  "885.3",
+                  "1,404",
+                  "584.1",
+                  "548.4",
+                  "1,301",
+                  "0.955"
+                ],
+                [
+                  "regex-log-scan",
+                  "1,718",
+                  "2,540",
+                  "3,970",
+                  "1,557",
+                  "1,519",
+                  "2,734",
+                  "0.677"
+                ],
+                [
+                  "sparse-array",
+                  "286.2",
+                  "381.0",
+                  "789.6",
+                  "204.2",
+                  "218.0",
+                  "268.4",
+                  "0.751"
+                ],
+                [
+                  "typedarray-math",
+                  "4,758",
+                  "3,817",
+                  "6,490",
+                  "2,224",
+                  "2,271",
+                  "3,258",
+                  "1.247"
+                ],
+                [
+                  "polymorphic-objects-v2",
+                  "435.6",
+                  "400.0",
+                  "841.3",
+                  "299.7",
+                  "310.2",
+                  "413.8",
+                  "1.089"
+                ],
+                [
+                  "property-ic-shapes",
+                  "3,032",
+                  "2,020",
+                  "5,215",
+                  "1,917",
+                  "1,951",
+                  "1,804",
+                  "1.501"
+                ],
+                [
+                  "sparse-array-v2",
+                  "334.5",
+                  "1,825",
+                  "871.9",
+                  "322.5",
+                  "303.6",
+                  "466.2",
+                  "0.183"
+                ]
+              ]
+            },
+            {
+              "type": "table",
+              "caption": "Hostile 17, interpreters, capture f1739644",
+              "head": [
+                "Row",
+                "Zipp interpreter",
+                "QuickJS",
+                "QuickJS-NG",
+                "Node jitless",
+                "Deno jitless",
+                "Bun no-JIT",
+                "Zipp/QuickJS"
+              ],
+              "rows": [
+                [
+                  "calls-baseline",
+                  "110.1",
+                  "110.3",
+                  "249.5",
+                  "104.1",
+                  "116.3",
+                  "106.8",
+                  "0.998"
+                ],
+                [
+                  "calls-closures",
+                  "283.4",
+                  "226.7",
+                  "450.5",
+                  "176.4",
+                  "196.4",
+                  "245.5",
+                  "1.250"
+                ],
+                [
+                  "shapes-stable",
+                  "93.9",
+                  "133.5",
+                  "234.1",
+                  "88.3",
+                  "101.2",
+                  "89.0",
+                  "0.703"
+                ],
+                [
+                  "shapes-megamorphic",
+                  "165.7",
+                  "192.1",
+                  "324.0",
+                  "114.7",
+                  "125.7",
+                  "186.4",
+                  "0.863"
+                ],
+                [
+                  "types-stable",
+                  "163.5",
+                  "162.6",
+                  "372.9",
+                  "128.9",
+                  "142.0",
+                  "128.9",
+                  "1.005"
+                ],
+                [
+                  "types-churn",
+                  "104.0",
+                  "98.6",
+                  "200.1",
+                  "99.5",
+                  "111.5",
+                  "112.5",
+                  "1.055"
+                ],
+                [
+                  "branch-control",
+                  "102.8",
+                  "108.5",
+                  "236.4",
+                  "100.8",
+                  "111.6",
+                  "101.6",
+                  "0.947"
+                ],
+                [
+                  "throw-catch",
+                  "101.2",
+                  "97.4",
+                  "292.5",
+                  "164.9",
+                  "136.8",
+                  "150.6",
+                  "1.038"
+                ],
+                [
+                  "allocation-ephemeral",
+                  "117.4",
+                  "263.1",
+                  "365.0",
+                  "123.7",
+                  "133.3",
+                  "259.7",
+                  "0.446"
+                ],
+                [
+                  "allocation-survival",
+                  "111.9",
+                  "178.3",
+                  "263.9",
+                  "105.0",
+                  "130.9",
+                  "135.5",
+                  "0.627"
+                ],
+                [
+                  "async-burst",
+                  "32.7",
+                  "102.2",
+                  "125.3",
+                  "61.5",
+                  "74.8",
+                  "42.3",
+                  "0.320"
+                ],
+                [
+                  "async-lived",
+                  "31.8",
+                  "107.0",
+                  "128.2",
+                  "50.3",
+                  "69.6",
+                  "65.1",
+                  "0.297"
+                ],
+                [
+                  "reactish-reconcile",
+                  "86.6",
+                  "123.6",
+                  "176.2",
+                  "74.4",
+                  "89.1",
+                  "104.1",
+                  "0.701"
+                ],
+                [
+                  "warm-router",
+                  "129.5",
+                  "123.1",
+                  "474.0",
+                  "78.2",
+                  "93.4",
+                  "139.6",
+                  "1.052"
+                ],
+                [
+                  "bytecode-vm",
+                  "348.6",
+                  "408.7",
+                  "941.9",
+                  "301.9",
+                  "307.3",
+                  "477.7",
+                  "0.853"
+                ],
+                [
+                  "module-hot-graph",
+                  "141.3",
+                  "95.3",
+                  "193.8",
+                  "104.9",
+                  "118.7",
+                  "145.4",
+                  "1.482"
+                ],
+                [
+                  "npm-nanoid",
+                  "518.3",
+                  "695.7",
+                  "1,162",
+                  "457.5",
+                  "465.2",
+                  "799.2",
+                  "0.745"
+                ]
+              ]
+            },
+            {
+              "type": "p",
+              "text": "Zipp's interpreter is faster than Bellard's QuickJS in aggregate and on 21 of 30 rows, and faster than QuickJS-NG on all of them. QuickJS wins property-ic-shapes (1.501×), module-hot-graph (1.482×), calls-closures (1.250×), typedarray-math (1.247×), polymorphic-objects-v2 (1.089×), types-churn (1.055×), warm-router (1.052×), throw-catch (1.038×), types-stable (1.005×). V8's Ignition is still faster overall (1.147×), and so, narrowly, is Deno's (1.060×); JavaScriptCore's LLInt is slower (0.856×)."
+            }
+          ]
+        },
+        {
+          "heading": "Python versus CPython",
+          "id": "python-versus-cpython",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Zipp compiles Python 3 to the same register bytecode. [`tools/python_bench.py`](https://github.com/f2i-com/zipp.org/blob/main/tools/python_bench.py) runs 36 programs (30 micro kernels, 6 application-shaped) as a fresh process per engine per repetition, interleaved, 15 repetitions, against CPython 3.13.14; every run's output must equal CPython's. The binary is the published 0.0.26 release build (the PGO build has no Python). Each program times its own workload in-process; that work time is the ratio below. Zipp runs with its JIT and again with `ZIPP_NOJIT=1`, since standard CPython is an interpreter. 8 further programs (the torch ones) have no CPython counterpart and are not included."
+            },
+            {
+              "type": "table",
+              "caption": "Zipp / CPython, geometric means of the work-time ratios",
+              "head": [
+                "Set",
+                "Zipp with JIT",
+                "Zipp, no JIT"
+              ],
+              "rows": [
+                [
+                  "Micro 30",
+                  "0.966×",
+                  "1.463×"
+                ],
+                [
+                  "Macro 6",
+                  "1.664×",
+                  "1.738×"
+                ],
+                [
+                  "All 36",
+                  "1.057×",
+                  "1.506×"
+                ],
+                [
+                  "All, whole-process wall time",
+                  "0.537×",
+                  "0.587×"
+                ]
+              ]
+            },
+            {
+              "type": "table",
+              "caption": "Python programs, work-time medians in milliseconds, CPython 3.13.14",
+              "head": [
+                "Program",
+                "Set",
+                "Zipp",
+                "Zipp no JIT",
+                "CPython",
+                "Zipp/CPython",
+                "No JIT/CPython"
+              ],
+              "rows": [
+                [
+                  "micro/attr_read_write",
+                  "micro",
+                  "3.32",
+                  "10.85",
+                  "7.83",
+                  "0.424",
+                  "1.382"
+                ],
+                [
+                  "micro/builtin_isinstance",
+                  "micro",
+                  "10.05",
+                  "17.12",
+                  "9.19",
+                  "1.094",
+                  "1.863"
+                ],
+                [
+                  "micro/builtin_len",
+                  "micro",
+                  "8.48",
+                  "14.79",
+                  "11.52",
+                  "0.736",
+                  "1.287"
+                ],
+                [
+                  "micro/call_defaults",
+                  "micro",
+                  "15.48",
+                  "15.29",
+                  "12.31",
+                  "1.257",
+                  "1.215"
+                ],
+                [
+                  "micro/call_keywords",
+                  "micro",
+                  "9.01",
+                  "8.62",
+                  "7.90",
+                  "1.140",
+                  "1.088"
+                ],
+                [
+                  "micro/call_simple",
+                  "micro",
+                  "37.08",
+                  "36.17",
+                  "36.12",
+                  "1.027",
+                  "1.006"
+                ],
+                [
+                  "micro/dict_get",
+                  "micro",
+                  "6.18",
+                  "12.10",
+                  "11.23",
+                  "0.550",
+                  "1.080"
+                ],
+                [
+                  "micro/dict_str_key",
+                  "micro",
+                  "27.67",
+                  "41.13",
+                  "20.18",
+                  "1.371",
+                  "2.015"
+                ],
+                [
+                  "micro/float_arith",
+                  "micro",
+                  "2.33",
+                  "11.74",
+                  "9.51",
+                  "0.245",
+                  "1.248"
+                ],
+                [
+                  "micro/for_list",
+                  "micro",
+                  "15.85",
+                  "25.10",
+                  "16.66",
+                  "0.951",
+                  "1.505"
+                ],
+                [
+                  "micro/fstring",
+                  "micro",
+                  "7.64",
+                  "9.80",
+                  "3.45",
+                  "2.211",
+                  "2.796"
+                ],
+                [
+                  "micro/generator_iter",
+                  "micro",
+                  "38.82",
+                  "44.31",
+                  "14.61",
+                  "2.658",
+                  "3.068"
+                ],
+                [
+                  "micro/global_read",
+                  "micro",
+                  "22.20",
+                  "32.59",
+                  "50.44",
+                  "0.440",
+                  "0.648"
+                ],
+                [
+                  "micro/hasattr_miss",
+                  "micro",
+                  "2.89",
+                  "6.07",
+                  "2.78",
+                  "1.038",
+                  "2.185"
+                ],
+                [
+                  "micro/hash_str",
+                  "micro",
+                  "7.14",
+                  "9.94",
+                  "7.94",
+                  "0.898",
+                  "1.257"
+                ],
+                [
+                  "micro/instance_new",
+                  "micro",
+                  "14.31",
+                  "16.74",
+                  "5.73",
+                  "2.495",
+                  "2.902"
+                ],
+                [
+                  "micro/int_arith",
+                  "micro",
+                  "66.84",
+                  "79.66",
+                  "144.88",
+                  "0.461",
+                  "0.553"
+                ],
+                [
+                  "micro/list_append",
+                  "micro",
+                  "4.77",
+                  "13.10",
+                  "5.19",
+                  "0.920",
+                  "2.556"
+                ],
+                [
+                  "micro/list_index",
+                  "micro",
+                  "16.62",
+                  "32.98",
+                  "26.55",
+                  "0.626",
+                  "1.240"
+                ],
+                [
+                  "micro/listcomp_small",
+                  "micro",
+                  "13.35",
+                  "15.53",
+                  "6.97",
+                  "1.914",
+                  "2.219"
+                ],
+                [
+                  "micro/math_sqrt",
+                  "micro",
+                  "10.84",
+                  "16.57",
+                  "9.79",
+                  "1.107",
+                  "1.689"
+                ],
+                [
+                  "micro/method_call",
+                  "micro",
+                  "14.10",
+                  "13.69",
+                  "8.51",
+                  "1.657",
+                  "1.581"
+                ],
+                [
+                  "micro/property_read",
+                  "micro",
+                  "12.23",
+                  "12.60",
+                  "8.77",
+                  "1.395",
+                  "1.443"
+                ],
+                [
+                  "micro/range_loop",
+                  "micro",
+                  "20.14",
+                  "45.60",
+                  "103.35",
+                  "0.195",
+                  "0.447"
+                ],
+                [
+                  "micro/str_long_len_index",
+                  "micro",
+                  "5.23",
+                  "7.97",
+                  "6.89",
+                  "0.759",
+                  "1.165"
+                ],
+                [
+                  "micro/str_methods",
+                  "micro",
+                  "22.73",
+                  "25.13",
+                  "7.15",
+                  "3.178",
+                  "3.503"
+                ],
+                [
+                  "micro/super_call",
+                  "micro",
+                  "14.46",
+                  "15.30",
+                  "8.49",
+                  "1.704",
+                  "1.792"
+                ],
+                [
+                  "micro/try_raise_catch",
+                  "micro",
+                  "24.06",
+                  "27.80",
+                  "8.91",
+                  "2.701",
+                  "3.121"
+                ],
+                [
+                  "micro/tuple_swap",
+                  "micro",
+                  "0.78",
+                  "1.64",
+                  "2.91",
+                  "0.266",
+                  "0.561"
+                ],
+                [
+                  "micro/tuple_unpack",
+                  "micro",
+                  "8.00",
+                  "12.12",
+                  "9.14",
+                  "0.875",
+                  "1.325"
+                ],
+                [
+                  "macro/fib_recursive",
+                  "macro",
+                  "36.76",
+                  "35.76",
+                  "22.15",
+                  "1.660",
+                  "1.616"
+                ],
+                [
+                  "macro/json_roundtrip",
+                  "macro",
+                  "6.58",
+                  "6.55",
+                  "7.90",
+                  "0.833",
+                  "0.831"
+                ],
+                [
+                  "macro/nbody",
+                  "macro",
+                  "14.41",
+                  "20.78",
+                  "9.07",
+                  "1.589",
+                  "2.314"
+                ],
+                [
+                  "macro/oo_simulation",
+                  "macro",
+                  "25.67",
+                  "25.01",
+                  "12.61",
+                  "2.036",
+                  "1.986"
+                ],
+                [
+                  "macro/sort_heapq",
+                  "macro",
+                  "12.30",
+                  "11.86",
+                  "5.90",
+                  "2.085",
+                  "2.017"
+                ],
+                [
+                  "macro/word_count",
+                  "macro",
+                  "22.55",
+                  "22.15",
+                  "9.92",
+                  "2.274",
+                  "2.213"
+                ]
+              ]
+            },
+            {
+              "type": "p",
+              "text": "With its JIT, Zipp's Python is faster than CPython on 15 of 36 programs and level on the micro kernels (0.966×), but CPython is faster on the application-shaped programs (1.664×) and overall (1.057×); without the JIT Zipp is 1.506×. Counting the whole process, Zipp's faster start makes it 0.537× CPython's wall time. No intervals are computed for these geometric means; the [JIT](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_5f1c0578_2026-10-18.json) and [no-JIT](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_nojit_5f1c0578_2026-10-18.json) artifacts hold every observation."
+            }
+          ]
+        },
+        {
+          "heading": "WebAssembly and GPU",
           "blocks": [
             {
               "type": "p",
@@ -2079,7 +2890,7 @@
             },
             {
               "type": "p",
-              "text": "There are no published Python-frontend benchmark tables beyond the three micro-timings on the [Python page](/python/), and no GPU performance numbers at all; the GPU work is validated for correctness only."
+              "text": "The Python frontend's measurements are in [Python versus CPython](#python-versus-cpython) above. There are no GPU performance numbers at all; the GPU work is validated for correctness only."
             }
           ]
         },
@@ -2140,23 +2951,28 @@
                 },
                 {
                   "date": "2026-10-15",
-                  "title": "0.795× headline, 0.703× all-30: the current capture",
+                  "title": "0.795× headline, 0.703× all-30: the previous capture",
                   "text": "All 13 normal rows faster than Node; seven hostile gaps remain."
+                },
+                {
+                  "date": "2026-10-18",
+                  "title": "0.769× headline, 0.634× all-30: the 0.0.26 capture",
+                  "text": "All 13 normal rows faster than Node; 6 hostile gaps remain, and the bytecode VM is no longer one."
                 }
               ]
             }
           ]
         },
         {
-          "heading": "A release measurement for v0.0.24",
+          "heading": "A release measurement for v0.0.26",
           "blocks": [
             {
               "type": "p",
-              "text": "For each release the 13 real rows are also measured against Node 24 alone, on the same Windows machine, in an ordinary release build rather than a profile-guided one. These are descriptive release checks, not the canonical four-engine capture above, and they are not compared with it. For v0.0.24 (`35e6d1dc`, 14 October 2026; Node 24.19.0, 10 interleaved repetitions, paired medians with bootstrap intervals, exact output on every row):"
+              "text": "The published binaries are ordinary release builds, not profile-guided ones, so each release is also measured as downloaded. These are descriptive release checks, separate from the canonical capture above. For v0.0.26 (the published `zipp-0.0.26-windows-x86_64-portable.exe`, source `5f1c0578`, 18 October 2026; Node 24.19.0, Bun 1.3.14 and Deno 2.6.10, 15 counterbalanced repetitions, paired medians with bootstrap intervals, exact output on every row):"
             },
             {
               "type": "table",
-              "caption": "v0.0.24 against Node 24, cold process medians",
+              "caption": "v0.0.26 release build against Node 24, cold process medians",
               "head": [
                 "Row",
                 "Node 24",
@@ -2166,87 +2982,87 @@
               "rows": [
                 [
                   "`async-promise-chain`",
-                  "333 ms",
-                  "315 ms",
-                  "0.94×"
+                  "335 ms",
+                  "298 ms",
+                  "0.89×"
                 ],
                 [
                   "`class-prototype-hot`",
-                  "296 ms",
-                  "234 ms",
-                  "0.79×"
-                ],
-                [
-                  "`json-large`",
-                  "256 ms",
-                  "245 ms",
-                  "0.95×"
-                ],
-                [
-                  "`map-set-heavy`",
-                  "649 ms",
-                  "603 ms",
-                  "0.94×"
-                ],
-                [
-                  "`markdown-render`",
-                  "276 ms",
-                  "212 ms",
+                  "303 ms",
+                  "235 ms",
                   "0.77×"
                 ],
                 [
-                  "`parse-large-js`",
+                  "`json-large`",
+                  "263 ms",
+                  "249 ms",
+                  "0.94×"
+                ],
+                [
+                  "`map-set-heavy`",
+                  "643 ms",
+                  "524 ms",
+                  "0.83×"
+                ],
+                [
+                  "`markdown-render`",
                   "272 ms",
-                  "246 ms",
-                  "0.90×"
+                  "221 ms",
+                  "0.82×"
+                ],
+                [
+                  "`parse-large-js`",
+                  "271 ms",
+                  "251 ms",
+                  "0.92×"
                 ],
                 [
                   "`polymorphic-objects`",
-                  "324 ms",
-                  "319 ms",
-                  "0.98×"
+                  "329 ms",
+                  "302 ms",
+                  "0.91×"
                 ],
                 [
                   "`polymorphic-objects-v2`",
-                  "82 ms",
-                  "26 ms",
+                  "84 ms",
+                  "27 ms",
                   "0.32×"
                 ],
                 [
                   "`property-ic-shapes`",
-                  "255 ms",
-                  "10 ms",
+                  "260 ms",
+                  "9 ms",
                   "0.04×"
                 ],
                 [
                   "`regex-log-scan`",
-                  "478 ms",
-                  "443 ms",
-                  "0.94×"
+                  "453 ms",
+                  "437 ms",
+                  "0.97×"
                 ],
                 [
                   "`sparse-array`",
-                  "78 ms",
-                  "74 ms",
-                  "0.94×"
+                  "81 ms",
+                  "72 ms",
+                  "0.88×"
                 ],
                 [
                   "`sparse-array-v2`",
-                  "169 ms",
-                  "105 ms",
-                  "0.62×"
+                  "174 ms",
+                  "100 ms",
+                  "0.57×"
                 ],
                 [
                   "`typedarray-math`",
-                  "201 ms",
-                  "141 ms",
-                  "0.70×"
+                  "208 ms",
+                  "139 ms",
+                  "0.67×"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "The geometric mean is 0.882× Node over the ten headline rows [0.873, 0.887] and 0.622× over all 13. Zipp's median is below Node's on every row; the strict sign test proves eight of them. Node's process start is about 30 ms of each of its times and Zipp's 7. Against v0.0.23 the same rows take 2.6% less time; `map-set-heavy` is the one row slower, by 2.8%. The [validation record](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-10-14-engine-size-round16-r2.md) has the paired intervals and the A/B."
+              "text": "The geometric mean is 0.856× Node over the ten headline rows [0.848, 0.861] and 0.604× over all 13 [0.599, 0.608]; Zipp's median is below Node's on every row. A paired A/B of the same 13 rows puts the profile-guided build at 0.901× the release build's time [0.897, 0.905]: the download is about 11% slower than the canonical figures. The [release](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/release_real13_5f1c0578_2026-10-18.json) and [A/B](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json) artifacts hold the observations."
             }
           ]
         },
@@ -2262,20 +3078,17 @@
             {
               "type": "ul",
               "items": [
-                "[bench/real13_fa8e3b86_pgo_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_fa8e3b86_pgo_2026-10-15.json), the normal-suite capture.",
-                "[bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json), the hostile capture.",
-                "[bench/comparison/interp_real13_fa8e3b86_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_real13_fa8e3b86_2026-10-15.json), the interpreter-versus-interpreter diagnostic (Zipp with `ZIPP_NOJIT=1` against QuickJS, QuickJS-NG and the JIT-off modes of Node, Deno and Bun).",
+                "[bench/real13_f1739644_pgo_2026-10-18.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_f1739644_pgo_2026-10-18.json), the normal-suite capture.",
+                "[bench/hostile/head_clean_f1739644_pgo_2026-10-18.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_f1739644_pgo_2026-10-18.json), the hostile capture.",
+                "[bench/comparison/interp_real13_f1739644_2026-10-18.json](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_real13_f1739644_2026-10-18.json) and [its hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_hostile17_f1739644_2026-10-18.json), interpreter against interpreter (Zipp with `ZIPP_NOJIT=1` against QuickJS, QuickJS-NG and the JIT-off modes of Node, Deno and Bun).",
+                "[bench/python/cpython_5f1c0578_2026-10-18.json](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_5f1c0578_2026-10-18.json) and [the no-JIT run](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_nojit_5f1c0578_2026-10-18.json), Python against CPython 3.13.14 (the second run sets `ZIPP_NOJIT=1` for the whole harness).",
+                "[bench/comparison/release_real13_5f1c0578_2026-10-18.json](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/release_real13_5f1c0578_2026-10-18.json) and [the PGO A/B](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json), the release build as downloaded.",
+                "[bench/real13_fa8e3b86_pgo_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_fa8e3b86_pgo_2026-10-15.json) and [its hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json), the previous canonical capture (15 October 2026, `zipp 0.0.24`).",
                 "[bench/real13_8229b3fc_pgo_2026-09-02.json](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/real13_8229b3fc_pgo_2026-09-02.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json), the previous canonical capture (since 17 October 2026 a row of [bench/history](https://github.com/f2i-com/zipp.org/blob/main/bench/history/README.md); these links are to the last commit that held the files).",
                 "[bench/real13_14770703_pgo_2026-09-11.json](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/real13_14770703_pgo_2026-09-11.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/hostile/head_clean_14770703_pgo_2026-09-11.json), the later capture.",
                 "[bench/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/README.md), the suite map and publication gate; [bench/hostile/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/README.md) and [manifest.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/manifest.json).",
                 "[docs/PERF_ROADMAP.md](https://github.com/f2i-com/zipp.org/blob/main/docs/PERF_ROADMAP.md), the checkable roadmap, and the [archived performance ledger](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/PERF_LEDGER-B001-B252.md), 881 KB of experiments including the refuted ones."
               ]
-            },
-            {
-              "type": "callout",
-              "tone": "note",
-              "title": "One inconsistency you will find in the repository",
-              "text": "The README quotes Deno's launch as 82.6 ms while the two artifacts record 81.8 and 83.3 ms. It does not change a conclusion."
             }
           ]
         }
@@ -2719,7 +3532,7 @@
             },
             {
               "type": "p",
-              "text": "Where Zipp is different: on native x86-64 it has a JIT and QuickJS does not, and the only interpreter-to-interpreter comparison in the repository, in WebAssembly, is marked not publishable because only five hostile rows were comparable; QuickJS-NG led four of those five. Zipp also carries a Python frontend, spec-strict call ordering with an audited host boundary, and a conformance result reported per execution with zero skips. Choose QuickJS for size and maturity; choose Zipp for native speed, two languages, or a Rust-native embedding."
+              "text": "Where Zipp is different: on native x86-64 it has a JIT and QuickJS does not. Run as a pure interpreter (`ZIPP_NOJIT=1`), natively, Zipp measures 0.720× Bellard's QuickJS and 0.410× QuickJS-NG over 30 rows on 18 October 2026; QuickJS is faster on 9 of them (the [benchmark page](/benchmarks/#interpreter-versus-interpreter) lists them). In WebAssembly the only comparison in the repository is marked not publishable: only five hostile rows were comparable, and QuickJS-NG led four of those five. Zipp also carries a Python frontend, spec-strict call ordering with an audited host boundary, and a conformance result reported per execution with zero skips. Choose QuickJS for size and maturity; choose Zipp for native speed, two languages, or a Rust-native embedding."
             }
           ]
         },

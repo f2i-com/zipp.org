@@ -147,6 +147,20 @@ test('the home page\'s story blurb states the journey page\'s own figures', () =
   assert.ok(journey.lede.includes(`in ${acts} acts`), `the journey page is told in ${acts} acts`)
 })
 
+test('every benchmark capture the page cites is in the repository, and the data names this release', () => {
+  // src/benchmark-data.json is written by scripts/import-benchmarks.py from these
+  // artifacts; BenchmarkSection.tsx links each of them on GitHub main.
+  const data = JSON.parse(readFileSync(new URL('../src/benchmark-data.json', import.meta.url), 'utf8'))
+  const artifacts = [data.jit.artifacts, data.interp.artifacts, data.python.artifacts, data.release.artifacts].flatMap(Object.values)
+  assert.equal(artifacts.length, 8)
+  for (const file of artifacts) assert.ok(existsSync(new URL(`../../${file}`, import.meta.url)), `${file} is missing`)
+  const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  for (const version of [data.jit.zipp.version, data.python.zipp.version, data.release.zipp.version]) {
+    assert.equal(version, `zipp ${site.zippEngineRelease}`)
+  }
+  assert.equal(data.jit.nodeWins, [...data.jit.normal.rows, ...data.jit.hostile.rows].filter(row => row.ratio < 1).length)
+})
+
 test('repository links on the site point at files and headings that exist on main', () => {
   // Links to github.com/f2i-com/zipp.org/blob/main/<path>[#anchor] (and tree/main) in the
   // home page's source and the documentation pages; the README and docs moved on 17

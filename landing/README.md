@@ -176,18 +176,30 @@ cannot fetch live repository facts. Normal builds work without network access.
 
 ## Evidence and engine provenance
 
-Canonical native CLI numbers are attached to the 15 October 2026 captures at
-`fa8e3b86`:
+The benchmark section's figures come from `src/benchmark-data.json`, which
+`python scripts/import-benchmarks.py` (run from the repository root as
+`python landing/scripts/import-benchmarks.py`) writes from the 18 October 2026
+captures and nothing else:
 
-- `../bench/real13_fa8e3b86_pgo_2026-10-15.json`
-- `../bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`
+- JIT against JIT, the canonical PGO build of the 0.0.26 engine (`zipp 0.0.26`,
+  clean source `f1739644`): `../bench/real13_f1739644_pgo_2026-10-18.json` and
+  `../bench/hostile/head_clean_f1739644_pgo_2026-10-18.json`
+- interpreter against interpreter, the same binary with `ZIPP_NOJIT=1`:
+  `../bench/comparison/interp_real13_f1739644_2026-10-18.json` and `../bench/comparison/interp_hostile17_f1739644_2026-10-18.json`
+- Python against CPython, the published release binary: `../bench/python/cpython_5f1c0578_2026-10-18.json`
+  and `../bench/python/cpython_nojit_5f1c0578_2026-10-18.json`
+- the release build as downloaded: `../bench/comparison/release_real13_5f1c0578_2026-10-18.json` and
+  `../bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json`
 
-The executable's recorded build identity is v0.0.24 (`zipp 0.0.24`, clean
-source `fa8e3b86`), and the root README quotes the same capture. Benchmark
-headlines, confidence intervals, row counts, and the table refer to the same
-capture, rather than silently mixing new README headlines with old table rows.
-The previous canonical pair (`8229b3fc`, 2 September 2026, recorded as
-v0.0.12) stays in `../bench/` as a prior series point.
+The importer checks that the canonical pair is publishable and exact, and that
+replaying the saved observations through `tools/bench.py` reproduces the
+capture's own geomeans before it derives the Bun and Deno ones;
+`--check` reports whether the committed data is current. The page states only
+what the data says (counts and directions are computed), so a new capture
+needs no hand edits there; the `/benchmarks/` page in `site/content.json`,
+`docs/PERFORMANCE.md` and the root README quote the same figures. The previous
+canonical pair (`fa8e3b86`, 15 October 2026, recorded as v0.0.24) stays in
+`../bench/` as a prior series point.
 
 The optional JavaScript story scratchpad's browser engine is v0.0.26, 4,621,320 raw bytes, SHA-256
 `db19933b2412c642daad507ccc1cfd6cf515ddb27ca4b1eeb3d47f91600f3418`.

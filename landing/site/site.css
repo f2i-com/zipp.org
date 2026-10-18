@@ -114,6 +114,8 @@ strong { font-weight: 760; color: #fff; }
 article.doc { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 48px; }
 article.doc > section, article.doc > .page-header, article.doc > .related { max-width: var(--measure); }
 article.doc > section { grid-column: 1; }
+/* Long file names and paths in prose and lists break rather than widen a phone's page. */
+article.doc p a, article.doc li a, article.doc p code, article.doc li code { overflow-wrap: anywhere; }
 
 .toc { padding: 18px 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-raised); margin-bottom: 2rem; }
 .toc strong { display: block; color: var(--lilac); font-family: var(--mono); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 8px; }

@@ -5,6 +5,7 @@ import './styles.css'
 import './experience.css'
 import './demos.css'
 import './embed.css'
+import './benchmarks.css'
 
 // The static introduction in index.html exists for readers and crawlers that
 // never run this script; the app renders the same links itself.

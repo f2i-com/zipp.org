@@ -1,0 +1,60 @@
+/* The benchmark section's comparison chooser (JIT vs JIT, interpreter vs
+   interpreter, Python vs CPython) and the wider tables it adds. The rest of
+   the section uses styles.css's benchmark rules. */
+
+.mode-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  margin: 2px 0 18px;
+  border-color: var(--line);
+  background: var(--bg-raised);
+}
+
+.mode-tabs button {
+  min-height: 40px;
+  padding: 0 16px;
+  color: #afb5b2;
+  font-size: 10px;
+}
+
+.mode-tabs button:hover {
+  color: var(--ink);
+}
+
+.mode-tabs button.active {
+  color: var(--dark-ink);
+  background: var(--lime);
+}
+
+/* Five engines in one summary card: tighter rows, room for the names. */
+.dense-card .ratio-row {
+  grid-template-columns: 78px 1fr 54px;
+  margin-top: 15px;
+}
+
+/* A summary bar past parity: ZIPP slower than that engine. */
+.ratio-row i.ratio-bar-gap {
+  background: var(--coral);
+}
+
+.interp-table th,
+.interp-table td,
+.python-table th,
+.python-table td {
+  padding: 0 12px;
+}
+
+@media (max-width: 620px) {
+  .mode-tabs {
+    display: flex;
+  }
+
+  .mode-tabs button {
+    flex: 1 1 auto;
+  }
+
+  .interp-table td,
+  .python-table td {
+    padding: 27px 8px 9px;
+  }
+}
