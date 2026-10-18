@@ -84,7 +84,9 @@ await writeFile(workerPath, worker)
 const pageDir = path.join(output, 'playground')
 const script = await readFile(path.join(pageDir, 'playground.js'), 'utf8')
 const css = await readFile(path.join(pageDir, 'playground.css'), 'utf8')
-const tag = hash([worker, script, css].join('\0')).slice(0, 16)
+// Line endings do not change what runs, and a CRLF checkout must stamp the
+// same tag as the committed LF one.
+const tag = hash([worker, script, css].join('\0').replace(/\r\n/g, '\n')).slice(0, 16)
 const tagged = (text, from, to, file) => {
   if (!text.includes(from)) throw Error(`${file} no longer contains ${from}`)
   return text.replace(from, to)
