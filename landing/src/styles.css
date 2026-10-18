@@ -2777,6 +2777,98 @@ svg {
   }
 }
 
+/* Nine inline links stop fitting beside the brand and the star at about
+   1,050px (labels wrapped to two lines and touched both); below 1,100px the
+   header uses the menu, as it already did below 850px. */
+@media (max-width: 1100px) {
+  .nav-links .nav-star {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--lime);
+  }
+
+  .site-header {
+    grid-template-columns: 1fr auto;
+  }
+
+  .header-cta {
+    display: none;
+  }
+
+  .menu-button {
+    position: relative;
+    z-index: 2;
+    justify-self: end;
+    display: grid;
+    width: 46px;
+    height: 46px;
+    place-content: center;
+    gap: 6px;
+    padding: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: rgba(8, 9, 13, 0.8);
+    cursor: pointer;
+  }
+
+  .menu-button span {
+    width: 18px;
+    height: 1px;
+    background: var(--ink);
+    transition: transform 180ms ease;
+  }
+
+  .menu-button[aria-expanded='true'] span:first-child {
+    transform: translateY(3.5px) rotate(45deg);
+  }
+
+  .menu-button[aria-expanded='true'] span:last-child {
+    transform: translateY(-3.5px) rotate(-45deg);
+  }
+
+  .nav-links {
+    position: absolute;
+    z-index: 1;
+    top: 58px;
+    right: 0;
+    left: 0;
+    display: grid;
+    gap: 0;
+    padding: 10px 16px;
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    background: rgba(15, 17, 23, 0.98);
+    box-shadow: 0 24px 50px rgba(0, 0, 0, 0.42);
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-8px);
+    visibility: hidden;
+    transition: opacity 160ms ease, transform 160ms ease, visibility 0s linear 160ms;
+  }
+
+  .nav-links.nav-open {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+    visibility: visible;
+    transition-delay: 0s;
+  }
+
+  .nav-links a {
+    min-height: 48px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .nav-links a:last-child {
+    border-bottom: 0;
+  }
+
+  .nav-links a::after {
+    display: none;
+  }
+}
+
 @media (max-width: 850px) {
   .reading-guide,
   .release-strip ol {

@@ -1,0 +1,453 @@
+/* "Embed ZIPP on your site" (EmbedSection.tsx): the engine chooser, the two
+   downloads, the copyable example and the starter project. */
+
+/* The hero's pointer to it (App.tsx), the seventh child of .hero-copy. */
+.hero-embed {
+  max-width: 640px;
+  margin-top: 18px;
+  color: #b7b1c2;
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+.hero-embed a {
+  color: var(--lime);
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.hero-embed code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: #e4dcff;
+}
+
+.hero-copy > :nth-child(7) {
+  animation-delay: 540ms;
+}
+
+/* The folder playground's place-holder (ProjectPlayground.tsx), the frame's
+   size so nothing below it moves when the frame arrives. */
+.project-playground-standby {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 22px;
+  padding: 32px;
+  text-align: center;
+}
+
+.project-playground-standby p {
+  max-width: 520px;
+  color: #c4bcd0;
+  line-height: 1.7;
+}
+
+.project-playground-standby strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--ink);
+  font-size: 1.15rem;
+}
+.embed-section {
+  padding-block: 90px 70px;
+}
+
+.embed-section .split-heading > p code,
+.embed-step code,
+.embed-note code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: #e4dcff;
+}
+
+.embed-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+  align-items: start;
+  gap: clamp(28px, 4vw, 56px);
+}
+
+/* One explicit, shrinkable track: an auto track would grow to the longest
+   line of a code block and push the column past the page. */
+.embed-steps,
+.embed-code {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 22px;
+  min-width: 0;
+}
+
+.embed-steps > *,
+.embed-code > * {
+  min-width: 0;
+}
+
+.embed-step {
+  min-width: 0;
+  margin: 0;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #13121a;
+}
+
+.embed-step h3,
+.embed-step legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 0;
+  font-size: 1.05rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+/* A fieldset's legend sits on its border unless it floats. */
+.embed-chooser legend {
+  float: left;
+  width: 100%;
+}
+
+.embed-chooser legend + * {
+  clear: both;
+}
+
+.embed-step-number {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: var(--dark-ink);
+  background: var(--lime);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.engine-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+
+.engine-option:hover {
+  border-color: var(--line-strong);
+}
+
+.engine-option:has(input:checked) {
+  border-color: var(--lime);
+  background: rgba(196, 181, 253, 0.08);
+}
+
+.engine-option input {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--lime);
+}
+
+/* The radio is the focus target; show the ring on the whole option. A browser
+   without :has() keeps the radio's own ring. */
+@supports selector(:has(*)) {
+  .engine-option input:focus-visible {
+    outline: none;
+  }
+
+  .engine-option:has(input:focus-visible) {
+    outline: 3px solid var(--cyan);
+    outline-offset: 3px;
+  }
+}
+
+.engine-option-text {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.engine-option-text strong {
+  font-size: 1rem;
+}
+
+.engine-option-text span {
+  color: #c7c1d3;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.engine-option-text small {
+  color: #9f97ae;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+
+.embed-note,
+.embed-step > p,
+.embed-more > p {
+  color: #c4bcd0;
+  font-size: 0.9rem;
+  line-height: 1.65;
+}
+
+.embed-note {
+  margin-top: 14px;
+}
+
+.embed-note a,
+.embed-step > p a,
+.embed-downloads a {
+  color: var(--lime);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+
+.embed-downloads {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.embed-downloads li {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.embed-downloads a code {
+  color: inherit;
+  font-size: 0.85rem;
+}
+
+.embed-downloads span {
+  color: #a9a1b8;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.embed-starter .button {
+  margin-top: 16px;
+  gap: 10px;
+}
+
+.embed-file-size {
+  color: #a9a1b8;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.embed-window {
+  min-width: 0;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: var(--radius);
+  background: #0d1015;
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.3);
+}
+
+.embed-window-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 0 14px 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.embed-window-header h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.embed-copy {
+  min-width: 72px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: #e4e8e6;
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.embed-copy-hint {
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--dark-ink);
+  background: var(--lime);
+  font-size: 0.85rem;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.embed-copy:hover {
+  color: var(--dark-ink);
+  border-color: var(--lime);
+  background: var(--lime);
+}
+
+.embed-code pre,
+.embed-more pre {
+  max-width: 100%;
+  overflow-x: auto;
+  font-family: var(--mono);
+  tab-size: 2;
+}
+
+.embed-window > pre {
+  padding: 20px 22px;
+  color: #d9dfdc;
+  font-size: 0.8rem;
+  line-height: 1.75;
+}
+
+/* Scrollable code is focusable, for keyboard scrolling; keep its ring inside. */
+.embed-code pre:focus-visible,
+.embed-more pre:focus-visible {
+  outline-offset: -3px;
+}
+
+.embed-code pre code,
+.embed-more pre code {
+  font: inherit;
+}
+
+.embed-output {
+  padding: 14px 22px 18px;
+  border-top: 1px solid var(--line);
+  background: rgba(124, 58, 237, 0.06);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+.embed-output > p {
+  color: #a9a1b8;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.embed-output pre {
+  margin-top: 8px;
+  color: var(--lime);
+  font-size: 0.85rem;
+  line-height: 1.7;
+}
+
+.embed-more {
+  padding: 0 22px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #13121a;
+}
+
+.embed-more summary {
+  padding: 18px 0;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.embed-more[open] summary {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 14px;
+}
+
+.embed-more pre {
+  margin-top: 14px;
+  padding: 16px 18px;
+  border-radius: 10px;
+  color: #d9dfdc;
+  background: #0d1015;
+  font-size: 0.8rem;
+  line-height: 1.75;
+}
+
+.embed-more-output {
+  margin-block: 12px 20px;
+}
+
+.embed-more-output code {
+  color: var(--lime);
+  font-family: var(--mono);
+}
+
+.embed-csp {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  color: #e4dcff;
+  background: #0d1015;
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+
+.embed-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 22px;
+  margin-top: 14px;
+}
+
+@media (max-width: 900px) {
+  .embed-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 620px) {
+  .embed-section {
+    padding-block: 60px 50px;
+  }
+
+  .embed-step,
+  .embed-more {
+    padding-inline: 16px;
+  }
+
+  .embed-step {
+    padding-block: 18px;
+  }
+
+  .embed-window > pre,
+  .embed-output {
+    padding-inline: 16px;
+  }
+
+  .embed-starter .button {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .engine-option {
+    transition: none;
+  }
+}

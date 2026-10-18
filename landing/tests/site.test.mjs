@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { renderSite, validateContent, siteRoutes, inline, escapeHtml, sortedEntries } from '../site/render.mjs'
 
 const content = JSON.parse(readFileSync(new URL('../site/content.json', import.meta.url), 'utf8'))
@@ -132,6 +132,41 @@ test('release install snippets run the Linux CLI the way releases package it', (
       assert.ok(/chmod \+x zipp/.test(code), 'a downloaded Linux binary is made executable before it runs')
     }
   }
+})
+
+test('the home page\'s story blurb states the journey page\'s own figures', () => {
+  // A dated snapshot on the home page, kept in step with the page it describes.
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
+  const blurb = /href: '\/journey\/'[^\n]*text: '([^']+)'/.exec(app)?.[1] ?? ''
+  const [, commits, days] = /^([\d,]+) commits in (\d+) days, to (\d+ \w+ \d{4})/.exec(blurb) ?? []
+  assert.ok(commits && days, `the blurb names a commit count, a day count and a date: ${blurb}`)
+  const journey = content.pages.find(page => page.slug === 'journey')
+  assert.ok(journey.lede.includes(`${commits} commits over ${days} days`), 'the journey page states the same numbers')
+  assert.ok(journey.title.includes(`${days} Days`))
+  const acts = /told in (\w+) acts/.exec(blurb)?.[1]
+  assert.ok(journey.lede.includes(`in ${acts} acts`), `the journey page is told in ${acts} acts`)
+})
+
+test('repository links on the site point at files and headings that exist on main', () => {
+  // Links to github.com/f2i-com/zipp.org/blob/main/<path>[#anchor] (and tree/main) in the
+  // home page's source and the documentation pages; the README and docs moved on 17
+  // October 2026, and links into them broke silently before this check.
+  const root = new URL('../../', import.meta.url)
+  const sources = ['src/App.tsx', 'src/ProjectPlayground.tsx', 'src/EmbedSection.tsx', 'src/RepositoryActivity.tsx', 'src/Experience.tsx', 'site/content.json', 'index.html']
+    .map(file => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8').replaceAll('${GITHUB_URL}', 'https://github.com/f2i-com/zipp.org'))
+  const slug = heading => heading.trim().toLowerCase().replace(/[^\w\- ]+/g, '').replace(/ /g, '-')
+  const broken = []
+  for (const text of sources) {
+    for (const [, kind, file, anchor] of text.matchAll(/https:\/\/github\.com\/f2i-com\/zipp\.org\/(blob|tree)\/main\/([^\s"'`)#?]+)(?:#([\w-]+))?/g)) {
+      const target = new URL(file, root)
+      if (!existsSync(target)) { broken.push(`${kind}/main/${file}`); continue }
+      if (anchor && file.endsWith('.md')) {
+        const headings = [...readFileSync(target, 'utf8').matchAll(/^#+\s+(.+)$/gm)].map(m => slug(m[1]))
+        if (!headings.includes(anchor)) broken.push(`${file}#${anchor}`)
+      }
+    }
+  }
+  assert.deepEqual([...new Set(broken)], [])
 })
 
 test('the home page keeps the site identity and links to the documentation without JavaScript', () => {

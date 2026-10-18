@@ -3,6 +3,7 @@ import { formatCount, relativeTime, useRepoStats, type RepoStats, type RepoStatu
 import { SandboxStack, ProjectShowcase } from './Experience'
 import { RepositoryActivity } from './RepositoryActivity'
 import { ProjectPlayground } from './ProjectPlayground'
+import { EmbedSection } from './EmbedSection'
 import { test262Summary } from './repoData'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
@@ -11,13 +12,15 @@ const DOCS_URL = '/javascript-engine/'
 const EMBEDDING_URL = '/embedding/'
 const SANDBOX_PLAYGROUND_URL = '/sandbox/playground/'
 const LANGUAGES_URL = `${GITHUB_URL}/blob/main/docs/LANGUAGES.md`
-const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
-const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
-const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
+// The canonical capture the benchmark figures below come from (15 October 2026,
+// engine fa8e3b86), and docs/PERFORMANCE.md, which reports its aggregates.
+const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_fa8e3b86_pgo_2026-10-15.json`
+const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`
+const ROADMAP_URL = `${GITHUB_URL}/blob/main/docs/PERF_ROADMAP.md`
 const RELEASE_URL = `${GITHUB_URL}/releases/latest`
 const RELEASES_URL = `${GITHUB_URL}/releases`
 const COMMITS_URL = `${GITHUB_URL}/commits/main`
-const CAPTURE_README_URL = `${GITHUB_URL}/blob/e6e0f65dd402f1bf75b9675d7acd904cb239c5a3/README.md#canonical-public-capture`
+const CAPTURE_SUMMARY_URL = `${GITHUB_URL}/blob/main/docs/PERFORMANCE.md#canonical-public-capture`
 
 /** The static documentation pages (rendered from site/content.json), with anchor text that names the destination. */
 const DOC_LINKS = [
@@ -32,7 +35,8 @@ const DOC_LINKS = [
   { href: '/sandbox/', title: 'Sandboxing untrusted code', text: 'Three execution profiles, their guarantees, and their non-guarantees.' },
   { href: SANDBOX_PLAYGROUND_URL, title: 'Sandbox playground', text: 'Run JavaScript in a default-deny sandbox, with a switch for every permission and limit.' },
   { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
-  { href: '/journey/', title: 'The Zipp story', text: '1,927 commits in 108 days, told in five acts with the mistakes left in.' },
+  // A dated snapshot: the figures the /journey/ page itself states (tests/embed.test.mjs checks they agree).
+  { href: '/journey/', title: 'The Zipp story', text: '2,477 commits in 139 days, to 14 October 2026, told in seven acts with the mistakes left in.' },
   { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
 ]
 
@@ -199,9 +203,12 @@ function StarIcon() {
   )
 }
 
+// The Test262 figure is read from the README at `sourceCommit`; docs/CORRECTNESS.md
+// at the same commit is where the repository explains it (the README's own
+// correctness section moved there).
 function ConformanceLink({ stats }: { stats: RepoStats }) {
   const result = test262Summary(stats)
-  return <a href={`${GITHUB_URL}/blob/${stats.sourceCommit ?? 'main'}/README.md#correctness-and-language-coverage`} target="_blank" rel="noreferrer" title={result?.detail}>{result?.label ?? 'ECMAScript compatibility'}</a>
+  return <a href={`${GITHUB_URL}/blob/${stats.sourceCommit ?? 'main'}/docs/CORRECTNESS.md`} target="_blank" rel="noreferrer" title={result?.detail}>{result?.label ?? 'ECMAScript compatibility'}</a>
 }
 
 function LiveRepoStrip({ stats, status }: { stats: RepoStats; status: RepoStatus }) {
@@ -620,6 +627,14 @@ function Playground() {
 
   const packageBase = () => new URL(`${import.meta.env.BASE_URL}wasm/`, document.baseURI)
 
+  // This scratchpad loads the engine's internal packaging: the wasm-bindgen glue
+  // and the module as two files in public/wasm, extracted from the release's
+  // zipp-0.0.26-javascript.wasm (`package.mjs extract`) and driven by
+  // playground.worker.ts. Pages that embed ZIPP use the public path instead,
+  // zipp.mjs plus that one .wasm, which the Embed section (EmbedSection.tsx)
+  // shows and /sandbox/playground/ runs. tests/adventure.test.mjs exercises this
+  // pair, tests/embed.test.mjs the public one.
+  //
   // The glue and the .wasm are hash-matched halves of one artifact; a cache that
   // serves a new .wasm beside an older glue fails instantiation with "function
   // import requires a callable". Neither filename is fingerprinted (they are
@@ -665,15 +680,12 @@ function Playground() {
     worker.postMessage({ type: 'warm', ...wasmUrls() })
   }
 
-  // Warm on intent rather than on mount, so a visitor who never touches the
-  // playground is not made to download and compile 4.4 MB to scroll past it.
-  useEffect(() => {
-    const idle = window.requestIdleCallback?.bind(window)
-    const handle = idle ? idle(() => prewarm(), { timeout: 4000 }) : undefined
-    return () => {
-      if (handle !== undefined) window.cancelIdleCallback?.(handle)
-    }
-  }, [])
+  // Warm on intent, not on mount: the spare Worker (a 4.6 MB download and
+  // compile) starts on the first pointer, touch or keyboard focus inside the
+  // scratchpad, or with the first Run. This component only mounts once its
+  // "More JavaScript examples" disclosure is opened, and even then a reader who
+  // only looks at the samples downloads nothing.
+  const warmOnIntent = () => prewarm()
 
   useEffect(() => () => {
     stopWorker()
@@ -773,7 +785,7 @@ function Playground() {
   }[status]
 
   return (
-    <section className="playground-section" id="javascript-scratchpad">
+    <section className="playground-section" id="javascript-scratchpad" onPointerEnter={warmOnIntent} onTouchStart={warmOnIntent} onFocus={warmOnIntent}>
       <div className="playground-heading">
         <div>
           <p className="section-kicker">LESS TALK. MORE TINKERING.</p>
@@ -846,6 +858,7 @@ function Playground() {
         </div>
       </div>
       <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.26`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.26</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">This scratchpad loads the engine’s internal two-file packaging. To put ZIPP in your own page, use <code>zipp.mjs</code> and one <code>.wasm</code>: see <a href="#embed">Embed ZIPP on your site</a>.</p>
     </section>
   )
 }
@@ -933,6 +946,7 @@ function App() {
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
           <a href="/javascript-engine/">Docs</a>
           <a href="#playground" onClick={closeMenu}>Playground</a>
+          <a href="#embed" onClick={closeMenu}>Embed</a>
           <a href="/webgpu/">Python &amp; GPU</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
           <a href="#updates" onClick={closeMenu}>What’s new</a>
@@ -976,6 +990,10 @@ function App() {
               <a className="button button-primary" href="#playground">Try the playground <span aria-hidden="true">↗</span></a>
               <ExternalLink className="button button-secondary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
             </div>
+            <p className="hero-embed">
+              <a href="#embed">Embed it in your page</a>: one <code>.wasm</code> engine and <code>zipp.mjs</code> from
+              the <a href={`${GITHUB_URL}/releases/tag/v0.0.26`} target="_blank" rel="noreferrer">v0.0.26 release</a>, nothing to build.
+            </p>
 
             <div className="hero-trust" aria-label="Zipp highlights">
               <ConformanceLink stats={stats} />
@@ -990,7 +1008,7 @@ function App() {
         </section>
 
         <section className="proof-band" aria-label="Measured native Zipp results">
-          <div className="proof-caption section-wrap"><span>NATIVE BENCHMARK SNAPSHOT</span><a href="#benchmarks">15 Oct 2026 · capture fa8e3b86 · see the evidence ↗</a></div>
+          <div className="proof-caption section-wrap"><span>NATIVE BENCHMARK SNAPSHOT</span><a href="#benchmarks">Captured 15 Oct 2026 at engine fa8e3b86 · native Windows x86-64 CLI vs Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · not the browser build · see the evidence ↗</a></div>
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
@@ -1016,6 +1034,8 @@ function App() {
         </section>
 
         <ProjectPlayground />
+
+        <EmbedSection />
 
         <ProjectShowcase />
 
@@ -1110,7 +1130,7 @@ function App() {
             </div>
           </div>
 
-          <p className="benchmark-capture-note">Measured 15 October 2026 · native Windows x86-64 · engine <code>fa8e3b86</code>. These are retained benchmark results, not measurements of the latest release or browser playground. <a href={CAPTURE_README_URL} target="_blank" rel="noreferrer">Read the capture summary ↗</a></p>
+          <p className="benchmark-capture-note">Measured 15 October 2026 · native Windows x86-64 · engine <code>fa8e3b86</code> · Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10. These are retained benchmark results, not measurements of the latest release or browser playground. <a href={CAPTURE_SUMMARY_URL} target="_blank" rel="noreferrer">Read the capture summary ↗</a></p>
           <div className="benchmark-summary">
             <article className="headline-result">
               <div>
@@ -1269,7 +1289,7 @@ function App() {
             <div className="methodology-links">
               <ExternalLink className="text-link" href={BENCHMARK_URL}>Normal capture</ExternalLink>
               <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile capture</ExternalLink>
-              <ExternalLink className="text-link" href={CAPTURE_README_URL}>Aggregate & intervals</ExternalLink>
+              <ExternalLink className="text-link" href={CAPTURE_SUMMARY_URL}>Aggregate & intervals</ExternalLink>
               <ExternalLink className="text-link" href={ROADMAP_URL}>What is next</ExternalLink>
             </div>
           </div>
@@ -1329,6 +1349,7 @@ function App() {
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
               <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
+              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.26`}>Or download the v0.0.26 CLI</ExternalLink>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>

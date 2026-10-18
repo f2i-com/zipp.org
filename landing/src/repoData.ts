@@ -30,7 +30,7 @@ const obj = (v: unknown): Record<string, unknown> => typeof v === 'object' && v 
 const str = (v: unknown): string | undefined => typeof v === 'string' && v.length > 0 ? v.slice(0, 500) : undefined
 const count = (v: unknown): number | undefined => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined
 const date = (v: unknown): string | undefined => str(v) && Number.isFinite(Date.parse(v as string)) ? v as string : undefined
-// The source commit becomes part of a README link path, so only a full commit
+// The source commit becomes part of a repository link path, so only a full commit
 // SHA is accepted; anything else could redirect the link to another repository.
 const commitSha = (v: unknown): string | undefined => typeof v === 'string' && /^[a-f0-9]{40}$/.test(v) ? v : undefined
 
@@ -77,7 +77,7 @@ export function test262Summary(stats: RepoStats): { label: string; detail: strin
     return { label: `${pct}% Test262 · corrected suite`, detail: `${formatCount(pass)} / ${formatCount(total)} executions passed with documented upstream test corrections.${original} See both reports.` }
   }
   return stats.test262Pct !== undefined
-    ? { label: `${stats.test262Pct}% Test262 · original suite`, detail: 'Original pinned core Test262 result. See the README for its scope and known failures.' }
+    ? { label: `${stats.test262Pct}% Test262 · original suite`, detail: 'Original pinned core Test262 result. docs/CORRECTNESS.md gives its scope and its expected failure.' }
     : null
 }
 

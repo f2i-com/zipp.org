@@ -78,6 +78,24 @@ commit and the loader's hash); the page reads it to find the module. Without a
 manifest the page says the sandbox is available once 0.0.26 is published. The
 landing tests check that `public/sandbox/` holds a complete engine or none.
 
+## Embed section and starter project
+
+The home page's "Embed ZIPP on your site" section (`src/EmbedSection.tsx`, at
+`/#embed`) shows the public way to embed ZIPP: an engine `.wasm` and `zipp.mjs`
+from the release's embed kit. Its release, file names, sizes, example programs
+and expected output live in `src/embed-data.mjs`, which the page, the starter
+generator and the tests share. The starter project it offers,
+`public/embed/zipp-starter-<v>.zip` (`index.html`, `main.mjs` and a README with
+the download and serve commands; no engine or loader inside), is generated:
+
+```sh
+node scripts/build-embed-starter.mjs           # write the ZIP
+node scripts/build-embed-starter.mjs --check   # fail if it differs from what the script makes
+```
+
+`tests/embed.test.mjs` checks the section, the ZIP's files and pinned URLs, and
+runs the displayed example through `public/sandbox/zipp.mjs` and its engine.
+
 ## Recorded examples
 
 `public/demos/` contains the actual local browser captures, still posters, an SVG

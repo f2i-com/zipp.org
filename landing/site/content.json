@@ -360,7 +360,7 @@
               "items": [
                 {
                   "q": "Is Zipp production-ready?",
-                  "a": "It is a 0.0.x project that is 108 days old at the time of writing. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python frontend is explicitly experimental. Read the [release notes](/releases/) and decide per use case."
+                  "a": "It is a 0.0.x project, first committed on 29 May 2026; v0.0.26 shipped on 18 October 2026. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python frontend is explicitly experimental. Read the [release notes](/releases/) and decide per use case."
                 },
                 {
                   "q": "Does Zipp have a JIT?",
@@ -1076,14 +1076,18 @@
                   "torch, added to the `-javascript-python-base` engine when a program needs it"
                 ],
                 [
+                  "`zipp-<v>-<engine>.wasm.br`",
+                  "Each module above compressed with Brotli (from v0.0.26): the same engine at about a quarter of the size, for a server that sends it with `Content-Encoding: br`"
+                ],
+                [
                   "`zipp-<v>-wasm-embed-kit.zip`",
-                  "The loader `zipp.mjs` and its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
+                  "The loader `zipp.mjs`, the one file a page needs beside an engine, with its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
+              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. The release has each one ready as a `.wasm.br` (1,196,785 bytes for the JavaScript engine): send it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it. `zipp.mjs` 1.2.0, in the v0.0.26 kit as republished, also loads a `.wasm.br` URL itself, decompressing it where the runtime can (Node, Firefox) or falling back to the plain `.wasm` beside it; the plain `.wasm` stays the default. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
             }
           ]
         },
@@ -1099,11 +1103,11 @@
             },
             {
               "type": "p",
-              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw a `SecurityError`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.26 JavaScript engine this way and lets you switch each permission and limit and see the result."
+              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw an `Error` whose message begins `SecurityError:`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.26 JavaScript engine this way and lets you switch each permission and limit and see the result."
             },
             {
               "type": "p",
-              "text": "`loadZipp` also takes `{ engine, packages }`: given the `-javascript-python-base` engine and the torch package, it adds torch to the engine in the same step. What it resolves to also holds the engine's `Engine` class, for a host that drives the API above itself."
+              "text": "`loadZipp` also takes `{ engine, packages }`: given the `-javascript-python-base` engine and the torch package, it adds torch to the engine in the same step. What it resolves to also holds the engine's `Engine` class, for a host that drives the API above itself. The [embed section of the home page](/#embed) shows the smallest default-deny example for each engine, links its two downloads, and offers a starter project with no build step."
             }
           ]
         }
@@ -1498,7 +1502,7 @@
                 "[tools/run_test262.py](https://github.com/f2i-com/zipp.org/blob/main/tools/run_test262.py), the runner and scorer.",
                 "[tools/CLDR-DATA.md](https://github.com/f2i-com/zipp.org/blob/main/tools/CLDR-DATA.md), the provenance of the generated DateTimeFormat CLDR data.",
                 "For the previous pin, `4249661`: the [hosted run at 1539eb4b](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947), the machine-readable [summary of 14 September 2026](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-test262-datetimeformat.json), and the [narrative log](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/validation/2026-09-14-ci-readiness.md) with a per-failure analysis.",
-                "[The correctness audits of 12 September 2026](https://github.com/f2i-com/zipp.org/tree/main/docs/audits)."
+                "[The correctness audits of 12 September 2026](https://github.com/f2i-com/zipp.org/tree/main/docs/archive/audits)."
               ]
             }
           ]
@@ -1608,7 +1612,7 @@
     {
       "slug": "benchmarks",
       "title": "Zipp Benchmarks: Rust JavaScript Engine vs Node, Bun and Deno",
-      "description": "Reproducible native benchmarks of Zipp against Node 24.12, Bun 1.3.14 and Deno 2.6.10: 30 rows, hardware, flags, PGO, bootstrap intervals, losses, and raw JSON.",
+      "description": "Reproducible native benchmarks of Zipp against Node 24.19, Bun 1.3.14 and Deno 2.6.10: 30 rows, hardware, flags, PGO, bootstrap intervals, losses, and raw JSON.",
       "h1": "Zipp benchmarks",
       "breadcrumb": "Benchmarks",
       "lede": "This is the canonical home for Zipp's performance numbers. Every table below comes from a checked-in JSON capture with engine hashes, competitor hashes, per-repetition schedules and bootstrap replicates, so anyone can re-run it and anyone can cite it. Ratios are Zipp divided by the competitor: lower is faster.",
@@ -1621,7 +1625,7 @@
         "JavaScript startup time"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-14",
+      "dateModified": "2026-10-18",
       "priority": "0.9",
       "extraStructuredData": [
         {
@@ -1682,7 +1686,7 @@
             },
             {
               "type": "p",
-              "text": "Capture: 15 October 2026, engine commit `fa8e3b86`, a clean profile-guided-optimization build recorded as `zipp 0.0.24`. Native Windows x86-64, four engines, 15 repetitions per row, exact output on every observation. Every engine runs with its production JIT; the README's interpreter-versus-interpreter table compares Zipp's interpreter separately."
+              "text": "Capture: 15 October 2026, engine commit `fa8e3b86`, a clean profile-guided-optimization build recorded as `zipp 0.0.24`. Native Windows x86-64, four engines, 15 repetitions per row, exact output on every observation. Every engine runs with its production JIT; the [interpreter-versus-interpreter table](https://github.com/f2i-com/zipp.org/blob/main/docs/PERFORMANCE.md#interpreter-versus-interpreter) in `docs/PERFORMANCE.md` compares Zipp's interpreter separately."
             },
             {
               "type": "callout",
@@ -2261,8 +2265,8 @@
                 "[bench/real13_fa8e3b86_pgo_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_fa8e3b86_pgo_2026-10-15.json), the normal-suite capture.",
                 "[bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_fa8e3b86_pgo_2026-10-15.json), the hostile capture.",
                 "[bench/comparison/interp_real13_fa8e3b86_2026-10-15.json](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_real13_fa8e3b86_2026-10-15.json), the interpreter-versus-interpreter diagnostic (Zipp with `ZIPP_NOJIT=1` against QuickJS, QuickJS-NG and the JIT-off modes of Node, Deno and Bun).",
-                "[bench/real13_8229b3fc_pgo_2026-09-02.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json), the previous canonical capture.",
-                "[bench/real13_14770703_pgo_2026-09-11.json](https://github.com/f2i-com/zipp.org/blob/main/bench/real13_14770703_pgo_2026-09-11.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/head_clean_14770703_pgo_2026-09-11.json), the later capture.",
+                "[bench/real13_8229b3fc_pgo_2026-09-02.json](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/real13_8229b3fc_pgo_2026-09-02.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json), the previous canonical capture (since 17 October 2026 a row of [bench/history](https://github.com/f2i-com/zipp.org/blob/main/bench/history/README.md); these links are to the last commit that held the files).",
+                "[bench/real13_14770703_pgo_2026-09-11.json](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/real13_14770703_pgo_2026-09-11.json) and [the hostile pair](https://github.com/f2i-com/zipp.org/blob/af87a2c7a2079a87e260e1ba6442efe42f9530cb/bench/hostile/head_clean_14770703_pgo_2026-09-11.json), the later capture.",
                 "[bench/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/README.md), the suite map and publication gate; [bench/hostile/README.md](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/README.md) and [manifest.json](https://github.com/f2i-com/zipp.org/blob/main/bench/hostile/manifest.json).",
                 "[docs/PERF_ROADMAP.md](https://github.com/f2i-com/zipp.org/blob/main/docs/PERF_ROADMAP.md), the checkable roadmap, and the [archived performance ledger](https://github.com/f2i-com/zipp.org/blob/main/docs/archive/PERF_LEDGER-B001-B252.md), 881 KB of experiments including the refuted ones."
               ]
@@ -2371,7 +2375,7 @@
             },
             {
               "type": "p",
-              "text": "Since v0.0.26 each engine is one `.wasm` file that loads through `zipp.mjs`, the embed kit's one-file loader. It hands back the `Engine` class above, and it also makes sandboxes that are default-deny and run in their own Worker by default, with a time limit that terminates it; the [WebAssembly page](/wasm/#from-0-0-26) describes it, and the [sandbox playground](/sandbox/playground/) runs it."
+              "text": "Since v0.0.26 each engine is one `.wasm` file that loads through `zipp.mjs`, the embed kit's one-file loader. It hands back the `Engine` class above, and it also makes sandboxes that are default-deny and run in their own Worker by default, with a time limit that terminates it; the [WebAssembly page](/wasm/#from-0-0-26) describes it, the [sandbox playground](/sandbox/playground/) runs it, and the [embed section of the home page](/#embed) has the two downloads and a starter project."
             }
           ]
         },
@@ -2506,7 +2510,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.26 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it."
+              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.26 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it. To run the same sandbox in a page of your own, start from the [embed section of the home page](/#embed): an engine `.wasm`, `zipp.mjs` and a starter project."
             }
           ]
         },
@@ -2581,7 +2585,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Two external correctness audits on 11 and 12 September 2026 produced 38 tickets across the embedding API, host boundary, TypedArray semantics, Proxy rooting, ArrayBuffer re-entrancy and iterator closing; all are recorded under `docs/audits/` and closed in v0.0.16 and v0.0.17. Security reports go through GitHub private advisories at [github.com/f2i-com/zipp.org/security/advisories/new](https://github.com/f2i-com/zipp.org/security/advisories/new), with acknowledgement targeted within seven days and status updates at least every fourteen."
+              "text": "Two external correctness audits on 11 and 12 September 2026 produced 38 tickets across the embedding API, host boundary, TypedArray semantics, Proxy rooting, ArrayBuffer re-entrancy and iterator closing; all are recorded under [`docs/archive/audits/`](https://github.com/f2i-com/zipp.org/tree/main/docs/archive/audits) and closed in v0.0.16 and v0.0.17. Security reports go through GitHub private advisories at [github.com/f2i-com/zipp.org/security/advisories/new](https://github.com/f2i-com/zipp.org/security/advisories/new), with acknowledgement targeted within seven days and status updates at least every fourteen."
             }
           ]
         }
@@ -2805,7 +2809,7 @@
       "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.26 on 18 October 2026, with what changed, how releases are gated, and what each download contains.",
       "h1": "Zipp releases",
       "breadcrumb": "Releases",
-      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine, and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Twenty-six tags shipped between 30 August and 18 October 2026. This page lists them, explains what a release has to pass, and links the notes.",
+      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine (each also Brotli-compressed, as `.wasm.br`), and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Twenty-six tags shipped between 30 August and 18 October 2026. This page lists them, explains what a release has to pass, and links the notes.",
       "keywords": [
         "Zipp releases",
         "Zipp download",
@@ -2827,7 +2831,7 @@
               "type": "ul",
               "items": [
                 "Downloads: the `.msi` installs per user into `%LOCALAPPDATA%\\Programs\\ZIPP` and adds `zipp` to the user's PATH, with no administrator rights; the Linux binaries need glibc 2.35 or later and `chmod +x`, and the armv7 one, for 32-bit Arm with hard float, is interpreter only.",
-                "WebAssembly: each engine is one `.wasm` file whose bindings sit in a custom section, and the embed kit's `zipp.mjs` loads any of them; `loadZipp({ engine, packages })` adds the torch package. `createSandbox()` runs a program in its own Worker with nothing permitted unless granted (storage, files, a network allowlist that sends no cookies, host functions), with step and time limits. The [sandbox playground](/sandbox/playground/) runs the 0.0.26 JavaScript engine.",
+                "WebAssembly: each engine is one `.wasm` file whose bindings sit in a custom section, and the embed kit's `zipp.mjs` loads any of them; `loadZipp({ engine, packages })` adds the torch package. `createSandbox()` runs a program in its own Worker with nothing permitted unless granted (storage, files, a network allowlist that sends no cookies, host functions), with step and time limits. Each engine also comes as a Brotli-compressed `.wasm.br`, the same module at about a quarter of the size; the plain `.wasm` stays the default. The [sandbox playground](/sandbox/playground/) runs the 0.0.26 JavaScript engine, and the [embed section of the home page](/#embed) has the example for each engine and a starter project.",
                 "Conformance: Test262 at the 13 October 2026 corpus (`d53ebc8b`), unmodified, passes 96,229 of 96,230 executions with one expected Annex B failure, and so do a 32-bit build, which CI runs as a Windows i686 job, and the arm64 Linux CLI built on an Arm runner. Indices and lengths past 2^32 were truncated on 32-bit hosts, wasm32 and armv7, in every earlier WebAssembly release too; that is fixed.",
                 "Interpreter: against Bellard's QuickJS on canonical held-out builds, the 21 expansion workloads went from 1.199× to 0.931× of its time over this cycle, and the 17 hostile workloads from 0.834× to 0.791×.",
                 "Python and torch: the first `import torch` in a fresh engine takes under 0.4 s in WebKit instead of about 32 s, about 0.27 s in Chromium instead of 0.64 s, and about 0.3 s in Node instead of 0.78 s.",
@@ -2894,14 +2898,39 @@
                   "The torch package, added to the `-javascript-python-base` engine when a program needs it"
                 ],
                 [
+                  "`zipp-0.0.26-javascript.wasm.br`",
+                  "1,196,785",
+                  "The JavaScript engine compressed with Brotli: the same module at about a quarter of the size. Serve it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it, or let `zipp.mjs` 1.2.0 load it"
+                ],
+                [
+                  "`zipp-0.0.26-javascript-lite.wasm.br`",
+                  "723,299",
+                  "ZIPP Lite, Brotli-compressed"
+                ],
+                [
+                  "`zipp-0.0.26-javascript-python.wasm.br`",
+                  "1,964,927",
+                  "JavaScript + Python with torch, Brotli-compressed"
+                ],
+                [
+                  "`zipp-0.0.26-javascript-python-base.wasm.br`",
+                  "1,588,216",
+                  "JavaScript + Python without torch, Brotli-compressed"
+                ],
+                [
+                  "`zipp-0.0.26-torch-package.wasm.br`",
+                  "403,240",
+                  "The torch package, Brotli-compressed"
+                ],
+                [
                   "`zipp-0.0.26-wasm-embed-kit.zip`",
-                  "210,554",
-                  "The loader `zipp.mjs` and its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
+                  "212,300",
+                  "The loader `zipp.mjs`, the one file a page needs beside an engine, with its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples. Replaced after publication by a kit with loader 1.2.0, which also loads a `.wasm.br`: decoded by the server, decompressed by the loader where the runtime can (Node, Firefox), or by falling back to the plain `.wasm` beside it"
                 ],
                 [
                   "`SHA256SUMS`",
-                  "1,078",
-                  "Checksums for every asset"
+                  "1,590",
+                  "Checksums for all 16 files above, regenerated when the `.wasm.br` files and the new kit were added"
                 ]
               ]
             },
@@ -2924,11 +2953,11 @@
               "type": "code",
               "caption": "From a release download",
               "lang": "shell",
-              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.26-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.26-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.26-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.26-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.26-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.26-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# WebAssembly, for a web page: the loader zipp.mjs from the embed kit, and one\n# engine (or its .wasm.br: the same engine, about a quarter of the size)\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-wasm-embed-kit.zip\nunzip -j zipp-0.0.26-wasm-embed-kit.zip zipp-0.0.26-wasm-embed-kit/zipp.mjs\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-javascript.wasm\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",
-              "text": "Zipp is not on crates.io or npm yet. The WebAssembly engines and the embed kit are meant to be served by your own host; the [WebAssembly page](/wasm/) explains the loader, its sandboxes and the Worker model."
+              "text": "Zipp is not on crates.io or npm yet. The WebAssembly engines and the embed kit are meant to be served by your own host, over HTTP: a page needs `zipp.mjs` from the kit beside whichever `.wasm` it loads. Serve a `.wasm.br` with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it; `zipp.mjs` 1.2.0 also loads one itself, decompressing it where the runtime can or falling back to the plain `.wasm` beside it. The [embed section of the home page](/#embed) has a starter project, and the [WebAssembly page](/wasm/) explains the loader, its sandboxes and the Worker model."
             },
             {
               "type": "p",
