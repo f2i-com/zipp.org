@@ -17,8 +17,9 @@ Pick an engine; each is one file from the release:
 | `zipp-{{VERSION}}-javascript-python-base.wasm` | JavaScript and Python, without torch (smaller) |
 | `zipp-{{VERSION}}-torch-package.wasm` | torch, added to the `-python-base` engine when you need it |
 
-From this kit you need one file, `zipp.mjs`. `modules.json` lists each
-module's size and SHA-256.
+Each also comes compressed with Brotli as `.wasm.br`, about a quarter of the
+size. From this kit you need one file, `zipp.mjs`. `modules.json` lists each
+module's size and SHA-256 (and its `.wasm.br`'s, when the release has one).
 
 ## Quick start
 
@@ -26,11 +27,17 @@ module's size and SHA-256.
 import { loadZipp } from "./zipp.mjs";
 
 const zipp = await loadZipp("./zipp-{{VERSION}}-javascript.wasm");
-const sandbox = await zipp.createSandbox();
-const { output } = await sandbox.run("console.log([1, 2, 3].map(x => x * 2))");
-console.log(output); // ["[ 2, 4, 6 ]"]
-await sandbox.close();
+const sandbox = await zipp.createSandbox();          // nothing is permitted
+try {
+  const { output } = await sandbox.run("console.log([1, 2, 3].map(x => x * 2))");
+  console.log(output);                               // ["[ 2, 4, 6 ]"]
+} finally {
+  await sandbox.close();
+}
 ```
+
+Serve the folder over HTTP (`python -m http.server` or `npx serve`); a page
+opened as `file://` cannot load modules.
 
 ## How it works
 
@@ -76,6 +83,23 @@ const sandbox = await zipp.createSandbox({
 | `host: { kind: fn }` | `host.call(kind, args, reply => ...)`; your function's return value (or promise) arrives as `{ ok: true, value }` | `{ ok: false, error: { code: "denied" } }` |
 
 Unknown option names are errors, so a typo cannot quietly drop a limit.
+`network: true` allows any http(s) URL under the same rules; prefer listing
+the origins or URL prefixes a program needs.
+
+What each language can be given in this release:
+
+| Permission | JavaScript | Python |
+| --- | --- | --- |
+| `storage` | yes | no |
+| `files` | yes, through `host.callSync("fs.*")` | yes, as its importable modules (`name.py`, read-only) |
+| `network` | yes, through `fetch` | no |
+| `host` | yes, through `host.call` | no |
+| `limits` | yes | yes |
+
+This is layered protection, not a guarantee: WebAssembly's memory isolation,
+an engine built without `unsafe` code or a JIT, default-deny capabilities, a
+Worker per program, and the limits below. Keep a Content-Security-Policy on
+the page and treat a program's output as untrusted data.
 
 ## Limits and isolation
 
@@ -101,7 +125,12 @@ const sandbox = await zipp.createSandbox({
   language: "python",
   permissions: { files: { "helpers.py": "def double(x):\n    return 2 * x\n" } },
 });
-await sandbox.run("import helpers, torch\nprint(helpers.double(21), torch.tensor([1.0, 2.0]).tolist())");
+try {
+  const { output } = await sandbox.run("import helpers, torch\nprint(helpers.double(21), torch.tensor([1.0, 2.0]).tolist())");
+  console.log(output);   // ["42 [1.0, 2.0]"]
+} finally {
+  await sandbox.close();
+}
 ```
 
 The complete `-javascript-python` engine has torch built in. A Python
@@ -122,8 +151,16 @@ themselves; its README has the contract.
 ## Serving the files
 
 - Serve `.wasm` as `application/wasm` so browsers compile while
-  downloading (with another type the loader downloads first). Brotli or gzip
-  roughly quarters the transfer.
+  downloading (with another type the loader downloads first).
+- **Brotli.** The `.wasm.br` beside each module is the same engine, about a
+  quarter of the bytes. Serve it with `Content-Encoding: br` and
+  `Content-Type: application/wasm` and the browser decodes it on arrival; on
+  Apache, `AddType application/wasm .wasm` with `AddEncoding br .br` does
+  that, and a rewrite can send it to Brotli-capable browsers in place of the
+  `.wasm`. `loadZipp("...wasm.br")` (loader 1.2.0 and later) also works where
+  the server does not decode it: it decompresses the bytes itself where the
+  runtime can (Node, Firefox) and otherwise falls back to the plain `.wasm`
+  beside it, so keep both deployed.
 - The loader imports the bindings from a `blob:` URL (browsers, Deno, Bun)
   or a `data:` URL (Node), and a sandbox starts a Worker from `zipp.mjs`. A
   Content-Security-Policy must allow them, e.g.

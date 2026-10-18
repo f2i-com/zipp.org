@@ -63,6 +63,7 @@ files, checksummed in its `SHA256SUMS`:
 | `zipp-0.0.26-javascript-lite.wasm` | The same without `Intl` and `Temporal`, built for size. |
 | `zipp-0.0.26-javascript-python.wasm` | JavaScript and Python, with torch built in. |
 | `zipp-0.0.26-javascript-python-base.wasm` + `zipp-0.0.26-torch-package.wasm` | JavaScript and Python, with torch as a separate add-on. |
+| `zipp-0.0.26-<engine>.wasm.br` | Each of those `.wasm` files compressed with Brotli: about a quarter of the size. Serve it with `Content-Encoding: br` (the browser decodes it); the plain `.wasm` is the default. |
 | `zipp-0.0.26-wasm-embed-kit.zip` | `zipp.mjs`, the one file that loads and sandboxes any of the `.wasm` engines, with types, examples and docs. |
 
 **Windows** (PowerShell):
@@ -102,47 +103,87 @@ hardened runner, [`zipp-sandbox`](crates/zipp-sandbox/README.md): no JIT, no
 
 ## Embed it in a web page or Node.js
 
-Download an engine `.wasm` and the embed kit, then:
+You need two files from the [release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.26):
+
+1. **One engine `.wasm`.** Pick the smallest that runs your language:
+
+   | You need | Download |
+   | --- | --- |
+   | JavaScript, smallest (no `Intl`, no `Temporal`) | `zipp-0.0.26-javascript-lite.wasm` |
+   | JavaScript, complete | `zipp-0.0.26-javascript.wasm` |
+   | JavaScript and Python | `zipp-0.0.26-javascript-python-base.wasm` |
+   | JavaScript and Python with torch | `zipp-0.0.26-javascript-python.wasm`, or the `-base` engine plus `zipp-0.0.26-torch-package.wasm` when only some pages need torch |
+
+2. **`zipp.mjs`**, the loader, from
+   [`zipp-0.0.26-wasm-embed-kit.zip`](https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-wasm-embed-kit.zip).
+   It loads any of the engines.
+
+Put both next to your page, serve the folder over HTTP (`python -m http.server`
+or `npx serve`; a page opened as `file://` cannot load modules), and start
+with nothing allowed:
 
 ```js
 import { loadZipp } from "./zipp.mjs";
 
 const zipp = await loadZipp("./zipp-0.0.26-javascript.wasm");
-const sandbox = await zipp.createSandbox({
-  limits: { instructions: 50_000_000, timeoutMs: 5000 },
-  permissions: {
-    storage: true,                                // its own private localStorage
-    files: { "data.csv": "a,b\n1,2" },            // files it may read
-    network: ["https://api.example.com/"],        // where its fetch() may go
-  },
-});
-const { output } = await sandbox.run(`
-  const rows = host.callSync("fs.read", "data.csv").split("\\n");
-  console.log(rows.length, "rows");
-`);
-await sandbox.close();
+const sandbox = await zipp.createSandbox();       // nothing is permitted
+try {
+  const { output } = await sandbox.run('console.log("Hello from ZIPP")');
+  console.log(output);                            // ["Hello from ZIPP"]
+} finally {
+  await sandbox.close();
+}
 ```
 
-**How it works, in short:**
+For Python, load a `-python` engine and pass `{ language: "python" }` to
+`createSandbox`. Then grant only what the program needs, one permission at a
+time:
 
-1. Each `.wasm` engine carries its own JavaScript bindings inside it, so
-   `zipp.mjs` can load any of them: just slot in the file you want.
-2. A sandbox runs one program in its own engine, in its own Worker (a worker
-   thread in Node), so a program that never stops cannot freeze your page:
-   past its time limit, the Worker is ended.
-3. The program can compute and print, and nothing else, until you allow
-   more. It never sees your page, its storage or cookies, the DOM, Node's
-   `process` or `require`, the file system or the network. Each permission
-   opens exactly one door: private storage, a map of files, `fetch` to the
-   URLs you list (without your cookies), or functions you choose to expose.
-4. Python works the same way, and torch is an optional second file:
-   `loadZipp({ engine: "...-javascript-python-base.wasm", packages: ["...-torch-package.wasm"] })`.
+```js
+const sandbox = await zipp.createSandbox({
+  limits: { instructions: 50_000_000, timeoutMs: 5000 },
+  permissions: { network: ["https://api.example.com/"] },   // fetch() may reach this origin only
+});
+```
 
-The [embed kit guide](crates/zipp-wasm/embed-kit/README.md) has every option,
-and [WebAssembly engine reference](crates/zipp-wasm/README.md) the engine's
-full API and limits. To embed ZIPP in a Rust program, see
-[embedding](docs/REFERENCE.md#embedding).
+**What a sandbox does.**
 
+- **Each sandbox is one program in its own engine and its own Worker** (a
+  worker thread in Node). The program cannot see your page, its DOM,
+  `localStorage` or cookies, or Node's `process`, `require` and file system.
+- **Everything outside it is denied until you grant it.** JavaScript
+  programs can be given private storage (`storage`), a map of files
+  (`files`), `fetch` to listed URLs (`network`) and functions you choose
+  (`host`). Python programs, in this release, can be given only `files`,
+  which become their importable modules.
+- **Three kinds of limit, enforced in different places.** The step budget
+  (`limits.instructions`, 50 million by default) is counted inside the engine
+  and stops runaway computation anywhere. The time limit (`limits.timeoutMs`,
+  30 seconds by default) is enforced from outside by ending the Worker, so it
+  needs the default isolation: with `isolate: false` the program runs on your
+  thread, and only the step budget can stop a loop. Memory, string, output
+  and nesting ceilings are fixed in the engine (`zipp.profile.limits` lists
+  them).
+- **Network access is an allowlist.** List origins
+  (`"https://api.example.com"`) or URL prefixes
+  (`"https://example.com/data/"`); `network: true` allows any http(s) URL.
+  Either way, requests carry no cookies or credentials, the Fetch standard's
+  forbidden headers are dropped, a redirect fails unless you allow redirects
+  (and then only to listed URLs), and each request has a time and size limit.
+- **`zipp.run(code)` is not a sandbox.** It runs the program on the calling
+  thread with nothing permitted and the default step budget, but with no
+  Worker and no time limit: use it for trusted code and quick checks, and
+  `createSandbox()` for anything else.
+
+This is layered protection, not a guarantee: WebAssembly's memory isolation,
+an engine built without `unsafe` code or a JIT, default-deny capabilities, a
+Worker per program, and limits. Keep your page's Content-Security-Policy (the
+loader needs `script-src 'self' blob: 'wasm-unsafe-eval'` and
+`worker-src 'self' blob:`), and read [SECURITY.md](SECURITY.md) for the
+threat model. The [embed kit guide](crates/zipp-wasm/embed-kit/README.md) has
+every option, the [WebAssembly engine reference](crates/zipp-wasm/README.md)
+the engine's full API, and [embedding](docs/REFERENCE.md#embedding) the Rust
+API.
 ## Python, torch and the GPU
 
 The Python frontend runs folders of modules, a bundled `torch` subset (eager

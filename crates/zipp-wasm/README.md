@@ -152,9 +152,7 @@ bootstrap. `tests/node/python-frontend.cjs` holds both variants to this; it is
 part of `run-boundary-suite.cjs` and adapts to the artifact's `languages`, so
 the JavaScript-only gate proves the refusal path.
 
-### Release downloads (0.0.18)
-
-The release workflow### Release downloads
+### Release downloads
 
 From 0.0.26 a release publishes each module as one `.wasm` file, and the
 [embed kit](embed-kit/README.md) (`zipp-<version>-wasm-embed-kit.zip`) as the
@@ -167,6 +165,9 @@ one way to load any of them:
 | `zipp-<version>-javascript-python.wasm` | JavaScript + experimental Python, torch built in | 16 MiB |
 | `zipp-<version>-javascript-python-base.wasm` | JavaScript + experimental Python, no torch | 16 MiB |
 | `zipp-<version>-torch-package.wasm` | the torch package for `-python-base` | |
+
+Each also comes as a Brotli `zipp-<version>-<engine>.wasm.br`, about a quarter of
+the size, to serve with `Content-Encoding: br`.
 
 Each engine module carries the wasm-bindgen bindings generated for it in a
 `zipp.glue` custom section, and a `zipp.meta` record (format, variant,
@@ -195,7 +196,7 @@ Releases 0.0.18 to 0.0.25 shipped each variant as a
 `zipp-wasm-<version>-web*.zip` archive of the bindings, the module, the host
 SDK and their checksums.
 
--js-interop` feature.
+No release module enables the separate `python-js-interop` feature.
 Python and Torch are experimental subsets, and GPU `torch.compile()` uses the
 nonstandard asynchronous `submit()` callback contract. It captures and uploads
 on each call; persistent GPU models and GPU Conv2d training are not implemented.
