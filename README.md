@@ -56,31 +56,31 @@ files, checksummed in its `SHA256SUMS`:
 
 | File | What it is |
 | --- | --- |
-| `zipp-0.0.26-windows-x86_64-portable.exe` | Windows command line. Run it from anywhere. |
-| `zipp-0.0.26-windows-x86_64-installer.msi` | The same, installed for your user and added to `PATH` (no administrator rights needed). |
-| `zipp-0.0.26-linux-x86_64`, `-linux-arm64`, `-linux-armv7` | Linux command line for x86-64, 64-bit Arm and 32-bit Arm (hard float), built against glibc 2.35. |
-| `zipp-0.0.26-javascript.wasm` | The JavaScript engine for browsers and server runtimes. |
-| `zipp-0.0.26-javascript-lite.wasm` | The same without `Intl` and `Temporal`, built for size. |
-| `zipp-0.0.26-javascript-python.wasm` | JavaScript and Python, with torch built in. |
-| `zipp-0.0.26-javascript-python-base.wasm` + `zipp-0.0.26-torch-package.wasm` | JavaScript and Python, with torch as a separate add-on. |
-| `zipp-0.0.26-<engine>.wasm.br` | Each of those `.wasm` files compressed with Brotli: about a quarter of the size. Serve it with `Content-Encoding: br` (the browser decodes it); the plain `.wasm` is the default. |
-| `zipp-0.0.26-wasm-embed-kit.zip` | `zipp.mjs`, the one file that loads and sandboxes any of the `.wasm` engines, with types, examples and docs. |
+| `zipp-0.0.27-windows-x86_64-portable.exe` | Windows command line. Run it from anywhere. |
+| `zipp-0.0.27-windows-x86_64-installer.msi` | The same, installed for your user and added to `PATH` (no administrator rights needed). |
+| `zipp-0.0.27-linux-x86_64`, `-linux-arm64`, `-linux-armv7` | Linux command line for x86-64, 64-bit Arm and 32-bit Arm (hard float), built against glibc 2.35. |
+| `zipp-0.0.27-javascript.wasm` | The JavaScript engine for browsers and server runtimes. |
+| `zipp-0.0.27-javascript-lite.wasm` | The same without `Intl` and `Temporal`, built for size. |
+| `zipp-0.0.27-javascript-python.wasm` | JavaScript and Python, with torch built in. |
+| `zipp-0.0.27-javascript-python-base.wasm` + `zipp-0.0.27-torch-package.wasm` | JavaScript and Python, with torch as a separate add-on. |
+| `zipp-0.0.27-<engine>.wasm.br` | Each of those `.wasm` files compressed with Brotli: about a quarter of the size. Serve it with `Content-Encoding: br` (the browser decodes it); the plain `.wasm` is the default. |
+| `zipp-0.0.27-wasm-embed-kit.zip` | `zipp.mjs`, the one file that loads and sandboxes any of the `.wasm` engines, with types, examples and docs. |
 
 **Windows** (PowerShell):
 
 ```powershell
-$version = '0.0.26'
+$version = '0.0.27'
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/zipp-$version-windows-x86_64-portable.exe" -OutFile zipp.exe
 .\zipp.exe js .\app.js
 ```
 
-Or download and open `zipp-0.0.26-windows-x86_64-installer.msi`, then use
+Or download and open `zipp-0.0.27-windows-x86_64-installer.msi`, then use
 `zipp` in a new terminal.
 
 **Linux**:
 
 ```sh
-version=0.0.26
+version=0.0.27
 arch=x86_64   # or arm64, armv7
 curl -fL -o zipp "https://github.com/f2i-com/zipp.org/releases/download/v$version/zipp-$version-linux-$arch"
 chmod +x zipp
@@ -103,19 +103,19 @@ hardened runner, [`zipp-sandbox`](crates/zipp-sandbox/README.md): no JIT, no
 
 ## Embed it in a web page or Node.js
 
-You need two files from the [release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.26):
+You need two files from the [release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.27):
 
 1. **One engine `.wasm`.** Pick the smallest that runs your language:
 
    | You need | Download |
    | --- | --- |
-   | JavaScript, smallest (no `Intl`, no `Temporal`) | `zipp-0.0.26-javascript-lite.wasm` |
-   | JavaScript, complete | `zipp-0.0.26-javascript.wasm` |
-   | JavaScript and Python | `zipp-0.0.26-javascript-python-base.wasm` |
-   | JavaScript and Python with torch | `zipp-0.0.26-javascript-python.wasm`, or the `-base` engine plus `zipp-0.0.26-torch-package.wasm` when only some pages need torch |
+   | JavaScript, smallest (no `Intl`, no `Temporal`) | `zipp-0.0.27-javascript-lite.wasm` |
+   | JavaScript, complete | `zipp-0.0.27-javascript.wasm` |
+   | JavaScript and Python | `zipp-0.0.27-javascript-python-base.wasm` |
+   | JavaScript and Python with torch | `zipp-0.0.27-javascript-python.wasm`, or the `-base` engine plus `zipp-0.0.27-torch-package.wasm` when only some pages need torch |
 
 2. **`zipp.mjs`**, the loader, from
-   [`zipp-0.0.26-wasm-embed-kit.zip`](https://github.com/f2i-com/zipp.org/releases/download/v0.0.26/zipp-0.0.26-wasm-embed-kit.zip).
+   [`zipp-0.0.27-wasm-embed-kit.zip`](https://github.com/f2i-com/zipp.org/releases/download/v0.0.27/zipp-0.0.27-wasm-embed-kit.zip).
    It loads any of the engines.
 
 Put both next to your page, serve the folder over HTTP (`python -m http.server`
@@ -125,7 +125,7 @@ with nothing allowed:
 ```js
 import { loadZipp } from "./zipp.mjs";
 
-const zipp = await loadZipp("./zipp-0.0.26-javascript.wasm");
+const zipp = await loadZipp("./zipp-0.0.27-javascript.wasm");
 const sandbox = await zipp.createSandbox();       // nothing is permitted
 try {
   const { output } = await sandbox.run('console.log("Hello from ZIPP")');
