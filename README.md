@@ -51,30 +51,39 @@ that compiles to the shared bytecode and inherits everything below it
 
 ## Get ZIPP
 
-The latest [release](https://github.com/f2i-com/zipp.org/releases) is
-**0.0.25**, published as archives. From **0.0.26** a release publishes plain
-files instead: a Windows portable `.exe` and an `.msi` installer, Linux
-binaries for x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine,
-and the embed kit.
+Every [release](https://github.com/f2i-com/zipp.org/releases) publishes plain
+files, checksummed in its `SHA256SUMS`:
+
+| File | What it is |
+| --- | --- |
+| `zipp-0.0.26-windows-x86_64-portable.exe` | Windows command line. Run it from anywhere. |
+| `zipp-0.0.26-windows-x86_64-installer.msi` | The same, installed for your user and added to `PATH` (no administrator rights needed). |
+| `zipp-0.0.26-linux-x86_64`, `-linux-arm64`, `-linux-armv7` | Linux command line for x86-64, 64-bit Arm and 32-bit Arm (hard float), built against glibc 2.35. |
+| `zipp-0.0.26-javascript.wasm` | The JavaScript engine for browsers and server runtimes. |
+| `zipp-0.0.26-javascript-lite.wasm` | The same without `Intl` and `Temporal`, built for size. |
+| `zipp-0.0.26-javascript-python.wasm` | JavaScript and Python, with torch built in. |
+| `zipp-0.0.26-javascript-python-base.wasm` + `zipp-0.0.26-torch-package.wasm` | JavaScript and Python, with torch as a separate add-on. |
+| `zipp-0.0.26-wasm-embed-kit.zip` | `zipp.mjs`, the one file that loads and sandboxes any of the `.wasm` engines, with types, examples and docs. |
 
 **Windows** (PowerShell):
 
 ```powershell
-$version = '0.0.25'
-$archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
-Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
-Expand-Archive -LiteralPath $archive -DestinationPath .
-& ".\zipp-$version-x86_64-pc-windows-msvc\zipp.exe" js .\app.js
+$version = '0.0.26'
+Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/zipp-$version-windows-x86_64-portable.exe" -OutFile zipp.exe
+.\zipp.exe js .\app.js
 ```
 
-**Linux** (x86-64):
+Or download and open `zipp-0.0.26-windows-x86_64-installer.msi`, then use
+`zipp` in a new terminal.
+
+**Linux**:
 
 ```sh
-version=0.0.25
-archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
-curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
-tar -xzf "$archive"
-"./zipp-$version-x86_64-unknown-linux-gnu/zipp" js ./app.js
+version=0.0.26
+arch=x86_64   # or arm64, armv7
+curl -fL -o zipp "https://github.com/f2i-com/zipp.org/releases/download/v$version/zipp-$version-linux-$arch"
+chmod +x zipp
+./zipp js app.js
 ```
 
 ## Run programs
@@ -93,7 +102,7 @@ hardened runner, [`zipp-sandbox`](crates/zipp-sandbox/README.md): no JIT, no
 
 ## Embed it in a web page or Node.js
 
-From 0.0.26, download an engine `.wasm` and the embed kit, then:
+Download an engine `.wasm` and the embed kit, then:
 
 ```js
 import { loadZipp } from "./zipp.mjs";
