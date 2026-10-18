@@ -571,6 +571,12 @@ impl<'a> Emitter<'a> {
             }
             self.proto.string_constants.push(t);
         }
+        // The code grew by doubling and is kept as long as the program (a
+        // library module's, as long as the process): give back the unused
+        // tail (in place, in the WebAssembly modules' allocator).
+        self.proto.code.shrink_to_fit();
+        self.proto.constants.shrink_to_fit();
+        self.proto.string_constants.shrink_to_fit();
         self.proto
     }
 
