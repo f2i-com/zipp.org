@@ -575,8 +575,13 @@ impl<'p> Vm<'p> {
                 // only synced at frame transitions and is stale in here.
                 // (The general profile's hook is one decrement of `step_hot`
                 // and one test, with or without a recorder: see `step_hot`.)
+                // The lite-hooked copy runs only for a VM that had no
+                // recorder when it began (`lite_entry_ok`), and one is only
+                // ever installed between runs (`set_instrumentation`), so
+                // `step_hot` holds `i64::MAX` there and the hook never fires:
+                // it was a read-modify-write of the VM per instruction.
                 #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
-                {
+                if !LITE {
                     self.step_hot -= 1;
                     if self.step_hot < 0 {
                         if let Err(msg) = self.instrument_step_hot_out(base, ip, instr) {
