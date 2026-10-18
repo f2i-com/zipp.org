@@ -865,9 +865,12 @@ impl<'p> Vm<'p> {
     /// namespace whose probes the walk would run first.
     #[inline]
     fn class_static_fast_ok(&self, o: Value, key: &str) -> bool {
+        // The receiver's kind first: every property read and write of a
+        // shapeless receiver (a DataView's `getUint32`, an array's `push`)
+        // asks, and the key compares cost them more than this load.
         o.is_heap()
-            && self.callable_member_lane_ok(key)
             && matches!(self.heap.get(o.heap_index()), HeapObj::Class(_))
+            && self.callable_member_lane_ok(key)
     }
 
     /// The key and VM conditions of the class-static and function-property
@@ -885,9 +888,10 @@ impl<'p> Vm<'p> {
     /// non-class callable and the lanes' conditions hold.
     #[inline]
     fn fn_props_lane(&self, o: Value, key: &str) -> Option<&ObjMap> {
-        if !o.is_heap() || !self.callable_member_lane_ok(key) {
+        if !o.is_heap() {
             return None;
         }
+        // The receiver's kind first, as `class_static_fast_ok` tests it.
         let idx = o.heap_index();
         if !matches!(
             self.heap.get(idx),
@@ -899,7 +903,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::NativeClosure { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
-        ) {
+        ) || !self.callable_member_lane_ok(key)
+        {
             return None;
         }
         self.fn_props.get(&idx)

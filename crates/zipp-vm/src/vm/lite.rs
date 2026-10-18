@@ -68,6 +68,23 @@ fn lite_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
+/// runs in the lite loop (`loops_are_lite`), for A/B.
+#[inline]
+fn partial_lite_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PARTIAL_LITE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// The instructions of the lite loop's small copy, the superinstructions over
 /// them included: a recursive integer function's (`fib`). The loop is
 /// compiled twice (`run_lite_in`) because each arm added for loops and
@@ -131,6 +148,26 @@ fn lite_instr(i: &Instr) -> bool {
             // A script's counters and accumulators.
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
+            // What most loops' bodies held besides those (`loops_are_lite`
+            // found them blocking the most loops of the suites): method and
+            // member calls, constants, element stores, the remainder and the
+            // comparisons, a function's own captured cells.
+            | Instr::CallMethod { .. }
+            | Instr::CallWithThis { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadBool { .. }
+            | Instr::SetIndex { .. }
+            | Instr::Mod { .. }
+            | Instr::Neg { .. }
+            | Instr::Not { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::CellGet { .. }
+            | Instr::CellSet { .. }
     )
 }
 
@@ -148,21 +185,49 @@ const LITE_HANDOVER_BUDGET: u16 = 64;
 /// 13% slower in the lite loop than in the main loop.
 const LITE_MIN_ENTRY_STEPS: u64 = 128;
 
+/// The target of `i` when it is a jump the lite loop or the compiler's loops
+/// can take backward.
+fn jump_target(i: &Instr) -> Option<u32> {
+    match *i {
+        Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::FuseAddIntJump { target, .. } => Some(target),
+        _ => None,
+    }
+}
+
 /// Whether `code` has a loop: a jump to its own position or an earlier one.
 #[cfg(test)]
 fn has_back_edge(code: &[Instr]) -> bool {
-    code.iter().enumerate().any(|(ip, i)| {
-        let target = match *i {
-            Instr::Jump { target }
-            | Instr::JumpIfFalse { target, .. }
-            | Instr::JumpIfTrue { target, .. }
-            | Instr::JumpIfNotLt { target, .. }
-            | Instr::JumpIfNotLe { target, .. }
-            | Instr::FuseAddIntJump { target, .. } => target,
-            _ => return false,
-        };
-        target as usize <= ip
-    })
+    code.iter()
+        .enumerate()
+        .any(|(ip, i)| jump_target(i).is_some_and(|t| t as usize <= ip))
+}
+
+/// Whether `code` has a loop and every instruction of every loop (from a
+/// back-edge's target to the back-edge) is one the lite loop runs. Such a
+/// function's loops run whole in the lite loop, calls and returns included,
+/// though its prologue or epilogue holds an instruction it hands over (a
+/// `MakeFunc`, a `console.log`): a function that is ALL lite instructions
+/// is rare once it does anything at its edges, so a hot loop in such a
+/// caller paid both loops' transitions on every call it made.
+fn loops_are_lite(code: &[Instr]) -> bool {
+    let mut any = false;
+    for (ip, i) in code.iter().enumerate() {
+        if let Some(t) = jump_target(i) {
+            let t = t as usize;
+            if t <= ip {
+                if !code[t..=ip].iter().all(lite_instr) {
+                    return false;
+                }
+                any = true;
+            }
+        }
+    }
+    any
 }
 
 /// Slots of the lite loop's callee cache, indexed by the callee's heap slot.
@@ -259,6 +324,9 @@ impl<'p> Vm<'p> {
     fn lite_decide(&mut self, fid: u32) -> bool {
         let i = fid as usize;
         let p = self.func(i);
+        // Every instruction the lite loop's, or (`loops_are_lite`) every
+        // instruction of its loops, the rest handed over where they stand.
+        let all = p.code.iter().all(lite_instr) && Self::lite_code(p).iter().all(lite_instr);
         let ok = lite_enabled()
             && !p.is_generator
             && !p.is_async
@@ -266,8 +334,7 @@ impl<'p> Vm<'p> {
             // lean push hands it there), and its body is ordinary code.
             && p.rest_reg.is_none()
             && p.arguments_reg.is_none()
-            && p.code.iter().all(lite_instr)
-            && Self::lite_code(p).iter().all(lite_instr)
+            && (all || (partial_lite_enabled() && loops_are_lite(&p.code) && loops_are_lite(Self::lite_code(p))))
             // A private member's read or write is the main arm's before any
             // cache (brand checks, the private side table).
             && !p.code.iter().any(|i| match *i {
@@ -276,7 +343,7 @@ impl<'p> Vm<'p> {
                 }
                 _ => false,
             });
-        let small = ok && p.code.iter().all(lite_small_instr) && Self::lite_code(p).iter().all(lite_small_instr);
+        let small = ok && all && p.code.iter().all(lite_small_instr) && Self::lite_code(p).iter().all(lite_small_instr);
         if self.lite.ok.len() <= i {
             self.lite.ok.resize(i + 1, LITE_UNDECIDED);
             self.lite.code.resize(i + 1, &[]);
@@ -444,6 +511,32 @@ impl<'p> Vm<'p> {
                 }
                 base = self.frames[top].base;
                 ip = self.frames[top].ip;
+                code = self.lite_fn_code(func_id);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    upv = (std::ptr::null(), 0);
+                }
+            }};
+        }
+        // Run the frame a call just pushed for `fid` here, or hand it (and
+        // the caller after it, to its next frame transition) to the main
+        // loop: the `Call` arm's steps after its push.
+        macro_rules! lite_enter {
+            ($fid:expr) => {{
+                let fid = $fid;
+                // The main loop's frame-transition safe point.
+                self.maybe_gc();
+                if !self.lite_eligible(fid) {
+                    self.lite_handed_over(func_id);
+                    exit!(LiteStep::Exit(LiteExit::Resume));
+                }
+                if !FULL && self.lite_is_full(fid) {
+                    exit!(LiteStep::Full);
+                }
+                top = self.frames.len() - 1;
+                func_id = fid;
+                base = self.frames[top].base;
+                ip = 0;
                 code = self.lite_fn_code(func_id);
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
@@ -900,15 +993,246 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, Value::num(r));
                     ip += 1;
                 }
-                Instr::SetProp { obj, val, .. } if FULL => {
+                Instr::SetProp { obj, val, name, .. } if FULL => {
                     let o = self.get(base, obj);
                     let v = self.get(base, val);
                     // The cache's own-data hit, the main arm's first step for
                     // a name that is not private (`lite_decide`).
                     if !self.ic_set_prop_own_hit(func_id, ip, o, v) {
-                        hand_over!();
+                        // An ordinary object's other cached writes (a
+                        // constructor's adds): the main arm's cache call, after
+                        // the lanes that answer only other receivers. Anything
+                        // it does not complete (a setter to call, a miss) left
+                        // nothing written, and the main arm runs it again.
+                        if !o.is_heap() || !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                            hand_over!();
+                        }
+                        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                        if !matches!(self.ic_set_prop(func_id, ip, o, key, v), SetAct::Done) {
+                            hand_over!();
+                        }
                     }
                     ip += 1;
+                }
+                Instr::StoreGlobalResolved { idx, src } if FULL => {
+                    // The main arm's slot write, for a binding its preamble
+                    // (an unresolvable strict reference, a vanished or
+                    // shadowed binding, a constant) does not concern.
+                    if !self.strict_unresolvable_globals.is_empty()
+                        || self.globals[idx as usize].is_uninitialized()
+                        || !self.eval_const_globals.is_empty()
+                        || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                    {
+                        hand_over!();
+                    }
+                    self.globals[idx as usize] = self.get(base, src);
+                    ip += 1;
+                }
+                Instr::LoadConst { dst, idx } if FULL => {
+                    let v = self.resolve_const_slot(func_id, idx as u32);
+                    self.set(base, dst, v);
+                    ip += 1;
+                }
+                Instr::LoadNull { dst } if FULL => {
+                    self.set(base, dst, Value::NULL);
+                    ip += 1;
+                }
+                Instr::LoadBool { dst, val } if FULL => {
+                    self.set(base, dst, Value::bool(val));
+                    ip += 1;
+                }
+                Instr::Mod { dst, a, b } if FULL => {
+                    // The main arm's number cases; anything else is its
+                    // ToNumeric path.
+                    let (va, vb) = (self.get(base, a), self.get(base, b));
+                    let r = if va.is_int() && vb.is_int() {
+                        let ia = va.as_int();
+                        match ia.checked_rem(vb.as_int()) {
+                            Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
+                            _ => Value::num(va.as_f64() % vb.as_f64()),
+                        }
+                    } else if va.is_number() && vb.is_number() {
+                        Value::num(va.as_f64() % vb.as_f64())
+                    } else {
+                        hand_over!();
+                    };
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::Neg { dst, a } if FULL => {
+                    let va = self.get(base, a);
+                    let r = if va.is_int() {
+                        let i = va.as_int();
+                        if i == 0 {
+                            Value::num(-0.0)
+                        } else {
+                            match i.checked_neg() {
+                                Some(v) => Value::int(v),
+                                None => Value::num(-(i as f64)),
+                            }
+                        }
+                    } else if va.is_double() {
+                        Value::num(-va.as_f64())
+                    } else {
+                        hand_over!();
+                    };
+                    self.set(base, dst, r);
+                    ip += 1;
+                }
+                Instr::Not { dst, a } if FULL => {
+                    let va = self.get(base, a);
+                    let t = self.truthy(va);
+                    self.set(base, dst, Value::bool(!t));
+                    ip += 1;
+                }
+                Instr::Lt { dst, a, b } if FULL => {
+                    let r = self.cmp_lt(base, a, b, true)?;
+                    self.set(base, dst, Value::bool(r));
+                    ip += 1;
+                }
+                Instr::Le { dst, a, b } if FULL => {
+                    let r = self.cmp_le(base, a, b, true)?;
+                    self.set(base, dst, Value::bool(r));
+                    ip += 1;
+                }
+                Instr::Gt { dst, a, b } if FULL => {
+                    let r = self.cmp_lt(base, b, a, false)?;
+                    self.set(base, dst, Value::bool(r));
+                    ip += 1;
+                }
+                Instr::Ge { dst, a, b } if FULL => {
+                    let r = self.cmp_le(base, b, a, false)?;
+                    self.set(base, dst, Value::bool(r));
+                    ip += 1;
+                }
+                Instr::CellGet { dst, cell } if FULL => {
+                    let v = self.heap.cell_get(self.get(base, cell).heap_index());
+                    // A binding in its TDZ throws, in the main arm.
+                    if v.is_uninitialized() {
+                        hand_over!();
+                    }
+                    self.set(base, dst, v);
+                    ip += 1;
+                }
+                Instr::CellSet { cell, src } if FULL => {
+                    let cell_idx = self.get(base, cell).heap_index();
+                    let v = self.get(base, src);
+                    self.heap.cell_set(cell_idx, v);
+                    ip += 1;
+                }
+                Instr::SetIndex { obj, key, val } if FULL => {
+                    // The main arm's numeric typed-array store first, then its
+                    // general store (which runs no frame of this loop).
+                    let (o, k, v) = (self.get(base, obj), self.get(base, key), self.get(base, val));
+                    if o.is_heap() && v.is_number() {
+                        let ta_idx = o.heap_index();
+                        if let HeapObj::TypedArray {
+                            buffer,
+                            kind,
+                            byte_offset,
+                            length,
+                        } = self.heap.get(ta_idx)
+                        {
+                            if !native::TA_KINDS[*kind as usize].2
+                                && (self.immutable_buffers.is_empty() || !self.immutable_buffers.contains(buffer))
+                            {
+                                if let Some(i) = array_index(k) {
+                                    let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                                        ta_idx,
+                                        *buffer,
+                                        *kind,
+                                        *byte_offset,
+                                        *length,
+                                    );
+                                    self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, o, v);
+                                    if self.ta_interp_numeric_set_view(view, i, v) {
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let strict = self.func(func_id as usize).is_strict;
+                    self.set_index(o, k, v, strict)?;
+                    ip += 1;
+                }
+                Instr::CallWithThis {
+                    dst,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                    ..
+                } if FULL => {
+                    // A member call in spec order whose callee is a plain user
+                    // function: the main arm's frame push, lean when `this`
+                    // needs no boxing. Everything else is the main arm's
+                    // (natives, `f.call`, the captured intrinsic lanes).
+                    let (callee_v, this_val) = (self.get(base, callee), self.get(base, this_v));
+                    let Some((fid, closure)) = self.ic_plain_fn(callee_v) else {
+                        hand_over!();
+                    };
+                    let this_is_object =
+                        this_val.is_heap() && matches!(self.heap.get(this_val.heap_index()), HeapObj::Object(_));
+                    self.setup_call_lean_this(
+                        fid,
+                        closure,
+                        this_val,
+                        this_is_object,
+                        base,
+                        arg_base,
+                        argc,
+                        dst,
+                        ip + 1,
+                        callee_v,
+                    )?;
+                    lite_enter!(fid);
+                }
+                Instr::CallMethod {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                } if FULL => {
+                    // An ordinary object's or class instance's method through
+                    // the method cache, the main arm's first step for one; an
+                    // array's `push` and a string's `charCodeAt`, its leaves.
+                    // Anything else is the main arm's.
+                    let recv = self.get(base, obj);
+                    let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                    if !recv.is_heap() || is_private_key(key) {
+                        hand_over!();
+                    }
+                    match self.heap.get(recv.heap_index()) {
+                        HeapObj::Object(_) => {
+                            let Some((fid, closure, callee_fn)) = self.ic_call_method(func_id, ip, recv, key) else {
+                                hand_over!();
+                            };
+                            self.setup_call_lean_this(
+                                fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee_fn,
+                            )?;
+                            lite_enter!(fid);
+                        }
+                        HeapObj::Array(_) if argc == 1 && super::builtins::is_push_name(key) => {
+                            let v = self.get(base, arg_base);
+                            let Some(len) = self.interp_array_push_fast(recv, v) else {
+                                hand_over!();
+                            };
+                            self.set(base, dst, len);
+                            ip += 1;
+                        }
+                        HeapObj::Str(_) | HeapObj::Cons { .. } if argc == 1 && key == "charCodeAt" => {
+                            let arg = self.get(base, arg_base);
+                            let Some(r) = self.interp_char_code_at_fast(recv, arg) else {
+                                hand_over!();
+                            };
+                            self.set(base, dst, r);
+                            ip += 1;
+                        }
+                        _ => hand_over!(),
+                    }
                 }
                 Instr::Call {
                     dst,

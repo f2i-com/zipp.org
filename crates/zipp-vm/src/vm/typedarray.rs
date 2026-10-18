@@ -30,6 +30,13 @@ pub const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
+/// The `N` bytes of `data` at `off`, or `None` past its end: one bounds check
+/// and a fixed-width load, for the typed-array element reads.
+#[inline(always)]
+fn ta_bytes<const N: usize>(data: &[u8], off: usize) -> Option<[u8; N]> {
+    data.get(off..off.checked_add(N)?)?.try_into().ok()
+}
+
 /// Immutable TypedArray internal slots copied by the interpreter's exact
 /// receiver match. Private fields make the match the only authority that can
 /// feed the direct numeric-index leaves without re-reading the receiver.
@@ -923,40 +930,47 @@ impl<'p> Vm<'p> {
             ));
         }
         let abs = byte_offset + pos;
-        let bytes = &data[abs..abs + size];
         let little = self.truthy(little_endian);
+        // Fixed-width reads (the bounds were proved above, so `ta_bytes`
+        // cannot decline), and integer kinds as integer Values, as the typed
+        // array reads make them.
+        macro_rules! rd {
+            ($n:expr) => {
+                ta_bytes::<$n>(data, abs).expect("DataView read inside the bounds just checked")
+            };
+        }
         let result = match kind {
-            0 => Value::num(bytes[0] as i8 as f64),
-            1 => Value::num(bytes[0] as f64),
-            3 => Value::num(if little {
-                i16::from_le_bytes([bytes[0], bytes[1]]) as f64
+            0 => Value::int(rd!(1)[0] as i8 as i32),
+            1 => Value::int(rd!(1)[0] as i32),
+            3 => Value::int(if little {
+                i16::from_le_bytes(rd!(2))
             } else {
-                i16::from_be_bytes([bytes[0], bytes[1]]) as f64
-            }),
-            4 => Value::num(if little {
-                u16::from_le_bytes([bytes[0], bytes[1]]) as f64
+                i16::from_be_bytes(rd!(2))
+            } as i32),
+            4 => Value::int(if little {
+                u16::from_le_bytes(rd!(2))
             } else {
-                u16::from_be_bytes([bytes[0], bytes[1]]) as f64
-            }),
-            5 => Value::num(if little {
-                i32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                u16::from_be_bytes(rd!(2))
+            } as i32),
+            5 => Value::int(if little {
+                i32::from_le_bytes(rd!(4))
             } else {
-                i32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                i32::from_be_bytes(rd!(4))
             }),
             6 => Value::num(if little {
-                u32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                u32::from_le_bytes(rd!(4))
             } else {
-                u32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
-            }),
+                u32::from_be_bytes(rd!(4))
+            } as f64),
             7 => Value::num(if little {
-                f32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+                f32::from_le_bytes(rd!(4))
             } else {
-                f32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
-            }),
+                f32::from_be_bytes(rd!(4))
+            } as f64),
             8 => Value::num(if little {
-                f64::from_le_bytes(bytes.try_into().expect("eight-byte DataView read"))
+                f64::from_le_bytes(rd!(8))
             } else {
-                f64::from_be_bytes(bytes.try_into().expect("eight-byte DataView read"))
+                f64::from_be_bytes(rd!(8))
             }),
             _ => unreachable!("dataview_get_kind returned a non-numeric getter"),
         };
@@ -1462,27 +1476,23 @@ impl<'p> Vm<'p> {
             return Some(Value::UNDEFINED);
         }
         let off = byte_offset + i * size;
-        let bytes = &data[off..off + size];
+        // Each kind reads its fixed width (a bounds check and one load) and
+        // an integer kind is an integer Value outright: through `f64` it paid
+        // a conversion and `Value::num`'s narrowing back for the same bits.
+        // The view lies in the buffer, so a read past it cannot happen; it
+        // would decline to the general path.
         Some(match kind {
-            0 => Value::num(bytes[0] as i8 as f64),
-            1 | 2 => Value::num(bytes[0] as f64),
-            3 => Value::num(i16::from_le_bytes([bytes[0], bytes[1]]) as f64),
-            4 => Value::num(u16::from_le_bytes([bytes[0], bytes[1]]) as f64),
-            5 => Value::num(
-                i32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            6 => Value::num(
-                u32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            7 => Value::num(
-                f32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
-            ),
-            8 => Value::num(f64::from_le_bytes(
-                bytes.try_into().expect("eight-byte TypedArray read"),
-            )),
-            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(
-                u16::from_le_bytes([bytes[0], bytes[1]]),
-            )),
+            0 => Value::int(ta_bytes::<1>(data, off)?[0] as i8 as i32),
+            1 | 2 => Value::int(ta_bytes::<1>(data, off)?[0] as i32),
+            3 => Value::int(i16::from_le_bytes(ta_bytes(data, off)?) as i32),
+            4 => Value::int(u16::from_le_bytes(ta_bytes(data, off)?) as i32),
+            5 => Value::int(i32::from_le_bytes(ta_bytes(data, off)?)),
+            6 => Value::num(u32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            7 => Value::num(f32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            8 => Value::num(f64::from_le_bytes(ta_bytes(data, off)?)),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(ta_bytes(
+                data, off,
+            )?))),
             _ => return None,
         })
     }
