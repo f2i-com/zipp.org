@@ -12,7 +12,8 @@
 #      proved by stripping them off again and comparing;
 #   4. the module loaded and exercised through zipp.mjs (test-kit.mjs).
 # Leaves <out-dir>/zipp-<version>-<variant>.wasm, the release asset (its path
-# is the last line printed), and <out-dir>/glue-<variant>/ with the generated
+# is the last line printed), its Brotli copy <...>.wasm.br, and
+# <out-dir>/glue-<variant>/ with the generated
 # zipp_wasm.js, the .d.ts files and PROFILE.json.
 set -euo pipefail
 variant=$1
@@ -51,4 +52,6 @@ cmp "$glue/zipp_wasm_bg.wasm" "$glue/unembedded.wasm"
 rm "$glue/unembedded.wasm"
 
 node "$here/test-kit.mjs" "$here" "$out" "$variant"
+# The Brotli copy a release publishes beside it.
+node "$here/package.mjs" compress "$asset"
 echo "$asset"

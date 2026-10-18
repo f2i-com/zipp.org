@@ -8,7 +8,8 @@ name: Release build
 #   zipp-<v>-linux-x86_64 / -linux-arm64 / -linux-armv7   the Linux CLIs
 #   zipp-<v>-javascript.wasm, -javascript-lite.wasm, -javascript-python.wasm,
 #     -javascript-python-base.wasm, -torch-package.wasm   the WebAssembly modules,
-#     each engine carrying its own bindings (crates/zipp-wasm/embed-kit)
+#     each engine carrying its own bindings (crates/zipp-wasm/embed-kit), and
+#     a Brotli copy of each (.wasm.br)
 #   zipp-<v>-wasm-embed-kit.zip            the loader, host SDK, types, docs and examples
 #
 # release.yml calls this at a tag and publishes exactly these files after its
@@ -416,7 +417,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-wasm-${{ matrix.variant }}
-          path: crates/zipp-wasm/dist/zipp-*.wasm
+          path: |
+            crates/zipp-wasm/dist/zipp-*.wasm
+            crates/zipp-wasm/dist/zipp-*.wasm.br
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -488,15 +491,17 @@ jobs:
         env:
           RELEASE_VERSION: ${{ needs.identify.outputs.version }}
           EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
-        run: >-
-          node embed-kit/package.mjs embed-torch "$RELEASE_VERSION" "$EXPECTED_COMMIT"
-          dist/torch/zipp_torch.wasm dist/release
+        run: |
+          node embed-kit/package.mjs embed-torch "$RELEASE_VERSION" "$EXPECTED_COMMIT" dist/torch/zipp_torch.wasm dist/release
+          node embed-kit/package.mjs compress "dist/release/zipp-$RELEASE_VERSION-torch-package.wasm"
 
       - name: Upload the torch module
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-wasm-torch-package
-          path: crates/zipp-wasm/dist/release/zipp-*.wasm
+          path: |
+            crates/zipp-wasm/dist/release/zipp-*.wasm
+            crates/zipp-wasm/dist/release/zipp-*.wasm.br
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

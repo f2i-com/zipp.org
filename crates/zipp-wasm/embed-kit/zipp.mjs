@@ -26,7 +26,7 @@
 // Node from a `data:` URL; a Content-Security-Policy must allow one of them
 // in `script-src`. One file, no dependencies: copy it anywhere.
 
-export const ZIPP_LOADER_VERSION = "1.1.0";
+export const ZIPP_LOADER_VERSION = "1.2.0";
 
 const GLUE_SECTION = "zipp.glue";
 const META_SECTION = "zipp.meta";
@@ -49,12 +49,54 @@ function localPath(source) {
   return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(source) ? null : source;
 }
 
-async function compileResponse(response) {
-  if (!response.ok) {
-    throw new Error(`zipp: fetching ${response.url || "the module"} failed with HTTP ${response.status}`);
+// A module starts with "\0asm"; anything else handed to the loader may be the
+// Brotli-compressed `.wasm.br` a release also publishes.
+function isWasm(bytes) {
+  const b = new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, Math.min(4, bytes.byteLength));
+  return b.length === 4 && b[0] === 0 && b[1] === 0x61 && b[2] === 0x73 && b[3] === 0x6d;
+}
+
+// Decompress Brotli where the runtime can: Node's zlib, or a
+// DecompressionStream("brotli") (Firefox, Node). Null where it cannot
+// (Chromium and WebKit, as of October 2026).
+async function brotliDecode(bytes) {
+  if (nodeLike()) {
+    try {
+      const zlib = await import("node:zlib");
+      return new Uint8Array(zlib.brotliDecompressSync(bytes));
+    } catch {
+      return null;
+    }
   }
-  // Streaming compilation needs `Content-Type: application/wasm`; GitHub
-  // release downloads and many static hosts send octet-stream instead.
+  if (typeof DecompressionStream === "function" && typeof Blob === "function") {
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("brotli"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// Compile module bytes, decompressing them first when they are Brotli.
+async function compileBytes(bytes) {
+  if (!isWasm(bytes)) {
+    const decoded = await brotliDecode(bytes);
+    if (decoded && isWasm(decoded)) return WebAssembly.compile(decoded);
+  }
+  return WebAssembly.compile(bytes);
+}
+
+const brotliUrl = url => /\.br$/i.test(url.pathname);
+
+async function compileResponse(response, url) {
+  if (!response.ok) {
+    throw new Error(`zipp: fetching ${response.url || url || "the module"} failed with HTTP ${response.status}`);
+  }
+  // Streaming compilation needs `Content-Type: application/wasm` (and a body
+  // the browser has already decoded); GitHub release downloads and many
+  // static hosts send octet-stream instead.
   const type = (response.headers.get("content-type") || "").split(";")[0].trim();
   if (type === "application/wasm" && typeof WebAssembly.compileStreaming === "function") {
     try {
@@ -63,12 +105,28 @@ async function compileResponse(response) {
       // Fall back to the buffered path below.
     }
   }
-  return WebAssembly.compile(await response.arrayBuffer());
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (isWasm(bytes)) return WebAssembly.compile(bytes);
+  // A `.wasm.br` the server sent without `Content-Encoding: br`: decompress
+  // it here where the runtime can, or else fetch the plain `.wasm` beside it.
+  const where = url ?? (response.url ? new URL(response.url) : null);
+  if (where && brotliUrl(where)) {
+    const decoded = await brotliDecode(bytes);
+    if (decoded && isWasm(decoded)) return WebAssembly.compile(decoded);
+    const plain = new URL(where.href.replace(/\.br(?=$|[?#])/i, ""));
+    const fallback = await fetch(plain);
+    if (fallback.ok) return compileResponse(fallback, plain);
+    throw new Error(`zipp: ${where.href} is Brotli-compressed and was not decoded, and ${plain.href} is missing: serve the .br with Content-Encoding: br, or put the plain .wasm beside it`);
+  }
+  return compileBytes(bytes);
 }
 
 /**
  * Compile a ZIPP module from a URL or path, a `Response` (or a promise of
- * one), bytes, a `Blob`, or an existing `WebAssembly.Module`.
+ * one), bytes, a `Blob`, or an existing `WebAssembly.Module`. A Brotli
+ * `.wasm.br` works in every form: decoded by the server
+ * (`Content-Encoding: br`), decompressed here where the runtime can, or, for
+ * a URL, replaced by the plain `.wasm` beside it.
  */
 export async function compileZipp(source) {
   source = await source;
@@ -78,15 +136,16 @@ export async function compileZipp(source) {
     const file = localPath(source);
     if (file) {
       const { readFile } = await import("node:fs/promises");
-      return WebAssembly.compile(await readFile(file));
+      return compileBytes(new Uint8Array(await readFile(file)));
     }
     const base = typeof document !== "undefined" ? document.baseURI : globalThis.location?.href;
-    return compileResponse(await fetch(base ? new URL(source, base) : source));
+    const url = base ? new URL(source, base) : new URL(source);
+    return compileResponse(await fetch(url), url);
   }
   if (typeof Blob !== "undefined" && source instanceof Blob) {
-    return WebAssembly.compile(await source.arrayBuffer());
+    return compileBytes(new Uint8Array(await source.arrayBuffer()));
   }
-  if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return WebAssembly.compile(source);
+  if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return compileBytes(source);
   throw new TypeError("zipp: expected a URL, path, Response, bytes, Blob or WebAssembly.Module");
 }
 

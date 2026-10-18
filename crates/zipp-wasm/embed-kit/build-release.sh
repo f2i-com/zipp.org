@@ -71,9 +71,10 @@ mkdir -p "$torch"
 cp "torch/target/$target/release/zipp_torch.wasm" torch/zipp_torch.js "$torch/"
 node tests/node/python-plugin.cjs "$out/node-javascript-python" "$out/node-javascript-python-base" "$torch"
 node "$here/package.mjs" embed-torch "$version" "$ZIPP_SOURCE_SHA" "$torch/zipp_torch.wasm" "$out"
+node "$here/package.mjs" compress "$out/zipp-$version-torch-package.wasm"
 
 echo "=== embed kit"
 ENGINE_DTS="$out/glue-javascript-python/zipp_wasm.d.ts" node "$here/package.mjs" kit "$version" "$out" "$out"
 node "$here/test-kit.mjs" "$out/zipp-$version-wasm-embed-kit" "$out"
 node "$here/test-sandbox.mjs" "$out/zipp-$version-wasm-embed-kit" "$out"
-ls -l "$out"/*.wasm "$out"/*.zip
+ls -l "$out"/*.wasm "$out"/*.wasm.br "$out"/*.zip

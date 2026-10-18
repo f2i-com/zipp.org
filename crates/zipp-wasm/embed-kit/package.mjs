@@ -16,6 +16,9 @@
 //       Write `zipp_wasm.js` and `zipp_wasm_bg.wasm` (stripped) and
 //       `meta.json`: the glue/module pair wasm-bindgen produced, for hosts
 //       that load them separately (the site's playground does).
+//   node package.mjs compress <file.wasm> ...
+//       Write <file.wasm>.br beside each: Brotli quality 11 with a 24-bit
+//       window, the same bytes on every run. A release publishes both.
 //   node package.mjs kit <version> <assets-dir> <out-dir>
 //       Assemble zipp-<version>-wasm-embed-kit/ and its .zip in <out-dir> from
 //       the release modules in <assets-dir> (their names: assetName below)
@@ -45,6 +48,26 @@ export const assetName = (version, variant) => `zipp-${version}-${VARIANTS[varia
 export const kitName = version => `zipp-${version}-wasm-embed-kit`;
 
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
+
+export function brotli(bytes) {
+  return zlib.brotliCompressSync(bytes, {
+    params: {
+      [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
+      [zlib.constants.BROTLI_PARAM_LGWIN]: 24,
+      [zlib.constants.BROTLI_PARAM_SIZE_HINT]: bytes.length,
+    },
+  });
+}
+
+function compress(...files) {
+  for (const file of files) {
+    const bytes = fs.readFileSync(file);
+    const packed = brotli(bytes);
+    if (!zlib.brotliDecompressSync(packed).equals(bytes)) throw new Error(`${file}: Brotli round trip differs`);
+    fs.writeFileSync(`${file}.br`, packed);
+    console.error(`${path.basename(file)}.br: ${bytes.length} -> ${packed.length} bytes`);
+  }
+}
 
 // --- WebAssembly sections ---------------------------------------------------
 
@@ -261,7 +284,16 @@ function kit(version, assetsDir, outDir) {
     }
     commit ??= record.commit;
     if (record.commit !== commit) throw new Error(`${name} is from ${record.commit}, not ${commit}`);
-    modules.push({ file: name, variant, languages: record.languages, bytes: bytes.length, sha256: sha256(bytes) });
+    const entry = { file: name, variant, languages: record.languages, bytes: bytes.length, sha256: sha256(bytes) };
+    // The Brotli copy a release publishes beside it, when present: it must
+    // decompress to exactly this module.
+    const brPath = path.join(assetsDir, `${name}.br`);
+    if (fs.existsSync(brPath)) {
+      const packed = fs.readFileSync(brPath);
+      if (!zlib.brotliDecompressSync(packed).equals(bytes)) throw new Error(`${name}.br does not decompress to ${name}`);
+      entry.brotli = { file: `${name}.br`, bytes: packed.length, sha256: sha256(packed) };
+    }
+    modules.push(entry);
   }
   const top = kitName(version);
   const files = [
@@ -315,6 +347,7 @@ function kit(version, assetsDir, outDir) {
 const [command, ...args] = process.argv.slice(2);
 const commands = {
   embed: () => embed(...args),
+  compress: () => compress(...args),
   "embed-torch": () => embedTorch(...args),
   strip: () => fs.writeFileSync(args[1], stripZipp(fs.readFileSync(args[0]))),
   extract: () => extract(...args),

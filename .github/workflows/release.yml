@@ -304,6 +304,11 @@ jobs:
             "zipp-$v-javascript-python.wasm" \
             "zipp-$v-javascript-python-base.wasm" \
             "zipp-$v-torch-package.wasm" \
+            "zipp-$v-javascript.wasm.br" \
+            "zipp-$v-javascript-lite.wasm.br" \
+            "zipp-$v-javascript-python.wasm.br" \
+            "zipp-$v-javascript-python-base.wasm.br" \
+            "zipp-$v-torch-package.wasm.br" \
             "zipp-$v-wasm-embed-kit.zip" > expected-assets.txt
           mapfile -t expected < expected-assets.txt
           mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
@@ -316,6 +321,9 @@ jobs:
           for asset in "${expected[@]}"; do
             case "$asset" in
               *.msi) ;; # a compressed cabinet; its zipp.exe is the portable exe, byte for byte
+              *.wasm.br) # must decompress to exactly the .wasm it accompanies
+                node -e 'const z=require("zlib"),f=require("fs");if(!z.brotliDecompressSync(f.readFileSync(process.argv[1])).equals(f.readFileSync(process.argv[2])))process.exit(1)' \
+                  "dist/$asset" "dist/${asset%.br}" ;;
               *.zip) unzip -p "dist/$asset" "${asset%.zip}/BUILD-INFO.txt" | grep -Fxq "commit=$EXPECTED_COMMIT" ;;
               *) LC_ALL=C grep -aqF "$EXPECTED_COMMIT" "dist/$asset" ;;
             esac
@@ -374,6 +382,9 @@ jobs:
               while read -r asset; do
                 case "$asset" in
                   *.msi) ;;
+                  *.wasm.br)
+                    node -e 'const z=require("zlib"),f=require("fs");if(!z.brotliDecompressSync(f.readFileSync(process.argv[1])).equals(f.readFileSync(process.argv[2])))process.exit(1)' \
+                      "existing-assets/$asset" "existing-assets/${asset%.br}" ;;
                   *.zip) unzip -p "existing-assets/$asset" "${asset%.zip}/BUILD-INFO.txt" | grep -Fxq "commit=$EXPECTED_COMMIT" ;;
                   *) LC_ALL=C grep -aqF "$EXPECTED_COMMIT" "existing-assets/$asset" ;;
                 esac

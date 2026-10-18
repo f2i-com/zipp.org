@@ -59,6 +59,25 @@ for (const m of manifest.modules) {
 }
 ok(`modules.json names ${manifest.modules.length} modules of ${manifest.version} at ${manifest.commit}`);
 
+// The Brotli copies a release publishes beside the modules: each must
+// decompress to its module, and the loader must take one directly.
+{
+  const zlib = await import("node:zlib");
+  const packed = manifest.modules.filter(m => fs.existsSync(path.join(modulesDir, `${m.file}.br`)));
+  for (const m of packed) {
+    const br = fs.readFileSync(path.join(modulesDir, `${m.file}.br`));
+    assert.ok(zlib.brotliDecompressSync(br).equals(fs.readFileSync(path.join(modulesDir, m.file))), `${m.file}.br`);
+    if (m.brotli) assert.equal(sha256(br), m.brotli.sha256, `${m.file}.br sha256`);
+  }
+  const js = packed.find(m => m.variant === "javascript" || m.variant === "lite");
+  if (js) {
+    const viaBr = await loadZipp(path.join(modulesDir, `${js.file}.br`));
+    assert.equal(viaBr.meta.variant, js.variant);
+    assert.deepEqual(viaBr.run("console.log(6 * 7)").output, ["42"]);
+  }
+  if (packed.length) ok(`${packed.length} .wasm.br files decompress to their modules, and ${js ? js.file + ".br loads" : "none is an engine"}`);
+}
+
 const engines = ["javascript", "lite", "javascript-python", "javascript-python-base"]
   .filter(v => byVariant.has(v) && (only.length === 0 || only.includes(v)));
 assert.ok(engines.length, "no engine module to check");

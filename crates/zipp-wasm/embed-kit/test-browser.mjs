@@ -71,6 +71,17 @@ const server = http.createServer((req, res) => {
   }
   const wasmType = url.searchParams.get("type") === "octet" ? "application/octet-stream" : "application/wasm";
   const ext = path.extname(file);
+  // A .wasm.br is sent as a server configured for it would
+  // (`Content-Encoding: br`, the browser decodes), or with `?enc=none` as a
+  // plain file a server knows nothing about.
+  if (file.endsWith(".wasm.br")) {
+    const decode = url.searchParams.get("enc") !== "none";
+    res.writeHead(200, decode
+      ? { "content-type": "application/wasm", "content-encoding": "br", "cache-control": "no-store" }
+      : { "content-type": "application/octet-stream", "cache-control": "no-store" });
+    fs.createReadStream(file).pipe(res);
+    return;
+  }
   res.writeHead(200, { "content-type": ext === ".wasm" ? wasmType : TYPES[ext] || "application/octet-stream", "cache-control": "no-store" });
   fs.createReadStream(file).pipe(res);
 });
@@ -95,6 +106,13 @@ async function inPage(page, version) {
     const pyOut = (await pySandbox.run("import helpers\nimport torch\nprint(helpers.triple(2), (torch.tensor([1.0, 2.0]) * 3).tolist())")).output.join("|");
     await pySandbox.close();
     results.push({ type: "sandbox", variant: "javascript-python-base+torch-package", version: base.meta.version, js: null, py: pyOut });
+    // The Brotli copy, decoded by the server, or sent raw (the loader then
+    // decompresses it itself where the browser can, or falls back to the
+    // plain .wasm beside it).
+    for (const enc of ["br", "none"]) {
+      const zipp = await loadZipp(`/zipp-${version}-javascript.wasm.br?enc=${enc}`);
+      results.push({ type: "brotli", variant: `javascript.wasm.br (${enc === "br" ? "Content-Encoding: br" : "no encoding"})`, version: zipp.meta.version, js: zipp.run("console.log(6 * 7)").output.join("|"), py: null });
+    }
     // The host SDK: a Worker per guest, ended at its deadline.
     // Enough steps that the deadline, not the instruction budget, ends the loop.
     const host = createZippHost({ wasmUrl: `/zipp-${version}-javascript.wasm`, deadlineMs: 2000, instructionBudget: 2_000_000_000 });
@@ -154,6 +172,10 @@ for (const name of browsers) {
     if (r.type === "sandbox") {
       const good = r.py === null ? r.js === "v undefined" : r.py === "6 [3.0, 6.0]";
       check(`isolated sandbox: ${r.variant}`, r.version === version && good, r);
+      continue;
+    }
+    if (r.type === "brotli") {
+      check(`loads ${r.variant}`, r.version === version && r.js === "42", r);
       continue;
     }
     if (r.type === "host-sdk") {
