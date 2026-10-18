@@ -29,8 +29,8 @@ CORPUS = ROOT / "tests" / "python_corpus"
 LIB = ROOT / "crates" / "zipp-vm" / "src" / "lang" / "python" / "lib" / "shared"
 
 
-def run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
-    env = dict(os.environ, PYTHONPATH=str(LIB), PYTHONDONTWRITEBYTECODE="1")
+def run(cmd: list[str], cwd: Path, **extra: str) -> tuple[int, str, str]:
+    env = dict(os.environ, PYTHONPATH=str(LIB), PYTHONDONTWRITEBYTECODE="1", **extra)
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, env=env)
     return p.returncode, p.stdout.replace("\r\n", "\n"), p.stderr.replace("\r\n", "\n")
 
@@ -57,7 +57,12 @@ def main() -> int:
             path.with_suffix(".status").write_text("0\n" if code == 0 else "1\n", encoding="utf-8", newline="\n")
             print(f"  wrote {path.with_suffix('.out').name} ({len(out.splitlines())} lines, exit {code})")
             continue
-        zcode, zout, zerr = run([args.zipp, "py", str(path)], CORPUS)
+        # CPython runs the bundled pure-Python graph evaluator (backend
+        # "cpu-python"), so zipp must too: on a machine with a GPU the native
+        # CLI would otherwise run the corpus's GPU graphs there and print
+        # that backend, its float32 rounding and its timings.
+        # crates/zipp-cli/tests/native_gpu.rs compares the GPU path itself.
+        zcode, zout, zerr = run([args.zipp, "py", str(path)], CORPUS, ZIPP_GPU="0")
         ok = out == zout and (code == 0) == (zcode == 0)
         if ok:
             print(f"  ok   {path.name}")

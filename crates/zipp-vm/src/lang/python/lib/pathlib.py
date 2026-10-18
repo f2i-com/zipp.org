@@ -331,13 +331,15 @@ def _child(base, name):
     return name if base == "." else (base + name if base == "/" else base + "/" + name)
 
 
-def _dirs(base):
-    """`base` and every directory below it."""
+def _dirs(base, files=False):
+    """`base` and every directory below it (with `files`, every file too)."""
     out = [base]
     for name in sorted(os.listdir(base)):
         full = _child(base, name)
         if os.path.isdir(full):
-            out.extend(_dirs(full))
+            out.extend(_dirs(full, files))
+        elif files:
+            out.append(full)
     return out
 
 
@@ -351,14 +353,17 @@ def _glob(root, pattern):
         if "**" in seg and seg != "**":
             raise ValueError("Invalid pattern: '**' can only be an entire path component")
     candidates = [root._path]
-    for seg in segments:
+    last = len(segments) - 1
+    for i, seg in enumerate(segments):
         nxt, seen = [], set()
         for c in candidates:
             if not os.path.isdir(c):
                 continue
             if seg == "**":
-                # This directory and every directory below it.
-                matches = _dirs(c)
+                # This directory and every directory below it. As the last
+                # component it matches files as well (Python 3.13), unless a
+                # trailing separator asks for directories.
+                matches = _dirs(c, files=i == last and not pattern.endswith("/"))
             else:
                 matches = [_child(c, name) for name in sorted(os.listdir(c)) if _fnmatch(name, seg)]
             for m in matches:

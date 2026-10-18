@@ -9,7 +9,7 @@ x  x a .
 ['src/pkg/sub/c.py']
 ['src/pkg/sub/c.py']
 ['src/pkg/sub/d.txt']
-['.', 'src', 'src/pkg', 'src/pkg/sub']
+['.', 'src', 'src/a.py', 'src/pkg', 'src/pkg/b.py', 'src/pkg/sub', 'src/pkg/sub/c.py', 'src/pkg/sub/d.txt', 'top.py']
 ['src']
 ['src/a.py']
 ['src/a.py', 'src/pkg/b.py', 'src/pkg/sub/c.py', 'top.py']
