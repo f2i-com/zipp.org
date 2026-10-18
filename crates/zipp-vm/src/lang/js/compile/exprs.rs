@@ -32,6 +32,36 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
     }
 }
 
+/// Whether the code being compiled can only ever be interpreted: a build
+/// without the JIT, or a process run with `ZIPP_NOJIT`, which no VM of the
+/// process can switch back on (`Vm::new` reads it and the embedding's
+/// `enable_vm_jit` declines to override it). Such code can drop the copies
+/// the JIT's pattern matchers expect (`expr_discarded`): in the interpreter
+/// of the JIT build that was 4% of the real and hostile suites (geomean of
+/// 28 rows, 11% on `types-stable`). `ZIPP_KEEP_JIT_COPIES=1` keeps them,
+/// for A/B.
+pub(crate) fn interp_only_bytecode() -> bool {
+    #[cfg(not(feature = "jit"))]
+    {
+        true
+    }
+    #[cfg(feature = "jit")]
+    {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let off = std::env::var_os("ZIPP_NOJIT").is_some()
+                    && std::env::var_os("ZIPP_KEEP_JIT_COPIES").is_none();
+                STATE.store(if off { 1 } else { 2 }, Ordering::Relaxed);
+                off
+            }
+        }
+    }
+}
+
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
 // gone from this file (`expr_into`, `typeof (f)`, `delete (x)`). That is a
 // deliberate behaviour change in one direction only: a parenthesized operand now
@@ -283,30 +313,32 @@ impl<'a> FnCompiler<'a> {
     /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
     /// `i++` over `++i` in a position where the two cannot be told apart.
     ///
-    /// The other, in builds without the JIT: an update or an assignment of a
-    /// plain register local computes in the local's own register, and what it
-    /// then hands back is a copy of that register into the result. Nobody
-    /// reads a discarded result, so the local is named as the result and the
-    /// copy is never emitted. `s += i` and `i++` as statements were two dead
-    /// `Move`s in a six-instruction loop: a third of what the interpreter
-    /// dispatched. The JIT's planners and stream recognisers match the
-    /// compiler's exact output, copies included, so builds with it keep it.
+    /// The other, for code only the interpreter will run: an update or an
+    /// assignment of a plain register local computes in the local's own
+    /// register, and what it then hands back is a copy of that register into
+    /// the result. Nobody reads a discarded result, so the local is named as
+    /// the result and the copy is never emitted. `s += i` and `i++` as
+    /// statements were two dead `Move`s in a six-instruction loop: a third of
+    /// what the interpreter dispatched. The JIT's planners and stream
+    /// recognisers match the compiler's exact output, copies included, so code
+    /// a JIT may compile keeps it ([`interp_only_bytecode`]).
     pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
-        #[cfg(not(feature = "jit"))]
-        match e {
-            ast::Expr::Update { op, target, .. } => {
-                if let Some(r) = self.discarded_in_place_reg(target) {
-                    return self.update(*op, true, target, r);
+        if interp_only_bytecode() {
+            match e {
+                ast::Expr::Update { op, target, .. } => {
+                    if let Some(r) = self.discarded_in_place_reg(target) {
+                        return self.update(*op, true, target, r);
+                    }
                 }
-            }
-            ast::Expr::Assign {
-                op, target, value, ..
-            } if !op.is_logical() => {
-                if let Some(r) = self.discarded_in_place_reg(target) {
-                    return self.assign(*op, target, value, r);
+                ast::Expr::Assign {
+                    op, target, value, ..
+                } if !op.is_logical() => {
+                    if let Some(r) = self.discarded_in_place_reg(target) {
+                        return self.assign(*op, target, value, r);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         if let ast::Expr::Update {
             op,
@@ -328,7 +360,6 @@ impl<'a> FnCompiler<'a> {
     ///
     /// Reads the scopes only. `resolve` threads upvalues and mints globals,
     /// and `with_obj_regs` emits code; neither may run for a question.
-    #[cfg(not(feature = "jit"))]
     fn discarded_in_place_reg(&self, target: &ast::Target) -> Option<Reg> {
         let ast::Target::Ident { name, .. } = target else {
             return None;
