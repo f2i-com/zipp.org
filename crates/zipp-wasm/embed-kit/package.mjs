@@ -207,7 +207,13 @@ function crc32(bytes) {
 
 // Entries in name order, all stamped 1980-01-01 00:00, files 0644: the same
 // tree always gives the same bytes.
-export function writeZip(file, entries) {
+// `date` stamps every entry (local time, as zip stores it); without it, the
+// fixed 1980-01-01 makes the same files pack to the same bytes. A website
+// needs a real date: a server sends the extracted files' times as
+// Last-Modified, and a 1980 one lets caches keep them for years.
+export function writeZip(file, entries, { date } = {}) {
+  const dosTime = date ? (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1) : 0;
+  const dosDate = date ? ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate() : 0x21;
   const locals = [], centrals = [];
   let offset = 0;
   for (const { name, data } of [...entries].sort((a, b) => (a.name < b.name ? -1 : 1))) {
@@ -221,8 +227,8 @@ export function writeZip(file, entries) {
     head.writeUInt16LE(20, 4);
     head.writeUInt16LE(0x0800, 6); // UTF-8 names
     head.writeUInt16LE(stored ? 0 : 8, 8);
-    head.writeUInt16LE(0, 10);
-    head.writeUInt16LE(0x21, 12); // 1980-01-01
+    head.writeUInt16LE(dosTime, 10);
+    head.writeUInt16LE(dosDate, 12);
     head.writeUInt32LE(crc, 14);
     head.writeUInt32LE(body.length, 18);
     head.writeUInt32LE(data.length, 22);
@@ -234,8 +240,8 @@ export function writeZip(file, entries) {
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0x0800, 8);
     central.writeUInt16LE(stored ? 0 : 8, 10);
-    central.writeUInt16LE(0, 12);
-    central.writeUInt16LE(0x21, 14);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
     central.writeUInt32LE(crc, 16);
     central.writeUInt32LE(body.length, 20);
     central.writeUInt32LE(data.length, 24);

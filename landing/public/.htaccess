@@ -4,6 +4,21 @@
 # The site's own page for a missing URL, not the server's.
 ErrorDocument 404 /404.html
 
+# Caching. Only the build's content-hashed files (/assets/) keep a name that
+# can never mean other bytes, so only they may be kept without asking. Every
+# other file (pages, the playgrounds' scripts, workers and engines, whose
+# names stay the same from one release to the next) is sent `no-cache`:
+# browsers and Cloudflare may store it but must check with this server before
+# using it, which costs a 304 when it is unchanged. Without this, a cache can
+# pair an old playground worker with a new engine (a LinkError on load).
+# Responses that set their own Cache-Control (api/stats.php) keep it.
+<IfModule mod_headers.c>
+  Header setifempty Cache-Control "no-cache"
+  <If "%{REQUEST_URI} =~ m#^/assets/#">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </If>
+</IfModule>
+
 # The live repository facts: /api/stats answers as /api/stats.php does, as
 # on the Cloudflare Worker.
 <IfModule mod_rewrite.c>

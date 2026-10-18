@@ -77,4 +77,21 @@ const worker = (await readFile(workerPath, 'utf8'))
   .replace('../playground-runtime/zipp_wasm.js', `../playground-runtime/zipp_wasm.js?v=${build}`)
   .replace('const ready = init()', `const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=${build}", import.meta.url) })`)
 await writeFile(workerPath, worker)
+// The page, its script and its worker keep their names from one release to
+// the next, so a cache holding an old copy of one would load it beside new
+// ones (an old worker beside a new engine fails to link). Tag the script and
+// the worker with a hash of everything below the page.
+const pageDir = path.join(output, 'playground')
+const script = await readFile(path.join(pageDir, 'playground.js'), 'utf8')
+const css = await readFile(path.join(pageDir, 'playground.css'), 'utf8')
+const tag = hash([worker, script, css].join('\0')).slice(0, 16)
+const tagged = (text, from, to, file) => {
+  if (!text.includes(from)) throw Error(`${file} no longer contains ${from}`)
+  return text.replace(from, to)
+}
+await writeFile(path.join(pageDir, 'playground.js'), tagged(script, 'new URL("./engine.worker.js"', `new URL("./engine.worker.js?v=${tag}"`, 'playground.js'))
+let page = await readFile(path.join(pageDir, 'index.html'), 'utf8')
+page = tagged(page, 'src="playground.js"', `src="playground.js?v=${tag}"`, 'index.html')
+page = tagged(page, 'href="playground.css"', `href="playground.css?v=${tag}"`, 'index.html')
+await writeFile(path.join(pageDir, 'index.html'), page)
 console.log('Folder playground synchronized; checked-in Python WASM pair verified.')

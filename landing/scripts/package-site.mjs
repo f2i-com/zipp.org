@@ -7,8 +7,10 @@
 // playgrounds and their engines (with the .wasm.br copies .htaccess serves),
 // the documentation pages, the journal and api/stats.php. Left out are
 // dist/server (the build's prerender bundle) and .assetsignore (read only by
-// Cloudflare's Worker deploy). The zip has forward-slash names and fixed
-// timestamps, so the same build packs to the same bytes.
+// Cloudflare's Worker deploy). The zip has forward-slash names, and every
+// entry is stamped with the packing time: the host serves the extracted
+// files' times as Last-Modified, and a fixed 1980 date would let browsers
+// and CDNs keep them for years (see public/.htaccess's cache rules).
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +43,6 @@ for (const required of ["index.html", "404.html", ".htaccess", "api/stats.php", 
   }
 }
 const entries = walk(client);
-writeZip(path.resolve(out), entries);
+writeZip(path.resolve(out), entries, { date: new Date() });
 const bytes = entries.reduce((sum, e) => sum + e.data.length, 0);
 console.log(`${path.basename(out)}: ${entries.length} files, ${bytes.toLocaleString("en-US")} bytes unpacked, ${fs.statSync(out).size.toLocaleString("en-US")} packed`);
