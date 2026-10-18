@@ -930,7 +930,12 @@ impl<'p> Vm<'p> {
             ));
         }
         let abs = byte_offset + pos;
-        let little = self.truthy(little_endian);
+        // `truthy` stayed an out-of-line call here; the flag is a primitive
+        // (`le === 1`, an absent one) in every read that runs hot.
+        let little = match little_endian.truthy_primitive() {
+            Some(t) => t,
+            None => self.truthy(little_endian),
+        };
         // Fixed-width reads (the bounds were proved above, so `ta_bytes`
         // cannot decline), and integer kinds as integer Values, as the typed
         // array reads make them.

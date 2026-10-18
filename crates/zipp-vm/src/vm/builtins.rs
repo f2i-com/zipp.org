@@ -763,6 +763,29 @@ impl<'p> Vm<'p> {
         self.proto_intrinsic_bits(name, is_arr)
     }
 
+    /// `o.key` on a heap receiver with no shape, answered by its kind in one
+    /// load: a class value's static data property (`Entity.count`), a
+    /// function's own one (`counter.calls`), or a prototype intrinsic of an
+    /// Array, a string, a Map or Set, a promise or a DataView
+    /// (`proto_intrinsic_read`). The interpreter asked the three lanes in
+    /// turn, each an out-of-line call that tested the kind again, so a
+    /// DataView's `getUint32` paid all three. `None`: the caller goes on to
+    /// the property cache and the member walk.
+    pub(crate) fn shapeless_read(&mut self, o: Value, key: &str) -> Option<Value> {
+        match self.heap.get(o.heap_index()) {
+            HeapObj::Class(_) => self.class_static_data_read(o, key),
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self.fn_own_data_read(o, key),
+            _ => self.proto_intrinsic_read(o, key).map(Value::from_bits),
+        }
+    }
+
     /// `C.key` on a built-in constructor object (`Object.hasOwn`,
     /// `Array.isArray`, `Number.MAX_SAFE_INTEGER`): an own data property of
     /// its map, read where it lies. The property caches decline constructor

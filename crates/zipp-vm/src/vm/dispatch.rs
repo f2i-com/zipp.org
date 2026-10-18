@@ -3704,18 +3704,11 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             // A class value's static data property
-                            // (`Entity.count`, `new.target.kind`), or a
-                            // function's own one (`counter.calls`).
-                            if let Some(v) = self
-                                .class_static_data_read(o, &key)
-                                .or_else(|| self.fn_own_data_read(o, &key))
-                            {
+                            // (`Entity.count`, `new.target.kind`), a
+                            // function's own one (`counter.calls`), or a
+                            // prototype intrinsic (`dv.getUint32`).
+                            if let Some(v) = self.shapeless_read(o, &key) {
                                 self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
-                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
-                                self.set(base, dst, Value::from_bits(bits));
                                 ip += 1;
                                 continue;
                             }
@@ -3740,19 +3733,10 @@ impl<'p> Vm<'p> {
                             }
                             GetAct::None => {}
                         }
-                        // B289: a prototype-intrinsic read on an Array or
-                        // String receiver — `arr.push`, `s.charCodeAt`, the
-                        // captured half of the strict member-call lowering.
-                        // The property IC is shape-keyed and these receivers
-                        // have no shape, so every such read took the generic
-                        // walk (~70ns over an own-property hit). The B191
-                        // baseline proof answers it in a few loads.
+                        // (A shapeless receiver's prototype intrinsic was
+                        // asked before the cache, `shapeless_read`; an object
+                        // has none to answer.)
                         if o.is_heap() {
-                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
-                                self.set(base, dst, Value::from_bits(bits));
-                                ip += 1;
-                                continue;
-                            }
                             // `Object.hasOwn`, `Array.isArray`: a constructor's
                             // own data property, which the IC declines.
                             if let Some(v) = self.ctor_own_data_read(o, &key) {
