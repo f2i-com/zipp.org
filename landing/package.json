@@ -9,11 +9,12 @@
   },
   "scripts": {
     "dev": "node scripts/sync-playground.mjs && vite",
-    "build": "node scripts/sync-playground.mjs && tsc -b && vite build",
+    "build": "node scripts/sync-playground.mjs && node scripts/compress-engines.mjs --check && tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --pretty false",
     "test": "node --experimental-strip-types --test tests/*.test.mjs",
-    "refresh:repo": "node scripts/refresh-repo.mjs"
+    "refresh:repo": "node scripts/refresh-repo.mjs",
+    "compress:engines": "node scripts/compress-engines.mjs"
   },
   "dependencies": {
     "react": "^19.3.0",

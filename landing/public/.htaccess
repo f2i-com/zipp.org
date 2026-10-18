@@ -1,0 +1,52 @@
+# Apache settings for www.zipp.org. Each block does nothing on a server
+# without its module.
+
+# The site's own page for a missing URL, not the server's.
+ErrorDocument 404 /404.html
+
+# The live repository facts: /api/stats answers as /api/stats.php does, as
+# on the Cloudflare Worker.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^api/stats$ api/stats.php [L]
+</IfModule>
+
+# Precompressed WebAssembly engines.
+#
+# Beside each engine .wasm the site serves (wasm/, playground-runtime/,
+# sandbox/) sits a Brotli copy, .wasm.br, written by scripts/compress-engines.mjs.
+# A browser that accepts Brotli asking for the .wasm gets the .br instead, sent
+# as `Content-Type: application/wasm` with `Content-Encoding: br`, which it
+# decodes itself: about a quarter of the bytes, and the same URL for everyone.
+# Any other client gets the plain .wasm.
+
+<IfModule mod_mime.c>
+  AddType application/wasm .wasm
+  AddEncoding br .br
+</IfModule>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{HTTP:Accept-Encoding} (^|[\s,])br([\s,;]|$) [NC]
+  RewriteCond %{REQUEST_FILENAME}.br -f
+  RewriteRule ^(.+\.wasm)$ $1.br [L]
+</IfModule>
+
+<FilesMatch "\.wasm\.br$">
+  # A host whose mime.types maps .br to a type of its own must not change
+  # what the browser compiles.
+  <IfModule mod_mime.c>
+    ForceType application/wasm
+  </IfModule>
+  # Already compressed: never compress it again.
+  <IfModule mod_env.c>
+    SetEnv no-gzip 1
+    SetEnv no-brotli 1
+  </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+  <FilesMatch "\.wasm(\.br)?$">
+    Header merge Vary Accept-Encoding
+  </FilesMatch>
+</IfModule>

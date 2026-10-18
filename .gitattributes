@@ -42,3 +42,5 @@ crates/zipp-wasm/**/*.wasm -text
 # line-ending conversion on checkout would corrupt it.
 *.pkl binary
 *.pt binary
+# Brotli-compressed engines (.wasm.br).
+*.br binary
