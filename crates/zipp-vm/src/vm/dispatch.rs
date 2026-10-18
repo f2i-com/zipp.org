@@ -91,6 +91,16 @@ pub(crate) mod interp_stats {
 /// `ZIPP_NO_LEAN_CALL=1`: every call-cache hit pushes its frame through
 /// `setup_call` and every return pops through `pop_frame_with`, out of line
 /// (the same-binary comparator for `setup_call_lean` / `pop_frame_fast`).
+/// [`Vm::lean_call_desc`]'s flags: a plain call takes the lean push.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_OK: u32 = 1 << 24;
+/// ... and the callee is sloppy, so its `this` is the global object.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_SLOPPY: u32 = 1 << 25;
+/// Set in every descriptor, so 0 means none.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
+
 #[inline(always)]
 fn lean_calls_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
@@ -7518,6 +7528,107 @@ impl<'p> Vm<'p> {
             callee: callee_val,
         });
         Ok(())
+    }
+
+    /// [`Self::setup_call_lean`] for a plain call (`this` undefined) whose
+    /// callee's frame facts the caller already holds, packed by
+    /// [`Self::lean_call_desc`]: the push reads nothing of the callee's
+    /// `FuncProto`. The lite loop's callee cache keeps the descriptor beside
+    /// the resolution, so a cached call skipped the dependent load of the
+    /// prototype and its flags, a quarter of the gap to QuickJS's call.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_lean_desc(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let params = ((desc >> 16) & 0xFF) as usize;
+        let new_base = self.regs.len();
+        let lean = desc & LEAN_DESC_OK != 0
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + callee_regs)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call_lean(
+                func_id,
+                closure,
+                Value::UNDEFINED,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        let this_val = if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+            Value::heap(self.callee_this_global(callee_val))
+        } else {
+            Value::UNDEFINED
+        };
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+        self.regs[new_base] = this_val;
+        let n = (argc as usize).min(params);
+        for i in 0..n {
+            let v = self.regs[caller_base + arg_base as usize + i];
+            self.regs[new_base + 1 + i] = v;
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: (caller_base + arg_base as usize) as u32,
+            argc,
+            is_eval: false,
+            construct_this: false,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: callee_val,
+        });
+        Ok(())
+    }
+
+    /// The frame facts [`Self::setup_call_lean_desc`] needs of `func_id`,
+    /// packed: its register count (bits 0-15), its parameter count (16-23),
+    /// [`LEAN_DESC_OK`] when a plain call to it takes the lean push (no rest
+    /// parameter, no `arguments` object, not an arrow), [`LEAN_DESC_SLOPPY`]
+    /// when its `this` is then the global object. 0 when the counts do not
+    /// fit, which sends every call to `setup_call_lean`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn lean_call_desc(&self, func_id: u32) -> u32 {
+        let p = self.func(func_id as usize);
+        let regs = (p.reg_count as usize).max(1);
+        if regs > 0xFFFF || p.param_count as usize > 0xFF {
+            return 0;
+        }
+        let mut d = regs as u32 | ((p.param_count as u32) << 16);
+        if p.rest_reg.is_none() && p.arguments_reg.is_none() && !p.lexical_this {
+            d |= LEAN_DESC_OK;
+        }
+        if !p.is_strict {
+            d |= LEAN_DESC_SLOPPY;
+        }
+        d | LEAN_DESC_KNOWN
     }
 
     /// Whether a register window ending at `needed` fits the register file

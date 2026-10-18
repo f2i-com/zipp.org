@@ -252,14 +252,17 @@ const LITE_CALL_SLOTS: usize = 256;
 
 /// One slot of the lite loop's callee cache: the callee's bits and version
 /// when `ic_call` resolved it to a plain user function the lite loop runs,
-/// and that resolution. What a Func or Closure object calls never changes
-/// and a reused slot has a new version, so it depends on the callee alone.
+/// and that resolution, with the callee's frame facts for the push
+/// (`Vm::lean_call_desc`; in the padding the slot had). What a Func or
+/// Closure object calls never changes and a reused slot has a new version,
+/// so it depends on the callee alone.
 #[derive(Clone, Copy)]
 struct LiteCall {
     bits: u64,
     ver: u32,
     fid: u32,
     closure: u32,
+    desc: u32,
 }
 
 impl LiteCall {
@@ -268,6 +271,7 @@ impl LiteCall {
         ver: 0,
         fid: 0,
         closure: 0,
+        desc: 0,
     };
 }
 
@@ -415,18 +419,20 @@ impl<'p> Vm<'p> {
     }
 
     /// The callee `callee` resolves to for a plain call from `func_id`'s
-    /// `ip`: the lite cache's answer, else `ic_call`'s (remembered when the
-    /// lite loop runs the callee).
+    /// `ip`, with its frame descriptor (`Vm::lean_call_desc`): the lite
+    /// cache's answer, else `ic_call`'s (remembered when the lite loop runs
+    /// the callee).
     #[inline(always)]
-    fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32)> {
+    fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
         if callee.is_heap() {
             let idx = callee.heap_index();
             let e = self.lite.calls[idx as usize & (LITE_CALL_SLOTS - 1)];
             if e.bits == callee.bits() && e.ver == self.heap.version_of(idx) {
-                return Some((e.fid, e.closure));
+                return Some((e.fid, e.closure, e.desc));
             }
         }
         let call = self.ic_call(func_id, ip, callee)?;
+        let desc = self.lean_call_desc(call.fid);
         if self.lite_eligible(call.fid) {
             let idx = callee.heap_index();
             self.lite.calls[idx as usize & (LITE_CALL_SLOTS - 1)] = LiteCall {
@@ -434,9 +440,10 @@ impl<'p> Vm<'p> {
                 ver: self.heap.version_of(idx),
                 fid: call.fid,
                 closure: call.closure,
+                desc,
             };
         }
-        Some((call.fid, call.closure))
+        Some((call.fid, call.closure, desc))
     }
 
     /// Run the top frame, and the eligible frames it calls or returns to, in
@@ -1264,20 +1271,10 @@ impl<'p> Vm<'p> {
                     argc,
                 } => {
                     let callee_v = self.get(base, callee);
-                    let Some((fid, closure)) = self.lite_resolve(func_id, ip, callee_v) else {
+                    let Some((fid, closure, desc)) = self.lite_resolve(func_id, ip, callee_v) else {
                         hand_over!();
                     };
-                    self.setup_call_lean(
-                        fid,
-                        closure,
-                        Value::UNDEFINED,
-                        base,
-                        arg_base,
-                        argc,
-                        dst,
-                        ip + 1,
-                        callee_v,
-                    )?;
+                    self.setup_call_lean_desc(fid, closure, desc, base, arg_base, argc, dst, ip + 1, callee_v)?;
                     // The main loop's frame-transition safe point.
                     self.maybe_gc();
                     if !self.lite_eligible(fid) {
