@@ -1039,6 +1039,13 @@ impl<'p> Vm<'p> {
     /// worker agent handed this buffer aliases the same memory), marked in
     /// `shared_buffers` and linked to %SharedArrayBuffer.prototype%. A growable
     /// SAB preallocates `maxByteLength` zeroed bytes; `grow` is a length store.
+    ///
+    /// The `safe-sandbox` profile has no worker agents and no `unsafe`, so its
+    /// SharedArrayBuffer is backed by agent-local bytes (`AbData::Local`),
+    /// reserved to the same capacity. With one agent nothing can observe
+    /// whether bytes are shared: the brand, growth and Atomics behave as they
+    /// do on shared memory, except that a synchronous `Atomics.wait` on an
+    /// equal value returns "timed-out" at once (no other agent could wake it).
     pub(crate) fn alloc_shared_array_buffer(
         &mut self,
         byte_len: usize,
@@ -1048,10 +1055,24 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         self.instrument_preflight_heap_growth(capacity)
             .map_err(|message| Thrown(message.into()))?;
-        let mem = crate::heap::SharedMem::try_new(byte_len, capacity)
-            .map_err(|_| Thrown::from_static("RangeError: SharedArrayBuffer allocation failed"))?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let data = {
+            let mem = crate::heap::SharedMem::try_new(byte_len, capacity).map_err(|_| {
+                Thrown::from_static("RangeError: SharedArrayBuffer allocation failed")
+            })?;
+            crate::heap::AbData::Shared(std::sync::Arc::new(mem))
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let data = {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .map_err(|_| Thrown::from_static("RangeError: SharedArrayBuffer allocation failed"))?;
+            bytes.resize(byte_len, 0u8);
+            crate::heap::AbData::Local(bytes)
+        };
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
-            data: crate::heap::AbData::Shared(std::sync::Arc::new(mem)),
+            data,
             detached: false,
         });
         self.shared_buffers.insert(idx);
@@ -1854,28 +1875,29 @@ impl<'p> Vm<'p> {
         if i >= len {
             return Err(Thrown::from_static("RangeError: Atomics index out of bounds"));
         }
-        // RevalidateAtomicAccess (DATA ops only — wait/waitAsync/notify never
-        // touch the buffer afterward): a coercion side effect that detached
-        // the buffer or shrank it below the index aborts the access.
+        // `load` revalidates here, after its only coercion (the index); the
+        // writing operations do it in atomics_op, after converting their
+        // value(s). wait/waitAsync/notify never touch the buffer afterward.
         if revalidate {
-            let buffer = match self.heap.get(ti) {
-                HeapObj::TypedArray { buffer, .. } => *buffer,
-                _ => 0,
-            };
-            if matches!(
-                self.heap.get(buffer),
-                HeapObj::ArrayBuffer { detached: true, .. }
-            ) {
-                return Err(Thrown::from_static(
-                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer",
-                ));
-            }
-            let cur = self.ta_effective_len(ti).unwrap_or(0);
-            if i >= cur {
-                return Err(Thrown::from_static("RangeError: Atomics index out of bounds"));
-            }
+            self.atomic_revalidate(ti, i)?;
         }
         Ok((ti, i, kind))
+    }
+
+    /// RevalidateAtomicAccess: a coercion that ran after ValidateAtomicAccess
+    /// may have detached the buffer or resized it. A detached buffer or an
+    /// out-of-bounds view is a TypeError; an element no longer inside the view
+    /// is a RangeError. (The spec compares the byte index with the buffer's
+    /// length; comparing whole elements also refuses an element the buffer
+    /// now cuts in two.)
+    fn atomic_revalidate(&self, ti: u32, i: usize) -> Result<(), Thrown> {
+        match self.ta_effective_len(ti) {
+            None => Err(Thrown::from_static(
+                "TypeError: Cannot perform Atomics operation on a detached or out-of-bounds TypedArray",
+            )),
+            Some(len) if i >= len => Err(Thrown::from_static("RangeError: Atomics index out of bounds")),
+            Some(_) => Ok(()),
+        }
     }
 
     /// The (buffer heap idx, byte address) a wait/notify on `(ta, index)`
@@ -1929,7 +1951,7 @@ impl<'p> Vm<'p> {
             "store" | "add" | "sub" | "and" | "or" | "xor" | "exchange" | "compareExchange"
         );
         let (ti, i, kind) =
-            self.atomic_validate(a0, a1, waitable, needs_shared, is_write, !waitable)?;
+            self.atomic_validate(a0, a1, waitable, needs_shared, is_write, op == "load")?;
         let is_bigint = native::TA_KINDS[kind as usize].2;
         // waitAsync(ta, index, value, timeout) -> { async, value }. value differs
         // -> {async:false, value:"not-equal"}; matches with timeout 0 ->
@@ -2166,18 +2188,23 @@ impl<'p> Vm<'p> {
             } else {
                 self.to_bigint(a2)?
             };
+            let repl_b = if op == "compareExchange" {
+                Some(self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?)
+            } else {
+                None
+            };
+            // RevalidateAtomicAccess, after every value conversion: a valueOf
+            // may have detached or shrunk the buffer.
+            if op != "load" {
+                self.atomic_revalidate(ti, i)?;
+            }
             // NumericToRawBytes: the memory op uses the value wrapped to 64
             // bits (exact for any magnitude, incl. the Big tier); `store`
             // still RETURNS the unwrapped ToBigInt value.
             let v64 = v_b.to_i64_wrap();
             if let Some((mem, off)) = sab_target {
                 if off + elem_size <= mem.capacity() {
-                    let repl = if op == "compareExchange" {
-                        self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
-                            .to_i64_wrap()
-                    } else {
-                        0
-                    };
+                    let repl = repl_b.as_ref().map_or(0, |r| r.to_i64_wrap());
                     let old = sab_atomic_op(&mem, kind, off, op, v64, repl);
                     let old_b: i128 = if kind == 9 {
                         old as i128
@@ -2202,7 +2229,7 @@ impl<'p> Vm<'p> {
                     Ok(self.make_bigint_val(v_b))
                 }
                 "compareExchange" => {
-                    let repl = self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                    let repl = repl_b.unwrap_or(BigVal::Small(0));
                     // NumericToRawBytes: the EXPECTED value compares as the
                     // element type (BigInt64 wraps to i64, BigUint64 to u64).
                     let expected = if kind == 9 {
@@ -2240,13 +2267,17 @@ impl<'p> Vm<'p> {
             } else {
                 self.to_integer_or_zero(a2)?
             };
+            let repl = if op == "compareExchange" {
+                self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
+            } else {
+                0
+            };
+            // RevalidateAtomicAccess, after every value conversion.
+            if op != "load" {
+                self.atomic_revalidate(ti, i)?;
+            }
             if let Some((mem, off)) = sab_target {
                 if off + elem_size <= mem.capacity() {
-                    let repl = if op == "compareExchange" {
-                        self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
-                    } else {
-                        0
-                    };
                     let old = sab_atomic_op(&mem, kind, off, op, v_in, repl);
                     // The operand wraps to the element type inside the memory
                     // op (NumericToRawBytes); `store` still RETURNS the
@@ -2267,8 +2298,6 @@ impl<'p> Vm<'p> {
                     Ok(Value::num(v_in as f64))
                 }
                 "compareExchange" => {
-                    let repl =
-                        self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                     // NumericToRawBytes: the EXPECTED value wraps to the
                     // element type before comparing (123456789 on an
                     // Int16Array compares as -13035).

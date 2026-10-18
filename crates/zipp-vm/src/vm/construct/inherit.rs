@@ -592,6 +592,14 @@ impl<'p> Vm<'p> {
                 // chain already reaches the error prototype (so name/toString/
                 // instanceof resolve), so nothing else is needed here.
                 _ => {
+                    // `%TypedArray%` is abstract: its first step throws, from a
+                    // subclass's super() as from `new`, before newTarget's
+                    // prototype is read (ES2025 23.2.1.1).
+                    if cval.heap_index() == self.ta_base_ctor && self.ta_base_ctor != 0 {
+                        return Err(Thrown::from_static(
+                            "TypeError: Abstract class TypedArray not directly constructable",
+                        ));
+                    }
                     // A non-class parent is the base that creates the object: a
                     // Proxy through its own [[Construct]] (which reads, or not,
                     // newTarget.prototype itself), anything else as its

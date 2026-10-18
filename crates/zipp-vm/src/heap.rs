@@ -5600,7 +5600,9 @@ unsafe impl Sync for SharedMem {}
 
 impl SharedMem {
     /// Allocate `cap` bytes of zeroed shared storage with `len` initially
-    /// visible (`len <= cap`; a non-growable SAB passes `len == cap`).
+    /// visible (`len <= cap`; a non-growable SAB passes `len == cap`). Unused
+    /// in the safe-sandbox profile, whose SharedArrayBuffer is agent-local.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     pub fn try_new(len: usize, cap: usize) -> Result<SharedMem, std::collections::TryReserveError> {
         #[cfg(not(feature = "safe-sandbox"))]
         let words = cap.div_ceil(8).max(1);
