@@ -611,14 +611,18 @@ impl Recorder {
     }
 
     /// Recompute [`Self::slow`] from the fields it summarises. A slow state
-    /// stops the countdown, so the very next step takes the full path.
+    /// stops the countdown, so the very next step takes the full path. An
+    /// abort flag is not one: it is read only every `ABORT_CHECK_MASK + 1`
+    /// ticks, so [`Self::schedule`] ends the countdown on that stride instead
+    /// and the full path polls it there. (As a slow state it sent every
+    /// instruction down the full path, about five times slower, for any host
+    /// that installs a flag for cooperative cancellation.)
     #[inline]
     pub(crate) fn refresh_slow(&mut self) {
         #[cfg(not(feature = "meter-only"))]
         {
             self.slow = self.tracing
                 || self.pending.is_some()
-                || self.abort.is_some()
                 || self.exhaustion.is_some()
                 || self.output_exhausted;
             if self.slow {
@@ -675,15 +679,22 @@ impl Recorder {
 
     /// After a full-path step: how many steps may follow on the countdown.
     /// None while a slow state holds. Otherwise up to the step before the
-    /// next heap poll (`ticks & HEAP_AUDIT_MASK == 0`, which the full path
-    /// runs) and no more than a finite budget's remaining steps, so the step
-    /// that finds it empty is a full-path step too, exactly as before.
+    /// next poll the full path runs (`ticks & HEAP_AUDIT_MASK == 0`, or with
+    /// an abort flag installed `ticks & ABORT_CHECK_MASK == 0`; the abort
+    /// stride divides the heap one, so every heap poll is still reached) and
+    /// no more than a finite budget's remaining steps, so the step that finds
+    /// it empty is a full-path step too, exactly as before.
     #[cfg(not(feature = "meter-only"))]
     #[inline]
     fn schedule(&mut self) {
         let mut steps = 0;
         if !self.slow {
-            steps = (HEAP_AUDIT_MASK - (self.ticks & HEAP_AUDIT_MASK)) as i64;
+            let stride = if self.abort.is_some() {
+                ABORT_CHECK_MASK
+            } else {
+                HEAP_AUDIT_MASK
+            };
+            steps = (stride - (self.ticks & stride)) as i64;
             if self.remaining != i64::MAX {
                 steps = steps.min(self.remaining.max(0));
             }
@@ -2077,8 +2088,8 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
         rec.settle();
-        // Trace rows, an abort flag and the terminal states are handled out
-        // of line (the terminal states first).
+        // Trace rows and the terminal states are handled out of line (the
+        // terminal states first).
         if rec.slow {
             return self.instrument_step_slow(base, ip, instr);
         }
@@ -2098,6 +2109,15 @@ impl super::Vm<'_> {
             return Ok(());
         };
         rec.ticks = rec.ticks.wrapping_add(1);
+        // The abort poll, on the stride `schedule` stops the countdown at
+        // while a flag is installed; before the heap poll, as on the slow path.
+        if rec.ticks & ABORT_CHECK_MASK == 0 {
+            if let Some(flag) = rec.abort.as_ref() {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(rec.exhaust(ResourceExhaustion::Abort));
+                }
+            }
+        }
         let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
 
         if heap_poll {
@@ -3366,6 +3386,48 @@ mod tests {
         assert_eq!(abort_rec.remaining_now(hot), ABORT_BUDGET - used as i64);
         assert_eq!(used + abort_rec.remaining_now(hot) as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
+    }
+
+    /// An installed abort flag is read every `ABORT_CHECK_MASK + 1` ticks, so
+    /// it must not make the recorder slow (that sent every instruction down the
+    /// full path, about five times slower): the countdown runs to the next
+    /// abort boundary instead of the next heap poll.
+    #[cfg(not(feature = "meter-only"))]
+    #[test]
+    fn abort_flag_keeps_the_countdown() {
+        let mut rec = Recorder::new();
+        rec.abort = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        rec.refresh_slow();
+        assert!(!rec.slow, "an abort flag alone is not a slow state");
+        rec.ticks = 100;
+        rec.schedule();
+        assert_eq!(rec.countdown, (ABORT_CHECK_MASK - 100) as i64);
+        rec.abort = None;
+        rec.refresh_slow();
+        rec.ticks = 100;
+        rec.schedule();
+        assert_eq!(rec.countdown, (HEAP_AUDIT_MASK - 100) as i64);
+    }
+
+    /// The flag still stops a running program when it is set from another
+    /// thread while the interpreter is on the countdown.
+    #[cfg(not(feature = "meter-only"))]
+    #[test]
+    fn abort_flag_set_mid_run_stops_the_countdown() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut vm = crate::vm::Vm::new(program("var s = 0; while (true) { s = (s + 1) | 0; }"));
+        let mut rec = Recorder::new();
+        rec.abort = Some(flag.clone());
+        rec.refresh_slow();
+        vm.set_instrumentation(rec);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        vm.run().expect_err("the abort flag stops an endless loop");
+        setter.join().unwrap();
+        assert_eq!(vm.instr_rec.as_ref().unwrap().exhaustion, Some(ResourceExhaustion::Abort));
+        assert_eq!(vm.instrument_resource_limit_error(), Some(ABORT_MSG));
     }
 
     #[test]
