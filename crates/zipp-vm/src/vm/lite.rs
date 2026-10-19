@@ -202,6 +202,14 @@ const LITE_HANDOVER_BUDGET: u16 = 64;
 /// 13% slower in the lite loop than in the main loop.
 const LITE_MIN_ENTRY_STEPS: u64 = 128;
 
+/// What a loop iteration (a back-edge) and a call add to an entry's step
+/// count (`LITE_MIN_ENTRY_STEPS`), in place of one per instruction: the
+/// count lived on the stack, and its increment was a read-modify-write of
+/// memory before every instruction this loop ran. A straight-line function
+/// still counts nothing, which is the case the threshold is there for.
+const LITE_LOOP_STEPS: u64 = 16;
+const LITE_CALL_STEPS: u64 = 8;
+
 /// The target of `i` when it is a jump the lite loop or the compiler's loops
 /// can take backward.
 fn jump_target(i: &Instr) -> Option<u32> {
@@ -554,6 +562,7 @@ impl<'p> Vm<'p> {
         macro_rules! lite_enter {
             ($fid:expr) => {{
                 let fid = $fid;
+                steps += LITE_CALL_STEPS;
                 // The main loop's frame-transition safe point.
                 self.maybe_gc();
                 if !self.lite_eligible(fid) {
@@ -575,7 +584,6 @@ impl<'p> Vm<'p> {
             }};
         }
         loop {
-            steps += 1;
             match code[ip] {
                 Instr::LoadInt { dst, val } => {
                     self.set(base, dst, Value::int(val));
@@ -702,6 +710,7 @@ impl<'p> Vm<'p> {
                     let t = target as usize;
                     // A back-edge: the main arm's GC safe point.
                     if t < ip {
+                        steps += LITE_LOOP_STEPS;
                         self.maybe_gc();
                     }
                     ip = t;
@@ -711,6 +720,7 @@ impl<'p> Vm<'p> {
                     let r = self.add_int_value(va, imm, upd)?;
                     self.set(base, dst, r);
                     // The back-edge `Jump` at `ip + 1`: its GC safe point.
+                    steps += LITE_LOOP_STEPS;
                     self.maybe_gc();
                     ip = target as usize;
                 }
@@ -1275,6 +1285,7 @@ impl<'p> Vm<'p> {
                         hand_over!();
                     };
                     self.setup_call_lean_desc(fid, closure, desc, base, arg_base, argc, dst, ip + 1, callee_v)?;
+                    steps += LITE_CALL_STEPS;
                     // The main loop's frame-transition safe point.
                     self.maybe_gc();
                     if !self.lite_eligible(fid) {
