@@ -691,6 +691,12 @@ pub(crate) fn dbinop(
 /// All false under `ZIPP_NO_INT32_TRUNC_ADD=1` — the byte-identical old
 /// emission, for a same-binary A/B.
 pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
+    trunc_only_arith_walk(proto, true)
+}
+
+/// [`trunc_only_arith_ips`], its walks bounded by the cuts or (`bounded`
+/// false, for the test that the bound changes nothing) run to the end.
+fn trunc_only_arith_walk(proto: &FuncProto, bounded: bool) -> Vec<bool> {
     let code = &proto.code;
     let n = code.len();
     let mut out = vec![false; n];
@@ -714,9 +720,12 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
     if by_name_scope {
         return out;
     }
-    fn push(q: usize, n: usize, stack: &mut Vec<usize>, visited: &mut [bool]) {
-        if q < n && !visited[q] {
-            visited[q] = true;
+    // `visited[q] == stamp`: reached by the current candidate's walk (a stamp
+    // per walk, not a clear of the whole array per candidate). `limit`: the
+    // walk's cut (see `cut_after` below); ips at or past it are not visited.
+    fn push(q: usize, limit: usize, stack: &mut Vec<usize>, visited: &mut [u32], stamp: u32) {
+        if q < limit && visited[q] != stamp {
+            visited[q] = stamp;
             stack.push(q);
         }
     }
@@ -733,10 +742,63 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
         })
         .filter(|&t| t < n)
         .collect();
+    // A walk's bound. `cut_after[x]` is the first ip `c >= x` that no edge
+    // crosses backwards: no jump at an ip past `c` lands at or before it, and
+    // no handler target is at or before it (handlers are successors of every
+    // ip). A path from past `c` therefore never comes back to `c` or before,
+    // so a walk for a register last read at `x` stops at `c`: past it are no
+    // reads. Without the bound every walk ran to the function's end, since
+    // the compiler gives each statement fresh temporaries that are never
+    // written again: quadratic, and most of a 3,000-line generated
+    // function's run.
+    let mut crossings = vec![0i32; n + 1];
+    for (r, i) in code.iter().enumerate() {
+        let s = match *i {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. }
+            | Instr::PushFinally { target, .. }
+            | Instr::JumpFinally { target, .. } => target as usize,
+            Instr::PushHandler { catch_target, .. } => catch_target as usize,
+            _ => continue,
+        };
+        // A jump at `r` back to `s` crosses every cut in `s..r`.
+        if s < r {
+            crossings[s] += 1;
+            crossings[r] -= 1;
+        }
+    }
+    for &h in &handler_targets {
+        crossings[h] += 1;
+        crossings[n] -= 1;
+    }
+    let mut cut_after = vec![n; n + 1];
+    let mut open = 0i32;
+    let mut crossed = vec![false; n];
+    for x in 0..n {
+        open += crossings[x];
+        crossed[x] = open > 0;
+    }
+    for x in (0..n).rev() {
+        cut_after[x] = if crossed[x] { cut_after[x + 1] } else { x };
+    }
+    let mut last_read: Vec<usize> = Vec::new();
+    for (q, u) in uses.iter().enumerate() {
+        for &r in u {
+            let r = r as usize;
+            if r >= last_read.len() {
+                last_read.resize(r + 1, usize::MAX);
+            }
+            last_read[r] = q;
+        }
+    }
     // Per candidate: the arith readers its membership waits on; `None` once a
     // reader is neither truncating nor arithmetic (or the walk was declined).
     let mut deps: Vec<Option<Vec<usize>>> = vec![None; n];
-    let mut visited = vec![false; n];
+    let mut visited = vec![0u32; n];
+    let mut stamp = 0u32;
     let mut stack: Vec<usize> = Vec::new();
     for p in 0..n {
         let t = match code[p] {
@@ -746,11 +808,17 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
         if proto.arguments_reg.is_some() && (1..=proto.param_count).contains(&t) {
             continue;
         }
-        visited.fill(false);
+        // Never read anywhere: a member with no readers, as the walk finds.
+        let limit = match last_read.get(t as usize) {
+            _ if !bounded => n,
+            Some(&hi) if hi != usize::MAX => (cut_after[hi] + 1).min(n),
+            _ => 0,
+        };
+        stamp += 1;
         stack.clear();
-        push(p + 1, n, &mut stack, &mut visited);
+        push(p + 1, limit, &mut stack, &mut visited, stamp);
         for &h in &handler_targets {
-            push(h, n, &mut stack, &mut visited);
+            push(h, limit, &mut stack, &mut visited, stamp);
         }
         let mut arith_readers: Vec<usize> = Vec::new();
         let mut ok = true;
@@ -768,7 +836,7 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
                 continue; // redefined: this path ends here
             }
             match *i {
-                Instr::Jump { target } => push(target as usize, n, &mut stack, &mut visited),
+                Instr::Jump { target } => push(target as usize, limit, &mut stack, &mut visited, stamp),
                 Instr::Return { .. } | Instr::ReturnUndefined => {}
                 Instr::JumpIfFalse { target, .. }
                 | Instr::JumpIfTrue { target, .. }
@@ -776,14 +844,14 @@ pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
                 | Instr::JumpIfNotLe { target, .. }
                 | Instr::PushFinally { target, .. }
                 | Instr::JumpFinally { target, .. } => {
-                    push(target as usize, n, &mut stack, &mut visited);
-                    push(q + 1, n, &mut stack, &mut visited);
+                    push(target as usize, limit, &mut stack, &mut visited, stamp);
+                    push(q + 1, limit, &mut stack, &mut visited, stamp);
                 }
                 Instr::PushHandler { catch_target, .. } => {
-                    push(catch_target as usize, n, &mut stack, &mut visited);
-                    push(q + 1, n, &mut stack, &mut visited);
+                    push(catch_target as usize, limit, &mut stack, &mut visited, stamp);
+                    push(q + 1, limit, &mut stack, &mut visited, stamp);
                 }
-                _ => push(q + 1, n, &mut stack, &mut visited),
+                _ => push(q + 1, limit, &mut stack, &mut visited, stamp),
             }
         }
         if ok {
@@ -1287,6 +1355,87 @@ mod int32_trunc_tests {
     fn member_ips(proto: &FuncProto) -> Vec<usize> {
         let m = trunc_only_arith_ips(proto);
         (0..proto.code.len()).filter(|&ip| m[ip]).collect()
+    }
+
+    /// The walks' cuts change no membership: every function of the bench
+    /// corpus, plus loops, handlers and finally blocks around truncations,
+    /// gets the same members bounded as run to the end.
+    #[test]
+    fn bounded_walks_match_unbounded() {
+        fn js_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    js_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "js") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut sources = vec![r#"
+            function loops(a, b) {
+                let s = 0;
+                for (let i = 0; i < a; i++) { s = (s + i * b) | 0; let t = s + 1; if (t & 1) continue; s = (t - b) | 0; }
+                outer: for (let j = 0; j < b; j++) { for (let k = 0; k < j; k++) { if (k > 3) continue outer; s = (s + k) | 0; } }
+                while (s > 0) { s = (s - 7) >>> 1; if (s === 3) break; }
+                return (s + a) | 0;
+            }
+            function handlers(a, b) {
+                let s = a + b;
+                try { s = (s + 1) | 0; if (a) throw s; } catch (e) { s = (e + s) | 0; } finally { s = (s - b) | 0; }
+                let u = a - b;
+                try { return u | 0; } finally { s = (s + u) | 0; }
+            }
+            function late(a) { let r = 0; for (let i = 0; i < a; i++) { if (i > 2) r = (r + a) | 0; a = a + 1; } return r + a; }
+            function switches(a, b) { let c = 0; switch (a & 3) { case 0: c = (a + b) | 0; break; case 1: c = a - b; break; default: c = (b + 1) & 255; } return c | 0; }
+        "#
+        .to_string()];
+        // A long generated function of the eval-function bench's shape.
+        let mut gen = String::from("function generated(x, y) { let a = x | 0, b = y | 0, c = 7, d = 0;\n");
+        let mut seed: u32 = 31337;
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let k = 1 + (seed >> 8) % 97;
+            gen.push_str(match (seed >> 4) % 8 {
+                0 => "a = (a + Math.imul(b, 5)) | 0;\n",
+                1 => "b = (b ^ (a >>> 3)) | 0;\n",
+                2 => "if ((a & 3) === 1) { c = (c + 9) | 0; } else { d = (d - c) | 0; }\n",
+                3 => "d = (d + (b & 11) - (c | 1)) | 0;\n",
+                4 => "c = (c * 3 + a) & 65535;\n",
+                5 => "switch (b & 3) { case 0: a = (a + 4) | 0; break; case 1: b = (b - 4) | 0; break; default: d = (d + 1) | 0; }\n",
+                6 => "for (let i = 0; i < 3; i++) { a = (a + i * c) | 0; }\n",
+                _ => "b = ((b << 1) | (a & 1)) | 0;\n",
+            });
+            if k == 1 {
+                gen.push_str("try { a = (a + d) | 0; } finally { d = d + 1; }\n");
+            }
+        }
+        gen.push_str("return (a ^ b ^ c ^ d) | 0; }\n");
+        sources.push(gen);
+        let mut files = Vec::new();
+        js_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench"), &mut files);
+        files.sort();
+        for f in &files {
+            if let Ok(s) = std::fs::read_to_string(f) {
+                sources.push(s);
+            }
+        }
+        let (mut protos, mut compared) = (0usize, 0usize);
+        for src in &sources {
+            let Ok(ast) = crate::front::parse_script(src) else { continue };
+            let Ok(prog) = crate::compile::compile_program(&ast, src) else { continue };
+            compared += 1;
+            for proto in &prog.functions {
+                protos += 1;
+                assert_eq!(
+                    trunc_only_arith_walk(proto, true),
+                    trunc_only_arith_walk(proto, false),
+                    "function {:?}",
+                    proto.name
+                );
+            }
+        }
+        assert!(compared > 20 && protos > 500, "{compared} sources, {protos} functions");
     }
 
     /// Every truncation idiom admits its producer, and a chain admits both.
