@@ -1026,6 +1026,26 @@ impl<'p> Vm<'p> {
                             IcEntry::OwnAcc { shape, slot } if shape == sh => {
                                 return self.ic_acc_get_from(m, slot as usize);
                             }
+                            // A class instance's method (`o.m` before a
+                            // `CallWithThis`): the matching shape proves the
+                            // key is still not an own property, which is all
+                            // the own-key scan below would tell the way, as
+                            // `ic_call_method`'s shape-keyed hit has it.
+                            IcEntry::ClassMethod {
+                                class,
+                                ver,
+                                epoch,
+                                callee,
+                                recv_shape,
+                                ..
+                            } if recv_shape == sh => {
+                                if m.class == Some(class)
+                                    && self.heap.version_of(class) == ver
+                                    && self.class_proto_epoch == epoch
+                                {
+                                    return GetAct::Value(callee);
+                                }
+                            }
                             _ => {}
                         }
                     }
