@@ -1744,6 +1744,39 @@ impl<'p> Vm<'p> {
         self.dispatch_builtin_method_inner(recv, name, args)
     }
 
+    /// The native id of `idx`'s own data property `name` when `idx` is an
+    /// ordinary object (not the global object, a module namespace or a
+    /// deferred one) and that property holds a plain native, which
+    /// `call_value` would run as `call_native` (no second realm, no realm
+    /// eval function, not `document.all`). `None` for anything else.
+    #[inline]
+    fn own_native_method(&self, idx: u32, name: &str) -> Option<u16> {
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if !self.realm_global_objs.is_empty()
+            || !self.realm_fns.is_empty()
+            || !self.deferred_ns_state.is_empty()
+            || idx == self.global_this
+        {
+            return None;
+        }
+        let slot = m.pos(name)?;
+        if m.attr_at(slot).accessor
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+        {
+            return None;
+        }
+        let f = m.val_at(slot);
+        if !f.is_heap() || self.is_htmldda_index(f.heap_index()) {
+            return None;
+        }
+        match self.heap.get(f.heap_index()) {
+            HeapObj::Native(id) => Some(*id),
+            _ => None,
+        }
+    }
+
     fn dispatch_builtin_method_inner(
         &mut self,
         recv: Value,
@@ -1826,6 +1859,16 @@ impl<'p> Vm<'p> {
                 return Ok(None);
             }
             return self.string_method(idx, name, args);
+        }
+        // An ordinary object's own data property holding a native function
+        // (`Reflect.get(o, k)`, `Object.keys(o)`, `JSON.parse(s)`): the call
+        // a Get of `name` and a [[Call]] with `this` = `recv` make, without the
+        // receiver-kind arms below (none serves an ordinary object) and the
+        // caller's generic Get. `Reflect.get` cost 45 ns a call against
+        // QuickJS's 20, and every Proxy trap forwarding through it paid that.
+        // After the string arm, which string method calls reach first.
+        if let Some(id) = self.own_native_method(idx, name) {
+            return self.call_native(id, recv, args).map(Some);
         }
         // ── RegExp `test` / `exec` ──
         // The terminal receiver-kind match below has arms for eleven heap kinds and
