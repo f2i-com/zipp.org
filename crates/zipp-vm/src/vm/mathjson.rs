@@ -1020,6 +1020,29 @@ impl<'p> Vm<'p> {
         self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
 
+    /// [`Self::eval_math`]'s result as the Value it stores: `Math.imul` of two
+    /// Ints is their Int product, without the trip through a double that
+    /// `Value::num` then narrows back; anything else is `eval_math`'s number.
+    /// Out of line, for the lite loop's `MathOp` arm, which stores it as it is
+    /// (the narrowing inline there was a sixth of a `Math.imul`-heavy loop).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn eval_math_value(
+        &mut self,
+        op: crate::bytecode::MathFn,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        if matches!(op, crate::bytecode::MathFn::Imul) && argc >= 2 {
+            let (a, b) = (self.get(base, arg_base), self.get(base, arg_base + 1));
+            if a.is_int() && b.is_int() {
+                return Ok(Value::int(a.as_int().wrapping_mul(b.as_int())));
+            }
+        }
+        Ok(Value::num(self.eval_math(op, base, arg_base, argc)?))
+    }
+
     /// `Math.<op>` reduced to a single f64 result (used by the `MathSpread`
     /// fallback for an unusual non-variadic spread like `Math.abs(...arr)`).
     pub(crate) fn eval_math_one(&self, op: crate::bytecode::MathFn, x: f64) -> f64 {

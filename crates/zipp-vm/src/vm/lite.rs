@@ -1024,13 +1024,13 @@ impl<'p> Vm<'p> {
                         self.math_bare_is_intrinsic(op, this_v as u32)
                     } else {
                         let (c, t) = (self.get(base, callee), self.get(base, this_v));
-                        self.static_builtin_is_intrinsic("Math", native::MATH_METHOD_BASE + op as u16, c, t)
+                        self.math_method_is_intrinsic(native::MATH_METHOD_BASE + op as u16, c, t)
                     };
                     if !intrinsic {
                         hand_over!();
                     }
-                    let r = self.eval_math(op, base, arg_base, argc)?;
-                    self.set(base, dst, Value::num(r));
+                    let r = self.eval_math_value(op, base, arg_base, argc)?;
+                    self.set(base, dst, r);
                     ip += 1;
                 }
                 Instr::SetProp { obj, val, name, .. } if FULL => {

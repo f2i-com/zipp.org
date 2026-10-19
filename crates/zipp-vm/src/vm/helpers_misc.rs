@@ -7837,6 +7837,15 @@ impl<'p> Vm<'p> {
         self.native_on_intrinsic_receiver(intrinsic_receiver, native_id, callee, this_v)
     }
 
+    /// `static_builtin_is_intrinsic("Math", ..)` for a caller that cannot
+    /// inline it (the lite loop): the `Math` slot read directly, where the
+    /// out-of-line generic one matched the namespace's name on every call.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn math_method_is_intrinsic(&self, native_id: u16, callee: Value, this_v: Value) -> bool {
+        self.native_on_intrinsic_receiver(self.builtin_ns_slots[0], native_id, callee, this_v)
+    }
+
     /// The tail of [`Vm::static_builtin_is_intrinsic`] once the namespace's
     /// receiver slot is known (`u32::MAX` for an absent one).
     #[inline]
