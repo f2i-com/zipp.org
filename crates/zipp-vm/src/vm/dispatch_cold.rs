@@ -4013,6 +4013,10 @@ impl<'p> Vm<'p> {
     #[cold]
     #[inline(never)]
     pub(crate) fn jit_compile_on_entry(&mut self, func_id: u32, base: usize) {
+        // Long `eval` / `new Function` code compiles after more calls.
+        if self.jit.runtime_fn_wait(func_id) {
+            return;
+        }
         // W9: a live register-homed region already serves this
         // function's hot loop; a Tier C body would shadow it with
         // mem-homed loop code forever (its back-edge is a bare

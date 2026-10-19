@@ -91,6 +91,54 @@ macro_rules! env_off_switch {
 /// Number of interpreter calls before a function is offered to the JIT.
 pub const JIT_THRESHOLD: u32 = 8;
 
+/// [`OSR_THRESHOLD`] for a loop of code compiled by `eval` or `new Function`.
+/// Such code is often made, run a few times and dropped: a loop building a
+/// fresh `new Function` per item compiled the little loop inside each one, at
+/// eight back-edges, and ran twice as slowly as with the JIT off. A loop that
+/// stays hot still compiles within its first few hundred iterations.
+pub const RUNTIME_OSR_THRESHOLD: u32 = 256;
+
+/// The most loops an `eval` or `new Function` function may have for its
+/// loops to compile as regions. A generated function of hundreds of short
+/// loops reached eight back-edges in each over a few hundred calls, compiled
+/// every one of them (376 regions, each a native entry per one to four
+/// iterations) and ran six times as slowly as interpreted; a function of that
+/// many loops is the whole-function tier's.
+pub const MAX_LOOPS_FOR_REGIONS: u32 = 32;
+
+/// Instructions of an `eval` or `new Function` function per call it makes
+/// before it compiles whole (never fewer calls than [`JIT_THRESHOLD`]). A
+/// whole-function compile costs about a microsecond per instruction, more in
+/// a long body, and a call saves a few nanoseconds per instruction run: a
+/// generated function of 32,000 instructions compiled at its eighth call and
+/// its 300 calls ran three times as slowly as interpreted.
+pub const RUNTIME_FN_INSTRS_PER_CALL: usize = 32;
+
+/// The `region_counts` key holding the calls an `eval` / `new Function`
+/// function still waits before its whole-function compile
+/// ([`Jit::runtime_fn_wait`]): no loop header is at this ip.
+const RUNTIME_WAIT_IP: u32 = u32::MAX;
+
+/// The loops of `code`: its distinct backward-jump targets (a loop's
+/// `continue`s jump back to the same header).
+fn loop_headers(code: &[Instr]) -> u32 {
+    let mut heads: Vec<u32> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(ip, i)| match *i {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } if target as usize <= ip => Some(target),
+            _ => None,
+        })
+        .collect();
+    heads.sort_unstable();
+    heads.dedup();
+    heads.len() as u32
+}
+
 /// Number of times a loop back-edge must fire before the loop region is offered
 /// to the OSR (on-stack-replacement) compiler. Low so hot loops promote fast.
 pub const OSR_THRESHOLD: u32 = 8;
@@ -106,6 +154,13 @@ pub const ENTRY_REFUSAL_LIMIT: u32 = 64;
 const INTERP_NO_FN: u8 = 1;
 /// `Jit::interp_only` flags: the function's loops never compile.
 const INTERP_NO_REGIONS: u8 = 2;
+/// `Jit::interp_only` flags, JavaScript programs only: `eval` or `new
+/// Function` code, whose loops wait [`RUNTIME_OSR_THRESHOLD`] back-edges.
+const RUNTIME_CODE: u8 = 4;
+/// `Jit::interp_only` flags, JavaScript programs only: `eval` or `new
+/// Function` code of more than [`MAX_LOOPS_FOR_REGIONS`] loops, whose loops
+/// stay interpreted.
+const RUNTIME_MANY_LOOPS: u8 = 8;
 
 /// [`OSR_THRESHOLD`] for a Python program's loops. A Python loop's compile
 /// (an extended region, its slow paths included) costs more than a
@@ -3679,7 +3734,9 @@ pub struct Jit {
     /// Python-emitted bodies compile.
     python_only: bool,
     /// Per main-program function of a Python program: `INTERP_*` flags
-    /// (answered as dead by `fn_state` / `region_dead`).
+    /// (answered as dead by `fn_state` / `region_dead`). In a JavaScript
+    /// program, the `RUNTIME_*` flags of `eval` and `new Function` code
+    /// ([`Jit::note_runtime_code`]), read by `record_region` alone.
     interp_only: Vec<u8>,
 }
 
@@ -3752,6 +3809,50 @@ impl Jit {
             let flags = self.python_interp_flags(f);
             self.interp_only.push(flags);
         }
+    }
+
+    /// `eval` or `new Function` code installed as `func_id` in a JavaScript
+    /// program: flag it `RUNTIME_CODE`, and `RUNTIME_MANY_LOOPS` past
+    /// [`MAX_LOOPS_FOR_REGIONS`] loops; a long one waits its extra calls
+    /// ([`RUNTIME_FN_INSTRS_PER_CALL`]).
+    pub fn note_runtime_code(&mut self, func_id: u32, code: &[Instr]) {
+        if self.python_program {
+            return;
+        }
+        let i = func_id as usize;
+        if self.interp_only.len() <= i {
+            self.interp_only.resize(i + 1, 0);
+        }
+        let many = if loop_headers(code) > MAX_LOOPS_FOR_REGIONS { RUNTIME_MANY_LOOPS } else { 0 };
+        self.interp_only[i] = RUNTIME_CODE | many;
+        let calls = (code.len() / RUNTIME_FN_INSTRS_PER_CALL) as u32;
+        if calls > JIT_THRESHOLD {
+            self.region_counts.insert((func_id, RUNTIME_WAIT_IP), calls - JIT_THRESHOLD);
+        }
+    }
+
+    /// A whole-function compile offer for `func_id`: `true` (decline it for
+    /// now) while it is `eval` / `new Function` code still waiting its extra
+    /// calls ([`Jit::note_runtime_code`]). Each offer re-arms the call count
+    /// for at most another [`JIT_THRESHOLD`] calls of the wait.
+    pub fn runtime_fn_wait(&mut self, func_id: u32) -> bool {
+        let key = (func_id, RUNTIME_WAIT_IP);
+        let Some(left) = self.region_counts.get_mut(&key) else {
+            return false;
+        };
+        if self.threshold_override != 0 {
+            self.region_counts.remove(&key);
+            return false;
+        }
+        let step = (*left).min(JIT_THRESHOLD);
+        *left -= step;
+        if *left == 0 {
+            self.region_counts.remove(&key);
+        }
+        if let Some(c) = self.counts.get_mut(&func_id) {
+            *c = JIT_THRESHOLD - step;
+        }
+        true
     }
 
     /// `func_id`'s `INTERP_*` flags in a Python program (see
@@ -4642,9 +4743,22 @@ impl Jit {
         if self.region_blacklist.contains(&key) {
             return false;
         }
+        // `eval` / `new Function` code (`note_runtime_code`; never flagged in
+        // a Python program, whose `interp_only` holds `INTERP_*` flags).
+        let runtime = if self.python_program || self.threshold_override != 0 {
+            0
+        } else {
+            self.interp_only.get(func_id as usize).copied().unwrap_or(0)
+        };
+        if runtime & RUNTIME_MANY_LOOPS != 0 {
+            self.region_blacklist.insert(key);
+            self.set_region_dead(func_id, entry_ip);
+            return false;
+        }
+        let threshold = if runtime & RUNTIME_CODE != 0 { RUNTIME_OSR_THRESHOLD } else { self.loop_threshold() };
         let c = self.region_counts.entry(key).or_insert(0);
         *c += 1;
-        *c == self.loop_threshold()
+        *c == threshold
     }
 
     /// Permanently blacklist the region headed at `entry_ip` (the dispatch-side

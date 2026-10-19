@@ -307,6 +307,12 @@ impl<'p> Vm<'p> {
                     _ => {}
                 }
             }
+            // `eval` / `new Function` code (not a module's): when it and its
+            // loops compile (`Jit::note_runtime_code`).
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if !module {
+                self.jit.note_runtime_code(self.funcs.len() as u32, &r.code);
+            }
             self.install_func(r);
         }
         // EvalDeclarationInstantiation step 5.a: a sloppy eval may not
