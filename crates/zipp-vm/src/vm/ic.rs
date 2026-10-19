@@ -932,7 +932,17 @@ impl<'p> Vm<'p> {
         }
         let hm = self.ic_chain_ok(idx, first, &hops)?;
         let s = slot as usize;
-        (hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
+        // The holder is the last hop, and its version is the one the fill saw:
+        // every key add, removal, compaction or descriptor change on it bumps
+        // that version, so the slot still holds the key as a data property.
+        // Comparing the key's text again was an eighth of an inherited read
+        // (an audit build that panicked on any disagreement passed Test262 in
+        // both modes and the 78-program check).
+        debug_assert!(
+            hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor,
+            "holder slot {s} changed under a matching version"
+        );
+        Some(hm.val_at(s))
     }
 
     /// `ns.name` on the module namespace `recv` (`import * as ns`): its
