@@ -1017,10 +1017,19 @@ impl<'p> Vm<'p> {
         // A TypedArray: a canonical numeric index writes the element (coerced +
         // out-of-bounds is a silent no-op); other keys go to set_prop.
         if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            // A view of an immutable buffer: [[Set]] of any numeric key
+            // returns false, before coercing the value.
+            let immutable = self.ta_view_immutable(idx);
             if let Some(i) = array_index(key) {
+                if immutable {
+                    return self.reject_write(&i.to_string(), strict).map(|_| ());
+                }
                 return self.ta_element_set(idx, i, val);
             }
             let k = self.key_of(key);
+            if immutable && self.is_canonical_numeric_index(&k) {
+                return self.reject_write(&k, strict).map(|_| ());
+            }
             // A valid integer index given as a STRING ("0") still writes the element.
             if let Some(i) = self.ta_valid_index(idx, &k) {
                 return self.ta_element_set(idx, i, val);

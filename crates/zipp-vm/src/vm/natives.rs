@@ -291,6 +291,11 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
+            // A view of an immutable buffer: false, before the receiver test
+            // and any coercion.
+            if self.ta_view_immutable(a0.heap_index()) {
+                return Ok(false);
+            }
             if self.same_value(a0, receiver) {
                 match self.ta_valid_index(a0.heap_index(), &key) {
                     Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
@@ -427,6 +432,9 @@ impl<'p> Vm<'p> {
         if let Some(c) = ta_chain_node {
             // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
             // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+            if self.ta_view_immutable(c) {
+                return Ok(false);
+            }
             if self.same_value(Value::heap(c), receiver) {
                 match self.ta_valid_index(c, &key) {
                     Some(i) => self.ta_element_set(c, i, value)?,
@@ -661,6 +669,11 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
+            // An immutable view's element is a non-writable data property:
+            // OrdinarySetWithOwnDescriptor returns false.
+            if self.ta_view_immutable(ridx) {
+                return Ok(false);
+            }
             return match self.ta_valid_index(ridx, &key) {
                 Some(i) => {
                     self.ta_element_set(ridx, i, value)?;

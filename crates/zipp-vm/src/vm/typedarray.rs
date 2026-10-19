@@ -1011,7 +1011,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let size = native::TA_KINDS[kind as usize].1;
-        if self.ta_tracking.contains(&ta_idx) {
+        if !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx) {
             if byte_offset > buf_len {
                 return None;
             }
@@ -1660,6 +1660,21 @@ impl<'p> Vm<'p> {
             self.to_number_strict(v)?;
         }
         Ok(())
+    }
+
+    /// Whether the TypedArray `ta_idx` views an immutable ArrayBuffer. Its
+    /// numeric-key [[Set]] then returns false before any coercion, and its
+    /// elements are non-writable, non-configurable data properties (the
+    /// Immutable ArrayBuffer proposal's 10.4.5.1, .3 and .5); TypedArraySetElement
+    /// asserts it is not.
+    pub(crate) fn ta_view_immutable(&self, ta_idx: u32) -> bool {
+        if self.immutable_buffers.is_empty() {
+            return false;
+        }
+        match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, .. } => self.immutable_buffers.contains(buffer),
+            _ => false,
+        }
     }
 
     pub(crate) fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {

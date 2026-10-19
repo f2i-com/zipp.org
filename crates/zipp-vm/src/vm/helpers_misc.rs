@@ -2232,47 +2232,34 @@ pub(crate) extern "win64" fn jit_set_index(
 /// returns the element's Value bits (undefined for OOB / detached / shrunk
 /// views, exactly like the interpreter), or `None` for a BigInt kind (whose
 /// result would allocate — the caller deopts).
+///
+/// The interpreter's read (`ta_interp_numeric_get_view`): one look at the
+/// view and its buffer, a fixed-width load, an integer kind an integer Value.
+/// This helper's own copy re-read the view for its length, probed the
+/// length-tracking set unguarded and copied the element through `memcpy`;
+/// with its caller it was 45% of dataview-binary with the JIT on.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn ta_fast_get_bits(vm: &Vm, ta_idx: u32, i: usize) -> Option<u64> {
-    let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
-        HeapObj::TypedArray {
-            buffer,
-            kind,
-            byte_offset,
-            ..
-        } => (*buffer, *kind, *byte_offset),
-        _ => return None,
+    let HeapObj::TypedArray {
+        buffer,
+        kind,
+        byte_offset,
+        length,
+    } = vm.heap.get(ta_idx)
+    else {
+        return None;
     };
-    if kind >= 9 {
+    if native::TA_KINDS[*kind as usize].2 {
         return None; // BigInt64/BigUint64 → interpreter (allocates)
     }
-    if i >= vm.ta_effective_len(ta_idx).unwrap_or(0) {
-        return Some(Value::UNDEFINED.bits());
-    }
-    let size = native::TA_KINDS[kind as usize].1;
-    let data = match vm.heap.get(buffer) {
-        HeapObj::ArrayBuffer { data, detached } if !*detached => data,
-        _ => return Some(Value::UNDEFINED.bits()),
-    };
-    let off = byte_offset + i * size;
-    if off + size > data.len() {
-        return Some(Value::UNDEFINED.bits());
-    }
-    let mut b = [0u8; 8];
-    b[..size].copy_from_slice(&data[off..off + size]);
-    Some(
-        match kind {
-            0 => Value::num(b[0] as i8 as f64),
-            1 | 2 => Value::num(b[0] as f64),
-            3 => Value::num(i16::from_le_bytes([b[0], b[1]]) as f64),
-            4 => Value::num(u16::from_le_bytes([b[0], b[1]]) as f64),
-            5 => Value::num(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            6 => Value::num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            7 => Value::num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-            _ => Value::num(f64::from_le_bytes(b)),
-        }
-        .bits(),
-    )
+    let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+        ta_idx,
+        *buffer,
+        *kind,
+        *byte_offset,
+        *length,
+    );
+    vm.ta_interp_numeric_get_view(view, i).map(Value::bits)
 }
 
 /// Mirror of `ta_element_set` for a NUMBER value on a non-BigInt element kind
@@ -2291,7 +2278,9 @@ fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
         } => (*buffer, *kind, *byte_offset),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    if kind >= 9 || !val.is_number() {
+    // A view of an immutable buffer: the interpreter's [[Set]] returns false
+    // (and throws in strict code).
+    if kind >= 9 || !val.is_number() || vm.ta_view_immutable(ta_idx) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let f = if val.is_int() {
@@ -2630,9 +2619,11 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // A length-tracking GSAB can grow concurrently without any VM call
             // that would refresh this region-entry snapshot. Decline that pin;
             // the per-access helper below reads its live length instead.
-            if !vm.dv_tracking.is_empty()
+            // An immutable buffer: the native lane's setters would write it.
+            if (!vm.dv_tracking.is_empty()
                 && vm.dv_tracking.contains(&idx)
-                && vm.shared_buffers.contains(&buffer)
+                && vm.shared_buffers.contains(&buffer))
+                || (!vm.immutable_buffers.is_empty() && vm.immutable_buffers.contains(&buffer))
             {
                 return None;
             }
@@ -2665,7 +2656,8 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             } => (*buffer, *kind, *byte_offset),
             _ => return None,
         };
-        if k as u32 != kind || k >= 9 {
+        // An immutable buffer: a pinned element store would write it.
+        if k as u32 != kind || k >= 9 || vm.ta_view_immutable(idx) {
             return None;
         }
         let len = vm.ta_effective_len(idx)?;

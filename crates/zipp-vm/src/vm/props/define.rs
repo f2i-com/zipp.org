@@ -608,6 +608,26 @@ impl<'p> Vm<'p> {
         {
             let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
             let valid_i = self.ta_valid_index(idx, key);
+            // An immutable buffer's element: ValidateAndApplyPropertyDescriptor
+            // against its { value, writable: false, enumerable: true,
+            // configurable: false } descriptor, which only an equal value (or
+            // no change at all) satisfies, and nothing is written.
+            if let Some(i) = valid_i.filter(|_| self.ta_view_immutable(idx)) {
+                let current = self.ta_element_get(idx, i);
+                let same = value.map_or(true, |v| self.same_value(v, current));
+                if get.is_some()
+                    || set.is_some()
+                    || cf == Some(true)
+                    || en == Some(false)
+                    || wr == Some(true)
+                    || !same
+                {
+                    return Err(Thrown(format!(
+                        "TypeError: Cannot redefine property: {key}"
+                    )));
+                }
+                return Ok(());
+            }
             if valid_i.is_none()
                 || get.is_some()
                 || set.is_some()
