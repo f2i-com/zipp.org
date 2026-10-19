@@ -220,10 +220,15 @@ impl<'p> Vm<'p> {
         }
         let mut cur = v;
         for _ in 0..10_000 {
-            if self.proxy_parts(cur.heap_index()).is_some() {
-                return None;
-            }
-            cur = self.object_get_prototype_of(cur);
+            cur = match self.instanceof_proto_step(cur) {
+                Some(next) => next,
+                None => {
+                    if self.proxy_parts(cur.heap_index()).is_some() {
+                        return None;
+                    }
+                    self.object_get_prototype_of(cur)
+                }
+            };
             if !cur.is_heap() {
                 return Some(false);
             }
@@ -232,6 +237,31 @@ impl<'p> Vm<'p> {
             }
         }
         None
+    }
+
+    /// `object_get_prototype_of(cur)` for the objects an `instanceof` walk
+    /// meets most, an ordinary object or class instance (`None`: ask it).
+    /// The general one tested for a Proxy, a class value, a dozen built-in
+    /// kinds and a callable before reaching an instance's class: a tenth of
+    /// a loop of `o instanceof C`.
+    #[inline]
+    fn instanceof_proto_step(&mut self, cur: Value) -> Option<Value> {
+        let idx = cur.heap_index();
+        let class = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor => m.class,
+            _ => return None,
+        };
+        if let Some(&p) = self.proto_of.get(&idx) {
+            return Some(p);
+        }
+        if idx == self.obj_proto {
+            return Some(Value::NULL);
+        }
+        match class {
+            Some(cidx) => self.prototype_of(Value::heap(cidx)),
+            None if self.obj_proto != 0 => Some(Value::heap(self.obj_proto)),
+            None => None,
+        }
     }
 
     pub(crate) fn ordinary_has_instance(&mut self, mut c: Value, v: Value) -> Result<bool, Thrown> {

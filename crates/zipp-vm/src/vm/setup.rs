@@ -34,12 +34,16 @@ impl<'p> Vm<'p> {
         // An explicit `fn.prototype = value` wins. A non-object value means there is
         // no usable prototype OBJECT (OrdinaryCreateFromConstructor then falls back to
         // the intrinsic default), so report None.
-        if let Some(&v) = self.fn_proto_override.get(&idx) {
-            return if v.is_heap() && self.is_object_value(v) {
-                Some(v)
-            } else {
-                None
-            };
+        // Empty in nearly every program: skip its SipHash (`instanceof`
+        // asks this at every class level it walks).
+        if !self.fn_proto_override.is_empty() {
+            if let Some(&v) = self.fn_proto_override.get(&idx) {
+                return if v.is_heap() && self.is_object_value(v) {
+                    Some(v)
+                } else {
+                    None
+                };
+            }
         }
         if let Some(&p) = self.prototypes.get(&idx) {
             return Some(Value::heap(p));
