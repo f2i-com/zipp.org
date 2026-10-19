@@ -4592,6 +4592,13 @@ impl<'p> Vm<'p> {
                                 )?;
                                 break;
                             }
+                            // An own native method (`Reflect.get(t, k)`).
+                            if let Some(id) = self.ic_call_native(func_id, ip, recv, key) {
+                                let r = self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, recv, argv))?;
+                                self.set(base, dst, r);
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // `charCodeAt` dominates the parser/tokenizer-shaped
                         // interpreter workload. Its exact flat-string + Int

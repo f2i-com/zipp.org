@@ -246,6 +246,18 @@ pub(crate) enum IcEntry {
         ver: u32,
         slot: u32,
     },
+    /// `obj.name(...)` at a `CallMethod` site where `obj` (heap `obj`,
+    /// version `ver` at fill) is an ordinary object whose own data property
+    /// at `slot` held the native `id` (value bits `bits`): `Reflect.get`,
+    /// `JSON.stringify`, `console.log`. The call runs that native directly
+    /// (`Vm::ic_call_native`). Last, like `NsExport`.
+    OwnNative {
+        obj: u32,
+        ver: u32,
+        slot: u32,
+        id: u16,
+        bits: u64,
+    },
 }
 
 // `SuperData` already established this interpreter-cache entry budget. Keep
@@ -2453,6 +2465,59 @@ impl<'p> Vm<'p> {
                 None
             }
         }
+    }
+
+    /// The native a `CallMethod` site's ordinary-object receiver `recv`
+    /// holds as its own data method `key`, from the site's `OwnNative` way,
+    /// filled here on a miss: what the builtin dispatcher's
+    /// `own_native_method` arm would call, without the receiver-kind probes
+    /// ahead of it and its key lookup (a hash on a namespace object's index).
+    /// The way is guarded by the receiver's identity and version and the
+    /// slot's value; a realm, a deferred namespace or a name the dispatcher
+    /// defers (`toString` and its kin) takes the dispatcher. `Reflect.get`
+    /// paid both on every call, and a Proxy trap forwards through it.
+    #[inline(never)]
+    pub(crate) fn ic_call_native(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<u16> {
+        if !self.realm_global_objs.is_empty() || !self.realm_fns.is_empty() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if let Some(site) = self.ic_site(func_id, ip) {
+            for e in &site.entries[..site.n as usize] {
+                if let IcEntry::OwnNative { obj, ver, slot, id, bits } = *e {
+                    if obj == idx && self.heap.version_of(idx) == ver {
+                        if let HeapObj::Object(m) = self.heap.get(idx) {
+                            let s = slot as usize;
+                            if m.val_get(s).is_some_and(|v| v.bits() == bits) && !m.attr_at(s).accessor {
+                                return Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(key, "toString" | "valueOf" | "toLocaleString" | "toJSON") {
+            return None;
+        }
+        let id = self.own_native_method(idx, key)?;
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        let slot = m.pos(key)?;
+        let bits = m.val_at(slot).bits();
+        let ver = self.heap.version_of(idx);
+        self.ic_install(
+            func_id,
+            ip,
+            IcEntry::OwnNative {
+                obj: idx,
+                ver,
+                slot: slot as u32,
+                id,
+                bits,
+            },
+        );
+        Some(id)
     }
 
     /// Read-only, allocation-free probe for the hot own-data arm of a

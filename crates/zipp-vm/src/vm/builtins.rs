@@ -1750,7 +1750,7 @@ impl<'p> Vm<'p> {
     /// `call_value` would run as `call_native` (no second realm, no realm
     /// eval function, not `document.all`). `None` for anything else.
     #[inline]
-    fn own_native_method(&self, idx: u32, name: &str) -> Option<u16> {
+    pub(crate) fn own_native_method(&self, idx: u32, name: &str) -> Option<u16> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
             return None;
         };
