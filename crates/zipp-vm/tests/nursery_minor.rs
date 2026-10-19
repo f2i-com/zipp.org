@@ -484,6 +484,7 @@ fn budget_adapts_and_pins() {
     let exe = std::env::current_exe().expect("test exe path");
     for (probe, envs) in [
         ("probe_budget_grows_then_shrinks", vec![]),
+        ("probe_budget_holds_when_growth_cannot_pay", vec![]),
         (
             "probe_budget_pinned_by_env",
             vec![("ZIPP_NURSERY_YOUNG_BUDGET", "32768")],
@@ -516,26 +517,53 @@ fn budget_adapts_and_pins() {
     }
 }
 
-/// Spawned by `budget_adapts_and_pins` with a clean env: build a large
-/// retained structure (survival ~100% per epoch → budget doubles), then
-/// churn (survival ~0% → halves back to the 16384 floor).
+/// Spawned by `budget_adapts_and_pins` with a clean env: lists of 24,000
+/// young nodes, each dropped once built and walked, so a larger nursery lets
+/// whole lists die before a minor (young survival about 60% at 16384, 11% at
+/// 32768) and the budget climbs; then churn (survival ~0% → halves back to
+/// the 16384 floor). The lists live only in locals: a value stored into an
+/// old holder is kept by the value-grain remembered set through its epoch.
 #[test]
 #[ignore = "spawned by budget_adapts_and_pins with a clean env"]
 fn probe_budget_grows_then_shrinks() {
     let out = run_ok(
         r#"
         "use strict";
-        var keep = [];
-        for (var i = 0; i < 200000; i++) keep.push({ v: i });   // high survival
+        var total = 0;
+        for (var r = 0; r < 40; r++) {
+          var head = null;
+          for (var k = 0; k < 24000; k++) head = { next: head, v: k };
+          for (var p = head; p !== null; p = p.next) total++;
+        }
         var s = 0;
         for (var j = 0; j < 400000; j++) { var g = { a: j }; s = (s + g.a) | 0; } // churn
-        console.log(keep.length + ":" + (s !== 0));
+        console.log(total + ":" + (s !== 0));
         "#,
     );
-    assert_eq!(out[0], "200000:true");
+    assert_eq!(out[0], "960000:true");
     let (last, peak) = zipp_vm::gc_young_budget_stats();
     assert!(peak >= 65536, "budget never grew: peak {peak}");
     assert_eq!(last, 16384, "budget did not shrink back: last {last}");
+}
+
+/// Spawned by `budget_adapts_and_pins` with a clean env: a retained build
+/// keeps every object (survival ~100% at any budget), so the one trial
+/// doubling does not pay and the budget goes back down instead of climbing.
+#[test]
+#[ignore = "spawned by budget_adapts_and_pins with a clean env"]
+fn probe_budget_holds_when_growth_cannot_pay() {
+    let out = run_ok(
+        r#"
+        "use strict";
+        var keep = [];
+        for (var i = 0; i < 200000; i++) keep.push({ v: i });   // survival ~100%
+        console.log(keep.length);
+        "#,
+    );
+    assert_eq!(out[0], "200000");
+    let (last, peak) = zipp_vm::gc_young_budget_stats();
+    assert!(peak <= 32768, "budget kept doubling without paying: peak {peak}");
+    assert_eq!(last, 16384, "budget did not return after the trial: last {last}");
 }
 
 /// Spawned with ZIPP_NURSERY_YOUNG_BUDGET=32768: pinned at the env value.

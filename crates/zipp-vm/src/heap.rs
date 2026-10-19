@@ -7393,6 +7393,13 @@ pub struct Heap {
     /// `ZIPP_NURSERY_YOUNG_BUDGET` or `ZIPP_NO_NURSERY_ADAPT=1`) — the
     /// survival-adaptive controller then never moves it.
     budget_pinned: bool,
+    /// The young survival (per mille) of the epoch before the controller's
+    /// last doubling, which the next epoch's survival judges; 0 when no
+    /// doubling awaits judgement (see `adapt_young_budget`).
+    grew_from_survival: u32,
+    /// Minors left before the controller may double again, after a doubling
+    /// that did not pay.
+    grow_hold: u32,
     /// W10 value-grain remembered set (B123): the YOUNG values stored into
     /// OLD-clean holders this epoch, recorded by `write_barrier_val` and
     /// marked DIRECTLY as minor roots — replacing the holder-grain full
@@ -7725,6 +7732,27 @@ fn parse_nursery_max_minors(raw: &str) -> Option<u32> {
 /// (async-promise-chain's chain-build phases: −3.3% at 64k in B121's trial).
 const NURSERY_BUDGET_MAX: usize = 1 << 17;
 
+/// Minors the survival-adaptive controller waits, after a doubling that did
+/// not cut survival, before it may double again (see
+/// `Heap::adapt_young_budget`): a phase change gets another try.
+const NURSERY_GROW_HOLD: u32 = 64;
+
+/// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
+/// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
+fn nursery_marginal_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_NURSERY_MARGINAL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
 /// streak at 3 makes stress alternate minor,minor,minor,major so BOTH sweep
 /// paths — and their interleavings over the same slots — are densely
@@ -7929,6 +7957,8 @@ impl Heap {
             nursery_max_minors,
             young_budget,
             budget_pinned,
+            grew_from_survival: 0,
+            grow_hold: 0,
             pretenure: 0,
             pretenure_on,
             nonyoung_cache: Vec::new(),
@@ -9590,14 +9620,54 @@ impl Heap {
     /// `ZIPP_NO_NURSERY_ADAPT=1`), on an empty log (an all-pretenured
     /// epoch), and under GC stress (the caller guards — epochs of ~1 alloc
     /// make the ratio noise).
+    ///
+    /// A doubling must pay: the epoch after one has to cut survival by a
+    /// fifth, else the budget halves back and does not double again for
+    /// [`NURSERY_GROW_HOLD`] minors. Survivors that outlive any affordable
+    /// nursery (a 50,000-entry LRU cache, a tree that keeps every node) are
+    /// only made dearer by a larger one: each minor of a 128k nursery cost a
+    /// cache run five milliseconds against a quarter of one at 16k, while
+    /// survival fell only from 74% to 55%, and the run spent 2.4 times as
+    /// long collecting. Where the larger nursery lets objects die first
+    /// (54% -> 15% survival on `survival.js`) every doubling pays and the
+    /// budget still climbs. `ZIPP_NO_NURSERY_MARGINAL=1` restores the plain
+    /// controller.
     pub fn adapt_young_budget(&mut self, survivors: usize, log_len: usize) {
         if self.budget_pinned || log_len == 0 {
             return;
         }
+        if !nursery_marginal_enabled() {
+            if survivors * 4 > log_len {
+                self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
+            } else if survivors * 20 < log_len {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            }
+            return;
+        }
+        let survival = (survivors * 1000 / log_len) as u32;
         if survivors * 4 > log_len {
-            self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
-        } else if survivors * 20 < log_len {
-            self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            if self.grew_from_survival != 0 && survival * 5 > self.grew_from_survival * 4 {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+                self.grew_from_survival = 0;
+                self.grow_hold = NURSERY_GROW_HOLD;
+                return;
+            }
+            if self.grow_hold > 0 {
+                self.grow_hold -= 1;
+                self.grew_from_survival = 0;
+                return;
+            }
+            if self.young_budget < NURSERY_BUDGET_MAX {
+                self.grew_from_survival = survival.max(1);
+                self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
+            } else {
+                self.grew_from_survival = 0;
+            }
+        } else {
+            self.grew_from_survival = 0;
+            if survivors * 20 < log_len {
+                self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+            }
         }
     }
 
