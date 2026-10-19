@@ -672,7 +672,20 @@ impl<'a> FnCompiler<'a> {
                         self.cx.heritage_classes.push((n.clone(), class_id));
                     }
                     let v = match finit {
-                        Some(e) => self.expr(e)?,
+                        // A static initializer is a method body of its own,
+                        // though compiled inline: `new.target` is allowed and
+                        // undefined there, and `arguments` is not (both through
+                        // `in_field_init`, as for an instance field). At script
+                        // level `new.target` was a SyntaxError, and inside a
+                        // function it read that function's.
+                        Some(e) => {
+                            let saved = (self.cx.new_target_ok, self.cx.in_field_init);
+                            self.cx.new_target_ok = true;
+                            self.cx.in_field_init = true;
+                            let r = self.expr(e);
+                            (self.cx.new_target_ok, self.cx.in_field_init) = saved;
+                            r?
+                        }
                         None => {
                             let t = self.temp();
                             self.emit(Instr::LoadUndefined { dst: t });

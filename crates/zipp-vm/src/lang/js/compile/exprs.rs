@@ -822,6 +822,14 @@ impl<'a> FnCompiler<'a> {
                 if !self.cx.new_target_ok {
                     return Err("SyntaxError: new.target expression is not allowed here".into());
                 }
+                // In a field initializer (and an arrow inside one) it is undefined:
+                // the initializer is called, never constructed. A class with no
+                // explicit constructor compiles its initializers into the one
+                // it synthesizes, whose frame does carry the `new` target.
+                if self.cx.in_field_init {
+                    self.emit(Instr::LoadUndefined { dst });
+                    return Ok(dst);
+                }
                 // The current activation's new.target (undefined unless entered via
                 // new/Reflect.construct/super). Arrows inherit it lexically from their
                 // enclosing function via the frame they run in.
