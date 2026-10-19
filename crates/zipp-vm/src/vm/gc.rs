@@ -1375,7 +1375,7 @@ impl Vm<'_> {
         prune_set!(self.dv_tracking);
         prune_map!(self.regexp_string_iters);
         prune_map!(self.matchall_batches);
-        let brand_entries = self.method_brand.len() + self.instance_brand.len();
+        let method_brand_entries = self.method_brand.len();
         prune_map!(self.method_brand);
         if !self.ctor_owner.is_empty() {
             self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
@@ -1406,14 +1406,15 @@ impl Vm<'_> {
         prune_map!(self.shadow_fn_realm);
         prune_slots!(self.private_fields);
         // The declared-name recompute (the major runs it whenever the table
-        // is non-empty) only shrinks when its source maps did; when no brand
-        // entry died this minor it is the identity and is skipped. Deferring it further is safe regardless:
-        // brand ids are minted from a monotone counter (`next_private_brand`)
-        // and never recycled, so a stale record can never be misread — it is
-        // memory, reclaimed at the next recompute.
-        if !self.brand_private_names.is_empty()
-            && self.method_brand.len() + self.instance_brand.len() != brand_entries
-        {
+        // is non-empty) only shrinks when its source maps did. A minor runs it
+        // only when a method's chain died: instances die every epoch, and a
+        // walk of every live instance's brands per minor was 3-4% of a
+        // class-heavy program, while a brand whose methods live on stays
+        // declared anyway. Deferring it further is safe regardless: brand ids
+        // are minted from a monotone counter (`next_private_brand`) and never
+        // recycled, so a stale record can never be misread — it is memory,
+        // reclaimed at the next recompute.
+        if !self.brand_private_names.is_empty() && self.method_brand.len() != method_brand_entries {
             let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
