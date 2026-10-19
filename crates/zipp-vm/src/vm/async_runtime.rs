@@ -422,6 +422,32 @@ fn pristine_lean_enabled() -> bool {
     }
 }
 
+/// The `done_dst` of a generator step `Vm::gen_enter_inline` runs for a
+/// `g.next(v)` call: the step's result object goes into the call's
+/// destination register (`value_dst`).
+pub(crate) const GEN_STEP_OBJECT: u16 = u16::MAX;
+
+/// `ZIPP_NO_GEN_INLINE=1` runs every generator step in a nested loop again
+/// (`Vm::gen_enter_inline`). Read once; the two sides of a one-binary A/B.
+/// Same idiom as `ZIPP_NO_PROMISE_SLOT_CACHE`.
+#[inline]
+fn gen_inline_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_GEN_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// The most entries a combinator reserves ahead of stepping a dense array
 /// (see `promise_combine_rooted`): 4,096 results and flags are 36 KiB.
 const COMBINATOR_PRESIZE_MAX: usize = 4096;
@@ -536,6 +562,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -787,6 +814,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: fid,
             base: new_base,
             ip: 0, // set below per resume kind
@@ -971,6 +999,279 @@ impl<'p> Vm<'p> {
                 Err(t)
             }
         }
+    }
+
+    /// Whether generator function `fid` may be resumed in its consumer's
+    /// loop (`gen_enter_inline`): a sync generator.
+    #[inline]
+    fn gen_inline_fn_ok(&mut self, fid: u32) -> bool {
+        match self.gen_inline_ok.get(fid as usize) {
+            Some(1) => true,
+            Some(2) => false,
+            _ => self.gen_inline_decide(fid),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn gen_inline_decide(&mut self, fid: u32) -> bool {
+        let i = fid as usize;
+        let p = self.func(i);
+        let ok = p.is_generator
+            && !p.is_async
+            && !p.code.iter().any(|op| matches!(op, Instr::AsyncYieldDelegate { .. } | Instr::Await { .. }));
+        if self.gen_inline_ok.len() <= i {
+            self.gen_inline_ok.resize(i + 1, 0);
+        }
+        self.gen_inline_ok[i] = if ok { 1 } else { 2 };
+        ok
+    }
+
+    /// A `next(sent)` step of the suspended generator `idx` for the top
+    /// frame's `IterNext` (a `for-of` step) or `IterDelegate` (`delegate`, a
+    /// `yield*` step) at `caller_ip`, into `value_dst`/`done_dst`, run as a
+    /// frame of the running loop rather than a nested one
+    /// (`generator_next_step`, `generator_delegate_step`): its window is
+    /// spliced back and its handlers restored as `gen_resume_step` does, and
+    /// the frame is marked (`Frame::gen`; the two registers in
+    /// `ret_dst`/`argc`, `delegate` in `super_done`, which a generator's
+    /// frame has no other use for), so its `yield` (`gen_yield_inline`), its
+    /// return (`pop_frame_with`) or a throw it does not catch
+    /// (`unwind_to_handler`) completes the step, and the consumer continues
+    /// past its instruction. A nested resume entered a dispatch loop per
+    /// step and per level of a generator pipeline or a `yield*` chain.
+    /// `false`: nothing was done, and the nested path runs the step.
+    #[inline(never)]
+    pub(crate) fn gen_enter_inline(
+        &mut self,
+        idx: u32,
+        caller_ip: usize,
+        value_dst: u16,
+        done_dst: u16,
+        sent: Value,
+        delegate: bool,
+    ) -> bool {
+        if !gen_inline_enabled() {
+            return false;
+        }
+        #[cfg(feature = "python")]
+        if self.py_rt.is_some() {
+            return false;
+        }
+        let (fid, closure, resume_ip, reg_count) = match self.heap.get(idx) {
+            HeapObj::Generator {
+                state: GenState::Suspended(ip),
+                func,
+                closure,
+                regs,
+                ..
+            } => (*func, *closure, *ip, regs.len()),
+            _ => return false,
+        };
+        if resume_ip == usize::MAX || self.frames.len() >= MAX_FRAMES || !self.gen_inline_fn_ok(fid) {
+            return false;
+        }
+        // Past a `yield` (`sent` is its value), a `yield*` (which takes the
+        // mode, next, and `sent` to forward), or the first step past
+        // `GenStart`.
+        let (dst, mode_dst) = match self.func(fid as usize).code.get(resume_ip) {
+            Some(Instr::Yield { dst, .. }) => (*dst, u16::MAX),
+            Some(Instr::YieldDelegate { mode_dst, val_dst, .. }) => (*val_dst, *mode_dst),
+            Some(Instr::GenStart) => (u16::MAX, u16::MAX),
+            _ => return false,
+        };
+        // A mapped `arguments` object or a direct eval's scope is re-linked
+        // by the nested path.
+        if (!self.gen_args_obj.is_empty() && self.gen_args_obj.contains_key(&idx))
+            || (!self.closure_eval_scope.is_empty() && self.closure_eval_scope.contains_key(&idx))
+        {
+            return false;
+        }
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            return false;
+        }
+        let handlers = match self.heap.get_mut(idx) {
+            HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } => {
+                *state = GenState::Running;
+                self.regs.extend_from_slice(regs);
+                std::mem::take(handlers)
+            }
+            _ => return false,
+        };
+        self.bump_regs_hw(new_base + reg_count);
+        if dst != u16::MAX {
+            self.regs[new_base + dst as usize] = sent;
+        }
+        if mode_dst != u16::MAX {
+            self.regs[new_base + mode_dst as usize] = Value::int(0);
+        }
+        let top = self.frames.len() - 1;
+        self.frames[top].ip = caller_ip;
+        let callee = self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: delegate,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: done_dst,
+            is_eval: false,
+            construct_this: true,
+            gen: idx,
+            func: fid,
+            base: new_base,
+            ip: resume_ip + 1,
+            ret_dst: value_dst,
+            closure,
+            handlers,
+            new_target: Value::UNDEFINED,
+            callee,
+        });
+        true
+    }
+
+    /// The `yield` at `yield_ip` of a frame `gen_enter_inline` pushed: park
+    /// it, and complete the consumer's step with `v`, not done.
+    #[inline(never)]
+    pub(crate) fn gen_yield_inline(&mut self, v: Value, yield_ip: usize) {
+        let (value_dst, done_dst, delegate) = self.gen_park_inline(yield_ip);
+        self.gen_inline_deliver(value_dst, done_dst, delegate, v, false);
+    }
+
+    /// The `yield*` suspension at `yield_ip` of a frame `gen_enter_inline`
+    /// pushed: park it, and complete the consumer's step with `v`, not done.
+    /// `raw`: `v` is the inner iterator's own result object, which a `yield*`
+    /// consumer forwards as it is, and a `for-of` reads `done` and `value`
+    /// from, as `IterNext` reads such a step.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn gen_yield_delegate_inline(&mut self, v: Value, yield_ip: usize, raw: bool) -> Result<(), Thrown> {
+        let (value_dst, done_dst, delegate) = self.gen_park_inline(yield_ip);
+        if raw && !delegate {
+            let top = self.frames.len() - 1;
+            // A `next()` call answers with the inner result object itself.
+            if done_dst == GEN_STEP_OBJECT {
+                let base = self.frames[top].base;
+                self.regs[base + value_dst as usize] = v;
+                self.frames[top].ip += 1;
+                return Ok(());
+            }
+            let (val, done) = match self.iter_result_unwrap(v) {
+                Some(p) => p,
+                None => {
+                    let done = self.get_prop(v, "done")?;
+                    (self.get_prop(v, "value")?, done)
+                }
+            };
+            let base = self.frames[top].base;
+            self.regs[base + value_dst as usize] = val;
+            self.regs[base + done_dst as usize] = done;
+            self.frames[top].ip += 1;
+            return Ok(());
+        }
+        self.gen_inline_deliver(value_dst, done_dst, delegate, v, false);
+        if delegate {
+            self.pending_yield_raw = raw;
+        }
+        Ok(())
+    }
+
+    /// Pop the top frame, which `gen_enter_inline` pushed, and park its
+    /// generator suspended at `yield_ip` as `gen_resume_step` parks it: its
+    /// window and handlers. Returns the frame's step registers and whether
+    /// its consumer is a `yield*`.
+    fn gen_park_inline(&mut self, yield_ip: usize) -> (u16, u16, bool) {
+        let f = self.frames.pop().unwrap();
+        let idx = f.gen;
+        if f.eval_scope != u32::MAX {
+            self.closure_eval_scope.insert(idx, f.eval_scope);
+        }
+        if let HeapObj::Generator {
+            state,
+            regs,
+            handlers,
+            ..
+        } = self.heap.get_mut(idx)
+        {
+            *state = GenState::Suspended(yield_ip);
+            regs.clear();
+            regs.extend_from_slice(&self.regs[f.base..]);
+            *handlers = f.handlers;
+        }
+        self.regs.truncate(f.base);
+        // Nursery barrier: the parked window may hold young values (as at
+        // `gen_resume_step`'s park).
+        self.heap.write_barrier(idx);
+        (f.ret_dst, f.argc, f.super_done)
+    }
+
+    /// The return of generator `idx`'s frame (window at `base`, step
+    /// registers `value_dst`/`done_dst`, a `yield*` consumer if `delegate`),
+    /// which `gen_enter_inline` pushed and `pop_frame_with` popped: the
+    /// generator completes with `ret`, and so does the consumer's step.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn gen_return_inline(
+        &mut self,
+        base: usize,
+        idx: u32,
+        value_dst: u16,
+        done_dst: u16,
+        delegate: bool,
+        ret: Value,
+    ) {
+        self.regs.truncate(base);
+        self.gen_complete(idx);
+        self.gen_inline_deliver(value_dst, done_dst, delegate, ret, true);
+    }
+
+    /// Generator `idx` has completed (returned, or a throw left its body):
+    /// nothing is parked any more.
+    pub(crate) fn gen_complete(&mut self, idx: u32) {
+        if let HeapObj::Generator {
+            state,
+            regs,
+            handlers,
+            ..
+        } = self.heap.get_mut(idx)
+        {
+            *state = GenState::Completed;
+            regs.clear();
+            handlers.clear();
+        }
+    }
+
+    /// Complete the top frame's `IterNext`, its `next()` call (`done_dst`
+    /// [`GEN_STEP_OBJECT`]: the result object into `value_dst`), or its
+    /// `IterDelegate` if `delegate` (at its `ip`), with a step of the
+    /// generator it resumed in this loop, and move the frame past it. A
+    /// `yield*` step that is not done is yielded on as a value, as
+    /// `generator_delegate_step` makes it.
+    #[inline]
+    fn gen_inline_deliver(&mut self, value_dst: u16, done_dst: u16, delegate: bool, v: Value, done: bool) {
+        let top = self.frames.len() - 1;
+        let base = self.frames[top].base;
+        if done_dst == GEN_STEP_OBJECT {
+            let r = self.iter_result(v, done);
+            self.regs[base + value_dst as usize] = r;
+            self.frames[top].ip += 1;
+            return;
+        }
+        self.regs[base + value_dst as usize] = v;
+        self.regs[base + done_dst as usize] = Value::bool(done);
+        if delegate {
+            let (fid, ip) = (self.frames[top].func, self.frames[top].ip);
+            if let Instr::IterDelegate { ret_dst, .. } = self.func(fid as usize).code[ip] {
+                self.regs[base + ret_dst as usize] = Value::FALSE;
+            }
+            self.pending_yield_raw = false;
+        }
+        self.frames[top].ip += 1;
     }
 
     /// Build an iterator-result object `{ value, done }` (insertion order matches
@@ -2147,6 +2448,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -2485,6 +2787,7 @@ impl<'p> Vm<'p> {
             argc: 0,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: fid,
             base: new_base,
             ip: 0,
@@ -3885,6 +4188,7 @@ impl<'p> Vm<'p> {
                 argc: 0,
                 is_eval: false,
                 construct_this: false,
+                gen: u32::MAX,
                 func: fid,
                 base: new_base,
                 ip: 0,

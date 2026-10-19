@@ -905,6 +905,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: lean.fid,
             base: new_base,
             ip: 0,

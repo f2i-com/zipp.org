@@ -6910,6 +6910,7 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         argc: argc as u16,
         is_eval: false,
         construct_this: false,
+        gen: u32::MAX,
         func: fid,
         base: new_base,
         ip: bail as usize,

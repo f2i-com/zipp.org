@@ -171,6 +171,9 @@ impl<'p> Vm<'p> {
             }
             let f = self.frames.pop().unwrap();
             self.regs.truncate(f.base);
+            if f.gen != u32::MAX {
+                self.gen_complete(f.gen);
+            }
         }
         // Created in the CALLER's context: the refused callee never ran.
         let v = self.alloc_error_from_message(MSG);
@@ -295,6 +298,11 @@ impl<'p> Vm<'p> {
             }
             let f = self.frames.pop().unwrap();
             self.regs.truncate(f.base);
+            // A generator's step run in its consumer's loop
+            // (`gen_enter_inline`): the throw completes the generator.
+            if f.gen != u32::MAX {
+                self.gen_complete(f.gen);
+            }
         }
         false
     }
@@ -4705,6 +4713,18 @@ impl<'p> Vm<'p> {
                                 self.get(base, arg_base)
                             };
                             super::builtins::builtin_stats_count(self, recv, "next");
+                            // Run the step as a frame of this loop; its yield or
+                            // return completes this call with its result object.
+                            if self.gen_enter_inline(
+                                recv.heap_index(),
+                                ip,
+                                dst,
+                                super::async_runtime::GEN_STEP_OBJECT,
+                                sent,
+                                false,
+                            ) {
+                                break;
+                            }
                             if let Some(result) = self.generator_method(recv.heap_index(), "next", &[sent])? {
                                 self.set(base, dst, result);
                                 ip += 1;
@@ -5158,6 +5178,12 @@ impl<'p> Vm<'p> {
                         // run_loop's stop frame) at a yield, so popping returns to
                         // the resumer. `pending_yield` carries the value + this ip.
                         let v = self.get(base, val);
+                        // A step `gen_enter_inline` runs in this loop: park, and
+                        // continue the consumer.
+                        if self.frames[frame_idx].gen != u32::MAX {
+                            self.gen_yield_inline(v, ip);
+                            break;
+                        }
                         // Capture this frame's `try` handlers so a SYNC generator can
                         // park them and `gen.throw(e)`/`gen.return(v)` resume into the
                         // body's try/catch/finally. (drive_async_gen ignores this.)
@@ -5370,6 +5396,11 @@ impl<'p> Vm<'p> {
                                 self.gen_method_pristine(it.heap_index(), "next")
                             }
                         {
+                            // Run the step as a frame of this loop; its yield or
+                            // return completes this instruction.
+                            if self.gen_enter_inline(it.heap_index(), ip, value_dst, done_dst, Value::UNDEFINED, false) {
+                                break;
+                            }
                             let res = match self.generator_next_step(it.heap_index())? {
                                 Some(super::async_runtime::GenStep::Yield(v)) => {
                                     self.set(base, value_dst, v);
@@ -6356,6 +6387,19 @@ impl<'p> Vm<'p> {
         // returns it ([[Construct]] step 10-12 for an ordinary function). The
         // instance's size is what the constructor's next one reserves.
         if finished.construct_this {
+            // Or a generator's step run in its consumer's loop
+            // (`gen_enter_inline`), whose return completes the step.
+            if finished.gen != u32::MAX {
+                self.gen_return_inline(
+                    finished.base,
+                    finished.gen,
+                    finished.ret_dst,
+                    finished.argc,
+                    finished.super_done,
+                    ret,
+                );
+                return false;
+            }
             let instance = self.regs[finished.base];
             if instance.is_heap() {
                 self.learn_ctor_field_hint(finished.func, instance);
@@ -7398,6 +7442,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -7514,6 +7559,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -7592,6 +7638,7 @@ impl<'p> Vm<'p> {
             argc,
             is_eval: false,
             construct_this: false,
+            gen: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,

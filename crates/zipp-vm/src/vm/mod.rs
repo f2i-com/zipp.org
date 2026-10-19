@@ -432,7 +432,16 @@ struct Frame {
     /// hands the caller that instance unless the body returned an object, as
     /// [[Construct]] does, and a tail call may not reuse the frame.
     construct_this: bool,
+    /// The generator (heap index) this frame resumes inside its consumer's
+    /// loop (`Vm::gen_enter_inline`), or u32::MAX. Such a frame also has
+    /// `construct_this` set, so its return takes `pop_frame_with`, and a
+    /// tail call does not reuse it.
+    gen: u32,
 }
+
+// `gen` fits the padding the other fields leave: every call pushes a Frame.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Frame>() == 88, "Frame grew");
 
 /// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
 /// with a simple parameter list). While the creating frame is live, a still-
@@ -2638,6 +2647,9 @@ pub struct Vm<'p> {
     /// to the freshly spliced frame (`relink_mapped_args`), so the live aliasing
     /// survives suspension. Pruned on GC sweep alongside `arguments_objs`.
     gen_args_obj: std::collections::HashMap<u32, u32>,
+    /// Per generator function: whether a `for-of` step may resume it in the
+    /// consumer's loop (`Vm::gen_enter_inline`). 0 undecided, 1 yes, 2 no.
+    gen_inline_ok: Vec<u8>,
     /// Directory the running script was loaded from, used to resolve a dynamic
     /// `import(specifier)` against the filesystem (relative + bare specifiers).
     /// `None` when running from a string (eval/embedding) — then `import()` has no

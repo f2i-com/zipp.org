@@ -2318,6 +2318,15 @@ impl<'p> Vm<'p> {
                 // runs it directly; a plain yield comes back as its value,
                 // which the YieldDelegate then yields as a value too.
                 if mode_code == 0 {
+                    // Run the step as a frame of this loop; its yield or
+                    // return completes this instruction.
+                    if iter_v.is_heap()
+                        && matches!(self.heap.get(iter_v.heap_index()), HeapObj::Generator { .. })
+                        && self.gen_method_pristine(iter_v.heap_index(), "next")
+                        && self.gen_enter_inline(iter_v.heap_index(), ip, value_dst, done_dst, sent_v, true)
+                    {
+                        return Ok(ColdFlow::Frame);
+                    }
                     if let Some(step) = self.generator_delegate_step(iter_v, sent_v)? {
                         let (val, done_b, raw) = match step {
                             crate::vm::async_runtime::GenStep::Yield(y) => (y, false, false),
@@ -3537,6 +3546,13 @@ impl<'p> Vm<'p> {
                 // gen_resume (it detects the resume op is a YieldDelegate), so
                 // here we only suspend.
                 let v = self.get(base, val);
+                // A step `gen_enter_inline` runs in this loop: park, and
+                // continue the consumer.
+                if self.frames[frame_idx].gen != u32::MAX {
+                    let raw = std::mem::replace(&mut self.pending_yield_raw, false);
+                    self.gen_yield_delegate_inline(v, ip, raw)?;
+                    return Ok(ColdFlow::Frame);
+                }
                 let f = self.frames.pop().unwrap();
                 self.pending_yield_eval_scope = f.eval_scope;
                 self.pending_yield_handlers = f.handlers;

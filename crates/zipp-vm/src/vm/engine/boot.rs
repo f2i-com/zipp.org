@@ -526,6 +526,7 @@ impl<'p> Vm<'p> {
             eval_prelude_mode: false,
             arguments_objs: crate::slot_table::SlotTable::default(),
             gen_args_obj: std::collections::HashMap::new(),
+            gen_inline_ok: Vec::new(),
             module_base_dir: None,
             module_root: None,
             module_max_bytes: None,
