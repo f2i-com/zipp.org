@@ -126,10 +126,12 @@ fn an_overwritten_ring_no_longer_floats_into_majors() {
         "small-holder barrier: the ring's overwritten values must die at their minor, saw minors {minors} majors {majors}"
     );
     // Pure value grain floats the ring's stores into old space: far fewer
-    // young reclaims and a heap several times the size.
+    // young reclaims and a bigger heap. (Only somewhat bigger: the young
+    // budget no longer doubles while a doubling buys no fall in survival,
+    // `Heap::adapt_young_budget`, and floated stores are all survival.)
     let (_, _, swept_young_off, peak_off) = child("ring_child", &[("ZIPP_VALGRAIN_SMALL_MAX", "0")]);
     assert!(
-        swept_young > 3 * swept_young_off && peak_off > 2 * peak,
+        swept_young > 3 * swept_young_off && peak_off > peak,
         "pure value grain must show the float this rule removes: on swept_young {swept_young} peak {peak}, off swept_young {swept_young_off} peak {peak_off}"
     );
 }
