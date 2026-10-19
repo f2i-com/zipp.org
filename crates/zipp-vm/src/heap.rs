@@ -5506,6 +5506,11 @@ pub struct ClassData {
     /// foreign newTarget). Lookups on this class's instances must then consult
     /// the instance's `proto_of` entry before the member tables.
     pub reproto_instances: bool,
+    /// The shape `statics` had when it was last proven to hold no
+    /// `@@hasInstance` (with no static accessors at all), or `shape::DICT`.
+    /// Shapes are never reissued, so while `statics` keeps that shape the
+    /// proof stands (`Vm::instanceof_fast`).
+    pub no_has_instance_shape: std::cell::Cell<u32>,
 }
 
 /// The per-EVALUATION decoration state of a decorated class: what the decorator

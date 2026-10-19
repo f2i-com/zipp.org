@@ -721,6 +721,7 @@ impl<'p> Vm<'p> {
                     dec: None,
                     proto_dirty: false,
                     reproto_instances: false,
+                    no_has_instance_shape: std::cell::Cell::new(crate::shape::DICT),
                 }))));
                 self.brand_owner.insert(private_brand, v.heap_index());
                 // Remember it so `super` in a derived class can reach it.
