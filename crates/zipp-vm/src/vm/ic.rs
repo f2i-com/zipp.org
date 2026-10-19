@@ -232,6 +232,17 @@ pub(crate) enum IcEntry {
         hops: IcHops,
         slot: u32,
     },
+    /// `ns.key` on the module namespace object `ns` (heap version `ver` at
+    /// fill): the export's live binding is global slot `slot`
+    /// (`ic_namespace_get`'s answer without its two hash lookups). A
+    /// binding still in its TDZ takes the full path. Last, so the other
+    /// variants keep their discriminants: the dispatch loops inline matches
+    /// on them, and renumbering moved a closure-call row by 18%.
+    NsExport {
+        ns: u32,
+        ver: u32,
+        slot: u32,
+    },
 }
 
 // `SuperData` already established this interpreter-cache entry budget. Keep
@@ -953,16 +964,11 @@ impl<'p> Vm<'p> {
     /// asks this.
     #[cold]
     #[inline(never)]
-    fn ic_namespace_get(&self, recv: Value, key: &str) -> GetAct {
-        if let Some(slots) = self.module_namespaces.get(&recv.heap_index()) {
-            if let Some(&slot) = slots.get(key) {
-                let v = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
-                if !v.is_uninitialized() {
-                    return GetAct::Value(v);
-                }
-            }
-        }
-        GetAct::None
+    fn ic_namespace_get(&self, recv: Value, key: &str) -> Option<(Value, u32)> {
+        let slots = self.module_namespaces.get(&recv.heap_index())?;
+        let slot = *slots.get(key)?;
+        let v = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+        (!v.is_uninitialized()).then_some((v, slot))
     }
 
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
@@ -984,6 +990,26 @@ impl<'p> Vm<'p> {
         // probe (a 4-way site otherwise pays the heap fetch + key scan per
         // entry). The site is fetched once for both probe and disable check.
         if let Some(site) = self.ic_site(func_id, ip) {
+            // `ns.key` on the module namespace this site read before: the
+            // export's live slot, the namespace [[Get]]'s answer (the same
+            // object at the same version, no deferred namespace pending, the
+            // binding out of its TDZ). The namespace map and its export map
+            // were two hash lookups per read, a sixth of a module loop.
+            if site.n > 0 {
+                if let IcEntry::NsExport { ns, ver, slot } = site.entries[0] {
+                    if recv.is_heap()
+                        && recv.heap_index() == ns
+                        && self.heap.version_of(ns) == ver
+                        && self.deferred_ns_state.is_empty()
+                    {
+                        if let Some(&v) = self.globals.get(slot as usize) {
+                            if !v.is_uninitialized() {
+                                return GetAct::Value(v);
+                            }
+                        }
+                    }
+                }
+            }
             if site.n > 0 {
                 if let Some((idx, m)) = self.ic_recv_map(recv) {
                     // ── shape-keyed fast path ──────────────────────────────
@@ -1123,7 +1149,19 @@ impl<'p> Vm<'p> {
             return GetAct::None;
         }
         if !self.module_namespaces.is_empty() && recv.is_heap() && self.module_namespaces.contains_key(&recv.heap_index()) {
-            return self.ic_namespace_get(recv, key);
+            return match self.ic_namespace_get(recv, key) {
+                Some((v, slot)) => {
+                    // Remember the export's slot for this site (the
+                    // `NsExport` hit at the top of this function).
+                    if self.deferred_ns_state.is_empty() {
+                        let ns = recv.heap_index();
+                        let ver = self.heap.version_of(ns);
+                        self.ic_install(func_id, ip, IcEntry::NsExport { ns, ver, slot });
+                    }
+                    GetAct::Value(v)
+                }
+                None => GetAct::None,
+            };
         }
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
