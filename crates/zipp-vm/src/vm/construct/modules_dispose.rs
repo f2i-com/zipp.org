@@ -866,8 +866,7 @@ impl<'p> Vm<'p> {
         // The whole map (and its vals Vec) was replaced: invalidate any JIT
         // inline cache that captured the old vals pointer.
         self.heap.bump_version(idx);
-        self.module_namespaces.insert(idx, slot_map);
-        self.heap.pin_mirror_dict(idx);
+        self.register_module_namespace(idx, slot_map);
     }
 
     pub(crate) fn disposable_op(

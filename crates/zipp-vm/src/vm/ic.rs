@@ -459,6 +459,37 @@ impl<'p> Vm<'p> {
             && (self.realm_global_objs.is_empty() || !self.realm_global_objs.contains_key(&idx))
     }
 
+    /// [`Self::ic_obj_ok`] for a receiver whose map `m` is at hand. A module
+    /// namespace's map is in dictionary mode for good
+    /// (`register_module_namespace`), so a receiver with a shape is not one,
+    /// and only a dictionary-mode receiver is hashed into
+    /// `module_namespaces`. Every cached read of a module program hashed its
+    /// receiver there: 4% of a module loop.
+    #[inline(always)]
+    fn ic_obj_ok_map(&self, idx: u32, m: &ObjMap) -> bool {
+        debug_assert!(
+            !m.shape_guardable() || self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&idx),
+            "module namespace {idx} with a guardable shape"
+        );
+        !(idx == self.global_this && self.global_this != 0)
+            && !(idx == self.arr_proto && self.arr_proto != 0)
+            && (m.shape_guardable() || self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&idx))
+            && (self.realm_global_objs.is_empty() || !self.realm_global_objs.contains_key(&idx))
+    }
+
+    /// Make `idx` the module namespace whose exports read `slots`: its live
+    /// bindings are layered over its map, so the map drops to dictionary
+    /// mode for good (no shape-keyed cache way can serve it, which is what
+    /// lets `ic_obj_ok_map` skip shaped receivers) and its mirrors are
+    /// pinned.
+    pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
+        self.module_namespaces.insert(idx, slots);
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.pin_dict();
+        }
+        self.heap.pin_mirror_dict(idx);
+    }
+
     /// The site cache for `(func_id, ip)`, if this function is IC-eligible.
     /// Loader-recorded modules cache; ordinary eval/new-Function code does not.
     ///
@@ -716,7 +747,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(m) = self.heap.get_for_ic(idx) else {
             return None;
         };
-        if m.is_ctor || !self.deferred_ns_state.is_empty() || !self.ic_obj_ok(idx) {
+        if m.is_ctor || !self.deferred_ns_state.is_empty() || !self.ic_obj_ok_map(idx, m) {
             return None;
         }
         Some((idx, m))

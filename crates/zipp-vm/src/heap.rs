@@ -3278,6 +3278,13 @@ impl ObjMap {
         self.shape_to_dict();
     }
 
+    /// Drop this map to dictionary mode for good: an object whose
+    /// properties are not all in its map (a module namespace's live
+    /// bindings) can then never match a shape-keyed cache way.
+    pub fn pin_dict(&mut self) {
+        self.shape_to_dict();
+    }
+
     /// Can this side table shadow, hide, or constrain an ELEMENT (or `length`)
     /// of the exotic object it belongs to? The precise form of the
     /// `arr_props.contains_key(idx)` test that the dense-array fast paths use —
