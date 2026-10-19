@@ -192,8 +192,11 @@ pub(crate) enum IcEntry {
     /// The class-instance form of `AddData`: no member table of `class`'s
     /// chain declares the key (the class's version and `class_proto_epoch`
     /// guard the tables, as `ClassSetter` guards them), and the ordinary
-    /// chain where the tables end (`hops`, at most two objects: a
-    /// materialized class prototype and `%Object.prototype%`) is clean.
+    /// chain where the tables end (`hops`: the materialized class prototypes
+    /// and `%Object.prototype%`) is clean. Five hops: constructing an
+    /// instance materializes every level's prototype, so a class three
+    /// `extends` deep walks four objects, and two hops (one level) sent
+    /// every constructor's `this.x = ...` of a derived class to `set_prop`.
     AddClass {
         before: u32,
         after: u32,
@@ -201,7 +204,7 @@ pub(crate) enum IcEntry {
         ver: u32,
         epoch: u32,
         nhops: u8,
-        hops: [(u32, u32); 2],
+        hops: [(u32, u32); 5],
     },
     /// Plain `Call` site: callee identity (bits) + slot version → resolved
     /// (fid, closure) for a plain (non-generator, non-async) Func/Closure.
@@ -2003,7 +2006,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let before = m.shape();
-        let mut hops = [(0u32, 0u32); 2];
+        let mut hops = [(0u32, 0u32); 5];
         let nhops = self.class_add_chain(idx, class, key, &mut hops)?;
         let after = crate::shape::add(before, key, crate::shape::attr_bits(true, true, true, false));
         if after == crate::shape::DICT {
