@@ -3503,21 +3503,17 @@ impl<'p> Vm<'p> {
                                         || !self.immutable_buffers.contains(buffer))
                                 {
                                     if let Some(i) = array_index(k) {
-                                        // Preserve the SetIndex GC/oracle
-                                        // chokepoint before the live-buffer
-                                        // leaf. The token copy itself is pure
-                                        // and cannot change store ordering.
+                                        // No store barrier: `v` is a number,
+                                        // which neither generation's barrier
+                                        // nor the oracle records (both want a
+                                        // heap value), and the call was 3% of
+                                        // a typed-array store loop.
                                         let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
                                             ta_idx,
                                             *buffer,
                                             *kind,
                                             *byte_offset,
                                             *length,
-                                        );
-                                        self.store_barrier_v(
-                                            crate::heap::gcoracle::SET_INDEX,
-                                            o,
-                                            v,
                                         );
                                         if self.ta_interp_numeric_set_view(view, i, v) {
                                             ip += 1;

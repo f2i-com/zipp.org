@@ -901,7 +901,7 @@ impl<'p> Vm<'p> {
                                 *byte_offset,
                                 *length,
                             );
-                            let Some(r) = self.ta_interp_numeric_get_view(view, i) else {
+                            let Some(r) = self.ta_interp_numeric_get_view_call(view, i) else {
                                 hand_over!();
                             };
                             r
@@ -1184,7 +1184,8 @@ impl<'p> Vm<'p> {
                                         *byte_offset,
                                         *length,
                                     );
-                                    self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, o, v);
+                                    // No store barrier for a number (see the
+                                    // main loop's arm).
                                     if self.ta_interp_numeric_set_view(view, i, v) {
                                         ip += 1;
                                         continue;

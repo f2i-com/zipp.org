@@ -1443,8 +1443,12 @@ impl<'p> Vm<'p> {
 
     /// Allocation-free numeric-index load using internal slots already copied
     /// by the dispatch receiver match. Backing-buffer identity, detachment and
-    /// resizable-view bounds remain live and fail closed here.
-    #[inline]
+    /// resizable-view bounds remain live and fail closed here. Inlined into
+    /// the main loop's `GetIndex` arm: out of line, the call (its 32-byte view
+    /// passed through memory, the prologue and epilogue) was half its cost,
+    /// an eighth of a typed-array read loop. The lite loop calls it out of
+    /// line ([`Vm::ta_interp_numeric_get_view_call`]).
+    #[inline(always)]
     pub(crate) fn ta_interp_numeric_get_view(
         &self,
         view: TaInterpNumericView,
@@ -1500,6 +1504,19 @@ impl<'p> Vm<'p> {
             )?))),
             _ => return None,
         })
+    }
+
+    /// [`Vm::ta_interp_numeric_get_view`] as a call, for the lite loop: its
+    /// body inlined there cost that loop's calls up to a quarter, through
+    /// what it did to the loop's register allocation.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn ta_interp_numeric_get_view_call(
+        &self,
+        view: TaInterpNumericView,
+        i: usize,
+    ) -> Option<Value> {
+        self.ta_interp_numeric_get_view(view, i)
     }
 
     /// Primitive-number twin of [`Vm::ta_element_set`] using dispatch-validated
