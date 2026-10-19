@@ -1174,12 +1174,15 @@ impl<'p> Vm<'p> {
     /// itself — holds the matching native as a data property. A method call
     /// or a `for-of` step that runs the generator directly is only right
     /// then; a replaced `next` is called (Node calls it; this did not).
+    /// `@@iterator` is the same question one level further up: inherited
+    /// from %Iterator.prototype%, whose intrinsic returns its receiver.
     pub(crate) fn gen_method_pristine(&self, idx: u32, name: &str) -> bool {
-        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW};
+        use crate::vm::native::{GEN_NEXT, GEN_RETURN, GEN_THROW, ITER_SELF};
         let id = match name {
             "next" => GEN_NEXT,
             "return" => GEN_RETURN,
             "throw" => GEN_THROW,
+            "@@iterator" => ITER_SELF,
             _ => return false,
         };
         if !self.arr_props.is_empty()
@@ -1331,7 +1334,18 @@ impl<'p> Vm<'p> {
     /// delegation needs a genuine iterator so it can call `.next`/`.throw`/`.return`
     /// on it (an Array Iterator has `.next` but no `.throw`/`.return`, exactly as the
     /// spec requires).
+    ///
+    /// A generator whose `@@iterator` is still %Iterator.prototype%'s is its
+    /// own iterator: `yield* inner()` read that method through the generic
+    /// property path and called the native, a twentieth of a recursive
+    /// `yield*` walk.
     pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && self.gen_method_pristine(v.heap_index(), "@@iterator")
+        {
+            return Ok(v);
+        }
         let m = self.get_prop(v, "@@iterator")?;
         if !self.is_callable(m) {
             return Err(Thrown(format!(
@@ -1411,11 +1425,13 @@ impl<'p> Vm<'p> {
                         self.display(v)
                     )));
                 }
-                // Iterator objects the engine drives directly.
-                HeapObj::Generator { .. }
-                | HeapObj::AsyncGenerator(_)
-                | HeapObj::Iterator { .. }
-                | HeapObj::IterHelper { .. } => return Ok(v),
+                // Iterator objects the engine drives directly; a generator
+                // only while its `@@iterator` is the intrinsic (a patched
+                // one is called, below).
+                HeapObj::Generator { .. } if self.gen_method_pristine(idx, "@@iterator") => return Ok(v),
+                HeapObj::AsyncGenerator(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => {
+                    return Ok(v)
+                }
                 // Everything else that is an object — a plain object, a Proxy, but
                 // also a Date / RegExp / Error / function / boxed primitive — goes
                 // through the real protocol. Restricting this to Object|Proxy left
@@ -1542,7 +1558,10 @@ impl<'p> Vm<'p> {
             Method(Value),
         }
         let drain = match self.heap.get(v.heap_index()) {
-            HeapObj::Generator { .. } => DestructureIter::Existing,
+            // A generator with a patched `@@iterator` calls it (below).
+            HeapObj::Generator { .. } if self.gen_method_pristine(v.heap_index(), "@@iterator") => {
+                DestructureIter::Existing
+            }
             // An ITERATOR OBJECT is iterable through the protocol and nothing
             // else — `%ArrayIteratorPrototype%[Symbol.iterator]` returns `this`.
             // Without this arm it fell to the positional fast path below, which

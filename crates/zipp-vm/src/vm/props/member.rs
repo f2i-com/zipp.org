@@ -702,10 +702,30 @@ impl<'p> Vm<'p> {
     /// carry own properties defined via `Object.defineProperty`.
     /// Whether a Map or Set's `size` is its live length without a lookup: no
     /// replaced [[Prototype]] (a subclass's or `setPrototypeOf`'s, which may
-    /// define its own `size`) and no own `size` property.
-    fn plain_collection_size(&self, idx: u32) -> bool {
-        !self.proto_of.contains_key(&idx)
-            && self.arr_props.get(&idx).is_none_or(|m| m.pos("size").is_none())
+    /// define its own `size`), no own `size` property, and its prototype's
+    /// `size` still the intrinsic getter. A redefined or deleted one is
+    /// observable, and was ignored.
+    fn plain_collection_size(&self, idx: u32, is_map: bool) -> bool {
+        use crate::vm::native::{MAP_SIZE_GET, SET_SIZE_GET};
+        if self.proto_of.contains_key(&idx)
+            || self.arr_props.get(&idx).is_some_and(|m| m.pos("size").is_some())
+        {
+            return false;
+        }
+        let (holder, id) = if is_map {
+            (self.map_proto, MAP_SIZE_GET)
+        } else {
+            (self.set_proto, SET_SIZE_GET)
+        };
+        let HeapObj::Object(p) = self.heap.get(holder) else {
+            return false;
+        };
+        p.pos("size").is_some_and(|i| {
+            let g = p.val_at(i);
+            p.attr_at(i).accessor
+                && g.is_heap()
+                && matches!(self.heap.get(g.heap_index()), HeapObj::Native(n) if *n == id)
+        })
     }
 
     pub(crate) fn exotic_own_or_proto(
@@ -2182,7 +2202,12 @@ impl<'p> Vm<'p> {
             // property take the general path, where the getter sees the
             // receiver (and throws for one that is not a Map).
             HeapObj::Map { .. } | HeapObj::Set(_)
-                if key == "size" && receiver == obj && self.plain_collection_size(obj.heap_index()) =>
+                if key == "size"
+                    && receiver == obj
+                    && self.plain_collection_size(
+                        obj.heap_index(),
+                        matches!(self.heap.get(obj.heap_index()), HeapObj::Map { .. }),
+                    ) =>
             {
                 Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
