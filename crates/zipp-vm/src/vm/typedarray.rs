@@ -994,11 +994,20 @@ impl<'p> Vm<'p> {
             } else {
                 i32::from_be_bytes(rd!(4))
             }),
-            6 => Value::num(if little {
-                u32::from_le_bytes(rd!(4))
-            } else {
-                u32::from_be_bytes(rd!(4))
-            } as f64),
+            // `Value::num`'s answer without its trip through a double: an
+            // Int under 2^31, the double above. On every `getUint32`.
+            6 => {
+                let u = if little {
+                    u32::from_le_bytes(rd!(4))
+                } else {
+                    u32::from_be_bytes(rd!(4))
+                };
+                if u <= i32::MAX as u32 {
+                    Value::int(u as i32)
+                } else {
+                    Value::num(u as f64)
+                }
+            }
             7 => Value::num(if little {
                 f32::from_le_bytes(rd!(4))
             } else {
