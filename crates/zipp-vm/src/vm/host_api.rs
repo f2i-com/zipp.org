@@ -406,7 +406,13 @@ pub enum HostValue {
 /// instance when the retained definitions have grown past what it accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResourceUsage {
-    /// Payload-aware resident guest heap estimate, in bytes.
+    /// Payload-aware resident guest heap estimate, in bytes: the O(1)
+    /// figure a heap ceiling is checked against between audits, not the
+    /// audit walk itself, so reading it per re-entry costs nothing at any
+    /// heap size. It is the heap's tables and live payload, plus, once
+    /// limits are set, the VM-owned side tables the latest audit counted;
+    /// it falls when a collection frees memory.
+    /// [`crate::embed::ScriptState::heap_bytes`] is the exact, walking read.
     pub heap_bytes: usize,
     /// Bytecode instructions executed since limits were set (0 without a
     /// recorder).
@@ -1469,8 +1475,15 @@ impl<'p> Vm<'p> {
         let console_bytes_lifetime = self.instr_rec.as_ref().map_or(0, |rec| rec.output_used);
         #[cfg(not(feature = "instrument"))]
         let console_bytes_lifetime = 0;
+        // The O(1) estimate, not `heap_bytes()`: that runs the audit walk,
+        // about 10 ms at a 265 MB heap, on a read hosts make after every
+        // entry (f2i-com/zipp.org#74).
+        #[cfg(feature = "instrument")]
+        let heap_bytes = self.heap_bytes_live_estimate();
+        #[cfg(not(feature = "instrument"))]
+        let heap_bytes = self.heap.resident_bytes();
         ResourceUsage {
-            heap_bytes: self.heap_bytes(),
+            heap_bytes,
             steps_used,
             dynamic_code_calls,
             dynamic_code_source_bytes,

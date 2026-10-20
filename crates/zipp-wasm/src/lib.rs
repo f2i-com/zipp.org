@@ -1534,7 +1534,8 @@ impl Engine {
     /// before attempting to reclaim it:
     ///
     /// - `heapBytes`: the payload-aware guest heap estimate the heap ceiling
-    ///   is enforced against;
+    ///   is enforced against between audits (O(1); the live figure, so it
+    ///   falls after a collection);
     /// - `stepsUsed`: bytecode instructions executed under the current budget;
     /// - `instructionBudget`: the allowance the host chose;
     /// - `evalCalls`, `evalRetainedSourceBytes`: this engine's `evalInContext`
