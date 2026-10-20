@@ -887,7 +887,9 @@ impl ScriptState {
     }
 
     /// What this VM currently retains and has spent — see [`ResourceUsage`].
-    /// Cheap (no walk), so a host may read it between every re-entry.
+    /// Cheap (no walk), so a host may read it between every re-entry: its
+    /// `heap_bytes` is the O(1) estimate, and [`Self::heap_bytes`] the exact
+    /// figure, which walks the heap.
     pub fn resource_usage(&self) -> ResourceUsage {
         self.vm()
             .map(|vm| vm.host_resource_usage())
