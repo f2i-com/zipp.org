@@ -459,8 +459,19 @@ struct FnCompiler<'a> {
     /// `string_constants` indices holding the lone-surrogate MARKER form
     /// (see `Function::wtf8_consts`).
     wtf8_consts: Vec<u32>,
-    /// Lexical scope chain: each entry is (name, register).
+    /// Lexical scope chain: each entry is (name, slot).
     scopes: Vec<scopes::ScopeBindings>,
+    /// A function with more declared names than the register file can hold
+    /// keeps the plain ones past `SPILL_KEEP_REGS` in a spill vector
+    /// (`Instr::NewSpill`), held in this register from the body's entry.
+    /// `None` in every other function, whose bytecode is unchanged.
+    spill_reg: Option<Reg>,
+    /// Spill slots handed out (the vector's length, patched into the
+    /// `NewSpill` at `spill_new_at` when the function is finalised).
+    spill_count: u32,
+    spill_new_at: Option<usize>,
+    /// Spill slots of `const` bindings: an assignment to one is a TypeError.
+    const_spills: HashSet<u32>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///
@@ -854,6 +865,9 @@ enum Binding {
     /// Local that has been boxed into a heap cell because a nested function
     /// captures it; the register holds the cell reference.
     LocalCell(Reg),
+    /// A local kept in slot `idx` of the function's spill vector: a function
+    /// with more locals than the register file addresses (`Slot::Spill`).
+    Spill(u32),
     /// A variable captured from an enclosing function: index into this
     /// function's upvalue list.
     Upvalue(u16),
@@ -882,5 +896,6 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
+pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;
 pub(crate) use string_accum::*;

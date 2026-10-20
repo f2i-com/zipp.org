@@ -341,7 +341,13 @@ impl<'a> FnCompiler<'a> {
         {
             return None;
         }
-        let r = self.scopes.iter().rev().find_map(|scope| scope.reg_of(name))?;
+        // A spilled local has no register to compute in.
+        let r = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.slot_of(name))?
+            .reg()?;
         (!self.cell_regs.contains(&r) && !self.const_regs.contains(&r) && !self.is_self_name_reg(r))
             .then_some(r)
     }
@@ -660,6 +666,11 @@ impl<'a> FnCompiler<'a> {
                     }
                     Binding::ClassName(class_id) => {
                         self.emit(Instr::LoadClassValue { dst, class_id });
+                        Ok(dst)
+                    }
+                    Binding::Spill(idx) => {
+                        let vec = self.spill_vec();
+                        self.emit(Instr::LoadSpill { dst, vec, idx });
                         Ok(dst)
                     }
                 }

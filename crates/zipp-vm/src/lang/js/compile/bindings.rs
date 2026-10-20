@@ -53,6 +53,11 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::CellGet { dst, cell: *cell });
                 dst
             }
+            Binding::Spill(idx) => {
+                let vec = self.spill_vec();
+                self.emit(Instr::LoadSpill { dst, vec, idx: *idx });
+                dst
+            }
             Binding::Upvalue(idx) => {
                 // A sloppy contains-direct-eval function: an eval-introduced
                 // function-scoped `var` shadows the captured name for READS —
@@ -171,6 +176,7 @@ impl<'a> FnCompiler<'a> {
         // uses Move/CellSet/StoreGlobal directly, never this path.
         let is_const = match b {
             Binding::Local(r) | Binding::LocalCell(r) => self.const_regs.contains(r),
+            Binding::Spill(idx) => self.const_spills.contains(idx),
             Binding::Global(idx) => self.cx.const_globals.contains(idx),
             Binding::Upvalue(_) => false, // a const captured by a closure: not tracked
             Binding::ClassName(_) => true, // the inner class-name binding is immutable
@@ -207,6 +213,14 @@ impl<'a> FnCompiler<'a> {
                 if *r != src {
                     self.emit(Instr::Move { dst: *r, src });
                 }
+            }
+            Binding::Spill(idx) => {
+                let vec = self.spill_vec();
+                self.emit(Instr::StoreSpill {
+                    vec,
+                    idx: *idx,
+                    src,
+                });
             }
             Binding::LocalCell(cell) => {
                 // A block-entry pre-created lexical cell whose declaration has

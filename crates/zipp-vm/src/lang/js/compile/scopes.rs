@@ -12,30 +12,72 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// One lexical scope's bindings, `(name, register)` in declaration order, a
-/// later entry shadowing an earlier one of the same name. Read as a slice;
-/// added to by `push`. Every declaration and every name resolution looked its
-/// name up by scanning the scope, so a body of n declarations compiled in
-/// O(n^2): 6,400 `var`s took a third of a second (f2i-com/zipp.org#72). Past
-/// `SCOPE_INDEX_MIN` entries a scope keeps a name index beside the list.
+/// Where a scope's binding lives: a frame register, or a slot of the spill
+/// vector a function with more locals than the register file addresses keeps
+/// the rest in (`Instr::NewSpill`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Reg(Reg),
+    Spill(u32),
+}
+
+impl Slot {
+    /// The register, when the binding has one.
+    pub(crate) fn reg(self) -> Option<Reg> {
+        match self {
+            Slot::Reg(r) => Some(r),
+            Slot::Spill(_) => None,
+        }
+    }
+}
+
+/// One lexical scope's bindings, `(name, slot)` in declaration order, a later
+/// entry shadowing an earlier one of the same name. Read as a slice; added to
+/// by `push` (a register) and `push_spill`. Every declaration and every name
+/// resolution looked its name up by scanning the scope, so a body of n
+/// declarations compiled in O(n^2): 6,400 `var`s took a third of a second
+/// (f2i-com/zipp.org#72). Past `SCOPE_INDEX_MIN` entries a scope keeps a name
+/// index beside the list.
 #[derive(Default)]
 pub(crate) struct ScopeBindings {
-    list: Vec<(String, Reg)>,
+    list: Vec<(String, Slot)>,
     /// Name -> positions in `list` of its first and its latest entry.
     index: Option<rustc_hash::FxHashMap<String, (usize, usize)>>,
+    /// Entries backed by a register: what popping the scope gives back.
+    regs: usize,
 }
 
 /// Entries a scope holds before it is indexed: most hold a few, which a scan
 /// finds faster than a hash.
 const SCOPE_INDEX_MIN: usize = 16;
 
+/// Declared names (`helpers::declared_binding_count`) past which a function
+/// spills: below it no function's bytecode changes, and every function that
+/// fit the register file before still compiles as it did.
+pub(crate) const SPILL_TRIGGER: usize = 30_000;
+
+/// The registers a spilling function's plain locals may fill before the rest
+/// spill; the register file above them is left to temporaries.
+pub(crate) const SPILL_KEEP_REGS: Reg = 16_384;
+
 impl ScopeBindings {
-    pub(crate) fn push(&mut self, entry: (String, Reg)) {
+    /// Bind a name to a register.
+    pub(crate) fn push(&mut self, (name, r): (String, Reg)) {
+        self.regs += 1;
+        self.push_slot(name, Slot::Reg(r));
+    }
+
+    /// Bind a name to slot `idx` of the function's spill vector.
+    pub(crate) fn push_spill(&mut self, name: String, idx: u32) {
+        self.push_slot(name, Slot::Spill(idx));
+    }
+
+    fn push_slot(&mut self, name: String, slot: Slot) {
         let at = self.list.len();
         if let Some(index) = self.index.as_mut() {
-            index.entry(entry.0.clone()).or_insert((at, at)).1 = at;
+            index.entry(name.clone()).or_insert((at, at)).1 = at;
         }
-        self.list.push(entry);
+        self.list.push((name, slot));
         if self.index.is_none() && self.list.len() >= SCOPE_INDEX_MIN {
             let mut index = rustc_hash::FxHashMap::default();
             for (at, (n, _)) in self.list.iter().enumerate() {
@@ -45,21 +87,21 @@ impl ScopeBindings {
         }
     }
 
-    /// The register of the latest binding of `name` here (what a scan from
-    /// the end finds).
-    pub(crate) fn reg_of(&self, name: &str) -> Option<Reg> {
+    /// The slot of the latest binding of `name` here (what a scan from the
+    /// end finds).
+    pub(crate) fn slot_of(&self, name: &str) -> Option<Slot> {
         match &self.index {
             Some(index) => index.get(name).map(|&(_, last)| self.list[last].1),
-            None => self.list.iter().rev().find(|(n, _)| n == name).map(|(_, r)| *r),
+            None => self.list.iter().rev().find(|(n, _)| n == name).map(|(_, s)| *s),
         }
     }
 
-    /// The register of the first binding of `name` here (what a scan from
-    /// the start finds).
-    pub(crate) fn first_reg_of(&self, name: &str) -> Option<Reg> {
+    /// The slot of the first binding of `name` here (what a scan from the
+    /// start finds).
+    pub(crate) fn first_slot_of(&self, name: &str) -> Option<Slot> {
         match &self.index {
             Some(index) => index.get(name).map(|&(first, _)| self.list[first].1),
-            None => self.list.iter().find(|(n, _)| n == name).map(|(_, r)| *r),
+            None => self.list.iter().find(|(n, _)| n == name).map(|(_, s)| *s),
         }
     }
 
@@ -69,18 +111,28 @@ impl ScopeBindings {
             None => self.list.iter().any(|(n, _)| n == name),
         }
     }
+
+    /// How many of the entries hold a register.
+    pub(crate) fn reg_count(&self) -> usize {
+        self.regs
+    }
+
+    /// The registers of the entries that have one, in order.
+    pub(crate) fn regs(&self) -> impl DoubleEndedIterator<Item = (&String, Reg)> + '_ {
+        self.list.iter().filter_map(|(n, s)| s.reg().map(|r| (n, r)))
+    }
 }
 
 impl std::ops::Deref for ScopeBindings {
-    type Target = [(String, Reg)];
+    type Target = [(String, Slot)];
     fn deref(&self) -> &Self::Target {
         &self.list
     }
 }
 
 impl<'s> IntoIterator for &'s ScopeBindings {
-    type Item = &'s (String, Reg);
-    type IntoIter = std::slice::Iter<'s, (String, Reg)>;
+    type Item = &'s (String, Slot);
+    type IntoIter = std::slice::Iter<'s, (String, Slot)>;
     fn into_iter(self) -> Self::IntoIter {
         self.list.iter()
     }
@@ -104,6 +156,10 @@ impl<'a> FnCompiler<'a> {
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             scopes: vec![ScopeBindings::default()],
+            spill_reg: None,
+            spill_count: 0,
+            spill_new_at: None,
+            const_spills: HashSet::new(),
             scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
@@ -234,10 +290,11 @@ impl<'a> FnCompiler<'a> {
                 cell_locals.push((name.clone(), *reg));
             }
         }
+        // A spill slot is never a cell: `spills` refuses a captured name.
         for scope in &self.scopes {
-            for (name, reg) in scope {
-                if self.cell_regs.contains(reg) {
-                    cell_locals.push((name.clone(), *reg));
+            for (name, reg) in scope.regs() {
+                if self.cell_regs.contains(&reg) {
+                    cell_locals.push((name.clone(), reg));
                 }
             }
         }
@@ -302,6 +359,13 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn check_regs(&mut self) -> R<()> {
         if self.upvalues.borrow().len() > u16::MAX as usize + 1 {
             return Err("function captures more than 65536 upvalues".into());
+        }
+        // The spill vector's length is known only now.
+        if let Some(at) = self.spill_new_at {
+            let slots = self.spill_count;
+            if let Some(Instr::NewSpill { count, .. }) = self.code.get_mut(at) {
+                *count = slots;
+            }
         }
         let total =
             self.max_reg as usize + self.bool_regs_max as usize + self.recv_regs_max as usize;
@@ -561,13 +625,15 @@ impl<'a> FnCompiler<'a> {
         // Saturating: after a `reg_overflow` the counter no longer tracks the
         // real allocation depth, and a plain `-=` would underflow-panic (the
         // release profile is `panic = "abort"`, so that would be a hard crash).
-        self.set_next_reg(self.next_reg.saturating_sub(scope.len() as Reg));
-        for (_, r) in &scope {
-            self.const_regs.remove(r);
-            self.cell_regs.remove(r);
-            self.lexical_regs.remove(r);
-            self.block_tdz_cells.remove(r);
-            self.catch_param_regs.remove(r);
+        // Only the register-backed entries took registers; a spill slot is
+        // the vector's for the function's life.
+        self.set_next_reg(self.next_reg.saturating_sub(scope.reg_count() as Reg));
+        for (_, r) in scope.regs() {
+            self.const_regs.remove(&r);
+            self.cell_regs.remove(&r);
+            self.lexical_regs.remove(&r);
+            self.block_tdz_cells.remove(&r);
+            self.catch_param_regs.remove(&r);
         }
     }
 
@@ -613,6 +679,72 @@ impl<'a> FnCompiler<'a> {
         r
     }
 
+    /// Make this function keep its plain locals past `SPILL_KEEP_REGS` in a
+    /// spill vector, created here, at the body's entry. Called only for a
+    /// function that declares more than `SPILL_TRIGGER` names: a register
+    /// operand addresses 32,768 registers, and V8, which has no such count,
+    /// reaches a large frame with wide operands. Every other function's
+    /// bytecode is unchanged.
+    pub(crate) fn start_spill(&mut self) {
+        let r = self.alloc_reg();
+        self.scopes[0].push(("<spill>".to_string(), r));
+        self.spill_new_at = Some(self.code.len());
+        self.emit(Instr::NewSpill { dst: r, count: 0 });
+        self.spill_reg = Some(r);
+    }
+
+    /// Whether a new binding of `name` here goes to the spill vector: in a
+    /// spilling function, once the plain locals fill `SPILL_KEEP_REGS`, and
+    /// only for a binding that would be a plain register — never a cell (a
+    /// captured name, any local of a function that may direct-eval or of an
+    /// eval's lexical environment), an internal `<…>` register or `arguments`.
+    pub(crate) fn spills(&self, name: &str) -> bool {
+        self.spill_reg.is_some()
+            && self.next_reg >= SPILL_KEEP_REGS
+            && !name.starts_with('<')
+            && name != "arguments"
+            && !self.box_all_locals
+            && !self.script_eval_lexicals
+            && !self.captured.contains(name)
+    }
+
+    /// Bind `name` to the next spill slot, in the innermost scope.
+    pub(crate) fn declare_spill(&mut self, name: &str) -> u32 {
+        let idx = self.spill_count;
+        self.spill_count += 1;
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .push_spill(name.to_string(), idx);
+        idx
+    }
+
+    /// The register holding the spill vector, in a spilling function.
+    pub(crate) fn spill_vec(&self) -> Reg {
+        self.spill_reg
+            .expect("a spill binding exists only in a spilling function")
+    }
+
+    /// Write `src` into a scope slot: through a cell, by a `Move` into a
+    /// plain register (none when it is `src` itself), or into the spill
+    /// vector.
+    pub(crate) fn store_slot(&mut self, slot: Slot, src: Reg) {
+        match slot {
+            Slot::Reg(r) if self.cell_regs.contains(&r) => {
+                self.emit(Instr::CellSet { cell: r, src })
+            }
+            Slot::Reg(r) => {
+                if r != src {
+                    self.emit(Instr::Move { dst: r, src });
+                }
+            }
+            Slot::Spill(idx) => {
+                let vec = self.spill_vec();
+                self.emit(Instr::StoreSpill { vec, idx, src });
+            }
+        }
+    }
+
     /// Like `declare_local` but never emits `MakeCell`. For bindings whose
     /// value is deposited into the register by the runtime (a `catch` param),
     /// where boxing must happen AFTER the value is present.
@@ -636,12 +768,8 @@ impl<'a> FnCompiler<'a> {
             self.uses_arguments = true; // request the call-time `arguments` array
         }
         for scope in self.scopes.iter().rev() {
-            if let Some(r) = scope.reg_of(name) {
-                return if self.cell_regs.contains(&r) {
-                    Binding::LocalCell(r)
-                } else {
-                    Binding::Local(r)
-                };
+            if let Some(slot) = scope.slot_of(name) {
+                return self.slot_binding(slot);
             }
         }
         // A named function expression's own name: outside the param/var scope, so
@@ -777,12 +905,8 @@ impl<'a> FnCompiler<'a> {
     /// reported as unresolved, which only affects the rare `delete <outer local>`.
     pub(crate) fn resolve_existing(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
-            if let Some(r) = scope.reg_of(name) {
-                return Some(if self.cell_regs.contains(&r) {
-                    Binding::LocalCell(r)
-                } else {
-                    Binding::Local(r)
-                });
+            if let Some(slot) = scope.slot_of(name) {
+                return Some(self.slot_binding(slot));
             }
         }
         if let Some((n, r)) = &self.self_name {
@@ -797,6 +921,16 @@ impl<'a> FnCompiler<'a> {
         self.cx
             .existing_global_slot(name)
             .map(|i| Binding::Global(i as u32))
+    }
+
+    /// The binding a scope entry's slot makes: a plain or a cell-backed
+    /// register, or a spill slot.
+    pub(crate) fn slot_binding(&self, slot: Slot) -> Binding {
+        match slot {
+            Slot::Reg(r) if self.cell_regs.contains(&r) => Binding::LocalCell(r),
+            Slot::Reg(r) => Binding::Local(r),
+            Slot::Spill(idx) => Binding::Spill(idx),
+        }
     }
 
     /// Annex B (B.3.3.3): a block-level function declaration is normally given an
@@ -859,8 +993,9 @@ impl<'a> FnCompiler<'a> {
             return true;
         }
         self.scopes[1..n - 1].iter().any(|s| {
-            s.iter()
-                .any(|(nm, r)| nm == name && !self.catch_param_regs.contains(r))
+            s.iter().any(|(nm, r)| {
+                nm == name && r.reg().is_none_or(|r| !self.catch_param_regs.contains(&r))
+            })
         }) || self.enclosing_block_lexical(name)
     }
 

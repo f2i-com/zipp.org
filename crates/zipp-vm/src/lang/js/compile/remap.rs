@@ -38,6 +38,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         Instr::LoadConst { dst: r0, .. }
         | Instr::LoadInt { dst: r0, .. }
         | Instr::LoadUndefined { dst: r0, .. }
+        | Instr::NewSpill { dst: r0, .. }
         | Instr::LoadNewTarget { dst: r0, .. }
         | Instr::LoadCallee { dst: r0, .. }
         | Instr::LoadClassValue { dst: r0, .. }
@@ -138,6 +139,8 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::MakeArrow { dst: r0, this_reg: r1, .. }
         | Instr::CellGet { dst: r0, cell: r1, .. }
         | Instr::CellSet { cell: r0, src: r1, .. }
+        | Instr::LoadSpill { dst: r0, vec: r1, .. }
+        | Instr::StoreSpill { vec: r0, src: r1, .. }
         | Instr::CellSetChecked { cell: r0, src: r1, .. }
         | Instr::NewArray { dst: r0, arg_base: r1, .. }
         | Instr::ToObject { dst: r0, src: r1, .. }

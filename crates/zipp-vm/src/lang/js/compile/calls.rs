@@ -639,7 +639,10 @@ impl<'a> FnCompiler<'a> {
                         // "plain local/parameter" means a binding in `scopes`.
                         let in_scope =
                             self.scopes.iter().rev().any(|scope| {
-                                scope.iter().rev().any(|(n, r)| n == name && *r == src)
+                                scope
+                                    .iter()
+                                    .rev()
+                                    .any(|(n, r)| n == name && *r == Slot::Reg(src))
                             });
                         let is_param = src != 0 && (src as usize) <= self.param_names.len();
                         if in_scope && (!is_param || self.cx.in_strict) {
@@ -1389,7 +1392,11 @@ impl<'a> FnCompiler<'a> {
                         // it replaced, not two: the local-SROA lane keeps its
                         // scalars in the registers a function never names.
                         let named = dst < 2
-                            || self.scopes.iter().flatten().any(|(_, r)| *r == dst)
+                            || self
+                                .scopes
+                                .iter()
+                                .flatten()
+                                .any(|(_, r)| *r == Slot::Reg(dst))
                             || self.self_name.as_ref().is_some_and(|(_, r)| *r == dst);
                         let callee = if named { self.alloc_reg() } else { dst };
                         let name = self.string_name(prop);
@@ -1835,19 +1842,25 @@ impl<'a> FnCompiler<'a> {
             let mut map: Vec<(String, u8, u16)> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for scope in self.scopes.iter().rev() {
-                for (n, r) in scope.iter().rev() {
-                    if self.cell_regs.contains(r) && seen.insert(n.clone()) {
+                for (n, slot) in scope.iter().rev() {
+                    // A function that may direct-eval never spills (its locals
+                    // are all cells); were one here it would still shadow.
+                    let Some(r) = slot.reg() else {
+                        seen.insert(n.clone());
+                        continue;
+                    };
+                    if self.cell_regs.contains(&r) && seen.insert(n.clone()) {
                         // Kind 3 marks a CATCH PARAMETER: the eval closes over
                         // its cell like any caller binding (kind 0), but an
                         // eval'd `var` of the same name still declares into the
                         // function's varEnv (Annex B.3.5) instead of being
                         // absorbed by the caller binding.
-                        let kind = if self.catch_param_regs.contains(r) {
+                        let kind = if self.catch_param_regs.contains(&r) {
                             3u8
                         } else {
                             0u8
                         };
-                        map.push((n.clone(), kind, *r));
+                        map.push((n.clone(), kind, r));
                     }
                 }
             }
@@ -1926,8 +1939,8 @@ impl<'a> FnCompiler<'a> {
             // at this call site gives the correct block nesting).
             let mut lex: Vec<String> = Vec::new();
             for scope in self.scopes.iter().rev() {
-                for (n, r) in scope.iter().rev() {
-                    if self.lexical_regs.contains(r) && !lex.iter().any(|e| e == n) {
+                for (n, r) in scope.regs().rev() {
+                    if self.lexical_regs.contains(&r) && !lex.iter().any(|e| e == n) {
                         lex.push(n.clone());
                     }
                 }
@@ -2207,8 +2220,9 @@ impl<'a> FnCompiler<'a> {
             return false;
         }
         match self.resolve(name) {
-            // Register-resident: the read is the register itself.
-            Binding::Local(_) => true,
+            // Register-resident: the read is the register itself. A spill
+            // slot's read cannot throw either.
+            Binding::Local(_) | Binding::Spill(_) => true,
             Binding::Global(_) => {
                 // A dynamic (eval) zone resolves through LoadGlobalDyn, whose
                 // EvalScope probe may find a TDZ binding.

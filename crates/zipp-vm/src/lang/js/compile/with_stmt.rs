@@ -60,7 +60,7 @@ impl<'a> FnCompiler<'a> {
                 self.scopes
                     .iter()
                     .flatten()
-                    .find(|(_, r)| *r == w.obj_reg)
+                    .find(|(_, r)| *r == Slot::Reg(w.obj_reg))
                     .map(|(n, _)| n.clone())
             })
             .collect()
@@ -342,6 +342,7 @@ impl<'a> FnCompiler<'a> {
         match self.resolve_existing(n) {
             Some(Binding::Local(_))
             | Some(Binding::LocalCell(_))
+            | Some(Binding::Spill(_))
             | Some(Binding::Upvalue(_))
             | Some(Binding::ClassName(_)) => {
                 self.emit(Instr::LoadBool { dst, val: false });

@@ -73,15 +73,9 @@ impl<'a> FnCompiler<'a> {
             }
             _ => return,
         };
-        let s0reg = self.scopes.first().and_then(|s| s.first_reg_of(name));
+        let s0reg = self.scopes.first().and_then(|s| s.first_slot_of(name));
         if let Some(s0) = s0reg {
-            if s0 != src {
-                if self.cell_regs.contains(&s0) {
-                    self.emit(Instr::CellSet { cell: s0, src });
-                } else {
-                    self.emit(Instr::Move { dst: s0, src });
-                }
-            }
+            self.store_slot(s0, src);
         }
         if self.is_script {
             let caller_b33_upval = if self.cx.eval_fn_context && self.cx.eval_caller_var(name) {
@@ -141,7 +135,7 @@ impl<'a> FnCompiler<'a> {
         let binding = name.as_deref().map(|n| self.resolve(n));
         let is_block_local = matches!(
             binding,
-            Some(Binding::Local(_)) | Some(Binding::LocalCell(_))
+            Some(Binding::Local(_)) | Some(Binding::LocalCell(_)) | Some(Binding::Spill(_))
         );
         // EvalDeclarationInstantiation step 15.d (sloppy fn-context direct eval):
         // a top-level function declaration whose name the CALLER's var scope
@@ -234,7 +228,7 @@ impl<'a> FnCompiler<'a> {
                 None => false,
             };
             let s0reg = match name.as_deref() {
-                Some(n) if b33_applicable => self.scopes.first().and_then(|s| s.first_reg_of(n)),
+                Some(n) if b33_applicable => self.scopes.first().and_then(|s| s.first_slot_of(n)),
                 _ => None,
             };
             // SCRIPT-level B.3.3: the block function ALSO updates its
@@ -263,13 +257,7 @@ impl<'a> FnCompiler<'a> {
                 Some(Binding::Local(reg)) => {
                     self.emit_make_callable(reg, id, has_upvalues);
                     if let Some(s0) = s0reg {
-                        if s0 != reg {
-                            if self.cell_regs.contains(&s0) {
-                                self.emit(Instr::CellSet { cell: s0, src: reg });
-                            } else {
-                                self.emit(Instr::Move { dst: s0, src: reg });
-                            }
-                        }
+                        self.store_slot(s0, reg);
                     }
                     if let Some(slot) = script_b33_slot {
                         if self.box_all_locals || self.cx.dyn_global_zone {
@@ -288,16 +276,19 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::UpvalSet { idx: ui, src: reg });
                     }
                 }
-                Some(Binding::LocalCell(cell)) => {
+                Some(binding @ (Binding::LocalCell(_) | Binding::Spill(_))) => {
                     let tmp = self.temp();
                     self.emit_make_callable(tmp, id, has_upvalues);
-                    self.emit(Instr::CellSet { cell, src: tmp });
-                    if let Some(s0) = s0reg {
-                        if self.cell_regs.contains(&s0) {
-                            self.emit(Instr::CellSet { cell: s0, src: tmp });
-                        } else {
-                            self.emit(Instr::Move { dst: s0, src: tmp });
+                    match binding {
+                        Binding::LocalCell(cell) => self.emit(Instr::CellSet { cell, src: tmp }),
+                        Binding::Spill(idx) => {
+                            let vec = self.spill_vec();
+                            self.emit(Instr::StoreSpill { vec, idx, src: tmp });
                         }
+                        _ => unreachable!("matched a cell or a spill slot"),
+                    }
+                    if let Some(s0) = s0reg {
+                        self.store_slot(s0, tmp);
                     }
                     if let Some(slot) = script_b33_slot {
                         if self.box_all_locals || self.cx.dyn_global_zone {
