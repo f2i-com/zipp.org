@@ -7,6 +7,11 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Source bytes from which `JSON.parse` allocates its tree old (W9 static
+/// pretenure): a document this large is kept; a smaller one is usually a
+/// message parsed, read and dropped.
+const JSON_PRETENURE_MIN_BYTES: usize = 16 * 1024;
+
 /// `ZIPP_NO_JSON_LEAF_FAST=1` restores the old JSON.stringify leaf emission:
 /// the `into_owned` copy per string leaf, the fresh `String` per number
 /// (`fmt_f64`), and the cloned-key + `pos()` re-lookup object walk. Kept so
@@ -2216,9 +2221,18 @@ impl<'p> Vm<'p> {
         // `internalize_json`, is deliberately OUTSIDE it), so no GC-visible
         // young value can be created and missed here. Manual begin/end pair —
         // the error path must unwind the depth too.
-        self.heap.pretenure_begin();
+        //
+        // Only a large document, though: a small one parsed per message is
+        // a temporary, and born old it waited for a major (json-small-many
+        // swept 410K objects at majors).
+        let pretenure = src.len() >= JSON_PRETENURE_MIN_BYTES;
+        if pretenure {
+            self.heap.pretenure_begin();
+        }
         let r = self.json_parse_scoped(src);
-        self.heap.pretenure_end();
+        if pretenure {
+            self.heap.pretenure_end();
+        }
         r
     }
 
@@ -2571,9 +2585,14 @@ impl<'p> Vm<'p> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
         // W9 static pretenure — same scope as `json_parse`; the reviver runs
         // later, outside this call, so its results stay young.
-        self.heap.pretenure_begin();
+        let pretenure = src.len() >= JSON_PRETENURE_MIN_BYTES;
+        if pretenure {
+            self.heap.pretenure_begin();
+        }
         let r = self.json_parse_with_src_scoped(src);
-        self.heap.pretenure_end();
+        if pretenure {
+            self.heap.pretenure_end();
+        }
         r
     }
 
