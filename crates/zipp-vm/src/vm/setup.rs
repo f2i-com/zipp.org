@@ -1197,6 +1197,44 @@ impl<'p> Vm<'p> {
         let finreg_ctor = build(self, &[], Some(finreg_proto));
         self.weakref_ctor = weakref_ctor;
         self.finreg_ctor = finreg_ctor;
+        // `TextEncoder` / `TextDecoder` (vm/text_codec.rs): methods, the
+        // attribute getters, and the constructors.
+        let te_proto = build(
+            self,
+            &[("encode", TE_ENCODE), ("encodeInto", TE_ENCODE_INTO)],
+            None,
+        );
+        let td_proto = build(self, &[("decode", TD_DECODE)], None);
+        let getter_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: true,
+            setter: Value::UNDEFINED,
+        };
+        for (proto, key, id) in [
+            (te_proto, "encoding", TE_ENCODING_GET),
+            (td_proto, "encoding", TD_ENCODING_GET),
+            (td_proto, "fatal", TD_FATAL_GET),
+            (td_proto, "ignoreBOM", TD_IGNORE_BOM_GET),
+        ] {
+            let g = self.setup_native(id);
+            if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                p.define(key, g, getter_attr);
+            }
+        }
+        for (proto, name) in [(te_proto, "TextEncoder"), (td_proto, "TextDecoder")] {
+            let tag = self.alloc_str(name.to_string());
+            if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                p.define("@@toStringTag", tag, tag_attr);
+            }
+        }
+        self.text_encoder_proto = te_proto;
+        self.text_decoder_proto = td_proto;
+        let text_encoder_ctor = build(self, &[], Some(te_proto));
+        let text_decoder_ctor = build(self, &[], Some(td_proto));
+        self.text_encoder_ctor = text_encoder_ctor;
+        self.text_decoder_ctor = text_decoder_ctor;
         // Error hierarchy: `Error` + the 7 native subtypes. Each is a constructor
         // VALUE (is_ctor object with a `.prototype`) whose prototype carries own
         // `name`/`message`/`constructor` (+ `Error.prototype.toString`). Every error
@@ -2420,6 +2458,8 @@ impl<'p> Vm<'p> {
             (self.weakset_proto, weakset_ctor),
             (self.weakref_proto, weakref_ctor),
             (self.finreg_proto, finreg_ctor),
+            (self.text_encoder_proto, text_encoder_ctor),
+            (self.text_decoder_proto, text_decoder_ctor),
         ] {
             if proto != 0 {
                 let cv = Value::heap(ctor);
@@ -2856,6 +2896,8 @@ impl<'p> Vm<'p> {
             ("WeakMap", weakmap_ctor),
             ("WeakSet", weakset_ctor),
             ("WeakRef", weakref_ctor),
+            ("TextEncoder", text_encoder_ctor),
+            ("TextDecoder", text_decoder_ctor),
             ("FinalizationRegistry", finreg_ctor),
             ("Error", self.error_ctors[0]),
             ("TypeError", self.error_ctors[1]),
@@ -2932,7 +2974,9 @@ impl<'p> Vm<'p> {
                     | "Symbol"
                     | "DisposableStack"
                     | "AsyncDisposableStack"
-                    | "ShadowRealm" => 0.0,
+                    | "ShadowRealm"
+                    | "TextEncoder"
+                    | "TextDecoder" => 0.0,
                     "AggregateError" => 2.0,  // (errors, message?)
                     "SuppressedError" => 3.0, // (error, suppressed, message?)
                     "RegExp" => 2.0,          // (pattern, flags)

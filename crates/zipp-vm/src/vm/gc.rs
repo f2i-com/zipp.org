@@ -1760,6 +1760,7 @@ impl Vm<'_> {
             | HeapObj::Date(_)
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::Temporal { .. }
+            | HeapObj::TextCodec(_)
             // A BigInt (either representation) holds no heap references.
             | HeapObj::BigInt(_)
             | HeapObj::BigIntBig(_) => {}

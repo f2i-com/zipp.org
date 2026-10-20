@@ -149,6 +149,14 @@ pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
 pub const WR_DEREF: u16 = 297;
+// `TextEncoder.prototype` / `TextDecoder.prototype` (vm/text_codec.rs).
+pub const TE_ENCODE: u16 = 2000;
+pub const TE_ENCODE_INTO: u16 = 2001;
+pub const TE_ENCODING_GET: u16 = 2002;
+pub const TD_DECODE: u16 = 2003;
+pub const TD_ENCODING_GET: u16 = 2004;
+pub const TD_FATAL_GET: u16 = 2005;
+pub const TD_IGNORE_BOM_GET: u16 = 2006;
 pub const FR_REGISTER: u16 = 298;
 pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
@@ -1699,6 +1707,13 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         WS_HAS => ("has", 1),
         WS_DELETE => ("delete", 1),
         WR_DEREF => ("deref", 0),
+        TE_ENCODE => ("encode", 0),
+        TE_ENCODE_INTO => ("encodeInto", 2),
+        TE_ENCODING_GET => ("get encoding", 0),
+        TD_DECODE => ("decode", 0),
+        TD_ENCODING_GET => ("get encoding", 0),
+        TD_FATAL_GET => ("get fatal", 0),
+        TD_IGNORE_BOM_GET => ("get ignoreBOM", 0),
         FR_REGISTER => ("register", 2),
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),

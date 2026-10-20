@@ -6326,6 +6326,23 @@ pub(crate) struct FinalizationCell {
     pub(crate) token: Value,
 }
 
+/// A `TextEncoder` or `TextDecoder` (`vm/text_codec.rs`). An encoder has no
+/// state; a decoder has its encoding, its flags and, while it streams, the
+/// bytes of a sequence the next chunk may complete.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextCodec {
+    pub decoder: bool,
+    /// 0 UTF-8, 1 UTF-16LE, 2 UTF-16BE.
+    pub encoding: u8,
+    pub fatal: bool,
+    pub ignore_bom: bool,
+    /// The stream's first code point has gone by (a BOM is only skipped
+    /// before it).
+    pub bom_seen: bool,
+    pub pending_len: u8,
+    pub pending: [u8; 4],
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -6496,6 +6513,8 @@ pub enum HeapObj {
     WeakSet(Vec<Value>),
     /// A JS `WeakRef`. `undefined` records a target cleared by GC.
     WeakRef(Value),
+    /// A `TextEncoder` or `TextDecoder`.
+    TextCodec(TextCodec),
     /// A JS `FinalizationRegistry`: the callback and holdings are strong; each
     /// cell's target and optional unregister token are weak. `cleanup_queued`
     /// prevents a collection during a callback from scheduling the same cells
@@ -6687,7 +6706,8 @@ impl HeapObj {
             | HeapObj::Date(_)
             | HeapObj::Boxed { .. }
             | HeapObj::BigInt(_)
-            | HeapObj::WeakRef(_) => 0,
+            | HeapObj::WeakRef(_)
+            | HeapObj::TextCodec(_) => 0,
             HeapObj::Str(s) => s.byte_capacity().saturating_add(s.marks_bytes()),
             HeapObj::Array(items) => vec_capacity_bytes(items),
             HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),

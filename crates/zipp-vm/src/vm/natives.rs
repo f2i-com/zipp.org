@@ -4886,6 +4886,8 @@ impl<'p> Vm<'p> {
             WS_ADD => self.weakset_method(this, "add", args)?,
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,
+            TE_ENCODE | TE_ENCODE_INTO | TE_ENCODING_GET | TD_DECODE | TD_ENCODING_GET
+            | TD_FATAL_GET | TD_IGNORE_BOM_GET => self.text_codec_native(id, this, args)?,
             WR_DEREF => {
                 let target =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {

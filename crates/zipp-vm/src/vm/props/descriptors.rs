@@ -1037,6 +1037,8 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.weakmap_proto,
             HeapObj::WeakSet(_) => self.weakset_proto,
             HeapObj::WeakRef(_) => self.weakref_proto,
+            HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
+            HeapObj::TextCodec(_) => self.text_encoder_proto,
             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
             HeapObj::Iterator { proto, .. } => *proto,
             HeapObj::IterHelper { .. } => self.iterator_helper_proto,

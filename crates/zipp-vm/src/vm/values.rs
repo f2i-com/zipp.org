@@ -560,6 +560,8 @@ impl<'p> Vm<'p> {
                             HeapObj::WeakMap { .. } => self.weakmap_proto,
                             HeapObj::WeakSet(_) => self.weakset_proto,
                             HeapObj::WeakRef(_) => self.weakref_proto,
+                            HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
+                            HeapObj::TextCodec(_) => self.text_encoder_proto,
                             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
                             HeapObj::Generator { .. } => self.gen_proto,
                             HeapObj::AsyncGenerator(_) => self.asyncgen_proto,

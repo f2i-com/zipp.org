@@ -3190,6 +3190,9 @@ impl<'p> Vm<'p> {
                 HeapObj::WeakRef(_) => {
                     out.push_str("[object WeakRef]");
                 }
+                HeapObj::TextCodec(c) => {
+                    out.push_str(if c.decoder { "[object TextDecoder]" } else { "[object TextEncoder]" });
+                }
                 HeapObj::FinalizationRegistry { .. } => {
                     out.push_str("[object FinalizationRegistry]");
                 }
@@ -3601,6 +3604,9 @@ impl<'p> Vm<'p> {
             }
             HeapObj::WeakRef(_) => {
                 out.push_str("WeakRef {}");
+            }
+            HeapObj::TextCodec(c) => {
+                out.push_str(if c.decoder { "TextDecoder {}" } else { "TextEncoder {}" });
             }
             HeapObj::FinalizationRegistry { .. } => {
                 out.push_str("FinalizationRegistry {}");

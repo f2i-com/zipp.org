@@ -2202,6 +2202,10 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.exotic_own_or_proto(obj, receiver, self.weakmap_proto, key),
             HeapObj::WeakSet(_) => self.exotic_own_or_proto(obj, receiver, self.weakset_proto, key),
             HeapObj::WeakRef(_) => self.exotic_own_or_proto(obj, receiver, self.weakref_proto, key),
+            HeapObj::TextCodec(c) => {
+                let proto = if c.decoder { self.text_decoder_proto } else { self.text_encoder_proto };
+                self.exotic_own_or_proto(obj, receiver, proto, key)
+            }
             HeapObj::FinalizationRegistry { .. } => {
                 self.exotic_own_or_proto(obj, receiver, self.finreg_proto, key)
             }
