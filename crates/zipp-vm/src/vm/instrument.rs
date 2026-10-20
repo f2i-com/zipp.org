@@ -445,6 +445,13 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// The most backtracking steps one regular-expression search may take:
+    /// `regress::MatchLimits::SANDBOX`'s unless the host set another
+    /// (`ScriptState::set_regex_step_limit`). Reaching it is a catchable
+    /// `RangeError`; running out of the VM's own budget inside a search is
+    /// not (`Vm::instrument_regex_usage`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) regex_step_limit: u64,
     /// A poll found the heap over `heap_limit` and asked for a major
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
@@ -568,6 +575,8 @@ impl Recorder {
             steps_base: 0,
             abort: None,
             heap_limit: usize::MAX,
+            #[cfg(feature = "safe-sandbox")]
+            regex_step_limit: regress::MatchLimits::SANDBOX.max_steps,
             ceiling_gc_pending: false,
             growth_level: 0,
             growth_major: u64::MAX,
@@ -1048,6 +1057,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
         };
+        limits.max_steps = rec.regex_step_limit;
         if let Some(left) = rec.finite_remaining(hot) {
             limits.max_steps = limits.max_steps.min(left);
         }
@@ -1217,8 +1227,17 @@ impl super::Vm<'_> {
     }
 
     /// Reconcile completed regex work with the VM recorder before any match
-    /// result becomes observable. A regex-local ceiling is a sticky host
-    /// resource failure, not a catchable JS exception that can be ignored.
+    /// result becomes observable. The work is charged to the VM's budget
+    /// first, so what a search spent is spent whichever way it ends.
+    ///
+    /// A search stopped by its own step ceiling (`regex_step_limit`, 16M
+    /// steps by default) while the VM's budget still has room is a
+    /// `RangeError` the script can catch, as it is without a recorder: the
+    /// budget is intact, and a page's script survives one slow regex in a
+    /// library (f2i-com/zipp.org#69). One stopped because the VM's remaining
+    /// budget ran out inside it is that budget's exhaustion, sticky like
+    /// any other. The backtrack-memory ceiling, which guards the embedder's
+    /// heap limit, stays sticky too.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_usage(&mut self, usage: regress::MatchUsage) -> Tick {
         self.charge_steps(usage.steps.min(i64::MAX as u64) as i64);
@@ -1228,12 +1247,21 @@ impl super::Vm<'_> {
             Some(regress::MatchLimitError::BacktrackMemory) => ResourceExhaustion::RegexMemory,
         };
         if cause == ResourceExhaustion::RegexMemory {
-            Err(self.instrument_regex_memory_exhausted())
-        } else {
-            match rec_mut!(self) {
-                Some(rec) => Err(rec.exhaust(cause)),
-                None => Err(cause.message()),
+            return Err(self.instrument_regex_memory_exhausted());
+        }
+        let hot = self.meter_hot();
+        match rec_mut!(self) {
+            Some(rec) => {
+                if let Some(message) = rec.terminal_message() {
+                    return Err(message);
+                }
+                if rec.finite_remaining(hot) == Some(0) {
+                    Err(rec.exhaust(cause))
+                } else {
+                    Err(cause.message())
+                }
             }
+            None => Err(cause.message()),
         }
     }
 

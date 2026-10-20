@@ -827,6 +827,24 @@ impl ScriptState {
         });
     }
 
+    /// Cap the backtracking steps one regular-expression search may take
+    /// (16,777,216 by default, `regress::MatchLimits::SANDBOX`'s). A search
+    /// that reaches it throws a `RangeError` the script can catch; its work
+    /// is charged to the [`Self::set_limits`] budget either way, and a search
+    /// that runs that budget out is stopped as any exhausted budget is. A
+    /// host that runs ordinary page content can raise it: a catastrophic
+    /// pattern Node finishes in tens of milliseconds can need more than the
+    /// default. Requires [`Self::set_limits`] first; without it this is a
+    /// no-op.
+    #[cfg(feature = "safe-sandbox")]
+    pub fn set_regex_step_limit(&mut self, max_steps: u64) {
+        self.with_vm(|vm| {
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.regex_step_limit = max_steps;
+            }
+        });
+    }
+
     /// How many functions this state has compiled at run time (`eval`,
     /// `new Function`, [`Self::eval_in_context`], modules): code it keeps until
     /// it is dropped. A repeated `new Function` source compiles once.
