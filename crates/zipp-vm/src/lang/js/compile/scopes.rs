@@ -136,6 +136,7 @@ impl<'a> FnCompiler<'a> {
             this_override: None,
             pattern_block_local: false,
             pattern_init_globals: std::collections::HashSet::new(),
+            plain_add_spines: rustc_hash::FxHashSet::default(),
             in_generator: false,
             in_async: false,
             pending_label: None,

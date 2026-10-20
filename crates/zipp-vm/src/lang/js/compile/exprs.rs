@@ -2277,7 +2277,18 @@ impl<'a> FnCompiler<'a> {
         // unchanged. `ZIPP_NO_CONCAT_FUSE=1` restores the pairwise emission
         // bit-for-bit. (This sits AFTER the AddInt fast path, which never
         // fires on an Add spine — `is_numeric_expr` rejects `Binary::Add`.)
-        if matches!(op, Op::Add) && concat_fuse_enabled() {
+        //
+        // A spine found to have no string producer marks the `+` nodes below
+        // its root (by their left operands, which `binary` is handed), so each
+        // of them, compiled pairwise in turn, skips the walk: its spine is a
+        // prefix of the one already searched. Walking every level's spine made
+        // a chain of n `+` compile in O(n^2): 20,000 terms took 0.76 s.
+        if matches!(op, Op::Add)
+            && concat_fuse_enabled()
+            && !self
+                .plain_add_spines
+                .contains(&(left as *const ast::Expr as usize))
+        {
             let mut leaves: Vec<&ast::Expr> = Vec::new();
             add_spine(left, &mut leaves);
             leaves.push(right);
@@ -2287,6 +2298,17 @@ impl<'a> FnCompiler<'a> {
                     .any(|l| matches!(l, ast::Expr::Str(_) | ast::Expr::Template(_)))
             {
                 return self.concat_chain(&leaves, dst);
+            }
+            let mut node = left;
+            while let ast::Expr::Binary {
+                op: ast::BinaryOp::Add,
+                left: below,
+                ..
+            } = node
+            {
+                self.plain_add_spines
+                    .insert(&**below as *const ast::Expr as usize);
+                node = below;
             }
         }
         // A completed expression exposes only its returned value register. Any

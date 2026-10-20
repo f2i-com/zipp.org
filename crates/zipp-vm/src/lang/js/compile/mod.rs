@@ -578,6 +578,10 @@ struct FnCompiler<'a> {
     /// initialization (`StoreGlobal`, as `const x = 1` emits), not an
     /// assignment, and leaves the set once made. Empty everywhere else.
     pattern_init_globals: std::collections::HashSet<u32>,
+    /// The `+` nodes (keyed by their left operand's address) that lie on a
+    /// spine `binary` already searched and found to hold no string producer,
+    /// so its concat-chain fusion test is not repeated down the spine.
+    plain_add_spines: rustc_hash::FxHashSet<usize>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
     /// True while compiling an `async` body, so `await` is allowed.
