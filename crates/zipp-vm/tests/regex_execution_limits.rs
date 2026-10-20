@@ -173,6 +173,34 @@ fn search_that_runs_out_the_vm_budget_stays_terminal_under_a_raised_ceiling() {
     assert!(state.steps_used() <= 100_000, "regex work overspent VM gas");
 }
 
+/// f2i-com/zipp.org#70: a script that fills its heap, with a linear regex
+/// in its loop. Whichever check sees the full heap first, the heap's budget
+/// is what ran out; the regex, which needs a few bytes, is not named.
+#[test]
+fn a_full_heap_seen_first_by_a_regex_is_the_heaps_exhaustion() {
+    let mut state = embed::compile_script("").expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(u64::MAX, None);
+    state.set_heap_limit(16 * 1024 * 1024);
+
+    let message = state
+        .eval_in_context(
+            r#"
+            var keep = [];
+            for (let i = 0; i < 3e6; i++) {
+              keep.push({ a: ["x" + i, "y" + i, "z" + i], n: i });
+              if (i % 100 === 0) /^(0|[1-9][0-9]*)$/.test(String(i));
+            }
+            "#,
+        )
+        .expect_err("the heap fills");
+    assert!(
+        message.contains("script exceeded its memory budget"),
+        "unexpected failure: {message}"
+    );
+    assert_eq!(state.resource_limit_error(), Some(message.as_str()));
+}
+
 #[test]
 fn transient_backtrack_stack_obeys_remaining_heap_headroom() {
     let mut state = embed::compile_script(
