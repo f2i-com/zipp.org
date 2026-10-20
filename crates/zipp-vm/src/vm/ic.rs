@@ -2426,10 +2426,59 @@ impl<'p> Vm<'p> {
                         }
                     }
                     let own = m.pos(key);
+                    let mut learned = None;
                     for e in &site.entries[..site.n as usize] {
                         if let Some(hit) = self.ic_validate_method(e, idx, m, own, key) {
-                            return Some(hit);
+                            learned = Some((hit, sh, *e, site.n as usize));
+                            break;
                         }
+                    }
+                    if let Some((hit, sh, e, n)) = learned {
+                        // A receiver of another layout reached a way's method:
+                        // the lookup just proved where this layout keeps the
+                        // key (or that it has none), so give the layout its
+                        // own way while one is free and its next call takes
+                        // the shape loop above. Without it every receiver but
+                        // the first layout's paid the key lookup each call,
+                        // a hashed one for a wide object.
+                        if sh != crate::shape::DICT && n < IC_WAYS {
+                            let way = match e {
+                                IcEntry::OwnData { .. } => own.map(|s| IcEntry::OwnData {
+                                    shape: sh,
+                                    slot: s as u32,
+                                }),
+                                IcEntry::ClassMethod {
+                                    class,
+                                    ver,
+                                    epoch,
+                                    callee,
+                                    fid,
+                                    closure,
+                                    ..
+                                } => Some(IcEntry::ClassMethod {
+                                    class,
+                                    ver,
+                                    epoch,
+                                    callee,
+                                    fid,
+                                    closure,
+                                    recv_shape: sh,
+                                }),
+                                IcEntry::ProtoData {
+                                    first, hops, slot, ..
+                                } => Some(IcEntry::ProtoData {
+                                    recv_shape: sh,
+                                    first,
+                                    hops,
+                                    slot,
+                                }),
+                                _ => None,
+                            };
+                            if let Some(way) = way {
+                                self.ic_install(func_id, ip, way);
+                            }
+                        }
+                        return Some(hit);
                     }
                 }
             }
