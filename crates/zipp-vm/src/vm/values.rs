@@ -26,14 +26,15 @@ pub(crate) enum PlainGet {
     Absent,
 }
 
-/// `Vm::private_memo`'s size, a power of two.
-pub(crate) const PRIVATE_MEMO_SLOTS: usize = 256;
+/// `Vm::private_memo`'s size, a power of two. Keyed by callee, a class's
+/// every method and field initializer holds entries of its own.
+pub(crate) const PRIVATE_MEMO_SLOTS: usize = 1024;
 
 /// One answer of `Vm::resolve_private_in`: at the access site `site` (see
-/// `private_site`), code whose chain's innermost brand is `head` resolves
-/// its private name to `(brand, kind, owner)`, and the name's id in
-/// `private_name_ids` is `id`. A site never has every bit set, so `EMPTY`
-/// matches nothing.
+/// `private_site`), code running as the callee `head` names (its heap index
+/// and slot version, `Vm::private_memo_key`) resolves its private name to
+/// `(brand, kind, owner)`, and the name's id in `private_name_ids` is `id`.
+/// A site never has every bit set, so `EMPTY` matches nothing.
 #[derive(Clone, Copy)]
 pub(crate) struct PrivateMemo {
     head: u64,
@@ -62,12 +63,15 @@ pub(crate) fn private_site(func_id: u32, name: u32) -> u64 {
     (u64::from(func_id) << 32) | u64::from(name)
 }
 
+/// The memo slot of a key: its callee's index (with the version folded in)
+/// and the site's function and name, each by its own odd multiplier, read
+/// from the high bits.
 #[inline]
 fn private_memo_index(head: u64, site: u64) -> usize {
-    let h = (head as u32).wrapping_mul(0x9E37_79B1)
+    let h = ((head as u32) ^ (head >> 32) as u32).wrapping_mul(0x9E37_79B1)
         ^ ((site >> 32) as u32).wrapping_mul(0x85EB_CA77)
         ^ (site as u32).wrapping_mul(0xC2B2_AE3D);
-    (h >> 24) as usize & (PRIVATE_MEMO_SLOTS - 1)
+    (h >> 22) as usize & (PRIVATE_MEMO_SLOTS - 1)
 }
 
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
@@ -999,26 +1003,30 @@ impl<'p> Vm<'p> {
     ///
     /// The search compares `key` with the private names of each class on the
     /// accessing chain, on every `this.#x`, and its answer depends only on
-    /// the chain and the name. The chain's innermost brand names the chain:
-    /// each class evaluation mints a fresh brand from a counter that never
-    /// repeats, and every function of its body carries the same chain. A
-    /// brand's declared names are fixed when its class is made, and kept
-    /// while a live chain holds the brand, as the running one does. What can
-    /// change is `brand_owner`: the declaring class can die while one of its
-    /// methods lives on, which makes the search answer `None`; the collector
-    /// clears the memo whenever it drops an entry there.
+    /// the chain and the name. The chain is the running callee's, fixed when
+    /// the callee is made (`method_brand`), so the memo is keyed by the callee
+    /// itself (`private_memo_key`): its heap index and slot version, which a
+    /// reuse of the slot bumps. That spared the chain's own lookup on every
+    /// hit (a side-table walk and the chain's buffer), a fifteenth of class
+    /// construction with private fields. A brand's declared names are fixed
+    /// when its class is made, and kept while a live chain holds the brand,
+    /// as the running one does. What can change is `brand_owner`: the
+    /// declaring class can die while one of its methods lives on, which makes
+    /// the search answer `None`; the collector clears the memo whenever it
+    /// drops an entry there.
     pub(crate) fn resolve_private_site(
         &mut self,
         ctx: Value,
         site: u64,
         key: &str,
     ) -> Option<(u64, u8, u32, u32)> {
-        let head = *self.private_brands_of(ctx)?.first()?;
+        let head = self.private_memo_key(ctx)?;
         let slot = private_memo_index(head, site);
         let e = self.private_memo[slot];
         if e.head == head && e.site == site {
             return Some((e.brand, e.kind, e.owner, e.id));
         }
+        self.private_brands_of(ctx)?.first()?;
         let (brand, kind, owner) = self.resolve_private_in(ctx, key)?;
         let id = self.private_name_id(key);
         self.private_memo[slot] = PrivateMemo {
@@ -1035,11 +1043,23 @@ impl<'p> Vm<'p> {
     /// What `resolve_private_site` remembers for `site` under `ctx`'s chain,
     /// if anything; never resolves. For a caller that can then skip spelling
     /// the name, which only a miss needs.
-    #[inline]
+    #[inline(never)]
     pub(crate) fn private_memo_hit(&self, ctx: Value, site: u64) -> Option<(u64, u8, u32, u32)> {
-        let head = *self.private_brands_of(ctx)?.first()?;
+        let head = self.private_memo_key(ctx)?;
         let e = self.private_memo[private_memo_index(head, site)];
         (e.head == head && e.site == site).then_some((e.brand, e.kind, e.owner, e.id))
+    }
+
+    /// `private_memo`'s key for code running as the callee `ctx`: its heap
+    /// index and the slot's version, which a reuse of the slot bumps, so a
+    /// live callee, and the brand chain it was made with, owns its entries.
+    #[inline]
+    fn private_memo_key(&self, ctx: Value) -> Option<u64> {
+        if !ctx.is_heap() {
+            return None;
+        }
+        let i = ctx.heap_index();
+        Some((u64::from(i) << 32) | u64::from(self.heap.version_of(i)))
     }
 
     /// Forget every remembered private resolution (see
