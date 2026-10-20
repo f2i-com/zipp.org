@@ -456,7 +456,7 @@ struct FnCompiler<'a> {
     /// (see `Function::wtf8_consts`).
     wtf8_consts: Vec<u32>,
     /// Lexical scope chain: each entry is (name, register).
-    scopes: Vec<Vec<(String, Reg)>>,
+    scopes: Vec<scopes::ScopeBindings>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///

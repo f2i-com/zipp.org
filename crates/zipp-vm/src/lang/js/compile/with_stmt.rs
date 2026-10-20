@@ -27,7 +27,7 @@ impl<'a> FnCompiler<'a> {
         // name is free here → a global/upvalue/unresolved, shadowable by all).
         let mut depth: isize = -1;
         for (i, scope) in self.scopes.iter().enumerate() {
-            if scope.iter().any(|(n, _)| n == name) {
+            if scope.binds(name) {
                 depth = i as isize;
             }
         }
@@ -48,7 +48,7 @@ impl<'a> FnCompiler<'a> {
         }
         let mut depth: isize = -1;
         for (i, scope) in self.scopes.iter().enumerate() {
-            if scope.iter().any(|(n, _)| n == name) {
+            if scope.binds(name) {
                 depth = i as isize;
             }
         }
@@ -85,7 +85,7 @@ impl<'a> FnCompiler<'a> {
         }
         // Enclosing-function withs apply only to names this function does not
         // bind itself (a local/param/self-name is never shadowed from outside).
-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+        let bound_here = self.scopes.iter().any(|s| s.binds(name))
             || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
         if !bound_here {
             if let Some(chain) = self.inherited_with_shadows.get(name).cloned() {

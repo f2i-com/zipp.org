@@ -12,6 +12,80 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// One lexical scope's bindings, `(name, register)` in declaration order, a
+/// later entry shadowing an earlier one of the same name. Read as a slice;
+/// added to by `push`. Every declaration and every name resolution looked its
+/// name up by scanning the scope, so a body of n declarations compiled in
+/// O(n^2): 6,400 `var`s took a third of a second (f2i-com/zipp.org#72). Past
+/// `SCOPE_INDEX_MIN` entries a scope keeps a name index beside the list.
+#[derive(Default)]
+pub(crate) struct ScopeBindings {
+    list: Vec<(String, Reg)>,
+    /// Name -> positions in `list` of its first and its latest entry.
+    index: Option<rustc_hash::FxHashMap<String, (usize, usize)>>,
+}
+
+/// Entries a scope holds before it is indexed: most hold a few, which a scan
+/// finds faster than a hash.
+const SCOPE_INDEX_MIN: usize = 16;
+
+impl ScopeBindings {
+    pub(crate) fn push(&mut self, entry: (String, Reg)) {
+        let at = self.list.len();
+        if let Some(index) = self.index.as_mut() {
+            index.entry(entry.0.clone()).or_insert((at, at)).1 = at;
+        }
+        self.list.push(entry);
+        if self.index.is_none() && self.list.len() >= SCOPE_INDEX_MIN {
+            let mut index = rustc_hash::FxHashMap::default();
+            for (at, (n, _)) in self.list.iter().enumerate() {
+                index.entry(n.clone()).or_insert((at, at)).1 = at;
+            }
+            self.index = Some(index);
+        }
+    }
+
+    /// The register of the latest binding of `name` here (what a scan from
+    /// the end finds).
+    pub(crate) fn reg_of(&self, name: &str) -> Option<Reg> {
+        match &self.index {
+            Some(index) => index.get(name).map(|&(_, last)| self.list[last].1),
+            None => self.list.iter().rev().find(|(n, _)| n == name).map(|(_, r)| *r),
+        }
+    }
+
+    /// The register of the first binding of `name` here (what a scan from
+    /// the start finds).
+    pub(crate) fn first_reg_of(&self, name: &str) -> Option<Reg> {
+        match &self.index {
+            Some(index) => index.get(name).map(|&(first, _)| self.list[first].1),
+            None => self.list.iter().find(|(n, _)| n == name).map(|(_, r)| *r),
+        }
+    }
+
+    pub(crate) fn binds(&self, name: &str) -> bool {
+        match &self.index {
+            Some(index) => index.contains_key(name),
+            None => self.list.iter().any(|(n, _)| n == name),
+        }
+    }
+}
+
+impl std::ops::Deref for ScopeBindings {
+    type Target = [(String, Reg)];
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+impl<'s> IntoIterator for &'s ScopeBindings {
+    type Item = &'s (String, Reg);
+    type IntoIter = std::slice::Iter<'s, (String, Reg)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
+}
+
 impl<'a> FnCompiler<'a> {
     pub(crate) fn new(
         cx: &'a mut Compiler,
@@ -29,7 +103,7 @@ impl<'a> FnCompiler<'a> {
             static_key_plans: Vec::new(),
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
-            scopes: vec![Vec::new()],
+            scopes: vec![ScopeBindings::default()],
             scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
@@ -459,7 +533,7 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn push_scope(&mut self) {
-        self.scopes.push(Vec::new());
+        self.scopes.push(ScopeBindings::default());
         self.scope_lex_names.push(HashSet::new());
     }
 
@@ -561,14 +635,12 @@ impl<'a> FnCompiler<'a> {
             self.uses_arguments = true; // request the call-time `arguments` array
         }
         for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    };
-                }
+            if let Some(r) = scope.reg_of(name) {
+                return if self.cell_regs.contains(&r) {
+                    Binding::LocalCell(r)
+                } else {
+                    Binding::Local(r)
+                };
             }
         }
         // A named function expression's own name: outside the param/var scope, so
@@ -680,7 +752,7 @@ impl<'a> FnCompiler<'a> {
         if self.heritage_class.as_ref().is_some_and(|(n, _)| n == name) {
             return true;
         }
-        !self.scopes.iter().any(|s| s.iter().any(|(n, _)| n == name))
+        !self.scopes.iter().any(|s| s.binds(name))
             && !self.self_name.as_ref().is_some_and(|(n, _)| n == name)
     }
 
@@ -704,14 +776,12 @@ impl<'a> FnCompiler<'a> {
     /// reported as unresolved, which only affects the rare `delete <outer local>`.
     pub(crate) fn resolve_existing(&self, name: &str) -> Option<Binding> {
         for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return Some(if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    });
-                }
+            if let Some(r) = scope.reg_of(name) {
+                return Some(if self.cell_regs.contains(&r) {
+                    Binding::LocalCell(r)
+                } else {
+                    Binding::Local(r)
+                });
             }
         }
         if let Some((n, r)) = &self.self_name {

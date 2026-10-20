@@ -73,10 +73,7 @@ impl<'a> FnCompiler<'a> {
             }
             _ => return,
         };
-        let s0reg = self
-            .scopes
-            .first()
-            .and_then(|s| s.iter().find(|(nm, _)| nm == name).map(|(_, r)| *r));
+        let s0reg = self.scopes.first().and_then(|s| s.first_reg_of(name));
         if let Some(s0) = s0reg {
             if s0 != src {
                 if self.cell_regs.contains(&s0) {
@@ -237,10 +234,7 @@ impl<'a> FnCompiler<'a> {
                 None => false,
             };
             let s0reg = match name.as_deref() {
-                Some(n) if b33_applicable => self
-                    .scopes
-                    .first()
-                    .and_then(|s| s.iter().find(|(nm, _)| nm == n).map(|(_, r)| *r)),
+                Some(n) if b33_applicable => self.scopes.first().and_then(|s| s.first_reg_of(n)),
                 _ => None,
             };
             // SCRIPT-level B.3.3: the block function ALSO updates its
@@ -1958,7 +1952,7 @@ impl<'a> FnCompiler<'a> {
         let mut map = std::collections::HashMap::new();
         for name in free_names {
             let mut chain = self.with_names_for(&name);
-            if !self.scopes.iter().flatten().any(|(n, _)| *n == name)
+            if !self.scopes.iter().any(|s| s.binds(&name))
                 && self.self_name.as_ref().map_or(true, |(n, _)| *n != name)
             {
                 if let Some(inh) = self.inherited_with_shadows.get(&name) {
