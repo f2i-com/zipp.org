@@ -3257,11 +3257,15 @@ struct StaticKeyPlanData {
 #[derive(Clone, Debug)]
 pub struct StaticKeyPlan(std::sync::Arc<StaticKeyPlanData>);
 
-/// Retained-plan ceilings. A single compiler accepts only a modest number of
-/// profitable literal sites; a live VM additionally bounds the aggregate from
+/// Retained-plan ceilings. The byte ceiling is what bounds a hostile source
+/// (each site is charged at least 160 bytes, so 8 MiB admits about 52,000);
+/// the site ceilings sit above what it admits. A bundled application is one
+/// script and so one compiler: at the old 256 sites per compiler, Babel's
+/// standalone bundle built all but its first 256 literal sites key by key,
+/// 5% of its run. A live VM additionally bounds the aggregate from
 /// separately-created eval/module Compilers before their FuncProtos are leaked.
-pub(crate) const STATIC_KEY_PLAN_COMPILER_MAX_SITES: usize = 256;
-pub(crate) const STATIC_KEY_PLAN_VM_MAX_SITES: usize = 4_096;
+pub(crate) const STATIC_KEY_PLAN_COMPILER_MAX_SITES: usize = 65_536;
+pub(crate) const STATIC_KEY_PLAN_VM_MAX_SITES: usize = 65_536;
 pub(crate) const STATIC_KEY_PLAN_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
 /// One process-wide comparator latch shared by compilation and runtime. When

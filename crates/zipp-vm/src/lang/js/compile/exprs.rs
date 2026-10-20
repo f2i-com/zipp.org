@@ -3428,28 +3428,30 @@ mod static_key_plan_tests {
     }
 
     #[test]
-    fn compiler_site_cap_falls_back_at_257_without_rejecting_source() {
-        let source = (0..=crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES)
+    fn compiler_byte_cap_falls_back_past_the_cap_without_rejecting_source() {
+        // The byte ceiling binds before the site ceiling (see the constants):
+        // one more site than it admits must keep the legacy bytecode.
+        let charge = crate::bytecode::static_key_plan_retained_charge(&["k".to_string()]).unwrap();
+        let admitted = crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES / charge;
+        assert!(admitted < crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES);
+        let source = (0..=admitted)
             .map(|i| format!("var x{i}={{k:{i}}};"))
             .collect::<String>();
         let program = compile(&source);
         let main = &program.functions[0];
-        assert_eq!(
-            main.static_key_plans.len(),
-            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
-        );
+        assert_eq!(main.static_key_plans.len(), admitted);
         assert_eq!(
             main.code
                 .iter()
                 .filter(|instr| matches!(instr, Instr::NewPlannedObject { .. }))
                 .count(),
-            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+            admitted
         );
         assert!(
             main.code
                 .iter()
                 .any(|instr| matches!(instr, Instr::NewObject { hint: 1, .. })),
-            "site 257 must retain exact legacy capacity bytecode"
+            "the site past the cap must retain exact legacy capacity bytecode"
         );
     }
 
