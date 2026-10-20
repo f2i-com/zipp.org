@@ -277,6 +277,17 @@ of inheriting the process-wide switch, and `compile_script_with_preamble`
 compiles engine plumbing ahead of a guest while keeping the guest's own
 `"use strict"` directive in force.
 
+Under `safe-sandbox` the limits are per VM. `set_limits` attaches the
+instruction meter, which `set_heap_limit`, `set_output_limit`,
+`set_dynamic_code_limits` and `set_regex_step_limit` (the steps one regex
+search may take before it throws a catchable `RangeError`) configure.
+`set_sandbox_caps` moves the profile's fixed caps on what ordinary content can
+make the engine do — regex pattern bytes (16 KiB), arrays nested in one `join`
+(4), JSON nesting (64) and BigInt bits (2^20) — with or without a meter; each
+is clamped to `SandboxCaps::MAX`, and the two depths need native stack on the
+VM's thread in proportion. Reaching any of them throws a catchable
+`RangeError`.
+
 `crates/zipp-wasm` exposes this API through wasm-bindgen and installs host
 bridges. wasm32 has no usable `std::time::Instant` implementation, so
 `vm/clock.rs` accepts host clock hooks; native targets re-export standard time.

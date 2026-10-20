@@ -33,11 +33,11 @@ use num_bigint::{BigInt as NumBig, Sign};
 use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 use std::cmp::Ordering;
 
-/// Maximum BigInt magnitude in bits. The ordinary engine matches V8's 2^30
-/// limit; the hardened profile caps one value at roughly 128 KiB so a single
-/// shift/power cannot overshoot a worker's memory ceiling by 128 MiB.
-#[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_BIGINT_BITS: u64 = 1 << 20;
+/// Maximum BigInt magnitude in bits in the ordinary engine: V8's 2^30 limit.
+/// The hardened profile caps one value at roughly 128 KiB (2^20 bits) by
+/// default, so a single shift/power cannot overshoot a worker's memory ceiling
+/// by 128 MiB, and lets the host move that cap (`SandboxCaps::bigint_bits`);
+/// see [`Vm::max_bigint_bits`].
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_BIGINT_BITS: u64 = 1 << 30;
 
@@ -211,6 +211,20 @@ pub(crate) fn cmp_big_f64(x: &NumBig, f: f64) -> Option<Ordering> {
 }
 
 impl<'p> Vm<'p> {
+    /// The most bits a BigInt this VM makes may have: [`MAX_BIGINT_BITS`],
+    /// or in the hardened profile the host's `SandboxCaps::bigint_bits`.
+    #[inline]
+    pub(crate) fn max_bigint_bits(&self) -> u64 {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.sandbox_caps.bigint_bits
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            MAX_BIGINT_BITS
+        }
+    }
+
     /// Allocate a BigInt Value from a `BigVal` (canonical by construction).
     pub(crate) fn make_bigint_val(&mut self, v: BigVal) -> Value {
         match v {
@@ -470,7 +484,7 @@ impl<'p> Vm<'p> {
             BigOp::Sub => x - y,
             BigOp::Mul => {
                 // Product bits ≈ bits(x)+bits(y): cap like V8 before allocating.
-                if x.bits().saturating_add(y.bits()) > MAX_BIGINT_BITS + 1 {
+                if x.bits().saturating_add(y.bits()) > self.max_bigint_bits() + 1 {
                     return Err(Thrown(BIGINT_SIZE_ERR.into()));
                 }
                 x * y
@@ -525,7 +539,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if a.bits().saturating_add(count.min(u64::MAX as i128) as u64) > MAX_BIGINT_BITS {
+            if a.bits().saturating_add(count.min(u64::MAX as i128) as u64) > self.max_bigint_bits() {
                 return Err(Thrown(BIGINT_SIZE_ERR.into()));
             }
             Ok(self.make_bigint_num(a.to_num() << (count as usize)))
@@ -583,7 +597,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        if a.bits().saturating_mul(e) > MAX_BIGINT_BITS {
+        if a.bits().saturating_mul(e) > self.max_bigint_bits() {
             return Err(Thrown(BIGINT_SIZE_ERR.into()));
         }
         // bits(a) ≥ 2 here, so e ≤ MAX_BIGINT_BITS/2 < u32::MAX.
@@ -610,7 +624,7 @@ impl<'p> Vm<'p> {
         if big.bits() < bits {
             return Ok(self.make_bigint_num(big));
         }
-        if bits > MAX_BIGINT_BITS {
+        if bits > self.max_bigint_bits() {
             return Err(Thrown(BIGINT_SIZE_ERR.into()));
         }
         let m = NumBig::one() << (bits as usize);
@@ -645,7 +659,7 @@ impl<'p> Vm<'p> {
         }
         // A negative value maps to 2^bits + x: refuse absurd widths (V8 throws
         // for e.g. BigInt.asUintN(2**32, -1n) rather than building 2^(2^32)).
-        if bits > MAX_BIGINT_BITS {
+        if bits > self.max_bigint_bits() {
             return Err(Thrown(BIGINT_SIZE_ERR.into()));
         }
         let m = NumBig::one() << (bits as usize);

@@ -1976,6 +1976,10 @@ pub struct Vm<'p> {
     /// instead of once per exec (see [`proxy_regexp::RegexSubjectUnits`]).
     /// Integers only: never traced; a major GC drops it with its subject.
     regex_subject_units: Option<proxy_regexp::RegexSubjectUnits>,
+    /// The profile's regex pattern, array join, JSON nesting and BigInt caps
+    /// for this VM (`ScriptState::set_sandbox_caps`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) sandbox_caps: host_api::SandboxCaps,
     /// Native bytes owned by completed RegExp matches that an outer operation
     /// retains while guest code can re-enter the VM (notably functional
     /// replacement callbacks). `heap_bytes()` cannot see those Rust-local

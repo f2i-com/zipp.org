@@ -55,12 +55,6 @@ fn json_plain_fast_enabled() -> bool {
 
 const JSON_STRING_LIMIT_ERROR: &str = "RangeError: Invalid string length";
 
-/// Pretty serialization retains one indentation string per recursive level;
-/// bounding depth in the hardened profile keeps that live set quadratic only
-/// in a small constant.
-#[cfg(feature = "safe-sandbox")]
-const MAX_JSON_NESTING_DEPTH: usize = 64;
-
 /// The ordinary profile bounds the same walks for a different reason: every
 /// level of the parser, the serializer and the reviver walk is a native Rust
 /// frame. Unbounded, a deeply nested document (or a replacer/`toJSON` that
@@ -105,26 +99,6 @@ const JSON_PROPERTY_MAP_BUCKET_BYTES: usize =
 #[derive(Default)]
 struct JsonKeySnapshotBudget {
     used: std::cell::Cell<usize>,
-}
-
-/// Recursive JSON parsing must fail before a valid, deeply nested document
-/// can exhaust the native (or WebAssembly) call stack: tightly in the
-/// hardened profile, and at [`MAX_JSON_PARSE_DEPTH`] in the ordinary one.
-#[inline]
-fn json_check_parse_depth(depth: usize) -> Result<(), Thrown> {
-    #[cfg(feature = "safe-sandbox")]
-    if depth >= MAX_JSON_NESTING_DEPTH {
-        return Err(Thrown::from_static(
-            "RangeError: JSON parse nesting depth exceeds the sandbox limit",
-        ));
-    }
-    #[cfg(not(feature = "safe-sandbox"))]
-    if depth >= MAX_JSON_PARSE_DEPTH {
-        return Err(Thrown::from_static(
-            "RangeError: JSON parse nesting depth exceeds the engine limit",
-        ));
-    }
-    Ok(())
 }
 
 /// Private output-buffer failure. Both an arithmetic/engine-size overflow and
@@ -391,6 +365,39 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
 }
 
 impl<'p> Vm<'p> {
+    /// Levels of JSON nesting this VM's parser, serializer and reviver walk
+    /// accept in the hardened profile: 64 unless the host moved it
+    /// (`SandboxCaps::json_nesting_depth`). Pretty serialization retains one
+    /// indentation string per recursive level, so the live set is quadratic
+    /// in this depth; that and the native stack each level takes are what
+    /// bound it.
+    #[cfg(feature = "safe-sandbox")]
+    #[inline]
+    fn json_nesting_cap(&self) -> usize {
+        self.sandbox_caps.json_nesting_depth
+    }
+
+    /// Recursive JSON parsing must fail before a valid, deeply nested document
+    /// can exhaust the native (or WebAssembly) call stack: at the profile's
+    /// cap in the hardened profile (`json_nesting_cap`), and at
+    /// [`MAX_JSON_PARSE_DEPTH`] in the ordinary one.
+    #[inline]
+    fn json_check_parse_depth(&self, depth: usize) -> Result<(), Thrown> {
+        #[cfg(feature = "safe-sandbox")]
+        if depth >= self.json_nesting_cap() {
+            return Err(Thrown::from_static(
+                "RangeError: JSON parse nesting depth exceeds the sandbox limit",
+            ));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if depth >= MAX_JSON_PARSE_DEPTH {
+            return Err(Thrown::from_static(
+                "RangeError: JSON parse nesting depth exceeds the engine limit",
+            ));
+        }
+        Ok(())
+    }
+
     fn json_output_error(&mut self) -> Thrown {
         // A metered sandbox treats exhaustion as terminal even if guest code
         // catches this immediate RangeError. Unmetered/ordinary engines retain
@@ -676,10 +683,11 @@ impl<'p> Vm<'p> {
         active: &mut Vec<u32>,
         out: &mut String,
     ) -> bool {
+        // Past it the generic serializer takes over (and enforces the cap).
         #[cfg(feature = "safe-sandbox")]
-        const MAX_DEPTH: usize = MAX_JSON_NESTING_DEPTH;
+        let max_depth = self.json_nesting_cap().min(256);
         #[cfg(not(feature = "safe-sandbox"))]
-        const MAX_DEPTH: usize = 256;
+        let max_depth = 256;
         if value.is_null() {
             return json_push_str_bounded(out, "null").is_ok();
         }
@@ -708,7 +716,7 @@ impl<'p> Vm<'p> {
                 json_quote_wtf8_bounded(out, &bytes, ascii).is_ok()
             }
             HeapObj::Array(items) => {
-                if depth >= MAX_DEPTH
+                if depth >= max_depth
                     || active.contains(&idx)
                     || self.proto_of.contains_key(&idx)
                     || self.arguments_objs.contains_key(&idx)
@@ -741,7 +749,7 @@ impl<'p> Vm<'p> {
                 true
             }
             HeapObj::Object(map) => {
-                if depth >= MAX_DEPTH
+                if depth >= max_depth
                     || active.contains(&idx)
                     || idx == self.global_this
                     // `%Array.prototype%` is internally an Object map, but
@@ -1798,7 +1806,7 @@ impl<'p> Vm<'p> {
             ));
         }
         #[cfg(feature = "safe-sandbox")]
-        if depth >= MAX_JSON_NESTING_DEPTH {
+        if depth >= self.json_nesting_cap() {
             return Err(Thrown::from_static(
                 "RangeError: JSON nesting depth exceeds the sandbox limit",
             ));
@@ -2249,7 +2257,7 @@ impl<'p> Vm<'p> {
         i: &mut usize,
         depth: usize,
     ) -> Result<Value, Thrown> {
-        json_check_parse_depth(depth)?;
+        self.json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '['
         let mut items = Vec::new();
@@ -2285,7 +2293,7 @@ impl<'p> Vm<'p> {
         i: &mut usize,
         depth: usize,
     ) -> Result<Value, Thrown> {
-        json_check_parse_depth(depth)?;
+        self.json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '{'
         #[cfg(feature = "wasm-lite")]
@@ -2404,7 +2412,7 @@ impl<'p> Vm<'p> {
         let mut active = Vec::new();
         #[cfg(feature = "safe-sandbox")]
         active
-            .try_reserve_exact(MAX_JSON_NESTING_DEPTH)
+            .try_reserve_exact(self.json_nesting_cap())
             .map_err(|_| {
                 Thrown::from_static("RangeError: JSON reviver nesting depth exceeds the sandbox limit")
             })?;
@@ -2437,7 +2445,7 @@ impl<'p> Vm<'p> {
         if val.is_heap() && self.is_object_value(val) {
             #[cfg(feature = "safe-sandbox")]
             {
-                if depth >= MAX_JSON_NESTING_DEPTH || active.contains(&val.heap_index()) {
+                if depth >= self.json_nesting_cap() || active.contains(&val.heap_index()) {
                     return Err(Thrown::from_static(
                         "RangeError: JSON reviver nesting depth exceeds the sandbox limit",
                     ));
@@ -2597,7 +2605,7 @@ impl<'p> Vm<'p> {
         i: &mut usize,
         depth: usize,
     ) -> Result<(Value, JsonSrc), Thrown> {
-        json_check_parse_depth(depth)?;
+        self.json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '['
         let mut items = Vec::new();
@@ -2632,7 +2640,7 @@ impl<'p> Vm<'p> {
         i: &mut usize,
         depth: usize,
     ) -> Result<(Value, JsonSrc), Thrown> {
-        json_check_parse_depth(depth)?;
+        self.json_check_parse_depth(depth)?;
         let b = src;
         *i += 1; // '{'
         #[cfg(feature = "wasm-lite")]
