@@ -12,7 +12,14 @@ use super::*;
 use crate::parse::ast;
 
 pub fn compile_program(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, false, false)
+    compile_program_inner(prog, source, false, false, false)
+}
+
+/// [`compile_program`] for a script whose top level hands back its completion
+/// value, as ScriptEvaluation does: what `$262.evalScript` returns. The
+/// script's declarations bind as a script's, not an eval's.
+pub fn compile_script_with_completion(prog: &ast::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, false, false, true)
 }
 
 /// Compile the ROOT program of a VM — one that `Vm::new` will run directly and
@@ -24,20 +31,20 @@ pub fn compile_program(prog: &ast::Program, source: &str) -> R<Program> {
 /// dynamic code with the plain entries instead is always safe — it only
 /// forgoes the optimization.
 pub fn compile_main_program(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, false, true)
+    compile_program_inner(prog, source, false, true, false)
 }
 
 /// Compile a MODULE as the program entry: the top level is an async context
 /// (top-level `await`), and the VM runs func 0 as an async activation.
 #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub fn compile_module(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, true, false)
+    compile_program_inner(prog, source, true, false, false)
 }
 
 /// [`compile_main_program`]'s module sibling — for a module program `Vm::new`
 /// runs directly as the root activation (never via the loader's eval install).
 pub fn compile_main_module(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, true, true)
+    compile_program_inner(prog, source, true, true, false)
 }
 
 pub(crate) fn compile_program_inner(
@@ -45,11 +52,13 @@ pub(crate) fn compile_program_inner(
     source: &str,
     module_mode: bool,
     main_goal: bool,
+    script_completion: bool,
 ) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
     c.main_goal = main_goal;
+    c.script_completion = script_completion;
     // The parser has already folded the directive prologue, the Module goal
     // and any caller-imposed strictness into `prog.strict`; honour it rather
     // than re-deriving strictness from the directives alone, which would

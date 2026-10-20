@@ -219,7 +219,7 @@ impl<'p> Vm<'p> {
         }
         if let Some(src) = prelude {
             self.eval_prelude_mode = true;
-            let r = self.eval_script(src);
+            let r = self.eval_script_with(src, false);
             self.eval_prelude_mode = false;
             // Harness and test are distinct Script jobs. Release WeakRef's
             // AddToKeptObjects set at the boundary, while preserving the
