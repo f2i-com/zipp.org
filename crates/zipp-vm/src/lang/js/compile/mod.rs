@@ -159,6 +159,10 @@ impl CellLocals {
 }
 
 struct Compiler {
+    /// Scopes `capture`'s per-compile memo of nested functions' free names;
+    /// the AST it points into outlives the compiler.
+    #[allow(dead_code)]
+    capture_memo: crate::capture::Session,
     functions: Vec<FuncProto>,
     /// Program-wide source caps for compiler-prepared object-literal keys.
     /// These count retained plan sites/bytes, not runtime objects.

@@ -50,6 +50,83 @@ type Names<'a> = FxHashSet<&'a str>;
 /// local boxed and every global access dynamic (f2i-com/zipp.org#52).
 pub const DIRECT_EVAL_CALL: &str = "\0eval-call";
 
+/// The free names of nested functions, memoised for one compile.
+///
+/// Every query here recurses through the functions nested in the code it
+/// walks, and the compiler asks several per function it compiles (captured
+/// locals, direct-eval detection, the free names it stashes for children,
+/// `arguments` use), so a function nested d levels deep was walked about 5d
+/// times: a fifth of the TypeScript compiler bundle's run. A nested
+/// function's free names depend on its node alone, so the first walk's
+/// answer is kept for the rest of the compile. `Session` (held by the
+/// compiler) scopes it: the names point into that compile's AST, which
+/// outlives the compiler; entries are keyed by the node's address, span and
+/// kind, and outside a session nothing is kept.
+mod memo {
+    use std::cell::RefCell;
+
+    type Key = (usize, u32, u32, u8);
+    type Entry = Box<[(*const u8, usize)]>;
+
+    thread_local! {
+        static STACK: RefCell<Vec<(u64, rustc_hash::FxHashMap<Key, Entry>)>> =
+            const { RefCell::new(Vec::new()) };
+        static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// One compile's memo, popped on drop.
+    pub struct Session(u64);
+
+    impl Session {
+        pub fn new() -> Session {
+            let id = NEXT.with(|n| {
+                let id = n.get();
+                n.set(id + 1);
+                id
+            });
+            STACK.with(|s| s.borrow_mut().push((id, Default::default())));
+            Session(id)
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            STACK.with(|s| s.borrow_mut().retain(|(id, _)| *id != self.0));
+        }
+    }
+
+    /// The memoised names for `key`, added to `out`. False when there is no
+    /// session or no entry.
+    ///
+    /// # Safety
+    /// `key` names a node of the innermost session's AST that is alive for
+    /// `'a`, so the names recorded for it (which point into its subtree, or
+    /// are static) are too.
+    pub unsafe fn get<'a>(key: Key, out: &mut super::Names<'a>) -> bool {
+        STACK.with(|s| {
+            let s = s.borrow();
+            let Some(e) = s.last().and_then(|(_, m)| m.get(&key)) else {
+                return false;
+            };
+            for &(p, n) in e.iter() {
+                // SAFETY: the caller's contract; the bytes were a `&str`.
+                out.insert(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) });
+            }
+            true
+        })
+    }
+
+    pub fn put(key: Key, names: &super::Names<'_>) {
+        STACK.with(|s| {
+            if let Some((_, m)) = s.borrow_mut().last_mut() {
+                m.insert(key, names.iter().map(|n| (n.as_ptr(), n.len())).collect());
+            }
+        });
+    }
+}
+
+pub use memo::Session;
+
 fn owned(set: Names<'_>) -> HashSet<String> {
     set.into_iter().map(str::to_string).collect()
 }
@@ -1198,21 +1275,33 @@ fn prop_key_refs<'a>(k: &'a PropKey, out: &mut Names<'a>) {
 /// Add a nested function's free variables to `out`. The nested function's own
 /// bindings are subtracted, so only names it captures from further out remain.
 fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
+    let key = (f as *const Function as usize, f.span.start, f.span.end, 0);
+    // SAFETY: `f` is a node of the compile's AST, alive for `'a`.
+    if unsafe { memo::get(key, out) } {
+        return;
+    }
     let mut param_names = param_names(&f.params);
     // An ordinary function BINDS its own `arguments` (and `this`), so a reference
     // to `arguments` inside it is NOT free — it must not leak out as a capture of
     // the enclosing scope. (Arrows, handled by `arrow_free`, do not bind it.)
     param_names.push("arguments");
-    let inner = free_vars_in(&param_names, &f.body.stmts);
-    out.extend(inner);
-    params_free(&f.params, &param_names, out);
+    let mut own = free_vars_in(&param_names, &f.body.stmts);
+    params_free(&f.params, &param_names, &mut own);
+    memo::put(key, &own);
+    out.extend(own);
 }
 
 fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
+    let key = (a as *const Arrow as usize, a.span.start, a.span.end, 1);
+    // SAFETY: `a` is a node of the compile's AST, alive for `'a`.
+    if unsafe { memo::get(key, out) } {
+        return;
+    }
     let param_names = param_names(&a.params);
-    let inner = free_vars_arrow_in(&param_names, &a.body);
-    out.extend(inner);
-    params_free(&a.params, &param_names, out);
+    let mut own = free_vars_arrow_in(&param_names, &a.body);
+    params_free(&a.params, &param_names, &mut own);
+    memo::put(key, &own);
+    out.extend(own);
 }
 
 /// Names a class body references from OUTSIDE a method's own scope: each

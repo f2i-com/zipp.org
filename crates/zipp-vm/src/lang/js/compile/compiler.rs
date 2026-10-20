@@ -59,6 +59,7 @@ impl Compiler {
 
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
+            capture_memo: crate::capture::Session::new(),
             functions: Vec::new(),
             static_key_plan_sites: 0,
             static_key_plan_retained_bytes: 0,
