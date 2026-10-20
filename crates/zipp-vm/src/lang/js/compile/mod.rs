@@ -123,9 +123,39 @@ type UpvalList = Rc<RefCell<Vec<(String, UpvalSource)>>>;
 struct EnclosingFn {
     /// name → register holding that binding's CELL in the parent frame. Only
     /// captured bindings appear here (non-captured locals can't be upvalues).
-    cell_locals: Vec<(String, Reg)>,
+    /// Shared: every function compiled under the ancestor while its bindings
+    /// stay the same holds the same snapshot (`FnCompiler::snapshot`).
+    cell_locals: std::rc::Rc<CellLocals>,
     /// The ancestor's own upvalue list (shared handle).
     upvalues: UpvalList,
+}
+
+/// One function's cell-backed bindings as a nested function sees them, in
+/// `list` weakest binding first (the order `FnCompiler::snapshot` documents)
+/// and in `index` by name, each name's strongest (last) entry. Copying and
+/// scanning the list for every nested function made a module of thousands of
+/// captured declarations and functions compile in quadratic time: the
+/// TypeScript compiler's bundle spent 62% of its run compiling.
+pub(crate) struct CellLocals {
+    list: Vec<(String, Reg)>,
+    index: rustc_hash::FxHashMap<String, Reg>,
+}
+
+impl CellLocals {
+    fn new(list: Vec<(String, Reg)>) -> CellLocals {
+        let mut index = rustc_hash::FxHashMap::default();
+        index.reserve(list.len());
+        for (n, r) in &list {
+            index.insert(n.clone(), *r);
+        }
+        CellLocals { list, index }
+    }
+
+    /// The register of the strongest binding of `name` (a backward scan's
+    /// first match).
+    fn get(&self, name: &str) -> Option<Reg> {
+        self.index.get(name).copied()
+    }
 }
 
 struct Compiler {
@@ -346,8 +376,8 @@ fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     // at the child's creation point — the binding `resolve` would pick in the
     // parent. Taking the first match handed a closure inside `{ let a; }` the
     // OUTER `a`'s cell.
-    if let Some((_, reg)) = parent.cell_locals.iter().rfind(|(n, _)| n == name) {
-        return Some(UpvalSource::ParentLocal(*reg));
+    if let Some(reg) = parent.cell_locals.get(name) {
+        return Some(UpvalSource::ParentLocal(reg));
     }
     // Parent already captured it as an upvalue.
     if let Some(i) = parent.upvalues.borrow().iter().position(|(n, _)| n == name) {
@@ -472,6 +502,10 @@ struct FnCompiler<'a> {
     spill_new_at: Option<usize>,
     /// Spill slots of `const` bindings: an assignment to one is a TypeError.
     const_spills: HashSet<u32>,
+    /// `pop_scope`s so far, and the last `snapshot`'s list with the key it
+    /// was built at (see `snapshot`).
+    scope_pops: u64,
+    snapshot_cache: std::cell::RefCell<Option<((u64, usize, usize, usize), std::rc::Rc<CellLocals>)>>,
     /// Parallel to `scopes` (same length, same indices): the lexically-declared
     /// names of each BLOCK-like scope, recorded at block ENTRY.
     ///

@@ -1887,6 +1887,7 @@ impl<'a> FnCompiler<'a> {
                     .flat_map(|enc| {
                         let mut ns: Vec<String> = enc
                             .cell_locals
+                            .list
                             .iter()
                             .rev()
                             .map(|(n, _)| n.clone())

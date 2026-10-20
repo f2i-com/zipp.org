@@ -160,6 +160,8 @@ impl<'a> FnCompiler<'a> {
             spill_count: 0,
             spill_new_at: None,
             const_spills: HashSet::new(),
+            scope_pops: 0,
+            snapshot_cache: std::cell::RefCell::new(None),
             scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
@@ -279,7 +281,38 @@ impl<'a> FnCompiler<'a> {
     /// Consumers (`capture_source`, the direct-eval site map) scan it BACKWARDS,
     /// so that order is exactly `resolve`'s shadowing order: a closure created
     /// inside `{ let a; }` under an outer `let a` must capture the INNER cell.
+    ///
+    /// Reused while it is current: a function nested in a module of thousands
+    /// of captured declarations sees the same list as its siblings, and
+    /// rebuilding it for each one made such a module compile in quadratic
+    /// time. Between two `pop_scope`s, bindings and cells are only ever added
+    /// (only a pop removes either), so the pop count, the scope depth and the
+    /// binding and cell counts change whenever the list could.
     pub(crate) fn snapshot(&self) -> EnclosingFn {
+        let key = (
+            self.scope_pops,
+            self.scopes.len(),
+            self.scopes.iter().map(|s| s.len()).sum::<usize>(),
+            self.cell_regs.len(),
+        );
+        if let Some((k, cells)) = &*self.snapshot_cache.borrow() {
+            if *k == key {
+                return EnclosingFn {
+                    cell_locals: cells.clone(),
+                    upvalues: self.upvalues.clone(),
+                };
+            }
+        }
+        let cells = std::rc::Rc::new(CellLocals::new(self.cell_locals_list()));
+        *self.snapshot_cache.borrow_mut() = Some((key, cells.clone()));
+        EnclosingFn {
+            cell_locals: cells,
+            upvalues: self.upvalues.clone(),
+        }
+    }
+
+    /// The cell-backed bindings in scope, weakest first (see `snapshot`).
+    fn cell_locals_list(&self) -> Vec<(String, Reg)> {
         let mut cell_locals = Vec::new();
         // A named-function-expression self-binding that was boxed (captured by a
         // nested closure) is also visible to that closure as an upvalue source.
@@ -298,10 +331,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        EnclosingFn {
-            cell_locals,
-            upvalues: self.upvalues.clone(),
-        }
+        cell_locals
     }
 
     /// Resolve a free variable to an upvalue index in THIS function, creating
@@ -618,6 +648,7 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn pop_scope(&mut self) {
         self.scope_lex_names.pop();
         let scope = self.scopes.pop().unwrap();
+        self.scope_pops += 1;
         // Free the registers the scope's locals used (block-local reuse) —
         // and drop their per-register markings, or a later local reallocated
         // onto the same register would inherit const-ness / cell-ness
@@ -892,7 +923,7 @@ impl<'a> FnCompiler<'a> {
     /// where a resolvable binding must answer `false`.
     pub(crate) fn bound_in_enclosing(&self, name: &str) -> bool {
         self.enclosing.iter().any(|enc| {
-            enc.cell_locals.iter().any(|(n, _)| n == name)
+            enc.cell_locals.get(name).is_some()
                 || enc.upvalues.borrow().iter().any(|(n, _)| n == name)
         })
     }
