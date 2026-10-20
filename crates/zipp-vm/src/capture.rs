@@ -61,11 +61,12 @@ pub const DIRECT_EVAL_CALL: &str = "\0eval-call";
 /// answer is kept for the rest of the compile. `Session` (held by the
 /// compiler) scopes it: the names point into that compile's AST, which
 /// outlives the compiler; entries are keyed by the node's address, span and
-/// kind, and outside a session nothing is kept.
+/// kind, and outside a session nothing is kept. The safe profile, which
+/// forbids the unsafe code that reads a name back, keeps none.
 mod memo {
     use std::cell::RefCell;
 
-    type Key = (usize, u32, u32, u8);
+    pub type Key = (usize, u32, u32, u8);
     type Entry = Box<[(*const u8, usize)]>;
 
     thread_local! {
@@ -102,6 +103,7 @@ mod memo {
     /// `key` names a node of the innermost session's AST that is alive for
     /// `'a`, so the names recorded for it (which point into its subtree, or
     /// are static) are too.
+    #[cfg(not(feature = "safe-sandbox"))]
     pub unsafe fn get<'a>(key: Key, out: &mut super::Names<'a>) -> bool {
         STACK.with(|s| {
             let s = s.borrow();
@@ -117,6 +119,9 @@ mod memo {
     }
 
     pub fn put(key: Key, names: &super::Names<'_>) {
+        if cfg!(feature = "safe-sandbox") {
+            return;
+        }
         STACK.with(|s| {
             if let Some((_, m)) = s.borrow_mut().last_mut() {
                 m.insert(key, names.iter().map(|n| (n.as_ptr(), n.len())).collect());
@@ -126,6 +131,23 @@ mod memo {
 }
 
 pub use memo::Session;
+
+/// The memoised free names of `node`, whose memo key is `key`, added to
+/// `out`: false when there are none (the safe profile keeps none).
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn memo_get<'a, T>(node: &'a T, span: (u32, u32), kind: u8, out: &mut Names<'a>) -> bool {
+    // SAFETY: the key is `node`'s own address, span and kind, and `node` is
+    // borrowed for `'a`: an entry under it was recorded from the names of
+    // this node's subtree (or static names), alive for as long.
+    unsafe { memo::get((node as *const T as usize, span.0, span.1, kind), out) }
+}
+
+#[cfg(feature = "safe-sandbox")]
+#[inline]
+fn memo_get<'a, T>(_node: &'a T, _span: (u32, u32), _kind: u8, _out: &mut Names<'a>) -> bool {
+    false
+}
 
 fn owned(set: Names<'_>) -> HashSet<String> {
     set.into_iter().map(str::to_string).collect()
@@ -1275,11 +1297,10 @@ fn prop_key_refs<'a>(k: &'a PropKey, out: &mut Names<'a>) {
 /// Add a nested function's free variables to `out`. The nested function's own
 /// bindings are subtracted, so only names it captures from further out remain.
 fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
-    let key = (f as *const Function as usize, f.span.start, f.span.end, 0);
-    // SAFETY: `f` is a node of the compile's AST, alive for `'a`.
-    if unsafe { memo::get(key, out) } {
+    if memo_get(f, (f.span.start, f.span.end), 0, out) {
         return;
     }
+    let key = (f as *const Function as usize, f.span.start, f.span.end, 0);
     let mut param_names = param_names(&f.params);
     // An ordinary function BINDS its own `arguments` (and `this`), so a reference
     // to `arguments` inside it is NOT free — it must not leak out as a capture of
@@ -1292,11 +1313,10 @@ fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
 }
 
 fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
-    let key = (a as *const Arrow as usize, a.span.start, a.span.end, 1);
-    // SAFETY: `a` is a node of the compile's AST, alive for `'a`.
-    if unsafe { memo::get(key, out) } {
+    if memo_get(a, (a.span.start, a.span.end), 1, out) {
         return;
     }
+    let key = (a as *const Arrow as usize, a.span.start, a.span.end, 1);
     let param_names = param_names(&a.params);
     let mut own = free_vars_arrow_in(&param_names, &a.body);
     params_free(&a.params, &param_names, &mut own);
