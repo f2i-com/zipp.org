@@ -8,6 +8,11 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Parts from which a string `split` allocates its result old (W9 static
+/// pretenure): a split this large is a document cut into the pieces a
+/// program keeps; a smaller one is usually a temporary (a row's fields).
+const SPLIT_PRETENURE_MIN_PARTS: usize = 128;
+
 /// `ZIPP_NO_MATCHALL_PRISTINE=1` disables the pristine dispatch shortcut for
 /// `String.prototype.matchAll` (the B77 retry), restoring the fully observable
 /// preamble on every call — the rollback switch and one side of a one-binary
@@ -1148,7 +1153,17 @@ impl<'p> Vm<'p> {
                 // output — measured to survive minors wholesale, so they
                 // allocate OLD. Purely internal from here down: nothing throws
                 // and no user code runs, so the begin/end pair is airtight.
-                self.heap.pretenure_begin();
+                //
+                // Only a large split, though: a document cut into lines is the
+                // builder, and a line cut into its few fields in a loop is a
+                // temporary. Born old, every such field waited for a major,
+                // and twelve majors traced the whole heap for it (a third of
+                // strings-build-slice's split loop; 227 of 240 ms of GC in a
+                // loop of `line.split(";").length`).
+                let pretenure = count >= SPLIT_PRETENURE_MIN_PARTS;
+                if pretenure {
+                    self.heap.pretenure_begin();
+                }
                 let parts: Vec<Value> = match &sep_or {
                     // No separator → the whole string as a single element (lim 0
                     // → []). The receiver itself — exact, strings are immutable.
@@ -1192,8 +1207,10 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(parts)));
-                self.heap.pretenure_end();
-                if sep_or.is_none() && lim != 0 {
+                if pretenure {
+                    self.heap.pretenure_end();
+                }
+                if pretenure && sep_or.is_none() && lim != 0 {
                     // The one element is the pre-existing receiver, not a part
                     // allocated in the scope: an OLD-born array holding a
                     // possibly-young string is an old->young edge no store saw.
