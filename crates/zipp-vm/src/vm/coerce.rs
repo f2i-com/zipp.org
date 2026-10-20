@@ -1307,7 +1307,14 @@ impl<'p> Vm<'p> {
                     match self.heap.as_callable(v.heap_index()) {
                         Some((fid, _)) => {
                             let fp = self.func(fid as usize);
-                            !(fp.is_generator || fp.is_async || fp.non_constructable)
+                            // An arrow (`lexical_this`) is refused as the
+                            // construct path refuses it, whether or not its
+                            // compile marked it `non_constructable`
+                            // (f2i-com/zipp.org#71).
+                            !(fp.is_generator
+                                || fp.is_async
+                                || fp.non_constructable
+                                || fp.lexical_this)
                         }
                         None => true,
                     }

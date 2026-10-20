@@ -939,6 +939,22 @@ impl<'p> Vm<'p> {
                     "TypeError: Cannot perform 'construct' on a revoked proxy",
                 ));
             }
+            // ProxyCreate step 7: a Proxy has [[Construct]] only when its
+            // target does, so `new` on a Proxy around an arrow (or a method,
+            // a generator, a bound one of those) throws before the handler's
+            // `construct` is even read (f2i-com/zipp.org#71). A Proxy target
+            // gave it the one its own target gave that Proxy when it was
+            // made, which its revocation since does not take away.
+            let mut inner = target;
+            while inner.is_heap() {
+                match self.proxy_parts(inner.heap_index()) {
+                    Some((t, _, _)) => inner = t,
+                    None => break,
+                }
+            }
+            if !self.is_constructor(inner) {
+                return Err(Thrown::from_static("TypeError: value is not a constructor"));
+            }
             return match self.proxy_trap(handler, "construct")? {
                 Some(trap) => {
                     let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
