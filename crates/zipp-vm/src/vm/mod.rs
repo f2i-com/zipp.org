@@ -1924,6 +1924,10 @@ pub struct Vm<'p> {
     /// dropped freely.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// The sites `jit_shape_slot` holds an entry for, kept with it (neither
+    /// ever drops one): the direct-miss gate's proof set.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_shape_slot_sites: rustc_hash::FxHashSet<u32>,
     /// The last property append each JIT `SetProp` site proved, by IC site
     /// index (`helpers_misc::AddWay`): a constructor's `this.x = v` adds a
     /// key to a new object every time, which no identity or shape way can

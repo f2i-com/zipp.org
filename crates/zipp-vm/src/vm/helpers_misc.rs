@@ -4513,9 +4513,21 @@ fn jit_direct_miss_gate(vm: &mut Vm, site_idx: u32) -> crate::codegen::DirectMis
     if !vm.jit.direct_miss_gate_ready(site_idx) {
         return crate::codegen::DirectMissGate::Probe;
     }
-    let memo_sites: rustc_hash::FxHashSet<u32> =
-        vm.jit_shape_slot.keys().map(|&(site, _)| site).collect();
-    vm.jit.direct_miss_gate(site_idx, &memo_sites)
+    // The set is kept with the memo. Building it here per call was meant to
+    // be a one-shot cost, but a site the gate keeps declining asks on every
+    // miss: with the TypeScript bundle's memo near its cap that rebuild was
+    // 70% of the run.
+    vm.jit.direct_miss_gate(site_idx, &vm.jit_shape_slot_sites)
+}
+
+/// Record a `(site, shape) -> slot` memo entry and its site.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_shape_slot_put(vm: &mut Vm, site_idx: u32, shape: u32, slot: u32) {
+    if vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX {
+        vm.jit_shape_slot.insert((site_idx, shape), slot);
+        vm.jit_shape_slot_sites.insert(site_idx);
+    }
 }
 
 /// Read-only twin of `get_member_slow`'s Array / String tail for a NAMED
@@ -5215,11 +5227,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // the receiver's own layout and is already guarded by hop versions.
     if let HeapObj::Object(map) = vm.heap.get(idx) {
         let sh = map.shape();
-        if sh != crate::shape::DICT
-            && map.attr_get(slot as usize).is_some_and(|a| !a.accessor)
-            && vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX
-        {
-            vm.jit_shape_slot.insert((site_idx, sh), slot);
+        if sh != crate::shape::DICT && map.attr_get(slot as usize).is_some_and(|a| !a.accessor) {
+            jit_shape_slot_put(vm, site_idx, sh, slot);
         }
     }
     val.bits()
@@ -5858,9 +5867,8 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             && map
                 .attr_get(slot as usize)
                 .is_some_and(|a| !a.accessor && a.writable)
-            && vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX
         {
-            vm.jit_shape_slot.insert((site_idx, sh), slot);
+            jit_shape_slot_put(vm, site_idx, sh, slot);
         }
     }
     0

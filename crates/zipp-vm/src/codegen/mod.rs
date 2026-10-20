@@ -5520,6 +5520,12 @@ impl Jit {
         {
             return DirectMissGate::Probe;
         }
+        // Already marked: a recompile will emit the direct form. Until then
+        // (a retired artifact still running, say) each miss asks again, and
+        // the sibling scan below walks every IC site of the program.
+        if self.direct_miss_sites.contains(&(m.func_id, m.op_ip)) {
+            return DirectMissGate::Probe;
+        }
 
         // Batch siblings in this same native artifact only when EACH has both
         // parts of the proof: a full round of identity-way eviction and at

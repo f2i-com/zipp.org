@@ -326,6 +326,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_shape_slot_sites: rustc_hash::FxHashSet::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_ways: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
