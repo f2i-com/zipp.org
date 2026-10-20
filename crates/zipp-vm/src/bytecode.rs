@@ -1280,6 +1280,28 @@ pub enum Instr {
         cell: Reg,
         src: Reg,
     },
+    /// `dst = a fresh spill vector of `count` undefined slots`: where a
+    /// function with more locals than the register file addresses keeps the
+    /// rest (`LoadSpill`/`StoreSpill`, a 32-bit index each, as V8's wide
+    /// operands reach a large register file). Emitted once, at the body's
+    /// entry, only for such a function; every other function compiles as it
+    /// always has.
+    NewSpill {
+        dst: Reg,
+        count: u32,
+    },
+    /// `dst = <spill vector in vec>[idx]`.
+    LoadSpill {
+        dst: Reg,
+        vec: Reg,
+        idx: u32,
+    },
+    /// `<spill vector in vec>[idx] = src`.
+    StoreSpill {
+        vec: Reg,
+        idx: u32,
+        src: Reg,
+    },
     /// Like `CellSet` but the target is a lexical (`let`/`const`) cell that may
     /// still be in its TDZ: writing while the cell holds UNINITIALIZED throws a
     /// ReferenceError (an ASSIGNMENT before the declaration runs). The
@@ -3009,6 +3031,16 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
 #[cfg(test)]
 mod fused_code_tests {
     use super::*;
+
+    /// The spill instructions (a 32-bit slot index beside two registers) fit
+    /// in the size the other variants already give `Instr`: wide access is
+    /// paid for by the functions that use it, not by every dispatch.
+    #[test]
+    fn spill_instructions_keep_instr_size() {
+        let size = std::mem::size_of::<Instr>();
+        println!("size_of::<Instr>() = {size}");
+        assert!(size <= 32, "Instr grew to {size} bytes");
+    }
 
     /// The copy keeps the original's length, each superinstruction sits
     /// where the first of its pair was with the second left in place, pairs

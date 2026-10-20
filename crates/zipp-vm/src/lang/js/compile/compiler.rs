@@ -983,9 +983,24 @@ impl Compiler {
             // (2) the with-chain's static fallback must resolve a `var`
             // textually after the `with` (unscopables-with); (3) `for (var k
             // in …)` heads resolve the hoisted binding instead of minting one.
+            // More declared names than the register file can hold: the plain
+            // locals past `SPILL_KEEP_REGS` go to a spill vector made here.
+            // (A `with` resolves names dynamically through registers; such a
+            // function keeps the old limit.)
+            if !fc.box_all_locals {
+                let (declared, has_with) = declared_binding_count(body);
+                if declared > super::scopes::SPILL_TRIGGER && !has_with {
+                    fc.start_spill();
+                }
+            }
             for name in &sorted_name_vec(&hv) {
                 if !fc.scopes[0].binds(name) {
-                    fc.declare_local(name); // boxes a cell if captured (undefined)
+                    if fc.spills(name) {
+                        // The vector starts undefined, as a register does.
+                        fc.declare_spill(name);
+                    } else {
+                        fc.declare_local(name); // boxes a cell if captured (undefined)
+                    }
                 }
             }
             // FunctionDeclarationInstantiation with parameter EXPRESSIONS (a
@@ -1910,7 +1925,11 @@ impl<'a> FnCompiler<'a> {
             if name == "arguments" || !seen.contains(name) {
                 continue;
             }
-            let Some(preg) = self.scopes[0].reg_of(name) else {
+            // A parameter: always a register, never spilled.
+            let Some(preg) = self.scopes[0]
+                .slot_of(name)
+                .and_then(super::scopes::Slot::reg)
+            else {
                 continue;
             };
             let breg = self.declare_local(name);

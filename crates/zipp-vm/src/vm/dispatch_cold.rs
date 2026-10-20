@@ -93,6 +93,36 @@ impl<'p> Vm<'p> {
         stop_depth: usize,
     ) -> Result<ColdFlow, Thrown> {
         match *instr {
+            // A function with more locals than the register file addresses
+            // keeps the rest in a spill vector (see `Instr::NewSpill`). It is
+            // an ordinary heap value held in a register, so the collector
+            // traces it and a suspended generator keeps it.
+            Instr::NewSpill { dst, count } => {
+                let slots = vec![Value::UNDEFINED; count as usize];
+                let v = Value::heap(self.heap.alloc(HeapObj::Array(slots)));
+                self.set(base, dst, v);
+                ip += 1;
+            }
+            Instr::LoadSpill { dst, vec, idx } => {
+                let holder = self.get(base, vec).heap_index();
+                let v = match self.heap.get(holder) {
+                    HeapObj::Array(slots) => slots[idx as usize],
+                    _ => unreachable!("a spill register holds its spill vector"),
+                };
+                self.set(base, dst, v);
+                ip += 1;
+            }
+            Instr::StoreSpill { vec, idx, src } => {
+                let holder = self.get(base, vec).heap_index();
+                let v = self.get(base, src);
+                match self.heap.get_mut(holder) {
+                    HeapObj::Array(slots) => slots[idx as usize] = v,
+                    _ => unreachable!("a spill register holds its spill vector"),
+                }
+                // An old vector holding a young value: the next minor must see it.
+                self.heap.write_barrier_val(holder, v);
+                ip += 1;
+            }
             Instr::LoadGlobalDyn { dst, idx } => {
                 // Dynamic-first: the activation's EvalScope may bind
                 // this slot's NAME (a sloppy fn-context eval var).

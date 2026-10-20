@@ -483,6 +483,84 @@ pub(crate) fn pattern_has_yield_or_await(
     }
 }
 
+/// How many names the statements declare for their own function — every
+/// `var`, `let`, `const`, class, function and catch-parameter binding, in
+/// nested blocks too but not in nested functions — and whether a `with`
+/// statement is among them. An over-count is harmless: it only decides
+/// whether a function is large enough to spill (`FnCompiler::start_spill`).
+pub(crate) fn declared_binding_count(body: &[Stmt]) -> (usize, bool) {
+    fn decl_names(d: &crate::parse::ast::VarDecl) -> usize {
+        d.decls
+            .iter()
+            .map(|decl| {
+                let mut names = std::collections::HashSet::new();
+                capture::collect_pattern_names(&decl.id, &mut names);
+                names.len()
+            })
+            .sum()
+    }
+    fn walk(s: &Stmt, count: &mut usize, has_with: &mut bool) {
+        use crate::parse::ast::Stmt as S;
+        match s {
+            S::VarDecl(d) => *count += decl_names(d),
+            S::FnDecl(_) | S::ClassDecl(_) => *count += 1,
+            S::Block(b) => b.iter().for_each(|s| walk(s, count, has_with)),
+            S::If { cons, alt, .. } => {
+                walk(cons, count, has_with);
+                if let Some(a) = alt {
+                    walk(a, count, has_with);
+                }
+            }
+            S::While { body, .. } | S::DoWhile { body, .. } | S::Labeled { body, .. } => {
+                walk(body, count, has_with)
+            }
+            S::For { init, body, .. } => {
+                if let Some(ForInit::Var(d)) = init {
+                    *count += decl_names(d);
+                }
+                walk(body, count, has_with);
+            }
+            S::ForIn { left, body, .. } | S::ForOf { left, body, .. } => {
+                if let ForTarget::Var(d) = left {
+                    *count += decl_names(d);
+                }
+                walk(body, count, has_with);
+            }
+            S::Switch { cases, .. } => cases
+                .iter()
+                .flat_map(|c| c.body.iter())
+                .for_each(|s| walk(s, count, has_with)),
+            S::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                block.iter().for_each(|s| walk(s, count, has_with));
+                if let Some(h) = handler {
+                    *count += 1;
+                    h.body.iter().for_each(|s| walk(s, count, has_with));
+                }
+                if let Some(f) = finalizer {
+                    f.iter().for_each(|s| walk(s, count, has_with));
+                }
+            }
+            S::With { body, .. } => {
+                *has_with = true;
+                walk(body, count, has_with);
+            }
+            S::Export(e) => {
+                if let ExportDecl::Decl(d) = &**e {
+                    walk(d, count, has_with);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut count, mut has_with) = (0, false);
+    body.iter().for_each(|s| walk(s, &mut count, &mut has_with));
+    (count, has_with)
+}
+
 pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut std::collections::HashSet<String>) {
     use crate::parse::ast::Stmt as S;
     match s {

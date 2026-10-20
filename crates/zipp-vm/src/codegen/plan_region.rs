@@ -5685,6 +5685,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::MarkCellConst { reg } => vec![reg],
         Instr::CellGet { cell, .. } => vec![cell],
         Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => vec![cell, src],
+        Instr::LoadSpill { vec, .. } => vec![vec],
+        Instr::StoreSpill { vec, src, .. } => vec![vec, src],
+        Instr::NewSpill { .. } => vec![],
         Instr::MakeArrow { this_reg, .. } => vec![this_reg],
 
         // ── constructors / literals with register operands ──
