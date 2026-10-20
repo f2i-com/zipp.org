@@ -35,9 +35,9 @@ const KEY_STR_CACHE_MAX_BYTES: usize = 64;
 const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
 
 /// `Vm::enum_key_cache`'s bound: the shape ids it has a slot for. Shapes
-/// themselves are bounded (`shape.rs` issues ids up to 4,096); an id past
-/// this would build its list each time as before.
-const ENUM_KEY_CACHE_MAX_SHAPES: usize = 4097;
+/// themselves are bounded (`shape::SHAPE_MAX`); an id past this would build
+/// its list each time as before.
+const ENUM_KEY_CACHE_MAX_SHAPES: usize = crate::shape::SHAPE_MAX + 1;
 
 impl<'p> Vm<'p> {
     /// EnumerableOwnProperties (Object.keys / values / entries).

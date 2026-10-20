@@ -88,7 +88,17 @@ pub const EMPTY: u32 = 1;
 /// wants 54,390 shapes for 18,604 objects. It can never benefit from a
 /// shape-keyed guard, and before this cap it paid ~9% for the privilege of
 /// finding that out on every append.
-const SHAPE_MAX: usize = 4096;
+///
+/// It was 4,096, which an application reaches long before its data does:
+/// the TypeScript, Babel, Prettier and three.js bundles each filled the
+/// table while still loading, and every layout after that — most of their
+/// objects — went `DICT`, with no shape-keyed cache way and no shared key
+/// list. A node costs about 80 bytes plus its key.
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const SHAPE_MAX: usize = 1 << 16;
+/// The safe profile keeps the old bound: the table is outside its heap meter.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const SHAPE_MAX: usize = 4096;
 
 /// Longest key (in bytes) an edge may carry. The table is thread-local, lives
 /// longer than any `Vm`, and is outside the heap meter, so a node count alone
@@ -99,6 +109,9 @@ const SHAPE_KEY_MAX: usize = 256;
 
 /// Total key bytes the table may retain — the byte-denominated twin of
 /// [`SHAPE_MAX`]. Once spent, new edges are refused exactly like a full table.
+#[cfg(not(feature = "safe-sandbox"))]
+const SHAPE_KEY_BYTES_MAX: usize = 4 << 20;
+#[cfg(feature = "safe-sandbox")]
 const SHAPE_KEY_BYTES_MAX: usize = 512 << 10;
 
 /// Fan-out at which a node stops being scanned linearly and gains a hash index.
@@ -247,6 +260,24 @@ fn disabled() -> bool {
     }
 }
 
+/// [`SHAPE_MAX`], or a lower `ZIPP_SHAPE_MAX` (an A/B switch).
+#[inline]
+fn shape_max() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MAX: AtomicUsize = AtomicUsize::new(0);
+    match MAX.load(Ordering::Relaxed) {
+        0 => {
+            let m = std::env::var("ZIPP_SHAPE_MAX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(SHAPE_MAX, |v| v.clamp(2, SHAPE_MAX));
+            MAX.store(m, Ordering::Relaxed);
+            m
+        }
+        m => m,
+    }
+}
+
 /// Pack a property's descriptor flags into the byte that participates in shape
 /// identity. The accessor's setter VALUE is deliberately absent: it is
 /// per-object data, so two objects can share a shape while holding different
@@ -307,7 +338,7 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 }
             }
         }
-        if t.nodes.len() >= SHAPE_MAX || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
+        if t.nodes.len() >= shape_max() || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
             return DICT;
         }
         t.key_bytes += key.len();
