@@ -136,8 +136,8 @@ impl<'a> FnCompiler<'a> {
     fn scope_shape(&self) -> (usize, usize, usize) {
         (
             self.scopes.len(),
-            self.scopes.last().map_or(0, Vec::len),
-            self.scopes.first().map_or(0, Vec::len),
+            self.scopes.last().map_or(0, |s| s.len()),
+            self.scopes.first().map_or(0, |s| s.len()),
         )
     }
 
@@ -941,7 +941,7 @@ impl<'a> FnCompiler<'a> {
             if !d.kind.is_lexical()
                 && decl.init.is_some()
                 && self.scopes.len() > 1
-                && self.scopes[1..].iter().flatten().any(|(n, _)| n == name)
+                && self.scopes[1..].iter().any(|s| s.binds(name))
             {
                 let init = decl.init.as_ref().unwrap();
                 let save = self.next_reg;
@@ -1048,11 +1048,7 @@ impl<'a> FnCompiler<'a> {
             // rather than duplicating. A nested closure over it boxes the slot (the
             // var name is in the capture set). A bare `var x;` never resets `x`.
             if !d.kind.is_lexical() {
-                let existing = self.scopes[0]
-                    .iter()
-                    .rev()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, r)| *r);
+                let existing = self.scopes[0].reg_of(name);
                 let reg = match existing {
                     Some(r) => r,
                     None => {
@@ -1121,9 +1117,7 @@ impl<'a> FnCompiler<'a> {
             // cell; otherwise a fresh binding is allocated.
             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
                 let r = self.scopes[0]
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, r)| *r)
+                    .first_reg_of(name)
                     .unwrap_or_else(|| self.declare_local(name));
                 self.entry_tdz_cells.remove(&r); // TDZ ends here
                 r
@@ -1131,9 +1125,7 @@ impl<'a> FnCompiler<'a> {
                 .scopes
                 .last()
                 .unwrap()
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, r)| *r)
+                .first_reg_of(name)
                 .filter(|r| self.block_tdz_cells.contains(r))
             {
                 // A block-entry pre-created TDZ cell (captured forward-referenced
@@ -1244,14 +1236,12 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn head_var_binding(&mut self, name: &str) -> Binding {
         // Innermost existing binding (catch param / pre-declared var / param).
         for scope in self.scopes.iter().rev() {
-            for (n, r) in scope.iter().rev() {
-                if n == name {
-                    return if self.cell_regs.contains(r) {
-                        Binding::LocalCell(*r)
-                    } else {
-                        Binding::Local(*r)
-                    };
-                }
+            if let Some(r) = scope.reg_of(name) {
+                return if self.cell_regs.contains(&r) {
+                    Binding::LocalCell(r)
+                } else {
+                    Binding::Local(r)
+                };
             }
         }
         if self.is_script && self.cx.script_binds_globals {
@@ -1308,20 +1298,14 @@ impl<'a> FnCompiler<'a> {
                     // Its TDZ ends here: the extraction that follows writes
                     // through `store_binding`, and a checked store would throw on
                     // the very cell it is initializing (`const {z} = {z:9}`).
-                    if let Some(r) = self.scopes[0]
-                        .iter()
-                        .find(|(n, _)| n == &**id)
-                        .map(|(_, r)| *r)
-                    {
+                    if let Some(r) = self.scopes[0].first_reg_of(id) {
                         self.entry_tdz_cells.remove(&r);
                     }
                 } else if let Some(r) = self
                     .scopes
                     .last()
                     .unwrap()
-                    .iter()
-                    .find(|(n, _)| n == &**id)
-                    .map(|(_, r)| *r)
+                    .first_reg_of(id)
                     .filter(|r| self.block_tdz_cells.contains(r))
                 {
                     // The block-entry TDZ cell of this leaf (captured, or
@@ -1370,13 +1354,7 @@ impl<'a> FnCompiler<'a> {
         // the instruction stream between compiles of the same source.
         sorted_name_vec(&names)
             .iter()
-            .filter_map(|n| {
-                self.scopes
-                    .iter()
-                    .rev()
-                    .find_map(|s| s.iter().rev().find(|(nm, _)| nm == n))
-                    .map(|(_, r)| *r)
-            })
+            .filter_map(|n| self.scopes.iter().rev().find_map(|s| s.reg_of(n)))
             .collect()
     }
 

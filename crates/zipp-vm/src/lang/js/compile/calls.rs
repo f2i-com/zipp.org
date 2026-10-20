@@ -771,7 +771,7 @@ impl<'a> FnCompiler<'a> {
         if !self.with_objs_for("Math").is_empty() {
             return None;
         }
-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == "Math")
+        let bound_here = self.scopes.iter().any(|s| s.binds("Math"))
             || self.self_name.as_ref().is_some_and(|(n, _)| n == "Math");
         if !bound_here && self.inherited_with_shadows.contains_key("Math") {
             return None;
@@ -797,7 +797,7 @@ impl<'a> FnCompiler<'a> {
         if name == "arguments" || !self.with_objs_for(name).is_empty() {
             return false;
         }
-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+        let bound_here = self.scopes.iter().any(|s| s.binds(name))
             || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
         if !bound_here && self.inherited_with_shadows.contains_key(name) {
             return false;
@@ -2201,7 +2201,7 @@ impl<'a> FnCompiler<'a> {
         if !self.with_objs_for(name).is_empty() {
             return false;
         }
-        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+        let bound_here = self.scopes.iter().any(|s| s.binds(name))
             || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
         if !bound_here && self.inherited_with_shadows.contains_key(name) {
             return false;

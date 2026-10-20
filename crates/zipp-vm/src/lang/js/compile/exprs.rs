@@ -358,12 +358,7 @@ impl<'a> FnCompiler<'a> {
         {
             return None;
         }
-        let r = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.iter().rev().find(|(n, _)| n == name))
-            .map(|(_, r)| *r)?;
+        let r = self.scopes.iter().rev().find_map(|scope| scope.reg_of(name))?;
         (!self.cell_regs.contains(&r) && !self.const_regs.contains(&r) && !self.is_self_name_reg(r))
             .then_some(r)
     }
