@@ -272,6 +272,16 @@ pub(crate) mod pc {
         fn GetModuleHandleW(name: *const u16) -> usize;
         fn LoadLibraryExA(name: *const u8, file: usize, flags: u32) -> usize;
         fn GetProcAddress(module: usize, name: *const u8) -> usize;
+        fn RtlVirtualUnwind(
+            handler_type: u32,
+            image_base: u64,
+            control_pc: u64,
+            function_entry: *const u8,
+            context: *mut u8,
+            handler_data: *mut *mut core::ffi::c_void,
+            establisher_frame: *mut u64,
+            context_pointers: *mut u8,
+        ) -> *mut core::ffi::c_void;
     }
 
     type SymInitializeFn = unsafe extern "system" fn(Handle, *const u8, i32) -> i32;
@@ -343,8 +353,114 @@ pub(crate) mod pc {
     /// `CONTEXT_AMD64 | CONTEXT_CONTROL` — the control registers only, which is
     /// the cheapest capture that includes `Rip`.
     const CONTEXT_CONTROL: u32 = 0x0010_0001;
+    /// `CONTEXT_FULL`: control, integer and floating-point registers — what
+    /// `RtlVirtualUnwind` restores from a frame (stack mode).
+    const CONTEXT_FULL: u32 = 0x0010_000B;
+    const CONTEXT_RSP_OFF: usize = 0x98;
 
     const MAX_SAMPLES: usize = 1 << 20;
+
+    /// Stack mode (`ZIPP_PROF_STACK=1` with `ZIPP_PROF_PC=1`): each sample also
+    /// records up to `STACK_DEPTH` return addresses, unwound while the engine
+    /// thread is still suspended. The unwind uses the executable's own
+    /// `.pdata`, found by a binary search here, and `RtlVirtualUnwind`, which
+    /// takes no lock and allocates nothing — `RtlLookupFunctionEntry` would
+    /// take the loader's function-table lock, which the suspended thread may
+    /// hold. It stops at the first frame outside the executable (emitted
+    /// code, a system DLL) or one whose stack pointer leaves the engine
+    /// thread's stack. `ZIPP_PROF_STACK_DUMP=<path>` writes one sample per
+    /// line, leaf first.
+    const STACK_DEPTH: usize = 32;
+    const STACK_MAX_SAMPLES: usize = 1 << 17;
+    static STACK_BUF: AtomicUsize = AtomicUsize::new(0);
+    static STACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    /// The image's `RUNTIME_FUNCTION` table (12-byte entries sorted by begin
+    /// RVA) and entry count, the image base and size, and the engine thread's
+    /// stack base (`NT_TIB::StackBase`), all read once when the mode arms.
+    static PDATA: AtomicUsize = AtomicUsize::new(0);
+    static PDATA_LEN: AtomicUsize = AtomicUsize::new(0);
+    static IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+    static IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+    static STACK_HI: AtomicU64 = AtomicU64::new(0);
+
+    fn stack_wanted() -> bool {
+        std::env::var_os("ZIPP_PROF_STACK").is_some()
+    }
+
+    /// The executable's exception directory: `DataDirectory[3]` of the PE32+
+    /// optional header, whose data directories start at 0x70.
+    fn pdata() -> Option<(usize, usize)> {
+        let (base, _) = main_module()?;
+        // SAFETY: our own mapped image's headers, present for the process's life.
+        unsafe {
+            let p = base as *const u8;
+            let pe = std::ptr::read_unaligned(p.add(0x3C) as *const u32) as usize;
+            let opt = p.add(pe + 4 + 20);
+            if std::ptr::read_unaligned(opt as *const u16) != 0x20B {
+                return None;
+            }
+            let rva = std::ptr::read_unaligned(opt.add(0x70 + 3 * 8) as *const u32) as usize;
+            let size = std::ptr::read_unaligned(opt.add(0x70 + 3 * 8 + 4) as *const u32) as usize;
+            (rva != 0 && size >= 12).then(|| (base as usize + rva, size / 12))
+        }
+    }
+
+    /// Unwind the suspended thread's `ctx` into `out` (`STACK_DEPTH` slots,
+    /// leaf first; unused slots stay 0).
+    ///
+    /// # Safety
+    /// The thread `ctx` came from is suspended, `ctx` was captured with
+    /// `CONTEXT_FULL`, and `out` has `STACK_DEPTH` slots.
+    unsafe fn unwind(ctx: &mut Context, out: *const AtomicU64) {
+        let base = IMAGE_BASE.load(Ordering::Relaxed);
+        let end = base + IMAGE_SIZE.load(Ordering::Relaxed);
+        let table = PDATA.load(Ordering::Relaxed) as *const [u32; 3];
+        let n = PDATA_LEN.load(Ordering::Relaxed);
+        let hi = STACK_HI.load(Ordering::Relaxed);
+        let p = ctx.0.as_mut_ptr();
+        for d in 0..STACK_DEPTH {
+            let rip = std::ptr::read(p.add(CONTEXT_RIP_OFF) as *const u64);
+            (*out.add(d)).store(rip, Ordering::Relaxed);
+            let rsp = std::ptr::read(p.add(CONTEXT_RSP_OFF) as *const u64);
+            if rip < base || rip >= end || table.is_null() || rsp & 7 != 0 || rsp + 8 > hi {
+                return;
+            }
+            let rva = (rip - base) as u32;
+            // The last entry beginning at or before `rva`, if it covers it.
+            let (mut lo, mut up) = (0usize, n);
+            while lo < up {
+                let mid = (lo + up) / 2;
+                if (*table.add(mid))[0] <= rva {
+                    lo = mid + 1;
+                } else {
+                    up = mid;
+                }
+            }
+            if lo > 0 && rva < (*table.add(lo - 1))[1] {
+                let mut handler: *mut core::ffi::c_void = std::ptr::null_mut();
+                let mut frame = 0u64;
+                RtlVirtualUnwind(
+                    0,
+                    base,
+                    rip,
+                    table.add(lo - 1) as *const u8,
+                    p,
+                    &mut handler,
+                    &mut frame,
+                    std::ptr::null_mut(),
+                );
+            } else {
+                // A leaf function: no frame, the return address on top.
+                let ret = std::ptr::read(rsp as *const u64);
+                std::ptr::write(p.add(CONTEXT_RIP_OFF) as *mut u64, ret);
+                std::ptr::write(p.add(CONTEXT_RSP_OFF) as *mut u64, rsp + 8);
+            }
+            let next = std::ptr::read(p.add(CONTEXT_RSP_OFF) as *const u64);
+            if next <= rsp || next > hi {
+                return;
+            }
+        }
+    }
 
     static THREAD: AtomicUsize = AtomicUsize::new(0);
     static BUF: AtomicUsize = AtomicUsize::new(0);
@@ -393,6 +509,22 @@ pub(crate) mod pc {
         // formal data race — free on x86-64, where these are plain movs.
         let buf: Box<[AtomicU64]> = (0..MAX_SAMPLES).map(|_| AtomicU64::new(0)).collect();
         BUF.store(Box::leak(buf).as_mut_ptr() as usize, Ordering::Release);
+        if stack_wanted() {
+            if let (Some((base, size)), Some((table, n))) = (main_module(), pdata()) {
+                let hi: u64;
+                // SAFETY: reads this (the engine) thread's NT_TIB::StackBase.
+                unsafe { core::arch::asm!("mov {}, gs:[0x08]", out(reg) hi) };
+                IMAGE_BASE.store(base, Ordering::Relaxed);
+                IMAGE_SIZE.store(size, Ordering::Relaxed);
+                PDATA.store(table, Ordering::Relaxed);
+                PDATA_LEN.store(n, Ordering::Relaxed);
+                STACK_HI.store(hi, Ordering::Relaxed);
+                let stacks: Box<[AtomicU64]> = (0..STACK_MAX_SAMPLES * STACK_DEPTH)
+                    .map(|_| AtomicU64::new(0))
+                    .collect();
+                STACK_BUF.store(Box::leak(stacks).as_mut_ptr() as usize, Ordering::Release);
+            }
+        }
         THREAD.store(dup as usize, Ordering::Release);
     }
 
@@ -419,22 +551,32 @@ pub(crate) mod pc {
 
     fn sample_armed(h: usize, buf: usize) {
         let mut ctx = Context([0u8; CONTEXT_SIZE]);
+        let stacks = STACK_BUF.load(Ordering::Relaxed);
         // SAFETY: `ctx` is a live, correctly aligned CONTEXT-sized buffer, and
         // the suspend window below allocates nothing and takes no lock.
         unsafe {
             std::ptr::write(
                 ctx.0.as_mut_ptr().add(CONTEXT_FLAGS_OFF) as *mut u32,
-                CONTEXT_CONTROL,
+                if stacks != 0 { CONTEXT_FULL } else { CONTEXT_CONTROL },
             );
             if SuspendThread(h as Handle) == u32::MAX {
                 return;
             }
             let got = GetThreadContext(h as Handle, ctx.0.as_mut_ptr());
-            ResumeThread(h as Handle);
             if got == 0 {
+                ResumeThread(h as Handle);
                 return;
             }
             let rip = std::ptr::read(ctx.0.as_ptr().add(CONTEXT_RIP_OFF) as *const u64);
+            if stacks != 0 {
+                let s = STACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                if s < STACK_MAX_SAMPLES {
+                    unwind(&mut ctx, (stacks as *const AtomicU64).add(s * STACK_DEPTH));
+                } else {
+                    STACK_COUNT.store(STACK_MAX_SAMPLES, Ordering::Relaxed);
+                }
+            }
+            ResumeThread(h as Handle);
             let i = COUNT.fetch_add(1, Ordering::Relaxed);
             if i < MAX_SAMPLES {
                 (*(buf as *const AtomicU64).add(i)).store(rip, Ordering::Relaxed);
@@ -622,6 +764,32 @@ pub(crate) mod pc {
                     }
                     _ => out.push_str(&format!("abs:{rip:x}\n")),
                 }
+            }
+            let _ = std::fs::write(path, out);
+        }
+        let stacks = STACK_BUF.load(Ordering::Acquire);
+        if let (true, Some(path)) = (stacks != 0, std::env::var_os("ZIPP_PROF_STACK_DUMP")) {
+            let n = STACK_COUNT.load(Ordering::Relaxed).min(STACK_MAX_SAMPLES);
+            let mut out = String::with_capacity(n * 64);
+            for s in 0..n {
+                for d in 0..STACK_DEPTH {
+                    // SAFETY: `s < n <= STACK_MAX_SAMPLES`, and the buffer is
+                    // quiescent (sampling stopped above).
+                    let a = unsafe {
+                        (*(stacks as *const AtomicU64).add(s * STACK_DEPTH + d)).load(Ordering::Relaxed)
+                    };
+                    if a == 0 {
+                        break;
+                    }
+                    if d > 0 {
+                        out.push(' ');
+                    }
+                    match module {
+                        Some((b, sz)) if a >= b && a < b + sz => out.push_str(&format!("{:x}", a - b)),
+                        _ => out.push_str(&format!("abs:{a:x}")),
+                    }
+                }
+                out.push('\n');
             }
             let _ = std::fs::write(path, out);
         }
