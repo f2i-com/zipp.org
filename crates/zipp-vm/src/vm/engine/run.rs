@@ -731,7 +731,21 @@ impl<'p> Vm<'p> {
         // cap (32) made calling a 300-deep chain a RangeError where Node
         // calls it.
         if callee.is_heap() {
-            if matches!(self.heap.get(callee.heap_index()), HeapObj::Bound { .. }) {
+            if let HeapObj::Bound {
+                target,
+                this: th,
+                args: bargs,
+            } = self.heap.get(callee.heap_index())
+            {
+                // One level with nothing bound — `it.next.bind(it)`, which a
+                // loose-mode `for…of` makes per loop and calls per step — calls
+                // its target with the caller's arguments as they are.
+                let (t, th) = (*target, *th);
+                if bargs.is_empty()
+                    && !(t.is_heap() && matches!(self.heap.get(t.heap_index()), HeapObj::Bound { .. }))
+                {
+                    return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args));
+                }
                 let (t, th, all) = self.unwrap_bound_call(callee, args);
                 return self.with_native_recursion_guard(|vm| vm.call_value(t, th, &all));
             }
