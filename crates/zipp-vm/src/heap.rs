@@ -9120,7 +9120,15 @@ impl Heap {
         // Reuse a reclaimed slot when one is available (its version is bumped so a
         // stale inline-cache entry for the old occupant misses).
         if let Some(idx) = self.free.pop() {
-            self.objs[idx as usize] = obj;
+            // Over the tombstone, as the thin paths install theirs: the
+            // assignment's drop glue was a call and a read of the dead
+            // occupant's tag on every general allocation into a reused slot.
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.reuse_slot_write(idx, obj);
+            #[cfg(feature = "safe-sandbox")]
+            {
+                self.objs[idx as usize] = obj;
+            }
             debug_assert_eq!(self.resident_payload_charged[idx as usize].get(), 0);
             // B197: skip the (always-zero) charge-cell write with accounting
             // off — one less line on the slot-reuse alloc path.
