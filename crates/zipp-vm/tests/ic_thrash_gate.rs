@@ -56,8 +56,7 @@ fn megamorphic_own_read_is_value_identical() {
     assert_eq!(out, vec!["63607810"]);
 }
 
-/// The same shape on the STORE path — `jit_set_prop_miss`'s own-data fill, the
-/// one whose scan-root registration moved inside the fill branch.
+/// The same shape on the STORE path — `jit_set_prop_miss`'s own-data fill.
 #[test]
 fn megamorphic_own_write_is_value_identical() {
     let out = run_ok(
@@ -153,10 +152,9 @@ fn mutation_mid_loop_at_a_thrashing_site() {
     assert_eq!(out, vec!["15177816"]);
 }
 
-/// The scan-root relocation. `jit_set_prop_miss` registers the receiver as a
-/// persistent minor-trace root because a filled way's HITS store with no call
-/// and no barrier; that root now lives inside the fill branch, so a suppressed
-/// fill registers nothing. Stores HEAP values through megamorphic sites, forces
+/// Heap values stored through a thrashing site's ways. A filled way's hits
+/// run the value-grain barrier themselves, and a suppressed fill leaves the
+/// store to the miss helper's barrier. Stores HEAP values through megamorphic sites, forces
 /// minor collections between phases (38 on the release build), and reads every
 /// stored value back afterwards — an under-rooted receiver loses one here.
 #[test]

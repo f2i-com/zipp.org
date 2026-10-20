@@ -5564,8 +5564,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
     // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1, the JIT miss
-    // route. IC-HIT stores make no call — that is what `register_scan_root`
-    // at the fill below is for.
+    // route. IC-HIT stores run the barrier in the emitted probe instead.
     vm.store_barrier(
         crate::heap::gcoracle::JIT_SET_PROP,
         idx,
@@ -5653,7 +5652,6 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     vm.jit.ic_rot_bump(site_idx);
                 } else {
                     vm.jit.set_ic(site_idx, e);
-                    vm.heap.register_scan_root(idx);
                 }
             }
         }
@@ -5844,15 +5842,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
                 vm.jit.ic_rot_bump(site_idx);
             } else {
+                // Nursery: this way's hits run the value-grain barrier
+                // themselves (`emit_ic_probe`'s store arm), so the receiver
+                // needs no persistent minor-trace root.
                 vm.jit.set_ic(site_idx, e);
-                // Nursery: this way's HITS store into `idx` with NO call (the probe's
-                // `mov [vals+slot*8], val`), so no barrier can ever see them.
-                // Register the receiver as a persistent minor-trace root instead —
-                // its edges are re-scanned at every minor for as long as the slot
-                // lives (the way itself dies with the slot's version on free/reuse).
-                // It covers call-free stores through a FILLED way and nothing else,
-                // so a suppressed fill must not register one.
-                vm.heap.register_scan_root(idx);
             }
         }
     }

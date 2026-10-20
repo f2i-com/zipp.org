@@ -5431,7 +5431,10 @@ pub(crate) fn compile_proto_mem(
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
                 emit_ic_probe(
                     &mut ops,
-                    IcProbe::Set { val },
+                    IcProbe::Set {
+                        val,
+                        gen_lane: heap.inline_store_lane_ok,
+                    },
                     obj,
                     off,
                     cont,

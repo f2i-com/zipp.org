@@ -2181,7 +2181,10 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_ic_probe(
                     &mut ops,
-                    IcProbe::Set { val },
+                    IcProbe::Set {
+                        val,
+                        gen_lane: heap.inline_store_lane_ok,
+                    },
                     obj,
                     off,
                     method_write_cont,

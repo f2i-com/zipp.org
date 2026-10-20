@@ -223,9 +223,9 @@ fn nursery_parity_collection_churn_keeps_live_collections_exact() {
 /// point at a NEW young object (the in-place data store: no key add, no
 /// version bump, the exact write the stage-3 barrier exists for). The holders
 /// are hot enough that the JIT's SetProp IC fills for them, so the same run
-/// also exercises the call-free-way scan-root registration: after the fill,
-/// stores to those receivers make NO helper call, and only the persistent
-/// scan root keeps their young referents alive across minors.
+/// also exercises the way's own barrier: after the fill, stores to those
+/// receivers make no miss-helper call, and only the barrier the hit runs
+/// keeps their young referents alive across minors.
 #[test]
 fn nursery_parity_old_field_overwrite_reaches_young() {
     let n = scaled(300_000);

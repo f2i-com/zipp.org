@@ -47,7 +47,8 @@
 //! an old-holder/young-value store, and every such store runs a write
 //! barrier (`Heap::write_barrier[_val]` at the enumerated VM chokepoints) or
 //! targets a registered scan root (`Heap::register_scan_root` — receivers
-//! JIT caches store into call-free), or lands in a root-like VM side table,
+//! baked method-inline setters store into barrier-free), or lands in a
+//! root-like VM side table,
 //! which the root walk re-scans wholesale each minor. Holder-keyed side tables
 //! such as `closure_home` and `closure_new_target` are directed edges instead:
 //! their record helpers run this same barrier and tracing visits the value only

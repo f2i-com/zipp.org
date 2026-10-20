@@ -7292,8 +7292,8 @@ pub struct Heap {
     /// `GEN_OLD` by [`Heap::remset_reset`] at the end of each minor.
     remset: Vec<u32>,
     /// Stage-3 PERSISTENT trace roots: receivers a JIT cache can store into
-    /// with NO helper call (a filled SetProp data way; a baked method-inline
-    /// trivial-setter arm). Those stores can never run a barrier, so their
+    /// with NO barrier (a baked method-inline trivial-setter arm; a SetProp
+    /// way's hit runs the barrier itself). Those stores never see one, so their
     /// targets' edges are re-scanned at EVERY minor instead — sound because
     /// the set of such receivers is exactly what the fill sites registered.
     /// Deduped by `GEN_SCAN`; an entry self-expires when its slot is recycled
@@ -9565,13 +9565,12 @@ impl Heap {
         self.remset.push(holder);
     }
 
-    /// Register `holder` as a PERSISTENT minor-trace root: a JIT cache was
-    /// just filled (or a plan baked) that can store into it CALL-FREE, so no
-    /// barrier will ever see those stores. Every minor re-scans its edges
-    /// instead. Sticky until the slot is recycled (`alloc` clears the bit and
-    /// the minor prune drops the entry); bounded by the number of distinct
-    /// receivers ever filled into a Set-capable way, which the 8-way IC and
-    /// the ≤8-arm method-inline plans keep small in practice.
+    /// Register `holder` as a PERSISTENT minor-trace root: a plan was just
+    /// baked that can store into it CALL-FREE, so no barrier will ever see
+    /// those stores. Every minor re-scans its edges instead. Sticky until the
+    /// slot is recycled (`alloc` clears the bit and the minor prune drops the
+    /// entry); bounded by the ≤8-arm method-inline plans. Not for IC ways: a
+    /// receiver per fill, kept for the receiver's life, grew without bound.
     #[inline]
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     pub fn register_scan_root(&mut self, holder: u32) {

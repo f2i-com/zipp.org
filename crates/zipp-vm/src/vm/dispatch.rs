@@ -2925,8 +2925,8 @@ impl<'p> Vm<'p> {
                                 // SetProp{obj:0} — `mov [vals_ptr+slot*8]`),
                                 // so no barrier ever sees it. Register every
                                 // storing arm's receiver as a persistent
-                                // minor-trace root instead (same rule as the
-                                // SetProp IC data-way fill).
+                                // minor-trace root instead (at most eight arms
+                                // per site, baked into the code).
                                 if self.heap.nursery_on() {
                                     for plan in method_plan.values() {
                                         for shape in &plan.shapes {
