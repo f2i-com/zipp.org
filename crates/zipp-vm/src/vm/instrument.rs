@@ -463,6 +463,11 @@ pub(crate) struct Recorder {
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
     pub(crate) ceiling_gc_pending: bool,
+    /// The recorder this one replaced (`Vm::set_instrumentation`) had found
+    /// the heap at its ceiling: convicted, or waiting on a collection for
+    /// it. `ScriptState::set_heap_limit` collects a heap the last budget left
+    /// at its ceiling, and only that one.
+    pub(crate) heap_ceiling_reached: bool,
     /// What the first heap walk after the latest major found (`growth_major`
     /// names that major): the level in-place growth is measured from. The
     /// collector schedules on what it allocates, and an Array filled by
@@ -587,6 +592,7 @@ impl Recorder {
             #[cfg(feature = "safe-sandbox")]
             regex_began_on_full_heap: std::cell::Cell::new(false),
             ceiling_gc_pending: false,
+            heap_ceiling_reached: false,
             growth_level: 0,
             growth_major: u64::MAX,
             growth_gc_pending: false,
@@ -787,6 +793,15 @@ impl Recorder {
             .wrapping_add(self.ticks)
             .wrapping_add(self.elapsed(hot) as u64)
             .saturating_sub(self.steps_base)
+    }
+
+    /// Whether this budget found the heap at its ceiling: it convicted on
+    /// it, a poll is waiting on the collection it asked for, or the budget
+    /// it replaced did either (`heap_ceiling_reached`).
+    pub(crate) fn heap_ceiling_reached(&self) -> bool {
+        self.heap_ceiling_reached
+            || self.ceiling_gc_pending
+            || matches!(self.exhaustion, Some(ResourceExhaustion::Heap))
     }
 
     #[inline]

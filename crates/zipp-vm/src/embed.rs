@@ -794,19 +794,34 @@ impl ScriptState {
     pub fn set_heap_limit(&mut self, bytes: usize) {
         self.with_vm(|vm| {
             vm.meter_fold();
-            if let Some(rec) = vm.instr_rec.as_mut() {
-                rec.heap_limit = bytes;
-                rec.ceiling_gc_pending = false;
-            }
+            let reached = match vm.instr_rec.as_mut() {
+                Some(rec) => {
+                    let reached = rec.heap_ceiling_reached();
+                    rec.heap_limit = bytes;
+                    rec.ceiling_gc_pending = false;
+                    rec.heap_ceiling_reached = false;
+                    reached
+                }
+                None => false,
+            };
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
-            // Re-arming between entries starts a budget on what is alive, not
-            // on what a previous entry left for the collector: a heap past half
-            // the ceiling is collected now, while no frame runs. After a script
-            // filled the heap and dropped it, the next entry would otherwise
-            // need a slot-table doubling before any collection had freed the
-            // dead objects' slots (f2i-com/zipp.org#55).
-            if bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
+            // Re-arming after a budget that found the heap at its ceiling
+            // starts the next one on what is alive, not on what the previous
+            // entry left for the collector: a heap past half the ceiling is
+            // collected now, while no frame runs. After a script filled the
+            // heap and dropped it, the next entry would otherwise need a
+            // slot-table doubling before any collection had freed the dead
+            // objects' slots (f2i-com/zipp.org#55).
+            //
+            // Only then. A host that re-arms before every entry paid a full
+            // collection per entry for as long as its live heap stayed past
+            // half the ceiling, with nothing exhausted: 15 ms a call at
+            // 265 MB (f2i-com/zipp.org#73). Garbage an entry leaves under
+            // the ceiling is the collector's schedule's to find, and a poll
+            // that finds the heap over the ceiling asks for a collection
+            // before it convicts.
+            if reached && bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
                 vm.collect_major_now();
             }
         });
