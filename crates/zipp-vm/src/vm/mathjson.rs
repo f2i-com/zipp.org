@@ -2237,6 +2237,8 @@ impl<'p> Vm<'p> {
         if pretenure {
             self.heap.pretenure_begin();
         }
+        // A parsed document's keys are data (`shape::data_keys`).
+        let _data = crate::shape::data_keys();
         let r = self.json_parse_scoped(src);
         if pretenure {
             self.heap.pretenure_end();
@@ -2597,6 +2599,7 @@ impl<'p> Vm<'p> {
         if pretenure {
             self.heap.pretenure_begin();
         }
+        let _data = crate::shape::data_keys();
         let r = self.json_parse_with_src_scoped(src);
         if pretenure {
             self.heap.pretenure_end();

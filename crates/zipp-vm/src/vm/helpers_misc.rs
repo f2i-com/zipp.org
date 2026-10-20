@@ -2129,6 +2129,8 @@ pub(crate) extern "win64" fn jit_set_index(
             }
             if let Some(k) = new_key {
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                    // A computed key that appends is data (`shape::data_keys`).
+                    let _data = crate::shape::data_keys();
                     m.push_data(k, Value::from_bits(val_bits));
                     vm.heap.bump_version(oidx); // a key add reallocs `vals`
                     return 0;

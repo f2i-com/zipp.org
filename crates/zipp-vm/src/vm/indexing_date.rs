@@ -971,6 +971,8 @@ impl<'p> Vm<'p> {
         if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Object(_)) {
             self.heap.flatten(key.heap_index());
         }
+        // A computed key that appends is data (`shape::data_keys`).
+        let _data = key.is_heap().then(crate::shape::data_keys);
         // FAST PATH: a plain-object computed write whose flat string key hits an
         // own WRITABLE DATA property stores straight into the ObjMap slot — the
         // twin of get_index's fast read (no key String materialization, no shape
@@ -1375,6 +1377,8 @@ impl<'p> Vm<'p> {
         strict: bool,
         func_id: u32,
     ) -> Result<(), Thrown> {
+        // A computed key that appends is data (`shape::data_keys`).
+        let _data = crate::shape::data_keys();
         if key.is_int() && obj.is_heap() {
             let mut scratch = std::mem::take(&mut self.idx_key_scratch);
             self.build_concat_key(&mut scratch, name, key.as_int(), func_id);

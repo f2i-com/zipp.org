@@ -260,6 +260,52 @@ fn disabled() -> bool {
     }
 }
 
+/// The cap for a shape minted inside a [`data_keys`] scope: the table size
+/// past which a computed key or a parsed JSON key no longer mints one.
+const DATA_SHAPE_MAX: usize = 4096;
+
+thread_local! {
+    /// Open [`data_keys`] scopes on this thread.
+    static DATA_KEYS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A scope in which the keys appended are data: a computed member store's
+/// (`o[k] = v`) and `JSON.parse`'s. Inside it a new shape is minted only
+/// while the table holds fewer than [`DATA_SHAPE_MAX`]; existing transitions
+/// are still followed. Code's own layouts (`o.x = v`, literals, class
+/// fields) keep the whole table: a bundled application needs tens of
+/// thousands of them, while keys built from data (`json-large`'s
+/// `obj[word + "_" + j]`, its parse back) are effectively unique, and
+/// minting a shape for each made that benchmark 7% slower for nothing a
+/// cache could use.
+pub(crate) struct DataKeys(());
+
+/// `ZIPP_NO_DATA_KEYS=1`: a data key mints shapes like any other (A/B).
+fn data_keys_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_DATA_KEYS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn data_keys() -> DataKeys {
+    DATA_KEYS.with(|c| c.set(c.get() + 1));
+    DataKeys(())
+}
+
+impl Drop for DataKeys {
+    fn drop(&mut self) {
+        DATA_KEYS.with(|c| c.set(c.get() - 1));
+    }
+}
+
 /// [`SHAPE_MAX`], or a lower `ZIPP_SHAPE_MAX` (an A/B switch).
 #[inline]
 fn shape_max() -> usize {
@@ -338,7 +384,12 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 }
             }
         }
-        if t.nodes.len() >= shape_max() || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
+        let cap = if DATA_KEYS.with(|c| c.get()) > 0 && data_keys_enabled() {
+            DATA_SHAPE_MAX.min(shape_max())
+        } else {
+            shape_max()
+        };
+        if t.nodes.len() >= cap || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
             return DICT;
         }
         t.key_bytes += key.len();
