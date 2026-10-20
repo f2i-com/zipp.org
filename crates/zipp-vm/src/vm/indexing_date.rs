@@ -166,6 +166,36 @@ impl<'p> Vm<'p> {
         Some(s)
     }
 
+    /// `arr[sym]` for the ordinary Array `oidx` and the Symbol `kidx`, when
+    /// the array holds no own properties beyond its elements, its
+    /// [[Prototype]] is this realm's %Array.prototype%, and that object has
+    /// a data property under the symbol: that property's value. The general
+    /// path copied the symbol's key string (`key_of`) and walked the member
+    /// lookup to reach the same slot. Anything else is `None`, and the
+    /// general path answers.
+    fn array_symbol_proto_get(&self, oidx: u32, kidx: u32) -> Option<Value> {
+        let HeapObj::Symbol { prop_key, .. } = self.heap.get(kidx) else {
+            return None;
+        };
+        if !matches!(self.heap.get(oidx), HeapObj::Array(_))
+            || self.arr_props.contains_key(&oidx)
+            || self.arguments_objs.contains_key(&oidx)
+            || self.proto_of.contains_key(&oidx)
+            || self.arr_proto == 0
+        {
+            return None;
+        }
+        let HeapObj::Object(pm) = self.heap.get(self.arr_proto) else {
+            return None;
+        };
+        let i = pm.pos(prop_key)?;
+        if pm.attr_at(i).accessor {
+            return None;
+        }
+        let v = pm.val_at(i);
+        (!v.is_uninitialized()).then_some(v)
+    }
+
     /// Record that `oidx` has the key `kidx` at `slot` (see `keyed_memo_slot`).
     #[inline]
     pub(crate) fn keyed_memo_put(&mut self, oidx: u32, kidx: u32, slot: usize) {
@@ -485,6 +515,14 @@ impl<'p> Vm<'p> {
             }
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
+        }
+        // FAST PATH: a Symbol-keyed read of an ordinary Array's inherited
+        // member (`arr[Symbol.iterator]`, which every loose-mode for...of and
+        // spread helper makes once per loop).
+        if key.is_heap() {
+            if let Some(v) = self.array_symbol_proto_get(obj.heap_index(), key.heap_index()) {
+                return Ok(v);
+            }
         }
         // FAST PATH: a plain-object computed read whose flat string key hits an
         // own DATA property answers straight from the ObjMap, with the key's
