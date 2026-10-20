@@ -26,6 +26,42 @@ fn poly_fid_crosscall_enabled() -> bool {
     }
 }
 
+/// B270: for each `Call` in `code`, the nearest preceding instruction (in
+/// code order) that writes its callee register, when that is an `UpvalGet`
+/// or a `LoadGlobal` — the two shapes `cross_callee_from_definition`
+/// resolves. Any other recognised writer (`writes_reg`, the int-tier table,
+/// which does not know `UpvalGet`) hides the definitions before it. One
+/// forward pass: a backward scan per call made a plan for a bundle's
+/// module function, thousands of calls long, quadratic in its length.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn call_callee_writers(code: &[Instr]) -> rustc_hash::FxHashMap<usize, usize> {
+    const HIDDEN: usize = usize::MAX;
+    let mut last: rustc_hash::FxHashMap<u16, usize> = rustc_hash::FxHashMap::default();
+    let mut out = rustc_hash::FxHashMap::default();
+    for (j, ins) in code.iter().enumerate() {
+        if let Instr::Call { callee, .. } = *ins {
+            if let Some(&w) = last.get(&callee) {
+                if w != HIDDEN {
+                    out.insert(j, w);
+                }
+            }
+        }
+        let def = match *ins {
+            Instr::UpvalGet { dst, .. } | Instr::LoadGlobal { dst, .. } => Some(dst),
+            _ => None,
+        };
+        if let Some(r) = crate::codegen::writes_reg(ins) {
+            if def != Some(r) {
+                last.insert(r, HIDDEN);
+            }
+        }
+        if let Some(dst) = def {
+            last.insert(dst, j);
+        }
+    }
+    out
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn computed_drop_obj_is_observable(
     code: &[Instr],
@@ -1992,34 +2028,17 @@ impl<'p> Vm<'p> {
     /// function yields `None`. A compile-time hint only — no IC fill, no side
     /// effect — so an unsound choice of writer costs a guard miss, never
     /// correctness.
+    ///
+    /// `writer` is the definition `call_callee_writers` found for the site.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn cross_callee_from_definition(
         &self,
         func_id: u32,
         ip: usize,
+        writer: Option<usize>,
         exemplar_base: Option<usize>,
     ) -> Option<(u64, u32, u32, u32)> {
-        if !crate::codegen::cross_def_callee_enabled() {
-            return None;
-        }
         let code = &self.func(func_id as usize).code;
-        let Instr::Call { callee, .. } = *code.get(ip)? else {
-            return None;
-        };
-        // Nearest preceding writer of the callee register. The two shapes this
-        // resolves are matched by hand: `writes_reg` is the int-tier table and
-        // does not know `UpvalGet`; any other recognised writer ends the scan.
-        let mut writer = None;
-        for j in (0..ip).rev() {
-            match code[j] {
-                Instr::UpvalGet { dst, .. } | Instr::LoadGlobal { dst, .. } if dst == callee => {
-                    writer = Some(j);
-                    break;
-                }
-                ref other if crate::codegen::writes_reg(other) == Some(callee) => return None,
-                _ => {}
-            }
-        }
         let writer = writer?;
         let value = match code[writer] {
             Instr::UpvalGet { idx, .. } => {
@@ -2078,6 +2097,11 @@ impl<'p> Vm<'p> {
             return (plan, pending, baked);
         }
         let caller = self.func(func_id as usize);
+        let writers = if crate::codegen::cross_def_callee_enabled() {
+            call_callee_writers(&caller.code)
+        } else {
+            rustc_hash::FxHashMap::default()
+        };
         for (ip, instr) in caller.code.iter().enumerate() {
             let Instr::Call { argc, .. } = *instr else {
                 continue;
@@ -2120,8 +2144,10 @@ impl<'p> Vm<'p> {
             // slot read in the live exemplar frame. The plan only needs a fid
             // to bake against; every lane it produces revalidates the live
             // callee per call and falls through to the helper on a mismatch.
-            let live =
-                live.or_else(|| self.cross_callee_from_definition(func_id, ip, exemplar_base));
+            let live = live.or_else(|| {
+                let writer = writers.get(&ip).copied();
+                self.cross_callee_from_definition(func_id, ip, writer, exemplar_base)
+            });
             let Some((_bits, _ver, fid, _closure)) = live else {
                 continue;
             };
