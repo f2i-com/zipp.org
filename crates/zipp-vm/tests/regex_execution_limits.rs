@@ -1,6 +1,9 @@
 //! Safe-profile hard limits for work and transient storage inside one RegExp
-//! instruction. These failures are host-terminal: guest `try`/`catch` cannot
-//! resume execution after the regex engine reaches a ceiling.
+//! instruction. Running out of the VM's step budget or the heap headroom
+//! inside a search is host-terminal: guest `try`/`catch` cannot resume after
+//! it. Reaching only the per-search step ceiling (`set_regex_step_limit`) is
+//! a `RangeError` the script catches, with the work charged to the budget
+//! (f2i-com/zipp.org#69).
 
 #![cfg(feature = "safe-sandbox")]
 
@@ -75,6 +78,127 @@ fn catastrophic_backtracking_is_a_sticky_host_failure() {
     );
     assert_eq!(state.resource_limit_error(), Some(message.as_str()));
     assert!(state.steps_used() <= 512, "regex work overspent VM gas");
+}
+
+/// The script of f2i-com/zipp.org#69 in a VM with limits set and budget to
+/// spare: the per-search ceiling stops the catastrophic match, the script
+/// catches the RangeError and goes on, and the steps the search took are
+/// charged to the budget.
+const ISSUE_69: &str = r#"
+    function attempt() {
+        let r;
+        try { r = /^(a+)+$/.test("a".repeat(22) + "!"); } catch (e) { r = "caught " + e.name; }
+        return r + " " + (globalThis.after = "after");
+    }
+"#;
+
+#[test]
+fn per_search_step_ceiling_is_a_catchable_range_error() {
+    let mut state = embed::compile_script(ISSUE_69).expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(100_000_000, None);
+    let before = state.steps_used();
+
+    let value = state
+        .call_slot(slot(&state, "attempt"), &[])
+        .expect("the script resumes after catching");
+    assert_eq!(value, HostValue::String("caught RangeError after".into()));
+    assert_eq!(state.resource_limit_error(), None);
+    assert!(
+        state.steps_used() - before >= 16 * 1024 * 1024,
+        "the stopped search's work must be charged to the budget"
+    );
+
+    // And the VM stays usable for the next entry.
+    let again = state
+        .call_slot(slot(&state, "attempt"), &[])
+        .expect("a later entry runs too");
+    assert_eq!(again, HostValue::String("caught RangeError after".into()));
+}
+
+#[test]
+fn raised_regex_step_limit_lets_the_search_finish() {
+    let mut state = embed::compile_script(ISSUE_69).expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(2_000_000_000, None);
+    state.set_regex_step_limit(1_000_000_000);
+
+    let value = state
+        .call_slot(slot(&state, "attempt"), &[])
+        .expect("the search completes under the raised ceiling");
+    assert_eq!(value, HostValue::String("false after".into()));
+    assert_eq!(state.resource_limit_error(), None);
+}
+
+#[test]
+fn lowered_regex_step_limit_stops_a_search_catchably() {
+    let mut state = embed::compile_script(
+        r#"
+        function modest() {
+            try { return String(/(a|aa)+$/.test("aaaaaaaaaaaaaaaa!")); }
+            catch (e) { return "caught " + e.name + ": " + e.message; }
+        }
+        "#,
+    )
+    .expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(10_000_000, None);
+    state.set_regex_step_limit(1_000);
+
+    let value = state
+        .call_slot(slot(&state, "modest"), &[])
+        .expect("the script resumes after catching");
+    assert_eq!(
+        value,
+        HostValue::String("caught RangeError: regular expression exceeded its execution budget".into())
+    );
+    assert_eq!(state.resource_limit_error(), None);
+}
+
+#[test]
+fn search_that_runs_out_the_vm_budget_stays_terminal_under_a_raised_ceiling() {
+    let mut state = embed::compile_script(ISSUE_69).expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(100_000, None);
+    state.set_regex_step_limit(1_000_000_000);
+
+    let message = state
+        .call_slot(slot(&state, "attempt"), &[])
+        .expect_err("the budget, not the ceiling, stops this search");
+    assert!(
+        message.contains("regular expression exceeded its execution budget"),
+        "unexpected failure: {message}"
+    );
+    assert_eq!(state.resource_limit_error(), Some(message.as_str()));
+    assert!(state.steps_used() <= 100_000, "regex work overspent VM gas");
+}
+
+/// f2i-com/zipp.org#70: a script that fills its heap, with a linear regex
+/// in its loop. Whichever check sees the full heap first, the heap's budget
+/// is what ran out; the regex, which needs a few bytes, is not named.
+#[test]
+fn a_full_heap_seen_first_by_a_regex_is_the_heaps_exhaustion() {
+    let mut state = embed::compile_script("").expect("script compiles");
+    state.run_init().expect("script initializes");
+    state.set_limits(u64::MAX, None);
+    state.set_heap_limit(16 * 1024 * 1024);
+
+    let message = state
+        .eval_in_context(
+            r#"
+            var keep = [];
+            for (let i = 0; i < 3e6; i++) {
+              keep.push({ a: ["x" + i, "y" + i, "z" + i], n: i });
+              if (i % 100 === 0) /^(0|[1-9][0-9]*)$/.test(String(i));
+            }
+            "#,
+        )
+        .expect_err("the heap fills");
+    assert!(
+        message.contains("script exceeded its memory budget"),
+        "unexpected failure: {message}"
+    );
+    assert_eq!(state.resource_limit_error(), Some(message.as_str()));
 }
 
 #[test]

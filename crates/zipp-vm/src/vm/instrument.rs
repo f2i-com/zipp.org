@@ -445,6 +445,20 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// The most backtracking steps one regular-expression search may take:
+    /// `regress::MatchLimits::SANDBOX`'s unless the host set another
+    /// (`ScriptState::set_regex_step_limit`). Reaching it is a catchable
+    /// `RangeError`; running out of the VM's own budget inside a search is
+    /// not (`Vm::instrument_regex_usage`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) regex_step_limit: u64,
+    /// Whether the latest search began with the heap by itself, regex
+    /// storage reserved around the search aside, already at `heap_limit`
+    /// (`Vm::instrument_regex_limits`), so that a refusal of its storage is
+    /// the heap's exhaustion and not the search's
+    /// (`Vm::instrument_regex_memory_exhausted`).
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) regex_began_on_full_heap: std::cell::Cell<bool>,
     /// A poll found the heap over `heap_limit` and asked for a major
     /// collection instead of convicting: the poll that follows that
     /// collection decides. See `instrument_heap_poll_inner`.
@@ -568,6 +582,10 @@ impl Recorder {
             steps_base: 0,
             abort: None,
             heap_limit: usize::MAX,
+            #[cfg(feature = "safe-sandbox")]
+            regex_step_limit: regress::MatchLimits::SANDBOX.max_steps,
+            #[cfg(feature = "safe-sandbox")]
+            regex_began_on_full_heap: std::cell::Cell::new(false),
             ceiling_gc_pending: false,
             growth_level: 0,
             growth_major: u64::MAX,
@@ -1048,6 +1066,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
         };
+        limits.max_steps = rec.regex_step_limit;
         if let Some(left) = rec.finite_remaining(hot) {
             limits.max_steps = limits.max_steps.min(left);
         }
@@ -1067,6 +1086,12 @@ impl super::Vm<'_> {
                 .saturating_sub(transient);
             limits.max_memory_bytes = limits.max_memory_bytes.min(headroom);
             limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+            // The heap by itself, not the regex storage reserved around this
+            // search: an outer operation's retained matches are regex storage.
+            rec.regex_began_on_full_heap
+                .set(self.heap_bytes_estimate() >= rec.heap_limit);
+        } else {
+            rec.regex_began_on_full_heap.set(false);
         }
         limits
     }
@@ -1207,9 +1232,27 @@ impl super::Vm<'_> {
         );
     }
 
+    /// Record that a regex's working storage was refused. When the search
+    /// began with the heap by itself already at its ceiling
+    /// (`instrument_regex_limits`) and the heap is still there, the heap's
+    /// budget is what ran out: a linear search that needed a few bytes was
+    /// only the first check to see a full heap, and naming the regex sent the
+    /// host after a runaway pattern that did not exist (f2i-com/zipp.org#70).
+    /// Storage that outgrew the headroom a search began with, including the
+    /// heap strings its own captures made and the matches an outer operation
+    /// retains, is still the regex's.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
-        let cause = ResourceExhaustion::RegexMemory;
+        let heap_full = self.instr_rec.as_ref().is_some_and(|rec| {
+            rec.heap_limit != usize::MAX
+                && rec.regex_began_on_full_heap.get()
+                && self.heap_bytes_estimate() >= rec.heap_limit
+        });
+        let cause = if heap_full {
+            ResourceExhaustion::Heap
+        } else {
+            ResourceExhaustion::RegexMemory
+        };
         match rec_mut!(self) {
             Some(rec) => rec.exhaust(cause),
             None => cause.message(),
@@ -1217,8 +1260,17 @@ impl super::Vm<'_> {
     }
 
     /// Reconcile completed regex work with the VM recorder before any match
-    /// result becomes observable. A regex-local ceiling is a sticky host
-    /// resource failure, not a catchable JS exception that can be ignored.
+    /// result becomes observable. The work is charged to the VM's budget
+    /// first, so what a search spent is spent whichever way it ends.
+    ///
+    /// A search stopped by its own step ceiling (`regex_step_limit`, 16M
+    /// steps by default) while the VM's budget still has room is a
+    /// `RangeError` the script can catch, as it is without a recorder: the
+    /// budget is intact, and a page's script survives one slow regex in a
+    /// library (f2i-com/zipp.org#69). One stopped because the VM's remaining
+    /// budget ran out inside it is that budget's exhaustion, sticky like
+    /// any other. The backtrack-memory ceiling, which guards the embedder's
+    /// heap limit, stays sticky too.
     #[cfg(feature = "safe-sandbox")]
     pub(crate) fn instrument_regex_usage(&mut self, usage: regress::MatchUsage) -> Tick {
         self.charge_steps(usage.steps.min(i64::MAX as u64) as i64);
@@ -1228,12 +1280,21 @@ impl super::Vm<'_> {
             Some(regress::MatchLimitError::BacktrackMemory) => ResourceExhaustion::RegexMemory,
         };
         if cause == ResourceExhaustion::RegexMemory {
-            Err(self.instrument_regex_memory_exhausted())
-        } else {
-            match rec_mut!(self) {
-                Some(rec) => Err(rec.exhaust(cause)),
-                None => Err(cause.message()),
+            return Err(self.instrument_regex_memory_exhausted());
+        }
+        let hot = self.meter_hot();
+        match rec_mut!(self) {
+            Some(rec) => {
+                if let Some(message) = rec.terminal_message() {
+                    return Err(message);
+                }
+                if rec.finite_remaining(hot) == Some(0) {
+                    Err(rec.exhaust(cause))
+                } else {
+                    Err(cause.message())
+                }
             }
+            None => Err(cause.message()),
         }
     }
 
