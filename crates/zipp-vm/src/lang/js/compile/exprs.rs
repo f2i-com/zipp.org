@@ -33,33 +33,19 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
 }
 
 /// Whether the code being compiled can only ever be interpreted: a build
-/// without the JIT, or a process run with `ZIPP_NOJIT`, which no VM of the
-/// process can switch back on (`Vm::new` reads it and the embedding's
-/// `enable_vm_jit` declines to override it). Such code can drop the copies
-/// the JIT's pattern matchers expect (`expr_discarded`): in the interpreter
-/// of the JIT build that was 4% of the real and hostile suites (geomean of
-/// 28 rows, 11% on `types-stable`). `ZIPP_KEEP_JIT_COPIES=1` keeps them,
-/// for A/B.
+/// without the JIT. Such code can drop the copies the JIT's pattern matchers
+/// expect (`expr_discarded`).
+///
+/// Not a process run with `ZIPP_NOJIT`: the bytecode a JIT build compiles
+/// must not depend on whether its JIT runs, or a metered VM stops at another
+/// step and heap figure with the JIT off than on (str_append_index's
+/// `reserved_first_builder_tiny_heap_boundary_matches_all_modes`, in CI's
+/// workspace lane, where `instrument` and the JIT meet). Dropping the copies
+/// under `ZIPP_NOJIT` had bought 4% of the interpreter's real and hostile
+/// suites; an interpreter-only rewrite belongs in `FusedCode`, which keeps
+/// the bytecode's length and positions.
 pub(crate) fn interp_only_bytecode() -> bool {
-    #[cfg(not(feature = "jit"))]
-    {
-        true
-    }
-    #[cfg(feature = "jit")]
-    {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static STATE: AtomicU8 = AtomicU8::new(0);
-        match STATE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => {
-                let off = std::env::var_os("ZIPP_NOJIT").is_some()
-                    && std::env::var_os("ZIPP_KEEP_JIT_COPIES").is_none();
-                STATE.store(if off { 1 } else { 2 }, Ordering::Relaxed);
-                off
-            }
-        }
-    }
+    cfg!(not(feature = "jit"))
 }
 
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
