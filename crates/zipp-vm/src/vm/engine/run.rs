@@ -750,7 +750,23 @@ impl<'p> Vm<'p> {
                         // takes that trip: it switches realm context.
                         HeapObj::Native(id) if self.realm_global_objs.is_empty() => {
                             let id = *id;
-                            return self.with_native_recursion_guard(|vm| vm.call_native(id, th, args));
+                            return self.with_native_recursion_guard(|vm| {
+                                // An array's iterator, the usual target: the
+                                // `ITER_NEXT` arm's own array step and result,
+                                // without `call_native`'s frame. That arm asks
+                                // the RegExp String Iterator table first, so
+                                // this only runs while the table is empty.
+                                if id == crate::vm::native::ITER_NEXT
+                                    && th.is_heap()
+                                    && vm.regexp_string_iters.is_empty()
+                                {
+                                    if let Some(step) = vm.array_iter_step(th.heap_index()) {
+                                        let (v, done) = step?;
+                                        return Ok(vm.iter_result(v, done));
+                                    }
+                                }
+                                vm.call_native(id, th, args)
+                            });
                         }
                         _ => return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args)),
                     }

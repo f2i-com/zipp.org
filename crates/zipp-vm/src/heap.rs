@@ -8277,6 +8277,23 @@ impl Heap {
         self.alloc_finalized(plan, vals, shape)
     }
 
+    /// [`Heap::alloc_finalized`] for a plan that lives as long as the
+    /// process (an engine-made object such as an iterator result): borrowed
+    /// like a literal site's, with no unsafe contract left to the caller.
+    #[inline]
+    pub(crate) fn alloc_finalized_static(
+        &mut self,
+        plan: &'static crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        // SAFETY: a `'static` plan outlives this heap.
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { self.alloc_finalized_borrowed(plan, vals, shape) };
+        #[cfg(feature = "safe-sandbox")]
+        self.alloc_finalized(plan, vals, shape)
+    }
+
     /// B257: the thin twin of [`Heap::alloc_finalized`] — the same slab
     /// cell, pool pop and in-place refit, with the allocation-mode latches
     /// already folded into `thin_alloc` and the occupant installed by

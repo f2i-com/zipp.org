@@ -1503,6 +1503,13 @@ impl<'p> Vm<'p> {
     /// Main-realm calls pay only the same single Option check.
     pub(crate) fn alloc_object_current_realm(&mut self, map: ObjMap) -> Value {
         let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        self.adopt_current_realm_object(idx)
+    }
+
+    /// The realm half of [`Vm::alloc_object_current_realm`], for an ordinary
+    /// object `idx` the caller has just allocated by another route.
+    #[inline]
+    pub(crate) fn adopt_current_realm_object(&mut self, idx: u32) -> Value {
         if let Some(r) = self.native_callee_realm {
             let home = self.native_home(self.obj_proto);
             if home != self.obj_proto {

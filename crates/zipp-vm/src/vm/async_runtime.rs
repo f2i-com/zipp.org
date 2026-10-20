@@ -1307,10 +1307,11 @@ impl<'p> Vm<'p> {
     /// CreateIterResultObject: `{value, done}`, an ordinary object with two
     /// data properties in that order.
     ///
-    /// Built from one key plan the VM keeps (`iter_result_plan`, with the
-    /// shape the two appends reach), as an object literal is: each result
-    /// used to own its two key strings and take two shape transitions, three
-    /// allocations and two table walks for every `next()` of every iterator.
+    /// Allocated as an object literal is (`Heap::alloc_finalized`: a pooled
+    /// shell, the values in a slab cell) from one process-wide key plan and
+    /// the shape the two appends reach (`iter_result_shape`): each result
+    /// used to build a fresh map around a value vector and drop whatever its
+    /// slot last held, for every `next()` of every iterator.
     pub(crate) fn iter_result(&mut self, value: Value, done: bool) -> Value {
         if !crate::bytecode::static_key_plans_enabled() {
             let mut map = ObjMap::new();
@@ -1318,18 +1319,22 @@ impl<'p> Vm<'p> {
             map.set("done", Value::bool(done));
             return self.alloc_object_current_realm(map);
         }
-        let (plan, shape) = match &self.iter_result_plan {
-            Some((plan, shape)) => (plan.clone(), *shape),
+        static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> =
+            std::sync::OnceLock::new();
+        let plan = PLAN.get_or_init(|| {
+            crate::bytecode::StaticKeyPlan::new(vec!["value".into(), "done".into()])
+        });
+        let shape = match self.iter_result_shape {
+            Some(shape) => shape,
             None => {
-                let plan = crate::bytecode::StaticKeyPlan::new(vec!["value".into(), "done".into()]);
                 let data = crate::shape::attr_bits(true, true, true, false);
                 let shape = crate::shape::add(crate::shape::add(crate::shape::EMPTY, "value", data), "done", data);
-                self.iter_result_plan = Some((plan.clone(), shape));
-                (plan, shape)
+                self.iter_result_shape = Some(shape);
+                shape
             }
         };
-        let map = ObjMap::finalized_from_plan(plan, vec![value, Value::bool(done)], shape);
-        self.alloc_object_current_realm(map)
+        let idx = self.heap.alloc_finalized_static(plan, &[value, Value::bool(done)], shape);
+        self.adopt_current_realm_object(idx)
     }
 
     // ── promises / microtasks ──

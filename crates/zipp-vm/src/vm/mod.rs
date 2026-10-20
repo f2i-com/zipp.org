@@ -2908,10 +2908,9 @@ pub struct Vm<'p> {
     /// (fid, plan) keys are append-only over the program + eval tables, so an
     /// entry can never alias a different plan.
     finalize_shapes: rustc_hash::FxHashMap<(u32, u16), u32>,
-    /// The key plan of an iterator result object (`["value", "done"]`) and
-    /// the shape two data appends of those keys reach, made at the first
-    /// result (`Vm::iter_result`).
-    iter_result_plan: Option<(crate::bytecode::StaticKeyPlan, u32)>,
+    /// The shape two data appends of `value` and `done` reach, the layout of
+    /// an iterator result object, made at the first result (`Vm::iter_result`).
+    iter_result_shape: Option<u32>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.
