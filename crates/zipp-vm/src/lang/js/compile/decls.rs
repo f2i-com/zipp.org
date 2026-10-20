@@ -774,32 +774,44 @@ impl<'a> FnCompiler<'a> {
                 self.pattern_block_local = block_local;
                 self.declare_pattern(&decl.id, !d.kind.is_lexical())?;
                 let save = self.next_reg;
-                // TOP-LEVEL global-bound leaves: INITIALIZE each slot before
-                // extraction. The extraction stores are assignment-flavored —
-                // in STRICT code (a module body) StoreGlobalStrict throws on
-                // an UNINITIALIZED slot, so the leaves' TDZ must end at this
-                // statement, not at the store. Lexical leaves also register
+                // TOP-LEVEL global-bound leaves. A `var` leaf's slot is set
+                // before extraction: the extraction stores are
+                // assignment-flavored, and in STRICT code (a module body)
+                // StoreGlobalStrict throws on an UNINITIALIZED slot. A lexical
+                // leaf is instead initialized BY the extraction, one
+                // `StoreGlobal` per leaf as `const x = 1` emits
+                // (`pattern_init_globals`): set beforehand, the extraction was
+                // a `const`'s second write, which a $262.evalScript's const
+                // rejects (f2i-com/zipp.org#75), and a leaf whose extraction
+                // never ran left its TDZ anyway. Lexical leaves also register
                 // like their simple-identifier siblings (const immutability,
                 // module per-module slots, script-GDI bookkeeping).
                 if self.is_script && self.cx.script_binds_globals && !block_local {
                     let mut leaves = std::collections::HashSet::new();
                     capture::collect_pattern_names(&decl.id, &mut leaves);
-                    let undef = self.alloc_reg();
-                    self.emit(Instr::LoadUndefined { dst: undef });
+                    let undef = if d.kind.is_lexical() {
+                        None
+                    } else {
+                        let undef = self.alloc_reg();
+                        self.emit(Instr::LoadUndefined { dst: undef });
+                        Some(undef)
+                    };
                     // Sorted: this emits one store per leaf (and may hand out
                     // new global slots), in this order.
                     for n in sorted_name_vec(&leaves) {
                         let slot = self.cx.global_slot(&n) as u32;
-                        if d.kind.is_lexical() {
-                            self.cx.lexical_globals.insert(slot);
+                        match undef {
+                            // (NOT const_globals yet: the extraction's
+                            // initializing stores must stay writable.)
+                            None => {
+                                self.cx.lexical_globals.insert(slot);
+                                self.pattern_init_globals.insert(slot);
+                            }
+                            Some(undef) => self.emit(Instr::StoreGlobal {
+                                idx: slot,
+                                src: undef,
+                            }),
                         }
-                        // (NOT const_globals: the extraction itself stores
-                        // through store_binding, which throws for a known
-                        // const — initialization must stay writable.)
-                        self.emit(Instr::StoreGlobal {
-                            idx: slot,
-                            src: undef,
-                        });
                     }
                 }
                 let src = self.alloc_reg();
@@ -824,7 +836,9 @@ impl<'a> FnCompiler<'a> {
                 if sv != src {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
-                self.extract_pattern(&decl.id, src)?;
+                let extracted = self.extract_pattern(&decl.id, src);
+                self.pattern_init_globals.clear();
+                extracted?;
                 // `const {a} = o` / `const [a] = xs`: the leaves are immutable
                 // too. Recorded only NOW — the extraction above stores through
                 // `store_binding`, which would reject its own initialization —
@@ -1374,6 +1388,18 @@ impl<'a> FnCompiler<'a> {
         match pat {
             P::Ident(id) => {
                 let b = self.resolve(id);
+                // A top-level lexical declaration's leaf: this store is its
+                // initialization, as the simple-identifier path emits it.
+                if let Binding::Global(idx) = b {
+                    if self.pattern_init_globals.remove(&idx) {
+                        if self.box_all_locals || self.cx.dyn_global_zone {
+                            self.emit(Instr::StoreGlobalDyn { idx, src });
+                        } else {
+                            self.emit(Instr::StoreGlobal { idx, src });
+                        }
+                        return Ok(());
+                    }
+                }
                 self.store_binding(&b, src);
                 Ok(())
             }

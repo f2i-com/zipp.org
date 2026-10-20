@@ -569,6 +569,11 @@ struct FnCompiler<'a> {
     /// (not globals), mirroring the simple-identifier `let`/`const` path — block
     /// `let {a} = …` must not leak to the global scope. Off everywhere else.
     pattern_block_local: bool,
+    /// The global slots of a top-level lexical destructuring declaration's
+    /// leaves, set around its extraction: each leaf's store is the binding's
+    /// initialization (`StoreGlobal`, as `const x = 1` emits), not an
+    /// assignment, and leaves the set once made. Empty everywhere else.
+    pattern_init_globals: std::collections::HashSet<u32>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
     /// True while compiling an `async` body, so `await` is allowed.
