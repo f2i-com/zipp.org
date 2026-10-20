@@ -2487,6 +2487,12 @@ pub struct Vm<'p> {
     /// instance and honour `newTarget.prototype`.
     weakref_ctor: u32,
     finreg_ctor: u32,
+    /// `TextEncoder` / `TextDecoder` (vm/text_codec.rs): their prototypes and
+    /// constructor objects.
+    text_encoder_proto: u32,
+    text_decoder_proto: u32,
+    text_encoder_ctor: u32,
+    text_decoder_ctor: u32,
     /// The `WeakMap` / `WeakSet` constructor objects, so the value-form
     /// `[[Construct]]` (Reflect.construct / subclassing) builds an instance,
     /// honours `newTarget.prototype`, and AddEntriesFromIterable via the adder.
@@ -3426,6 +3432,7 @@ mod dtf_pattern;
 mod enum_stream;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
+mod text_codec;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

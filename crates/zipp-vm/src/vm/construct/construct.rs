@@ -658,6 +658,10 @@ impl<'p> Vm<'p> {
             let wr = Value::heap(wr_idx);
             return Ok(self.set_ctor_proto(wr, over));
         }
+        if (ci == self.text_encoder_ctor || ci == self.text_decoder_ctor) && ci != 0 {
+            let decoder = ci == self.text_decoder_ctor;
+            return self.text_codec_construct(decoder, args, new_target, cv);
+        }
         if ci == self.finreg_ctor && ci != 0 {
             let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
             if self.type_of(cb) != "function" {
@@ -1582,6 +1586,63 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // `class D extends TextDecoder` (or TextEncoder): build the real codec
+        // from the label and options and move it into the instance; the
+        // prototype methods brand-check for it.
+        if cval.is_heap()
+            && self.text_encoder_ctor != 0
+            && (cval.heap_index() == self.text_encoder_ctor
+                || cval.heap_index() == self.text_decoder_ctor)
+        {
+            let decoder = cval.heap_index() == self.text_decoder_ctor;
+            let tv = self.text_codec_construct(decoder, args, Value::UNDEFINED, cval)?;
+            let cloned = self::copy_builtin_instance!(self.heap.get(tv.heap_index()));
+            self.heap.replace(oidx, cloned);
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class W extends WeakRef`: the instance holds the target weakly, as
+        // `new WeakRef(t)` does (it stayed a plain Object, and `deref` threw).
+        if cval.is_heap() && cval.heap_index() == self.weakref_ctor && self.weakref_ctor != 0 {
+            let t = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !self.can_be_held_weakly(t) {
+                return Err(Thrown::from_static(
+                    "TypeError: WeakRef: target cannot be held weakly",
+                ));
+            }
+            self.keep_during_job(t);
+            self.heap.replace(oidx, HeapObj::WeakRef(t));
+            self.register_weak_container(oidx);
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class R extends FinalizationRegistry`, likewise.
+        if cval.is_heap() && cval.heap_index() == self.finreg_ctor && self.finreg_ctor != 0 {
+            let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if self.type_of(cb) != "function" {
+                return Err(Thrown::from_static(
+                    "TypeError: FinalizationRegistry: cleanup callback must be callable",
+                ));
+            }
+            self.heap.replace(
+                oidx,
+                HeapObj::FinalizationRegistry {
+                    cleanup: cb,
+                    cells: Vec::new(),
+                    cleared: Vec::new(),
+                    cleanup_queued: false,
+                },
+            );
+            self.register_weak_container(oidx);
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
         // `class D extends DataView`: build a real DataView through the builtin
         // ctor and move it into the instance (the buffer heap index is shared
         // correctly by the clone; the dv_tracking side-set flag is carried like
@@ -1890,6 +1951,7 @@ fn clone_builtin_instance(obj: &HeapObj) -> HeapObj {
         },
         HeapObj::Boxed { kind, value } => HeapObj::Boxed { kind: *kind, value: *value },
         HeapObj::Date(value) => HeapObj::Date(*value),
+        HeapObj::TextCodec(c) => HeapObj::TextCodec(*c),
         HeapObj::RegExp { regex, source, flags, last_index, ascii_twin } => HeapObj::RegExp {
             regex: regex.clone(), source: source.clone(), flags: flags.clone(),
             last_index: *last_index, ascii_twin: ascii_twin.clone(),

@@ -654,6 +654,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakMap { .. }
                 | HeapObj::WeakSet(_)
                 | HeapObj::WeakRef(_)
+                | HeapObj::TextCodec(_)
                 | HeapObj::FinalizationRegistry { .. }
                 | HeapObj::RegExp { .. }
                 | HeapObj::Symbol { .. }
