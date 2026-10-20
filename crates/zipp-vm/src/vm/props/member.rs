@@ -5,6 +5,18 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Whether `Vm::callable_name_length` answers for the builtin `id` (its
+/// `HeapObj::Native` arm), without building the name.
+fn native_has_name_length(id: u16) -> bool {
+    (native::BUFFER_GETTER_BASE..native::BUFFER_GETTER_BASE + native::BUFFER_GETTERS.len() as u16)
+        .contains(&id)
+        || (native::SAB_GETTER_BASE..native::SAB_GETTER_BASE + native::SAB_GETTERS.len() as u16)
+            .contains(&id)
+        || native::proto_method(id).is_some()
+        || native::math_method(id).is_some()
+        || native::static_name_length(id).is_some()
+}
+
 /// The RegExp flag character a per-flag accessor name reports, if the name is
 /// one of the eight. Lets a `re.global`-style read be answered from the flag
 /// string in place, with no allocation and no prototype walk.
@@ -458,13 +470,25 @@ impl<'p> Vm<'p> {
                 }
                 // A bound function F: name is "bound " + target.name, and length is
                 // max(0, target.length - boundArgsCount) when the target has a
-                // numeric length (BoundFunctionCreate / SetFunctionLength+Name). Read
-                // the target's EFFECTIVE name/length so a `defineProperty`-redefined
-                // value flows through to the bound function.
+                // numeric length (BoundFunctionCreate / SetFunctionLength+Name).
+                // `bind` leaves these to be derived here only for a target whose
+                // name and length were its intrinsics at bind time
+                // (`bind_lazy_name_length_ok`), so read those intrinsics: they
+                // are what the bind would have read, and a later redefinition
+                // must not reach the bound function. Other targets (the
+                // engine's own internal bound functions) read the EFFECTIVE
+                // name/length.
                 let nbound = args.len() as f64;
-                let (tname, tlen) = self
-                    .effective_name_length(*target)
-                    .unwrap_or((String::new(), 0.0));
+                let plain = matches!(
+                    self.heap.get(target.heap_index()),
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_)
+                );
+                let (tname, tlen) = if plain {
+                    self.callable_name_length(*target)
+                } else {
+                    self.effective_name_length(*target)
+                }
+                .unwrap_or((String::new(), 0.0));
                 // L = max(0, ToIntegerOrInfinity(target.length) − boundArgs): a +Inf
                 // target length stays +Inf; the f64 channel avoids the i32 overflow
                 // a 2^31 length would hit.
@@ -640,7 +664,64 @@ impl<'p> Vm<'p> {
         if has_explicit_own {
             return false;
         }
-        self.callable_name_length(obj).is_some()
+        self.callable_has_name_length(obj)
+    }
+
+    /// Whether `callable_name_length` answers for `obj`, without building the
+    /// name it would return: a function's `length` read, and every
+    /// `name`/`length` existence check, allocated and freed one.
+    fn callable_has_name_length(&self, obj: Value) -> bool {
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::Class(_) => true,
+            HeapObj::Bound { target, .. } => target.is_heap(),
+            HeapObj::Native(id) => native_has_name_length(*id),
+            _ => false,
+        }
+    }
+
+    /// Whether `bind` may leave its bound function's `name` and `length` to be
+    /// derived when they are read (`callable_name_length`'s Bound arm) rather
+    /// than defining them as own properties now. True when the target is a
+    /// user function or a builtin whose `name` and `length` are still its
+    /// intrinsics: then the spec's HasOwnProperty and the two Gets have no
+    /// effect, and the intrinsics they read are immutable function data — a
+    /// later redefinition of the target's own `name` lands in `fn_props` and
+    /// does not reach them — so deriving later gives what reading now would.
+    /// The eager form cost a side-table map, two owned keys, two strings and
+    /// four hash inserts per bind; a loose-mode `for…of` binds once per loop.
+    pub(crate) fn bind_lazy_name_length_ok(&self, target: Value) -> bool {
+        if !target.is_heap() {
+            return false;
+        }
+        let idx = target.heap_index();
+        let plain = match self.heap.get(idx) {
+            HeapObj::Func(_) | HeapObj::Closure { .. } => true,
+            HeapObj::Native(id) => native_has_name_length(*id),
+            _ => false,
+        };
+        plain
+            && !self.deleted_callable_intrinsics.contains(&(idx, 0))
+            && !self.deleted_callable_intrinsics.contains(&(idx, 1))
+            && !self
+                .fn_props
+                .get(&idx)
+                .is_some_and(|m| m.pos("name").is_some() || m.pos("length").is_some())
+    }
+
+    /// A user function's or class's `length` intrinsic, which needs no name.
+    fn plain_callable_length(&self, obj: Value) -> Option<f64> {
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Func(fid) => Some(self.func(*fid as usize).length as f64),
+            HeapObj::Closure { func, .. } => Some(self.func(*func as usize).length as f64),
+            HeapObj::Class(c) => Some(c.ctor.map_or(0.0, |f| self.func(f as usize).length as f64)),
+            _ => None,
+        }
     }
 
     /// Whether a callable owns a `prototype` data property. Per spec only some
@@ -679,7 +760,10 @@ impl<'p> Vm<'p> {
         if !self.callable_has_intrinsic(obj, key) {
             return None;
         }
-        let (nm, len) = self.callable_name_length(obj)?;
+        let (nm, len) = match self.plain_callable_length(obj) {
+            Some(len) if key == "length" => (String::new(), len),
+            _ => self.callable_name_length(obj)?,
+        };
         Some(if key == "name" {
             self.alloc_str(nm)
         } else if len.is_finite() && len >= 0.0 && len <= i32::MAX as f64 && len.fract() == 0.0 {

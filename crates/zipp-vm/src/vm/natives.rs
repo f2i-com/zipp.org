@@ -3156,6 +3156,21 @@ impl<'p> Vm<'p> {
                 // reads below, so a Proxy target's getPrototypeOf trap fires first
                 // — and its result is then held un-rooted across those (re-entrant)
                 // reads, so GC has to stay suspended until it lands in `proto_of`.
+                if self.bind_lazy_name_length_ok(this) {
+                    // A plain target: no step below can run guest code, and
+                    // the name and length are derived when read.
+                    let bound_proto = self.object_get_prototype_of(this);
+                    let bound: Vec<Value> = args.get(1..).map_or_else(Vec::new, <[Value]>::to_vec);
+                    let idx = self.heap.alloc(HeapObj::Bound {
+                        target: this,
+                        this: a0,
+                        args: bound,
+                    });
+                    if self.object_get_prototype_of(Value::heap(idx)) != bound_proto {
+                        self.proto_of.insert(idx, bound_proto);
+                    }
+                    return Ok(Value::heap(idx));
+                }
                 let _gc = self.gc_lock_guard();
                 let bound_proto = self.object_get_prototype_of(this);
                 // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
