@@ -2505,9 +2505,9 @@ impl<'p> Vm<'p> {
         };
         #[cfg(feature = "safe-sandbox")]
         {
-            const MAX_SAFE_REGEX_PATTERN_BYTES: usize = 16 << 10;
+            // 16 KiB unless the host moved it (`SandboxCaps::regex_pattern_bytes`).
             let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
-            if source.len().max(exact_len) > MAX_SAFE_REGEX_PATTERN_BYTES {
+            if source.len().max(exact_len) > self.sandbox_caps.regex_pattern_bytes {
                 return Err(Thrown::from_static(
                     "RangeError: regular expression pattern exceeds the sandbox limit",
                 ));

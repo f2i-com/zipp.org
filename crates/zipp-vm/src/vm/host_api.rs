@@ -453,6 +453,75 @@ pub struct ResourceUsage {
     pub program_source_bytes: usize,
 }
 
+/// The `safe-sandbox` profile's fixed caps on what ordinary content can make
+/// the engine do, each of which a host may raise or lower per VM
+/// ([`crate::embed::ScriptState::set_sandbox_caps`], f2i-com/zipp.org#69).
+/// [`SandboxCaps::DEFAULT`] holds the values the profile has always enforced,
+/// so a host that sets nothing keeps them. Reaching a cap throws a
+/// `RangeError` the script can catch.
+///
+/// Each cap is clamped to [`SandboxCaps::MAX`]. The two depths are native
+/// recursion: every level of JSON nesting or of arrays nested in one `join`
+/// is a native frame (up to a few KiB each), so a host that raises them must
+/// give the thread that runs the VM the stack for the depth it allows (the
+/// `zipp` CLI runs on 256 MiB). The defaults fit a WebAssembly stack.
+#[cfg(feature = "safe-sandbox")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxCaps {
+    /// Bytes of one regular expression's source, `new RegExp` or literal
+    /// (16 KiB; at most 1 MiB, where the compiled program's own 4 MiB cap
+    /// takes over). Group nesting is bounded separately.
+    pub regex_pattern_bytes: usize,
+    /// Arrays nested inside one `Array.prototype.join`, `toString` or
+    /// `toLocaleString` (4; at most 1,024, the ordinary profile's limit).
+    pub array_stringify_depth: usize,
+    /// Levels of nesting `JSON.parse`, `JSON.stringify` and a reviver walk
+    /// accept (64; at most 1,000). Pretty printing keeps one indentation
+    /// string per level, quadratic in the depth and outside the heap
+    /// ceiling: about 5 MB at 1,000 levels of a 10-character indent.
+    pub json_nesting_depth: usize,
+    /// Bits in one BigInt's magnitude (2^20, about 128 KiB; at most 2^30,
+    /// V8's limit). A result is built before the heap ceiling sees it, so
+    /// this also bounds how far one shift or power can overshoot the ceiling.
+    pub bigint_bits: u64,
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl SandboxCaps {
+    /// What the profile enforces when the host sets nothing.
+    pub const DEFAULT: Self = Self {
+        regex_pattern_bytes: 16 << 10,
+        array_stringify_depth: 4,
+        json_nesting_depth: 64,
+        bigint_bits: 1 << 20,
+    };
+
+    /// The most each cap may be raised to.
+    pub const MAX: Self = Self {
+        regex_pattern_bytes: 1 << 20,
+        array_stringify_depth: 1_024,
+        json_nesting_depth: 1_000,
+        bigint_bits: 1 << 30,
+    };
+
+    /// `self` with each cap brought down to [`Self::MAX`].
+    pub fn clamped(self) -> Self {
+        Self {
+            regex_pattern_bytes: self.regex_pattern_bytes.min(Self::MAX.regex_pattern_bytes),
+            array_stringify_depth: self.array_stringify_depth.min(Self::MAX.array_stringify_depth),
+            json_nesting_depth: self.json_nesting_depth.min(Self::MAX.json_nesting_depth),
+            bigint_bits: self.bigint_bits.min(Self::MAX.bigint_bits),
+        }
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl Default for SandboxCaps {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Bytes a dynamically installed function definition owns (see
 /// [`ResourceUsage::retained_function_bytes`]).
 fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {

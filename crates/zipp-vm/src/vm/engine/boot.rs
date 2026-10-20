@@ -340,6 +340,8 @@ impl<'p> Vm<'p> {
             matchall_flat_scratch: Vec::new(),
             regex_subject_units: None,
             #[cfg(feature = "safe-sandbox")]
+            sandbox_caps: crate::vm::host_api::SandboxCaps::DEFAULT,
+            #[cfg(feature = "safe-sandbox")]
             regex_transient_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regexp_scalar_exec_pending: None,

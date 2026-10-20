@@ -684,7 +684,10 @@ every figure below that the engine owns is read back from `zippProfile()`, the
 JSON record the module exports of its own limits and semantics, so a host can
 inspect what it loaded rather than trust this page. The rows the table does not
 cover that way (string, regex, BigInt, array and nesting ceilings) come from
-`zipp-vm`'s own constants.
+`zipp-vm`'s own constants. Four of them — the regex pattern size, the BigInt
+magnitude, `join` recursion and JSON nesting — are `SandboxCaps::DEFAULT`,
+which a native `zipp-vm` embedder of the `safe-sandbox` profile can move per
+VM with `ScriptState::set_sandbox_caps`; this module keeps the defaults.
 
 | Resource | Limit |
 | --- | ---: |

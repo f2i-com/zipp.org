@@ -7,8 +7,9 @@ use crate::heap::{
 };
 use crate::value::Value;
 
-#[cfg(feature = "safe-sandbox")]
-const MAX_ARRAY_STRINGIFY_DEPTH: usize = 4;
+/// Arrays nested in one join in the ordinary engine. The hardened profile
+/// allows 4 by default and lets the host move it
+/// (`SandboxCaps::array_stringify_depth`).
 #[cfg(not(feature = "safe-sandbox"))]
 const MAX_ARRAY_STRINGIFY_DEPTH: usize = 1_024;
 
@@ -384,7 +385,11 @@ impl<'p> Vm<'p> {
         if self.array_stringify_active.contains(&idx) {
             return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
         }
-        if self.array_stringify_active.len() >= MAX_ARRAY_STRINGIFY_DEPTH {
+        #[cfg(feature = "safe-sandbox")]
+        let max_depth = self.sandbox_caps.array_stringify_depth;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let max_depth = MAX_ARRAY_STRINGIFY_DEPTH;
+        if self.array_stringify_active.len() >= max_depth {
             return Err(Thrown::from_static(
                 "RangeError: array stringification nesting limit exceeded",
             ));

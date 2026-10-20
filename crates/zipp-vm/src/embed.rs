@@ -38,6 +38,8 @@ pub use crate::vm::host_api::{
     DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
 pub use crate::vm::host_api::{HostCallCtx, HostCtx};
+#[cfg(feature = "safe-sandbox")]
+pub use crate::vm::host_api::SandboxCaps;
 /// The execution-trace row and its opcode contract. Full `instrument` builds
 /// expose the `ScriptState::start_trace` control API; the artifact-internal
 /// `meter-only` profile deliberately does not.
@@ -858,6 +860,21 @@ impl ScriptState {
                 rec.regex_step_limit = max_steps;
             }
         });
+    }
+
+    /// Set this VM's regex pattern, array join, JSON nesting and BigInt
+    /// caps — see [`SandboxCaps`]. Each is clamped to [`SandboxCaps::MAX`]
+    /// and takes effect at the next operation it bounds. Unlike the budgets,
+    /// it needs no [`Self::set_limits`]: the caps hold with or without one.
+    #[cfg(feature = "safe-sandbox")]
+    pub fn set_sandbox_caps(&mut self, caps: SandboxCaps) {
+        self.with_vm(|vm| vm.sandbox_caps = caps.clamped());
+    }
+
+    /// The caps in force — see [`Self::set_sandbox_caps`].
+    #[cfg(feature = "safe-sandbox")]
+    pub fn sandbox_caps(&self) -> SandboxCaps {
+        self.vm().map_or(SandboxCaps::DEFAULT, |vm| vm.sandbox_caps)
     }
 
     /// How many functions this state has compiled at run time (`eval`,
