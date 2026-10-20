@@ -75,6 +75,45 @@ pub(crate) const IC_WAYS: usize = 8;
 const IC_MISS_LIMIT: u8 = 16;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
+
+/// `Vm::own_slot_cache`'s size, a power of two.
+pub(crate) const OWN_SLOT_CACHE_SLOTS: usize = 4096;
+
+/// One answer of [`Vm::own_pos`]: in an object of shape `shape`, the key of
+/// `len` bytes held zero-padded in `w0`/`w1` is at `slot`, or absent when
+/// `slot` is `u32::MAX`. `shape` is never `DICT`, so the empty entry (shape
+/// 0) matches nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnSlot {
+    shape: u32,
+    len: u32,
+    slot: u32,
+    w0: u64,
+    w1: u64,
+}
+
+impl OwnSlot {
+    pub(crate) const EMPTY: OwnSlot = OwnSlot { shape: crate::shape::DICT, len: 0, slot: 0, w0: 0, w1: 0 };
+}
+
+/// A key of at most 16 bytes as two little-endian words, zero-padded.
+#[inline(always)]
+fn key_words(b: &[u8]) -> (u64, u64) {
+    let mut buf = [0u8; 16];
+    buf[..b.len()].copy_from_slice(b);
+    let (lo, hi) = buf.split_at(8);
+    (
+        u64::from_le_bytes(lo.try_into().expect("8 bytes")),
+        u64::from_le_bytes(hi.try_into().expect("8 bytes")),
+    )
+}
+
+#[inline(always)]
+fn own_slot_index(shape: u32, w0: u64, len: usize) -> usize {
+    let h = (shape as u64 | (len as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ w0.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    (h >> (64 - OWN_SLOT_CACHE_SLOTS.trailing_zeros())) as usize
+}
 #[cfg(all(feature = "meter-only", not(feature = "jit")))]
 pub(crate) const IC_NO_FIB_GLOBAL: u32 = u32::MAX;
 
@@ -645,7 +684,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) if !m.is_ctor => m,
             _ => return Walked::No,
         };
-        if let Some(i) = m.pos(key) {
+        if let Some(i) = self.own_pos(m, key) {
             return if m.attr_at(i).accessor {
                 Walked::OwnAcc { slot: i }
             } else {
@@ -675,6 +714,43 @@ impl<'p> Vm<'p> {
         }
         // Plain-object proto_of chain, recording (idx, version) per hop.
         self.ic_walk_chain(idx, key)
+    }
+
+    /// `m.pos(key)`, answered from `own_slot_cache` when `m` has a shape and
+    /// `key` is at most 16 bytes.
+    ///
+    /// A site that sees many layouts — Babel's `node.type`, `path.node`, the
+    /// AST walkers of every bundled compiler — misses its shape-keyed ways on
+    /// most reads, and each miss hashed the key and compared it against the
+    /// object's heap-allocated key string (a quarter of a miss-heavy profile,
+    /// and the set path asked twice). An object's shape fixes its key
+    /// sequence, and shapes are never reissued, so one (shape, key) answer —
+    /// a slot, or absent — holds for every object of that shape for the
+    /// VM's life. Keys are compared by their bytes, not by address.
+    #[inline]
+    pub(crate) fn own_pos(&self, m: &ObjMap, key: &str) -> Option<usize> {
+        let sh = m.shape();
+        let b = key.as_bytes();
+        if sh == crate::shape::DICT || b.len() > 16 {
+            return m.pos(key);
+        }
+        let (w0, w1) = key_words(b);
+        let cell = &self.own_slot_cache[own_slot_index(sh, w0, b.len())];
+        let e = cell.get();
+        if e.shape == sh && e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 {
+            let r = (e.slot != u32::MAX).then_some(e.slot as usize);
+            debug_assert_eq!(r, m.pos(key), "own_slot_cache: a stale answer for {key:?}");
+            return r;
+        }
+        let r = m.pos(key);
+        cell.set(OwnSlot {
+            shape: sh,
+            len: b.len() as u32,
+            slot: r.map_or(u32::MAX, |s| s as u32),
+            w0,
+            w1,
+        });
+        r
     }
 
     /// The proto-chain leg of [`Vm::ic_walk`], starting from the link OUT of
@@ -724,7 +800,7 @@ impl<'p> Vm<'p> {
             };
             hops.0[hops.1 as usize] = (next, self.heap.version_of(next));
             hops.1 += 1;
-            if let Some(i) = m2.pos(key) {
+            if let Some(i) = self.own_pos(m2, key) {
                 return if m2.attr_at(i).accessor {
                     Walked::ChainAcc {
                         first,
@@ -1155,7 +1231,7 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    let own = m.pos(key);
+                    let own = self.own_pos(m, key);
                     // In a pure-interpreter VM, `own` has already answered the
                     // static site's complete own-property question against the
                     // LIVE map. Once the first-way shape shortcut misses, do
@@ -1674,7 +1750,7 @@ impl<'p> Vm<'p> {
                     // Dictionary receivers, unsafe/invalidated first ways, and
                     // shape misses retain the complete old lookup and way scan.
                     if plan.is_none() {
-                        let own = m.pos(key);
+                        let own = self.own_pos(m, key);
                         for e in &site.entries[..site.n as usize] {
                             if let Some(p) = self.ic_validate_set(e, idx, m, own) {
                                 plan = Some(p);

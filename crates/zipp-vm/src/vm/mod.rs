@@ -1625,6 +1625,9 @@ pub struct Vm<'p> {
     /// `o`'s own properties: a direct-mapped table of (receiver, key, slot)
     /// that predicts the slot, which every use verifies (`keyed_memo_slot`).
     pub(crate) keyed_slot_memo: Box<[indexing_date::KeyedSlotMemo]>,
+    /// Where a shaped object holds a named key, or that it does not
+    /// (`Vm::own_pos`): a direct-mapped table keyed by (shape, key bytes).
+    pub(crate) own_slot_cache: Box<[std::cell::Cell<ic::OwnSlot>]>,
     /// JSON.stringify fast-path cache: `(obj_proto version, arr_proto version,
     /// either default prototype has a callable `toJSON`)`. Keyed on the two proto
     /// shape versions so any mutation that adds/removes `toJSON` on the default

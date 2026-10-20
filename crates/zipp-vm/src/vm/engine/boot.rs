@@ -259,6 +259,9 @@ impl<'p> Vm<'p> {
                 crate::vm::indexing_date::KEYED_SLOT_MEMO_SLOTS
             ]
             .into_boxed_slice(),
+            own_slot_cache: (0..crate::vm::ic::OWN_SLOT_CACHE_SLOTS)
+                .map(|_| std::cell::Cell::new(crate::vm::ic::OwnSlot::EMPTY))
+                .collect(),
             json_default_tj: None,
             site_ics: Vec::new(),
             #[cfg(feature = "python")]
