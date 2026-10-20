@@ -120,9 +120,17 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
             && self.gen_method_pristine(iter.heap_index(), "next")
         {
-            let res = self
-                .generator_method(iter.heap_index(), "next", &[])?
-                .unwrap_or(Value::UNDEFINED);
+            // The step as a value, without the result object `next` would
+            // make (a `yield*` forwarding a user iterator's result is read).
+            let res = match self.generator_next_step(iter.heap_index())? {
+                Some(crate::vm::async_runtime::GenStep::Yield(v)) => {
+                    self.note_iterator_drain_step()?;
+                    return Ok(Some(v));
+                }
+                Some(crate::vm::async_runtime::GenStep::Done(_)) => return Ok(None),
+                Some(crate::vm::async_runtime::GenStep::Raw(r)) => r,
+                None => Value::UNDEFINED,
+            };
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
                 return Ok(None);

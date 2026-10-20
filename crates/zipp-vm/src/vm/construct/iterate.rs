@@ -1696,8 +1696,21 @@ impl<'p> Vm<'p> {
         let mut iter_done = false;
         while out.len() < lim {
             let res = if is_gen {
-                self.generator_method(iter.heap_index(), "next", &[])?
-                    .unwrap_or(Value::UNDEFINED)
+                // The step as a value, without the result object (see
+                // `drain_iterator_steps`).
+                match self.generator_next_step(iter.heap_index())? {
+                    Some(crate::vm::async_runtime::GenStep::Yield(v)) => {
+                        out.push(v);
+                        self.instrument_drain_heap_check(out.len())?;
+                        continue;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Done(_)) => {
+                        iter_done = true;
+                        break;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Raw(r)) => r,
+                    None => Value::UNDEFINED,
+                }
             } else {
                 let next = self.get_prop(iter, "next")?;
                 if !self.is_callable(next) {
@@ -2052,9 +2065,29 @@ impl<'p> Vm<'p> {
                     }
                     res
                 }
-                None => self
-                    .generator_method(iter.heap_index(), "next", &[])?
-                    .unwrap_or(Value::UNDEFINED),
+                // A generator with the intrinsic `next` (the caller's
+                // proof): its step as a value, without the result object
+                // `next` would make and the two reads of it. Spreading a
+                // generator made and read one per element.
+                None => match self.generator_next_step(iter.heap_index())? {
+                    Some(crate::vm::async_runtime::GenStep::Yield(value)) => {
+                        if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                            items.push(value);
+                        }
+                        self.heap.write_barrier_val(acc, value);
+                        n += 1;
+                        if n > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                            return Err(Thrown::from_static(
+                                "RangeError: iterator produced more values than the engine's limit",
+                            ));
+                        }
+                        self.instrument_drain_heap_check(n)?;
+                        continue;
+                    }
+                    Some(crate::vm::async_runtime::GenStep::Done(_)) => return Ok(()),
+                    Some(crate::vm::async_runtime::GenStep::Raw(r)) => r,
+                    None => Value::UNDEFINED,
+                },
             };
             self.host_result_roots[scratch] = res;
             let done = self.get_prop(res, "done")?;
