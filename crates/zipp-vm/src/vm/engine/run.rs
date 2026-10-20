@@ -741,9 +741,20 @@ impl<'p> Vm<'p> {
                 // loose-mode `for…of` makes per loop and calls per step — calls
                 // its target with the caller's arguments as they are.
                 let (t, th) = (*target, *th);
-                if bargs.is_empty()
-                    && !(t.is_heap() && matches!(self.heap.get(t.heap_index()), HeapObj::Bound { .. }))
-                {
+                if bargs.is_empty() && t.is_heap() {
+                    match self.heap.get(t.heap_index()) {
+                        HeapObj::Bound { .. } => {}
+                        // A builtin target (an iterator's `next`) is the
+                        // `Native` arm below, without the second trip
+                        // through `call_value` to reach it. A realm copy
+                        // takes that trip: it switches realm context.
+                        HeapObj::Native(id) if self.realm_global_objs.is_empty() => {
+                            let id = *id;
+                            return self.with_native_recursion_guard(|vm| vm.call_native(id, th, args));
+                        }
+                        _ => return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args)),
+                    }
+                } else if bargs.is_empty() {
                     return self.with_native_recursion_guard(|vm| vm.call_value(t, th, args));
                 }
                 let (t, th, all) = self.unwrap_bound_call(callee, args);
