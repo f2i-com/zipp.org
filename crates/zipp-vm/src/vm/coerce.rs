@@ -1307,10 +1307,10 @@ impl<'p> Vm<'p> {
                     match self.heap.as_callable(v.heap_index()) {
                         Some((fid, _)) => {
                             let fp = self.func(fid as usize);
-                            // An arrow (`lexical_this`) is refused as the
-                            // construct path refuses it, whether or not its
-                            // compile marked it `non_constructable`
-                            // (f2i-com/zipp.org#71).
+                            // Every arrow is compiled `non_constructable`;
+                            // `lexical_this` repeats the flat construct
+                            // path's own test (`flat_new_instance`), so the
+                            // two cannot drift apart.
                             !(fp.is_generator
                                 || fp.is_async
                                 || fp.non_constructable
