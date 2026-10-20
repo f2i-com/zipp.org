@@ -769,15 +769,27 @@ impl<'p> Vm<'p> {
     /// the current realm. Every top-level declaration — var, function, AND
     /// `let`/`const`/`class` — binds a persistent realm global (the eval
     /// pipeline's name-mapped slots), matching script
-    /// GlobalDeclarationInstantiation rather than eval semantics.
+    /// GlobalDeclarationInstantiation rather than eval semantics. Returns the
+    /// script's completion value, as ScriptEvaluation does.
     pub(crate) fn eval_script(&mut self, code: &str) -> Result<Value, Thrown> {
+        self.eval_script_with(code, true)
+    }
+
+    /// [`Vm::eval_script`], with `completion` choosing whether the script
+    /// tracks its completion value (a harness prelude has no use for one) or
+    /// completes with `undefined`.
+    pub(crate) fn eval_script_with(&mut self, code: &str, completion: bool) -> Result<Value, Thrown> {
         self.require_external_code_enabled()?;
         // SCRIPT goal: module mode would make the whole program strict and
         // silently disable Annex B.3.3 hoisting, sloppy semantics, and HTML
         // comments.
         let ast = crate::front::parse_script(code).map_err(Thrown)?;
-        let prog = crate::compile::compile_program(&ast, code)
-            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        let prog = if completion {
+            crate::compile::compile_script_with_completion(&ast, code)
+        } else {
+            crate::compile::compile_program(&ast, code)
+        }
+        .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         // Browser WASM has no process environment or stderr bytecode dump.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
