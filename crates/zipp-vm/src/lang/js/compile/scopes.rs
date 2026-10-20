@@ -297,6 +297,10 @@ impl<'a> FnCompiler<'a> {
         );
         if let Some((k, cells)) = &*self.snapshot_cache.borrow() {
             if *k == key {
+                debug_assert!(
+                    cells.list == self.cell_locals_list(),
+                    "snapshot: a reused list went stale"
+                );
                 return EnclosingFn {
                     cell_locals: cells.clone(),
                     upvalues: self.upvalues.clone(),
