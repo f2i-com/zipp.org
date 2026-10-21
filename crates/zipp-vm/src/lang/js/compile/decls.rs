@@ -109,7 +109,18 @@ impl<'a> FnCompiler<'a> {
         self.typeof_alias_stmt_enter(s);
         let save = (self.next_reg, self.bool_regs, self.recv_regs);
         let shape = self.scope_shape();
+        let late = self.box_late_for_return(s);
         let r = self.stmt_inner(s);
+        // The cells exist only on the path through this `return`; any later
+        // statement is reached some other way, where the bindings are plain.
+        // Removing cells without a scope pop would let `snapshot` reuse a
+        // list with these cells in it, so its cache goes too.
+        if !late.is_empty() {
+            for reg in late {
+                self.cell_regs.remove(&reg);
+            }
+            self.snapshot_cache.borrow_mut().take();
+        }
         self.typeof_alias_stmt_exit();
         if r.is_ok() && self.loop_ctx.is_empty() && self.scope_shape() == shape {
             if save.0 >= STMT_RECLAIM_FLOOR && self.next_reg > save.0 {
@@ -126,6 +137,37 @@ impl<'a> FnCompiler<'a> {
             }
         }
         r
+    }
+
+    /// `return function () {…}` / `return () => …` capturing late-boxed
+    /// bindings (`late_boxed`): box each into a cell now, just before the
+    /// closure is made, and count it a cell while the statement compiles, so
+    /// the closure captures it. Nothing in this function reads or writes the
+    /// bindings after this point. Returns the registers to un-mark afterwards.
+    fn box_late_for_return(&mut self, s: &ast::Stmt) -> Vec<Reg> {
+        let ast::Stmt::Return(Some(arg)) = s else {
+            return Vec::new();
+        };
+        if self.late_boxed.is_empty() || !matches!(arg, ast::Expr::Function(_) | ast::Expr::Arrow(_)) {
+            return Vec::new();
+        }
+        let free = crate::capture::closure_free_names(arg);
+        let mut names: Vec<String> = self.late_boxed.iter().filter(|n| free.contains(*n)).cloned().collect();
+        names.sort();
+        let mut boxed = Vec::with_capacity(names.len());
+        for n in &names {
+            // A parameter or `var`: a register in the function scope (the
+            // analysis rules out shadowing, and `spills` keeps it a register).
+            match self.resolve_existing(n) {
+                Some(Binding::Local(r)) => boxed.push(r),
+                _ => debug_assert!(false, "late-boxed `{n}` is not a register"),
+            }
+        }
+        for &r in &boxed {
+            self.emit(Instr::MakeCell { reg: r });
+            self.cell_regs.insert(r);
+        }
+        boxed
     }
 
     /// The depth of the scope stack and the sizes of the two scopes a

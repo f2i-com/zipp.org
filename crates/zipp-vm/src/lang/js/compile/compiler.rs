@@ -435,7 +435,24 @@ impl Compiler {
             }
             captured.extend(all);
         }
+        // Bindings only directly returned closures capture stay plain until
+        // the `return` that makes one (`capture::late_box_names`).
+        let late_boxed = if is_script
+            || is_generator
+            || is_async
+            || body_refs_eval
+            || capture::stmts_refs_all(body).contains("arguments")
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
+        {
+            HashSet::new()
+        } else {
+            capture::late_box_names(params_ast, body, &captured)
+        };
+        for n in &late_boxed {
+            captured.remove(n);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.late_boxed = late_boxed;
         if body_refs_eval {
             fc.box_all_locals = true;
         }

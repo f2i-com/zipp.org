@@ -659,6 +659,10 @@ struct FnCompiler<'a> {
     /// This function's own bindings that some nested function captures; these
     /// are boxed into heap cells at declaration so the closure shares the slot.
     captured: HashSet<String>,
+    /// Captured bindings left out of `captured` because only directly
+    /// returned closures capture them (`capture::late_box_names`): plain
+    /// registers, boxed by the `return` that makes such a closure.
+    late_boxed: HashSet<String>,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,

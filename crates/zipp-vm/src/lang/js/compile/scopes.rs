@@ -209,6 +209,7 @@ impl<'a> FnCompiler<'a> {
             using_scope_reg: None,
             self_name: None,
             captured,
+            late_boxed: HashSet::new(),
             cell_regs: HashSet::new(),
             lexical_regs: HashSet::new(),
             const_regs: HashSet::new(),
@@ -286,8 +287,10 @@ impl<'a> FnCompiler<'a> {
     /// of captured declarations sees the same list as its siblings, and
     /// rebuilding it for each one made such a module compile in quadratic
     /// time. Between two `pop_scope`s, bindings and cells are only ever added
-    /// (only a pop removes either), so the pop count, the scope depth and the
-    /// binding and cell counts change whenever the list could.
+    /// (only a pop removes either, apart from a late-boxing `return`, which
+    /// drops the cache when it un-marks its cells), so the pop count, the
+    /// scope depth and the binding and cell counts change whenever the list
+    /// could.
     pub(crate) fn snapshot(&self) -> EnclosingFn {
         let key = (
             self.scope_pops,
@@ -741,6 +744,7 @@ impl<'a> FnCompiler<'a> {
             && !self.box_all_locals
             && !self.script_eval_lexicals
             && !self.captured.contains(name)
+            && !self.late_boxed.contains(name)
     }
 
     /// Bind `name` to the next spill slot, in the innermost scope.

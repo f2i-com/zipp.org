@@ -30,7 +30,7 @@ use rustc_hash::FxHashSet;
 
 use crate::parse::ast::{
     Arg, ArrayElem, Arrow, ArrowBody, Class, ClassMember, Expr, ForInit, ForTarget, Function,
-    MemberProp, ObjectMember, Params, Pattern, PropKey, Stmt, Target,
+    MemberProp, ObjectMember, Params, Pattern, PropKey, Stmt, Target, VarDecl, VarKind,
 };
 
 /// The working set of every walk below: names borrowed from the AST, hashed
@@ -603,6 +603,169 @@ pub fn captured_locals_arrow(
             collect_nested_free_expr(e, &mut nested_free);
             bound.intersection(&nested_free).map(|n| n.to_string()).collect()
         }
+    }
+}
+
+/// The captured bindings that only closures RETURNED directly
+/// (`return function () {…}`, `return () => …`) capture, and so can stay
+/// plain registers until that `return` boxes them. Nothing in the function
+/// reads or writes them once a returned closure is made, so a cell made right
+/// before the closure holds the binding's last value and is its only copy from
+/// then on, and a call that returns some other way allocates no cell at all.
+/// (`_createForOfIteratorHelperLoose`'s array fallback captures `r` and `o`:
+/// boxing them at entry cost every for-of loop two allocations it then threw
+/// away.)
+///
+/// Only parameters and `var`s qualify. A name a block also declares (lexically,
+/// as a catch parameter or as a function) stays boxed, and so does everything
+/// in a body with a `finally`, a `using` or a `with`, where code runs after the
+/// `return` or names resolve dynamically. The caller leaves out generators,
+/// async functions, and bodies that direct-eval or name `arguments`.
+pub fn late_box_names(
+    params_ast: Option<&Params>,
+    body: &[Stmt],
+    captured: &HashSet<String>,
+) -> HashSet<String> {
+    if captured.is_empty() || body.iter().any(late_box_blocked) {
+        return HashSet::new();
+    }
+    let mut kept = Names::default();
+    params_nested_free(params_ast, &mut kept);
+    for s in body {
+        collect_nested_free_in(s, &mut kept, true);
+    }
+    let mut lexical = Names::default();
+    for s in body {
+        collect_lexical_stmt(s, &mut lexical);
+    }
+    captured
+        .iter()
+        .filter(|n| !kept.contains(n.as_str()) && !lexical.contains(n.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The free names of a closure expression: what a `return` of it must box
+/// (`late_box_names`).
+pub fn closure_free_names(e: &Expr) -> HashSet<String> {
+    let mut out = Names::default();
+    collect_nested_free_expr(e, &mut out);
+    owned(out)
+}
+
+/// Whether `s` (this function's statements, not nested functions') has a
+/// `finally`, a `using` declaration or a `with`.
+fn late_box_blocked(s: &Stmt) -> bool {
+    let using = |d: &VarDecl| matches!(d.kind, VarKind::Using | VarKind::AwaitUsing);
+    match s {
+        Stmt::With { .. } => true,
+        Stmt::VarDecl(d) => using(d),
+        Stmt::Block(b) => b.iter().any(late_box_blocked),
+        Stmt::If { cons, alt, .. } => late_box_blocked(cons) || alt.as_deref().is_some_and(late_box_blocked),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+            late_box_blocked(body)
+        }
+        Stmt::For { init, body, .. } => {
+            matches!(init, Some(ForInit::Var(d)) if using(d)) || late_box_blocked(body)
+        }
+        Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
+            matches!(left, ForTarget::Var(d) if using(d)) || late_box_blocked(body)
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            finalizer.is_some()
+                || block.iter().any(late_box_blocked)
+                || handler.as_ref().is_some_and(|h| h.body.iter().any(late_box_blocked))
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| c.body.iter().any(late_box_blocked)),
+        _ => false,
+    }
+}
+
+/// The names this function's blocks declare lexically, as catch parameters
+/// or as functions (not nested functions' own declarations).
+fn collect_lexical_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
+    match s {
+        Stmt::VarDecl(d) if d.kind.is_lexical() => {
+            for decl in &d.decls {
+                pattern_names(&decl.id, out);
+            }
+        }
+        Stmt::FnDecl(f) => {
+            if let Some(n) = &f.name {
+                out.insert(&**n);
+            }
+        }
+        Stmt::ClassDecl(c) => {
+            if let Some(n) = &c.name {
+                out.insert(&**n);
+            }
+        }
+        Stmt::Block(b) => {
+            for st in b {
+                collect_lexical_stmt(st, out);
+            }
+        }
+        Stmt::If { cons, alt, .. } => {
+            collect_lexical_stmt(cons, out);
+            if let Some(a) = alt {
+                collect_lexical_stmt(a, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Labeled { body, .. } => {
+            collect_lexical_stmt(body, out)
+        }
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Var(d)) = init {
+                if d.kind.is_lexical() {
+                    for decl in &d.decls {
+                        pattern_names(&decl.id, out);
+                    }
+                }
+            }
+            collect_lexical_stmt(body, out);
+        }
+        Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
+            if let ForTarget::Var(d) = left {
+                if d.kind.is_lexical() {
+                    for decl in &d.decls {
+                        pattern_names(&decl.id, out);
+                    }
+                }
+            }
+            collect_lexical_stmt(body, out);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for st in block {
+                collect_lexical_stmt(st, out);
+            }
+            if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    pattern_names(p, out);
+                }
+                for st in &h.body {
+                    collect_lexical_stmt(st, out);
+                }
+            }
+            for st in finalizer.iter().flatten() {
+                collect_lexical_stmt(st, out);
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                for st in &case.body {
+                    collect_lexical_stmt(st, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1369,6 +1532,13 @@ fn class_free<'a>(class: &'a Class, out: &mut Names<'a>) {
 
 /// Union of free vars of functions nested DIRECTLY in `s` (one level down).
 fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
+    collect_nested_free_in(s, out, false)
+}
+
+/// [`collect_nested_free`], optionally leaving out each function or arrow
+/// expression that is the direct operand of one of this body's own `return`s
+/// (`late_box_names`).
+fn collect_nested_free_in<'a>(s: &'a Stmt, out: &mut Names<'a>, skip_returns: bool) {
     match s {
         Stmt::Expr(e) => collect_nested_free_expr(e, out),
         Stmt::VarDecl(d) => {
@@ -1383,26 +1553,26 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         }
         Stmt::Block(b) => {
             for st in b {
-                collect_nested_free(st, out);
+                collect_nested_free_in(st, out, skip_returns);
             }
         }
         Stmt::If { test, cons, alt } => {
             collect_nested_free_expr(test, out);
-            collect_nested_free(cons, out);
+            collect_nested_free_in(cons, out, skip_returns);
             if let Some(a) = alt {
-                collect_nested_free(a, out);
+                collect_nested_free_in(a, out, skip_returns);
             }
         }
         Stmt::While { test, body } => {
             collect_nested_free_expr(test, out);
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
         }
         Stmt::With { object, body } => {
             collect_nested_free_expr(object, out);
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
         }
         Stmt::DoWhile { body, test } => {
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
             collect_nested_free_expr(test, out);
         }
         Stmt::For {
@@ -1434,23 +1604,25 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
             if let Some(u) = update {
                 collect_nested_free_expr(u, out);
             }
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
         }
         Stmt::ForOf {
             left, right, body, ..
         } => {
             for_head_nested_free(left, out);
             collect_nested_free_expr(right, out);
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
         }
         Stmt::ForIn { left, right, body } => {
             for_head_nested_free(left, out);
             collect_nested_free_expr(right, out);
-            collect_nested_free(body, out);
+            collect_nested_free_in(body, out, skip_returns);
         }
         Stmt::Return(r) => {
             if let Some(a) = r {
-                collect_nested_free_expr(a, out);
+                if !(skip_returns && matches!(a, Expr::Function(_) | Expr::Arrow(_))) {
+                    collect_nested_free_expr(a, out);
+                }
             }
         }
         Stmt::FnDecl(f) => fn_node_free(f, out),
@@ -1460,19 +1632,19 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
             finalizer,
         } => {
             for st in block {
-                collect_nested_free(st, out);
+                collect_nested_free_in(st, out, skip_returns);
             }
             if let Some(h) = handler {
                 if let Some(p) = &h.param {
                     collect_nested_free_pattern(p, out);
                 }
                 for st in &h.body {
-                    collect_nested_free(st, out);
+                    collect_nested_free_in(st, out, skip_returns);
                 }
             }
             if let Some(f) = finalizer {
                 for st in f {
-                    collect_nested_free(st, out);
+                    collect_nested_free_in(st, out, skip_returns);
                 }
             }
         }
@@ -1483,12 +1655,12 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
                     collect_nested_free_expr(t, out);
                 }
                 for st in &case.body {
-                    collect_nested_free(st, out);
+                    collect_nested_free_in(st, out, skip_returns);
                 }
             }
         }
         Stmt::Throw(t) => collect_nested_free_expr(t, out),
-        Stmt::Labeled { body, .. } => collect_nested_free(body, out),
+        Stmt::Labeled { body, .. } => collect_nested_free_in(body, out, skip_returns),
         Stmt::ClassDecl(c) => class_free(c, out),
         _ => {}
     }
