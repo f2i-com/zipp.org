@@ -160,10 +160,8 @@ impl<'p> Vm<'p> {
                 };
             }
         }
-        // No @@-method: ToString(receiver), then the default algorithm. (The default
-        // arms in string_method re-check the @@-method, but it is absent here, so
-        // that is a no-op apart from a redundant property read.) A receiver that
-        // already IS a string passes through EXACTLY (its lone surrogates
+        // No @@-method: ToString(receiver), then the default algorithm. A receiver
+        // that already IS a string passes through EXACTLY (its lone surrogates
         // survive — `to_js_string` would be lossy).
         let s_idx = if recv.is_heap() && self.heap.is_str_like(recv.heap_index()) {
             recv.heap_index()
@@ -171,9 +169,35 @@ impl<'p> Vm<'p> {
             let s = self.to_js_string(recv)?;
             self.alloc_str(s).heap_index()
         };
-        Ok(self
-            .string_method(s_idx, name, args)?
-            .unwrap_or(Value::UNDEFINED))
+        if !self.is_object_value(arg0) {
+            return Ok(self
+                .string_method(s_idx, name, args)?
+                .unwrap_or(Value::UNDEFINED));
+        }
+        // An OBJECT argument has had its one Get of the @@-method (and, for
+        // replaceAll/matchAll, its IsRegExp). The default algorithm's next use
+        // of it is a ToString: RegExpCreate's for match/search/matchAll,
+        // ToString(searchValue) for replace, and for split ToString(separator)
+        // after ToUint32(limit). Doing that here hands `string_method`
+        // primitives, whose arms would otherwise Get the @@-method again and
+        // re-run IsRegExp, which a Proxy or getter observes (kangax
+        // compat-table "Proxy, internal 'get' calls").
+        self.with_host_roots(&[Value::heap(s_idx)], |vm| {
+            let mut coerced = args.to_vec();
+            if name == "split" {
+                if let Some(limit) = args.get(1).copied().filter(|v| !v.is_undefined()) {
+                    let lim = crate::vm::helpers_num2::to_uint32(vm.to_number_strict(limit)?);
+                    coerced[1] = Value::num(lim as f64);
+                }
+            }
+            let s = vm.to_js_str_owned(arg0)?;
+            coerced[0] = Value::heap(vm.heap.alloc_js(s));
+            vm.with_host_roots(&[coerced[0]], |vm| {
+                Ok(vm
+                    .string_method(s_idx, name, &coerced)?
+                    .unwrap_or(Value::UNDEFINED))
+            })
+        })
     }
 
     /// The pristine dispatch shortcut for `String.prototype.matchAll` — B77's
@@ -1007,9 +1031,9 @@ impl<'p> Vm<'p> {
                         return Ok(Some(self.call_value(matcher, regexp, &[s_val])?));
                     }
                 }
-                // Otherwise build a fresh global RegExp and use its @@matchAll.
+                // Otherwise RegExpCreate(regexp, "g") and use its @@matchAll.
                 let gflag = self.alloc_str("g".to_string());
-                let rx = self.build_regexp(regexp, gflag)?;
+                let rx = self.regexp_create(regexp, gflag)?;
                 let matcher = self.get_prop(rx, "@@matchAll")?;
                 Ok(Some(self.call_value(matcher, rx, &[s_val])?))
             }

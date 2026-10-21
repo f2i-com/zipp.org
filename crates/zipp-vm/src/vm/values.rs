@@ -2378,6 +2378,25 @@ impl<'p> Vm<'p> {
         self.build_regexp_snapshot(p, f, pre)
     }
 
+    /// RegExpCreate(P, F) (22.2.3.1): RegExpAlloc + RegExpInitialize, which
+    /// coerces the pattern with ToString and nothing else. There is no
+    /// IsRegExp, so no `@@match` read, and a RegExp pattern is its ToString
+    /// (`"/a/g"`), not its source. String.prototype.match, search and matchAll
+    /// build theirs this way, after their own one `@@match`/`@@matchAll` Get.
+    pub(crate) fn regexp_create(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
+        let exact_bytes = if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+            self.heap.str_exact_if_not_wellformed(p.heap_index())
+        } else {
+            None
+        };
+        let pre = RegExpPre {
+            pattern_is_regexp: false,
+            real_regexp: None,
+            exact_bytes,
+        };
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
     /// Admit one newly-compiled immutable RegExp program before it is wrapped
     /// in an `Arc` or retained by a heap object/cache entry.
     pub(crate) fn preflight_regex_program(&mut self, regex: &regress::Regex) -> Result<(), Thrown> {
@@ -2409,6 +2428,13 @@ impl<'p> Vm<'p> {
         // the pattern, so it runs before the slot snapshot. (Non-objects return
         // false with no Get.)
         let pattern_is_regexp = self.is_regexp(p)?;
+        Ok(self.regexp_pattern_snapshot_after(p, pattern_is_regexp))
+    }
+
+    /// `regexp_pattern_snapshot` for a caller that has already run
+    /// IsRegExp(pattern): `RegExp(p)` called as a function needs the answer
+    /// for its `constructor` shortcut too, and reads `@@match` once for both.
+    pub(crate) fn regexp_pattern_snapshot_after(&self, p: Value, pattern_is_regexp: bool) -> RegExpPre {
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
@@ -2433,11 +2459,11 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        Ok(RegExpPre {
+        RegExpPre {
             pattern_is_regexp,
             real_regexp,
             exact_bytes,
-        })
+        }
     }
 
     /// RegExpInitialize against an already-taken pattern snapshot.

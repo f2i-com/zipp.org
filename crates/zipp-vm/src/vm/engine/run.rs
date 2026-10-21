@@ -623,6 +623,17 @@ impl<'p> Vm<'p> {
         // A callable Proxy: `apply` trap (or call the target).
         if callee.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(callee.heap_index()) {
+                // Only a Proxy whose target is callable has [[Call]] (10.5.12):
+                // `new Proxy({}, { apply() {} })()` is a TypeError, and the trap
+                // never runs. (`typeof`, `.call` and Reflect.apply already ask
+                // `is_callable`; a direct call came straight here.)
+                if !self.is_callable(callee) {
+                    // Worded as the forwarded call to the target used to fail.
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not a function",
+                        self.display(target)
+                    )));
+                }
                 if revoked {
                     return Err(Thrown(
                         "TypeError: Cannot perform 'apply' on a revoked proxy".into(),

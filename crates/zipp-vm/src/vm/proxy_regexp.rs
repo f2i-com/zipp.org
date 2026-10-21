@@ -1808,18 +1808,16 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Coerce a `String.prototype.match`/`search` argument to a RegExp: a RegExp
-    /// passes through; anything else becomes `new RegExp(arg)`.
+    /// Coerce a `String.prototype.match`/`search` argument whose `@@match` /
+    /// `@@search` was absent to a RegExp: RegExpCreate(arg, undefined), which
+    /// ToStrings it (`regexp_create`) and does not read `@@match` again.
     pub(crate) fn to_regexp_arg(&mut self, v: Value) -> Result<u32, Thrown> {
-        if let Some(i) = self.as_regexp(v) {
-            return Ok(i);
-        }
         let p = if v.is_undefined() {
             self.alloc_str(String::new())
         } else {
             v
         };
-        Ok(self.build_regexp(p, Value::UNDEFINED)?.heap_index())
+        Ok(self.regexp_create(p, Value::UNDEFINED)?.heap_index())
     }
 
     /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
@@ -4601,21 +4599,37 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let proto = match self.heap.get(it_idx) {
+        let mut holder = match self.heap.get(it_idx) {
             HeapObj::Iterator { proto, .. } if *proto == self.regexp_string_iter_proto => *proto,
             _ => return None,
         };
-        let p = match self.heap.get(proto) {
-            HeapObj::Object(p) => p,
-            _ => return None,
-        };
-        let slot = p.pos(name)?;
-        if p.attr_at(slot).accessor {
-            return None;
+        // `next` is the prototype's own; `@@iterator` is inherited from
+        // %Iterator.prototype%, the prototype's [[Prototype]], so the walk
+        // goes at most that one link further.
+        loop {
+            let p = match self.heap.get(holder) {
+                HeapObj::Object(p) => p,
+                _ => return None,
+            };
+            if let Some(slot) = p.pos(name) {
+                if p.attr_at(slot).accessor {
+                    return None;
+                }
+                let v = p.val_at(slot);
+                return (v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
+                .then_some(v);
+            }
+            if holder != self.regexp_string_iter_proto {
+                return None;
+            }
+            match self.proto_of.get(&holder) {
+                Some(next) if next.is_heap() && next.heap_index() == self.iterator_proto_root => {
+                    holder = self.iterator_proto_root;
+                }
+                _ => return None,
+            }
         }
-        let v = p.val_at(slot);
-        (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
-            .then_some(v)
     }
 
     /// Pure guard for the source `GetIterator` at the exact scalar outer-loop

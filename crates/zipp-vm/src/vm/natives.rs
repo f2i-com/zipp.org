@@ -5168,26 +5168,32 @@ impl<'p> Vm<'p> {
                 // Spec order: ToObject(this) [step 1], THEN IsCallable(getter) [step 2],
                 // THEN ToPropertyKey(P) [step 4]. A null/undefined receiver therefore
                 // throws before the getter is type-checked or the key is coerced.
+                // A primitive receiver is boxed (`__defineGetter__.call(1, …)`
+                // defines on a Number wrapper, as `__proto__`'s getter boxes),
+                // and the wrapper is rooted across the key's ToPrimitive.
                 self.require_object_coercible(this)?;
+                let o = self.to_object(this)?;
                 if !self.is_callable(a1) {
                     return Err(Thrown::from_static(
                         "TypeError: Object.prototype.__define[GS]etter__: expecting a function",
                     ));
                 }
-                let key = self.to_property_key(a0)?;
-                let mut d = ObjMap::new();
-                d.set(
-                    if id == OBJPROTO_DEFINE_GETTER {
-                        "get"
-                    } else {
-                        "set"
-                    },
-                    a1,
-                );
-                d.set("enumerable", Value::bool(true));
-                d.set("configurable", Value::bool(true));
-                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
-                self.object_define_property(this, &key, desc)?;
+                self.with_host_roots(&[o], |vm| {
+                    let key = vm.to_property_key(a0)?;
+                    let mut d = ObjMap::new();
+                    d.set(
+                        if id == OBJPROTO_DEFINE_GETTER {
+                            "get"
+                        } else {
+                            "set"
+                        },
+                        a1,
+                    );
+                    d.set("enumerable", Value::bool(true));
+                    d.set("configurable", Value::bool(true));
+                    let desc = Value::heap(vm.heap.alloc(HeapObj::Object(Box::new(d))));
+                    vm.object_define_property(o, &key, desc)
+                })?;
                 Value::UNDEFINED
             }
             OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
