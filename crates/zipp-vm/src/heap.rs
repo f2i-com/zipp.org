@@ -9461,9 +9461,25 @@ impl Heap {
         let cap = if stress {
             NURSERY_STRESS_MINORS
         } else {
-            self.nursery_max_minors
+            self.backstop_minors()
         };
         self.nursery && !self.major_due && self.minors_since_major < cap
+    }
+
+    /// The backstop streak: at least `nursery_max_minors`, and for a large
+    /// heap as many minors as allocate twice what the last major found live.
+    /// A major traces the whole old heap, so a fixed streak made it the cost
+    /// of a big program's collections: Babel's standalone bundle ran eleven,
+    /// each tracing two million objects to reclaim one percent of them. Floats
+    /// stay bounded by `major_at`, which still forces a major on growth. An
+    /// explicit `ZIPP_NURSERY_MAX_MINORS` keeps its exact streak.
+    #[inline]
+    fn backstop_minors(&self) -> u32 {
+        if self.nursery_max_minors != NURSERY_MAX_MINORS_DEFAULT {
+            return self.nursery_max_minors;
+        }
+        let amortized = (self.live_at_major / self.young_budget.max(1)).saturating_mul(2);
+        (amortized.min(NURSERY_MAX_MINORS_LIMIT as usize) as u32).max(NURSERY_MAX_MINORS_DEFAULT)
     }
 
     /// The slots allocated since the last collection (the minor sweep set).
@@ -13311,6 +13327,22 @@ mod tests {
             !h.minor_due(true),
             "GC stress must retain its fixed three-minor cadence"
         );
+    }
+
+    #[test]
+    fn default_backstop_streak_scales_with_the_heap_a_major_found() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+        h.nursery_max_minors = NURSERY_MAX_MINORS_DEFAULT;
+        h.young_budget = 16_384;
+        h.live_at_major = 100_000;
+        assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_DEFAULT, "a small heap keeps the default");
+        h.live_at_major = 2_000_000;
+        assert_eq!(h.backstop_minors(), 244, "twice the live heap, in young budgets");
+        h.live_at_major = usize::MAX / 2;
+        assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_LIMIT);
+        h.nursery_max_minors = 2;
+        assert_eq!(h.backstop_minors(), 2, "an explicit streak is kept exactly");
     }
 
     #[test]
