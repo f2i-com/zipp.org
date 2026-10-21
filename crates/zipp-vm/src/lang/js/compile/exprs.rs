@@ -693,56 +693,11 @@ impl<'a> FnCompiler<'a> {
             E::Yield { arg, delegate } => self.yield_expr(arg.as_deref(), *delegate, dst),
             E::Await(a) => self.await_expr(a, dst),
             E::Call(c) => self.call(c, dst),
-            E::New { callee, args } => {
-                // Only Array keeps a dedicated user-visible constructor opcode.
-                // Every other named builtin uses the generic construct path: it
-                // already implements exact constructor identity, proxies,
-                // newTarget/prototype selection and the complete argument list.
-                let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
-                if !has_spread
-                    && matches!(&**callee, ast::Expr::Ident(id) if &**id == "Array" && self.builtin_unshadowed(id))
-                {
-                    let save = self.next_reg;
-                    let callee_reg = self.capture_plain_callee(callee)?;
-                    let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                    self.emit(Instr::ArrayCtor {
-                        dst,
-                        callee: Some(callee_reg),
-                        arg_base,
-                        argc,
-                        is_construct: true,
-                    });
-                    self.set_next_reg(save.max(dst.saturating_add(1)));
-                    return Ok(dst);
-                }
-                // General `new C(args)`: evaluate the constructor value, then the
-                // args (contiguous), and let the VM build the instance. When the
-                // arguments contain a spread (`new C(...xs)`), build a flat args
-                // array and construct via NewSpread instead. The constructor is
-                // SNAPSHOTTED into a temp before the args run: an argument's
-                // side effect reassigning the callee variable must not change
-                // which value is constructed (EvaluateNew takes GetValue first).
-                let save = self.next_reg;
-                let callee_reg = self.capture_plain_callee(callee)?;
-                if has_spread {
-                    let args_arr = self.build_spread_args(args)?;
-                    self.emit(Instr::NewSpread {
-                        dst,
-                        callee: callee_reg,
-                        args: args_arr,
-                    });
-                    self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + arg scratch
-                    return Ok(dst);
-                }
-                let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                self.emit(Instr::New {
-                    dst,
-                    callee: callee_reg,
-                    arg_base,
-                    argc,
-                });
-                self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + args
-                Ok(dst)
+            E::New { callee, args, pos } => {
+                let start = self.code.len();
+                let r = self.new_expr(callee, args, dst);
+                self.note_call_site(start, *pos);
+                r
             }
             E::Function(f) => {
                 let (id, has_up) =
@@ -847,6 +802,60 @@ impl<'a> FnCompiler<'a> {
             // by the construct that owns it (member reads, `super(...)`).
             E::Super => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
+    }
+
+    /// `new C(args)`, an arm of `expr` apart so that its call site is
+    /// recorded around it.
+    fn new_expr(&mut self, callee: &ast::Expr, args: &[ast::Arg], dst: Reg) -> R<Reg> {
+        // Only Array keeps a dedicated user-visible constructor opcode.
+        // Every other named builtin uses the generic construct path: it
+        // already implements exact constructor identity, proxies,
+        // newTarget/prototype selection and the complete argument list.
+        let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
+        if !has_spread
+            && matches!(callee, ast::Expr::Ident(id) if &**id == "Array" && self.builtin_unshadowed(id))
+        {
+            let save = self.next_reg;
+            let callee_reg = self.capture_plain_callee(callee)?;
+            let (arg_base, argc) = self.eval_args_contiguous(args)?;
+            self.emit(Instr::ArrayCtor {
+                dst,
+                callee: Some(callee_reg),
+                arg_base,
+                argc,
+                is_construct: true,
+            });
+            self.set_next_reg(save.max(dst.saturating_add(1)));
+            return Ok(dst);
+        }
+        // General `new C(args)`: evaluate the constructor value, then the
+        // args (contiguous), and let the VM build the instance. When the
+        // arguments contain a spread (`new C(...xs)`), build a flat args
+        // array and construct via NewSpread instead. The constructor is
+        // SNAPSHOTTED into a temp before the args run: an argument's
+        // side effect reassigning the callee variable must not change
+        // which value is constructed (EvaluateNew takes GetValue first).
+        let save = self.next_reg;
+        let callee_reg = self.capture_plain_callee(callee)?;
+        if has_spread {
+            let args_arr = self.build_spread_args(args)?;
+            self.emit(Instr::NewSpread {
+                dst,
+                callee: callee_reg,
+                args: args_arr,
+            });
+            self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + arg scratch
+            return Ok(dst);
+        }
+        let (arg_base, argc) = self.eval_args_contiguous(args)?;
+        self.emit(Instr::New {
+            dst,
+            callee: callee_reg,
+            arg_base,
+            argc,
+        });
+        self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + args
+        Ok(dst)
     }
 
     /// `obj.x` / `obj[k]` / `obj.#x` — one node in `ast`, three lowerings.

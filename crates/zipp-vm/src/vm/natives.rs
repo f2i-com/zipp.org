@@ -5247,7 +5247,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if this.is_heap() && self.error_data.contains(&this.heap_index()) {
-                    self.alloc_str(String::new())
+                    self.error_stack_value(this.heap_index())?
                 } else {
                     Value::UNDEFINED
                 }

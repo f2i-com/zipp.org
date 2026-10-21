@@ -286,7 +286,7 @@ fn nesting_within(program: &Program, limit: usize) -> bool {
                     work.push(Work::Expr(alt, child));
                 }
                 Expr::Call(call) => push_call(&mut work, call, child),
-                Expr::New { callee, args } => {
+                Expr::New { callee, args, .. } => {
                     work.push(Work::Expr(callee, child));
                     push_args(&mut work, args, child);
                 }

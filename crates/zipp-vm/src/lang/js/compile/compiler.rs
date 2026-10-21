@@ -69,6 +69,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
+            source_index: std::cell::OnceCell::new(),
             eval_mode: false,
             script_completion: false,
             eval_inherit_super: None,
@@ -147,6 +148,13 @@ impl Compiler {
             .get(start as usize..end as usize)
             .map(|s| s.to_string())
             .unwrap_or_default()
+    }
+
+    /// The `(line, column)` of source byte offset `off` (see `positions`).
+    pub(crate) fn line_col(&self, off: u32) -> (u32, u32) {
+        self.source_index
+            .get_or_init(|| super::positions::SourceIndex::new(&self.source))
+            .line_col(off)
     }
 
     /// Look up an already-reserved global without changing the deterministic
@@ -1109,6 +1117,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1148,6 +1157,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1464,6 +1474,7 @@ impl Compiler {
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1499,6 +1510,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
             fused: Default::default(),
+            call_sites,
         })
     }
 
@@ -1753,6 +1765,7 @@ impl Compiler {
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.typeof_alias_finish();
         fc.check_regs()?;
+        let call_sites = fc.take_call_sites();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -1787,6 +1800,7 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
             fused: Default::default(),
+            call_sites,
         })
     }
 }

@@ -150,6 +150,7 @@ impl<'a> FnCompiler<'a> {
         let mut fc = FnCompiler {
             cx,
             code: Vec::new(),
+            call_sites: Vec::new(),
             constants: Vec::new(),
             string_constants: Vec::new(),
             static_key_plans: Vec::new(),
@@ -399,6 +400,29 @@ impl<'a> FnCompiler<'a> {
             self.max_reg = total as Reg;
         }
         Ok(())
+    }
+
+    /// Record that the code from `start` to here evaluates the call or `new`
+    /// at source offset `offset` (`FuncProto::call_sites`).
+    pub(crate) fn note_call_site(&mut self, start: usize, offset: u32) {
+        let end = self.code.len();
+        if end > start {
+            self.call_sites.push((start as u32, end as u32, offset));
+        }
+    }
+
+    /// The call sites recorded so far, positioned, in code order.
+    pub(crate) fn take_call_sites(&mut self) -> Box<[crate::bytecode::CallSite]> {
+        let mut sites: Vec<crate::bytecode::CallSite> = std::mem::take(&mut self.call_sites)
+            .into_iter()
+            .map(|(start, end, offset)| {
+                let (line, col) = self.cx.line_col(offset);
+                crate::bytecode::CallSite { start, end, line, col }
+            })
+            .collect();
+        // Recorded as each one ENDS, so a nested site comes first.
+        sites.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+        sites.into_boxed_slice()
     }
 
     pub(crate) fn emit(&mut self, i: Instr) {

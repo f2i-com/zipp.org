@@ -553,6 +553,16 @@ impl ScriptState {
         self.with_vm(|vm| vm.microtask_checkpoint(false));
     }
 
+    /// Name the script this state was compiled from in error stacks: its
+    /// frames read `at f (NAME:1:27)` instead of `at f (<anonymous>:1:27)`.
+    /// Nothing else reads the name, and code run later through
+    /// [`Self::eval_in_context`] or [`Self::run_script`] stays `<anonymous>`.
+    /// Positions count from the start of the compiled text, so a preamble's
+    /// lines come first.
+    pub fn set_script_name(&mut self, name: &str) {
+        self.with_vm(|vm| vm.script_name = Some(std::sync::Arc::from(name)));
+    }
+
     /// Hear of every promise rejection that no handler has taken by the end
     /// of a microtask checkpoint: `sink` is called with the reason's message
     /// ("Error: boom" for an Error, the value's text otherwise), once per

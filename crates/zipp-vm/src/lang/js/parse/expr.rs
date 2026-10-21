@@ -806,11 +806,15 @@ impl<'s> Parser<'s> {
         }
         let mut saw_optional = false;
         let mut links = 0usize;
+        // Where a call on `e` reports itself (`CallExpr::pos`): an identifier
+        // callee's start, a dotted one's property name, else (`None`) the `(`.
+        let mut callee_pos = matches!(&e, Expr::Ident(_) | Expr::Super).then_some(lhs_start);
         loop {
             if self.at(Punct::Dot) {
                 self.check_syntax_chain(links)?;
                 links += 1;
                 self.bump_after_operand()?;
+                callee_pos = Some(self.cur().span.start);
                 let prop = self.member_prop()?;
                 if matches!(&e, Expr::Super) && matches!(&prop, MemberProp::Private(_)) {
                     return Err(self.err_here("SyntaxError: a private name cannot follow 'super'"));
@@ -833,13 +837,16 @@ impl<'s> Parser<'s> {
                 saw_optional = true;
                 self.bump_after_operand()?;
                 if self.at(Punct::LParen) {
+                    let pos = callee_pos.take().unwrap_or(self.cur().span.start);
                     let args = self.parse_args()?;
                     e = Expr::Call(Box::new(CallExpr {
                         callee: e,
                         args,
                         optional: true,
+                        pos,
                     }));
                 } else if self.at(Punct::LBracket) {
+                    callee_pos = None;
                     self.bump_before_operand()?;
                     let saved_in = self.ctx.in_;
                     self.ctx.in_ = true;
@@ -852,6 +859,7 @@ impl<'s> Parser<'s> {
                         optional: true,
                     }));
                 } else {
+                    callee_pos = Some(self.cur().span.start);
                     let prop = self.member_prop()?;
                     e = Expr::Member(Box::new(Member {
                         object: e,
@@ -862,6 +870,7 @@ impl<'s> Parser<'s> {
             } else if self.at(Punct::LBracket) {
                 self.check_syntax_chain(links)?;
                 links += 1;
+                callee_pos = None;
                 self.bump_before_operand()?;
                 let saved_in = self.ctx.in_;
                 self.ctx.in_ = true;
@@ -876,15 +885,18 @@ impl<'s> Parser<'s> {
             } else if self.at(Punct::LParen) {
                 self.check_syntax_chain(links)?;
                 links += 1;
+                let pos = callee_pos.take().unwrap_or(self.cur().span.start);
                 let args = self.parse_args()?;
                 e = Expr::Call(Box::new(CallExpr {
                     callee: e,
                     args,
                     optional: false,
+                    pos,
                 }));
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
                 self.check_syntax_chain(links)?;
                 links += 1;
+                callee_pos = None;
                 // A tagged template. `` a?.b`x` `` is a SyntaxError: an optional
                 // chain may not be tagged.
                 if saw_optional {
@@ -1058,6 +1070,7 @@ impl<'s> Parser<'s> {
         Ok(Expr::New {
             callee: Box::new(callee),
             args,
+            pos,
         })
     }
 

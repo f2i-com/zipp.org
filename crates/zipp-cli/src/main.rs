@@ -447,8 +447,13 @@ fn run(args: &[String]) -> Result<(), String> {
             match harness {
                 None if pgo_training => emit(zipp_vm::run_for_pgo_training(&src, base_dir)?),
                 // The process exits when the program has ended, so its heap
-                // is left for that exit instead of being freed first.
-                None => emit(zipp_vm::run_then_exit(&src, base_dir)?),
+                // is left for that exit instead of being freed first. Error
+                // stacks name the script by its absolute path, as Node does.
+                None => {
+                    let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
+                    let name = name.to_string_lossy();
+                    emit(zipp_vm::run_file_then_exit(&src, base_dir, &name)?)
+                }
                 Some(_) if pgo_training => {
                     Err("--pgo-training does not accept a harness prelude".into())
                 }

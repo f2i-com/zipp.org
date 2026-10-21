@@ -2586,6 +2586,18 @@ pub struct Vm<'p> {
     /// removed once for every error collected, so it is a bit a slot: as a
     /// hashed set of slots those two were 7% of a throw-and-catch loop.
     error_data: crate::slot_table::SlotSet,
+    /// The stack each error object was created on, for Error.prototype.stack`r
+    /// (error_stack): its frames until the first read, then that read's text.
+    /// Pruned on GC sweep with error_data.
+    error_stacks: crate::slot_table::SlotTable<error_stack::ErrorStack>,
+    /// The name the main program's frames give their script in a stack, as
+    /// the host supplies it (the zipp command, a file's path); None is
+    /// <anonymous>.
+    pub(crate) script_name: Option<std::sync::Arc<str>>,
+    /// The compiled caller of the construction running now, as the JIT's
+    /// `new` helper hands it over (`func << 32 | ip`), and the frame count
+    /// then; `error_stack::NO_JIT_SITE` otherwise. Read by `mark_error_data`.
+    pub(crate) jit_new_site: (u64, usize),
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.
@@ -3439,6 +3451,7 @@ mod counted_loop;
 mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
+mod error_stack;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
 mod text_codec;

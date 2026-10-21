@@ -127,7 +127,7 @@ pub(crate) fn expr_may_assign_name(e: &Expr, name: &str) -> bool {
         Expr::Template(t) => t.exprs.iter().any(rec),
         Expr::TaggedTemplate { tag, quasi } => rec(tag) || quasi.exprs.iter().any(rec),
         Expr::Call(c) => rec(&c.callee) || args_rec(&c.args),
-        Expr::New { callee, args } => rec(callee) || args_rec(args),
+        Expr::New { callee, args, .. } => rec(callee) || args_rec(args),
         Expr::Member(m) => {
             rec(&m.object)
                 || match &m.prop {
@@ -1016,6 +1016,13 @@ impl<'a> FnCompiler<'a> {
     // (evaluate the call, then throw a ReferenceError) belongs to the assignment
     // module and reaches this `call` unchanged.
     pub(crate) fn call(&mut self, c: &CallExpr, dst: Reg) -> R<Reg> {
+        let start = self.code.len();
+        let r = self.call_inner(c, dst);
+        self.note_call_site(start, c.pos);
+        r
+    }
+
+    fn call_inner(&mut self, c: &CallExpr, dst: Reg) -> R<Reg> {
         // Optional call `f?.(args)` — EvaluateCall: a MEMBER callee (even
         // through parens) preserves its base as `this`; `super.m?.()` binds the
         // running `this`. The base's own `?.` links short-circuit inside the

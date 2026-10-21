@@ -1087,6 +1087,7 @@ impl Vm<'_> {
         self.immutable_buffers.retain_marked(&marks);
         self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
+        self.error_stacks.retain_marked(&marks);
         self.notified_rejections.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
@@ -1442,6 +1443,7 @@ impl Vm<'_> {
                 self.error_data.remove(i);
             }
         }
+        prune_slots!(self.error_stacks);
         // A short list, and empty unless a rejection hook is installed.
         if !self.notified_rejections.is_empty() {
             self.notified_rejections.retain(|&k| live_bits[k as usize]);

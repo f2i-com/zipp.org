@@ -161,6 +161,9 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by span) for `Function.prototype.toString`.
     source: String,
+    /// `source`'s lines, for the positions of call sites (`FuncProto::
+    /// call_sites`); built when the first function with one is finished.
+    source_index: std::cell::OnceCell<positions::SourceIndex>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
@@ -426,6 +429,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         eval_sites: Vec::new(),
         source: String::new(),
         fused: Default::default(),
+        call_sites: Box::default(),
     }
 }
 
@@ -451,6 +455,9 @@ fn fn_directives(f: &ast::Function) -> &[ast::Directive] {
 struct FnCompiler<'a> {
     cx: &'a mut Compiler,
     code: Vec<Instr>,
+    /// The calls and `new`s compiled so far: (first instruction, end,
+    /// source offset). Finished into `FuncProto::call_sites`.
+    call_sites: Vec<(u32, u32, u32)>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
     static_key_plans: Vec<crate::bytecode::StaticKeyPlan>,
@@ -889,6 +896,7 @@ mod entry;
 mod exprs;
 mod funcs;
 mod helpers;
+mod positions;
 mod remap;
 mod scopes;
 mod string_accum;
