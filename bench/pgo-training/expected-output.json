@@ -7,6 +7,7 @@
     {"path": "bench/pgo-training/template-uri-mix.js", "stdout": "template-uri=36000:1810247:106620:2787392704\n", "stderr": ""},
     {"path": "bench/pgo-training/async-dag-mix.js", "stdout": "async-dag=192:92:2743580189\n", "stderr": ""},
     {"path": "bench/pgo-training/memory-shapes-mix.js", "stdout": "1125858648\n", "stderr": ""},
-    {"path": "bench/pgo-training/dictionary-mix.js", "stdout": "80951254\n", "stderr": ""}
+    {"path": "bench/pgo-training/dictionary-mix.js", "stdout": "80951254\n", "stderr": ""},
+    {"path": "bench/pgo-training/tree-walk-mix.js", "stdout": "tree-walk=70606:3162:3312:6898190\n", "stderr": ""}
   ]
 }

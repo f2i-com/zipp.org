@@ -41,13 +41,15 @@ and checksums. The current mechanism-level inputs include a fan-out/fan-in async
 DAG, a quoted-CSV scanner whose boundaries are tuple records, and a separate
 URI-template expander. They replace the former serial-promise and combined text
 pipeline shapes, which were too close to scored control flow even though their
-bytes differed. The text/data, CSV, and URI programs use independent checksum
+bytes differed. A syntax-tree walk (a wrapper object per node, visitor tables, a
+loose iteration helper and prototype predicates) trains the shape of compiler
+and bundler code, which the other inputs left cold. The text/data, CSV, and URI programs use independent checksum
 families rather than the FNV-1a loop shared by several scored programs; the
 validator rejects the FNV-1a constants and shared distinctive numeric kernels
 from every training input.
 
 Every training input must be self-contained, bounded, and deterministic. The
-manifest declares exact stdout and stderr for all seven inputs. The six legacy
+manifest declares exact stdout and stderr for all eight inputs. The six legacy
 training micros were removed because they mechanically duplicated public micro
 benches; every tracked JavaScript or module benchmark outside this directory is
 now a scored provenance input.

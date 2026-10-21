@@ -180,6 +180,7 @@ PGO_INPUTS=(
   bench/pgo-training/async-dag-mix.js
   bench/pgo-training/memory-shapes-mix.js
   bench/pgo-training/dictionary-mix.js
+  bench/pgo-training/tree-walk-mix.js
 )
 TRAINING_INPUTS=("${PGO_INPUTS[@]}")
 CORPUS_VALIDATOR=tools/pgo_corpus.py
