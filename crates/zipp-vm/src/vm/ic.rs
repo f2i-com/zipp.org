@@ -99,13 +99,34 @@ impl OwnSlot {
 /// A key of at most 16 bytes as two little-endian words, zero-padded.
 #[inline(always)]
 fn key_words(b: &[u8]) -> (u64, u64) {
-    let mut buf = [0u8; 16];
-    buf[..b.len()].copy_from_slice(b);
-    let (lo, hi) = buf.split_at(8);
-    (
-        u64::from_le_bytes(lo.try_into().expect("8 bytes")),
-        u64::from_le_bytes(hi.try_into().expect("8 bytes")),
-    )
+    if b.len() > 8 {
+        let (lo, hi) = b.split_at(8);
+        (u64::from_le_bytes(lo.try_into().expect("8 bytes")), load_le_short(hi))
+    } else {
+        (load_le_short(b), 0)
+    }
+}
+
+/// At most 8 bytes as a zero-padded little-endian word, from two loads that
+/// overlap when the length is not a power of two: copying the key into a
+/// zeroed buffer was a variable-length `memcpy` on every property probe.
+#[inline(always)]
+fn load_le_short(b: &[u8]) -> u64 {
+    let n = b.len();
+    debug_assert!(n <= 8);
+    if n >= 4 {
+        let lo = u32::from_le_bytes(b[..4].try_into().expect("4 bytes")) as u64;
+        let hi = u32::from_le_bytes(b[n - 4..].try_into().expect("4 bytes")) as u64;
+        lo | (hi << ((n - 4) * 8))
+    } else if n >= 2 {
+        let lo = u16::from_le_bytes(b[..2].try_into().expect("2 bytes")) as u64;
+        let hi = u16::from_le_bytes(b[n - 2..].try_into().expect("2 bytes")) as u64;
+        lo | (hi << ((n - 2) * 8))
+    } else if n == 1 {
+        b[0] as u64
+    } else {
+        0
+    }
 }
 
 #[inline(always)]
@@ -3567,6 +3588,26 @@ impl<'p> Vm<'p> {
                     self.obj_proto
                 }
             };
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_word_tests {
+    use super::key_words;
+
+    #[test]
+    fn key_words_are_the_zero_padded_little_endian_words() {
+        let bytes: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        for n in 0..=16 {
+            let b = &bytes[..n];
+            let mut buf = [0u8; 16];
+            buf[..n].copy_from_slice(b);
+            let want = (
+                u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                u64::from_le_bytes(buf[8..].try_into().unwrap()),
+            );
+            assert_eq!(key_words(b), want, "length {n}");
         }
     }
 }
