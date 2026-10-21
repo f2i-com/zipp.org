@@ -16,6 +16,80 @@ const CONFINED_MODULE_COUNT_LIMIT: usize = 256;
 const CONFINED_MODULE_TOTAL_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
 const CONFINED_MODULE_RECURSION_LIMIT: u32 = 64;
 
+/// An absolute path as a `file:` URL, as Node's `url.pathToFileURL(path).href`
+/// writes it (and so `import.meta.url`): on Windows `\` is a separator and a
+/// verbatim `\\?\` prefix is dropped, a UNC server becomes the URL's host, and
+/// what a URL path may not hold literally is percent-encoded: `%`, space, `"`,
+/// `#`, `<`, `>`, `?`, `` ` ``, `{`, `}` (and `\` off Windows), control
+/// characters and every byte of a non-ASCII character.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub(crate) fn file_url(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    let text = {
+        let t = path.to_string_lossy().replace('\\', "/");
+        if let Some(rest) = t.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else if let Some(rest) = t.strip_prefix("//?/") {
+            rest.to_string()
+        } else {
+            t
+        }
+    };
+    #[cfg(not(windows))]
+    let text = path.to_string_lossy().into_owned();
+    let mut url = String::from("file://");
+    let path_part = if let Some(rest) = text.strip_prefix("//") {
+        let (server, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        url.push_str(server);
+        format!("/{rest}")
+    } else if text.starts_with('/') {
+        text
+    } else {
+        format!("/{text}")
+    };
+    for b in path_part.bytes() {
+        match b {
+            0..=0x1F | 0x7F..=0xFF | b' ' | b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}' => {
+                url.push_str(&format!("%{b:02X}"));
+            }
+            #[cfg(not(windows))]
+            b'\\' => url.push_str("%5C"),
+            _ => url.push(b as char),
+        }
+    }
+    url
+}
+
+#[cfg(all(test, not(feature = "wasm-no-fs-loader")))]
+mod file_url_tests {
+    use super::file_url;
+    use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_as_node_writes_them() {
+        assert_eq!(file_url(Path::new(r"C:\a b\x.mjs")), "file:///C:/a%20b/x.mjs");
+        assert_eq!(file_url(Path::new(r"\\?\C:\x\y.mjs")), "file:///C:/x/y.mjs");
+        assert_eq!(file_url(Path::new(r"\\server\share\f.mjs")), "file://server/share/f.mjs");
+        assert_eq!(file_url(Path::new(r"\\?\UNC\server\share\f.mjs")), "file://server/share/f.mjs");
+        assert_eq!(
+            file_url(Path::new(r"C:\d #1 %é\{q}?`<>.mjs")),
+            "file:///C:/d%20%231%20%25%C3%A9/%7Bq%7D%3F%60%3C%3E.mjs"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_paths_as_node_writes_them() {
+        assert_eq!(file_url(Path::new("/tmp/a b/x.mjs")), "file:///tmp/a%20b/x.mjs");
+        assert_eq!(file_url(Path::new("/tmp/back\\slash.mjs")), "file:///tmp/back%5Cslash.mjs");
+        assert_eq!(
+            file_url(Path::new("/d #1 %é/{q}?`<>.mjs")),
+            "file:///d%20%231%20%25%C3%A9/%7Bq%7D%3F%60%3C%3E.mjs"
+        );
+    }
+}
+
 fn lexical_module_path(raw_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut path = std::path::PathBuf::new();
     for component in raw_path.components() {
@@ -317,6 +391,18 @@ impl<'p> Vm<'p> {
             }
         }
         self.module_base_dir.clone()
+    }
+
+    /// `import.meta.url` of the module whose namespace is `ns`: the `file:`
+    /// URL of the path the loader cached it under. `None` for code no file
+    /// was loaded for.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
+    pub(crate) fn module_url(&self, ns: u32) -> Option<String> {
+        let ns = Value::heap(ns);
+        self.module_cache
+            .iter()
+            .find(|(_, v)| **v == ns)
+            .map(|(path, _)| file_url(path))
     }
 
     /// `import_module` for a static request edge taken by the link in

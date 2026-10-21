@@ -1709,10 +1709,16 @@ impl<'p> Vm<'p> {
                             None => {
                                 // Lazily created, host-defined: ordinary
                                 // extensible null-proto object (GC-rooted
-                                // via module_metas).
-                                let m = self
-                                    .heap
-                                    .alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                // via module_metas), whose `url` is the
+                                // module file's (HostGetImportMetaProperties,
+                                // as Node, Deno and browsers give it). No
+                                // collection runs between the two allocations.
+                                let mut meta = ObjMap::new();
+                                if let Some(url) = self.module_url(k) {
+                                    let url = self.alloc_str(url);
+                                    meta.set("url", url);
+                                }
+                                let m = self.heap.alloc(HeapObj::Object(Box::new(meta)));
                                 self.proto_of.insert(m, Value::NULL);
                                 self.module_metas.insert(k, m);
                                 m
