@@ -25,14 +25,14 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "landing/src/benchmark-data.json"
 
 CAPTURES = {
-    "jit_normal": "bench/real13_f1739644_pgo_2026-10-18.json",
-    "jit_hostile": "bench/hostile/head_clean_f1739644_pgo_2026-10-18.json",
-    "interp_normal": "bench/comparison/interp_real13_f1739644_2026-10-18.json",
-    "interp_hostile": "bench/comparison/interp_hostile17_f1739644_2026-10-18.json",
-    "release_normal": "bench/comparison/release_real13_5f1c0578_2026-10-18.json",
-    "pgo_ab": "bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json",
-    "python_jit": "bench/python/cpython_5f1c0578_2026-10-18.json",
-    "python_interp": "bench/python/cpython_nojit_5f1c0578_2026-10-18.json",
+    "jit_normal": "bench/real13_84012a2d_pgo_2026-10-21.json",
+    "jit_hostile": "bench/hostile/head_clean_84012a2d_pgo_2026-10-21.json",
+    "interp_normal": "bench/comparison/interp_real13_84012a2d_2026-10-21.json",
+    "interp_hostile": "bench/comparison/interp_hostile17_84012a2d_2026-10-21.json",
+    "release_normal": "bench/comparison/release_real13_da0fe6b1_2026-10-21.json",
+    "pgo_ab": "bench/comparison/pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json",
+    "python_jit": "bench/python/cpython_da0fe6b1_2026-10-21.json",
+    "python_interp": "bench/python/cpython_nojit_da0fe6b1_2026-10-21.json",
 }
 
 NORMAL_NAMES = {

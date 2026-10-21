@@ -23,8 +23,10 @@ const jit = data.jit
 const interp = data.interp
 const python = data.python
 const release = data.release
+// "zipp 0.0.28" -> "0.0.28": each capture names the engine it measured.
+const versionOf = (stamp: string) => stamp.replace(/^zipp /, '')
 
-const x = (value: number, digits = 3) => `${value.toFixed(digits)}×`
+const x =(value: number, digits = 3) => `${value.toFixed(digits)}×`
 const ms = (value: number | undefined | null) =>
   value === undefined || value === null ? '—' : value >= 1000 ? value.toLocaleString('en-US', { maximumFractionDigits: 0 }) : value.toFixed(value >= 100 ? 0 : 1)
 const range = (ci: Interval) => (ci && ci.length === 2 ? `${ci[0].toFixed(3)}–${ci[1].toFixed(3)}` : 'no interval')
@@ -122,7 +124,7 @@ const READING: Record<Mode, { title: string; copy: string }[]> = {
     { title: 'Why it matters', copy: 'The WebAssembly build, the safe-sandbox profile and arm64 hosts without the JIT all run this interpreter, so these rows are what most embedders get.' },
   ],
   python: [
-    { title: 'ZIPP Python against CPython', copy: `Python 3 compiled to ZIPP’s register bytecode, run by the published 0.0.26 binary, against CPython ${python.cpython}. Standard CPython is an interpreter, so ZIPP is shown both with its JIT and with ZIPP_NOJIT=1.` },
+    { title: 'ZIPP Python against CPython', copy: `Python 3 compiled to ZIPP’s register bytecode, run by the published ${versionOf(python.zipp.version)} binary, against CPython ${python.cpython}. Standard CPython is an interpreter, so ZIPP is shown both with its JIT and with ZIPP_NOJIT=1.` },
     { title: 'Work time, and the whole process', copy: 'Each program times its own workload in-process (the ratio in the table), and the harness records wall time too. Wall time adds process start and compile, where ZIPP’s lighter start counts in its favour.' },
     { title: 'Same answers', copy: `Every run’s output must equal CPython’s. ${python.zippOnlyPrograms} more programs (the torch ones) have no CPython counterpart and are left out of every figure here.` },
   ],
@@ -391,12 +393,12 @@ export function BenchmarkSection() {
               <p>
                 Native Windows x86-64 CLI, high-performance power mode, {jit.reps} paired repetitions in a deterministically
                 shuffled order, {jit.bootstrapSamples.toLocaleString('en-US')} bootstrap samples, exact-byte output. ZIPP is the
-                provenance-stamped profile-guided (PGO) build of the 0.0.26 engine, SHA-256 <code>{jit.zipp.sha256.slice(0, 8)}…{jit.zipp.sha256.slice(-6)}</code>,
+                provenance-stamped profile-guided (PGO) build of the {versionOf(jit.zipp.version)} engine, SHA-256 <code>{jit.zipp.sha256.slice(0, 8)}…{jit.zipp.sha256.slice(-6)}</code>,
                 the project’s canonical benchmark build. Medians include process launch: ZIPP {jit.startupMs.zipp.toFixed(1)} ms,
                 Node {jit.startupMs.node.toFixed(1)} ms, Bun {jit.startupMs.bun.toFixed(1)} ms, Deno {jit.startupMs.deno.toFixed(1)} ms.
               </p>
               <p>
-                <strong>The download is a plain release build.</strong> The published <code>zipp-0.0.26-windows-x86_64-portable.exe</code> runs
+                <strong>The download is a plain release build.</strong> The published <code>zipp-{versionOf(release.zipp.version)}-windows-x86_64-portable.exe</code> runs
                 the normal 13 rows at {x(release.normalVsNode.all_measured.value)} Node ({range(release.normalVsNode.all_measured.ci)}); the PGO build takes{' '}
                 {release.pgoOverRelease.all_measured ? x(release.pgoOverRelease.all_measured.value) : '—'} of its time on the same rows.
               </p>
@@ -424,7 +426,7 @@ export function BenchmarkSection() {
           {mode === 'python' && (
             <>
               <p>
-                The published 0.0.26 binary (<code>{python.zipp.sha256.slice(0, 8)}…{python.zipp.sha256.slice(-6)}</code>, the plain release build: the PGO
+                The published {versionOf(python.zipp.version)} binary (<code>{python.zipp.sha256.slice(0, 8)}…{python.zipp.sha256.slice(-6)}</code>, the plain release build: the PGO
                 build has no Python) against CPython {python.cpython}, a fresh process per engine per repetition, interleaved. Ratios are medians of
                 the in-process work time; geometric means: micro {x(pyWorkJit.micro)}, macro {x(pyWorkJit.macro)}, all {x(pyWorkJit.all)} with the JIT,
                 {' '}{x(pyWorkInterp.all)} without it. Whole-process wall time: {x(pyWallJit.all)} with the JIT.

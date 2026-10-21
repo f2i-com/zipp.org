@@ -23,51 +23,51 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-10-18
+## Current status — 2026-10-21
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `f1739644`, the
-0.0.26 engine. The `f1739644` rows:
+The public score is the clean four-engine PGO capture at `84012a2d`, the
+0.0.28 engine. The `84012a2d` rows:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.769×** [0.762, 0.775] | 0.649× [0.644, 0.654] | 0.681× [0.666, 0.692] | 10 / 10 |
-| diagnostics three | **0.169×** [0.165, 0.175] | 0.148× [0.147, 0.155] | 0.138× [0.135, 0.145] | 3 / 3 |
-| all 13 | **0.542×** [0.537, 0.547] | 0.462× [0.459, 0.466] | 0.471× [0.462, 0.481] | 13 / 13 |
-| hostile all 17, ordinary | **0.715×** [0.705, 0.722] | 0.537× [0.533, 0.543] | 0.414× [0.411, 0.419] | 11 / 17 |
-| hostile category-balanced | **0.748×** [0.738, 0.754] | 0.553× [0.548, 0.560] | 0.428× [0.426, 0.434] | — |
-| all 30, equal row weight | **0.634×** | 0.503× | 0.438× | 24 / 30 |
+| retained ten | **0.766×** [0.758, 0.771] | 0.641× [0.635, 0.645] | 0.682× [0.672, 0.687] | 10 / 10 |
+| diagnostics three | **0.176×** [0.172, 0.180] | 0.150× [0.147, 0.153] | 0.140× [0.138, 0.143] | 3 / 3 |
+| all 13 | **0.545×** [0.540, 0.549] | 0.458× [0.455, 0.461] | 0.473× [0.467, 0.477] | 13 / 13 |
+| hostile all 17, ordinary | **0.748×** [0.740, 0.757] | 0.527× [0.522, 0.536] | 0.407× [0.403, 0.412] | 10 / 17 |
+| hostile category-balanced | **0.784×** [0.775, 0.793] | 0.542× [0.537, 0.552] | 0.421× [0.418, 0.427] | — |
+| all 30, equal row weight | **0.652×** | 0.496× | 0.434× | 23 / 30 |
 
 Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
 counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
 and failure lists. The all-30 row is the equal-row point
 `exp((13 ln G13 + 17 ln G17) / 30)`; no interval was computed for it this time.
-The previous canonical pair (`fa8e3b86`, 2026-10-15) read 0.795× / 0.182× /
-0.566× / 0.829× / 0.895× / 0.703× against Node; `8229b3fc` (2026-09-02) 0.878× /
-0.186× / 0.614× / 0.829× / 0.862× / 0.728×.
+The previous canonical pair (`f1739644`, 2026-10-18, the 0.0.26 engine) read
+0.769× / 0.169× / 0.542× / 0.715× / 0.748× / 0.634× against Node; `fa8e3b86` (2026-10-15)
+0.795× / 0.182× / 0.566× / 0.829× / 0.895× / 0.703×; `8229b3fc` (2026-09-02)
+0.878× / 0.186× / 0.614× / 0.829× / 0.862× / 0.728×.
 
 The literal all-row target remains false: every Node gap is in the hostile set
-(allocation-survival 1.36×, warm-router 1.31×, reactish-reconcile 1.16×, calls-closures 1.07×, shapes-megamorphic 1.03×, shapes-stable 1.01×); the bytecode VM
-is no longer one. See [`PERFORMANCE.md`](PERFORMANCE.md) for the tables and raw
+(allocation-survival 1.38×, reactish-reconcile 1.26×, warm-router 1.25×, calls-closures 1.12×, shapes-megamorphic 1.10×, bytecode-vm 1.05×, shapes-stable 1.04×). See [`PERFORMANCE.md`](PERFORMANCE.md) for the tables and raw
 artifact links.
 
 ### Interpreter versus interpreter
 
 The same PGO binary with `ZIPP_NOJIT=1`, over the same 30 rows
-(`bench/comparison/interp_real13_f1739644_2026-10-18.json` and its hostile pair, diagnostic `run_native.py`
-runs): **0.720×** Bellard's QuickJS (21 / 30 point wins),
-**0.410×** QuickJS-NG (30 / 30), 0.856× Bun with JavaScriptCore's JIT off,
-1.060× Deno `--jitless` and 1.147× Node `--jitless`. Bellard's QuickJS still
-wins property-ic-shapes (1.50×), module-hot-graph (1.48×), calls-closures (1.25×), typedarray-math (1.25×) and 5 more rows; on the five micro kernels
+(`bench/comparison/interp_real13_84012a2d_2026-10-21.json` and its hostile pair, diagnostic `run_native.py`
+runs): **0.685×** Bellard's QuickJS (24 / 30 point wins; 0.720× in the
+0.0.26 capture), **0.387×** QuickJS-NG (30 / 30), 0.809× Bun with JavaScriptCore's
+JIT off, 0.994× Deno `--jitless` and 1.090× Node `--jitless`. Bellard's QuickJS still
+wins property-ic-shapes (1.32×), module-hot-graph (1.18×), types-churn (1.09×), typedarray-math (1.08×) and 2 more rows; on the five micro kernels
 (15 October) Zipp's interpreter was 1.12× Bellard's, most of it calls (`fib` 1.66×).
 
 ### Python versus CPython
 
-The published 0.0.26 binary against CPython 3.13.14, 36 programs, in-process
-work time (`bench/python/cpython_5f1c0578_2026-10-18.json`): 1.057× with the JIT
-(0.966× micro, 1.664× application-shaped), 1.506× without it. String
-methods, exceptions, generators and object creation are the largest gaps.
+The published 0.0.28 binary against CPython 3.13.14, 36 programs, in-process
+work time (`bench/python/cpython_da0fe6b1_2026-10-21.json`): 1.067× with the JIT
+(0.975× micro, 1.674× application-shaped), 1.443× without it; the 0.0.26
+binary measured 1.057× and 1.506×. String methods, generators, exceptions and object creation are the largest gaps.
 
 
 ### Historical v0.0.5 QuickJS-NG and Boa diagnostic

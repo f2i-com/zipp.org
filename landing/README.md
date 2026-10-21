@@ -178,18 +178,18 @@ cannot fetch live repository facts. Normal builds work without network access.
 
 The benchmark section's figures come from `src/benchmark-data.json`, which
 `python scripts/import-benchmarks.py` (run from the repository root as
-`python landing/scripts/import-benchmarks.py`) writes from the 18 October 2026
+`python landing/scripts/import-benchmarks.py`) writes from the 21 October 2026
 captures and nothing else:
 
-- JIT against JIT, the canonical PGO build of the 0.0.26 engine (`zipp 0.0.26`,
-  clean source `f1739644`): `../bench/real13_f1739644_pgo_2026-10-18.json` and
-  `../bench/hostile/head_clean_f1739644_pgo_2026-10-18.json`
+- JIT against JIT, the canonical PGO build of the 0.0.28 engine (`zipp 0.0.28`,
+  clean source `84012a2d`): `../bench/real13_84012a2d_pgo_2026-10-21.json` and
+  `../bench/hostile/head_clean_84012a2d_pgo_2026-10-21.json`
 - interpreter against interpreter, the same binary with `ZIPP_NOJIT=1`:
-  `../bench/comparison/interp_real13_f1739644_2026-10-18.json` and `../bench/comparison/interp_hostile17_f1739644_2026-10-18.json`
-- Python against CPython, the published release binary: `../bench/python/cpython_5f1c0578_2026-10-18.json`
-  and `../bench/python/cpython_nojit_5f1c0578_2026-10-18.json`
-- the release build as downloaded: `../bench/comparison/release_real13_5f1c0578_2026-10-18.json` and
-  `../bench/comparison/pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json`
+  `../bench/comparison/interp_real13_84012a2d_2026-10-21.json` and `../bench/comparison/interp_hostile17_84012a2d_2026-10-21.json`
+- Python against CPython, the published release binary: `../bench/python/cpython_da0fe6b1_2026-10-21.json`
+  and `../bench/python/cpython_nojit_da0fe6b1_2026-10-21.json`
+- the release build as downloaded: `../bench/comparison/release_real13_da0fe6b1_2026-10-21.json` and
+  `../bench/comparison/pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json`
 
 The importer checks that the canonical pair is publishable and exact, and that
 replaying the saved observations through `tools/bench.py` reproduces the
@@ -198,8 +198,8 @@ capture's own geomeans before it derives the Bun and Deno ones;
 what the data says (counts and directions are computed), so a new capture
 needs no hand edits there; the `/benchmarks/` page in `site/content.json`,
 `docs/PERFORMANCE.md` and the root README quote the same figures. The previous
-canonical pair (`fa8e3b86`, 15 October 2026, recorded as v0.0.24) stays in
-`../bench/` as a prior series point.
+canonical pairs (`f1739644`, 18 October 2026, recorded as v0.0.26, and `fa8e3b86`,
+15 October 2026, v0.0.24) stay in `../bench/` as prior series points.
 
 The optional JavaScript story scratchpad's browser engine is v0.0.28, 4,764,941 raw bytes, SHA-256
 `3f5d5ee1c733dda49ef5d42eab6888cac49548d206cd7ef20c7017bbbf85f681`.
