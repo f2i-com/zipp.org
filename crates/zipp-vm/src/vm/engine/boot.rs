@@ -575,6 +575,7 @@ impl<'p> Vm<'p> {
             closure_new_target: crate::slot_table::SlotTable::default(),
             finalize_shapes: rustc_hash::FxHashMap::default(),
             iter_result_shape: None,
+            step_tokens: vec![(u32::MAX, 0, 0); crate::vm::STEP_TOKEN_SLOTS].into_boxed_slice(),
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,

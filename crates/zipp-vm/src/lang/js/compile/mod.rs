@@ -931,7 +931,7 @@ mod entry;
 mod exprs;
 mod funcs;
 mod helpers;
-mod remap;
+pub(crate) mod remap;
 mod scopes;
 mod string_accum;
 mod typeof_alias;

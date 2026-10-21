@@ -590,6 +590,73 @@ impl<'p> Vm<'p> {
         self.call_value_exotic(callee, this, args)
     }
 
+    /// A loose for-of loop's step, `_step = _iterator()` with `_iterator`
+    /// `it.next.bind(it)` over an array iterator, at a `Call` writing a step
+    /// register (`FusedCode::step_site`): `call_value_exotic`'s bound-next
+    /// fast path, whose result object rewrites the one the previous step
+    /// left in that register instead of allocating another. `None` when any
+    /// of that does not hold; the caller then makes the ordinary call.
+    #[inline(never)]
+    pub(crate) fn bound_step_call(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        dst: crate::bytecode::Reg,
+        callee: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        if !callee.is_heap() || !self.realm_global_objs.is_empty() || !self.regexp_string_iters.is_empty() {
+            return None;
+        }
+        let (target, this) = match self.heap.get(callee.heap_index()) {
+            HeapObj::Bound { target, this, args } if args.is_empty() => (*target, *this),
+            _ => return None,
+        };
+        if !target.is_heap()
+            || !this.is_heap()
+            || !matches!(self.heap.get(target.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::ITER_NEXT)
+        {
+            return None;
+        }
+        let f = self.func(func_id as usize);
+        if !f.fused.step_site(f, ip) {
+            return None;
+        }
+        let (v, done) = match self.array_iter_step(this.heap_index())? {
+            Ok(step) => step,
+            Err(e) => return Some(Err(e)),
+        };
+        let prev = self.get(base, dst);
+        Some(Ok(self.step_result(base + dst as usize, prev, v, done)))
+    }
+
+    /// The step's `{ value, done }`: the register's previous result rewritten
+    /// in place when it is the object the fast path last made for this
+    /// register (`step_tokens`; the step register is that object's only
+    /// holder), else a new one, remembered for the next step.
+    fn step_result(&mut self, reg: usize, prev: Value, v: Value, done: bool) -> Value {
+        let slot = reg & (crate::vm::STEP_TOKEN_SLOTS - 1);
+        let (treg, idx, ver) = self.step_tokens[slot];
+        if treg as usize == reg && prev.is_heap() && prev.heap_index() == idx && self.heap.version_of(idx) == ver {
+            if let Some(shape) = self.iter_result_shape {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    if m.shape() == shape {
+                        m.set_val_at(0, v);
+                        m.set_val_at(1, Value::bool(done));
+                        self.heap.write_barrier_val(idx, v);
+                        return prev;
+                    }
+                }
+            }
+        }
+        let r = self.iter_result(v, done);
+        if r.is_heap() {
+            let idx = r.heap_index();
+            self.step_tokens[slot] = (reg as u32, idx, self.heap.version_of(idx));
+        }
+        r
+    }
+
     /// The rare-receiver tail of [`call_value`]: the pre-flattening cascade,
     /// arm for arm in its original order (some arms are order-dependent —
     /// `realm_fns` must be probed before the plain `Native` arm because its

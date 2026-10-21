@@ -907,7 +907,23 @@ impl<'a> FnCompiler<'a> {
             }
             return Ok(dst);
         }
-        let obj = self.recv_expr(&m.object)?;
+        // `(x = v).p` with `x` a plain local: assign in place and read the
+        // property from the local itself. Nothing runs between the store and
+        // the read, so that is the assignment's value, and the general path's
+        // copy into a temporary is a Move per evaluation (per step of a loose
+        // for-of loop, `!(_step = _iterator()).done`).
+        let in_place = match &m.object {
+            ast::Expr::Assign {
+                op: ast::AssignOp::Assign,
+                target,
+                ..
+            } => self.discarded_in_place_reg(target),
+            _ => None,
+        };
+        let obj = match (&m.object, in_place) {
+            (ast::Expr::Assign { op, target, value, .. }, Some(r)) => self.assign(*op, target, value, r)?,
+            _ => self.recv_expr(&m.object)?,
+        };
         if m.optional {
             self.emit_optional_check(obj);
         }

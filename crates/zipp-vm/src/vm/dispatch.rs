@@ -4443,6 +4443,16 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // A loose for-of step through a bound array-iterator
+                            // `next` reuses its result object (`bound_step_call`).
+                            if argc == 0 {
+                                if let Some(r) = self.bound_step_call(func_id, ip, base, dst, callee_v) {
+                                    let r = r?;
+                                    self.set(base, dst, r);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             // A bound or native function: run via call_value (fixes
                             // `this`/prepends bound args, or dispatches the builtin).
                             // A CombinatorResolver (a Promise.all/race/â€¦ resolve/reject

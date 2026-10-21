@@ -2886,6 +2886,9 @@ pub struct FuncProto {
 pub struct FusedCode {
     /// The copy; an empty one when nothing in the function fuses.
     code: std::sync::OnceLock<Box<[Instr]>>,
+    /// The function's step call sites (`step_call_sites`), found the first
+    /// time the interpreter asks.
+    steps: std::sync::OnceLock<Box<[u32]>>,
 }
 
 impl Clone for FusedCode {
@@ -2923,6 +2926,93 @@ impl FusedCode {
         self.code.get_or_init(|| fuse_for_interpreter(code).unwrap_or_default());
         self.get()
     }
+
+    /// Whether the `Call` at `ip` of `f` (whose `fused` this is) writes a
+    /// step register (`step_call_sites`).
+    #[inline]
+    pub fn step_site(&self, f: &FuncProto, ip: usize) -> bool {
+        self.steps
+            .get_or_init(|| step_call_sites(f))
+            .binary_search(&(ip as u32))
+            .is_ok()
+    }
+}
+
+/// The argument-less `Call`s of `f` that write a loose for-of loop's step
+/// register: `!(_step = _iterator()).done`, then `_step.value` in the body.
+/// A register qualifies when every write to it is such a call followed at
+/// once by a `GetProp` of `done` from it (or a load of `undefined`), and every
+/// read a `GetProp` of `done` or `value`. It is then the only holder of what
+/// those calls return, so a step result the interpreter made there itself
+/// can be rewritten in place by the next step instead of allocated anew
+/// (`Vm::bound_step_call`).
+///
+/// Any other mention of the register (`compile::remap::remap_regs` lists
+/// every register operand of every instruction) disqualifies it. An argument
+/// window is listed by its base only, but every slot of one is written by
+/// the argument code right before the call, and a call result that lands in
+/// a slot is not followed by a `done` read of that slot. A generator or
+/// async function (whose frame is saved), one with an `arguments` object
+/// (which aliases parameter registers) or one that direct-evals has none.
+pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
+    if f.is_generator || f.is_async || f.arguments_reg.is_some() || !f.eval_sites.is_empty() {
+        return Box::default();
+    }
+    // A name is a string-constant index, and a function keeps one entry per
+    // use, so each loop of a function names `done` through its own index.
+    let named = |name: u32, key: &str| f.string_constants.get(name as usize).is_some_and(|s| s == key);
+    let code = &f.code;
+    let mut sites: std::collections::HashMap<Reg, Vec<u32>> = std::collections::HashMap::new();
+    for (i, pair) in code.windows(2).enumerate() {
+        if let (Instr::Call { dst, argc: 0, .. }, Instr::GetProp { obj, name, .. }) = (pair[0], pair[1]) {
+            if obj == dst && named(name, "done") {
+                sites.entry(dst).or_default().push(i as u32);
+            }
+        }
+    }
+    if sites.is_empty() {
+        return Box::default();
+    }
+    let read = |name: u32| named(name, "done") || named(name, "value");
+    let mut bad: std::collections::HashSet<Reg> = std::collections::HashSet::new();
+    for (i, ins) in code.iter().enumerate() {
+        match *ins {
+            Instr::Call { dst, callee, argc: 0, .. }
+                if sites.get(&dst).is_some_and(|v| v.contains(&(i as u32))) =>
+            {
+                if sites.contains_key(&callee) {
+                    bad.insert(callee);
+                }
+                continue;
+            }
+            Instr::GetProp { dst, obj, name } if sites.contains_key(&obj) && read(name) => {
+                if sites.contains_key(&dst) {
+                    bad.insert(dst);
+                }
+                continue;
+            }
+            Instr::LoadUndefined { dst } if sites.contains_key(&dst) => continue,
+            _ => {}
+        }
+        let mut copy = *ins;
+        let named = std::cell::RefCell::new(Vec::new());
+        crate::compile::remap::remap_regs(&mut copy, &|r| {
+            named.borrow_mut().push(r);
+            r
+        });
+        for r in named.into_inner() {
+            if sites.contains_key(&r) {
+                bad.insert(r);
+            }
+        }
+    }
+    let mut out: Vec<u32> = sites
+        .into_iter()
+        .filter(|(r, _)| !bad.contains(r))
+        .flat_map(|(_, ips)| ips)
+        .collect();
+    out.sort_unstable();
+    out.into_boxed_slice()
 }
 
 /// The interpreter's superinstruction copy of `code` (see [`FusedCode`]),

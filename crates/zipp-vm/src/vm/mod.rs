@@ -536,6 +536,9 @@ pub(crate) enum Resume {
     Return(Value),
 }
 
+/// `Vm::step_tokens`' size, a power of two.
+pub(crate) const STEP_TOKEN_SLOTS: usize = 64;
+
 /// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
 /// GC suspension (the pricing comparator; it re-opens the TLA starvation).
 pub(crate) const COLL_PROOF_SLOTS: usize = 16;
@@ -2911,6 +2914,12 @@ pub struct Vm<'p> {
     /// The shape two data appends of `value` and `done` reach, the layout of
     /// an iterator result object, made at the first result (`Vm::iter_result`).
     iter_result_shape: Option<u32>,
+    /// The result object each step register last got from the bound-next
+    /// fast path (`Vm::bound_step_call`), direct-mapped by the register's
+    /// absolute index: (absolute register, heap index, heap version), with
+    /// `u32::MAX` for a register no step has written. `STEP_TOKEN_SLOTS` of
+    /// them.
+    step_tokens: Box<[(u32, u32, u32)]>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.
