@@ -1,6 +1,8 @@
 // Nested interpreter re-entry in the hardened wasm build: a builtin callback,
-// a generator resumption, a Proxy trap, a sort comparator each run the guest
-// inside a nested run loop, and the safe profile caps that nesting
+// a Proxy trap, a sort comparator each run the guest inside a nested run loop
+// (a generator drained by spread or for...of steps as frames of the loop that
+// drains it instead, so its nesting costs frames, which the frame cap refuses
+// just as catchably), and the safe profile caps that nesting
 // (MAX_RUN_LOOP_DEPTH in crates/zipp-vm/src/vm/mod.rs) so runaway nesting is
 // a catchable error long before either stack overflows. Two halves: the
 // shapes real programs use (a research script's generator inside `sum`
@@ -26,7 +28,8 @@ const WORKING_DEPTH = 20;
 const HOSTILE_DEPTH = 200;
 const shapes = {
   js_proxy_traps: ["javascript", (d) => `let t = {x: 1}; for (let i = 0; i < ${d}; i++) { const inner = t; t = new Proxy({}, { get: (o, k) => inner[k] }); } console.log(t.x);`, "1"],
-  js_generators: ["javascript", (d) => `function* g(d) { if (d === 0) { yield 1; return; } for (const v of g(d - 1)) yield v; } console.log([...g(${d})][0]);`, "1"],
+  // Steps as frames: 1,000 deep runs, and the frame cap refuses it before 5,000.
+  js_generators: ["javascript", (d) => `function* g(d) { if (d === 0) { yield 1; return; } for (const v of g(d - 1)) yield v; } console.log([...g(${d})][0]);`, "1", 5000],
   js_sort_comparators: ["javascript", (d) => `function probe(d) { if (d === 0) return 0; return [2, 1].sort((a, b) => probe(d - 1) + a - b)[0]; } console.log(probe(${d}));`, "1"],
   js_replace_callbacks: ["javascript", (d) => `function probe(d) { if (d === 0) return "0"; return "a".replace(/a/, () => probe(d - 1)); } console.log(probe(${d}));`, "0"],
 };
@@ -52,12 +55,12 @@ function healthy() {
   return r.ok && r.out === "42";
 }
 
-for (const [name, [lang, make, expected]] of Object.entries(shapes)) {
+for (const [name, [lang, make, expected, hostileDepth = HOSTILE_DEPTH]] of Object.entries(shapes)) {
   const shallow = run(lang, make(WORKING_DEPTH));
   ok(`${name}: ${WORKING_DEPTH} nested re-entries run`, shallow.ok && shallow.out.startsWith(expected), shallow.ok ? shallow.out : shallow.error);
-  const deep = run(lang, make(HOSTILE_DEPTH));
+  const deep = run(lang, make(hostileDepth));
   const message = deep.ok ? "" : deep.error;
-  ok(`${name}: ${HOSTILE_DEPTH} is refused as a catchable error, not a trap`, !deep.ok && /call stack|RecursionError|recursion/i.test(message), deep.ok ? "ran" : message.slice(0, 80));
+  ok(`${name}: ${hostileDepth} is refused as a catchable error, not a trap`, !deep.ok && /call stack|RecursionError|recursion/i.test(message), deep.ok ? "ran" : message.slice(0, 80));
   ok(`${name}: the instance stays healthy afterwards`, healthy());
 }
 if (hasPython) {
