@@ -781,9 +781,117 @@ impl<'p> Vm<'p> {
             | HeapObj::Native(_)
             | HeapObj::NativeClosure { .. }
             | HeapObj::BoundResolver { .. }
-            | HeapObj::CombinatorResolver { .. } => self.fn_own_data_read(o, key),
+            | HeapObj::CombinatorResolver { .. } => self.fn_data_read(o, key),
+            HeapObj::Iterator { proto, .. } => {
+                let proto = *proto;
+                self.iterator_data_read(o, proto, key)
+            }
             _ => self.proto_intrinsic_read(o, key).map(Value::from_bits),
         }
+    }
+
+    /// The callable and iterator arms of [`Vm::shapeless_read`], for the
+    /// member walk's own entry (`get_member_slow`): a method call's Get of
+    /// `bind` on a native reaches it without passing `shapeless_read`.
+    #[inline]
+    pub(crate) fn callable_iter_data_read(&self, o: Value, key: &str) -> Option<Value> {
+        match self.heap.get(o.heap_index()) {
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => self.fn_data_read(o, key),
+            HeapObj::Iterator { proto, .. } => self.iterator_data_read(o, *proto, key),
+            _ => None,
+        }
+    }
+
+    /// `f.key` on a non-class callable: its own data property
+    /// (`counter.calls`), or, when it has no own `key`, the data property the
+    /// member walk's callable arm inherits (`fn.call`, `fn.bind`) from the
+    /// same start: a `proto_of` override, else the dynamic-function prototype
+    /// of a generator or async function, else %Function.prototype%. Reading
+    /// `it.next.bind(it)` took that whole walk twice per loose-mode for...of.
+    #[inline(never)]
+    fn fn_data_read(&self, o: Value, key: &str) -> Option<Value> {
+        if !self.callable_member_lane_ok(key) {
+            return None;
+        }
+        let idx = o.heap_index();
+        if let Some(m) = self.fn_props.get(&idx) {
+            if let Some(i) = m.pos(key) {
+                let v = m.val_at(i);
+                return (!m.attr_at(i).accessor && !v.is_uninitialized()).then_some(v);
+            }
+        }
+        if !self.arr_props.is_empty() && self.arr_props.contains_key(&idx) {
+            return None;
+        }
+        let start = match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return None,
+            None => self.callable_dynfn_proto(idx).unwrap_or(self.fn_proto),
+        };
+        self.proto_chain_data_read(start, key)
+    }
+
+    /// `it.key` on a built-in iterator (`it.next` of an array's iterator):
+    /// the member walk's iterator arm, which has no own storage beyond
+    /// `arr_props` and starts at a `proto_of` override, else the iterator's
+    /// own prototype.
+    #[inline(never)]
+    fn iterator_data_read(&self, o: Value, proto: u32, key: &str) -> Option<Value> {
+        if !self.callable_member_lane_ok(key) {
+            return None;
+        }
+        let idx = o.heap_index();
+        if !self.arr_props.is_empty() && self.arr_props.contains_key(&idx) {
+            return None;
+        }
+        let start = match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return None,
+            None => proto,
+        };
+        self.proto_chain_data_read(start, key)
+    }
+
+    /// [`Vm::proto_member_get`]'s walk for a read that must not run code:
+    /// the value of the data property where the chain first holds `key`.
+    /// `None` for an accessor or an uninitialised slot there, a level that
+    /// is not an ordinary object (the general path knows its storage), and a
+    /// miss, which the general path answers.
+    fn proto_chain_data_read(&self, proto: u32, key: &str) -> Option<Value> {
+        let data = |m: &ObjMap, i: usize| {
+            let v = m.val_at(i);
+            (!m.attr_at(i).accessor && !v.is_uninitialized()).then_some(v)
+        };
+        let mut cur = proto;
+        let mut guard = 0u32;
+        while cur != 0 && guard < 64 {
+            guard += 1;
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return None;
+            };
+            if let Some(i) = self.own_pos(m, key) {
+                return data(m, i);
+            }
+            match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => cur = p.heap_index(),
+                _ => break,
+            }
+        }
+        if self.obj_proto != 0 && proto != self.obj_proto {
+            if let HeapObj::Object(m) = self.heap.get(self.obj_proto) {
+                if let Some(i) = self.own_pos(m, key) {
+                    return data(m, i);
+                }
+            }
+        }
+        None
     }
 
     /// `C.key` on a built-in constructor object (`Object.hasOwn`,

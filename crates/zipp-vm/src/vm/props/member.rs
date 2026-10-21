@@ -1234,12 +1234,21 @@ impl<'p> Vm<'p> {
         receiver: Value,
     ) -> Result<Value, Thrown> {
         self.defer_check(obj, key)?; // a deferred-namespace Get may evaluate
-                                     // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
-                                     // own binding for x when one exists (bare `x` and `globalThis.x`
-                                     // alias the same realm slot).
-                                     // (A `$262.createRealm()` child has a global object of its OWN — a
-                                     // reference to the main global from child code is an OrdinaryGet
-                                     // (10.1.8) on that object, never the child's binding table.)
+        // A callable's or built-in iterator's data property (`fn.bind`,
+        // `it.next`) where nothing below can apply: no realm or deferred
+        // namespace, none of the keys synthesized for callables, no own
+        // property beyond the ones those arms read first.
+        if obj.is_heap() {
+            if let Some(v) = self.callable_iter_data_read(obj, key) {
+                return Ok(v);
+            }
+        }
+        // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
+        // own binding for x when one exists (bare `x` and `globalThis.x`
+        // alias the same realm slot).
+        // (A `$262.createRealm()` child has a global object of its OWN — a
+        // reference to the main global from child code is an OrdinaryGet
+        // (10.1.8) on that object, never the child's binding table.)
         if let Some(rid) = self.active_realm {
             if obj.is_heap()
                 && self.global_this != 0

@@ -1,13 +1,17 @@
-//! Three fast paths against Node: a bound array-iterator `next` (a
+//! Four fast paths against Node: a bound array-iterator `next` (a
 //! loose-mode `for...of` as Babel compiles it) stepping the array without the
-//! native call, iterator result objects allocated as object literals are, and
-//! a method call site that learns each receiver layout reaching a way's
-//! method. The probe covers growing, shrinking and exhausted arrays, keys and
+//! native call, iterator result objects allocated as object literals are, a
+//! method call site that learns each receiver layout reaching a way's
+//! method, and inherited data reads on callables and built-in iterators
+//! (`fn.bind`, `it.next`) without the member walk. The probe covers growing,
+//! shrinking and exhausted arrays, keys and
 //! entries, holes read through a prototype getter, array-likes and their
 //! `length` getter, typed arrays, maps, sets, strings, `matchAll`, the wrong
 //! receiver, binds of binds and with arguments, a `next` patched after the
-//! bind, result objects' keys, attributes and mutation, and method sites over
-//! many layouts whose own, inherited, prototype and class methods change. The
+//! bind, result objects' keys, attributes and mutation, method sites over
+//! many layouts whose own, inherited, prototype and class methods change, and
+//! `call`/`bind`/`apply` and iterator methods that are own, inherited,
+//! accessors, deleted, added or behind a replaced or null prototype. The
 //! expected lines are Node's (v24).
 
 const PROBE: &str = r###""use strict";
@@ -168,6 +172,54 @@ try {
 } catch (e) {
   log("own deleted", e.constructor.name);
 }
+// Inherited reads on callables and iterators.
+function plain(a) { return "plain" + a; }
+function* gen() { yield 1; }
+async function af() {}
+log("fn methods", typeof plain.call, plain.call === Function.prototype.call, plain.bind === Function.prototype.bind, typeof plain.apply, plain.call(null, 1));
+log("gen methods", gen.call === Function.prototype.call, Object.getPrototypeOf(gen) === Function.prototype, typeof gen.constructor, af.bind === Function.prototype.bind);
+log("native methods", Math.max.call === Function.prototype.call, typeof [].push.bind, [].push.hasOwnProperty === Object.prototype.hasOwnProperty, typeof Math.max.toString);
+const ownCall = function () {};
+ownCall.call = "own";
+log("own call", ownCall.call, ownCall.bind === Function.prototype.bind);
+const nullProto = function () {};
+Object.setPrototypeOf(nullProto, null);
+log("null proto", nullProto.call, nullProto.bind);
+const reproFn = function () {};
+Object.setPrototypeOf(reproFn, { call: "custom", __proto__: Function.prototype });
+log("reproto fn", reproFn.call, reproFn.bind === Function.prototype.bind);
+const savedBind = Function.prototype.bind;
+let getterRuns = 0;
+Object.defineProperty(Function.prototype, "bind", { get() { getterRuns++; return savedBind; }, configurable: true });
+log("bind getter", plain.bind === savedBind, getterRuns, typeof plain.bind(null), getterRuns);
+Object.defineProperty(Function.prototype, "bind", { value: savedBind, writable: true, configurable: true });
+const savedApply = Function.prototype.apply;
+delete Function.prototype.apply;
+log("deleted apply", plain.apply, typeof plain.toString);
+Function.prototype.apply = savedApply;
+Function.prototype.extra = 7;
+log("added to Function.prototype", plain.extra, Math.max.extra, gen.extra);
+delete Function.prototype.extra;
+log("after delete", plain.extra);
+const ai2 = [1, 2].values();
+const aiProto = Object.getPrototypeOf(ai2);
+log("iter methods", ai2.next === aiProto.next, typeof ai2.toString, ai2.hasOwnProperty === Object.prototype.hasOwnProperty, ai2[Symbol.toStringTag]);
+const mi2 = new Map([[1, 1]]).entries();
+const si2 = "ab"[Symbol.iterator]();
+log("other iterators", typeof mi2.next, typeof si2.next, mi2.next === Object.getPrototypeOf(mi2).next, JSON.stringify(si2.next()));
+const own2 = [3].values();
+own2.next = function () { return { value: "own next", done: true }; };
+log("own iterator next", own2.next().value, JSON.stringify([...[4].values()]));
+const rep2 = [5].values();
+Object.setPrototypeOf(rep2, { next() { return { value: "replaced", done: true }; } });
+log("reproto iterator", rep2.next().value, rep2.toString === Object.prototype.toString);
+const savedNext2 = aiProto.next;
+delete aiProto.next;
+log("deleted next", typeof [6].values().next);
+aiProto.next = savedNext2;
+Object.getPrototypeOf(aiProto).extra2 = "inherited";
+log("from IteratorPrototype", [7].values().extra2);
+delete Object.getPrototypeOf(aiProto).extra2;
 console.log(out.join("\n"));
 "###;
 
@@ -205,7 +257,23 @@ class layouts K0,LK1,K2,LK3,K4,LK5,K6,LK7,K8,LK9 K0,LK1,K2,LK3,K4,LK5,K6,LK7,K8,
 class patched patched0,Lpatched1,patched2,Lpatched3,patched4,Lpatched5,patched6,Lpatched7,patched8,Lpatched9
 own layouts f0,f1,f2,f3,f4,f5,f6,f7,f8,f9 f0,f1,f2,f3,f4,f5,f6,f7,f8,f9
 own swapped f0,f1,f2,f3,swapped,f5,f6,f7,f8,f9
-own deleted TypeError"###;
+own deleted TypeError
+fn methods function true true function plain1
+gen methods true false function true
+native methods true function true function
+own call own true
+null proto undefined undefined
+reproto fn custom true
+bind getter true 1 function 2
+deleted apply undefined function
+added to Function.prototype 7 7 7
+after delete undefined
+iter methods true function true Array Iterator
+other iterators function function true {"value":"a","done":false}
+own iterator next own next [4]
+reproto iterator replaced true
+deleted next undefined
+from IteratorPrototype inherited"###;
 
 /// Run src on a 256 MiB stack, as the CLI does, and return its output.
 fn run(src: &str) -> String {
