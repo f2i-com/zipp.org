@@ -998,6 +998,7 @@ impl<'p> Vm<'p> {
                 args,
             } => {
                 let parent = self.get(base, ctor);
+                self.sync_top_ip(ip);
                 if !self.is_constructor(parent) {
                     return Err(Thrown(
                         "TypeError: superclass is not a constructor".into(),
@@ -1710,10 +1711,16 @@ impl<'p> Vm<'p> {
                             None => {
                                 // Lazily created, host-defined: ordinary
                                 // extensible null-proto object (GC-rooted
-                                // via module_metas).
-                                let m = self
-                                    .heap
-                                    .alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                // via module_metas), whose `url` is the
+                                // module file's (HostGetImportMetaProperties,
+                                // as Node, Deno and browsers give it). No
+                                // collection runs between the two allocations.
+                                let mut meta = ObjMap::new();
+                                if let Some(url) = self.module_url(k) {
+                                    let url = self.alloc_str(url);
+                                    meta.set("url", url);
+                                }
+                                let m = self.heap.alloc(HeapObj::Object(Box::new(meta)));
                                 self.proto_of.insert(m, Value::NULL);
                                 self.module_metas.insert(k, m);
                                 m
@@ -1760,6 +1767,8 @@ impl<'p> Vm<'p> {
                 // already captured call reference.
                 let live = self.get(base, callee);
                 let call_this = self.get(base, this_v);
+                // The eval code's frames sit above this one at this call.
+                self.sync_top_ip(ip);
                 // Direct semantics depend on the captured VALUE's
                 // identity, not on where the named reference resolved.
                 // A miss ordinary-calls the exact captured value with
@@ -3657,6 +3666,7 @@ impl<'p> Vm<'p> {
                 let cv = self.get(base, callee);
                 let args_v = self.get(base, args);
                 let arg_vec = self.array_snapshot(args_v.heap_index());
+                self.sync_top_ip(ip);
                 let result = self.construct(cv, &arg_vec)?;
                 self.set(base, dst, result);
                 ip += 1;

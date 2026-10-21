@@ -305,6 +305,9 @@ pub enum Expr {
     New {
         callee: Box<Expr>,
         args: Vec<Arg>,
+        /// Source offset of the `new` keyword: where a stack frame
+        /// suspended in this construction reports itself, as V8 does.
+        pos: u32,
     },
     Member(Box<Member>),
     /// An optional chain `a?.b.c` — the whole chain, so short-circuiting is
@@ -353,6 +356,10 @@ pub struct CallExpr {
     pub args: Vec<Arg>,
     /// `a?.()`
     pub optional: bool,
+    /// Source offset a stack frame suspended in this call reports, as V8
+    /// places it: a dotted callee's property name (`o.g()` at `g`), an
+    /// identifier callee's start, otherwise the `(`.
+    pub pos: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +854,7 @@ mod tests {
                 callee: Expr::Ident("f".into()),
                 args: vec![],
                 optional: false,
+                pos: 0,
             })),
             value: Box::new(Expr::Num(1.0)),
             covered: false,

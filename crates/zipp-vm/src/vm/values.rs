@@ -1910,13 +1910,16 @@ impl<'p> Vm<'p> {
         // The exact-capacity path benefits Lite. Full profiles retain their
         // previous allocation path after repeated error-throughput regressions.
         #[cfg(not(feature = "wasm-lite"))]
-        return self.make_error(kind, Some(message));
+        let e = self.make_error(kind, Some(message));
         #[cfg(feature = "wasm-lite")]
-        {
+        let e = {
             let mut map = ObjMap::with_capacity(1);
             map.define("message", message, ERROR_MESSAGE_ATTR);
             self.alloc_error_map(kind, map)
-        }
+        };
+        // The engine's own throw: the running frame's instruction is unknown.
+        self.forget_top_position(e.heap_index());
+        e
     }
 
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
@@ -1944,7 +1947,7 @@ impl<'p> Vm<'p> {
         if p != 0 {
             self.proto_of.insert(obj, Value::heap(p));
         }
-        self.error_data.insert(obj); // [[ErrorData]] internal slot
+        self.mark_error_data(obj); // [[ErrorData]] internal slot
         Value::heap(obj)
     }
 

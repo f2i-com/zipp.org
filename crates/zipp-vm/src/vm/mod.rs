@@ -1905,6 +1905,36 @@ pub struct Vm<'p> {
     /// them, as it has no HostReportErrors hook).
     uncaught_timer_errors: Vec<String>,
     report_unhandled: bool,
+    /// HostPromiseRejectionTracker for a host that asked to hear of
+    /// unhandled rejections (#77): the `zipp` command, which ends the program
+    /// on one as Node does (`fatal_rejections`), or an embedder's
+    /// `set_unhandled_rejection_sink` / `set_promise_rejection_hook`. Off,
+    /// nothing is recorded.
+    pub(crate) track_rejections: bool,
+    /// Promises rejected while no handler was attached, since the last
+    /// microtask checkpoint, in rejection order (HTML's about-to-be-notified
+    /// rejected promises list). GC ROOTS until `rejection_checkpoint` looks
+    /// at them; the ones that gained a handler meanwhile are dropped there.
+    pending_rejections: Vec<u32>,
+    /// Promises reported unhandled to `rejection_hook`, kept for its
+    /// "rejectionhandled" call should one gain a handler later (HTML's
+    /// outstanding rejected promises weak set). WEAK: a promise nothing
+    /// reaches can never gain a handler, so the collector drops it.
+    pub(crate) notified_rejections: Vec<u32>,
+    /// The embedder's `set_unhandled_rejection_sink`: called with the reason's
+    /// message for each rejection still unhandled at a checkpoint.
+    pub(crate) rejection_sink: Option<Box<dyn FnMut(&str)>>,
+    /// The embedder's `set_promise_rejection_hook` function, called as
+    /// `hook("unhandledrejection" | "rejectionhandled", promise, reason)`.
+    /// A GC root.
+    pub(crate) rejection_hook: Option<Value>,
+    /// End the event loop on the first rejection still unhandled at a
+    /// checkpoint, which becomes the program's error (Node's default
+    /// `--unhandled-rejections=throw`). Set for the `zipp` command; never
+    /// with the Test262 report, which scores such rejections itself.
+    fatal_rejections: bool,
+    /// `uncaught_timer_throw` holds such a rejection's reason, not a throw.
+    uncaught_in_promise: bool,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
@@ -2575,6 +2605,18 @@ pub struct Vm<'p> {
     /// removed once for every error collected, so it is a bit a slot: as a
     /// hashed set of slots those two were 7% of a throw-and-catch loop.
     error_data: crate::slot_table::SlotSet,
+    /// The stack each error object was created on, for Error.prototype.stack`r
+    /// (error_stack): its frames until the first read, then that read's text.
+    /// Pruned on GC sweep with error_data.
+    error_stacks: crate::slot_table::SlotTable<error_stack::ErrorStack>,
+    /// The name the main program's frames give their script in a stack, as
+    /// the host supplies it (the zipp command, a file's path); None is
+    /// <anonymous>.
+    pub(crate) script_name: Option<std::sync::Arc<str>>,
+    /// The compiled caller of the construction running now, as the JIT's
+    /// `new` helper hands it over (`func << 32 | ip`), and the frame count
+    /// then; `error_stack::NO_JIT_SITE` otherwise. Read by `mark_error_data`.
+    pub(crate) jit_new_site: (u64, usize),
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.
@@ -3438,6 +3480,7 @@ mod counted_loop;
 mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
+mod error_stack;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
 mod text_codec;

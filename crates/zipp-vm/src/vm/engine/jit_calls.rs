@@ -1103,7 +1103,11 @@ impl<'p> Vm<'p> {
         }
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
         self.jit_call_depth += 1;
+        // The compiled caller may have no interpreter frame: an Error this
+        // creates still names it (`mark_error_data`).
+        let site = std::mem::replace(&mut self.jit_new_site, (packed_fip, self.frames.len()));
         let r = self.construct(cv, &args);
+        self.jit_new_site = site;
         self.jit_call_depth -= 1;
         match r {
             Ok(v) => v.bits(),

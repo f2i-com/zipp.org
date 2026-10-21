@@ -393,7 +393,7 @@ pub(crate) fn expr_has_yield_or_await(e: &Expr, want_yield: bool, want_await: bo
                     Arg::Spread(_) => false,
                 })
         }
-        E::New { callee, args } => {
+        E::New { callee, args, .. } => {
             r!(callee)
                 || args.iter().any(|a| match a {
                     Arg::Expr(x) => r!(x),

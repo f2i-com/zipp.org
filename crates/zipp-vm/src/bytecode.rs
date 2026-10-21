@@ -2874,6 +2874,34 @@ pub struct FuncProto {
     /// The interpreter's copy of `code` with superinstructions, built the
     /// first time the interpreter enters the function (see [`FusedCode`]).
     pub fused: FusedCode,
+    /// Where each call and `new` in this function sits in the source, for
+    /// `Error.prototype.stack` (#78): a frame suspended at an instruction
+    /// reports the innermost site whose code holds it. In code order of
+    /// `start`; nested sites follow their enclosing one.
+    pub call_sites: Box<[CallSite]>,
+}
+
+/// One call or `new` expression's code and source position
+/// ([`FuncProto::call_sites`]): instructions `start..end` evaluate it, and a
+/// frame suspended in them reports `line:col` (1-based, the column in UTF-16
+/// code units, as V8 reports it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallSite {
+    pub start: u32,
+    pub end: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+impl FuncProto {
+    /// The source position of the innermost call site whose code holds `ip`.
+    pub fn position_at(&self, ip: u32) -> Option<(u32, u32)> {
+        self.call_sites
+            .iter()
+            .filter(|s| s.start <= ip && ip < s.end)
+            .max_by_key(|s| s.start)
+            .map(|s| (s.line, s.col))
+    }
 }
 
 /// An interpreter-only copy of a function's `code` in which some adjacent
@@ -3830,9 +3858,10 @@ mod static_key_plan_layout_tests {
 
     /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
     /// when the optimization never applies, and `fused` (the interpreter's
-    /// superinstruction copy, `FusedCode`) another 24 until it is built. Keep
-    /// that startup/many-function cost, plus the retained-charge assumptions
-    /// for non-empty plans, explicit.
+    /// superinstruction copy, `FusedCode`) another 24 until it is built, and
+    /// `call_sites` (a boxed slice: 16) the source positions error stacks
+    /// report. Keep that startup/many-function cost, plus the retained-charge
+    /// assumptions for non-empty plans, explicit.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
@@ -3840,7 +3869,8 @@ mod static_key_plan_layout_tests {
         assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
         assert_eq!(std::mem::size_of::<FusedCode>(), 24);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 296);
+        assert_eq!(std::mem::size_of::<CallSite>(), 16);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 312);
     }
 }
 

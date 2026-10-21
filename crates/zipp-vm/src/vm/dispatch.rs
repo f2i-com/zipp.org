@@ -1977,12 +1977,7 @@ impl<'p> Vm<'p> {
                             }
                             break;
                         }
-                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            args.push(self.get(base, arg_base + i));
-                        }
-                        let result = self.construct(cv, &args)?;
-                        self.set(base, dst, result);
+                        self.new_construct(base, ip, dst, cv, arg_base, argc)?;
                         ip += 1;
                     }
                     Instr::FieldInit {
@@ -2055,30 +2050,7 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
-                        // IsConstructor is checked AFTER the argument registers
-                        // were evaluated (the fetch happened before them).
-                        let parent = self.get(base, ctor);
-                        if !self.is_constructor(parent) {
-                            return Err(Thrown(
-                                "TypeError: superclass is not a constructor".into(),
-                            ));
-                        }
-                        let this = self.get(base, 0);
-                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            args.push(self.get(base, arg_base + i));
-                        }
-                        // `super(...)` keeps the derived activation's new.target.
-                        let nt = self
-                            .frames
-                            .last()
-                            .map(|f| f.new_target)
-                            .unwrap_or(Value::UNDEFINED);
-                        // super() PRODUCES `this`; completion enforces the once-only
-                        // rule, rebinds reg 0 (return-override), lifts the this-TDZ
-                        // and runs this class's deferred field initializers.
-                        let produced = self.run_class_ctor(parent, this, &args, nt)?;
-                        self.super_ctor_complete(base, this, produced, home_class_id)?;
+                        self.super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)?;
                         ip += 1;
                     }
                     Instr::SuperBase { dst, home_class_id } => {
@@ -7333,6 +7305,62 @@ impl<'p> Vm<'p> {
                 Err(t)
             }
         }
+    }
+
+    /// `New` at `ip` for a constructor the arm does not push a frame for:
+    /// `construct` with the argument registers, the result into `dst`. Out
+    /// of `dispatch_body`, as is its record of this frame's position for the
+    /// stack of an Error the construction creates (`sync_top_ip`): six lines
+    /// of it inside the loop moved a throw-and-catch row by a fifth.
+    #[inline(never)]
+    fn new_construct(
+        &mut self,
+        base: usize,
+        ip: usize,
+        dst: u16,
+        cv: Value,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<(), Thrown> {
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.sync_top_ip(ip);
+        let result = self.construct(cv, &args)?;
+        self.set(base, dst, result);
+        Ok(())
+    }
+
+    /// `SuperCtor` at `ip` (`super(...)`), out of `dispatch_body` as
+    /// [`Self::new_construct`] is.
+    #[inline(never)]
+    fn super_ctor_call(
+        &mut self,
+        base: usize,
+        ip: usize,
+        ctor: u16,
+        home_class_id: u32,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<(), Thrown> {
+        // IsConstructor is checked AFTER the argument registers were
+        // evaluated (the fetch happened before them).
+        let parent = self.get(base, ctor);
+        self.sync_top_ip(ip);
+        if !self.is_constructor(parent) {
+            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+        }
+        let this = self.get(base, 0);
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        // `super(...)` keeps the derived activation's new.target.
+        let nt = self
+            .frames
+            .last()
+            .map(|f| f.new_target)
+            .unwrap_or(Value::UNDEFINED);
+        // super() PRODUCES `this`; completion enforces the once-only rule,
+        // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
+        // class's deferred field initializers.
+        let produced = self.run_class_ctor(parent, this, &args, nt)?;
+        self.super_ctor_complete(base, this, produced, home_class_id)
     }
 
     /// Push a new frame for `func_id`, binding `this_val` to register 0 and the

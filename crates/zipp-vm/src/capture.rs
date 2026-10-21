@@ -1195,7 +1195,7 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
                 }
             }
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             expr_refs(callee, out);
             for arg in args {
                 match arg {
@@ -1705,7 +1705,7 @@ fn collect_nested_free_expr<'a>(e: &'a Expr, out: &mut Names<'a>) {
                 }
             }
         }
-        Expr::New { callee, args } => {
+        Expr::New { callee, args, .. } => {
             collect_nested_free_expr(callee, out);
             for arg in args {
                 match arg {

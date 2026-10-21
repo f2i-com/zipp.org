@@ -10,7 +10,8 @@
 //! (`ZIPP_REPORT_UNHANDLED=1`) on stderr, before the CLI's own `zipp: <error>`
 //! line, so tools/run_test262.py still reads a negative test's diagnostic as
 //! the last `zipp: ` line. The report names only exceptions that ESCAPED A JOB
-//! unhandled, never an ordinary `reject(value)`.
+//! unhandled, never an ordinary `reject(value)`. Without it, any rejection
+//! still unhandled is fatal, as in Node (#77).
 use std::{fs, path::PathBuf, process::Command};
 
 struct Fixture(PathBuf);
@@ -197,8 +198,13 @@ fn test262_report_precedes_the_error_line() {
     let (code, out, err) = f.zipp(&["js", "--script-goal", "lost.js", "harness.js"], &report);
     assert_eq!((code, out.as_str()), (Some(0), ""));
     assert_eq!(err, "zipp: unhandled exception in promise job: Test262Error: deferred\n");
+    // Without the report, a rejection nothing handles ends the run as in Node
+    // (#77); the report keeps the corpus's deliberate ones from failing.
     let (code, _, err) = f.zipp(&["js", "--script-goal", "lost.js", "harness.js"], &[]);
-    assert_eq!((code, err.as_str()), (Some(0), ""));
+    assert_eq!(
+        (code, err.as_str()),
+        (Some(1), "zipp: Uncaught (in promise) Test262Error: deferred\n")
+    );
     let (code, _, err) = f.zipp(&["js", "--script-goal", "plain.js", "harness.js"], &report);
     assert_eq!((code, err.as_str()), (Some(0), ""));
     let (code, _, err) = f.zipp(&["js", "--script-goal", "negative.js"], &report);

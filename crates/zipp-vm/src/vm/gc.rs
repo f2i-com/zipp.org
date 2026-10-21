@@ -698,6 +698,13 @@ impl Vm<'_> {
         for &promise in &self.unhandled_rejections {
             root_idx!(promise);
         }
+        // Not `notified_rejections`: weak, pruned after the mark.
+        for &promise in &self.pending_rejections {
+            root_idx!(promise);
+        }
+        if let Some(hook) = self.rejection_hook {
+            root_val!(hook);
+        }
         for f in &self.frames {
             root_idx!(f.closure);
             root_val!(f.new_target);
@@ -1081,6 +1088,8 @@ impl Vm<'_> {
         self.immutable_buffers.retain_marked(&marks);
         self.pinned_buffers.retain_marked(&marks);
         self.error_data.retain(|&k| marks[k as usize]);
+        self.error_stacks.retain_marked(&marks);
+        self.notified_rejections.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain_marked(&marks);
         self.gen_args_obj
             .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
@@ -1435,6 +1444,11 @@ impl Vm<'_> {
             for i in freed {
                 self.error_data.remove(i);
             }
+        }
+        prune_slots!(self.error_stacks);
+        // A short list, and empty unless a rejection hook is installed.
+        if !self.notified_rejections.is_empty() {
+            self.notified_rejections.retain(|&k| live_bits[k as usize]);
         }
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments

@@ -130,7 +130,7 @@ fn agent_worker(
         // the same run-to-completion driver the script path uses. An uncaught
         // timer throw ends this task only; do not keep it rooted.
         vm.run_event_loop();
-        vm.uncaught_timer_throw = None;
+        vm.drop_uncaught_timer_throw();
     }
 }
 

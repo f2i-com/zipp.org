@@ -20,10 +20,13 @@
 //! ```
 //!
 //! Nothing here is new engine machinery. `run_init` is [`crate::vm::Vm::run`],
-//! `eval_in_context` is the `$262.evalScript` pipeline (script-goal
+//! `eval_in_context` is an indirect `eval` (top-level `var` and `function`
+//! persist; `let`, `const` and `class` stay in the evaluation), `run_script`
+//! is the `$262.evalScript` pipeline (script-goal
 //! GlobalDeclarationInstantiation: top-level `var`, `function`, `let`, `const`
-//! and `class` all bind persistent realm globals, so successive evals see each
-//! other's declarations), and `call_global` is the ordinary internal call path.
+//! and `class` all bind persistent realm globals, as successive `<script>`
+//! elements see each other's declarations), and `call_global` is the
+//! ordinary internal call path.
 //! The one genuinely new capability is [`ScriptState::set_host_call`] — the
 //! `__zippHostCall` native, which is the only channel from JS into
 //! embedder-supplied Rust and is inert unless a host is installed.
@@ -435,6 +438,40 @@ impl ScriptState {
         .unwrap_or_else(torn_down)
     }
 
+    /// Run `src` as a classic script in the running script's realm, as a
+    /// `<script>` element (or `$262.evalScript`) does, and return its
+    /// completion value.
+    ///
+    /// Unlike [`Self::eval_in_context`]'s indirect `eval`, this is
+    /// ScriptEvaluation with GlobalDeclarationInstantiation:
+    ///
+    /// - every top-level declaration persists for later scripts and calls:
+    ///   `var` and `function` as global-object properties, `let`, `const`
+    ///   and `class` as global lexical bindings, so a script loaded after
+    ///   this one sees them;
+    /// - a strict script's declarations persist too (a strict eval keeps its
+    ///   own);
+    /// - a script that redeclares a global lexical binding, or declares a
+    ///   lexical binding a `var` already holds, is a `SyntaxError` and runs
+    ///   none of its code;
+    /// - the completion value is the last evaluated expression's, and a throw
+    ///   is returned as its message.
+    ///
+    /// Microtasks the script schedules are not run here; a browser runs them
+    /// after each script, [`Self::run_microtasks`] here. The cost note on
+    /// [`Self::eval_in_context`] applies: each call compiles fresh.
+    pub fn run_script(&mut self, src: &str) -> Result<JsValue, String> {
+        self.with_vm(|vm| {
+            let result = match vm.eval_script(src) {
+                Ok(v) => Ok(marshal(vm, v)),
+                Err(thrown) => Err(vm.take_host_throw(thrown)),
+            };
+            vm.finish_weak_job();
+            result
+        })
+        .unwrap_or_else(torn_down)
+    }
+
     /// Call the global function `name` with `args`, returning its result.
     ///
     /// The preferred way to re-enter a live script by name: unlike
@@ -513,7 +550,65 @@ impl ScriptState {
     /// without draining, the update never happens and the interaction silently
     /// does nothing.
     pub fn run_microtasks(&mut self) {
-        self.with_vm(|vm| vm.drain_microtasks());
+        self.with_vm(|vm| vm.microtask_checkpoint(false));
+    }
+
+    /// Name the script this state was compiled from in error stacks: its
+    /// frames read `at f (NAME:1:27)` instead of `at f (<anonymous>:1:27)`.
+    /// Nothing else reads the name, and code run later through
+    /// [`Self::eval_in_context`] or [`Self::run_script`] stays `<anonymous>`.
+    /// Positions count from the start of the compiled text, so a preamble's
+    /// lines come first.
+    pub fn set_script_name(&mut self, name: &str) {
+        self.with_vm(|vm| vm.script_name = Some(std::sync::Arc::from(name)));
+    }
+
+    /// Hear of every promise rejection that no handler has taken by the end
+    /// of a microtask checkpoint: `sink` is called with the reason's message
+    /// ("Error: boom" for an Error, the value's text otherwise), once per
+    /// promise, in rejection order. A rejection handled later in the same
+    /// checkpoint (a `.catch` attached by a queued job) is not reported, as
+    /// Node and browsers do not report it.
+    ///
+    /// Checkpoints are where this state drains jobs: the end of
+    /// [`Self::run_init`] and of each timer it runs, [`Self::run_microtasks`],
+    /// and the `call_slot` family's drain. Rejections from before the sink was
+    /// installed are not reported. Replaces any previous sink.
+    pub fn set_unhandled_rejection_sink(&mut self, sink: Box<dyn FnMut(&str)>) {
+        self.with_vm(|vm| {
+            vm.rejection_sink = Some(sink);
+            vm.track_rejections = true;
+        });
+    }
+
+    /// HTML's HostPromiseRejectionTracker for a browser-like host: the
+    /// function `expression` evaluates to (in the global scope, as
+    /// [`Self::eval_in_context`] evaluates) is called as
+    /// `hook("unhandledrejection", promise, reason)` for each rejection
+    /// still unhandled at a microtask checkpoint, and as
+    /// `hook("rejectionhandled", promise, reason)` at a later checkpoint if
+    /// such a promise has gained a handler since, so the host can dispatch the
+    /// window events itself. Jobs the hook queues run before the checkpoint
+    /// ends; a throw from it is reported on the error console stream. The
+    /// promises reported are held weakly: one that becomes unreachable can
+    /// never be handled and is forgotten.
+    ///
+    /// `Err` when the expression throws or yields something not callable;
+    /// the previous hook, if any, then stays.
+    pub fn set_promise_rejection_hook(&mut self, expression: &str) -> Result<(), String> {
+        self.with_vm(|vm| {
+            let hook = match eval_indirect(vm, expression) {
+                Ok(v) => v,
+                Err(thrown) => return Err(vm.take_host_throw(thrown)),
+            };
+            if !vm.is_callable(hook) {
+                return Err(format!("TypeError: {expression} is not a function"));
+            }
+            vm.rejection_hook = Some(hook);
+            vm.track_rejections = true;
+            Ok(())
+        })
+        .unwrap_or_else(torn_down)
     }
 
     /// Deliver console lines to `sink` as they are produced, each tagged with

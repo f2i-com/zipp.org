@@ -331,6 +331,16 @@ struct JobWindow {
     at: usize,
 }
 
+/// What one round of unhandled-rejection reports did (`Vm::notify_rejections`).
+enum Notified {
+    /// Nothing that could queue a job: the checkpoint is over.
+    Quiet,
+    /// The hook ran: drain what it queued and look again.
+    RanScript,
+    /// A rejection ended the program.
+    Fatal,
+}
+
 /// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
 /// proof (`promise_proto_pristine_uncached`) re-found `then`/`constructor`/
 /// `@@species` with 2-4 linear `pos()` scans plus 3-4 `heap.get`s on EVERY
@@ -1411,6 +1421,11 @@ impl<'p> Vm<'p> {
         // report (see `reject_thrown_job` and `report_unhandled_errors`).
         if unhandled && self.report_unhandled && self.rejecting_thrown_job {
             self.unhandled_rejections.push(p);
+        }
+        // The host's tracker (#77) hears of every one; the next checkpoint
+        // drops those that gained a handler by then.
+        if unhandled && self.track_rejections {
+            self.pending_rejections.push(p);
         }
         let kind = if state == PromiseState::Fulfilled {
             ReactionKind::Fulfill
@@ -4044,7 +4059,7 @@ impl<'p> Vm<'p> {
         let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
         map.define("errors", errs, attr);
         let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
-        self.error_data.insert(idx); // [[ErrorData]] internal slot
+        self.mark_error_data(idx); // [[ErrorData]] internal slot
                                      // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
                                      // internally-created error is a real AggregateError instance:
                                      // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to
@@ -4706,18 +4721,141 @@ impl<'p> Vm<'p> {
                 } => *result,
                 _ => continue,
             };
-            let msg = if reason.is_heap()
-                && matches!(self.heap.get(reason.heap_index()), HeapObj::Object(_))
-            {
-                self.throw_message(reason)
-            } else {
-                self.display(reason)
-            };
+            let msg = self.rejection_message(reason);
             self.errput
                 .push(format!("zipp: unhandled exception in promise job: {msg}"));
         }
         let timers = std::mem::take(&mut self.uncaught_timer_errors);
         self.errput.extend(timers);
+    }
+
+    /// A microtask checkpoint: drain the queue, then tell the host of the
+    /// rejections no handler took (HTML's "notify about rejected promises",
+    /// Node's unhandled-rejection pass after each macrotask), draining again
+    /// after any hook call. `true` when one of them ends the program
+    /// (`may_end`, under `fatal_rejections`): its reason is then in
+    /// `uncaught_timer_throw`, and the caller stops the event loop.
+    pub(crate) fn microtask_checkpoint(&mut self, may_end: bool) -> bool {
+        self.drain_microtasks();
+        while self.track_rejections {
+            match self.notify_rejections(may_end) {
+                Notified::Fatal => return true,
+                Notified::RanScript => self.drain_microtasks(),
+                Notified::Quiet => break,
+            }
+        }
+        false
+    }
+
+    /// One round of [`Vm::microtask_checkpoint`]'s reports: first
+    /// `rejectionhandled` for each reported promise that has since gained a
+    /// handler, then the sink, the hook's `unhandledrejection` and, under
+    /// `fatal_rejections`, the end of the program for each promise rejected
+    /// since the last round that is still unhandled.
+    fn notify_rejections(&mut self, may_end: bool) -> Notified {
+        let mut ran_script = false;
+        // The batches below left their (rooted or weak) lists, and the sink
+        // and the hook may collect: root them as the timer batch is rooted.
+        let roots_base = self.host_result_roots.len();
+        if self.rejection_hook.is_some() && !self.notified_rejections.is_empty() {
+            let notified = std::mem::take(&mut self.notified_rejections);
+            let (handled, still): (Vec<u32>, Vec<u32>) =
+                notified.into_iter().partition(|&p| {
+                    matches!(self.heap.get(p), HeapObj::Promise { handled: true, .. })
+                });
+            self.notified_rejections = still;
+            self.host_result_roots
+                .extend(handled.iter().map(|&p| Value::heap(p)));
+            for p in handled {
+                ran_script = true;
+                self.call_rejection_hook("rejectionhandled", p);
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_rejections);
+        let unhandled: Vec<(u32, Value)> = pending
+            .into_iter()
+            .filter_map(|p| match self.heap.get(p) {
+                HeapObj::Promise {
+                    state: PromiseState::Rejected,
+                    handled: false,
+                    result,
+                    ..
+                } => Some((p, *result)),
+                _ => None,
+            })
+            .collect();
+        self.host_result_roots
+            .extend(unhandled.iter().map(|&(p, _)| Value::heap(p)));
+        let mut fatal = false;
+        for (p, reason) in unhandled {
+            if self.rejection_sink.is_some() {
+                let msg = self.rejection_message(reason);
+                if let Some(sink) = self.rejection_sink.as_mut() {
+                    sink(&msg);
+                }
+            }
+            if self.rejection_hook.is_some() {
+                ran_script = true;
+                self.notified_rejections.push(p);
+                self.call_rejection_hook("unhandledrejection", p);
+            }
+            if may_end && self.fatal_rejections {
+                // Node reports the first and exits: the rest go unreported.
+                if self.uncaught_timer_throw.is_none() {
+                    self.uncaught_timer_throw = Some(reason);
+                    self.uncaught_in_promise = true;
+                }
+                fatal = true;
+                break;
+            }
+        }
+        self.host_result_roots.truncate(roots_base);
+        if fatal {
+            self.pending_rejections.clear();
+            Notified::Fatal
+        } else if ran_script {
+            Notified::RanScript
+        } else {
+            Notified::Quiet
+        }
+    }
+
+    /// `hook(kind, promise, reason)` for `rejection_hook`. A throw from it is
+    /// reported to the console's error stream, as a browser reports one
+    /// from an event listener, and goes no further.
+    fn call_rejection_hook(&mut self, kind: &str, p: u32) {
+        let Some(hook) = self.rejection_hook else {
+            return;
+        };
+        let reason = match self.heap.get(p) {
+            HeapObj::Promise { result, .. } => *result,
+            _ => return,
+        };
+        let kind = self.alloc_str(kind.to_string());
+        if let Err(Thrown(msg)) = self.call_value(hook, Value::UNDEFINED, &[kind, Value::heap(p), reason]) {
+            self.pending_throw = None;
+            self.push_console_line(format!("Uncaught {msg}"), true);
+        }
+    }
+
+    /// Mark `p`, if it is a promise, as having a handler: a host consumes its
+    /// rejection itself (a module body's is the program's error).
+    pub(crate) fn mark_promise_handled(&mut self, p: Value) {
+        if p.is_heap() {
+            if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p.heap_index()) {
+                *handled = true;
+            }
+        }
+    }
+
+    /// A rejection reason as the reports show it: an object's as an uncaught
+    /// throw's message ("Name: message"), a primitive's as its display.
+    pub(crate) fn rejection_message(&mut self, reason: Value) -> String {
+        if reason.is_heap() && matches!(self.heap.get(reason.heap_index()), HeapObj::Object(_)) {
+            self.throw_message(reason)
+        } else {
+            self.display(reason)
+        }
     }
 
     /// The full event loop: deliver cross-thread waitAsync wakes, drain
@@ -4732,7 +4870,10 @@ impl<'p> Vm<'p> {
             // Cross-thread wakes FIRST: an "ok" resolution beats both the
             // microtask drain and the deadline bookkeeping below.
             self.drain_mailbox();
-            self.drain_microtasks();
+            if self.microtask_checkpoint(true) {
+                self.timer_queue.clear();
+                break;
+            }
             let now = crate::vm::clock::Instant::now();
             let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
             let next_wait = self
@@ -4825,7 +4966,10 @@ impl<'p> Vm<'p> {
                     threw = true;
                     break;
                 }
-                self.drain_microtasks();
+                if self.microtask_checkpoint(true) {
+                    threw = true;
+                    break;
+                }
             }
             self.host_result_roots.truncate(roots_base);
             if threw {

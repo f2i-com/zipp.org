@@ -499,11 +499,13 @@ impl<'s> Parser<'s> {
         // …optionally ONE argument list, and nothing after it: `@a.b(1)` is a
         // DecoratorCallExpression, `@a(1).b` and `@a(1)(2)` are not.
         if self.at(Punct::LParen) {
+            let pos = self.cur().span.start;
             let args = self.parse_args_public()?;
             e = Expr::Call(Box::new(CallExpr {
                 callee: e,
                 args,
                 optional: false,
+                pos,
             }));
         }
         Ok(e)

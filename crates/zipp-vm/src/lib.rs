@@ -147,6 +147,27 @@ pub mod bench_support {
 #[path = "lang/js/front.rs"]
 mod front;
 pub use front::set_pure_script_goal;
+
+/// Whether a rejection no handler took ends the program (#77). See
+/// [`set_unhandled_rejections_fatal`].
+static UNHANDLED_REJECTIONS_FATAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// End every program a VM created after this call runs on the first promise
+/// rejection still unhandled at a microtask checkpoint, as Node does by
+/// default: the event loop stops (no later timer runs) and the run's error is
+/// `Uncaught (in promise) <reason>`. The `zipp` command turns this on; a
+/// library caller keeps the old behaviour, a dropped rejection, unless it
+/// asks. `ZIPP_REPORT_UNHANDLED=1` (the Test262 runner's narrower report)
+/// overrides it. Process-wide, like [`set_pure_script_goal`], so agents and
+/// realms inherit it.
+pub fn set_unhandled_rejections_fatal(on: bool) {
+    UNHANDLED_REJECTIONS_FATAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn unhandled_rejections_fatal() -> bool {
+    UNHANDLED_REJECTIONS_FATAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// A diagnostic switch that is set or not for the life of the process, read
 /// from the environment once.
 ///
@@ -666,7 +687,7 @@ pub(crate) fn compile_only(src: &str, module: bool) -> Result<bytecode::Program,
 /// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
 /// `run` default) means no host module loader, so `import()` rejects.
 pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    run_with_policy(src, base_dir, false, false)
+    run_with_policy(src, base_dir, false, false, None)
 }
 
 /// [`run_with_base`] for a host that exits as soon as the program has ended,
@@ -677,7 +698,18 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
 /// A host that goes on to run anything else must not use it: nothing this
 /// run allocated is ever freed.
 pub fn run_then_exit(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    run_with_policy(src, base_dir, false, true)
+    run_with_policy(src, base_dir, false, true, None)
+}
+
+/// [`run_then_exit`] for the script file named `script_name`: the name its
+/// frames give in an error's `stack` (`at f (/path/to/file.js:1:27)`), as
+/// Node names a script by its path. Without a name they say `<anonymous>`.
+pub fn run_file_then_exit(
+    src: &str,
+    base_dir: Option<std::path::PathBuf>,
+    script_name: &str,
+) -> Result<Outcome, String> {
+    run_with_policy(src, base_dir, false, true, Some(script_name))
 }
 
 /// Run one release-PGO training program while denying every secondary source
@@ -690,7 +722,7 @@ pub fn run_for_pgo_training(
     src: &str,
     base_dir: Option<std::path::PathBuf>,
 ) -> Result<Outcome, String> {
-    run_with_policy(src, base_dir, true, false)
+    run_with_policy(src, base_dir, true, false, None)
 }
 
 fn run_with_policy(
@@ -698,6 +730,7 @@ fn run_with_policy(
     base_dir: Option<std::path::PathBuf>,
     disable_external_code: bool,
     leave_heap: bool,
+    script_name: Option<&str>,
 ) -> Result<Outcome, String> {
     // Annex B call assignment targets (`f() = 1` in sloppy code) need no
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
@@ -721,6 +754,7 @@ fn run_with_policy(
     }
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
+    vm.script_name = script_name.map(std::sync::Arc::from);
     if disable_external_code {
         vm.disable_external_code();
     }
