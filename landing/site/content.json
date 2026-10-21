@@ -3974,11 +3974,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 139 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 14 October 2026, mistakes included.",
+      "title": "The Zipp Story: A JavaScript Engine in Rust in 146 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 21 October 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 2,477 commits over 139 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in seven acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 2,780 commits over 146 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in eight acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -3997,9 +3997,9 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "2,477",
-                  "label": "Commits from 29 May to 14 October 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 342 in October"
+                  "value": "2,780",
+                  "label": "Commits from 29 May to 21 October 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 645 in October"
                 },
                 {
                   "value": "28",
@@ -4116,6 +4116,27 @@
           ]
         },
         {
+          "heading": "Act eight: embedders, releases and large programs (15 to 21 October)",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The week after v0.0.24 belonged to embedders. @takahashim, who had filed the first eight issues, embedded Zipp the way a browser-like host does and sent ten more reports, from a Proxy on the global object's prototype chain to a VM that could not allocate again after reaching its heap ceiling; v0.0.25 fixed them on 15 October, with the safe-sandbox interpreter at 0.84× Bellard's QuickJS's time. On 17 October the interpreter learned superinstructions and a second, smaller loop that keeps its state in registers, and a new suite of 21 workloads went looking for where QuickJS still won. Its first record was corrected the same afternoon: the build it measured had been trained on the rows it measured. The same day each language's source moved under `src/lang/`, and a language became one entry of a table."
+            },
+            {
+              "type": "p",
+              "text": "18 October shipped two releases. The Test262 pin moved to the corpus of 13 October and ran once, unmodified: 96,229 of 96,230 executions, with one documented expected failure and no correction patches. v0.0.26 changed what a release is: plain native files for Windows and for Linux on x86-64, arm64 and armv7, one `.wasm` per WebAssembly engine that carries its own bindings, and one loader, `zipp.mjs`, that runs any of them in a sandbox that starts with nothing permitted. That evening v0.0.27 fixed seven more reports from @takahashim, among them a regex that never finished compiling, and added a Brotli copy of every engine."
+            },
+            {
+              "type": "p",
+              "text": "The last three days went to the interpreter and to large programs. Generators began to run their steps as frames of the loop that asks for them, and bundled applications became the yardstick: Babel, the TypeScript compiler, Prettier, and Vue, Preact and React rendering on the server. Each found a limit sized for small programs: a module that compiled in quadratic time, a cap of 256 planned object literals per compiler, string literals left uncached past a bundle's 4,096th function. Every bundle also ran slower with the JIT on than off, by 4% to 36%, so a program of 256 or more functions now runs with its JIT off. Babel's workload went from 13.8 s with v0.0.27's default JIT, or 11.1 s interpreted, to 5.34 s, and the TypeScript compiler's from 2.88 s interpreted to 1.19 s, against Bellard's QuickJS's 3.82 and 1.04 s; React's server renderer, which needed `TextEncoder`, ran for the first time."
+            },
+            {
+              "type": "p",
+              "text": "Eleven more reports came from @takahashim over those days, the last four as designs for new embedding API: `import.meta.url`, unhandled-rejection reports, V8-format `Error.prototype.stack`, and a host call that runs a classic script. With them fixed and every ES5, ES6, ES2016+ and Intl test of the kangax compat-table passing, v0.0.28 was published on 21 October. The first Linux CI run of the week's work, dispatched before the tag because every commit skips CI, found three failures, all fixed first; one was a stale cache key the previous release's site refresh had left behind. The canonical capture of the 0.0.28 engine the same day put its JIT at 0.652× Node's time over the 30 benchmark rows and its interpreter at 0.685× Bellard's QuickJS's ([benchmarks](/benchmarks/))."
+            }
+          ]
+        },
+        {
           "heading": "How the work was done",
           "blocks": [
             {
@@ -4133,7 +4154,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "What makes this history unusual is that the corrections are in the subjects, not buried in bodies. \"RETRACT the false perf claims.\" \"Real pass rate is 96.97%, not 100%.\" \"The INT tier was silently returning wrong answers on ordinary loops.\" \"It is the COLLECTOR, not the allocator — pool built, measured zero, reverted.\" \"The profiler was lying about a quarter of json-large.\" \"B95 shipped a 19x pathology and the benchmarks could not see it.\" \"The harness could name a commit it had never measured.\" Every one of those is a commit you can open."
+              "text": "What makes this history unusual is that the corrections are in the subjects, not buried in bodies. \"RETRACT the false perf claims.\" \"Real pass rate is 96.97%, not 100%.\" \"The INT tier was silently returning wrong answers on ordinary loops.\" \"It is the COLLECTOR, not the allocator — pool built, measured zero, reverted.\" \"The profiler was lying about a quarter of json-large.\" \"B95 shipped a 19x pathology and the benchmarks could not see it.\" \"The harness could name a commit it had never measured.\" \"Correct the expansion record: its build was trained on the rows it measured.\" Every one of those is a commit you can open."
             },
             {
               "type": "timeline",
@@ -4227,6 +4248,31 @@
                   "date": "2026-10-14",
                   "title": "Compiled loops, eight reported bugs fixed; v0.0.24",
                   "text": "`4515054f`, `9470f615`, `acca1331`, `6333c421`, `a82ad0bb`."
+                },
+                {
+                  "date": "2026-10-15",
+                  "title": "Ten embedding reports fixed; v0.0.25",
+                  "text": "`cbea93aa`, `ca0091bc`, `3e8a5d07`, `ddbd0272`."
+                },
+                {
+                  "date": "2026-10-17",
+                  "title": "Superinstructions, a second interpreter loop, one folder per language",
+                  "text": "`b2b8f5ca`, `702ad388`, `da8427b6`, `37da4030`."
+                },
+                {
+                  "date": "2026-10-18",
+                  "title": "The latest Test262, unmodified; plain files and one-file engines in v0.0.26; v0.0.27",
+                  "text": "`67a7e1cc`, `543917b8`, `5f1c0578`, `74d92e70`."
+                },
+                {
+                  "date": "2026-10-20",
+                  "title": "Generators as frames; eleven more reports begin",
+                  "text": "`732a0855`, `6f730a8d`, `c0d9527b`."
+                },
+                {
+                  "date": "2026-10-21",
+                  "title": "Large programs run interpreted; `Error.stack`; v0.0.28",
+                  "text": "`2e83f5e0`, `130640b0`, `79ddfd28`, `ca511f54`, `fced020a`, `da0fe6b1`."
                 }
               ]
             }
@@ -6874,6 +6920,47 @@
         ]
       },
       {
+        "slug": "babel-typescript-and-prettier-on-the-interpreter",
+        "date": "2026-10-20",
+        "title": "Babel, TypeScript and Prettier on the interpreter",
+        "summary": "Bundled applications became the interpreter's yardstick: generators run as frames, a large module compiles in linear time, a bundle's object literals are planned again, and a program of 256 or more functions runs with its JIT off, which every bundle measured ran faster without.",
+        "tags": [
+          "javascript",
+          "performance",
+          "vm"
+        ],
+        "commits": [
+          "d6c38d15",
+          "c25ee322",
+          "49448b77",
+          "2b62543a",
+          "732a0855",
+          "f6378f2d",
+          "2e83f5e0",
+          "b9f618ae",
+          "130640b0",
+          "032d92d0",
+          "e982f918",
+          "b63fc659",
+          "79ddfd28",
+          "ca511f54"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Round 28 began on 19 October with the interpreter's per-operation gaps against Bellard's QuickJS and Deno's `--jitless` mode. Method calls, construction sites, inherited reads and closure reads are now answered by the receiver's shape (`d6c38d15`); a cached own-property read or write goes through a compact mirror of the object's shape and values (`c25ee322`); and the lite loop runs hot loops, module top levels and async bodies (`49448b77`, `2b62543a`). A generator step used to enter and leave a nested interpreter loop, about 33 ns for each level of a pipeline or a `yield*` chain against QuickJS's 12 to 17; it now runs as a frame of the loop that asks for it (`732a0855`). One shortcut was undone: dropping a discarded assignment's copy whenever the JIT was off made a metered run stop at another step with the JIT off than on. A CI test pins that parity, but every commit skips CI, so it failed unseen until a bisect over the round's 37 commits found it, and the bytecode is the same in both modes again (`f6378f2d`)."
+          },
+          {
+            "type": "p",
+            "text": "From 20 October the yardstick was bundled applications: Babel, the TypeScript compiler, Prettier, a three.js and lodash bundle, and Vue, Preact and React rendering on the server, each checked against Node's output. Each found a limit sized for small programs. The TypeScript compiler's module compiled in quadratic time until a function's captured bindings were shared and indexed for its nested functions (`2e83f5e0`), and a function may now declare more locals than the register file holds (`b9f618ae`). A bundle is one compiler, and one compiler planned at most 256 object-literal sites, so almost every literal in Babel grew its object a property at a time; the limit is now 65,536 sites, bounded by an 8 MiB byte ceiling (`130640b0`). Past its 4,096th function a bundle's string literals were no longer cached (`032d92d0`), and one string now serves each literal text (`e982f918`); a `switch` over string literals is one table lookup (`b63fc659`). React's renderer needed `TextEncoder` and `TextDecoder`, which now exist (`79ddfd28`)."
+          },
+          {
+            "type": "p",
+            "text": "Every bundle also ran slower with the JIT on than off: the TypeScript compiler 1.33×, Prettier 1.36×, Babel 1.12×, the three.js and lodash bundle 1.24×, Vue's renderer 1.06× and React's 1.04×. Higher compile thresholds narrowed the gap and never closed it, because a JIT-enabled VM counts every call and meters every instruction even when next to nothing compiles. The benchmark rows the JIT speeds up have at most 56 functions and the large bundles thousands, so a program of 256 or more functions now starts with its JIT off; `ZIPP_JIT_LARGE=1` keeps it on (`ca511f54`). Parsing was not the gap: with each bundle wrapped in a function that is never called, Zipp's front end takes 379, 126 and 178 ms on the TypeScript, Prettier and Babel bundles, and QuickJS's 412, 119 and 190. With the published executables run interleaved on one machine, address-space randomization off, v0.0.28 takes 5.34 s on Babel's workload, where v0.0.27 took 11.1 s interpreted and 13.8 s with its default JIT, 1.19 s on the TypeScript compiler's (2.88 s interpreted) and 0.56 s on Prettier's (0.87 s); Bellard's QuickJS takes 3.82, 1.04 and 0.45 s."
+          }
+        ]
+      },
+      {
         "slug": "eleven-embedding-fixes-and-v0-0-28",
         "date": "2026-10-21",
         "title": "Eleven reports from @takahashim, a faster interpreter, and v0.0.28",
@@ -6886,6 +6973,7 @@
         ],
         "commits": [
           "6f730a8d",
+          "ff104592",
           "4b94c120",
           "1c43deca",
           "c0d9527b",
