@@ -3858,9 +3858,9 @@ mod static_key_plan_layout_tests {
 
     /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
     /// when the optimization never applies, and `fused` (the interpreter's
-    /// superinstruction copy, `FusedCode`) another 24 until it is built, and
-    /// `call_sites` (a boxed slice: 16) the source positions error stacks
-    /// report. Keep that startup/many-function cost, plus the retained-charge
+    /// superinstruction copy and its step call sites, `FusedCode`) another 48
+    /// until they are built, and `call_sites` (a boxed slice: 16) the source
+    /// positions error stacks report. Keep that startup/many-function cost, plus the retained-charge
     /// assumptions for non-empty plans, explicit.
     #[cfg(target_pointer_width = "64")]
     #[test]
@@ -3868,9 +3868,9 @@ mod static_key_plan_layout_tests {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
-        assert_eq!(std::mem::size_of::<FusedCode>(), 24);
+        assert_eq!(std::mem::size_of::<FusedCode>(), 48);
         assert_eq!(std::mem::size_of::<CallSite>(), 16);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 312);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 336);
     }
 }
 
