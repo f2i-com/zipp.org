@@ -20,10 +20,13 @@
 //! ```
 //!
 //! Nothing here is new engine machinery. `run_init` is [`crate::vm::Vm::run`],
-//! `eval_in_context` is the `$262.evalScript` pipeline (script-goal
+//! `eval_in_context` is an indirect `eval` (top-level `var` and `function`
+//! persist; `let`, `const` and `class` stay in the evaluation), `run_script`
+//! is the `$262.evalScript` pipeline (script-goal
 //! GlobalDeclarationInstantiation: top-level `var`, `function`, `let`, `const`
-//! and `class` all bind persistent realm globals, so successive evals see each
-//! other's declarations), and `call_global` is the ordinary internal call path.
+//! and `class` all bind persistent realm globals, as successive `<script>`
+//! elements see each other's declarations), and `call_global` is the
+//! ordinary internal call path.
 //! The one genuinely new capability is [`ScriptState::set_host_call`] — the
 //! `__zippHostCall` native, which is the only channel from JS into
 //! embedder-supplied Rust and is inert unless a host is installed.
@@ -426,6 +429,40 @@ impl ScriptState {
     pub fn eval_in_context(&mut self, src: &str) -> Result<JsValue, String> {
         self.with_vm(|vm| {
             let result = match eval_indirect(vm, src) {
+                Ok(v) => Ok(marshal(vm, v)),
+                Err(thrown) => Err(vm.take_host_throw(thrown)),
+            };
+            vm.finish_weak_job();
+            result
+        })
+        .unwrap_or_else(torn_down)
+    }
+
+    /// Run `src` as a classic script in the running script's realm, as a
+    /// `<script>` element (or `$262.evalScript`) does, and return its
+    /// completion value.
+    ///
+    /// Unlike [`Self::eval_in_context`]'s indirect `eval`, this is
+    /// ScriptEvaluation with GlobalDeclarationInstantiation:
+    ///
+    /// - every top-level declaration persists for later scripts and calls:
+    ///   `var` and `function` as global-object properties, `let`, `const`
+    ///   and `class` as global lexical bindings, so a script loaded after
+    ///   this one sees them;
+    /// - a strict script's declarations persist too (a strict eval keeps its
+    ///   own);
+    /// - a script that redeclares a global lexical binding, or declares a
+    ///   lexical binding a `var` already holds, is a `SyntaxError` and runs
+    ///   none of its code;
+    /// - the completion value is the last evaluated expression's, and a throw
+    ///   is returned as its message.
+    ///
+    /// Microtasks the script schedules are not run here; a browser runs them
+    /// after each script, [`Self::run_microtasks`] here. The cost note on
+    /// [`Self::eval_in_context`] applies: each call compiles fresh.
+    pub fn run_script(&mut self, src: &str) -> Result<JsValue, String> {
+        self.with_vm(|vm| {
+            let result = match vm.eval_script(src) {
                 Ok(v) => Ok(marshal(vm, v)),
                 Err(thrown) => Err(vm.take_host_throw(thrown)),
             };
