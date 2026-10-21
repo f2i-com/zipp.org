@@ -395,14 +395,21 @@ impl<'p> Vm<'p> {
 
     /// `import.meta.url` of the module whose namespace is `ns`: the `file:`
     /// URL of the path the loader cached it under. `None` for code no file
-    /// was loaded for.
+    /// was loaded for. Under a confined loader the URL is the path below the
+    /// root (`file:///lib/util.mjs`), as its errors name no host path either:
+    /// untrusted code learns nothing of where the host keeps its files, and
+    /// a URL resolved against it still names the files beside it.
     #[cfg(not(feature = "wasm-no-fs-loader"))]
     pub(crate) fn module_url(&self, ns: u32) -> Option<String> {
         let ns = Value::heap(ns);
-        self.module_cache
-            .iter()
-            .find(|(_, v)| **v == ns)
-            .map(|(path, _)| file_url(path))
+        let (path, _) = self.module_cache.iter().find(|(_, v)| **v == ns)?;
+        match &self.module_root {
+            Some(root) => {
+                let below = path.strip_prefix(root).ok()?;
+                Some(file_url(&std::path::Path::new("/").join(below)))
+            }
+            None => Some(file_url(path)),
+        }
     }
 
     /// `import_module` for a static request edge taken by the link in
@@ -2357,6 +2364,21 @@ mod confined_budget_tests {
                 calls > 0 && calls < 8 * (K + G),
                 "{calls} canonicalize calls for {K} deferred imports over a {G}-module graph"
             );
+        });
+    }
+
+    #[test]
+    fn a_confined_module_url_names_no_host_path() {
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            std::fs::create_dir(root.join("lib")).expect("create lib");
+            std::fs::write(root.join("lib").join("dep.mjs"), "console.log(import.meta.url);")
+                .expect("write dependency");
+            std::fs::write(root.join("entry.mjs"), "import './lib/dep.mjs'; console.log(import.meta.url);")
+                .expect("write entry");
+            let entry = std::fs::canonicalize(root.join("entry.mjs")).expect("canonical entry");
+            vm.import_module(&entry, None).expect("the graph runs");
+            assert_eq!(vm.output, ["file:///lib/dep.mjs", "file:///entry.mjs"]);
         });
     }
 }
