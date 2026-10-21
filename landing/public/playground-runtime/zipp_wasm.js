@@ -471,7 +471,8 @@ export class Engine {
      * before attempting to reclaim it:
      *
      * - `heapBytes`: the payload-aware guest heap estimate the heap ceiling
-     *   is enforced against;
+     *   is enforced against between audits (O(1); the live figure, so it
+     *   falls after a collection);
      * - `stepsUsed`: bytecode instructions executed under the current budget;
      * - `instructionBudget`: the allowance the host chose;
      * - `evalCalls`, `evalRetainedSourceBytes`: this engine's `evalInContext`
@@ -1054,7 +1055,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_0dedf73d0f6c1b6d: function() { return handleError(function (arg0) {
+        __wbg_isArray_8c60ada374b6fd21: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -1062,7 +1063,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_37b1d7c41beb1855: function() { return handleError(function (arg0) {
+        __wbg_keys_04160e53f65f8d3b: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -1082,7 +1083,7 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_7f851cc3ea36d7c1: function() { return handleError(function (arg0) {
+        __wbg_new_5c9346200e0d7511: function() { return handleError(function (arg0) {
             const ret = new Float32Array(arg0);
             return ret;
         }, arguments); },
@@ -1151,7 +1152,7 @@ function __wbg_get_imports() {
             const ret = JSON.stringify(arg0);
             return ret;
         }, arguments); },
-        __wbg_zippTorchKernel_904d59d7c7b9138a: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_zippTorchKernel_fc37bf5a2c235406: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg1.zippTorchKernel(getArrayU8FromWasm0(arg2, arg3));
             var ptr1 = isLikeNone(ret) ? 0 : passArray8ToWasm0(ret, wasm.__wbindgen_malloc);
             var len1 = WASM_VECTOR_LEN;

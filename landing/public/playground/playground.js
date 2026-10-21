@@ -521,7 +521,7 @@ function startWorker() {
   if (worker.instance) worker.instance.terminate();
   for (const p of worker.pending.values()) { clearTimeout(p.timer); p.reject(new Error("engine restarted")); }
   worker.pending.clear();
-  worker.instance = new Worker(new URL("./engine.worker.js?v=37558552f864d405", import.meta.url), { type: "module" });
+  worker.instance = new Worker(new URL("./engine.worker.js?v=a8ff1de6ef6f195b", import.meta.url), { type: "module" });
   worker.instance.onmessage = (event) => {
     const m = event.data;
     if (m.type === "event") { hostEvent(m); return; }

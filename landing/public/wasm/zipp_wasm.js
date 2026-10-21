@@ -417,7 +417,8 @@ export class Engine {
      * before attempting to reclaim it:
      *
      * - `heapBytes`: the payload-aware guest heap estimate the heap ceiling
-     *   is enforced against;
+     *   is enforced against between audits (O(1); the live figure, so it
+     *   falls after a collection);
      * - `stepsUsed`: bytecode instructions executed under the current budget;
      * - `instructionBudget`: the allowance the host chose;
      * - `evalCalls`, `evalRetainedSourceBytes`: this engine's `evalInContext`
@@ -886,7 +887,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_0dedf73d0f6c1b6d: function() { return handleError(function (arg0) {
+        __wbg_isArray_8c60ada374b6fd21: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -894,7 +895,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_37b1d7c41beb1855: function() { return handleError(function (arg0) {
+        __wbg_keys_04160e53f65f8d3b: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -914,7 +915,7 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_7f851cc3ea36d7c1: function() { return handleError(function (arg0) {
+        __wbg_new_5c9346200e0d7511: function() { return handleError(function (arg0) {
             const ret = new Float32Array(arg0);
             return ret;
         }, arguments); },
