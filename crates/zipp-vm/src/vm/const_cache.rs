@@ -80,7 +80,7 @@ fn function_literals_shareable(f: &crate::bytecode::FuncProto) -> bool {
     })
 }
 
-impl Vm<'_> {
+impl<'p> Vm<'p> {
     /// Whether `func_id` is the main program's or a loader module's: code
     /// whose functions and constants are bounded by its source, unlike an
     /// `eval` / `new Function` stream's, so the caches' function caps need
@@ -170,21 +170,31 @@ impl Vm<'_> {
             return self.resolve_const(func_id, raw);
         }
 
-        let resolved = self.resolve_const(func_id, raw);
-        debug_assert!(
-            resolved.is_heap(),
-            "a string constant resolves to a heap value"
-        );
-        // A Python program's names are one heap string per text (`vm::py_rt`).
-        #[cfg(feature = "python")]
-        let resolved = {
-            let text = self.func(func_id as usize).string_constants[string_idx].as_str();
-            self.py_intern(text, resolved)
+        // One representation per literal text, whichever function loads it:
+        // `node.type === "Identifier"` then compares two equal handles, as
+        // QuickJS's atoms do, where it read both strings. Every value in the
+        // text map is also in the slot map, which roots it.
+        let text: &'p str = self.func(func_id as usize).string_constants[string_idx].as_str();
+        let resolved = match self.const_string_texts.get(text) {
+            Some(&shared) => shared,
+            None => {
+                let resolved = self.resolve_const(func_id, raw);
+                debug_assert!(
+                    resolved.is_heap(),
+                    "a string constant resolves to a heap value"
+                );
+                // A Python program's names are one heap string per text
+                // (`vm::py_rt`).
+                #[cfg(feature = "python")]
+                let resolved = self.py_intern(text, resolved);
+                // Held by this cache and by every load it serves: no
+                // accumulator's own (see `function_literals_shareable`).
+                #[cfg(not(feature = "jit"))]
+                self.heap.freeze_shared_str(resolved.heap_index());
+                self.const_string_texts.insert(text, resolved);
+                resolved
+            }
         };
-        // Held by this cache and by every load it serves: no accumulator's
-        // own (see `function_literals_shareable`).
-        #[cfg(not(feature = "jit"))]
-        self.heap.freeze_shared_str(resolved.heap_index());
         self.const_string_cache.insert(key, resolved);
         let f = func_id as usize;
         // Only `eval` / `new Function` code takes the cap. A bundle is one
@@ -222,6 +232,13 @@ mod tests {
     }
 
     fn literal_slot(vm: &Vm<'_>, text: &str) -> (u32, u32) {
+        *literal_slots(vm, text)
+            .first()
+            .unwrap_or_else(|| panic!("literal slot not found: {text:?}"))
+    }
+
+    fn literal_slots(vm: &Vm<'_>, text: &str) -> Vec<(u32, u32)> {
+        let mut slots = Vec::new();
         for func_id in 0..vm.funcs.len() as u32 {
             let f = vm.func(func_id as usize);
             for (const_idx, &raw) in f.constants.iter().enumerate() {
@@ -233,11 +250,29 @@ mod tests {
                 let string_idx =
                     (raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize;
                 if f.string_constants[string_idx] == text {
-                    return (func_id, const_idx as u32);
+                    slots.push((func_id, const_idx as u32));
                 }
             }
         }
-        panic!("literal slot not found: {text:?}");
+        slots
+    }
+
+    #[test]
+    fn equal_literals_in_different_functions_share_one_string() {
+        let mut vm = vm(r#"
+            function left() { return "shared-literal-text"; }
+            function right() { return "shared-literal-text"; }
+            function other() { return "other-literal-text"; }
+            "#);
+        let slots = literal_slots(&vm, "shared-literal-text");
+        assert_eq!(slots.len(), 2);
+        assert_ne!(slots[0].0, slots[1].0);
+        let left = vm.resolve_const_slot(slots[0].0, slots[0].1);
+        let right = vm.resolve_const_slot(slots[1].0, slots[1].1);
+        assert_eq!(left, right, "one representation for one text");
+        assert_eq!(vm.display(right), "shared-literal-text");
+        let (other_func, other_const) = literal_slot(&vm, "other-literal-text");
+        assert_ne!(vm.resolve_const_slot(other_func, other_const), left);
     }
 
     #[test]
@@ -246,6 +281,7 @@ mod tests {
         let (func_id, const_idx) = literal_slot(&vm, "cache-me-please");
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
 
         let first = vm.resolve_const_slot(func_id, const_idx);
         let second = vm.resolve_const_slot(func_id, const_idx);
@@ -254,6 +290,7 @@ mod tests {
 
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
         vm.const_string_cache_enabled = false;
         let fresh_a = vm.resolve_const_slot(func_id, const_idx);
         let fresh_b = vm.resolve_const_slot(func_id, const_idx);
@@ -267,6 +304,7 @@ mod tests {
         let (func_id, const_idx) = literal_slot(&vm, "cache-root-check");
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
         vm.regs.clear();
 
         let cached = vm.resolve_const_slot(func_id, const_idx);
@@ -360,6 +398,7 @@ mod tests {
 
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
         for n in 0..CONST_STRING_CACHE_MAX_ENTRIES as u64 {
             vm.const_string_cache
                 .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
@@ -395,6 +434,7 @@ mod tests {
         let mut vm = vm(&source);
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
         for n in 0..CONST_STRING_CACHE_WIDE_ENTRIES as u64 {
             vm.const_string_cache
                 .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
@@ -425,6 +465,7 @@ mod tests {
             "#);
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
+        vm.const_string_texts.clear();
         let (left_func, left_const) = literal_slot(&vm, "left-function-literal");
         let (right_func, right_const) = literal_slot(&vm, "right-function-literal");
         assert_ne!(left_func, right_func);
