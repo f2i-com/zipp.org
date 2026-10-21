@@ -626,25 +626,30 @@ impl<'p> Vm<'p> {
             Ok(step) => step,
             Err(e) => return Some(Err(e)),
         };
-        let prev = self.get(base, dst);
-        Some(Ok(self.step_result(base + dst as usize, prev, v, done)))
+        Some(Ok(self.step_result(base + dst as usize, v, done)))
     }
 
-    /// The step's `{ value, done }`: the register's previous result rewritten
-    /// in place when it is the object the fast path last made for this
-    /// register (`step_tokens`; the step register is that object's only
-    /// holder), else a new one, remembered for the next step.
-    fn step_result(&mut self, reg: usize, prev: Value, v: Value, done: bool) -> Value {
+    /// The step's `{ value, done }`: the object the fast path last made for
+    /// this register (`step_tokens`), rewritten in place, when it is still
+    /// there (same version); else a new one, remembered for the next step.
+    ///
+    /// A step register is the only holder of its results, and the register
+    /// lives at that absolute index in exactly one frame at a time (live
+    /// frames' windows are disjoint; a tail call replaces its caller's). So
+    /// the remembered object is either this register's current value or what
+    /// a frame that has since returned left there, unreachable either way:
+    /// the first step of a loop in a fresh frame reuses it too.
+    fn step_result(&mut self, reg: usize, v: Value, done: bool) -> Value {
         let slot = reg & (crate::vm::STEP_TOKEN_SLOTS - 1);
         let (treg, idx, ver) = self.step_tokens[slot];
-        if treg as usize == reg && prev.is_heap() && prev.heap_index() == idx && self.heap.version_of(idx) == ver {
+        if treg as usize == reg && self.heap.version_of(idx) == ver {
             if let Some(shape) = self.iter_result_shape {
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     if m.shape() == shape {
                         m.set_val_at(0, v);
                         m.set_val_at(1, Value::bool(done));
                         self.heap.write_barrier_val(idx, v);
-                        return prev;
+                        return Value::heap(idx);
                     }
                 }
             }
