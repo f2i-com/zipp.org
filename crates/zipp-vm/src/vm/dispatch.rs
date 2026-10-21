@@ -1814,6 +1814,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    Instr::FuseNotJump { dst, a, when, target } => {
+                        let m = !self.truthy(self.get(base, a));
+                        self.set(base, dst, Value::bool(m));
+                        ip = if m == when { target as usize } else { ip + 2 };
+                    }
 
                     Instr::Lt { dst, a, b } => {
                         let r = self.cmp_lt(base, a, b, true)?;

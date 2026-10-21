@@ -2642,6 +2642,9 @@ pub enum Instr {
         when: bool,
         target: u32,
     },
+    /// `Not { dst, a }` then the conditional jump on `dst`, as
+    /// [`Instr::FuseEqJump`]: `if (!node) …`, `while (!(s = it()).done)`.
+    FuseNotJump { dst: Reg, a: Reg, when: bool, target: u32 },
     /// `LoadInt { dst: ldst, val }` then `JumpIfNotLt { a, b: ldst, target }`
     /// (`JumpIfNotLe` when `le`): a loop or branch bound that is a literal.
     FuseIntCmpJump {
@@ -3102,6 +3105,7 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
                     Instr::TypeOfIs { dst, a, code, neg } if dst == cond => {
                         Some(Instr::FuseTypeOfJump { dst, a, code, neg, when, target })
                     }
+                    Instr::Not { dst, a } if dst == cond => Some(Instr::FuseNotJump { dst, a, when, target }),
                     _ => None,
                 }
             }
@@ -3186,6 +3190,27 @@ mod fused_code_tests {
         let none = FusedCode::default();
         assert!(none.entered(&[Instr::Return { src: 0 }]).is_none());
         assert!(none.code.get().is_some() && none.get().is_none());
+    }
+
+    /// `!x` and the forward branch on it fuse, the fused op writing the
+    /// `Not`'s register too (`z = !y; if (z) …` reads it again); a branch on
+    /// another register, or a backward one, does not.
+    #[test]
+    fn not_and_its_branch_fuse() {
+        let code = [
+            Instr::Not { dst: 3, a: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 4 },
+            Instr::ReturnUndefined,
+            Instr::Not { dst: 4, a: 1 },
+            Instr::JumpIfTrue { cond: 5, target: 6 },
+            Instr::Not { dst: 6, a: 1 },
+            Instr::JumpIfFalse { cond: 6, target: 0 },
+        ];
+        let fused = fuse_for_interpreter(&code).expect("the forward pair fuses");
+        assert!(matches!(fused[0], Instr::FuseNotJump { dst: 3, a: 1, when: false, target: 4 }));
+        assert!(matches!(fused[1], Instr::JumpIfFalse { cond: 3, target: 4 }));
+        assert!(matches!(fused[3], Instr::Not { .. }));
+        assert!(matches!(fused[5], Instr::Not { .. }));
     }
 
     /// The bound tests, the literal add and the counter's back-edge fuse
