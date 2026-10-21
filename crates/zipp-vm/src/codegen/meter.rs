@@ -177,7 +177,11 @@ fn blocks_split(code: &[Instr], start: usize, end: usize, split: Option<&[bool]>
         // a synthetic ReturnUndefined after an explicit Return, but that
         // fallback is unreachable from the returning path and must belong to a
         // separate block or native execution bills it without executing it.
-        if matches!(code[ip], Instr::Return { .. } | Instr::ReturnUndefined) {
+        // A throw leaves the same way.
+        if matches!(
+            code[ip],
+            Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. }
+        ) {
             mark(ip + 1);
             continue;
         }

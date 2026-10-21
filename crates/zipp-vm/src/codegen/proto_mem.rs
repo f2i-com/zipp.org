@@ -41,6 +41,12 @@ fn tierc_protected_return_map(code: &[Instr]) -> Vec<bool> {
 }
 
 env_off_switch!(
+    /// `ZIPP_NO_TIERC_THROW=1` leaves every function holding a `throw`
+    /// interpreted, as before Tier C admitted it.
+    fn tierc_throw_enabled() = "ZIPP_NO_TIERC_THROW"
+);
+
+env_off_switch!(
     /// Defer flat-ASCII builder metadata across a compiler-proved call-free
     /// Tier-C loop. `ZIPP_NO_STR_APPEND_CURSOR=1` restores one
     /// `jit_str_append_index_ascii` boundary crossing per appended character.
@@ -1304,6 +1310,16 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] op Neg (disabled)");
                 }
             }
+            // `throw v`: a committed throw through `jit_throw`, unwound by
+            // every entry as a call's throw is. A guard clause's `throw` (an
+            // argument check, a class-call check) used to leave its whole
+            // function interpreted, and every call into it re-entered the
+            // interpreter loop.
+            Instr::Throw { .. } => {
+                if !tierc_throw_enabled() {
+                    reject!("[tierC-reject] op Throw (disabled)");
+                }
+            }
             // Captured accesses use Tier-C-specific helpers. A frame-free native
             // cross-call installs its live closure explicitly; using the region
             // helper here would read `frames.last()` (the CALLER) and silently
@@ -1823,6 +1839,9 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::JumpIfNotLt { a, b, .. } | Instr::JumpIfNotLe { a, b, .. } => (u2(a, b), None),
             Instr::CheckCoercible { src } => (u1(src), None),
             Instr::Return { src } => (u1(src), None),
+            // Leaves the body; the fixpoint's fall-through edge after it only
+            // costs precision.
+            Instr::Throw { src } => (u1(src), None),
             _ => return None,
         })
     }
@@ -4039,6 +4058,19 @@ pub(crate) fn compile_proto_mem(
             } if py => {
                 emit_py_array_append(&mut ops, arr, val, bail);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            // `throw v` in a JavaScript body: `jit_throw` leaves the value
+            // pending and the bail at this ip is a committed throw, which
+            // every entry unwinds from without re-entering the interpreter.
+            Instr::Throw { src } if !py => {
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(src)]          // the thrown value
+                    ; mov rax, QWORD crate::vm::jit_throw as i64
+                    ; call rax
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => epilogue
+                );
             }
             Instr::PushHandler {
                 catch_target,

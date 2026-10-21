@@ -1243,6 +1243,20 @@ pub(crate) extern "win64" fn jit_new_ic(
     })
 }
 
+/// Win64 helper for `throw v` (`Throw`) in a Tier C body: `v` becomes the
+/// pending exception, as the interpreter's arm makes it, and the body then
+/// bails at the `Throw`, so every entry unwinds from there exactly as it does
+/// after a call that threw. A throw is not a deopt signal.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_throw(vm: *mut core::ffi::c_void, v: u64) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.pending_throw = Some(Value::from_bits(v));
+    vm.osr_deopt_exempt = true;
+}
+
 /// Win64 helpers for array destructuring, array spread and a spread call in a
 /// compiled region: `IterToArray` (`packed_args` = `src | count << 16`),
 /// `ArrayAppend` (`arr | val << 16 | spread << 32`; the array's own bits come
