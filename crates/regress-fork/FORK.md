@@ -7,7 +7,8 @@ code at all. On top of that it carries seven correctness patches for bugs test26
 hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`, `property-escapes`,
 and the `staging/sm/RegExp` unicode-flag cluster), plus the 15 September 2026
 audit patches B8-B11 (a backtracking crash, the anchored sticky attempt,
-lookbehind group names, and `[UnicodeMode]` grammar under `v`).
+lookbehind group names, and `[UnicodeMode]` grammar under `v`), and B12 (`v`
+class set expressions).
 
 ## Why not a different crate
 
@@ -242,6 +243,35 @@ Annex B paths: `/a{/v`, `/]/v`, `/(?=a)+/v`, `/\a/v`, `/\1/v`, `/\c/v`,
   identity escape `x`, and the characters after it are re-read as pattern text
   (`/\x1/` matches `"x1"`); they were consumed, so `/[\x1]/` was an
   "Unbalanced bracket" SyntaxError.
+
+## Patch B12: `v`-mode class set expressions
+
+QuickJS's `test_builtin.js` regexp block and probes against QuickJS and V8
+found the `v` class grammar computing the wrong sets. Where V8 and QuickJS
+disagree the spec decides: V8 keeps `A` out of `/[\q{BC|A}]/vi` and lets `B`
+into `/[^\q{a|b}]/vi`, and QuickJS accepts `/[^[\q{ab}--\q{ab}]]/v`.
+
+- `src/unicode.rs`, `src/parse.rs`: under `v` with ignoreCase every operand is
+  simple case folded before `&&` and `--` run (MaybeSimpleCaseFolding), and a
+  complement (`[^…]`, `\P{…}`, `\W`, `\D`, `\S`) is taken within the code
+  points that fold to themselves (CharacterComplement over AllCharacters). The
+  operators ran on raw sets, so `/[[a-c]&&B]/vi` matched nothing and
+  `/[\w--k]/vi` matched `K`.
+- `src/parse.rs`: a nested `[^…]` is complemented. The code called
+  `inverted()` and dropped the result, so `/[[^b]]/v` was `[b]`.
+- `src/parse.rs`: `ClassSet::strings` is MayContainStrings, syntactic as the
+  spec defines it, and is what gates `[^…]`; the old check rejected any string
+  property under a negated class, `/[^\p{RGI_Emoji}&&a]/v` included, and let
+  `/[^\q{ab}]/v` through. One-code-point strings join the code points before a
+  complement or a bracket (`/[^\q{a}]/v` is `[^a]`), `\q{}` and `\q{a|}` keep
+  the empty string, and strings are tried longest first (`/[\q{a|ab}]/v`
+  matches all of `"ab"`).
+- `src/parse.rs`: a lone `&` after the first operand (`/[a&b]/v`) no longer
+  drops that operand.
+
+Tests: `tests/class_set_operations.rs`. Of the differential fuzzer's 306
+recorded disagreements with Node (`fuzz/corpus.js`), 201 now agree and none
+moved further away; their ZIPP lines are re-recorded.
 
 ## Compact Unicode property storage
 

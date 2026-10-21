@@ -259,6 +259,44 @@ fn fold_interval(iv: Interval, unicode: bool, recv: &mut CodePointSet) {
     }
 }
 
+/// The code points simple case folding changes (`scf(c) != c`). FOLDS is
+/// sorted and disjoint (`fold` binary searches it), so the intervals come out
+/// in order.
+fn folded_away() -> CodePointSet {
+    let mut ivs: Vec<Interval> = Vec::new();
+    for fr in FOLDS.iter() {
+        for cu in fr.first()..=fr.last() {
+            if fr.apply(cu) == cu {
+                continue;
+            }
+            match ivs.last_mut() {
+                Some(last) if last.last + 1 == cu => last.last = cu,
+                _ => ivs.push(Interval { first: cu, last: cu }),
+            }
+        }
+    }
+    CodePointSet::from_sorted_disjoint_intervals(ivs)
+}
+
+/// MaybeSimpleCaseFolding (22.2.2.9.3) for a `v`-mode class under
+/// ignoreCase: every member of `set` replaced by its simple case folding.
+/// The class set operators work on these folded sets, so `[[a-c]&&B]` is
+/// `{b}` and `[[a-c]--B]` is `{a, c}`.
+pub(crate) fn simple_case_fold_set(set: &CodePointSet) -> CodePointSet {
+    let mut out = set.clone();
+    out.remove(folded_away().intervals());
+    for iv in set.intervals() {
+        fold_interval(*iv, true, &mut out);
+    }
+    out
+}
+
+/// AllCharacters (22.2.2.9.4) under `v` and ignoreCase: the code points that
+/// are their own simple case folding, which a complement is taken within.
+pub(crate) fn fold_fixed_points() -> CodePointSet {
+    folded_away().inverted()
+}
+
 /// Find all characters that fold into the given interval and add them to the given code point set.
 /// This skips characters which fold to themselves.
 fn unfold_interval(iv: Interval, unicode: bool, recv: &mut CodePointSet) {

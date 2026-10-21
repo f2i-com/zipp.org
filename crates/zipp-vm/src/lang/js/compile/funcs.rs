@@ -332,14 +332,18 @@ impl<'a> FnCompiler<'a> {
             Cell(Reg, Reg),   // (cell, temp)
             Global(u32, Reg), // (slot, temp)
         }
-        // A class declaration pre-declared block-local (e.g. inside a switch/block,
-        // where it is lexically scoped) binds to that existing innermost local
-        // rather than leaking to a global. `resolve_existing` scans innermost-first,
-        // so it returns the current block's binding (shadowing any outer/global one).
-        let dest = match self.resolve_existing(&n) {
+        // A class declaration is lexically scoped to its block, as `let` is: it
+        // binds to a binding the CURRENT scope already holds (pre-declared at
+        // block entry for a closure or a switch, or at a function body's entry)
+        // and otherwise declares a new one there. An outer binding of the same
+        // name is shadowed, never written: `const C = 1; { class C {} }` leaves
+        // `C === 1`. Only a script's own top level binds to a global slot, so a
+        // class in a script-level block does not leak either.
+        let here = self.scopes.last().and_then(|s| s.slot_of(&n)).map(|s| self.slot_binding(s));
+        let dest = match here {
             Some(Binding::LocalCell(r)) => Dest::Cell(r, self.temp()),
             Some(Binding::Local(r)) => Dest::Reg(r),
-            _ if self.is_script && !self.cx.eval_locals => {
+            _ if self.is_script && !self.cx.eval_locals && self.scopes.len() == 1 => {
                 let slot = self.cx.global_slot(&n) as u32;
                 Dest::Global(slot, self.temp())
             }

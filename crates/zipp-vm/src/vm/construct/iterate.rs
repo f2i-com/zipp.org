@@ -480,15 +480,22 @@ impl<'p> Vm<'p> {
         // routes it through the plain call, the step lives here as well.
         // (IsRegExp — a Get of `@@match` — precedes the `constructor` Get, as
         // the spec orders them; `test262/built-ins/RegExp/S15.10.3.1_A1_T*`.)
+        // The build reuses that one IsRegExp answer: newTarget is RegExp
+        // itself, whose `prototype` is non-writable, so constructing would only
+        // repeat the `@@match` Get (kangax compat-table "Proxy, internal 'get'
+        // calls: RegExp constructor").
         if ci == self.regexp_ctor && self.regexp_ctor != 0 {
             let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
             let flags = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-            if self.is_regexp(pattern)? && flags == Value::UNDEFINED {
+            let pattern_is_regexp = self.is_regexp(pattern)?;
+            if pattern_is_regexp && flags == Value::UNDEFINED {
                 let c = self.get_prop(pattern, "constructor")?;
                 if self.same_value(c, callee) {
                     return Ok(pattern);
                 }
             }
+            let pre = self.regexp_pattern_snapshot_after(pattern, pattern_is_regexp);
+            return self.build_regexp_snapshot(pattern, flags, pre);
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m

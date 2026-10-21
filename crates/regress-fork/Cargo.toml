@@ -64,6 +64,10 @@ name = "audit_20260915_regex"
 path = "tests/audit_20260915_regex.rs"
 
 [[test]]
+name = "class_set_operations"
+path = "tests/class_set_operations.rs"
+
+[[test]]
 name = "compile_limits"
 path = "tests/compile_limits.rs"
 
