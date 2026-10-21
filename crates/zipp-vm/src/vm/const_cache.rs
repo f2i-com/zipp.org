@@ -11,8 +11,10 @@
 //!
 //! * the key is the unified `(func_id, constant-slot)` pair, so main code,
 //!   loader modules and monotonically-installed eval functions cannot collide;
-//! * only short literals and a bounded number of slots/functions are retained
-//!   (past the first few thousand slots, only name-sized ones);
+//! * only short literals are retained, and for `eval` / `new Function` code
+//!   only a bounded number of slots/functions (past the first few thousand
+//!   slots, only name-sized ones); the main program's and loader modules'
+//!   literals are bounded by their source;
 //! * any function containing a bytecode op licensed to mutate a unique string
 //!   buffer is rejected wholesale. Such an op relies on a literal load being a
 //!   fresh representation; the cache is a hidden alias, so sharing there would
@@ -39,7 +41,8 @@ pub(super) const CONST_STRING_CACHE_WIDE_ENTRIES: usize = 4096;
 /// See [`CONST_STRING_CACHE_WIDE_ENTRIES`].
 pub(super) const CONST_STRING_CACHE_NAME_BYTES: usize = 32;
 /// Functions whose cached slots are also kept in the dense mirror
-/// (`Vm::const_string_dense`); a function past it keeps the map alone.
+/// (`Vm::const_string_dense`) whatever code they are; a runtime-installed
+/// `eval` / `new Function` function past it keeps the map alone.
 pub(super) const CONST_DENSE_FUNCS: usize = 4096;
 /// Dynamic code installs monotonically increasing function ids. Bound the
 /// accompanying eligibility memo too; beyond it we fail closed to fresh loads.
@@ -78,6 +81,14 @@ fn function_literals_shareable(f: &crate::bytecode::FuncProto) -> bool {
 }
 
 impl Vm<'_> {
+    /// Whether `func_id` is the main program's or a loader module's: code
+    /// whose functions and constants are bounded by its source, unlike an
+    /// `eval` / `new Function` stream's, so the caches' function caps need
+    /// not bound it.
+    fn const_func_source_bounded(&self, func_id: u32) -> bool {
+        (func_id as usize) < self.main_func_count || self.loader_module_func(func_id)
+    }
+
     #[cfg(not(feature = "jit"))]
     #[inline(always)]
     fn const_string_func_shareable(&mut self, _func_id: u32) -> bool {
@@ -93,8 +104,12 @@ impl Vm<'_> {
         // Keep the VM-internal side table resource-bounded even under an eval
         // stream producing infinitely many distinct functions. Failure to memo
         // is also failure to cache, so an attacker cannot induce a repeated
-        // whole-body scan at the bound.
-        if self.const_string_cache_funcs.len() >= CONST_STRING_CACHE_MAX_FUNCTIONS {
+        // whole-body scan at the bound. Code bounded by its source is not
+        // capped: a bundle's literals past its 4096th function were loaded as
+        // a fresh string every time.
+        if self.const_string_cache_funcs.len() >= CONST_STRING_CACHE_MAX_FUNCTIONS
+            && !self.const_func_source_bounded(func_id)
+        {
             return false;
         }
         let safe = function_literals_shareable(self.func(func_id as usize));
@@ -146,11 +161,12 @@ impl Vm<'_> {
         if let Some(&cached) = self.const_string_cache.get(&key) {
             return cached;
         }
+        // The entry caps bound what runtime code can make the cache retain;
+        // a source-bounded function's literals are bounded by that source.
         let len = self.const_string_cache.len();
-        if len >= CONST_STRING_CACHE_MAX_ENTRIES
-            || (len >= CONST_STRING_CACHE_WIDE_ENTRIES && source_bytes > CONST_STRING_CACHE_NAME_BYTES)
-            || !self.const_string_func_shareable(func_id)
-        {
+        let capped = len >= CONST_STRING_CACHE_MAX_ENTRIES
+            || (len >= CONST_STRING_CACHE_WIDE_ENTRIES && source_bytes > CONST_STRING_CACHE_NAME_BYTES);
+        if (capped && !self.const_func_source_bounded(func_id)) || !self.const_string_func_shareable(func_id) {
             return self.resolve_const(func_id, raw);
         }
 
@@ -171,7 +187,10 @@ impl Vm<'_> {
         self.heap.freeze_shared_str(resolved.heap_index());
         self.const_string_cache.insert(key, resolved);
         let f = func_id as usize;
-        if f < CONST_DENSE_FUNCS {
+        // Only `eval` / `new Function` code takes the cap. A bundle is one
+        // program of thousands of functions, and every string load past the
+        // first 4096 of them hashed into the map.
+        if f < CONST_DENSE_FUNCS || self.const_func_source_bounded(func_id) {
             if self.const_string_dense.len() <= f {
                 self.const_string_dense.resize(f + 1, Vec::new());
             }
@@ -203,7 +222,7 @@ mod tests {
     }
 
     fn literal_slot(vm: &Vm<'_>, text: &str) -> (u32, u32) {
-        for func_id in 0..vm.main_func_count as u32 {
+        for func_id in 0..vm.funcs.len() as u32 {
             let f = vm.func(func_id as usize);
             for (const_idx, &raw) in f.constants.iter().enumerate() {
                 if !raw.is_heap()
@@ -324,7 +343,12 @@ mod tests {
     #[test]
     fn entry_and_literal_size_bounds_fail_to_the_exact_fresh_path() {
         let long = "x".repeat(CONST_STRING_CACHE_MAX_BYTES + 1);
-        let source = format!("function long_value() {{ return {long:?}; }}\nfunction short_value() {{ return \"bounded-short\"; }}");
+        // The entry cap binds runtime-installed code: `short_value` is eval's.
+        let source = format!(
+            "function long_value() {{ return {long:?}; }}\n\
+             function main_value() {{ return \"bounded-main\"; }}\n\
+             eval('function short_value() {{ return \"bounded-short\"; }}');"
+        );
         let mut vm = vm(&source);
         let (long_func, long_const) = literal_slot(&vm, &long);
         let long_a = vm.resolve_const_slot(long_func, long_const);
@@ -341,6 +365,7 @@ mod tests {
                 .insert(u64::MAX - n, Value::heap(crate::heap::INTERN_EMPTY));
         }
         let (short_func, short_const) = literal_slot(&vm, "bounded-short");
+        assert!(short_func as usize >= vm.main_func_count, "eval installed it");
         let before = vm.const_string_cache.len();
         let short = vm.resolve_const_slot(short_func, short_const);
         assert_eq!(vm.display(short), "bounded-short");
@@ -348,14 +373,25 @@ mod tests {
         assert!(!vm
             .const_string_cache
             .contains_key(&slot_key(short_func, short_const)));
+
+        // The main program's literals are bounded by its source: still cached.
+        let (main_func, main_const) = literal_slot(&vm, "bounded-main");
+        let main_a = vm.resolve_const_slot(main_func, main_const);
+        assert_eq!(vm.resolve_const_slot(main_func, main_const), main_a);
+        assert!(vm
+            .const_string_cache
+            .contains_key(&slot_key(main_func, main_const)));
     }
 
     #[test]
     fn past_the_wide_entries_only_name_sized_literals_are_cached() {
         let name = "n".repeat(CONST_STRING_CACHE_NAME_BYTES);
         let wide = "w".repeat(CONST_STRING_CACHE_NAME_BYTES + 1);
-        let source = format!("function name_value() {{ return {name:?}; }}
-function wide_value() {{ return {wide:?}; }}");
+        // Runtime-installed code, which the caps bind.
+        let source = format!(
+            "eval('function name_value() {{ return {name:?}; }}\\n\
+             function wide_value() {{ return {wide:?}; }}');"
+        );
         let mut vm = vm(&source);
         vm.const_string_cache.clear();
         vm.const_string_dense.clear();
