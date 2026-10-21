@@ -5328,6 +5328,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::FuseIntEqJump { a, .. }
         | Instr::FuseIntNeJump { a, .. }
         | Instr::FuseConstEqJump { a, .. }
+        | Instr::FuseStrSwitch { a, .. }
         | Instr::FuseIntCmpJump { a, .. }
         | Instr::FuseGlobalCmpJump { a, .. }
         | Instr::FuseAddLoadInt { a, .. }

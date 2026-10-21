@@ -2632,6 +2632,12 @@ pub enum Instr {
         when: bool,
         target: u32,
     },
+    /// `n` [`Instr::FuseConstEqJump`] cases in a row (stride three, the same
+    /// `ldst`, `a` and `dst`, each `JumpIfTrue`), from a run's second case:
+    /// `switch (a)` over string literals, answered by one lookup of `a`'s
+    /// text in the function's [`StrSwitch`] table for this position instead
+    /// of a compare per case. The cases around it keep their own fused form.
+    FuseStrSwitch { ldst: Reg, a: Reg, dst: Reg, n: u16 },
     /// `TypeOfIs { dst, a, code, neg }` then the conditional jump on `dst`,
     /// as [`Instr::FuseEqJump`].
     FuseTypeOfJump {
@@ -2920,6 +2926,32 @@ pub struct FusedCode {
     /// The function's step call sites (`step_call_sites`), found the first
     /// time the interpreter asks.
     steps: std::sync::OnceLock<Box<[u32]>>,
+    /// The tables of the copy's `FuseStrSwitch` positions, in position
+    /// order, built the first time one runs.
+    switches: std::sync::OnceLock<Box<[StrSwitch]>>,
+}
+
+/// The cases of one `FuseStrSwitch`: each case's string constant and branch
+/// target, in order, and the position after the last. `index` holds the
+/// first case of each text; `None` when a case is not an ASCII string
+/// literal, and the position then runs as the plain first case.
+pub struct StrSwitch {
+    ip: u32,
+    pub after: u32,
+    pub cases: Box<[(u32, u32)]>,
+    index: Option<rustc_hash::FxHashMap<Box<[u8]>, u16>>,
+}
+
+impl StrSwitch {
+    /// The first case whose literal is `text`, or `None` when no case
+    /// matches; `Err(())` when the table could not be built.
+    #[inline]
+    pub fn find(&self, text: &[u8]) -> Result<Option<usize>, ()> {
+        match &self.index {
+            Some(index) => Ok(index.get(text).map(|&k| k as usize)),
+            None => Err(()),
+        }
+    }
 }
 
 impl Clone for FusedCode {
@@ -2956,6 +2988,18 @@ impl FusedCode {
     fn build(&self, code: &[Instr]) -> Option<&[Instr]> {
         self.code.get_or_init(|| fuse_for_interpreter(code).unwrap_or_default());
         self.get()
+    }
+
+    /// The table of the `FuseStrSwitch` at `ip` of `f` (whose `fused` this
+    /// is); every such position's is built the first time one asks.
+    #[inline]
+    pub fn str_switch(&self, f: &FuncProto, ip: usize) -> Option<&StrSwitch> {
+        let all = self
+            .switches
+            .get_or_init(|| str_switches(f, self.get().unwrap_or(&[])));
+        all.binary_search_by_key(&(ip as u32), |s| s.ip)
+            .ok()
+            .map(|i| &all[i])
     }
 
     /// Whether the `Call` at `ip` of `f` (whose `fused` this is) writes a
@@ -3046,6 +3090,87 @@ pub(crate) fn step_call_sites(f: &FuncProto) -> Box<[u32]> {
     out.into_boxed_slice()
 }
 
+/// The tables of the `FuseStrSwitch` positions of `fused`, the copy of
+/// `f.code`. A case qualifies when its constant is a string literal stored as
+/// its own ASCII text (no lone-surrogate markers), so the text's bytes are
+/// the string's; one that does not leaves its position without an index.
+fn str_switches(f: &FuncProto, fused: &[Instr]) -> Box<[StrSwitch]> {
+    let literal = |idx: u32| -> Option<&str> {
+        let raw = *f.constants.get(idx as usize)?;
+        let bit = crate::vm::STRING_CONST_BIT;
+        if !raw.is_heap() || raw.heap_index() & bit == 0 {
+            return None;
+        }
+        let si = raw.heap_index() & !bit;
+        if f.wtf8_consts.binary_search(&si).is_ok() {
+            return None;
+        }
+        f.string_constants
+            .get(si as usize)
+            .map(String::as_str)
+            .filter(|t| t.is_ascii())
+    };
+    let mut out = Vec::new();
+    for (ip, ins) in fused.iter().enumerate() {
+        let Instr::FuseStrSwitch { n, .. } = *ins else {
+            continue;
+        };
+        let mut cases = Vec::with_capacity(n as usize);
+        let mut index: Option<rustc_hash::FxHashMap<Box<[u8]>, u16>> = Some(Default::default());
+        for k in 0..n as usize {
+            let at = ip + 3 * k;
+            let (Some(&Instr::LoadConst { idx, .. }), Some(&Instr::JumpIfTrue { target, .. })) =
+                (f.code.get(at), f.code.get(at + 2))
+            else {
+                index = None;
+                break;
+            };
+            cases.push((idx, target));
+            match (literal(idx), index.as_mut()) {
+                (Some(text), Some(map)) => {
+                    map.entry(text.as_bytes().into()).or_insert(k as u16);
+                }
+                _ => index = None,
+            }
+        }
+        // A lexer's character switch compares interned one-character strings,
+        // each a bits test: there the cases beat the lookup.
+        if index.as_ref().is_some_and(|map| map.keys().all(|k| k.len() <= 1)) {
+            index = None;
+        }
+        out.push(StrSwitch {
+            ip: ip as u32,
+            after: (ip + 3 * n as usize) as u32,
+            cases: cases.into_boxed_slice(),
+            index,
+        });
+    }
+    out.into_boxed_slice()
+}
+
+/// Cases in a row that become one [`Instr::FuseStrSwitch`]; fewer stay a
+/// compare each.
+const STR_SWITCH_MIN_CASES: usize = 4;
+
+/// Whether `code[at..at + 3]` is a `LoadConst { dst: ldst }`,
+/// `Eq { dst, a, b: ldst }`, forward `JumpIfTrue { cond: dst }` case.
+fn str_case_at(code: &[Instr], at: usize, ldst: Reg, a: Reg, dst: Reg) -> bool {
+    matches!(
+        code.get(at..at + 3),
+        Some(&[Instr::LoadConst { dst: l, .. }, Instr::Eq { dst: d, a: x, b: y }, Instr::JumpIfTrue { cond, target }])
+            if l == ldst && d == dst && x == a && y == ldst && cond == dst && target as usize > at + 2
+    )
+}
+
+/// How many such cases run in a row from `i`.
+fn str_switch_run(code: &[Instr], i: usize, ldst: Reg, a: Reg, dst: Reg) -> usize {
+    let mut n = 0;
+    while n < u16::MAX as usize && str_case_at(code, i + 3 * n, ldst, a, dst) {
+        n += 1;
+    }
+    n
+}
+
 /// The interpreter's superinstruction copy of `code` (see [`FusedCode`]),
 /// or `None` when no pair in it fuses. Pairs never overlap: after a fused
 /// pair the scan resumes at the instruction after its second.
@@ -3071,7 +3196,19 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
                             Instr::FuseIntNeJump { ldst, val, a, dst, target }
                         }),
                         Instr::LoadConst { dst: ldst, idx } if b == ldst && a != ldst => {
-                            Some(Instr::FuseConstEqJump { ldst, idx, a, dst, when, target })
+                            // The table takes a run from its second case: the
+                            // first stays a compare, all that a switch whose
+                            // first case usually matches needs.
+                            let second = when
+                                && i >= 3
+                                && str_case_at(code, i - 3, ldst, a, dst)
+                                && !(i >= 6 && str_case_at(code, i - 6, ldst, a, dst));
+                            let run = if second { str_switch_run(code, i, ldst, a, dst) } else { 0 };
+                            Some(if run >= STR_SWITCH_MIN_CASES {
+                                Instr::FuseStrSwitch { ldst, a, dst, n: run as u16 }
+                            } else {
+                                Instr::FuseConstEqJump { ldst, idx, a, dst, when, target }
+                            })
                         }
                         _ => None,
                     };
@@ -3322,6 +3459,33 @@ mod fused_code_tests {
         assert!(matches!(fused[7], Instr::FuseEqJump { dst: 5, a: 4, b: 1, ne: false, when: true, target: 12 }));
         assert!(matches!(fused[9], Instr::LoadInt { .. }));
         assert!(matches!(fused[10], Instr::Eq { .. }) && matches!(fused[11], Instr::JumpIfTrue { .. }));
+    }
+
+    /// Five string cases in a row on one value: the first stays a case and
+    /// the other four become one switch at the second, the cases after it
+    /// keeping their own form; with four in all, the three after the first
+    /// stay cases.
+    #[test]
+    fn string_case_runs_become_a_switch() {
+        let case = |idx: u32, target: u32| {
+            [
+                Instr::LoadConst { dst: 4, idx },
+                Instr::Eq { dst: 5, a: 1, b: 4 },
+                Instr::JumpIfTrue { cond: 5, target },
+            ]
+        };
+        let mut code: Vec<Instr> = (0..5).flat_map(|k| case(k, 30)).collect();
+        code.push(Instr::Jump { target: 31 });
+        let fused = fuse_for_interpreter(&code).expect("cases fuse");
+        assert!(matches!(fused[0], Instr::FuseConstEqJump { when: true, target: 30, .. }));
+        assert!(matches!(fused[3], Instr::FuseStrSwitch { ldst: 4, a: 1, dst: 5, n: 4 }));
+        for k in 2..5 {
+            assert!(matches!(fused[3 * k], Instr::FuseConstEqJump { when: true, target: 30, .. }));
+        }
+
+        let four: Vec<Instr> = (0..4).flat_map(|k| case(k, 30)).collect();
+        let fused = fuse_for_interpreter(&four).expect("cases fuse");
+        assert!((0..4).all(|k| matches!(fused[3 * k], Instr::FuseConstEqJump { .. })));
     }
 
     /// A program run on the interpreter builds the copies of the code that
@@ -3858,19 +4022,20 @@ mod static_key_plan_layout_tests {
 
     /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
     /// when the optimization never applies, and `fused` (the interpreter's
-    /// superinstruction copy and its step call sites, `FusedCode`) another 48
-    /// until they are built, and `call_sites` (a boxed slice: 16) the source
-    /// positions error stacks report. Keep that startup/many-function cost, plus the retained-charge
-    /// assumptions for non-empty plans, explicit.
+    /// superinstruction copy, its step call sites and its string-switch
+    /// tables, `FusedCode`) another 72 until they are built, and `call_sites`
+    /// (a boxed slice: 16) the source positions error stacks report. Keep
+    /// that startup/many-function cost, plus the retained-charge assumptions
+    /// for non-empty plans, explicit.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
-        assert_eq!(std::mem::size_of::<FusedCode>(), 48);
+        assert_eq!(std::mem::size_of::<FusedCode>(), 72);
         assert_eq!(std::mem::size_of::<CallSite>(), 16);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 336);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 360);
     }
 }
 

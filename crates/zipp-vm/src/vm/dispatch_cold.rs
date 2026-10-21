@@ -103,6 +103,13 @@ impl<'p> Vm<'p> {
                 self.set(base, dst, v);
                 ip += 1;
             }
+            // A `switch` over string literals: here rather than in
+            // `dispatch_body`, where an arm moved rows that never run one by
+            // 4-7% (ephemeral, throw-catch); the call is a sliver of the
+            // compares it replaces.
+            Instr::FuseStrSwitch { ldst, a, dst, n } => {
+                ip = self.str_switch(running, func_id, base, ip, ldst, a, dst, n);
+            }
             Instr::LoadSpill { dst, vec, idx } => {
                 let holder = self.get(base, vec).heap_index();
                 let v = match self.heap.get(holder) {

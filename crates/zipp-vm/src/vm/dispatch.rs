@@ -5621,6 +5621,63 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `FuseStrSwitch` at `ip`: the `n` string-literal cases from `ip` in one
+    /// lookup of the discriminant's text, leaving `ldst` and `dst` as the
+    /// cases would (the matched or else the last case's literal, and whether
+    /// one matched). Only a string can be `===` a string literal, so any
+    /// other value matches none. Answers the next ip.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    pub(crate) fn str_switch(
+        &mut self,
+        running: &'p crate::bytecode::FuncProto,
+        func_id: u32,
+        base: usize,
+        ip: usize,
+        ldst: u16,
+        a: u16,
+        dst: u16,
+        n: u16,
+    ) -> usize {
+        let v = self.get(base, a);
+        let table = running.fused.str_switch(running, ip).and_then(|sw| {
+            let found = if v.is_heap() {
+                let idx = v.heap_index();
+                self.heap.flatten(idx);
+                match self.heap.get(idx) {
+                    HeapObj::Str(s) => sw.find(s.as_bytes()),
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            };
+            found.ok().map(|k| (sw, k))
+        });
+        let Some((sw, found)) = table else {
+            // No table: the first case alone, as `FuseConstEqJump` runs it.
+            let (Instr::LoadConst { idx, .. }, Instr::JumpIfTrue { target, .. }) =
+                (running.code[ip], running.code[ip + 2])
+            else {
+                unreachable!("FuseStrSwitch stands for a string case");
+            };
+            let c = self.resolve_const_slot(func_id, idx);
+            self.set(base, ldst, c);
+            let r = self.strict_eq(base, a, ldst);
+            self.set(base, dst, Value::bool(r));
+            return if r { target as usize } else { ip + 3 };
+        };
+        let case = found.unwrap_or(n as usize - 1);
+        let (idx, target) = sw.cases[case];
+        let c = self.resolve_const_slot(func_id, idx);
+        self.set(base, ldst, c);
+        self.set(base, dst, Value::bool(found.is_some()));
+        if found.is_some() {
+            target as usize
+        } else {
+            sw.after as usize
+        }
+    }
+
     /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,
     /// non-async) function or closure, rebuild the CURRENT frame's register
     /// window in place for it (constant stack for tail recursion) and return
