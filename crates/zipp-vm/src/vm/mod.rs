@@ -1952,7 +1952,7 @@ pub struct Vm<'p> {
     /// the JIT's add ways and the interpreter's cached adds append to
     /// (`helpers_misc::shape_key_plan`): built once an add reaches the
     /// shape, `None` where the list is too long.
-    shape_key_plans: Vec<Option<crate::bytecode::StaticKeyPlan>>,
+    shape_key_plans: helpers_misc::ShapePlans,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
     /// is enumerable, and none can shadow a farther level because the walk ends
     /// there. Keyed by heap index, valued by the heap version the answer was

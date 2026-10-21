@@ -5430,9 +5430,47 @@ pub(crate) struct AddWay {
 /// Longest key list a shape gets a shared plan for, and the most key bytes it
 /// may hold: plans live outside the heap, one per shape reached by an add way
 /// (shapes are capped at `shape::SHAPE_MAX`), so a long or wide one stays on
-/// owned keys.
-const SHAPE_PLAN_MAX_KEYS: u32 = 16;
-const SHAPE_PLAN_MAX_BYTES: usize = 512;
+/// owned keys. At 16 keys a constructor writing 17 fields (Babel's NodePath)
+/// copied all 16 keys into a list of its own at the 17th, for every object.
+const SHAPE_PLAN_MAX_KEYS: u32 = 32;
+const SHAPE_PLAN_MAX_BYTES: usize = 1024;
+/// The key bytes every shape plan holds together, for the process: past it a
+/// shape stays on owned keys, so a hostile program minting wide shapes cannot
+/// make the plans its memory sink.
+const SHAPE_PLAN_TOTAL_BYTES: usize = 32 << 20;
+static SHAPE_PLAN_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What a shape plan counts against [`SHAPE_PLAN_TOTAL_BYTES`]: its key
+/// bytes and each key's `String` record.
+fn shape_plan_charge(keys: &[String]) -> usize {
+    keys.iter().map(String::len).sum::<usize>() + keys.len() * std::mem::size_of::<String>()
+}
+
+/// `Vm::shape_key_plans`: by shape id, the shared key list of each shape that
+/// has one. A VM going away returns its plans' charge to the process budget.
+#[derive(Default)]
+pub(crate) struct ShapePlans(Vec<Option<crate::bytecode::StaticKeyPlan>>);
+
+impl std::ops::Deref for ShapePlans {
+    type Target = Vec<Option<crate::bytecode::StaticKeyPlan>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ShapePlans {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ShapePlans {
+    fn drop(&mut self) {
+        let held: usize = self.0.iter().flatten().map(|p| shape_plan_charge(p.keys())).sum();
+        SHAPE_PLAN_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// `shape`'s key list as a shared plan, built the first time an add way (or
 /// the interpreter's cached add) reaches the shape; `None` for a dictionary
@@ -5452,8 +5490,13 @@ pub(crate) fn shape_key_plan(vm: &mut Vm, shape: u32) -> Option<crate::bytecode:
     if keys.iter().map(String::len).sum::<usize>() > SHAPE_PLAN_MAX_BYTES {
         return None;
     }
+    let charge = shape_plan_charge(&keys);
     let plan = crate::bytecode::StaticKeyPlan::new(keys);
     if !plan.runtime_valid() || plan.has_element_key() {
+        return None;
+    }
+    if SHAPE_PLAN_BYTES.fetch_add(charge, std::sync::atomic::Ordering::Relaxed) + charge > SHAPE_PLAN_TOTAL_BYTES {
+        SHAPE_PLAN_BYTES.fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
     if vm.shape_key_plans.len() <= s {

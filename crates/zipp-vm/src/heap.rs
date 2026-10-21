@@ -94,6 +94,14 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// [`PROP_INDEX_THRESHOLD`] for a map whose keys are a shared plan (a
+/// literal's, or a shape's for a constructor's appends). Such a map is read
+/// through caches keyed by its shape, which never consult the index, so it
+/// stays unindexed until this wide and a lookup that does reach it scans:
+/// building an index per object was a fifth of constructing one with more
+/// than twelve fields (Babel's NodePath has seventeen).
+const PLANNED_INDEX_THRESHOLD: usize = 64;
+
 /// Most keys a map's shape is rebuilt for after `seal`/`freeze`
 /// (`ObjMap::reshape_after_integrity`): each rebuild walks a fresh path of
 /// the shape tree, so a large frozen dictionary goes DICT rather than spend
@@ -3108,7 +3116,7 @@ impl ObjMap {
             }
             self.numeric_index = Some(numeric);
         }
-        if n >= PROP_INDEX_THRESHOLD {
+        if n >= PLANNED_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
     }
@@ -3158,7 +3166,7 @@ impl ObjMap {
             }
             m.numeric_index = Some(numeric);
         }
-        if n >= PROP_INDEX_THRESHOLD {
+        if n >= PLANNED_INDEX_THRESHOLD {
             m.index = Some(PropIndex::build(&m.keys));
         }
         m
@@ -3479,8 +3487,19 @@ impl ObjMap {
             if !ix.insert_tagged(&self.keys[slot], slot as u32, tag) {
                 self.index = Some(PropIndex::collided(&self.keys));
             }
-        } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
+        } else if self.keys.len() >= self.index_threshold() {
             self.index = Some(PropIndex::build(&self.keys));
+        }
+    }
+
+    /// The key count at which this map builds its index: later for a map
+    /// whose keys are a shared plan (see [`PLANNED_INDEX_THRESHOLD`]).
+    #[inline]
+    fn index_threshold(&self) -> usize {
+        if self.keys.is_planned() {
+            PLANNED_INDEX_THRESHOLD
+        } else {
+            PROP_INDEX_THRESHOLD
         }
     }
 
@@ -3604,7 +3623,7 @@ impl ObjMap {
             if !ix.insert_tagged(key, n as u32, prop_tag(key)) {
                 self.index = Some(PropIndex::collided(&self.keys));
             }
-        } else if n + 1 >= PROP_INDEX_THRESHOLD {
+        } else if n + 1 >= PLANNED_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
     }
