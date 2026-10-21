@@ -1890,6 +1890,36 @@ pub struct Vm<'p> {
     /// them, as it has no HostReportErrors hook).
     uncaught_timer_errors: Vec<String>,
     report_unhandled: bool,
+    /// HostPromiseRejectionTracker for a host that asked to hear of
+    /// unhandled rejections (#77): the `zipp` command, which ends the program
+    /// on one as Node does (`fatal_rejections`), or an embedder's
+    /// `set_unhandled_rejection_sink` / `set_promise_rejection_hook`. Off,
+    /// nothing is recorded.
+    pub(crate) track_rejections: bool,
+    /// Promises rejected while no handler was attached, since the last
+    /// microtask checkpoint, in rejection order (HTML's about-to-be-notified
+    /// rejected promises list). GC ROOTS until `rejection_checkpoint` looks
+    /// at them; the ones that gained a handler meanwhile are dropped there.
+    pending_rejections: Vec<u32>,
+    /// Promises reported unhandled to `rejection_hook`, kept for its
+    /// "rejectionhandled" call should one gain a handler later (HTML's
+    /// outstanding rejected promises weak set). WEAK: a promise nothing
+    /// reaches can never gain a handler, so the collector drops it.
+    pub(crate) notified_rejections: Vec<u32>,
+    /// The embedder's `set_unhandled_rejection_sink`: called with the reason's
+    /// message for each rejection still unhandled at a checkpoint.
+    pub(crate) rejection_sink: Option<Box<dyn FnMut(&str)>>,
+    /// The embedder's `set_promise_rejection_hook` function, called as
+    /// `hook("unhandledrejection" | "rejectionhandled", promise, reason)`.
+    /// A GC root.
+    pub(crate) rejection_hook: Option<Value>,
+    /// End the event loop on the first rejection still unhandled at a
+    /// checkpoint, which becomes the program's error (Node's default
+    /// `--unhandled-rejections=throw`). Set for the `zipp` command; never
+    /// with the Test262 report, which scores such rejections itself.
+    fatal_rejections: bool,
+    /// `uncaught_timer_throw` holds such a rejection's reason, not a throw.
+    uncaught_in_promise: bool,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).

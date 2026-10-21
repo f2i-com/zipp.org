@@ -1440,7 +1440,7 @@ impl<'p> Vm<'p> {
             Err(t) => Err(self.take_host_throw(t)),
         };
         if drain_microtasks {
-            self.drain_microtasks();
+            self.microtask_checkpoint(false);
         } else {
             // This host entry is still a complete ECMAScript job even though
             // its queued jobs are intentionally left pending. The completion
@@ -1491,7 +1491,7 @@ impl<'p> Vm<'p> {
     /// globals (rather than calling a function) uses this to let promise
     /// continuations observe the write.
     pub(crate) fn host_pump(&mut self) {
-        self.drain_microtasks();
+        self.microtask_checkpoint(false);
     }
 
     /// Evaluate `src` as indirect eval in the global scope and marshal the

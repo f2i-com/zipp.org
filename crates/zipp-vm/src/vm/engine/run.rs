@@ -295,18 +295,32 @@ impl<'p> Vm<'p> {
         }
         // The main script's throw is the program's error; a timer throw
         // after it is dropped rather than kept rooted for the VM's life.
-        self.uncaught_timer_throw = None;
+        self.drop_uncaught_timer_throw();
         main
     }
 
     /// The first exception a timer callback let escape (see
     /// `uncaught_timer_throw`), rethrown as the program's completion: the
     /// value goes back into `pending_throw` so a host sees the real error.
+    /// Or, under `fatal_rejections`, the reason of the rejection that ended
+    /// the loop, as `Uncaught (in promise) <reason>`.
     pub(crate) fn take_uncaught_timer_throw(&mut self) -> Option<Thrown> {
         let v = self.uncaught_timer_throw.take()?;
-        let msg = self.throw_message(v);
+        let msg = if std::mem::take(&mut self.uncaught_in_promise) {
+            format!("Uncaught (in promise) {}", self.rejection_message(v))
+        } else {
+            self.throw_message(v)
+        };
         self.pending_throw = Some(v);
         Some(Thrown(msg))
+    }
+
+    /// Forget `uncaught_timer_throw` without reporting it (the program's
+    /// own error came first, or an agent's task ended), so it is not kept
+    /// rooted for the VM's life.
+    pub(crate) fn drop_uncaught_timer_throw(&mut self) {
+        self.uncaught_timer_throw = None;
+        self.uncaught_in_promise = false;
     }
 
     /// Run a MODULE as the program entry. The top-level body (func 0) is an async
@@ -339,6 +353,9 @@ impl<'p> Vm<'p> {
         // microtask drain below; if its body promise then REJECTED, that
         // rejection IS the program's error (the entry module failed).
         let body = self.pending_module_body.take();
+        if let Some(bp) = body {
+            self.mark_promise_handled(bp);
+        }
         self.run_event_loop();
         if let Some(bp) = body {
             if bp.is_heap() {
@@ -361,7 +378,7 @@ impl<'p> Vm<'p> {
                 return Err(t);
             }
         }
-        self.uncaught_timer_throw = None;
+        self.drop_uncaught_timer_throw();
         r.map(|_| Value::UNDEFINED)
     }
 
@@ -453,6 +470,8 @@ impl<'p> Vm<'p> {
         // Module top-level `this` is undefined. alloc_async builds + drives the
         // activation to its first await; drain_microtasks runs it to completion.
         let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
+        // Its rejection is the program's error below, never an unhandled one.
+        self.mark_promise_handled(p);
         self.run_event_loop();
         if p.is_heap() {
             if let HeapObj::Promise {
@@ -468,7 +487,7 @@ impl<'p> Vm<'p> {
                 // Render the rejection like an uncaught throw ("Name: message")
                 // rather than display() (which gives "[object Object]" for an Error).
                 let msg = self.throw_message(reason);
-                self.uncaught_timer_throw = None;
+                self.drop_uncaught_timer_throw();
                 return Err(Thrown(msg));
             }
         }

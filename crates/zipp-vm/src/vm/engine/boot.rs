@@ -179,6 +179,8 @@ impl<'p> Vm<'p> {
         eval_arena: &'p crate::vm::eval_arena::EvalArena,
     ) -> Vm<'p> {
         let mut heap = Heap::new();
+        let report_unhandled = std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
+        let fatal_rejections = crate::unhandled_rejections_fatal() && !report_unhandled;
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
         // string-constant slots to carry their heap index as an Int payload
@@ -319,7 +321,14 @@ impl<'p> Vm<'p> {
             unhandled_rejections: Vec::new(),
             rejecting_thrown_job: false,
             uncaught_timer_errors: Vec::new(),
-            report_unhandled: std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1"),
+            report_unhandled,
+            track_rejections: fatal_rejections,
+            pending_rejections: Vec::new(),
+            notified_rejections: Vec::new(),
+            rejection_sink: None,
+            rejection_hook: None,
+            fatal_rejections,
+            uncaught_in_promise: false,
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),

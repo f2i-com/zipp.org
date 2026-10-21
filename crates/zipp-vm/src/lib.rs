@@ -147,6 +147,27 @@ pub mod bench_support {
 #[path = "lang/js/front.rs"]
 mod front;
 pub use front::set_pure_script_goal;
+
+/// Whether a rejection no handler took ends the program (#77). See
+/// [`set_unhandled_rejections_fatal`].
+static UNHANDLED_REJECTIONS_FATAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// End every program a VM created after this call runs on the first promise
+/// rejection still unhandled at a microtask checkpoint, as Node does by
+/// default: the event loop stops (no later timer runs) and the run's error is
+/// `Uncaught (in promise) <reason>`. The `zipp` command turns this on; a
+/// library caller keeps the old behaviour, a dropped rejection, unless it
+/// asks. `ZIPP_REPORT_UNHANDLED=1` (the Test262 runner's narrower report)
+/// overrides it. Process-wide, like [`set_pure_script_goal`], so agents and
+/// realms inherit it.
+pub fn set_unhandled_rejections_fatal(on: bool) {
+    UNHANDLED_REJECTIONS_FATAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn unhandled_rejections_fatal() -> bool {
+    UNHANDLED_REJECTIONS_FATAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// A diagnostic switch that is set or not for the life of the process, read
 /// from the environment once.
 ///

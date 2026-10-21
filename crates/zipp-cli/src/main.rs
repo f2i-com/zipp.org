@@ -97,6 +97,9 @@ unsafe impl std::alloc::GlobalAlloc for ReportingAlloc {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A rejection no handler took ends the program with status 1, as Node
+    // ends it (#77); the Test262 runner's report overrides this.
+    zipp_vm::set_unhandled_rejections_fatal(true);
     let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
     let bstats = std::env::var_os("ZIPP_BUILTINSTATS").is_some();
     let istats = std::env::var_os("ZIPP_INTERPSTATS").is_some();
