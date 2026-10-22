@@ -2,12 +2,12 @@
 // production artifact.
 //
 //   ZIPP-06 (stage 1)  `resourceUsage()` reports what an engine retains and
-//                      has spent; `zippInstanceUsage()` reports what the WASM
-//                      instance has accumulated across disposed engines — the
-//                      figure `dispose()` cannot give back and a host recycles
-//                      the instance on. A create/run/dispose churn records
-//                      them alongside linear-memory pages and process RSS,
-//                      which are reported separately and never conflated.
+//                      has spent; `zippInstanceUsage()` keeps running totals
+//                      over the instance's disposed engines (counts of the
+//                      dynamic code they compiled, which dispose() freed). A
+//                      create/run/dispose churn records them alongside
+//                      linear-memory pages and process RSS, which are
+//                      reported separately and never conflated.
 //   ZIPP-12            `evalInContextRich` marshals structured values under
 //                      the slot-read contract, next to the JSON projection.
 const { Engine, zippInstanceUsage } = require("./pkg/zipp_wasm.js");
@@ -76,13 +76,13 @@ function close(e) { try { e.dispose(); } catch {} try { e.free(); } catch {} }
   const end = zippInstanceUsage();
   same("every churned engine was counted as created and disposed", [end.enginesCreated - start.enginesCreated, end.enginesDisposed - start.enginesDisposed], [rounds, rounds]);
   check("the instance total grows by exactly what each disposed engine retained", end.retainedFunctions - start.retainedFunctions === rounds * retainedPerEngine && end.dynamicCodeCalls - start.dynamicCodeCalls === rounds * 2, JSON.stringify({ start, end, retainedPerEngine }));
-  check("a fresh engine starts from zero: retention is the instance's, not the engine's", retainedPerEngine > 0);
+  check("each engine's own dynamic code is counted once, as it is disposed", retainedPerEngine > 0 && end.disposedDynamicFunctions === end.retainedFunctions && end.enginesLive === end.enginesCreated - end.enginesDisposed, JSON.stringify(end));
   check("a disposed engine's compiled program is freed with it, so the instance does not count programs", end.programFunctions === undefined && end.programBytecodeBytes === undefined && programBytesPerEngine > 0, JSON.stringify(end));
   const rss1 = process.memoryUsage().rss;
   // Reported, not asserted: a linear-memory high-water mark that does not
   // shrink is not by itself proof of a live-allocation leak, and RSS is the
   // process's, not the instance's.
-  console.log(`  info churn of ${rounds} engines: instance retains ${end.retainedFunctions - start.retainedFunctions} dynamic functions (${end.dynamicCodeSourceBytes - start.dynamicCodeSourceBytes} source bytes); each engine's own program (${programBytesPerEngine} bytes of bytecode) was freed with it; process RSS ${rss0} -> ${rss1} (+${rss1 - rss0} bytes)`);
+  console.log(`  info churn of ${rounds} engines: the disposed engines compiled ${end.disposedDynamicFunctions - start.disposedDynamicFunctions} dynamic functions (${end.dynamicCodeSourceBytes - start.dynamicCodeSourceBytes} source bytes); each engine's own program (${programBytesPerEngine} bytes of bytecode) was freed with it; process RSS ${rss0} -> ${rss1} (+${rss1 - rss0} bytes)`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

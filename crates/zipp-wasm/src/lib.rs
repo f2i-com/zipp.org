@@ -962,18 +962,18 @@ impl Engine {
 
             let init = st.run_init();
             // A failed init never becomes `self.state`, so `terminate` cannot
-            // see what its top level retained (code `eval`/`new Function`
-            // defined stays in the instance); it is accounted here instead.
+            // add what its top level compiled (`eval`, `new Function`) to the
+            // instance totals; it is added here, before the state is dropped.
             if let Some(error) = st.resource_limit_error() {
                 self.note_error_kind("resource");
                 self.failed_init_console = st.console_snapshot();
-                account_retained(&st);
+                account_disposed(&st);
                 return Err(JsValue::from_str(error));
             }
             if let Err(e) = init {
                 self.note_error_kind("source");
                 self.failed_init_console = st.console_snapshot();
-                account_retained(&st);
+                account_disposed(&st);
                 return Err(JsValue::from_str(&e));
             }
 
@@ -1040,7 +1040,7 @@ impl Engine {
             let out = match to_js(&HostValue::Object(exposed)) {
                 Ok(out) => out,
                 Err(error) => {
-                    account_retained(&st);
+                    account_disposed(&st);
                     return Err(self.to_js_error(error));
                 }
             };
@@ -1588,11 +1588,10 @@ impl Engine {
     /// - `dynamicCodeCalls`, `dynamicCodeSourceBytes`: every dynamic
     ///   compilation attempt (`eval`, `Function`, `ShadowRealm`, host eval)
     ///   and the source bytes charged;
-    /// - `retainedFunctions`, `retainedClasses`: stable-address definitions
-    ///   retained by successful dynamic compilations — the figure
-    ///   `dispose()` does NOT reclaim within one WASM instance, so a host
-    ///   recycles the Worker/WASM instance when their sum across tenants
-    ///   passes what it accepts;
+    /// - `retainedFunctions`, `retainedClasses`: the stable-address
+    ///   definitions this engine's successful dynamic compilations installed,
+    ///   which it keeps for its life and `dispose()` frees with it (they
+    ///   then count in `zippInstanceUsage`'s `disposedDynamic*` totals);
     /// - `retainedFunctionBytes`, `retainedClassBytes`: the bytes those
     ///   definitions own (the definition, its bytecode, constants, tables
     ///   and retained source) — owned bytes, not the allocator's
@@ -2333,9 +2332,9 @@ impl Engine {
         {
             self.python_hooks = None;
         }
-        // Account what this engine leaves behind in the instance before the
-        // state that knows the figures is dropped. Every engine is disposed
-        // once, whether or not it ever initialized.
+        // Add this engine's figures to the instance totals before the state
+        // that knows them is dropped. Every engine is disposed once, whether
+        // or not it ever initialized.
         if !self.disposed {
             INSTANCE_USAGE.with(|c| {
                 let mut u = c.get();
@@ -2344,7 +2343,7 @@ impl Engine {
             });
         }
         if let Some(st) = self.state.as_ref() {
-            account_retained(st);
+            account_disposed(st);
         }
         self.state = None;
         self.slots.clear();
@@ -2357,9 +2356,11 @@ impl Engine {
     }
 }
 
-/// Add what a state retained in the instance (dynamic code outlives it) to the
-/// instance totals `zippInstanceUsage` reports.
-fn account_retained(st: &ScriptState) {
+/// Add a state's dynamic-code figures to the instance's running totals
+/// (`zippInstanceUsage`), as it is disposed. The code itself goes with the
+/// state, which owns it (zipp-vm's eval arena, #53); these are counts of what
+/// was compiled, not of anything left behind.
+fn account_disposed(st: &ScriptState) {
     let usage = st.resource_usage();
     INSTANCE_USAGE.with(|c| {
         let mut u = c.get();
@@ -2467,11 +2468,10 @@ fn sync_host_call_arity(kind: &str) -> Option<usize> {
 }
 
 thread_local! {
-    /// What this WASM instance has accumulated across the engines it has
-    /// disposed: the definitions `dispose()` cannot give back, and the
-    /// compilation work that produced them. Live engines report their own
-    /// figures through `resourceUsage()`; these are the disposed ones', so a
-    /// host can decide when to recycle the instance (ZIPP-06, stage 1).
+    /// Running totals over the engines this WASM instance has disposed: how
+    /// many, and the dynamic code they compiled (freed with each engine).
+    /// Live engines report their own figures through `resourceUsage()`
+    /// (ZIPP-06, stage 1).
     static INSTANCE_USAGE: std::cell::Cell<InstanceUsage> =
         const { std::cell::Cell::new(InstanceUsage::ZERO) };
     /// The context of the `accel.run` call in progress, for
@@ -2506,18 +2506,28 @@ impl InstanceUsage {
     };
 }
 
-/// What this WASM instance has accumulated over every engine it has disposed
-/// so far, as JSON-shaped data: `enginesCreated`, `enginesDisposed`, and the
-/// disposed engines' summed `retainedFunctions`, `retainedClasses`,
-/// `dynamicCodeCalls` and `dynamicCodeSourceBytes`. An engine's compiled
-/// preamble-plus-guest program is freed with the engine since B306 stage two
-/// (the state owns it; nothing is leaked); the stable-address definitions
-/// that successful dynamic compilations install are what still survive
-/// `dispose()`. When their total passes
-/// what a host accepts, the host recycles the Worker/WASM instance, which is
-/// the only reclamation this artifact offers (the 11 September 2026 audit's
-/// ZIPP-06, stage 1: measure before reclaiming). Live engines are not
-/// included; read each one's `resourceUsage()`.
+/// Running totals for this WASM instance, as JSON-shaped data:
+///
+/// - `enginesCreated`, `enginesDisposed`, and `enginesLive` (the difference:
+///   engines not yet disposed);
+/// - over the disposed engines, the dynamic code they compiled (`eval`,
+///   `new Function`, class expressions in either):
+///   `disposedDynamicFunctions`, `disposedDynamicClasses`,
+///   `disposedDynamicFunctionBytes`, `disposedDynamicClassBytes`, and the
+///   compilation work, `dynamicCodeCalls` and `dynamicCodeSourceBytes`.
+///
+/// Every figure only grows. None of it is memory the instance still holds:
+/// an engine's program and its dynamic code are owned by its state and freed
+/// by `dispose()` (B306 stage two; the eval arena, #53), and the instance's
+/// allocator reuses that memory. A WASM instance's linear memory never
+/// shrinks, so its high-water mark (`memory.buffer.byteLength`) is the figure
+/// a fresh instance resets; these counters are not a reason to recycle one.
+///
+/// `retainedFunctions`, `retainedClasses`, `retainedFunctionBytes` and
+/// `retainedClassBytes` are deprecated names for the four `disposedDynamic*`
+/// totals, with the same values: they were documented as definitions that
+/// outlive `dispose()`, which they have not done since #53. Live engines are
+/// not included; read each one's `resourceUsage()`.
 #[wasm_bindgen(js_name = zippInstanceUsage)]
 pub fn zipp_instance_usage() -> Result<JsValue, JsValue> {
     let u = INSTANCE_USAGE.with(|c| c.get());
@@ -2525,15 +2535,30 @@ pub fn zipp_instance_usage() -> Result<JsValue, JsValue> {
     to_js(&HostValue::Object(vec![
         ("enginesCreated".into(), n(u.engines_created)),
         ("enginesDisposed".into(), n(u.engines_disposed)),
-        ("retainedFunctions".into(), n(u.retained_functions)),
-        ("retainedClasses".into(), n(u.retained_classes)),
-        ("retainedFunctionBytes".into(), n(u.retained_function_bytes)),
-        ("retainedClassBytes".into(), n(u.retained_class_bytes)),
+        (
+            "enginesLive".into(),
+            n(u.engines_created.saturating_sub(u.engines_disposed)),
+        ),
+        ("disposedDynamicFunctions".into(), n(u.retained_functions)),
+        ("disposedDynamicClasses".into(), n(u.retained_classes)),
+        (
+            "disposedDynamicFunctionBytes".into(),
+            n(u.retained_function_bytes),
+        ),
+        (
+            "disposedDynamicClassBytes".into(),
+            n(u.retained_class_bytes),
+        ),
         ("dynamicCodeCalls".into(), n(u.dynamic_code_calls)),
         (
             "dynamicCodeSourceBytes".into(),
             n(u.dynamic_code_source_bytes),
         ),
+        // Deprecated aliases of the `disposedDynamic*` totals.
+        ("retainedFunctions".into(), n(u.retained_functions)),
+        ("retainedClasses".into(), n(u.retained_classes)),
+        ("retainedFunctionBytes".into(), n(u.retained_function_bytes)),
+        ("retainedClassBytes".into(), n(u.retained_class_bytes)),
     ]))
     .map_err(to_js_error)
 }

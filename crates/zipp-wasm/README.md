@@ -592,21 +592,27 @@ terminated, and never route a completion using only a guest-provided ID.
 
 ## Host lifetime policy
 
-`Engine.dispose()` tears down one VM; it does not shrink the WASM **instance**
-that hosted it, because dynamically compiled functions and classes that the
-guest created (`eval`, `new Function`, class expressions inside an eval) are
-owned by the instance's compiler arena. `zippInstanceUsage()` reports what an
-instance has accumulated across disposed engines; the only reclamation is a
-fresh instance. The ecosystem review of 14 September 2026 (ZP-01) turned that
-into a contract every host must meet, verified by
-`tests/node/instance-recycling-soak.cjs` in the boundary suite:
+`Engine.dispose()` tears down one VM and frees what it owned: its compiled
+program and the functions and classes its guest compiled at run time (`eval`,
+`new Function`, class expressions inside an eval), which the engine's state
+owns (#53), for the instance's allocator to reuse. It does not shrink the WASM
+**instance** that hosted it: linear memory only grows, so the most any engine
+used stays reserved until the instance is replaced. `zippInstanceUsage()`
+keeps running totals over the instance's disposed engines (how many, and the
+dynamic code they compiled); they are counts, not memory the instance still
+holds. Its `retained*` fields are deprecated names for the `disposedDynamic*`
+totals, from when that code was taken to outlive `dispose()`. The ecosystem
+review of 14 September 2026 (ZP-01) made the instance's lifetime a contract,
+verified by `tests/node/instance-recycling-soak.cjs` in the boundary suite:
 
-1. Within one instance, batches of create → dynamic code → dispose keep
-   growing the instance account; the live VM heap per engine, the instance's
-   linear memory and the process RSS are three different numbers and are
-   reported separately (RSS is never asserted: allocator reservation is not a
-   leak).
-2. A recycled instance starts from zero.
+1. Within one instance, batches of create → dynamic code → dispose grow the
+   totals with every batch, while linear memory levels off after the first:
+   the disposed engines' code is freed and reused. The live VM heap per
+   engine, the instance's linear memory and the process RSS are three
+   different numbers and are reported separately (RSS is never asserted:
+   allocator reservation is not a leak).
+2. A fresh instance starts its totals at zero and its linear memory at the
+   initial size.
 
 What the reviewed hosts do (the inventory is the review's, the policies are
 theirs):
@@ -800,12 +806,13 @@ remain recoverable.
   steps used, the eval and dynamic-compilation counters, retained dynamic
   function/class definitions, buffered and lifetime console figures, pinned
   buffers, and the compiled program's function count, bytecode bytes and
-  retained source bytes. `zippInstanceUsage()` sums the disposed engines'
-  figures for the whole WASM instance. An engine's compiled program (about 36
-  functions and 18 KB of bytecode for a small guest, dominated by the
-  preamble) is freed with the engine; what outlives `dispose()` is the
-  stable-address definitions its dynamic compilations installed, so a host
-  recycles the Worker/WASM instance when that total passes what it accepts.
+  retained source bytes. `zippInstanceUsage()` keeps running totals over the
+  disposed engines of the whole WASM instance (`enginesLive`, and the
+  `disposedDynamic*` counts and bytes of the dynamic code they compiled). An
+  engine's compiled program (about 36 functions and 18 KB of bytecode for a
+  small guest, dominated by the preamble) and its dynamic code are freed with
+  the engine, so the totals are not memory the instance holds; linear memory,
+  which never shrinks, is (see "Host lifetime policy").
 - `host-sdk/` is the reference host adapter for browsers — one Worker and
   WASM instance per guest, generation-scoped messages, external deadlines
   that terminate the Worker, immutable capability setup, Worker-side bridges
