@@ -93,8 +93,8 @@ took was 0.3 MiB.
 
    A cache for `zipp js` is therefore worth building, behind the plan's
    conditions (a key over the engine build, features, source and options;
-   no cache in a sandbox profile; bounded decoding). Writing it by default is
-   a product decision, as `zipp py`'s cache is: not taken here.
+   no cache in a sandbox profile; bounded decoding). Asked for it, the
+   command keeps one by default, as `zipp py` does (see Results).
 3. **The heap object table.** 9–16% of peak working set on the applications
    (80-byte slots, grown by doubling, counted at capacity). It is the GC's own
    structure; a later, separately designed experiment, not one to start
@@ -114,6 +114,77 @@ took was 0.3 MiB.
    this census. Earlier stack profiles (21–22 October) put TypeScript's
    `setup_call_lean` at 4.7% and its dispatch match at 4.2%; the JIT-policy
    ledger is negative on every bundle; `ZIPP_PY_PROF` was not run here.
+
+## Results
+
+Both experiments were built: `176832e7` (A) and `63f2e776` (B). Raw
+evidence is in `target/bench-results/impl-plan-2026-10-22/`
+(`expA-census.json`, `expB-cache-states.json`).
+
+**A, one shared copy of each script's source.** A function's or class's
+text is now a range of one shared copy of the script it was compiled from
+(`SourceText`, the size of the `String` it replaces). The bytecode codec
+stores those ranges without searching for them, so encoding TypeScript's
+program went from 439 ms to 15 ms. Census builds of `b7b118f5` and
+`63f2e776`, cache off, peak working set the median of three:
+
+| Bundle | Source text | Code and source text | Peak working set |
+|---|---:|---:|---:|
+| TypeScript | 45.7 → 9.9 MiB | 94.2 → 58.4 MiB (−38.0%) | 349 → 310 MiB (−11.3%) |
+| Babel | 19.0 → 4.4 MiB | 46.6 → 32.0 MiB (−31.3%) | 250 → 238 MiB (−4.8%) |
+| misc | 4.4 → 2.0 MiB | 17.4 → 15.0 MiB (−13.9%) | 212 → 186 MiB (−12.1%) |
+| Prettier | 4.4 → 2.2 MiB | 26.4 → 24.1 MiB (−8.5%) | 159 → 161 MiB (+1.0%) |
+
+The gate holds on TypeScript and not on Prettier, whose copies were only
+twice its bundle: there was less to share. Output is identical; Test262's
+function, class, method, arrow, eval-code and Annex B directories pass in
+both modes, and the decoded program prints (`{:?}`) exactly as the compiled
+one for every bundle, benchmark row and test script (69 files).
+
+**B, the `zipp js` cache.** `zipp js` (and `zipp file.js`) loads a script
+of 32 KiB or more from the code cache instead of parsing and compiling it,
+and after a compile stores it from a thread of its own while the program
+runs. Same folder, keys and bounds as `zipp py`'s; `ZIPP_CACHE_DIR` set but
+empty turns it off. Benchmark rows (10 KB at most), Test262, harness runs,
+PGO training, modules, embedders and sandboxes never use it. Release builds
+of `1aecb40b` (base, the same engine as `b7b118f5`) and `63f2e776`, median
+of five, interleaved; *off* is the new build with the cache off, *miss* a
+fresh folder every run, *hit* a folder one run filled:
+
+| Bundle | Base | Off | Miss | Hit | Peak working set, hit |
+|---|---:|---:|---:|---:|---:|
+| TypeScript | 1,174 ms | 1,145 ms | 1,185 ms | 838 ms (−29%) | 349 → 190 MiB |
+| Prettier | 545 ms | 550 ms | 549 ms | 453 ms (−17%) | 159 → 116 MiB |
+| Vue SSR | 91 ms | 90 ms | 92 ms | 74 ms (−19%) | 48 → 41 MiB |
+| misc | 809 ms | 811 ms | 809 ms | 746 ms (−8%) | 212 → 173 MiB |
+| React SSR | 71 ms | 72 ms | 72 ms | 66 ms (−7%) | 54 → 46 MiB |
+| Preact SSR | 71 ms | 70 ms | 73 ms | 68 ms (−4%) | 39 → 36 MiB |
+| Babel | 5,050 ms | 5,045 ms | 5,067 ms | 4,953 ms (−2%) | 250 → 171 MiB |
+
+Times are to the first byte of output. A hit skips the syntax tree as well
+as the compile, which is most of the memory it saves. A miss costs about 3%
+on TypeScript (the encoding, on another core). Every run's stdout and exit
+status matched the base's (React SSR prints its own timing to stderr). The
+plan's gate, first output 10% sooner on TypeScript and Prettier, holds.
+
+**Speed elsewhere.** Neither change runs inside the interpreter's loop, and
+the geomeans say so; single rows move both ways by up to 5%, the code
+placement of a build that grew (the JavaScript-only build carries the codec
+now: 9.08 → 9.34 MB).
+
+| Comparison | Geomean, new / base |
+|---|---:|
+| Canonical PGO, interpreter only, 51 rows, 5 reps | 1.005 |
+| Canonical PGO, JIT, 51 rows, 5 reps | 0.997 |
+| Release, real13 with the JIT, 12 paired reps | 1.002 [0.996, 1.010] |
+| Release, real13 with `ZIPP_NOJIT=1`, 10 paired reps | 1.020 [1.017, 1.024] |
+| Release, Python suite, 44 programs | 1.01 |
+
+At nine reps, the rows that moved most were branch-control 1.050,
+reactish-reconcile 1.046 and class-features 1.024 against sparse-array
+0.950 and collections-map-mixed 0.964. The new canonical build's
+interpreter takes 0.745 of QuickJS's time over the 51 rows and is faster on
+40 of them.
 
 ## Not run
 
