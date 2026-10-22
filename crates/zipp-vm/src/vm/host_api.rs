@@ -429,7 +429,9 @@ pub struct ResourceUsage {
     pub retained_classes: usize,
     /// Bytes those retained function definitions own: each `FuncProto`
     /// itself plus the bytecode, constants, names, plans, upvalue and eval
-    /// site tables and retained source it holds. An exact count of what it
+    /// site tables it holds, and the copies of source text their texts are
+    /// ranges of, each counted once (one per dynamic compilation that
+    /// installed a function with a text). An exact count of what it
     /// counts — the allocator's own overhead, page reservation and
     /// high-water mark are not in it, and are what a process's RSS adds on
     /// top (the 11 September 2026 close audit's ZA-10, stage one: measure
@@ -444,7 +446,8 @@ pub struct ResourceUsage {
     /// ArrayBuffers pinned for the accelerator.
     pub pinned_buffers: usize,
     /// Functions in the compiled program itself (the preamble-plus-guest
-    /// script), and its bytecode and retained source bytes: the allocation
+    /// script), and its bytecode and retained source bytes (the copy of the
+    /// script its functions' texts are ranges of, once): the allocation
     /// the `safe-sandbox` profile keeps for the WASM instance's lifetime
     /// rather than freeing on `dispose()`. Exact for what they count; the
     /// compiler's side tables are not included.
@@ -523,7 +526,9 @@ impl Default for SandboxCaps {
 }
 
 /// Bytes a dynamically installed function definition owns (see
-/// [`ResourceUsage::retained_function_bytes`]).
+/// [`ResourceUsage::retained_function_bytes`]), its source text aside: that
+/// is a range of a copy it shares with every definition compiled from the
+/// same source, counted once ([`shared_source_bytes`]).
 fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {
     use std::mem::size_of_val;
     let strings = |v: &[String]| v.iter().map(|s| size_of_val(s) + s.len()).sum::<usize>();
@@ -547,11 +552,11 @@ fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {
                     + strings(lexicals)
             })
             .sum::<usize>()
-        + f.source.len()
 }
 
 /// Bytes a dynamically installed class definition owns (see
-/// [`ResourceUsage::retained_class_bytes`]).
+/// [`ResourceUsage::retained_class_bytes`]), its source text aside, as for a
+/// function.
 fn retained_class_bytes(c: &crate::bytecode::ClassDef) -> usize {
     use std::mem::size_of_val;
     let strings = |v: &[String]| v.iter().map(|s| size_of_val(s) + s.len()).sum::<usize>();
@@ -567,7 +572,27 @@ fn retained_class_bytes(c: &crate::bytecode::ClassDef) -> usize {
         + members(&c.static_setters)
         + strings(&c.proto_order)
         + strings(&c.instance_field_names)
-        + c.source.len()
+}
+
+/// The bytes of the source copies `texts` are ranges of, each copy counted
+/// once: `seen` holds those already counted. Texts compiled from one source
+/// come together, so a copy is looked up only where it changes.
+fn shared_source_bytes<'a>(
+    texts: impl Iterator<Item = &'a crate::bytecode::SourceText>,
+    seen: &mut rustc_hash::FxHashSet<*const u8>,
+) -> usize {
+    let mut last = std::ptr::null();
+    let mut bytes = 0;
+    for text in texts {
+        let (copy, len) = text.shared();
+        if copy != last {
+            last = copy;
+            if seen.insert(copy) {
+                bytes += len;
+            }
+        }
+    }
+    bytes
 }
 
 /// How deep the walk will follow an object graph before giving up. Deep enough
@@ -1554,6 +1579,9 @@ impl<'p> Vm<'p> {
         let heap_bytes = self.heap_bytes_live_estimate();
         #[cfg(not(feature = "instrument"))]
         let heap_bytes = self.heap.resident_bytes();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let function_sources = shared_source_bytes(self.eval_funcs.iter().map(|f| &f.source), &mut seen);
+        let class_sources = shared_source_bytes(self.eval_classes.iter().map(|c| &c.source), &mut seen);
         ResourceUsage {
             heap_bytes,
             steps_used,
@@ -1561,12 +1589,14 @@ impl<'p> Vm<'p> {
             dynamic_code_source_bytes,
             retained_functions: self.eval_funcs.len(),
             retained_classes: self.eval_classes.len(),
-            retained_function_bytes: self.eval_funcs.iter().map(|f| retained_func_bytes(f)).sum(),
+            retained_function_bytes: self.eval_funcs.iter().map(|f| retained_func_bytes(f)).sum::<usize>()
+                + function_sources,
             retained_class_bytes: self
                 .eval_classes
                 .iter()
                 .map(|c| retained_class_bytes(c))
-                .sum(),
+                .sum::<usize>()
+                + class_sources,
             console_lines_buffered: self.output.len() + self.errput.len(),
             console_bytes_lifetime,
             pinned_buffers: self.pinned_buffers.len(),
@@ -1577,7 +1607,10 @@ impl<'p> Vm<'p> {
                 .iter()
                 .map(|f| f.code.len() * std::mem::size_of::<crate::bytecode::Instr>())
                 .sum(),
-            program_source_bytes: self.program.functions.iter().map(|f| f.source.len()).sum(),
+            program_source_bytes: shared_source_bytes(
+                self.program.functions.iter().map(|f| &f.source),
+                &mut rustc_hash::FxHashSet::default(),
+            ),
         }
     }
 

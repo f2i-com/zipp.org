@@ -45,9 +45,11 @@ pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
 ));
 
 mod bytecode;
-#[cfg(all(feature = "python", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 mod bytecode_codec;
 mod capture;
+#[cfg(not(target_arch = "wasm32"))]
+mod code_cache;
 mod cold_sort;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod codegen;
@@ -711,12 +713,70 @@ pub fn run_then_exit(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
 /// [`run_then_exit`] for the script file named `script_name`: the name its
 /// frames give in an error's `stack` (`at f (/path/to/file.js:1:27)`), as
 /// Node names a script by its path. Without a name they say `<anonymous>`.
+///
+/// When the host keeps compiled code ([`set_code_cache`]), a large script's
+/// program is loaded from there instead of parsed and compiled, and a
+/// script compiled here is stored there, encoded beside the run.
 pub fn run_file_then_exit(
     src: &str,
     base_dir: Option<std::path::PathBuf>,
     script_name: &str,
 ) -> Result<Outcome, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(entry) = code_cache::script(src) {
+        return run_cached(src, base_dir, script_name, entry);
+    }
     run_with_policy(src, base_dir, false, true, Some(script_name))
+}
+
+/// Keep compiled code in `dir` between processes, or not at all (`None`, the
+/// default): large scripts run with [`run_file_then_exit`], and Python's
+/// runtime and library modules ([`frontend::set_python_runtime_cache`] names
+/// the same folder). For a host that runs one program per process, such as
+/// the `zipp` command. Entries belong to the executable and settings that
+/// wrote them, see `code_cache.rs`. Takes effect if called before the first
+/// compile that would use it; ignored on `wasm32`.
+pub fn set_code_cache(dir: Option<std::path::PathBuf>) {
+    #[cfg(not(target_arch = "wasm32"))]
+    code_cache::set_dir(dir);
+    #[cfg(target_arch = "wasm32")]
+    let _ = dir;
+}
+
+/// [`run_file_then_exit`] with a code-cache entry for `src`: its program
+/// loaded from there, or else compiled and, while it runs, stored there.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_cached(
+    src: &str,
+    base_dir: Option<std::path::PathBuf>,
+    script_name: &str,
+    entry: code_cache::ScriptEntry,
+) -> Result<Outcome, String> {
+    let (program, compiled) = match entry.load(src) {
+        Some(program) => (program, None),
+        None => {
+            let ast = front::parse_auto_located(src).map_err(|f| f.located(src, Some(script_name)))?;
+            let program = compile::compile_main_program(&ast, src)?;
+            (program, Some(ast))
+        }
+    };
+    let store = compiled.is_some();
+    let outcome = std::thread::scope(|scope| {
+        if store {
+            // Encoding takes TypeScript's compiler 15 ms; a thread of its own
+            // keeps that off the run. If one cannot be had, nothing is stored.
+            let program = &program;
+            let entry = &entry;
+            let _ = std::thread::Builder::new()
+                .name("zipp-code-cache".into())
+                .spawn_scoped(scope, move || entry.store(src, program));
+        }
+        run_program(&program, base_dir, false, true, Some(script_name))
+    });
+    // See `run_then_exit`: the process's exit reclaims both.
+    std::mem::forget(program);
+    std::mem::forget(compiled);
+    Ok(outcome)
 }
 
 /// Run one release-PGO training program while denying every secondary source
@@ -745,6 +805,24 @@ fn run_with_policy(
     // error is reported where it is, as a frame of the script.
     let ast = front::parse_auto_located(src).map_err(|f| f.located(src, script_name))?;
     let program = compile::compile_main_program(&ast, src)?;
+    let outcome = run_program(&program, base_dir, disable_external_code, leave_heap, script_name);
+    if leave_heap {
+        // See `run_then_exit`: the process's exit reclaims all three.
+        std::mem::forget(program);
+        std::mem::forget(ast);
+    }
+    Ok(outcome)
+}
+
+/// Run a compiled main program (see [`run_with_policy`]); with `leave_heap`,
+/// its VM is left for the process's exit.
+fn run_program(
+    program: &bytecode::Program,
+    base_dir: Option<std::path::PathBuf>,
+    disable_external_code: bool,
+    leave_heap: bool,
+    script_name: Option<&str>,
+) -> Outcome {
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
     // Browser WASM has no process environment or stderr bytecode dump.
@@ -760,7 +838,7 @@ fn run_with_policy(
             }
         }
     }
-    let mut vm = vm::Vm::new(&program);
+    let mut vm = vm::Vm::new(program);
     vm.set_module_base_dir(base_dir);
     vm.script_name = script_name.map(std::sync::Arc::from);
     if disable_external_code {
@@ -776,12 +854,9 @@ fn run_with_policy(
         error: result.err().map(|thrown| thrown.0),
     };
     if leave_heap {
-        // See `run_then_exit`: the process's exit reclaims all three.
         std::mem::forget(vm);
-        std::mem::forget(program);
-        std::mem::forget(ast);
     }
-    Ok(outcome)
+    outcome
 }
 
 /// Run `harness` and then `src` as TWO SEPARATE SCRIPTS in one realm — the

@@ -208,8 +208,8 @@ pub fn set_python_runtime_memo(enabled: bool) {
 /// process, such as the `zipp` command: only the first process then compiles
 /// the runtime (about 0.7 MB of JavaScript) and each library module. Entries
 /// belong to the executable and settings that wrote them, see
-/// `lang/python/frontend/code_cache.rs`. Takes effect if called before the first
-/// Python compile; ignored on `wasm32`.
+/// `code_cache.rs` (one folder with [`crate::set_code_cache`]'s). Takes
+/// effect if called before the first Python compile; ignored on `wasm32`.
 pub fn set_python_runtime_cache(dir: Option<std::path::PathBuf>) {
     #[cfg(feature = "python")]
     python::set_runtime_cache(dir);

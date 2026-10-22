@@ -1,9 +1,10 @@
-//! A compiled [`Program`] as bytes and back: what lets the Python runtime
-//! (about 0.7 MB of JavaScript every Python program starts from) be compiled
-//! once and then loaded, instead of compiled, by every later process.
+//! A compiled [`Program`] as bytes and back: what lets a large script, or the
+//! Python runtime (about 0.7 MB of JavaScript every Python program starts
+//! from), be compiled once and then loaded, instead of compiled, by every
+//! later process (`code_cache`).
 //!
 //! The encoding is private to one build of the engine: [`FORMAT`] and the
-//! caller's key (see `lang::python::frontend::runtime_cache`) decide whether bytes
+//! caller's key (see `code_cache`) decide whether bytes
 //! may be decoded at all. Decoding reproduces the program exactly —
 //! `decode(encode(p))` prints (`{:?}`) the same as `p` — and a truncated or
 //! mangled input is an error, never a panic. `Instr` is encoded by code
@@ -720,6 +721,7 @@ fn decode_import(r: &mut Reader) -> R<ImportEntry> {
 
 /// A list of functions (a Python library module compiled for installation)
 /// as bytes.
+#[cfg(feature = "python")]
 pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::with_capacity(1 << 16),
@@ -735,6 +737,7 @@ pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
 }
 
 /// The functions `bytes` encode (from [`encode_functions`] of this build).
+#[cfg(feature = "python")]
 pub(crate) fn decode_functions(bytes: &[u8]) -> R<Vec<FuncProto>> {
     let mut r = Reader { data: bytes, at: 0 };
     if r.u32()? != FORMAT || r.u32()? != INSTR_VARIANTS as u32 {

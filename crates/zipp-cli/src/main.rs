@@ -467,6 +467,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => {
                     let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
                     let name = name.to_string_lossy();
+                    // A large script's compiled code is kept between runs, as
+                    // `zipp py` keeps Python's.
+                    zipp_vm::set_code_cache(frontend_cli::code_cache_dir());
                     emit(zipp_vm::run_file_then_exit(&src, base_dir, &name)?)
                 }
                 Some(_) if pgo_training => {
@@ -662,8 +665,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
-            #[cfg(feature = "python")]
-            println!("  ZIPP_CACHE_DIR=<dir>            where `zipp py` keeps compiled Python between runs (empty: nowhere)");
+            println!("  ZIPP_CACHE_DIR=<dir>            where compiled code is kept between runs: scripts of 32 KiB");
+            println!("                                  or more, and Python's runtime and modules (empty: nowhere)");
             println!("\nsandbox defaults:");
             println!("  --timeout-ms 5000               hard child-process wall deadline");
             println!("  --max-steps 50000000            VM instruction budget");

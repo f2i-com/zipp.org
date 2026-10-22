@@ -18,13 +18,14 @@ pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
     // One program per process: its compiled runtime is never reused in the
     // process, but compiled code is kept on disk for the next one.
     zipp_vm::frontend::set_python_runtime_memo(false);
-    zipp_vm::frontend::set_python_runtime_cache(python_cache_dir());
+    zipp_vm::frontend::set_python_runtime_cache(code_cache_dir());
     Some(run(args))
 }
 
-/// Where compiled Python code is kept between runs: `ZIPP_CACHE_DIR` (set
-/// but empty: nowhere), else the platform's per-user cache folder.
-fn python_cache_dir() -> Option<PathBuf> {
+/// Where compiled code (Python's, and large JavaScript scripts') is kept
+/// between runs: `ZIPP_CACHE_DIR` (set but empty: nowhere), else the
+/// platform's per-user cache folder.
+pub(crate) fn code_cache_dir() -> Option<PathBuf> {
     let env = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     if let Some(dir) = std::env::var_os("ZIPP_CACHE_DIR") {
         return (!dir.is_empty()).then(|| PathBuf::from(dir));
