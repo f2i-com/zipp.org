@@ -1388,6 +1388,22 @@ impl<'p> Vm<'p> {
             )
     }
 
+    /// `a == b` when either side is `null` or `undefined`, which loosely
+    /// equal each other, themselves and `document.all` and nothing else (no
+    /// coercion runs): `None` when neither is. `x == null` paid `loose_eq`'s
+    /// object, BigInt and tag tests first, reading `x`'s heap slot for them.
+    #[inline(always)]
+    pub(crate) fn loose_eq_nullish(&self, a: Value, b: Value) -> Option<bool> {
+        let other = if b.is_nullish() {
+            a
+        } else if a.is_nullish() {
+            b
+        } else {
+            return None;
+        };
+        Some(other.is_nullish() || (other.is_heap() && self.is_htmldda_index(other.heap_index())))
+    }
+
     pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Thrown> {
         // An [[IsHTMLDDA]] exotic (`document.all`) loosely equals null/undefined.
         if a.is_heap() && b.is_nullish() {

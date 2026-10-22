@@ -1845,14 +1845,20 @@ impl<'p> Vm<'p> {
                     Instr::LooseEq { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = self.loose_eq(va, vb)?;
+                        let r = match self.loose_eq_nullish(va, vb) {
+                            Some(r) => r,
+                            None => self.loose_eq(va, vb)?,
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::LooseNe { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = self.loose_eq(va, vb)?;
+                        let r = match self.loose_eq_nullish(va, vb) {
+                            Some(r) => r,
+                            None => self.loose_eq(va, vb)?,
+                        };
                         self.set(base, dst, Value::bool(!r));
                         ip += 1;
                     }
