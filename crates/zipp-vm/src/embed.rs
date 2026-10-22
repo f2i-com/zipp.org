@@ -1094,6 +1094,15 @@ impl ScriptState {
         self.vm().map_or(0, |vm| vm.heap_bytes())
     }
 
+    /// Record this state's storage census when `ZIPP_CENSUS` asks for one
+    /// (`take_census`). Built with the `census` feature only.
+    #[cfg(feature = "census")]
+    pub fn record_census(&self) {
+        if let Some(vm) = self.vm() {
+            vm.record_census();
+        }
+    }
+
     /// Run pending microtasks without calling anything.
     pub fn pump(&mut self) {
         self.with_vm(|vm| vm.host_pump());

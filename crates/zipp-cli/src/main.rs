@@ -127,6 +127,21 @@ fn main() -> ExitCode {
     if let Some((n, mx, tot)) = shape {
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
     }
+    // `ZIPP_CENSUS=1` prints the run's storage census to stderr;
+    // `ZIPP_CENSUS=<file>` writes it there.
+    #[cfg(feature = "census")]
+    if let Some(entries) = zipp_vm::take_census() {
+        let map: serde_json::Map<String, serde_json::Value> = entries.into_iter().map(|(k, v)| (k, v.into())).collect();
+        let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default();
+        match std::env::var("ZIPP_CENSUS") {
+            Ok(path) if !path.is_empty() && path != "1" => {
+                if let Err(e) = std::fs::write(&path, text) {
+                    eprintln!("zipp: the census was not written to {path}: {e}");
+                }
+            }
+            _ => eprintln!("[census] {text}"),
+        }
+    }
     if std::env::var_os("ZIPP_PROF").is_some() {
         let (rows, total) = zipp_vm::prof_stats();
         eprintln!("[prof] {total} samples @200us");

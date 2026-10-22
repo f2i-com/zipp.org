@@ -2997,6 +2997,17 @@ impl FusedCode {
         self.code.get().map(|c| &**c).filter(|c| !c.is_empty())
     }
 
+    /// The bytes the built tables hold, for the storage census: the fused
+    /// copy's instructions, the step call sites and the string switches.
+    #[cfg(feature = "census")]
+    pub(crate) fn census_bytes(&self) -> (usize, usize, usize) {
+        (
+            self.code.get().map_or(0, |c| std::mem::size_of_val(&**c)),
+            self.steps.get().map_or(0, |s| std::mem::size_of_val(&**s)),
+            self.switches.get().map_or(0, |s| std::mem::size_of_val(&**s)),
+        )
+    }
+
     /// An entry of the function whose bytecode is `code`: the copy, built
     /// now if this is the first, when anything in it fused.
     #[inline]

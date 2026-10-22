@@ -72,6 +72,10 @@ python-native-gpu = ["python"]
 default = ["jit"]
 jit = ["dep:dynasm", "dep:dynasmrt", "regress/rx-jit"]
 regex-linear = ["regress/linear-ascii"]
+# The storage census (`ZIPP_CENSUS`, vm/census.rs): what code, caches, frames,
+# heap and JIT hold at the end of a run. Diagnostics only; off in every
+# shipped and timed build.
+census = []
 # Step budget, cooperative abort, and per-instruction execution tracing for
 # embedders running untrusted code (see vm/instrument.rs). Off by default: it
 # adds a branch to the inner dispatch loop, and enabling it on a VM turns the

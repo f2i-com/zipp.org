@@ -42,6 +42,9 @@ gpu = ["python", "dep:zipp-gpu", "zipp-vm/python-native-gpu"]
 python-js-interop = ["python", "zipp-vm/python-js-interop"]
 secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]
+# `ZIPP_CENSUS=1` (stderr) or `ZIPP_CENSUS=<file>`: the storage census of a
+# run as JSON. Diagnostics only.
+census = ["zipp-vm/census"]
 
 [build-dependencies]
 sha2 = "0.11.0"

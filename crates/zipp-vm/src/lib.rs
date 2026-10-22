@@ -409,6 +409,13 @@ pub fn htmldda_membership_stats() -> (u64, u64) {
 /// matches that dispatched an accessor directly instead of taking a permanent
 /// miss (`ZIPP_NO_ACCESSOR_WAY=1` forces them to zero and restores the misses).
 /// Zeroed unless the variable was set.
+/// `ZIPP_CENSUS`: the storage census the last run recorded, as flat
+/// `(key, value)` pairs (`vm::census`). Built with the `census` feature only.
+#[cfg(feature = "census")]
+pub fn take_census() -> Option<Vec<(String, u64)>> {
+    vm::take_census()
+}
+
 pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     vm::ic_stats()
 }
@@ -761,6 +768,8 @@ fn run_with_policy(
     }
     let result = vm.run();
     vm.report_unhandled_errors();
+    #[cfg(feature = "census")]
+    vm.record_census();
     let outcome = Outcome {
         output: std::mem::take(&mut vm.output),
         errput: std::mem::take(&mut vm.errput),
@@ -870,6 +879,8 @@ pub fn run_module_file(
     if !matches!(&entry_result, Err(thrown) if thrown.0.contains("top-level await is not supported")) {
         vm.report_unhandled_errors();
     }
+    #[cfg(feature = "census")]
+    vm.record_census();
     match entry_result {
         Ok(_) => Ok(Outcome {
             output: vm.output,
@@ -924,6 +935,8 @@ pub fn run_module_with_base(
     vm.set_module_base_dir(base_dir);
     let result = vm.run_module();
     vm.report_unhandled_errors();
+    #[cfg(feature = "census")]
+    vm.record_census();
     match result {
         Ok(_) => Ok(Outcome {
             output: vm.output,

@@ -5832,3 +5832,43 @@ pub(crate) use region_int::*;
 pub(crate) use region_int_gpr::*;
 pub(crate) use region_mem::*;
 pub(crate) use self_call::*;
+
+/// The JIT's part of the storage census (`vm::census`): compiled functions
+/// and regions with their machine-code bytes (each in its own executable
+/// mapping, a page at least), the retired ones still held, and the JIT's
+/// own inline-cache table and site metadata.
+#[cfg(feature = "census")]
+impl Jit {
+    pub(crate) fn census(&self) -> Vec<(&'static str, u64)> {
+        const PAGE: u64 = 4096;
+        let mapped = |n: usize| (n as u64).div_ceil(PAGE).max(1) * PAGE;
+        let fns = || self.compiled.values().chain(self.retired_fns.iter());
+        let regions = || self.regions.values().chain(self.retired.iter()).map(|r| &r.code);
+        let kernels = || {
+            self.map_kernels.values().chain(self.reduce_kernels.values()).chain(self.filter_kernels.values()).flatten()
+        };
+        let code = |it: &mut dyn Iterator<Item = &JitFn>| it.fold((0u64, 0u64, 0u64), |(n, b, m), f| (n + 1, b + f._buf.len() as u64, m + mapped(f._buf.len())));
+        let (fn_n, fn_b, fn_m) = code(&mut fns());
+        let (rg_n, rg_b, rg_m) = code(&mut regions());
+        let (kn_n, kn_b, kn_m) = code(&mut kernels());
+        vec![
+            ("functions", fn_n),
+            ("function_code_bytes", fn_b),
+            ("function_mapped_bytes", fn_m),
+            ("retired_functions", self.retired_fns.len() as u64),
+            ("regions", rg_n),
+            ("region_code_bytes", rg_b),
+            ("region_mapped_bytes", rg_m),
+            ("retired_regions", self.retired.len() as u64),
+            ("kernels", kn_n),
+            ("kernel_code_bytes", kn_b),
+            ("kernel_mapped_bytes", kn_m),
+            ("ic_table_entries", self.ic_table.len() as u64),
+            ("ic_table_bytes", (self.ic_table.capacity() * std::mem::size_of::<IcEntry>()) as u64),
+            ("ic_site_meta_bytes", (self.ic_site_meta.capacity() * std::mem::size_of::<IcSiteMeta>()) as u64),
+            ("ic_entry_size", std::mem::size_of::<IcEntry>() as u64),
+            ("call_counters", self.counts.len() as u64),
+            ("blacklisted_functions", self.blacklist.len() as u64),
+        ]
+    }
+}

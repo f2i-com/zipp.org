@@ -3443,6 +3443,10 @@ macro_rules! rec_mut {
 mod access;
 mod async_runtime;
 mod builtins;
+#[cfg(feature = "census")]
+mod census;
+#[cfg(feature = "census")]
+pub(crate) use census::take_census;
 pub(crate) mod clock;
 pub(crate) mod eval_arena;
 mod dispatch;

@@ -13922,3 +13922,44 @@ mod birth_payload_tests {
         }
     }
 }
+
+/// The heap's part of the storage census (`vm::census`): the object table's
+/// capacity, the payload estimate now and at its high-water mark, and how
+/// many table entries hold each kind of object (a variant's `Debug` name,
+/// read without formatting its contents).
+#[cfg(feature = "census")]
+impl Heap {
+    pub(crate) fn census(&self) -> (usize, usize, usize, Vec<(String, usize)>) {
+        struct Head(String);
+        impl std::fmt::Write for Head {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                for c in s.chars() {
+                    if !(c.is_alphanumeric() || c == '_') {
+                        return Err(std::fmt::Error);
+                    }
+                    self.0.push(c);
+                }
+                Ok(())
+            }
+        }
+        let mut kinds: Vec<(std::mem::Discriminant<HeapObj>, String, usize)> = Vec::new();
+        for obj in &self.objs {
+            let d = std::mem::discriminant(obj);
+            match kinds.iter_mut().find(|k| k.0 == d) {
+                Some(k) => k.2 += 1,
+                None => {
+                    let mut head = Head(String::new());
+                    let _ = std::fmt::write(&mut head, format_args!("{obj:?}"));
+                    kinds.push((d, head.0, 1));
+                }
+            }
+        }
+        kinds.sort_by(|a, b| b.2.cmp(&a.2));
+        (
+            self.objs.capacity(),
+            self.resident_payload_current.get(),
+            self.resident_payload_high_water.get(),
+            kinds.into_iter().map(|(_, name, n)| (name, n)).collect(),
+        )
+    }
+}

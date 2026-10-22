@@ -226,6 +226,8 @@ fn execute(mut compiled: zipp_vm::frontend::CompiledSource, gpu: bool) -> Result
         enable_python_jit(state);
     }
     let outcome = state.run_init();
+    #[cfg(feature = "census")]
+    state.record_census();
     // A program read from standard input has no project folder to write to.
     if python {
         if let Ok(zipp_vm::embed::JsValue::String(listing)) =
@@ -876,6 +878,8 @@ fn run_project(
     install_gpu(state, gpu);
     enable_python_jit(state);
     let outcome = state.run_init();
+    #[cfg(feature = "census")]
+    state.record_census();
     // Files the program wrote go back to disk, inside the root only. The
     // program's own failure (and its traceback) is the run's result even
     // when some of its changes could not be written, and it is reported
