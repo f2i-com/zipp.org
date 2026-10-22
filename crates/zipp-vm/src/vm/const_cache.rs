@@ -129,26 +129,48 @@ impl<'p> Vm<'p> {
     /// Resolve one bytecode constant slot, memoizing eligible string literals.
     /// Every rejection delegates verbatim to `resolve_const`, including lone-
     /// surrogate/WTF-8 decoding and the canonical `typeof` handles.
+    ///
+    /// A constant that is not a string is its own value, answered here at
+    /// the load: `resolve_const` makes the same test and returns the same
+    /// bits, but it is a call, and it was 4% of a loop that adds a float
+    /// constant. As one call with the string paths, the test was still a
+    /// tenth of a loop storing `i * 0.5`: the call and the prologue its body
+    /// needs. A string's remembered representation is a small call
+    /// (`resolve_const_string`), and the fill a cold one.
     #[inline]
     pub(crate) fn resolve_const_slot(&mut self, func_id: u32, const_idx: u32) -> Value {
         let raw = self.func(func_id as usize).constants[const_idx as usize];
-        // A constant that is not a string is its own value. Answer it here:
-        // `resolve_const` makes the same test and returns the same bits, but
-        // it is a call, and it was 4% of a loop that adds a float constant.
         if !raw.is_heap() || (raw.heap_index() & crate::vm::helpers_misc::STRING_CONST_BIT) == 0 {
             return raw;
         }
+        self.resolve_const_string(func_id, const_idx, raw)
+    }
+
+    /// [`Self::resolve_const_slot`] for a string constant: its remembered
+    /// representation, or the fill.
+    #[inline(never)]
+    fn resolve_const_string(&mut self, func_id: u32, const_idx: u32, raw: Value) -> Value {
+        if self.const_string_cache_enabled {
+            if let Some(&v) = self
+                .const_string_dense
+                .get(func_id as usize)
+                .and_then(|f| f.get(const_idx as usize))
+            {
+                if !v.is_undefined() {
+                    return v;
+                }
+            }
+        }
+        self.resolve_const_string_fill(func_id, const_idx, raw)
+    }
+
+    /// [`Self::resolve_const_string`]'s miss: the slot map, the eligibility
+    /// tests and the caches' fill.
+    #[cold]
+    #[inline(never)]
+    fn resolve_const_string_fill(&mut self, func_id: u32, const_idx: u32, raw: Value) -> Value {
         if !self.const_string_cache_enabled {
             return self.resolve_const(func_id, raw);
-        }
-        if let Some(&v) = self
-            .const_string_dense
-            .get(func_id as usize)
-            .and_then(|f| f.get(const_idx as usize))
-        {
-            if !v.is_undefined() {
-                return v;
-            }
         }
 
         let string_idx = (raw.heap_index() & !crate::vm::helpers_misc::STRING_CONST_BIT) as usize;
