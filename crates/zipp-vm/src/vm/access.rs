@@ -1095,7 +1095,7 @@ impl<'p> Vm<'p> {
     /// property makes the write fail). `None` means the chain is not walkable
     /// cheaply (a proxy or exotic link) and the caller must take the slow path.
     fn proto_chain_blocks_set(&self, oi: u32, key: &str) -> Option<bool> {
-        self.proto_chain_blocks_set_from(self.proto_of.get(&oi).copied(), key)
+        self.proto_chain_blocks_set_from(self.proto_of.get_copied(oi), key)
     }
 
     /// [`Self::proto_chain_blocks_set`] from an explicit starting prototype:
@@ -1133,7 +1133,7 @@ impl<'p> Vm<'p> {
             if pi == self.obj_proto {
                 return Some(false);
             }
-            cur = self.proto_of.get(&pi).copied();
+            cur = self.proto_of.get_copied(pi);
         }
         // No recorded prototype means the DEFAULT %Object.prototype%, which must
         // actually be consulted — a test (or a program) can install a

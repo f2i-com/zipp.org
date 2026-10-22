@@ -2082,7 +2082,7 @@ impl<'p> Vm<'p> {
                 }
                 Some(p)
                     if p != 0
-                        && self.proto_of.get(&idx).is_none()
+                        && !self.proto_of.has(idx)
                         && !self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
                         && self.builtin_iter_next_pristine(p) =>
                 {

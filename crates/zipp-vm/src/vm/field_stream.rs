@@ -814,7 +814,7 @@ impl<'p> Vm<'p> {
                 let value = map.val_at(slot);
                 return value.is_int().then(|| value.as_int());
             }
-            match self.proto_of.get(&cur).copied() {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
                 Some(_) => return None,
                 None if self.obj_proto != 0 && cur != self.obj_proto => cur = self.obj_proto,

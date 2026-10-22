@@ -1877,7 +1877,7 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(idx), HeapObj::Promise { .. }) {
             return false;
         }
-        match self.proto_of.get(&idx) {
+        match self.proto_of.get_copied(idx) {
             // Absent ⇒ the HeapObj::Promise default, %Promise.prototype%.
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.promise_proto => {}

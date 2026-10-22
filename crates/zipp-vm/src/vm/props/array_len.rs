@@ -644,7 +644,7 @@ impl<'p> Vm<'p> {
     /// (B289 — it used to fall back to %Array.prototype%, so `arr.push` still
     /// resolved after the prototype was removed).
     pub(crate) fn array_eff_proto(&self, idx: u32) -> u32 {
-        match self.proto_of.get(&idx) {
+        match self.proto_of.get_copied(idx) {
             Some(p) if p.is_heap() => p.heap_index(),
             Some(_) => 0,
             None => self.arr_proto,
@@ -802,7 +802,7 @@ impl<'p> Vm<'p> {
             if let Some((attr, raw)) = self.own_member(cur, &key) {
                 return self.apply_proto_set(attr, raw, obj, &key, val, strict);
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 _ => 0,
             };

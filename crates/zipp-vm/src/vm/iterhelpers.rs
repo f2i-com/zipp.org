@@ -106,7 +106,7 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(raw);
             }
-            cur = match self.proto_of.get(&cur).copied() {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 _ => 0,
             };

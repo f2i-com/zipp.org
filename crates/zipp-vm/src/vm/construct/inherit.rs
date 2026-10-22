@@ -201,7 +201,7 @@ impl<'p> Vm<'p> {
                         .fn_props
                         .get(&cur)
                         .is_some_and(|m| m.pos("@@hasInstance").is_some())
-                        || self.proto_of.get(&cur).is_some()
+                        || self.proto_of.has(cur)
                     {
                         return None;
                     }
@@ -209,7 +209,7 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 HeapObj::Class(cc) => {
-                    if !class_lacks_has_instance(cc) || self.proto_of.get(&cur).is_some() {
+                    if !class_lacks_has_instance(cc) || self.proto_of.has(cur) {
                         return None;
                     }
                     match cc.parent {
@@ -332,7 +332,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) if !m.is_ctor => m.class,
             _ => return None,
         };
-        if let Some(&p) = self.proto_of.get(&idx) {
+        if let Some(p) = self.proto_of.get_copied(idx) {
             return Some(p);
         }
         if idx == self.obj_proto {
@@ -542,7 +542,7 @@ impl<'p> Vm<'p> {
             .running_class_value()
             .or_else(|| self.class_value_for(home_class_id));
         if let Some(h) = home.filter(|h| h.is_heap()) {
-            if let Some(&p) = self.proto_of.get(&h.heap_index()) {
+            if let Some(p) = self.proto_of.get_copied(h.heap_index()) {
                 return p;
             }
         }

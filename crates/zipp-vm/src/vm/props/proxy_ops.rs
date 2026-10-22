@@ -154,8 +154,8 @@ impl<'p> Vm<'p> {
             if m.is_ctor || m.class.is_some() || m.pos(name).is_some() {
                 return false;
             }
-            cur = match self.proto_of.get(&idx) {
-                Some(&p) => p,
+            cur = match self.proto_of.get_copied(idx) {
+                Some(p) => p,
                 None if self.obj_proto != 0 && idx != self.obj_proto => Value::heap(self.obj_proto),
                 None => return true,
             };

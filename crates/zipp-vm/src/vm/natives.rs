@@ -1696,7 +1696,7 @@ impl<'p> Vm<'p> {
             return;
         }
         let idx = err.heap_index();
-        let main_p = match self.proto_of.get(&idx) {
+        let main_p = match self.proto_of.get_copied(idx) {
             Some(v) if v.is_heap() => v.heap_index(),
             _ => return,
         };

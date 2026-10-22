@@ -844,8 +844,8 @@ impl<'p> Vm<'p> {
         let mut cur = idx;
         let mut first = FIRST_HEAP;
         loop {
-            let next = match self.proto_of.get(&cur) {
-                Some(&p) => {
+            let next = match self.proto_of.get_copied(cur) {
+                Some(p) => {
                     if !p.is_heap() {
                         // Null-prototype chain end → undefined.
                         if cur == idx {
@@ -2161,7 +2161,7 @@ impl<'p> Vm<'p> {
         key: &str,
         hops: &mut [(u32, u32)],
     ) -> Option<usize> {
-        if self.proto_of.get(&idx).is_some() {
+        if self.proto_of.has(idx) {
             return None;
         }
         let mut cur = class;
@@ -2204,8 +2204,8 @@ impl<'p> Vm<'p> {
                 }
                 break;
             }
-            next = match self.proto_of.get(&h) {
-                Some(p) => *p,
+            next = match self.proto_of.get_copied(h) {
+                Some(p) => p,
                 None if self.obj_proto == 0 || h == self.obj_proto => Value::NULL,
                 None => Value::heap(self.obj_proto),
             };
@@ -2233,7 +2233,7 @@ impl<'p> Vm<'p> {
                 || m.is_ctor
                 || self.heap.version_of(class) != ver
                 || self.class_proto_epoch != epoch
-                || self.proto_of.get(&idx).is_some()
+                || self.proto_of.has(idx)
                 || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
                 || hops[..nhops as usize]
                     .iter()
@@ -3764,8 +3764,8 @@ impl<'p> Vm<'p> {
             if let Some(i) = m.pos(key) {
                 return Some((hops, i as u32, m.attr_at(i).accessor));
             }
-            cur = match self.proto_of.get(&cur) {
-                Some(&p) if p.is_heap() => p.heap_index(),
+            cur = match self.proto_of.get_copied(cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
                 Some(_) => return None, // null end — super misses stay slow
                 None => {
                     if self.obj_proto == 0 || cur == self.obj_proto {

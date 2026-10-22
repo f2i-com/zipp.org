@@ -41,7 +41,7 @@ impl<'p> Vm<'p> {
         // proto_of chain: direct error instances + `Object.create(XError.prototype)`.
         let mut cur = idx;
         for _ in 0..64 {
-            match self.proto_of.get(&cur) {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => {
                     let pi = p.heap_index();
                     if self.error_protos.contains(&pi) {
@@ -86,7 +86,7 @@ impl<'p> Vm<'p> {
                     return Some(v);
                 }
             }
-            match self.proto_of.get(&cur) {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
                 _ => return None,
             }

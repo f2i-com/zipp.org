@@ -734,7 +734,7 @@ impl<'p> Vm<'p> {
             return true;
         }
         // Must terminate the chain: an explicit proto entry means more levels.
-        match self.proto_of.get(&idx) {
+        match self.proto_of.get_copied(idx) {
             Some(p) if p.is_heap() => return false,
             Some(_) => {}
             // No entry means the DEFAULT proto, which for a non-%Object.prototype%

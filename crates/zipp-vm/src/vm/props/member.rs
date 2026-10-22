@@ -116,7 +116,7 @@ impl<'p> Vm<'p> {
                     RegExpAccessor::Override(raw, attr)
                 };
             }
-            p = self.proto_of.get(&pi).copied().unwrap_or(Value::NULL);
+            p = self.proto_of.get_copied(pi).unwrap_or(Value::NULL);
         }
         RegExpAccessor::Absent
     }
@@ -163,7 +163,7 @@ impl<'p> Vm<'p> {
                     Ok(raw)
                 };
             }
-            match self.proto_of.get(&cur) {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
                 _ => break,
             }
@@ -198,7 +198,7 @@ impl<'p> Vm<'p> {
                     return v;
                 }
             }
-            match self.proto_of.get(&cur) {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
                 // An Array in the chain with no recorded prototype chains to
                 // %Array.prototype%, not nowhere (see proto_member_get).
@@ -840,7 +840,7 @@ impl<'p> Vm<'p> {
         // `proto_of` entry → the builtin's default prototype. A NULL entry
         // (`Object.setPrototypeOf(x, null)`) ends the chain: nothing inherited
         // (B289 — it used to fall back to the default prototype).
-        let eff = match self.proto_of.get(&obj.heap_index()) {
+        let eff = match self.proto_of.get_copied(obj.heap_index()) {
             Some(p) if !p.is_heap() => return Ok(Value::UNDEFINED),
             Some(p) => p.heap_index(),
             None => proto,
@@ -872,7 +872,7 @@ impl<'p> Vm<'p> {
             };
             if public {
                 if first && c.reproto_instances {
-                    if let Some(&p) = self.proto_of.get(&inst) {
+                    if let Some(p) = self.proto_of.get_copied(inst) {
                         return ClassLookup::Live(p);
                     }
                 }
@@ -928,7 +928,7 @@ impl<'p> Vm<'p> {
     /// else where the class chain leaves the classes. `&self`: nothing is
     /// materialized here.
     pub(crate) fn class_instance_live_proto(&self, inst: u32, class: u32) -> Value {
-        if let Some(&p) = self.proto_of.get(&inst) {
+        if let Some(p) = self.proto_of.get_copied(inst) {
             return p;
         }
         let mut cur = class;
@@ -1161,8 +1161,8 @@ impl<'p> Vm<'p> {
                 }
                 // [[Prototype]] step — the Object arm's resolution for a plain
                 // object: an explicit proto_of entry, else %Object.prototype%.
-                match self.proto_of.get(&ci) {
-                    Some(&p) => {
+                match self.proto_of.get_copied(ci) {
+                    Some(p) => {
                         if !p.is_heap() {
                             return Ok(Value::UNDEFINED); // null-prototype chain end
                         }
@@ -1770,7 +1770,7 @@ impl<'p> Vm<'p> {
                     };
                     // A NULL entry (`Object.setPrototypeOf(buf, null)`) means no
                     // prototype: nothing is inherited, `buf.slice` included.
-                    let proto = match self.proto_of.get(&ai).copied() {
+                    let proto = match self.proto_of.get_copied(ai) {
                         Some(p) if p.is_heap() => p.heap_index(),
                         Some(_) => return Ok(Value::UNDEFINED),
                         None => default,
@@ -2055,7 +2055,7 @@ impl<'p> Vm<'p> {
             // Walk the REAL chain when a subclass / setPrototypeOf replaced it
             // (`class F extends Intl.ListFormat {}` puts F.prototype in front of
             // the service prototype); otherwise start at the service prototype.
-            let start = match self.proto_of.get(&obj.heap_index()) {
+            let start = match self.proto_of.get_copied(obj.heap_index()) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 _ => proto,
             };
@@ -2201,7 +2201,7 @@ impl<'p> Vm<'p> {
                 // `Object.create` proto, else a class instance's `C.prototype`
                 // (carries `constructor` + inherited methods, and itself chains to
                 // Object.prototype), else the base Object.prototype.
-                let proto = if let Some(&p) = self.proto_of.get(&obj.heap_index()) {
+                let proto = if let Some(p) = self.proto_of.get_copied(obj.heap_index()) {
                     p.is_heap().then_some(p)
                 } else if let Some(cidx) = class {
                     self.prototype_of(Value::heap(cidx))
@@ -2269,7 +2269,7 @@ impl<'p> Vm<'p> {
                 // link: the recorded prototype (or null, ending the chain) wins
                 // over both the parent and %Function.prototype%.
                 let parent = c.parent;
-                if let Some(&p) = self.proto_of.get(&obj.heap_index()) {
+                if let Some(p) = self.proto_of.get_copied(obj.heap_index()) {
                     if !p.is_heap() {
                         return Ok(Value::UNDEFINED);
                     }
@@ -2344,7 +2344,7 @@ impl<'p> Vm<'p> {
             // methods). So `g().next`, `g().map`, `g()[Symbol.iterator]` all
             // resolve, and a REPLACED g.prototype is honored.
             HeapObj::Generator { .. } => {
-                let p = match self.proto_of.get(&obj.heap_index()) {
+                let p = match self.proto_of.get_copied(obj.heap_index()) {
                     Some(p) if p.is_heap() => p.heap_index(),
                     Some(_) => return Ok(Value::UNDEFINED), // null proto: no chain
                     None => self.gen_proto,
@@ -2352,7 +2352,7 @@ impl<'p> Vm<'p> {
                 self.proto_chain_get(p, key, obj)
             }
             HeapObj::AsyncGenerator(_) => {
-                let p = match self.proto_of.get(&obj.heap_index()) {
+                let p = match self.proto_of.get_copied(obj.heap_index()) {
                     Some(p) if p.is_heap() => p.heap_index(),
                     Some(_) => return Ok(Value::UNDEFINED),
                     None => self.asyncgen_proto,
@@ -2451,7 +2451,7 @@ impl<'p> Vm<'p> {
                 // then up to Object.prototype (toString/valueOf/hasOwnProperty/…).
                 // A NULL override (`Object.setPrototypeOf(f, null)`) ends the
                 // chain: nothing is inherited, matching [[HasProperty]].
-                let start = match self.proto_of.get(&obj.heap_index()) {
+                let start = match self.proto_of.get_copied(obj.heap_index()) {
                     Some(p) if !p.is_heap() => return Ok(Value::UNDEFINED),
                     Some(p) => p.heap_index(),
                     None => self

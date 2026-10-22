@@ -250,7 +250,7 @@ impl<'p> Vm<'p> {
     /// The nearest object on `ta_idx`'s prototype chain with an own `key`
     /// (the instance's own side-table props are checked by the caller first).
     fn ta_chain_has_own(&self, ta_idx: u32, key: &str) -> Option<u32> {
-        let mut cur = match self.proto_of.get(&ta_idx) {
+        let mut cur = match self.proto_of.get_copied(ta_idx) {
             Some(p) if p.is_heap() => p.heap_index(),
             Some(_) => return None, // explicit null prototype
             None => match self.heap.get(ta_idx) {
@@ -283,7 +283,7 @@ impl<'p> Vm<'p> {
                 // Fail closed and let the ordinary property path resolve them.
                 _ => return None,
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 _ => return None,
             };
@@ -320,7 +320,7 @@ impl<'p> Vm<'p> {
             _ => return false,
         };
         // `Object.setPrototypeOf(ta, …)` re-points the chain.
-        match self.proto_of.get(&ta_idx) {
+        match self.proto_of.get_copied(ta_idx) {
             Some(v) if v.is_heap() && v.heap_index() == want_proto => {}
             _ => return false,
         }
@@ -339,7 +339,7 @@ impl<'p> Vm<'p> {
         if self.ta_base_proto == 0 {
             return false;
         }
-        match self.proto_of.get(&want_proto) {
+        match self.proto_of.get_copied(want_proto) {
             Some(v) if v.is_heap() && v.heap_index() == self.ta_base_proto => {}
             _ => return false,
         }

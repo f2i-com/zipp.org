@@ -1139,7 +1139,7 @@ impl<'p> Vm<'p> {
                 chain[len] = (cur, self.heap.version_of(cur));
                 len += 1;
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 Some(_) => break,
                 None if cur == self.obj_proto => break,
@@ -1197,7 +1197,7 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let first = match self.proto_of.get(&idx) {
+        let first = match self.proto_of.get_copied(idx) {
             Some(p) if p.is_heap() => p.heap_index(),
             Some(_) => return false,
             None => self.gen_proto,
@@ -1246,7 +1246,7 @@ impl<'p> Vm<'p> {
                 }
                 return ok;
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 _ => return false,
             };

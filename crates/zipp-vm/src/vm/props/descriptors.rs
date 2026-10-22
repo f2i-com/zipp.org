@@ -1011,7 +1011,7 @@ impl<'p> Vm<'p> {
             }
             break idx;
         };
-        if let Some(&p) = self.proto_of.get(&idx) {
+        if let Some(p) = self.proto_of.get_copied(idx) {
             return p;
         }
         if idx == self.obj_proto {

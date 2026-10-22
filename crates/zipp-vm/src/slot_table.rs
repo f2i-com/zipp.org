@@ -454,6 +454,17 @@ impl ProtoTable {
         self.table.get(k)
     }
 
+    /// [`Self::get`] by value: a heap prototype, the case nearly every entry
+    /// is, is the link's index itself, so only a `null` one reads the table.
+    #[inline]
+    pub(crate) fn get_copied(&self, k: u32) -> Option<crate::value::Value> {
+        match self.link(k) {
+            Self::NONE => None,
+            Self::NON_HEAP => self.table.get(&k).copied(),
+            l => Some(crate::value::Value::heap(l - Self::HEAP_BASE)),
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn has(&self, k: u32) -> bool {
         self.link(k) != Self::NONE
@@ -527,7 +538,11 @@ mod proto_table_tests {
         assert_eq!(t.link(5), 9 + ProtoTable::HEAP_BASE);
         assert_eq!(t.link(70_000), ProtoTable::NON_HEAP);
         assert_eq!(t.get(&5), Some(&Value::heap(9)));
+        assert_eq!(t.get_copied(5), Some(Value::heap(9)));
+        assert_eq!(t.get_copied(70_000), Some(Value::NULL));
+        assert_eq!(t.get_copied(6), None);
         assert_eq!(t.insert(5, Value::heap(0)), Some(Value::heap(9)));
+        assert_eq!(t.get_copied(5), Some(Value::heap(0)));
         assert_eq!(t.link(5), ProtoTable::HEAP_BASE);
         assert!(t.has(5) && t.contains_key(&70_000) && !t.has(6));
         t.retain(|&k| k != 5);

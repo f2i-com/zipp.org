@@ -141,7 +141,7 @@ impl<'p> Vm<'p> {
                 {
                     return None;
                 }
-                match self.proto_of.get(&idx) {
+                match self.proto_of.get_copied(idx) {
                     None => self.regexp_proto,
                     Some(value) if value.is_heap() => value.heap_index(),
                     _ => return None,
@@ -300,7 +300,7 @@ impl<'p> Vm<'p> {
                     // `Object.create` proto, then the base Object.prototype (which
                     // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
                     // proto resolution.
-                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                    let proto = if let Some(p) = self.proto_of.get_copied(idx) {
                         p.is_heap().then_some(p)
                     } else if self.obj_proto != 0 && idx != self.obj_proto {
                         Some(Value::heap(self.obj_proto))
@@ -341,8 +341,8 @@ impl<'p> Vm<'p> {
                         }
                         // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
                         // carries inherited indices), else %Array.prototype%.
-                        let proto = match self.proto_of.get(&idx) {
-                            Some(&p) => p,
+                        let proto = match self.proto_of.get_copied(idx) {
+                            Some(p) => p,
                             None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                             None => Value::NULL,
                         };
@@ -382,8 +382,8 @@ impl<'p> Vm<'p> {
                     }
                     // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
                     // else Array.prototype (push/map/…) then Object.prototype.
-                    let proto = match self.proto_of.get(&idx) {
-                        Some(&p) => p,
+                    let proto = match self.proto_of.get_copied(idx) {
+                        Some(p) => p,
                         None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                         None => Value::NULL,
                     };
@@ -424,7 +424,7 @@ impl<'p> Vm<'p> {
                     {
                         return true;
                     }
-                    match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                    match self.proto_of.get_copied(idx).filter(|p| p.is_heap()) {
                         Some(p) => {
                             obj = p;
                             continue 'prototype_chain;
@@ -534,7 +534,7 @@ impl<'p> Vm<'p> {
                     // are visible to `in` (`"toFixed" in Object(2.5)`, `"call" in fn`),
                     // mirroring get_member. Without this fallback `in` saw only own
                     // props on a boxed primitive / callable / Date / Promise / …
-                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                    let proto = if let Some(p) = self.proto_of.get_copied(idx) {
                         p.is_heap().then_some(p)
                     } else {
                         let bp = match self.heap.get(idx) {
@@ -1597,7 +1597,7 @@ impl<'p> Vm<'p> {
             if m.class.is_some() {
                 return None;
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 Some(_) => return Some(false),
                 None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
@@ -1653,7 +1653,7 @@ impl<'p> Vm<'p> {
                 }
                 return (!v.is_uninitialized()).then_some(PlainGet::Data(v));
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 // An explicit null prototype: a true miss.
                 Some(_) => return Some(PlainGet::Absent),
@@ -1835,7 +1835,7 @@ impl<'p> Vm<'p> {
                     }
                 };
                 next.is_heap().then_some(next)
-            } else if let Some(&p) = self.proto_of.get(&idx) {
+            } else if let Some(p) = self.proto_of.get_copied(idx) {
                 p.is_heap().then_some(p)
             } else if self.obj_proto != 0 && idx != self.obj_proto {
                 Some(Value::heap(self.obj_proto))
@@ -1870,8 +1870,8 @@ impl<'p> Vm<'p> {
                         return Ok(true);
                     }
                 }
-                let proto = match self.proto_of.get(&idx) {
-                    Some(&p) => p,
+                let proto = match self.proto_of.get_copied(idx) {
+                    Some(p) => p,
                     None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                     None => Value::NULL,
                 };
@@ -1930,8 +1930,8 @@ impl<'p> Vm<'p> {
             if own {
                 return Ok(true);
             }
-            let proto = match self.proto_of.get(&idx) {
-                Some(&p) => p,
+            let proto = match self.proto_of.get_copied(idx) {
+                Some(p) => p,
                 None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                 None => Value::NULL,
             };
@@ -1956,7 +1956,7 @@ impl<'p> Vm<'p> {
             {
                 return Ok(true);
             }
-            return match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+            return match self.proto_of.get_copied(idx).filter(|p| p.is_heap()) {
                 Some(p) => self.with_native_recursion_guard(|vm| vm.has_property_dyn(p, key)),
                 None => Ok(false),
             };
@@ -2102,7 +2102,7 @@ impl<'p> Vm<'p> {
             {
                 return None;
             }
-            let proto = if let Some(&p) = self.proto_of.get(&cur) {
+            let proto = if let Some(p) = self.proto_of.get_copied(cur) {
                 if p.is_heap() {
                     p.heap_index()
                 } else {

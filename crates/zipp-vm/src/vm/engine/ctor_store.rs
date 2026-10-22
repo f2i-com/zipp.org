@@ -308,7 +308,7 @@ impl<'p> Vm<'p> {
                         }
                         _ => return None, // an exotic level
                     }
-                    next = match self.proto_of.get(&next) {
+                    next = match self.proto_of.get_copied(next) {
                         Some(p) if p.is_heap() => p.heap_index(),
                         Some(_) => u32::MAX,
                         None if self.obj_proto == 0 || next == self.obj_proto => u32::MAX,

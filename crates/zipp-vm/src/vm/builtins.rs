@@ -830,7 +830,7 @@ impl<'p> Vm<'p> {
         if !self.arr_props.is_empty() && self.arr_props.contains_key(&idx) {
             return None;
         }
-        let start = match self.proto_of.get(&idx) {
+        let start = match self.proto_of.get_copied(idx) {
             Some(p) if p.is_heap() => p.heap_index(),
             Some(_) => return None,
             None => self.callable_dynfn_proto(idx).unwrap_or(self.fn_proto),
@@ -851,7 +851,7 @@ impl<'p> Vm<'p> {
         if !self.arr_props.is_empty() && self.arr_props.contains_key(&idx) {
             return None;
         }
-        let start = match self.proto_of.get(&idx) {
+        let start = match self.proto_of.get_copied(idx) {
             Some(p) if p.is_heap() => p.heap_index(),
             Some(_) => return None,
             None => proto,
@@ -879,7 +879,7 @@ impl<'p> Vm<'p> {
             if let Some(i) = self.own_pos(m, key) {
                 return data(m, i);
             }
-            match self.proto_of.get(&cur) {
+            match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
                 _ => break,
             }
@@ -951,7 +951,7 @@ impl<'p> Vm<'p> {
             }
             if c.static_getters.iter().any(|(k, _)| k == key)
                 || c.static_setters.iter().any(|(k, _)| k == key)
-                || self.proto_of.get(&cur).is_some()
+                || self.proto_of.has(cur)
             {
                 return None;
             }
@@ -2248,7 +2248,7 @@ impl<'p> Vm<'p> {
             // those two.
             HeapObj::Iterator { proto, .. } if name == "next" => {
                 let proto = *proto;
-                if self.proto_of.get(&idx).is_some()
+                if self.proto_of.has(idx)
                     || self.arr_props.get(&idx).is_some_and(|m| m.pos("next").is_some())
                     || !self.builtin_iter_next_pristine(proto)
                 {
@@ -2372,7 +2372,7 @@ impl<'p> Vm<'p> {
         if !promise_pristine_enabled() {
             return false; // ZIPP_NO_PROMISE_PRISTINE=1 → the old get_prop proof
         }
-        match self.proto_of.get(&p) {
+        match self.proto_of.get_copied(p) {
             None => {}
             Some(pr) if pr.is_heap() && pr.heap_index() == self.promise_proto => {}
             _ => return false,
@@ -2484,8 +2484,8 @@ impl<'p> Vm<'p> {
                             found = Some((h, i as u32));
                             break;
                         }
-                        next = match self.proto_of.get(&h) {
-                            Some(p) => *p,
+                        next = match self.proto_of.get_copied(h) {
+                            Some(p) => p,
                             None if self.obj_proto == 0 || h == self.obj_proto => Value::NULL,
                             None => Value::heap(self.obj_proto),
                         };
@@ -2723,8 +2723,8 @@ impl<'p> Vm<'p> {
         if !self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos("constructor").is_some()) {
             return false;
         }
-        if self.proto_of.get(&idx).copied() != Some(Value::heap(proto))
-            || self.proto_of.get(&ctor).copied() != Some(Value::heap(base))
+        if self.proto_of.get_copied(idx) != Some(Value::heap(proto))
+            || self.proto_of.get_copied(ctor) != Some(Value::heap(base))
         {
             return false;
         }

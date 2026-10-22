@@ -1457,7 +1457,7 @@ impl<'p> Vm<'p> {
     /// Anything else (a subclass instance, a patched prototype) must run the
     /// full observable @@replace protocol.
     pub(crate) fn regexp_replace_fast_ok(&self, re: u32) -> bool {
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -1549,7 +1549,7 @@ impl<'p> Vm<'p> {
     /// shape: `"xay".split(re)` ignored the override that
     /// `String.prototype.split.call("xay", re)` honoured.
     pub(crate) fn regexp_split_fast_ok(&self, re: u32) -> bool {
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -1585,7 +1585,7 @@ impl<'p> Vm<'p> {
     /// steps is guaranteed to return the intrinsic, the whole sequence is
     /// equivalent to cloning the compiled regex.
     pub(crate) fn regexp_matchall_fast_ok(&self, re: u32) -> bool {
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -1658,7 +1658,7 @@ impl<'p> Vm<'p> {
         if !fastok_memo_enabled() {
             return self.regexp_matchall_fast_ok(re);
         }
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -4076,7 +4076,7 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(re), HeapObj::RegExp { .. }) {
             return false;
         }
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -4146,7 +4146,7 @@ impl<'p> Vm<'p> {
     /// affordable — B68's ablation put the near-identical `regexp_exec_fast_ok` at ~7% of
     /// the call, while the generic path this skips is the bulk of it.
     pub(crate) fn regexp_method_is_intrinsic(&self, re: u32, name: &str, want: u16) -> bool {
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -4165,7 +4165,7 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn regexp_exec_fast_ok(&self, re: u32) -> bool {
-        match self.proto_of.get(&re) {
+        match self.proto_of.get_copied(re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
@@ -4623,7 +4623,7 @@ impl<'p> Vm<'p> {
             if holder != self.regexp_string_iter_proto {
                 return None;
             }
-            match self.proto_of.get(&holder) {
+            match self.proto_of.get_copied(holder) {
                 Some(next) if next.is_heap() && next.heap_index() == self.iterator_proto_root => {
                     holder = self.iterator_proto_root;
                 }

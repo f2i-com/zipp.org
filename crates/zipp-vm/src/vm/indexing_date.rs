@@ -234,7 +234,7 @@ impl<'p> Vm<'p> {
         }
         let mut cur = idx;
         for _ in 0..64 {
-            let next = match self.proto_of.get(&cur) {
+            let next = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 // Explicit null prototype: a true chain miss.
                 Some(_) => return Some(Value::UNDEFINED),
@@ -300,7 +300,7 @@ impl<'p> Vm<'p> {
         }
         let mut cur = idx;
         for _ in 0..64 {
-            let next = match self.proto_of.get(&cur) {
+            let next = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 // Explicit null prototype: a true chain miss.
                 Some(_) => return Some(Value::UNDEFINED),
@@ -360,7 +360,7 @@ impl<'p> Vm<'p> {
         }
         let mut cur = idx;
         for _ in 0..64 {
-            let next = match self.proto_of.get(&cur) {
+            let next = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 Some(_) => return Some(false),
                 None => {
@@ -418,7 +418,7 @@ impl<'p> Vm<'p> {
                 }
                 _ => return None, // exotic link
             }
-            cur = match self.proto_of.get(&cur) {
+            cur = match self.proto_of.get_copied(cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
                 // Explicit null prototype: a true chain miss.
                 Some(_) => return Some(Value::UNDEFINED),
@@ -726,8 +726,8 @@ impl<'p> Vm<'p> {
                     {
                         return Ok(Value::UNDEFINED);
                     }
-                    let proto = match self.proto_of.get(&aidx) {
-                        Some(&p) => p,
+                    let proto = match self.proto_of.get_copied(aidx) {
+                        Some(p) => p,
                         None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                         None => Value::NULL,
                     };
@@ -854,8 +854,8 @@ impl<'p> Vm<'p> {
     pub(super) fn plain_add_chain_clear_tagged(&self, start: u32, key: &str, tag: Option<u32>) -> bool {
         let mut lidx = start;
         for _ in 0..1000 {
-            let proto = match self.proto_of.get(&lidx) {
-                Some(p) => *p,
+            let proto = match self.proto_of.get_copied(lidx) {
+                Some(p) => p,
                 None if lidx == self.obj_proto => Value::NULL,
                 None if self.obj_proto != 0 => Value::heap(self.obj_proto),
                 None => Value::NULL,
