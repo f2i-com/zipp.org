@@ -91,20 +91,57 @@
         if (r === Infinity) throw rt.makeExc(E.OverflowError, [34n, "Result too large"]);
         return negate ? -r : r;
     }
-    // int / int, correctly rounded even beyond 2^53: scale the quotient to at
-    // least 70 significant bits before the (correctly rounded) BigInt to
-    // Number conversion.
+    // The bit length of a positive int, from its hex digits (a quarter of
+    // the binary form's length).
+    function bitLength(v) {
+        const h = v.toString(16);
+        return (h.length - 1) * 4 + (32 - Math.clz32(parseInt(h[0], 16)));
+    }
+    // int / int, correctly rounded (half to even) at any size, as CPython's
+    // long_true_divide: operands within 2^53 are exact doubles, so one
+    // division rounds once. Otherwise the quotient is taken to 55 bits (fewer
+    // where the result is subnormal), every discarded bit kept as a sticky
+    // bit, rounded once to the double's precision, and scaled by powers of
+    // two that are exact. Scaling a 70-bit quotient instead rounded twice
+    // and flushed a result below 2^-1004 to zero.
     function intTrueDiv(a, b) {
         if (b === 0n) fail(E.ZeroDivisionError, "division by zero");
         const LIMIT = 9007199254740992n;
         if (a > -LIMIT && a < LIMIT && b > -LIMIT && b < LIMIT) return Number(a) / Number(b);
         const neg = (a < 0n) !== (b < 0n);
-        let x = a < 0n ? -a : a, y = b < 0n ? -b : b;
-        const bits = (v) => v.toString(2).length;
-        let shift = 70 - (bits(x) - bits(y));
-        if (shift < 0) shift = 0;
-        const q = (x << BigInt(shift)) / y;
-        const r = Number(q) * Math.pow(2, -shift);
+        let x = a < 0n ? -a : a;
+        const y = b < 0n ? -b : b;
+        if (x === 0n) return neg ? -0 : 0;
+        // a / b lies in [2^(diff-1), 2^(diff+1)).
+        const diff = bitLength(x) - bitLength(y);
+        if (diff > 1024) fail(E.OverflowError, "integer division result too large for a float");
+        if (diff < -1021 - 53 - 1) return neg ? -0 : 0;
+        // x / y = a / b * 2^-shift, with 55 or 56 bits above the point, or
+        // the subnormal range's fewer.
+        const shift = Math.max(diff, -1021) - 53 - 2;
+        let inexact = false;
+        if (shift <= 0) x <<= BigInt(-shift);
+        else {
+            const s = BigInt(shift);
+            inexact = (x & ((1n << s) - 1n)) !== 0n;
+            x >>= s;
+        }
+        let q = x / y;
+        if (q * y !== x) inexact = true;
+        // Round away the bits below the double's precision, half to even;
+        // the lowest is below the rounding bit, so it carries `inexact`.
+        const extra = Math.max(bitLength(q), -1021 - shift) - 53;
+        const mask = 1n << BigInt(extra - 1);
+        const low = q | (inexact ? 1n : 0n);
+        q = ((low & mask) !== 0n && (low & (3n * mask - 1n)) !== 0n ? low + mask : low) & ~(2n * mask - 1n);
+        // q * 2^shift is now a double (or past the range): each step below is
+        // exact, the halves keeping every divisor and intermediate in range.
+        let r;
+        if (shift >= 0) r = Number(q << BigInt(shift));
+        else {
+            const h = -shift >> 1;
+            r = Number(q) / Number(1n << BigInt(h)) / Number(1n << BigInt(-shift - h));
+        }
         if (r === Infinity) fail(E.OverflowError, "integer division result too large for a float");
         return neg ? -r : r;
     }
