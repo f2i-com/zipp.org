@@ -408,6 +408,12 @@ impl<'p> Vm<'p> {
                     argc: sargc,
                     ..
                 } => {
+                    // A repeated class's home is the running callee's, which an
+                    // inlined body has no frame to show (`class_value_for`):
+                    // decline before anything runs, here and at each super op.
+                    if self.class_repeated(home_class_id) {
+                        return None;
+                    }
                     let bits =
                         self.mi_super_call(fid, body_ip, home_class_id, name, sargc, recv, depth)?;
                     // A nested super target threw — propagate (the region exits;
@@ -435,6 +441,9 @@ impl<'p> Vm<'p> {
                     home_class_id,
                     name,
                 } => {
+                    if self.class_repeated(home_class_id) {
+                        return None;
+                    }
                     let v = self.mi_super_get(fid, body_ip, home_class_id, name, recv)?;
                     regs[dst as usize] = v;
                 }
@@ -467,6 +476,9 @@ impl<'p> Vm<'p> {
                 I::SuperBase { dst, home_class_id } => {
                     // The same live GetSuperBase the interpreter's op performs
                     // (a pure read — a decline commits nothing).
+                    if self.class_repeated(home_class_id) {
+                        return None;
+                    }
                     let is_static = self.func(fid as usize).super_static;
                     let v = self.super_base(home_class_id, is_static);
                     regs[dst as usize] = v;
@@ -480,6 +492,9 @@ impl<'p> Vm<'p> {
                     // The body's only off-frame side effect. Commits exactly once
                     // (an inherited trivial setter over recv's own data slot) or
                     // declines BEFORE committing (None).
+                    if self.class_repeated(home_class_id) {
+                        return None;
+                    }
                     let value = regs[val as usize];
                     self.mi_super_set(fid, body_ip, home_class_id, name, recv, value)?;
                 }

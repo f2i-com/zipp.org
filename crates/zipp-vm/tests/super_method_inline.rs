@@ -150,20 +150,17 @@ fn super_setter_inline_follows_parent_setter_swap() {
 
 #[test]
 fn super_method_inline_class_redefinition_is_tier_consistent() {
-    // Re-executing a class declaration swaps `class_values[home_class_id]` to a
-    // NEW class with a new prototype chain, without touching the prototypes the
-    // hop guards watch. The baked plan's class-epoch guard is what catches that,
-    // and this pins it: whatever the engine answers, the inlined tier must answer
-    // the same as the interpreter.
+    // Re-executing a class declaration makes a NEW class with a new prototype
+    // chain, without touching the prototypes the hop guards watch. The baked
+    // plan's class-epoch guard is what catches that, and once a class is
+    // evaluated a second time nothing is baked for it at all; the inlined tier
+    // must answer as the interpreter does.
     //
-    // KNOWN DEVIATION (pre-existing, unrelated to inlining — `ZIPP_NOJIT=1` and
-    // the pre-inline build give the same answer): zipp resolves `super` through
-    // the ONE `class_values` slot a `class_id` owns, so re-running the
-    // declaration retargets the FIRST instance's super chain too. This prints
-    // "epoch 184 184"; V8 prints "epoch 37 184" because each evaluation of the
-    // declaration makes a distinct class. Fixing it means giving `super`
-    // resolution a per-closure home object rather than a per-class-id slot —
-    // a semantics change, not a codegen one.
+    // Each evaluation's code resolves `super` against its own class
+    // (`Vm::class_value_for`), as V8 does: "epoch 37 184". Until 22 October
+    // 2026 zipp resolved it through the one `class_values` slot a `class_id`
+    // owns, so re-running the declaration retargeted the FIRST instance's
+    // super chain too ("epoch 184 184").
     let out = run_ok(&hot(r#"
         function make(k) {
           class A { constructor(v) { this._v = v | 0; } area() { return this._v + k; } }
@@ -176,7 +173,7 @@ fn super_method_inline_class_redefinition_is_tier_consistent() {
         for (var i = 0; i < HOT; i++) acc2 = (acc2 + b.area()) | 0;
         console.log("epoch", a.area(), b.area());
         "#));
-    assert_eq!(out[0], "epoch 184 184");
+    assert_eq!(out[0], "epoch 37 184");
 }
 
 #[test]

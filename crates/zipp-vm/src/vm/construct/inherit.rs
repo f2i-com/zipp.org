@@ -458,13 +458,71 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The runtime class value compile-time class `class_id` denotes for the
+    /// running code. `class_values` holds only the latest evaluation, which is
+    /// the answer for a class evaluated once. For one evaluated more than once
+    /// (a class expression inside a function called twice, a mixin applied to
+    /// two bases) it is the evaluation the running code belongs to: the first
+    /// brand on the running callee's lexical chain whose owner came from
+    /// `class_id`, as `running_class_value` and `dec_class_of_id` recover it.
+    /// With `class_values` alone, `super.m()`, `super.x = v`, a method's use of
+    /// its own class's name and a computed field key in every earlier
+    /// evaluation's code resolved against the newest one. Code outside the
+    /// class (its heritage, or a computed key while the class is defined) has
+    /// no brand for it and gets the latest, which is the one being defined.
+    ///
+    /// The running callee is the top frame's, so a frame-free activation (an
+    /// inlined method body, a Tier C function) must not ask for a repeated
+    /// class: `class_repeated` says when to decline, and
+    /// `class_value_for_callee` takes the activation's own callee.
+    pub(crate) fn class_value_for(&self, class_id: u32) -> Option<Value> {
+        let callee = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.class_value_for_callee(class_id, callee)
+    }
+
+    /// [`Self::class_value_for`] for code running as `callee`.
+    pub(crate) fn class_value_for_callee(&self, class_id: u32, callee: Value) -> Option<Value> {
+        let slot = self.class_values.get(class_id as usize)?;
+        if !slot.repeated {
+            return slot.latest;
+        }
+        self.class_value_in_chain(self.private_brands_of(callee), class_id)
+            .or(slot.latest)
+    }
+
+    /// Whether compile-time class `class_id` has been evaluated more than once.
+    /// Asked by the frame-free JIT paths only.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn class_repeated(&self, class_id: u32) -> bool {
+        self.class_values
+            .get(class_id as usize)
+            .is_some_and(|slot| slot.repeated)
+    }
+
+    /// The evaluation of `class_id` that owns a brand on `chain`, innermost
+    /// first.
+    fn class_value_in_chain(&self, chain: Option<&Vec<u64>>, class_id: u32) -> Option<Value> {
+        for &b in chain? {
+            if let Some(&owner) = self.brand_owner.get(&b) {
+                // The class_id check also guards against a brand whose owner
+                // slot the GC has since recycled.
+                if let HeapObj::Class(c) = self.heap.get(owner) {
+                    if c.class_id == class_id {
+                        return Some(Value::heap(owner));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The superclass value for a `super` reference inside a method of class
     /// `home_class_id`: that class's runtime `ClassData.parent` (linked by
     /// MakeClass from the evaluated `extends` expression), or None.
     pub(crate) fn super_parent(&self, home_class_id: u32) -> Option<Value> {
         let home = match self.running_class_value() {
             Some(v) => v,
-            None => (*self.class_values.get(home_class_id as usize)?)?,
+            None => self.class_value_for(home_class_id)?,
         };
         match self.heap.get(home.heap_index()) {
             HeapObj::Class(c) => c.parent.map(Value::heap),
@@ -480,12 +538,9 @@ impl<'p> Vm<'p> {
     pub(crate) fn super_ctor_fetch(&mut self, home_class_id: u32) -> Value {
         // The RUNNING ctor's own class evaluation, not merely the latest one
         // bound to this class_id — see `running_class_value`.
-        let home = self.running_class_value().or_else(|| {
-            self.class_values
-                .get(home_class_id as usize)
-                .copied()
-                .flatten()
-        });
+        let home = self
+            .running_class_value()
+            .or_else(|| self.class_value_for(home_class_id));
         if let Some(h) = home.filter(|h| h.is_heap()) {
             if let Some(&p) = self.proto_of.get(&h.heap_index()) {
                 return p;
@@ -501,12 +556,7 @@ impl<'p> Vm<'p> {
     /// UNDEFINED if unresolvable. (Unlike `super_parent`, this does not require a
     /// parent class, so `super.x` works in base-class methods.)
     pub(crate) fn super_base(&mut self, home_class_id: u32, is_static: bool) -> Value {
-        let home = match self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()
-        {
+        let home = match self.class_value_for(home_class_id) {
             Some(c) => c,
             None => return Value::UNDEFINED,
         };
@@ -643,12 +693,9 @@ impl<'p> Vm<'p> {
         // Same evaluation the `super()` above resolved against, so a chain built
         // by re-evaluating one class expression initializes each level's OWN
         // fields rather than the newest evaluation's.
-        let cls_v = self.running_class_value().or_else(|| {
-            self.class_values
-                .get(home_class_id as usize)
-                .copied()
-                .flatten()
-        });
+        let cls_v = self
+            .running_class_value()
+            .or_else(|| self.class_value_for(home_class_id));
         if let Some(cv) = cls_v {
             // Checked PrivateBrandAdd: a return-override that already carries
             // this class's private elements, or a non-extensible instance,

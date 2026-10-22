@@ -5900,7 +5900,8 @@ pub(crate) fn compile_proto_mem(
             }
             Instr::LoadClassValue { dst, class_id } => {
                 // The class binding through `jit_load_class_value_ic`; see
-                // the region arm.
+                // the region arm. The flag says the activation, not the top
+                // frame, is the running code.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
                     &mut ops,
@@ -5909,7 +5910,7 @@ pub(crate) fn compile_proto_mem(
                     epilogue,
                     crate::vm::jit_load_class_value_ic as usize,
                     packed_fip,
-                    class_id as u64,
+                    class_id as u64 | crate::vm::LOAD_CLASS_FROM_TIER_C,
                     0,
                     dst,
                     refetch,

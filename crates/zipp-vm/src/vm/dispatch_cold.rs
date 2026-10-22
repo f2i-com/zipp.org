@@ -761,8 +761,12 @@ impl<'p> Vm<'p> {
                     no_has_instance_shape: std::cell::Cell::new(crate::shape::DICT),
                 }))));
                 self.brand_owner.insert(private_brand, v.heap_index());
-                // Remember it so `super` in a derived class can reach it.
-                self.class_values[class_id as usize] = Some(v);
+                // Remember it so `super` in a derived class can reach it, and
+                // whether an earlier evaluation's code may still run
+                // (`class_value_for`).
+                let slot = &mut self.class_values[class_id as usize];
+                slot.repeated |= slot.latest.is_some();
+                slot.latest = Some(v);
                 // A re-executed class declaration swaps this slot to a NEW
                 // class value (+ new prototype chain) without mutating the
                 // OLD prototype objects a JIT method-inline `super` arm's
@@ -2628,7 +2632,7 @@ impl<'p> Vm<'p> {
                 // The inner class-name binding (used by methods/ctor/static
                 // blocks + arrows within them). None = accessed before the
                 // class value is initialized (e.g. `class C extends C`) → TDZ.
-                match self.class_values.get(class_id as usize).copied().flatten() {
+                match self.class_value_for(class_id) {
                     // A class DECORATOR may have replaced the class:
                     // ClassDefinitionEvaluation binds classBinding to the
                     // decorated value, so the inner name means the

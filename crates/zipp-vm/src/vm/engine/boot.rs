@@ -278,7 +278,7 @@ impl<'p> Vm<'p> {
             builtin_globals: std::collections::HashMap::new(),
             builtin_ns_slots: [u32::MAX; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
             math_bare_memo: [(u32::MAX, u32::MAX); crate::bytecode::MATH_FN_COUNT],
-            class_values: vec![None; program.classes.len()],
+            class_values: vec![ClassSlot::default(); program.classes.len()],
             mi_class_epoch: 0,
             class_proto_epoch: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -804,7 +804,7 @@ impl<'p> Vm<'p> {
             .saturating_add(
                 self.class_values
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Option<Value>>()),
+                    .saturating_mul(std::mem::size_of::<ClassSlot>()),
             )
             .saturating_add(
                 self.microtasks

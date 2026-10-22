@@ -162,7 +162,7 @@ impl<'p> Vm<'p> {
             let node = self.eval_arena.classes.push(self.eval_class_tail, cd);
             self.eval_class_tail = Some(node);
             self.eval_classes.push(&node.value);
-            self.class_values.push(None);
+            self.class_values.push(ClassSlot::default());
         }
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.

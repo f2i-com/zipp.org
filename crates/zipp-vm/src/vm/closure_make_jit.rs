@@ -100,6 +100,24 @@ fn make_site_preflight(
     })
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Vm<'_> {
+    /// The callee of the Tier C activation running function `fid`, if one
+    /// is (the identity `make_site_preflight` checks).
+    pub(crate) fn jit_tierc_callee_of(&self, fid: u32) -> Option<Value> {
+        let act = self.jit_tierc_activation;
+        if !act.active || act.callee == NO_CLOSURE || act.callee as usize >= self.heap.len() {
+            return None;
+        }
+        let active_fid = match self.heap.get(act.callee) {
+            HeapObj::Func(f) => *f,
+            HeapObj::Closure { func, .. } => *func,
+            _ => return None,
+        };
+        (active_fid == fid).then_some(Value::heap(act.callee))
+    }
+}
+
 /// Resolve the child proto's capture sources against the live window and
 /// activation closure. Read-only; `None` declines before any effect.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -416,6 +434,10 @@ pub(crate) extern "win64" fn jit_make_closure(
         if let Some(scope) = eval_scope {
             vm.closure_eval_scope.insert(idx, scope);
         }
+        // A function defined inside a class body keeps that body's brand
+        // chain (`make_closure_with_cells`): its private names and, for a class
+        // evaluated more than once, its `super` and class-name resolution.
+        vm.inherit_private_brands(Value::heap(site.active), idx);
         vm.realm_tag_new(idx);
         Value::heap(idx).bits()
     })) {

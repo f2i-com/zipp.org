@@ -1542,7 +1542,11 @@ mod tests {
                     for (var i = 0; i < n; i++) out = invokeSuper();
                     return out;
                 }
-                function retargetSuper() { make(50); return invokeSuper(); }
+                function retargetSuper() {
+                    var first = superObj;
+                    superObj = make(50);
+                    return invokeSuper() * 1000 + first.area();
+                }
             "#,
             )
             .expect("compiles"),
@@ -1656,13 +1660,14 @@ mod tests {
             "deleted setters must not observe the failed real-call writes"
         );
 
-        // Re-running the factory changes the live class epoch. Zipp's existing
-        // per-class-id semantics retarget the first instance too; the important
-        // invariant here is that moved native code observes the new epoch and
-        // agrees with the interpreter instead of using the stale super chain.
+        // Re-running the factory changes the live class epoch. The new
+        // instance's `super.area()` is its own class's (k = 50: 184), which
+        // moved native code must take from the new epoch instead of the stale
+        // super chain it baked; the first instance keeps its own class's
+        // answer (37), as each class evaluation's code resolves its own.
         assert_eq!(
             st.call_global("retargetSuper", &[]),
-            Ok(JsValue::Number(184.0))
+            Ok(JsValue::Number(184_037.0))
         );
     }
 

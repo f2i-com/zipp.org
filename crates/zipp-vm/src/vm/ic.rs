@@ -3037,11 +3037,12 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()?;
+        // A repeated class's methods are shared by all its evaluations, so no
+        // one home can be baked into their code: the helper resolves it.
+        if self.class_repeated(home_class_id) {
+            return None;
+        }
+        let home = self.class_value_for(home_class_id)?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::SuperData {
@@ -3095,11 +3096,12 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()?;
+        // A repeated class's methods are shared by all its evaluations, so no
+        // one home can be baked into their code: the helper resolves it.
+        if self.class_repeated(home_class_id) {
+            return None;
+        }
+        let home = self.class_value_for(home_class_id)?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::SuperAcc {
@@ -3160,11 +3162,12 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()?;
+        // A repeated class's methods are shared by all its evaluations, so no
+        // one home can be baked into their code: the helper resolves it.
+        if self.class_repeated(home_class_id) {
+            return None;
+        }
+        let home = self.class_value_for(home_class_id)?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::SuperAcc {
@@ -3363,11 +3366,7 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> Option<(u32, u32, Value)> {
-        let home = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()?;
+        let home = self.class_value_for(home_class_id)?;
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
                 if let IcEntry::SuperData {
@@ -3430,12 +3429,7 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> GetAct {
-        let Some(home) = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(home) = self.class_value_for(home_class_id) else {
             return GetAct::None;
         };
         if let Some(site) = self.ic_site(func_id, ip) {
@@ -3507,12 +3501,7 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> SetAct {
-        let Some(home) = self
-            .class_values
-            .get(home_class_id as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(home) = self.class_value_for(home_class_id) else {
             return SetAct::None;
         };
         if let Some(site) = self.ic_site(func_id, ip) {

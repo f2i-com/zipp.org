@@ -1396,9 +1396,15 @@ pub(crate) extern "win64" fn jit_obj_init_ic(
     })
 }
 
+/// Set in `jit_load_class_value_ic`'s `packed_args` by a Tier C body, whose
+/// activation, not the top frame, says which code is running.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const LOAD_CLASS_FROM_TIER_C: u64 = 1 << 63;
+
 /// Win64 helper for `LoadClassValue` (a method naming its own class, as in
 /// `return new Vec(...)` inside `class Vec`) in a compiled region or Tier C
-/// body: `class_values[packed_args]`, through a decorator's replacement, as
+/// body: the class value of the class id in `packed_args`'s low bits for the
+/// running code (`class_value_for`), through a decorator's replacement, as
 /// the interpreter's arm reads it. Before the class value exists (its TDZ)
 /// the ReferenceError is thrown through the call protocol.
 ///
@@ -1414,7 +1420,26 @@ pub(crate) extern "win64" fn jit_load_class_value_ic(
 ) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
-        match vm.class_values.get(packed_args as usize).copied().flatten() {
+        let class_id = packed_args as u32;
+        let fid = (_packed_fip >> 32) as u32;
+        // A repeated class is resolved through the running callee's brand
+        // chain (`class_value_for`): a Tier C body (which sets
+        // `LOAD_CLASS_FROM_TIER_C`) through its activation's callee, a loop
+        // region through this function's own top frame, and anything else
+        // declines to the interpreter.
+        let resolved = if !vm.class_repeated(class_id) {
+            vm.class_value_for(class_id)
+        } else if packed_args & LOAD_CLASS_FROM_TIER_C != 0 {
+            match vm.jit_tierc_callee_of(fid) {
+                Some(callee) => vm.class_value_for_callee(class_id, callee),
+                None => return crate::codegen::SELF_CALL_DEOPT,
+            }
+        } else if vm.frames.last().is_some_and(|f| f.func == fid) {
+            vm.class_value_for(class_id)
+        } else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        match resolved {
             Some(v) => match vm.heap.get(v.heap_index()) {
                 HeapObj::Class(c) => match &c.dec {
                     Some(d) if d.replacement.is_heap() => d.replacement.bits(),

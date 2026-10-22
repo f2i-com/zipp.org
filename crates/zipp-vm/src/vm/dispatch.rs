@@ -1993,10 +1993,7 @@ impl<'p> Vm<'p> {
                         // no class link at all); fall back to `this`'s class for
                         // the sentinel (a base class, no override possible).
                         let key = if class_id != u32::MAX {
-                            self.class_values
-                                .get(class_id as usize)
-                                .copied()
-                                .flatten()
+                            self.class_value_for(class_id)
                                 .filter(|cv| cv.is_heap())
                                 .and_then(|cv| match self.heap.get(cv.heap_index()) {
                                     HeapObj::Class(c) => {

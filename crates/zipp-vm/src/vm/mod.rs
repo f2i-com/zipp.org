@@ -644,6 +644,16 @@ pub(crate) enum EnumWhat {
     Entries,
 }
 
+/// One compile-time class's entry in `Vm::class_values`: its latest
+/// evaluation, and whether an earlier one exists. A class inside a function
+/// called twice leaves only the latest here; the code of an earlier
+/// evaluation finds its own through its brand chain (`Vm::class_value_for`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ClassSlot {
+    pub(crate) latest: Option<Value>,
+    pub(crate) repeated: bool,
+}
+
 /// A module whose dependencies are still evaluating (top-level await):
 /// everything needed to execute its body once they settle. Holds NO heap
 /// Values (slots/ids only) — the namespace itself is rooted via module_cache.
@@ -1590,8 +1600,9 @@ pub struct Vm<'p> {
     /// `u32::MAX` slot = not resolved. See `Vm::math_bare_is_intrinsic`.
     math_bare_memo: [(u32, u32); crate::bytecode::MATH_FN_COUNT],
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
-    /// `super` call can reach its lexical superclass value at runtime.
-    class_values: Vec<Option<Value>>,
+    /// `super` call can reach its lexical superclass value at runtime, and
+    /// whether the class was evaluated before (`Vm::class_value_for`).
+    class_values: Vec<ClassSlot>,
     /// Bumped on every `class_values` write (class declaration / redefinition).
     /// The JIT method-inline `super.m()` arm bakes this epoch + a pointer to it
     /// and re-checks it each call: a re-executed class declaration swaps

@@ -444,7 +444,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.class_values.get(class_id as usize).copied().flatten()
+        self.class_values.get(class_id as usize).and_then(|slot| slot.latest)
     }
 
     // ── MakeClass hook ──────────────────────────────────────────────────────

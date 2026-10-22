@@ -559,7 +559,7 @@ impl Vm<'_> {
                 root_idx!(state.callee);
             }
         }
-        for v in self.class_values.iter().flatten() {
+        for v in self.class_values.iter().filter_map(|slot| slot.latest.as_ref()) {
             root_val!(*v);
         }
         if let Some(v) = self.pending_throw {
