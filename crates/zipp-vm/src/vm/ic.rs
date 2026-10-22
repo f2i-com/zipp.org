@@ -65,6 +65,7 @@ use super::props::ClassLookup;
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{ClassData, Handler, Heap, HeapObj, ObjMap, PropAttr};
+use crate::slot_table::ProtoTable;
 use crate::value::Value;
 
 /// Ways per call-site cache. The class benches cycle 4 receiver shapes and the
@@ -926,29 +927,24 @@ impl<'p> Vm<'p> {
     /// map when the chain still stands.
     #[inline]
     fn ic_chain_ok(&self, recv_idx: u32, first: u8, hops: &IcHops) -> Option<&ObjMap> {
-        // First link re-read (the receiver itself is not version-guarded).
+        // First link re-read (the receiver itself is not version-guarded),
+        // from `proto_of`'s link copy.
+        let link = self.proto_of.link(recv_idx);
         match first {
             FIRST_HEAP => {
-                let p = self.proto_of.get(&recv_idx)?;
-                if !p.is_heap() || p.heap_index() != hops.0[0].0 {
+                if link < ProtoTable::HEAP_BASE || link - ProtoTable::HEAP_BASE != hops.0[0].0 {
                     return None;
                 }
             }
             FIRST_DEFAULT => {
-                if self.proto_of.get(&recv_idx).is_some()
-                    || hops.1 == 0
-                    || hops.0[0].0 != self.obj_proto
-                {
+                if link != ProtoTable::NONE || hops.1 == 0 || hops.0[0].0 != self.obj_proto {
                     return None;
                 }
             }
             _ => {
                 // FIRST_NULL: the receiver's explicit proto must still be
                 // non-heap (a miss entry with no hops).
-                match self.proto_of.get(&recv_idx) {
-                    Some(p) if !p.is_heap() => return Some(self.ic_empty_map()),
-                    _ => return None,
-                }
+                return (link == ProtoTable::NON_HEAP).then(|| self.ic_empty_map());
             }
         }
         // Hop versions: any key add/remove/defineProperty/setPrototypeOf on a

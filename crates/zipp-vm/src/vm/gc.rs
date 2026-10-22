@@ -211,6 +211,28 @@ impl<V> SlotKeyed for crate::slot_table::SlotTable<V> {
     }
 }
 
+/// `proto_of`: the table's own walks, with its link copy kept in step.
+impl SlotKeyed for crate::slot_table::ProtoTable {
+    #[inline(never)]
+    fn retain_marked(&mut self, marks: &[bool]) {
+        self.retain(|&k| marks[k as usize]);
+    }
+
+    #[inline(never)]
+    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+        if self.is_empty() {
+            return;
+        }
+        if self.len() <= freed.len() {
+            self.retain(|&k| live[k as usize]);
+        } else {
+            for &i in freed {
+                self.forget(i);
+            }
+        }
+    }
+}
+
 impl Vm<'_> {
     /// Pin everything allocated so far (called once, after setup + hoisting).
     pub(crate) fn set_gc_floor(&mut self) {

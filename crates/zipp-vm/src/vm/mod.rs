@@ -2199,7 +2199,7 @@ pub struct Vm<'p> {
     ctor_initial_name: rustc_hash::FxHashMap<u32, String>,
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
-    proto_of: crate::slot_table::SlotTable<Value>,
+    proto_of: crate::slot_table::ProtoTable,
     /// The lite loop's tables (`vm/lite.rs`).
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     lite: lite::LiteState<'p>,
