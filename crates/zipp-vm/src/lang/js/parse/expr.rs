@@ -1380,10 +1380,7 @@ impl<'s> Parser<'s> {
                 }
             }
             TokenKind::Eof => Err(self.err_here("SyntaxError: unexpected end of input")),
-            TokenKind::Punct(p) => {
-                let p = *p;
-                Err(self.err_here(format!("SyntaxError: unexpected token {p:?}")))
-            }
+            TokenKind::Punct(_) => Err(self.unexpected_here()),
         }
     }
 

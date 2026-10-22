@@ -198,6 +198,10 @@ struct Compiler {
     /// `source`'s lines, for the positions of call sites (`FuncProto::
     /// call_sites`); built when the first function with one is finished.
     source_index: std::cell::OnceCell<positions::SourceIndex>,
+    /// Where the host's text sits in `source` when it is not all the host's
+    /// (an embedding preamble, an expression wrapper): call sites then record
+    /// the host's positions (see `positions::SourceOrigin`).
+    origin: Option<positions::SourceOrigin>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
@@ -946,6 +950,7 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
+pub(crate) use positions::{locate_message, SourceOrigin};
 pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;
 pub(crate) use string_accum::*;

@@ -88,10 +88,10 @@ function thrown(fn) {
     same(label, e.callFunction("auditThis", []), want);
     close(e);
   }
-  // Positions are those of the concatenation, exactly as before, so the
-  // preamble line count still corrects them.
+  // Positions are the guest's own since 0.0.29 (stack-positions.cjs), so
+  // there is nothing left for a host to correct by.
   const { e } = init('"use strict"; var here = 1;');
-  check("preambleLines is still the offset a host corrects by", e.preambleLines > 0);
+  check("preambleLines is the correction a host still needs: none", e.preambleLines === 0);
   close(e);
   const { e: g } = init('"use strict"; var persistent = 5; function readIt(){ return persistent; }');
   same("strict guests keep persistent globals and preamble helpers", [g.callFunction("readIt", []), g.getEventListenerTypes()], [5, []]);

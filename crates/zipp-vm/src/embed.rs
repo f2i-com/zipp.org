@@ -201,14 +201,105 @@ pub struct CompileOptions {
     pub goal: ScriptGoal,
 }
 
+/// Where a host's script comes from, as Node's `vm.Script` options say it:
+/// the name its stack frames and its syntax errors report, and offsets added
+/// to the positions they report. A host that put lines of its own ahead of
+/// the code it was given passes minus their count as `line_offset`, and its
+/// code's line 1 is then line 1 again; a position the offsets move before
+/// line 1 or column 1 is reported without one (V8 omits a line 0 that way
+/// and prints a negative one).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptOrigin {
+    /// The script's name in a stack (`at f (name:1:5)`); `None` is
+    /// `<anonymous>`. See [`ScriptState::set_script_name`].
+    pub name: Option<String>,
+    /// Added to every line, as `vm.Script`'s `lineOffset`.
+    pub line_offset: i32,
+    /// Added to the columns of the script's first line, as `columnOffset`.
+    pub column_offset: i32,
+}
+
 /// [`compile_script`] under an explicit grammar goal.
+///
+/// A syntax error is reported with its position as a stack frame would give
+/// it: `SyntaxError: unexpected token ';'\n    at <anonymous>:2:9`.
 pub fn compile_script_with_options(
     src: &str,
     options: &CompileOptions,
 ) -> Result<ScriptState, String> {
-    let ast = crate::front::parse_script_with(src, options.goal.allow_return(), false)?;
-    let program = crate::compile::compile_main_program(&ast, src)?;
-    Ok(ScriptState::from_program(program))
+    compile_with_origin(None, src, options, &ScriptOrigin::default())
+}
+
+/// [`compile_script_with_options`] for a script from `origin`: its frames
+/// and its syntax errors give `origin`'s name and positions.
+pub fn compile_script_with_origin(
+    src: &str,
+    options: &CompileOptions,
+    origin: &ScriptOrigin,
+) -> Result<ScriptState, String> {
+    compile_with_origin(None, src, options, origin)
+}
+
+/// [`compile_script_with_preamble`] for a script from `origin`: its frames
+/// and its syntax errors give `origin`'s name and positions in `source`.
+pub fn compile_script_with_preamble_and_origin(
+    preamble: &str,
+    source: &str,
+    options: &CompileOptions,
+    origin: &ScriptOrigin,
+) -> Result<ScriptState, String> {
+    compile_with_origin(Some(preamble), source, options, origin)
+}
+
+fn compile_with_origin(
+    preamble: Option<&str>,
+    source: &str,
+    options: &CompileOptions,
+    origin: &ScriptOrigin,
+) -> Result<ScriptState, String> {
+    let allow_return = options.goal.allow_return();
+    let (full, guest_start, strict): (std::borrow::Cow<str>, usize, bool) = match preamble {
+        None => (source.into(), 0, false),
+        Some(preamble) => {
+            let strict = crate::front::script_prologue_is_strict(source, allow_return);
+            let mut full = String::with_capacity(preamble.len() + 1 + source.len());
+            full.push_str(preamble);
+            full.push('\n');
+            let guest_start = full.len();
+            full.push_str(source);
+            if source.starts_with("#!") {
+                // Same byte length, same line count: the guest's positions
+                // stay where they are.
+                full.replace_range(guest_start..guest_start + 2, "//");
+            }
+            (full.into(), guest_start, strict)
+        }
+    };
+    // Positions count from the guest's first line, plus the host's offsets.
+    let at = (preamble.is_some() || origin.line_offset != 0 || origin.column_offset != 0).then(|| {
+        crate::compile::SourceOrigin {
+            guest: guest_start as u32..full.len() as u32,
+            preamble: true,
+            line_offset: origin.line_offset,
+            column_offset: origin.column_offset,
+        }
+    });
+    let name = origin.name.as_deref();
+    let ast = crate::front::parse_script_with_located(&full, allow_return, strict).map_err(|f| {
+        match f.pos {
+            Some(pos) => crate::compile::locate_message(&f.message, &full, pos, name, at.as_ref()),
+            None => f.message,
+        }
+    })?;
+    let program = match at {
+        Some(at) => crate::compile::compile_main_program_with_origin(&ast, &full, at)?,
+        None => crate::compile::compile_main_program(&ast, &full)?,
+    };
+    let mut state = ScriptState::from_program(program);
+    if let Some(name) = name {
+        state.set_script_name(name);
+    }
+    Ok(state)
 }
 
 /// Compile `preamble` followed by `source` as ONE program — the two share a
@@ -227,31 +318,20 @@ pub fn compile_script_with_options(
 /// be strict-clean, so it runs the same either way; the guest is exactly as
 /// strict as it asked to be, and only then.
 ///
-/// Source positions are those of the concatenation, exactly as before: a
-/// host still corrects a compile error's line by the number of preamble
-/// lines. A guest hashbang is honoured even though it is no longer the first
-/// bytes of the program (it is turned into a line comment of the same
+/// Source positions are the guest's own: an error's stack and a syntax
+/// error count lines and columns from `source`'s first character, so a host
+/// has nothing to correct. A frame of the preamble's code is named
+/// `zipp:preamble`, at its line in `preamble`. (Before 0.0.29 positions were
+/// those of the concatenation, `preamble`'s lines plus one more ahead of the
+/// guest's.) A guest hashbang is honoured even though it is no longer the
+/// first bytes of the program (it is turned into a line comment of the same
 /// length), and a guest BOM is whitespace.
 pub fn compile_script_with_preamble(
     preamble: &str,
     source: &str,
     options: &CompileOptions,
 ) -> Result<ScriptState, String> {
-    let allow_return = options.goal.allow_return();
-    let strict = crate::front::script_prologue_is_strict(source, allow_return);
-    let mut full = String::with_capacity(preamble.len() + 1 + source.len());
-    full.push_str(preamble);
-    full.push('\n');
-    let guest_start = full.len();
-    full.push_str(source);
-    if source.starts_with("#!") {
-        // Same byte length, same line count: positions stay those of the
-        // concatenation.
-        full.replace_range(guest_start..guest_start + 2, "//");
-    }
-    let ast = crate::front::parse_script_with(&full, allow_return, strict)?;
-    let program = crate::compile::compile_main_program(&ast, &full)?;
-    Ok(ScriptState::from_program(program))
+    compile_with_origin(Some(preamble), source, options, &ScriptOrigin::default())
 }
 
 impl ScriptState {
@@ -427,8 +507,31 @@ impl ScriptState {
     /// memory without bound. Prefer defining a function once and calling it
     /// with [`Self::call_global`].
     pub fn eval_in_context(&mut self, src: &str) -> Result<JsValue, String> {
+        self.eval_in_context_with(src, None)
+    }
+
+    /// [`Self::eval_in_context`] for a host's expression inside code of the
+    /// host's own: `src[guest]` is the expression, the rest the wrapper
+    /// around it (`JSON.stringify((function () { return (` … `); })())`).
+    /// An error's `stack` then gives the expression's own positions, column
+    /// 1 being its first character, and leaves out the frames the wrapper
+    /// adds; the call the wrapper makes into the expression stays, as the
+    /// frame of `<anonymous>` code it is.
+    pub fn eval_wrapped_in_context(
+        &mut self,
+        src: &str,
+        guest: std::ops::Range<usize>,
+    ) -> Result<JsValue, String> {
+        self.eval_in_context_with(src, Some(wrapper_origin(guest)))
+    }
+
+    fn eval_in_context_with(
+        &mut self,
+        src: &str,
+        origin: Option<crate::compile::SourceOrigin>,
+    ) -> Result<JsValue, String> {
         self.with_vm(|vm| {
-            let result = match eval_indirect(vm, src) {
+            let result = match eval_indirect(vm, src, origin) {
                 Ok(v) => Ok(marshal(vm, v)),
                 Err(thrown) => Err(vm.take_host_throw(thrown)),
             };
@@ -597,7 +700,7 @@ impl ScriptState {
     /// the previous hook, if any, then stays.
     pub fn set_promise_rejection_hook(&mut self, expression: &str) -> Result<(), String> {
         self.with_vm(|vm| {
-            let hook = match eval_indirect(vm, expression) {
+            let hook = match eval_indirect(vm, expression, None) {
                 Ok(v) => v,
                 Err(thrown) => return Err(vm.take_host_throw(thrown)),
             };
@@ -1009,7 +1112,19 @@ impl ScriptState {
         src: &str,
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
-        self.with_vm(|vm| vm.host_eval_rich(src, budget))
+        self.with_vm(|vm| vm.host_eval_rich(src, budget, None))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
+    }
+
+    /// [`Self::eval_in_context_rich`] for an expression at `src[guest]`
+    /// inside a host's wrapper, as [`Self::eval_wrapped_in_context`] takes it.
+    pub fn eval_wrapped_in_context_rich(
+        &mut self,
+        src: &str,
+        guest: std::ops::Range<usize>,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        self.with_vm(|vm| vm.host_eval_rich(src, budget, Some(wrapper_origin(guest))))
             .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
     }
 
@@ -1240,7 +1355,11 @@ impl ScriptState {
 /// and `var_env_global = true` (top-level `var`/`function` bind realm globals
 /// rather than a throwaway scope, which is what makes declarations persist
 /// between calls).
-fn eval_indirect(vm: &mut Vm<'_>, src: &str) -> Result<Value, crate::vm::Thrown> {
+fn eval_indirect(
+    vm: &mut Vm<'_>,
+    src: &str,
+    origin: Option<crate::compile::SourceOrigin>,
+) -> Result<Value, crate::vm::Thrown> {
     vm.do_eval(
         src,
         false,            // force_strict: inherit the source's own directive
@@ -1257,7 +1376,19 @@ fn eval_indirect(vm: &mut Vm<'_>, src: &str) -> Result<Value, crate::vm::Thrown>
         None,             // caller_scope
         None,             // eval_scope_idx
         None,             // exact_src: `src` is well-formed UTF-8 by type
+        origin,
     )
+}
+
+/// The [`crate::compile::SourceOrigin`] of an expression at `guest` inside a
+/// host's wrapper (`eval_wrapped_in_context`).
+fn wrapper_origin(guest: std::ops::Range<usize>) -> crate::compile::SourceOrigin {
+    crate::compile::SourceOrigin {
+        guest: guest.start as u32..guest.end as u32,
+        preamble: false,
+        line_offset: 0,
+        column_offset: 0,
+    }
 }
 
 /// A plain JS identifier — no dots, no call syntax, no operators. Guards the

@@ -615,6 +615,7 @@ impl<'s> Parser<'s> {
                 return Err(self.err_here("SyntaxError: decorators must precede a class"));
             }
             self.bump_after_operand()?;
+            self.expect_class_decl_name()?;
             let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
@@ -655,6 +656,7 @@ impl<'s> Parser<'s> {
             let (dstart, decorators) = self.take_class_decorators()?;
             let start = dstart.unwrap_or_else(|| self.cur().span.start);
             self.bump_after_operand()?;
+            self.expect_class_decl_name()?;
             let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;

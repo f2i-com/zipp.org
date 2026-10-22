@@ -1500,11 +1500,13 @@ impl<'p> Vm<'p> {
     /// `evalInContext` performs, with the same cycle, depth, opaque and
     /// budget rules as a slot read. Microtasks are drained afterwards, as
     /// [`Self::host_call_slot`] drains them. Each call compiles and retains a
-    /// program; it is for one-off queries, never a per-frame path.
+    /// program; it is for one-off queries, never a per-frame path. `origin`
+    /// places an expression the host wrapped (`eval_wrapped_in_context_rich`).
     pub(crate) fn host_eval_rich(
         &mut self,
         src: &str,
         budget: &mut HostValueBudget,
+        origin: Option<crate::compile::SourceOrigin>,
     ) -> Result<HostValue, HostCallError> {
         let res = self.do_eval(
             src,
@@ -1522,6 +1524,7 @@ impl<'p> Vm<'p> {
             None,             // caller_scope
             None,             // eval_scope_idx
             None,             // exact_src
+            origin,
         );
         // Rooted across the drain, as a slot call's result is (ZA-05).
         self.marshal_after_drain(res, budget, true)

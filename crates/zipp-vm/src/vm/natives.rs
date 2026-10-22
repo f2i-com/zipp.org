@@ -1812,6 +1812,7 @@ impl<'p> Vm<'p> {
             None,
             None,
             exact.as_deref(),
+            None,
         );
         self.active_realm = prev_realm;
         let v = evaled?;
@@ -5850,6 +5851,7 @@ impl<'p> Vm<'p> {
                         None,
                         None,
                         exact.as_deref(),
+                        None,
                     );
                 }
             }

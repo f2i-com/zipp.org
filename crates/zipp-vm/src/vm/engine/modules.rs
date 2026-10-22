@@ -549,6 +549,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             false,
             false,
+            None,
         ) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
@@ -1603,6 +1604,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             false,
             false,
+            None,
         ) else {
             return false;
         };

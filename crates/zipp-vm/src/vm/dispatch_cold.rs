@@ -2068,6 +2068,7 @@ impl<'p> Vm<'p> {
                         },
                         eval_scope_idx,
                         exact.as_deref(),
+                        None,
                     );
                     // `direct_eval_installed` is set only by the `do_eval` this
                     // arm asked, and taken here even when that eval threw: a

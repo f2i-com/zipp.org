@@ -3448,6 +3448,8 @@ pub(crate) mod eval_arena;
 mod dispatch;
 mod dispatch_cold;
 mod engine;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub(crate) use engine::file_url;
 pub(crate) mod host_api;
 mod indexing_date;
 /// Step budget, cooperative abort, and the optional execution trace. Off by

@@ -161,8 +161,9 @@ mod growth {
 // here: one `str::parse::<f64>()` in this crate links core's 10 KB
 // power-of-five table back into every module.
 use zipp_vm::embed::{
-    compile_script_with_preamble, parse_f64, CompileOptions, ConsoleStream, FingerprintBudget,
-    HostCallError, HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,
+    compile_script_with_preamble_and_origin, parse_f64, CompileOptions, ConsoleStream,
+    FingerprintBudget, HostCallError, HostCtx, HostValue, HostValueBudget, ScriptGoal,
+    ScriptOrigin, ScriptState, SymbolScope,
     DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
     DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
@@ -217,6 +218,8 @@ const RICH_EVAL_SUFFIX: &str = "); })()";
 // the embedding boundary: a guest must not be able to raise its own ceiling,
 // and every browser host gets the same fail-closed defaults.
 const MAX_INITIAL_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+// A script's name is repeated in every frame of every stack it reports.
+const MAX_SCRIPT_NAME_BYTES: usize = 4096;
 const MAX_DYNAMIC_CODE_SOURCE_BYTES: usize = 64 * 1024;
 // `evalInContext` adds a fixed host-controlled wrapper before it enters the
 // same VM-wide dynamic compiler gate as guest `eval`/`Function`/ShadowRealm.
@@ -523,9 +526,9 @@ pub struct Engine {
     /// What a failed initialization printed before its error, kept for
     /// `takeFailedConsole` after the engine is disposed.
     failed_init_console: Vec<(ConsoleStream, String)>,
-    /// Number of lines the preamble adds, so a host can correct the line
-    /// numbers in a compile error back to its own source.
-    preamble_lines: u32,
+    /// The name and position offsets the host gave its script
+    /// (`setScriptOrigin`), applied when it is compiled.
+    script_origin: ScriptOrigin,
     /// `evalInContext` installs stable-address definitions that are not broadly
     /// reclaimed on Engine disposal. Track both calls and exact wrapper-source
     /// bytes so one Engine has a strict contribution bound; hosts recycle the
@@ -580,7 +583,7 @@ impl Engine {
             slots: Vec::new(),
             helpers: Helpers::default(),
             bridges: Rc::new(RefCell::new(Bridges::default())),
-            preamble_lines: PREAMBLE.lines().count() as u32,
+            script_origin: ScriptOrigin::default(),
             eval_calls: 0,
             eval_retained_source_bytes: 0,
             disposed: false,
@@ -592,10 +595,50 @@ impl Engine {
         }
     }
 
-    /// Lines the preamble prepends to the host's source.
+    /// Lines a host still has to subtract from the positions this engine
+    /// reports: 0. An error's `stack` and a syntax error from `initScript`
+    /// count lines and columns from the host's own source (shifted by
+    /// `setScriptOrigin`'s offsets, if it set any), and name a frame of the
+    /// engine's preamble `zipp:preamble`. Up to 0.0.28 positions were those
+    /// of the preamble and the source together, and this was the preamble's
+    /// line count, one short of the true shift; it is 0 now so that a host
+    /// that subtracts it stays right.
     #[wasm_bindgen(getter, js_name = preambleLines)]
     pub fn preamble_lines(&self) -> u32 {
-        self.preamble_lines
+        0
+    }
+
+    /// Name the script `initScript` compiles, and offset the positions its
+    /// errors report, as Node's `vm.Script` options `filename`, `lineOffset`
+    /// and `columnOffset` do. Frames then read `at f (name:line:col)`, and a
+    /// syntax error `SyntaxError: ...\n    at name:line:col`; without a name
+    /// they say `<anonymous>`. `lineOffset` is added to every line and
+    /// `columnOffset` to the columns of the first line, so a host that put
+    /// lines of its own ahead of the code it was given passes minus their
+    /// count; a position the offsets move before line 1 or column 1 is
+    /// reported without one. Call it before `initScript`.
+    #[wasm_bindgen(js_name = setScriptOrigin)]
+    pub fn set_script_origin(
+        &mut self,
+        name: Option<String>,
+        line_offset: Option<f64>,
+        column_offset: Option<f64>,
+    ) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        if name.as_ref().is_some_and(|name| name.len() > MAX_SCRIPT_NAME_BYTES) {
+            return Err(self.usage_error(&format!(
+                "RangeError: a script name may be at most {MAX_SCRIPT_NAME_BYTES} bytes"
+            )));
+        }
+        let offset = |value: Option<f64>, what: &str| match value {
+            None => Ok(0),
+            Some(v) if v.fract() == 0.0 && v.abs() <= i32::MAX as f64 => Ok(v as i32),
+            Some(_) => Err(self.usage_error(&format!("RangeError: {what} must be an integer"))),
+        };
+        let line_offset = offset(line_offset, "lineOffset")?;
+        let column_offset = offset(column_offset, "columnOffset")?;
+        self.script_origin = ScriptOrigin { name, line_offset, column_offset };
+        Ok(())
     }
 
     /// Install the object backing `db.*`. Its methods are called synchronously
@@ -723,10 +766,14 @@ impl Engine {
         let language: zipp_vm::frontend::LanguageId = language
             .parse()
             .map_err(|error: String| self.usage_error(&error))?;
+        let origin = self.script_origin.clone();
         self.initialize(language, source.len(), || match language {
-            zipp_vm::frontend::LanguageId::JavaScript => {
-                compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
-            }
+            zipp_vm::frontend::LanguageId::JavaScript => compile_script_with_preamble_and_origin(
+                PREAMBLE,
+                source,
+                &GUEST_COMPILE_OPTIONS,
+                &origin,
+            ),
             zipp_vm::frontend::LanguageId::Python => zipp_vm::frontend::compile_source(
                 source,
                 zipp_vm::frontend::Frontend::Python {
@@ -862,11 +909,6 @@ impl Engine {
         // code can invoke a synchronous host bridge.
         self.host_configuration_frozen = true;
         self.source_language = language;
-        self.preamble_lines = if language == zipp_vm::frontend::LanguageId::JavaScript {
-            PREAMBLE.lines().count() as u32
-        } else {
-            0
-        };
         // Reject before allocating the combined preamble+guest buffer or
         // entering the parser. Source size is a compile-time resource, so the
         // VM's execution/heap recorder cannot protect this path for us.
@@ -1459,12 +1501,14 @@ impl Engine {
         }
         // Route the result through JSON so structured values survive; the
         // shallow `eval_in_context` marshaller would render them as ToString.
+        // An error's stack counts from `expr` and leaves the wrapper out.
         let wrapped = self.account_eval("evalInContext", expr, EVAL_PREFIX, EVAL_SUFFIX)?;
+        let guest = EVAL_PREFIX.len()..EVAL_PREFIX.len() + expr.len();
         let result = self
             .state
             .as_mut()
             .expect("initialization checked by account_eval")
-            .eval_in_context(&wrapped);
+            .eval_wrapped_in_context(&wrapped, guest);
         let value = self.finish_execution(result)?;
         match value.as_str() {
             Some(s) => {
@@ -1515,11 +1559,12 @@ impl Engine {
             RICH_EVAL_SUFFIX,
         )?;
         let mut budget = HostValueBudget::default();
+        let guest = RICH_EVAL_PREFIX.len()..RICH_EVAL_PREFIX.len() + expr.len();
         let result = self
             .state
             .as_mut()
             .expect("initialization checked by account_eval")
-            .eval_in_context_rich(&wrapped, &mut budget);
+            .eval_wrapped_in_context_rich(&wrapped, guest, &mut budget);
         // A resource ceiling is terminal whatever the typed error says.
         let (result, kind) = classify_host_call_result(result);
         let value = self.finish_classified_execution(result, kind)?;
@@ -3497,8 +3542,9 @@ fn from_js_bounded(
 
 #[cfg(test)]
 mod tests {
+    use zipp_vm::embed::compile_script_with_preamble;
     use super::{
-        compile_script_with_preamble, host_dispatch, is_allowed_sync_host_call,
+        host_dispatch, is_allowed_sync_host_call,
         parse_accel_identifier, resolve_accel_spec, sync_host_call_arity, Bridges, HostCtx,
         HostValue, GUEST_COMPILE_OPTIONS, MAX_ACCEL_SPEC_BYTES, MAX_ACCEL_SPEC_ENTRIES,
         MAX_ACCEL_SPEC_NAME_BYTES, MAX_SYNC_BRIDGE_ARGS, MAX_SYNC_BRIDGE_BYTES, PREAMBLE,

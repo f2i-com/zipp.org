@@ -734,8 +734,9 @@ fn run_with_policy(
 ) -> Result<Outcome, String> {
     // Annex B call assignment targets (`f() = 1` in sloppy code) need no
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
-    // directly and the compiler emits the runtime ReferenceError.
-    let ast = front::parse_auto(src)?;
+    // directly and the compiler emits the runtime ReferenceError. A syntax
+    // error is reported where it is, as a frame of the script.
+    let ast = front::parse_auto_located(src).map_err(|f| f.located(src, script_name))?;
     let program = compile::compile_main_program(&ast, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
@@ -838,7 +839,12 @@ pub fn run_module_file(
         Some(h) => Some(std::fs::read_to_string(h).map_err(|e| format!("read error: {e}"))?),
         None => None,
     };
-    let entry_ast = front::parse_module(&src)?;
+    // A syntax error is reported where it is, in the entry's file URL, as
+    // its frames and its `import.meta.url` name it.
+    let entry_ast = front::parse_module_located(&src).map_err(|f| {
+        let url = std::path::absolute(path).map(|p| vm::file_url(&p));
+        f.located(&src, url.as_deref().ok())
+    })?;
     compile::compile_module(&entry_ast, &src)?;
     // The harness (if any) runs as a realm SCRIPT — its vars become realm
     // globals every module can reference — then the entry loads through the

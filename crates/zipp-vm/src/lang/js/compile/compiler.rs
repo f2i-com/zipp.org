@@ -71,6 +71,7 @@ impl Compiler {
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
             source_index: std::cell::OnceCell::new(),
+            origin: None,
             eval_mode: false,
             script_completion: false,
             eval_inherit_super: None,
@@ -151,11 +152,17 @@ impl Compiler {
             .unwrap_or_default()
     }
 
-    /// The `(line, column)` of source byte offset `off` (see `positions`).
+    /// The `(line, column)` a call site at source byte offset `off` records
+    /// (see `positions`): the source's own, or the host's under `origin`.
     pub(crate) fn line_col(&self, off: u32) -> (u32, u32) {
-        self.source_index
-            .get_or_init(|| super::positions::SourceIndex::new(&self.source))
-            .line_col(off)
+        let idx = self
+            .source_index
+            .get_or_init(|| super::positions::SourceIndex::new(&self.source));
+        let (line, col) = idx.line_col(off);
+        match &self.origin {
+            Some(origin) => origin.place(idx, off, line, col),
+            None => (line, col),
+        }
     }
 
     /// Look up an already-reserved global without changing the deterministic

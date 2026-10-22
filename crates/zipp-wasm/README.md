@@ -744,10 +744,31 @@ force: the parser reads `"use strict"` off the guest text before the two are
 combined, so a strict guest gets strict assignment, receiver and early-error
 semantics even though preamble statements precede it, a sloppy guest stays
 sloppy, and an escaped or expression-position string is not a directive. A
-guest hashbang and BOM are honoured; source positions are those of the
-concatenation, so `preambleLines` still corrects them. Preamble binding names
+guest hashbang and BOM are honoured. Preamble binding names
 come from a compiler-checked static manifest, so filtering host-visible slots
 does not retain a second preamble-only `ScriptState` allocation.
+
+Positions are the guest's own. An error's `stack` and a syntax error from
+`initScript` count lines and columns from the first character of the source
+the host passed, as `zipp js` and Node count a file, so there is nothing to
+correct: `preambleLines` is 0 (up to 0.0.28 positions were those of the
+concatenation, and it returned the preamble's line count, one short of the
+true shift). A syntax error reads `SyntaxError: unexpected token ';'\n    at
+<anonymous>:2:9`. A frame of the preamble's own code is named
+`zipp:preamble` (`at __zDispatchEvent (zipp:preamble:109:12)`, a line of the
+embedded, comment-free preamble), so it cannot be mistaken for a line of the
+guest's. `evalInContext` and `evalInContextRich` count from the expression,
+column 1 being its first character, and leave the frames of their own
+wrapper out.
+
+`setScriptOrigin(name, lineOffset, columnOffset)`, called before
+`initScript`, does what Node's `vm.Script` options `filename`, `lineOffset`
+and `columnOffset` do: frames and syntax errors name the script `name`
+instead of `<anonymous>`, `lineOffset` is added to every line and
+`columnOffset` to the columns of the first line. A host that puts lines of
+its own ahead of the code it was given passes minus their count, and the
+code's line 1 is line 1 again; a position moved before line 1 is reported
+without one.
 
 An initialization failure, an initial/eval source-growth violation, or any VM
 instruction/abort/heap/output/dynamic-compilation limit violation disposes the
@@ -817,6 +838,10 @@ remain recoverable.
   `String(event.type)` and always reports the event as not cancelled. There is
   no `Event` class, no bubbling or capture, no default actions and no DOM; a
   non-object argument is a `TypeError`.
+- `setScriptOrigin(name, lineOffset, columnOffset)` must be called before
+  `initScript` (after, it is a usage error, like the bridge setters). Every
+  argument may be left out: no name is `<anonymous>`, and the offsets must be
+  integers. See the positions paragraph above.
 - `setInstructionBudget(steps)` may be called before `initScript`, in which case
   the allowance governs top-level execution and `_init`; called after, it
   resizes the running budget, and `renewInstructionBudget` then restores the

@@ -25,7 +25,10 @@
 //! call has replaced its caller's frame. Script names come from the host
 //! (`Vm::script_name`) or a module's `import.meta.url`; anything else, eval
 //! code included, is `<anonymous>`, so embedded code learns no host path
-//! unless the host gives one.
+//! unless the host gives one. Where the host's text was compiled behind an
+//! embedding preamble or inside an expression wrapper, the compiler recorded
+//! the host's positions (`compile::SourceOrigin`): a preamble frame is named
+//! `zipp:preamble`, and a wrapper's frame is left out.
 
 use super::*;
 
@@ -208,15 +211,26 @@ impl<'p> Vm<'p> {
     /// One recorded frame as a line of the stack, its leading newline
     /// included: `\n    at name (script:line:col)`, `new name` for a
     /// construction, and no name or parentheses for an unnamed function.
+    /// A frame of an embedding preamble's code names `zipp:preamble`, and
+    /// one of the wrapper around a host's expression is no line at all
+    /// (`CallSite::PLUMBING`, `CallSite::HIDDEN`).
     fn stack_frame_line(&self, f: u64) -> String {
+        use crate::bytecode::CallSite;
         let func = (f >> 32) as u32;
         let ip = (f & (NO_POS - 1)) as u32;
         let proto = self.func(func as usize);
-        let mut loc = self.stack_script_name(func);
         // A frame records the instruction after the one it is suspended at.
         let pos = if f & NO_POS == 0 { proto.position_at(ip.saturating_sub(1)) } else { None };
-        if let Some((line, col)) = pos {
-            loc.push_str(&format!(":{line}:{col}"));
+        let preamble = match pos {
+            Some((CallSite::HIDDEN, _)) => return String::new(),
+            Some((line, _)) => line & CallSite::PLUMBING != 0,
+            None => proto.is_plumbing(),
+        };
+        let mut loc = if preamble { "zipp:preamble".to_string() } else { self.stack_script_name(func) };
+        match pos {
+            // Before the host's line 1 (its offsets moved it there).
+            Some((0, _)) | None => {}
+            Some((line, col)) => loc.push_str(&format!(":{}:{col}", line & !CallSite::PLUMBING)),
         }
         // A class constructor's proto is named `C.constructor`; V8 says `new C`.
         let name = proto.name.strip_suffix(".constructor").unwrap_or(&proto.name);

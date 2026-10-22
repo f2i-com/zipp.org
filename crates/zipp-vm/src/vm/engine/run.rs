@@ -2241,6 +2241,9 @@ impl<'p> Vm<'p> {
         caller_scope: Option<(Vec<String>, Vec<Value>, Vec<String>, Vec<String>)>,
         eval_scope_idx: Option<u32>,
         exact_src: Option<&[u8]>,
+        // An embedder's expression inside its own wrapper code
+        // (`ScriptState::eval_wrapped_in_context`): see `SourceOrigin`.
+        origin: Option<crate::compile::SourceOrigin>,
     ) -> Result<Value, Thrown> {
         // One-shot CreateDynamicFunction marker (set by build_function_kind):
         // consumed HERE, at entry, so a parse failure below cannot leak it
@@ -2431,6 +2434,7 @@ impl<'p> Vm<'p> {
             // "anonymous" wrapper's self-name binding — one-shot, consumed
             // at do_eval entry above.
             fn_ctor,
+            origin,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -2676,6 +2680,7 @@ impl<'p> Vm<'p> {
             false,
             None,
             Vec::new(),
+            None,
             None,
             None,
             None,

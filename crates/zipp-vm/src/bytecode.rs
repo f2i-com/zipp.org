@@ -2890,13 +2890,27 @@ pub struct FuncProto {
 /// One call or `new` expression's code and source position
 /// ([`FuncProto::call_sites`]): instructions `start..end` evaluate it, and a
 /// frame suspended in them reports `line:col` (1-based, the column in UTF-16
-/// code units, as V8 reports it).
+/// code units, as V8 reports it). Where the host's text was compiled behind
+/// or inside text of the engine's (`SourceOrigin`), `line:col` is the host's,
+/// and three `line`s are not positions: 0 for one the host's offsets moved
+/// before its line 1, which a stack reports without a position (V8 omits
+/// a line 0 that way and prints a negative one);
+/// [`CallSite::PLUMBING`]; and [`CallSite::HIDDEN`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallSite {
     pub start: u32,
     pub end: u32,
     pub line: u32,
     pub col: u32,
+}
+
+impl CallSite {
+    /// Set in the `line` of a call in an embedding preamble: the frame is
+    /// named `zipp:preamble`, at the line of the preamble below this bit.
+    pub const PLUMBING: u32 = 1 << 31;
+    /// The `line` of a call in the wrapper an embedder evaluated an
+    /// expression in: the frame is left out of a stack.
+    pub const HIDDEN: u32 = u32::MAX;
 }
 
 impl FuncProto {
@@ -2907,6 +2921,16 @@ impl FuncProto {
             .filter(|s| s.start <= ip && ip < s.end)
             .max_by_key(|s| s.start)
             .map(|s| (s.line, s.col))
+    }
+
+    /// Whether this is a function of an embedding preamble: it calls
+    /// something, and every one of its calls is the preamble's.
+    pub fn is_plumbing(&self) -> bool {
+        !self.call_sites.is_empty()
+            && self
+                .call_sites
+                .iter()
+                .all(|s| s.line != CallSite::HIDDEN && s.line & CallSite::PLUMBING != 0)
     }
 }
 

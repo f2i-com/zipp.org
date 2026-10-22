@@ -22,16 +22,44 @@ use crate::parse::parser::{ParseOptions, Parser};
 use crate::parse::stmt::{parse, parse_exact};
 
 fn err_str(e: crate::parse::parser::SyntaxError) -> String {
+    failure(e).message
+}
+
+/// A parse failure as a host that shows it to a person needs it: the message
+/// a SyntaxError object would carry, and for a syntax error the byte offset
+/// it is at. `zipp js`, `zipp mjs` and an embedder's initial script report
+/// the position beside the message (`compile::locate_message`); an `eval`'s
+/// SyntaxError carries the message alone, as V8's does.
+pub(crate) struct ParseFailure {
+    pub(crate) message: String,
+    pub(crate) pos: Option<u32>,
+}
+
+impl ParseFailure {
+    /// The message, with a syntax error's position in `src` appended as a
+    /// frame of the script `name` (`<anonymous>` without one).
+    pub(crate) fn located(self, src: &str, name: Option<&str>) -> String {
+        match self.pos {
+            Some(pos) => crate::compile::locate_message(&self.message, src, pos, name, None),
+            None => self.message,
+        }
+    }
+}
+
+fn failure(e: crate::parse::parser::SyntaxError) -> ParseFailure {
     // The default profile reports source nesting past its budget as the
     // resource limit it is, the way node does — see
     // `parse::parser::MAX_NATIVE_SYNTAX_RECURSION`.
     if e.msg.starts_with("RangeError: ") {
-        return e.msg;
+        return ParseFailure { message: e.msg, pos: None };
     }
-    format!(
-        "SyntaxError: {}",
-        e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg)
-    )
+    ParseFailure {
+        message: format!(
+            "SyntaxError: {}",
+            e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg)
+        ),
+        pos: Some(e.pos),
+    }
 }
 
 /// Conformance mode: parse a top-level script under the PURE Script goal.
@@ -73,6 +101,15 @@ pub(crate) fn parse_script_with(
     allow_return: bool,
     force_strict: bool,
 ) -> Result<Program, String> {
+    parse_script_with_located(src, allow_return, force_strict).map_err(|f| f.message)
+}
+
+/// [`parse_script_with`], keeping a syntax error's position.
+pub(crate) fn parse_script_with_located(
+    src: &str,
+    allow_return: bool,
+    force_strict: bool,
+) -> Result<Program, ParseFailure> {
     parse(
         src,
         ParseOptions {
@@ -81,7 +118,7 @@ pub(crate) fn parse_script_with(
             ..ParseOptions::script()
         },
     )
-    .map_err(err_str)
+    .map_err(failure)
 }
 
 /// Whether `src`'s OWN directive prologue turns strict mode on, decided by the
@@ -111,17 +148,27 @@ pub(crate) fn script_prologue_is_strict(src: &str, allow_return: bool) -> bool {
 }
 
 pub(crate) fn parse_module(src: &str) -> Result<Program, String> {
-    parse(src, ParseOptions::module()).map_err(err_str)
+    parse_module_located(src).map_err(|f| f.message)
+}
+
+/// [`parse_module`], keeping a syntax error's position.
+pub(crate) fn parse_module_located(src: &str) -> Result<Program, ParseFailure> {
+    parse(src, ParseOptions::module()).map_err(failure)
 }
 
 pub(crate) fn parse_auto(src: &str) -> Result<Program, String> {
-    match parse_script(src) {
+    parse_auto_located(src).map_err(|f| f.message)
+}
+
+/// [`parse_auto`], keeping a syntax error's position.
+pub(crate) fn parse_auto_located(src: &str) -> Result<Program, ParseFailure> {
+    match parse_script_with_located(src, !pure_script_goal(), false) {
         Ok(p) => Ok(p),
         // Under the pure Script goal there is no second guess: a script that
         // fails to parse is a SyntaxError, not a module. This is what makes
         // `export default null;` at top level the early error the spec wants.
         Err(script_err) if pure_script_goal() => Err(script_err),
-        Err(script_err) => match parse_module(src) {
+        Err(script_err) => match parse_module_located(src) {
             Ok(p) => Ok(p),
             // The script error, not the module one: a file that is neither is
             // overwhelmingly a broken script, and the script diagnostic points

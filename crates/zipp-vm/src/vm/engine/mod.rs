@@ -84,6 +84,8 @@ mod jit_frame;
 mod jit_plans;
 mod method_inline;
 mod modules;
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+pub(crate) use modules::file_url;
 // Python's native-tier entry points (see `lang/python/jit/`).
 #[cfg(feature = "python")]
 #[path = "../../lang/python/jit/py_jit.rs"]

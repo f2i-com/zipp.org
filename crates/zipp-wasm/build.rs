@@ -5,8 +5,9 @@
 //!
 //! Dropping whole lines is sound while no template literal and no string
 //! spans lines, which is asserted below: a line that starts with `//` is
-//! then a comment and nothing else. The host corrects guest line numbers by
-//! `preambleLines`, which is counted from the embedded text.
+//! then a comment and nothing else. Guest positions do not depend on the
+//! preamble's length (they count from the guest's first line); a frame of
+//! the preamble's code reports its line in this embedded text.
 
 use std::{env, fs, path::PathBuf};
 

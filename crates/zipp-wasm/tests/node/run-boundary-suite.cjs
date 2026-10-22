@@ -63,6 +63,7 @@ const CHECKS = [
   ["internal-error-storage.cjs"],
   ["promise-method-cache.cjs"],
   ["syntax-corpus.cjs"],
+  ["stack-positions.cjs"],
   // The experimental Python frontend's boundary contract; adapts to the
   // artifact's `languages`, so the JavaScript-only build proves the refusal.
   ["native-depth.cjs"],

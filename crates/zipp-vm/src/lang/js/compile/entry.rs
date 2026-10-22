@@ -34,6 +34,16 @@ pub fn compile_main_program(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, false, true, false)
 }
 
+/// [`compile_main_program`] for a source that is not all the host's (an
+/// embedding preamble ahead of it): call sites record the host's positions.
+pub(crate) fn compile_main_program_with_origin(
+    prog: &ast::Program,
+    source: &str,
+    origin: SourceOrigin,
+) -> R<Program> {
+    compile_program_with(prog, source, false, true, false, Some(origin))
+}
+
 /// Compile a MODULE as the program entry: the top level is an async context
 /// (top-level `await`), and the VM runs func 0 as an async activation.
 #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
@@ -54,8 +64,20 @@ pub(crate) fn compile_program_inner(
     main_goal: bool,
     script_completion: bool,
 ) -> R<Program> {
+    compile_program_with(prog, source, module_mode, main_goal, script_completion, None)
+}
+
+fn compile_program_with(
+    prog: &ast::Program,
+    source: &str,
+    module_mode: bool,
+    main_goal: bool,
+    script_completion: bool,
+    origin: Option<SourceOrigin>,
+) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source.to_string());
+    c.origin = origin;
     c.module_mode = module_mode;
     c.main_goal = main_goal;
     c.script_completion = script_completion;
@@ -161,6 +183,9 @@ pub fn compile_eval(
     // CreateDynamicFunction compile: suppress the "anonymous" wrapper's
     // self-name binding (see `Compiler::fn_ctor_no_self_name`).
     fn_ctor: bool,
+    // An embedder's expression wrapped in its own code
+    // (`ScriptState::eval_wrapped_in_context`): see `SourceOrigin`.
+    origin: Option<SourceOrigin>,
 ) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
@@ -257,6 +282,7 @@ pub fn compile_eval(
         }
     }
     let mut c = Compiler::new(source.to_string());
+    c.origin = origin;
     c.eval_mode = true;
     c.eval_locals = !is_module;
     c.fn_ctor_no_self_name = fn_ctor;

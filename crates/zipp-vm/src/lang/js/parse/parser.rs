@@ -926,6 +926,28 @@ impl<'s> Parser<'s> {
         SyntaxError::new(msg, self.tok.span.start)
     }
 
+    /// `unexpected token ';'` at the current token, quoted as it is written.
+    pub(crate) fn unexpected_here(&self) -> SyntaxError {
+        let span = self.tok.span;
+        match self.src.get(span.start as usize..span.end as usize) {
+            Some(text) if !text.is_empty() => {
+                self.err_here(format!("SyntaxError: unexpected token '{text}'"))
+            }
+            _ => self.err_here("SyntaxError: unexpected end of input"),
+        }
+    }
+
+    /// After a ClassDeclaration's `class`: the name it must have. Only
+    /// `export default class {}` may leave it out, and that form does not
+    /// come here.
+    pub(crate) fn expect_class_decl_name(&self) -> PResult<()> {
+        if self.is_binding_ident() {
+            Ok(())
+        } else {
+            Err(self.unexpected_here())
+        }
+    }
+
     pub(crate) fn prev_end(&self) -> u32 {
         self.prev_end
     }
