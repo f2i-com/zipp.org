@@ -73,6 +73,20 @@ pub(crate) const IC_WAYS: usize = 8;
 /// Non-cacheable misses (or full-set evictions) before a site is disabled and
 /// stops paying the fill walk. Existing entries keep validating.
 const IC_MISS_LIMIT: u8 = 16;
+/// Slow-path visits a disabled site makes between fills (a power of two, at
+/// most 128).
+/// A site whose receivers change class over time, such as one reading a class
+/// expression's instances when each call makes a new class, evicts a way per
+/// class and reaches the limit although each class then hits for hundreds of
+/// reads; class-features' per-round classes ran their getters, methods and
+/// statics through the generic paths for the rest of the run, 2.8 times
+/// QuickJS's time. Letting one visit in this many fill again brings such a
+/// site back soon after each new class, and costs a megamorphic one a fill
+/// walk per this many of its slow reads. Measured in one binary against no
+/// probation: that phase 0.60 (0.55 at 16 visits, whose refills cost the
+/// polymorphic phases beside it 2-4%), class-features 0.971, the rest of the
+/// 51 bench rows and the bundled applications neutral.
+const IC_PROBATION: u8 = 64;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
 
@@ -586,6 +600,36 @@ impl<'p> Vm<'p> {
         if let Some(site) = self.ic_site_mut(func_id, ip) {
             site.misses = site.misses.saturating_add(1);
         }
+    }
+
+    /// Whether a site past [`IC_MISS_LIMIT`] stays on the slow path for this
+    /// visit; every [`IC_PROBATION`]th visit it may fill once more (and the
+    /// fill's eviction, if the site is full, disables it again). The visits
+    /// are counted in the eviction cursor, so that fill takes way 0.
+    #[cold]
+    #[inline(never)]
+    fn ic_still_disabled(&mut self, func_id: u32, ip: usize) -> bool {
+        let Some(site) = self
+            .site_ics
+            .get_mut(func_id as usize)
+            .and_then(Option::as_mut)
+            .and_then(|table| table.get_mut(ip))
+            .and_then(Option::as_deref_mut)
+        else {
+            return true;
+        };
+        // `ZIPP_NO_IC_PROBATION=1` leaves a disabled site disabled, as before:
+        // the two sides of a one-binary A/B.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_IC_PROBATION").is_some()) {
+            return true;
+        }
+        site.rot = site.rot.wrapping_add(1);
+        if site.rot % IC_PROBATION != 0 {
+            return true;
+        }
+        site.misses = IC_MISS_LIMIT - 1;
+        false
     }
 
     /// Mutable access to (and lazy allocation of) the site cache.
@@ -1281,7 +1325,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return GetAct::None;
             }
         }
@@ -1785,7 +1829,7 @@ impl<'p> Vm<'p> {
         if let Some(p) = plan {
             return self.ic_apply_set(p, key, val);
         }
-        if disabled {
+        if disabled && self.ic_still_disabled(func_id, ip) {
             return SetAct::None;
         }
         // Keys with exotic write interception never cache: `__proto__`
@@ -2503,7 +2547,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return None;
             }
         }
@@ -3263,7 +3307,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return None;
             }
         }
@@ -3347,7 +3391,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return None;
             }
         }
@@ -3429,7 +3473,7 @@ impl<'p> Vm<'p> {
                     _ => {}
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return GetAct::None;
             }
         }
@@ -3487,7 +3531,7 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            if site.misses >= IC_MISS_LIMIT {
+            if site.misses >= IC_MISS_LIMIT && self.ic_still_disabled(func_id, ip) {
                 return SetAct::None;
             }
         }
