@@ -3568,85 +3568,12 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let key = strs[name as usize].as_str();
-                        // PrivateFieldGet brand check: reading a private member
-                        // (`obj.#x`) from an object whose class did not declare it
-                        // is a TypeError (has_property_str walks instance own fields
-                        // + private methods/getters on the class chain).
-                        // PrivateFieldGet present iff the element exists textually AND
-                        // (when the accessing class's brand chain is resolvable) the
-                        // receiver carries the declaring class's brand — the textual
-                        // half rejects a wholly-absent member, the brand half rejects a
-                        // same-named member of a DIFFERENT class evaluation.
-                        if is_private_key(&key) {
-                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                            let site = super::values::private_site(func_id as u32, name as u32);
-                            if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
-                                // Declaring-class-resolved, KIND-aware access
-                                // (spec PrivateGet): a method or accessor
-                                // checks the receiver's brand, then dispatches
-                                // on the DECLARING class's member kind. A
-                                // field needs no brand check of its own: its
-                                // entry exists for this brand on this receiver
-                                // only once the brand is installed, and a
-                                // missing one is the same TypeError below.
-                                if kind & 7 != 0 {
-                                    if !self.private_receiver_ok(o, b, kind, owner) {
-                                        return Err(Thrown(format!(
-                                            "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                                        )));
-                                    }
-                                    let r = if kind & 1 != 0 {
-                                        self.private_member_from_owner(owner, &key, (kind & 8) | 1)
-                                            .unwrap_or(Value::UNDEFINED)
-                                    } else if kind & 2 != 0 {
-                                        let g = self
-                                            .private_member_from_owner(owner, &key, (kind & 8) | 2)
-                                            .unwrap_or(Value::UNDEFINED);
-                                        self.call_value(g, o, &[])?
-                                    } else {
-                                        // Setter-only accessor: no [[Get]].
-                                        return Err(Thrown(format!(
-                                            "TypeError: '{key}' was defined without a getter"
-                                        )));
-                                    };
-                                    self.set(base, dst, r);
-                                    ip += 1;
-                                    continue;
-                                }
-                                // Private FIELD: PrivateFieldFind in the
-                                // side table (empty -> TypeError). Found, the
-                                // site's way 0 remembers it for the own hit.
-                                match self.private_field_get_id(o, b, pid) {
-                                    Some(v) => {
-                                        #[cfg(not(feature = "safe-sandbox"))]
-                                        self.ic_private_fill(func_id, ip, ctx, b, pid, o);
-                                        self.set(base, dst, v);
-                                        ip += 1;
-                                        continue;
-                                    }
-                                    None => {
-                                        return Err(Thrown(format!(
-                                            "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                                        )));
-                                    }
-                                }
-                            } else {
-                                let textual = self.has_property_str(o, &key)
-                                    || self.private_field_scan_has(o, &key);
-                                let present = match self.private_brand_ok(o, &key) {
-                                    Some(b) => textual && b,
-                                    None => textual,
-                                };
-                                if !present {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                                    )));
-                                }
-                                if let Some(vv) = self.private_field_scan(o, &key) {
-                                    self.set(base, dst, vv);
-                                    ip += 1;
-                                    continue;
-                                }
+                        // A private name the own hit did not answer (`private_get_slow`).
+                        if is_private_key(key) {
+                            if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
                             }
                         }
                         // The cache's inherited-data hit for a receiver whose
@@ -3783,100 +3710,12 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let key = strs[name as usize].as_str();
-                        // Private stores route to the side table / accessors
-                        // (field-init emission, compound/update writes). One
+                        // Private stores (field-init emission, compound and update
+                        // writes) go to the side table or the accessors. One
                         // byte-compare on the hot path.
-                        if matches!(key.as_bytes().first(), Some(b'#')) {
-                            let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                            let site = super::values::private_site(func_id as u32, name as u32);
-                            if let Some((b2, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
-                                // PrivateFieldSet on a field already present:
-                                // its entry for this brand exists on this
-                                // receiver only once the brand is installed,
-                                // and private fields ignore integrity levels,
-                                // so the store needs no other check.
-                                if kind & 7 == 0 && self.private_field_set_id(o, b2, pid, v, false) {
-                                    #[cfg(not(feature = "safe-sandbox"))]
-                                    self.ic_private_fill(func_id, ip, ctx, b2, pid, o);
-                                    ip += 1;
-                                    continue;
-                                }
-                                if !self.private_receiver_ok(o, b2, kind, owner) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                                    )));
-                                }
-                                if kind & 7 == 0 {
-                                    // PrivateFieldAdd: the field initializer's
-                                    // first store, the entry known absent.
-                                    // Adding a NEW entry to a non-extensible
-                                    // object is a TypeError, checked AT ADD time
-                                    // — the initializer itself may have sealed
-                                    // the instance (`#g = (Object.
-                                    // preventExtensions(this), v)`).
-                                    if o.is_heap() && !self.target_is_extensible(o) {
-                                        return Err(Thrown(
-                                            "TypeError: cannot define private elements on a non-extensible object".into(),
-                                        ));
-                                    }
-                                    self.private_field_set_id(o, b2, pid, v, true);
-                                } else if kind & 4 != 0 {
-                                    let s = self
-                                        .private_member_from_owner(owner, &key, (kind & 8) | 4)
-                                        .unwrap_or(Value::UNDEFINED);
-                                    self.call_value(s, o, &[v])?;
-                                } else if kind & 2 != 0 {
-                                    return Err(Thrown(format!(
-                                        "TypeError: '{key}' was defined without a setter"
-                                    )));
-                                } else {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot assign to private method {key}"
-                                    )));
-                                }
-                                ip += 1;
-                                continue;
-                            }
-                            // A STATIC private field initializer runs inline
-                            // in the DEFINING frame (this_override), so the chain
-                            // is unresolvable there — derive the brand from the
-                            // receiver class itself.
-                            if o.is_heap()
-                                && matches!(self.heap.get(o.heap_index()), HeapObj::Class(_))
-                            {
-                                if let Some(own) = self
-                                    .method_brand
-                                    .get(&o.heap_index())
-                                    .and_then(|c| c.first())
-                                    .copied()
-                                {
-                                    let declares =
-                                        self.brand_private_names.get(&own).is_some_and(|ns| {
-                                            ns.iter().any(|(n, k)| n == &key && *k == 8)
-                                        });
-                                    if declares {
-                                        // PrivateFieldAdd on the class object:
-                                        // the initializer may have sealed it
-                                        // (preventExtensions(C) before the add).
-                                        if !self.private_field_has(o, own, &key)
-                                            && !self.target_is_extensible(o)
-                                        {
-                                            return Err(Thrown(
-                                                "TypeError: cannot define private elements on a non-extensible object".into(),
-                                            ));
-                                        }
-                                        self.private_field_set(o, own, &key, v, true);
-                                        ip += 1;
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Unresolvable chain: write an EXISTING table entry
-                            // (any brand) before falling back to a textual prop.
-                            if self.private_field_scan_set(o, &key, v) {
-                                ip += 1;
-                                continue;
-                            }
+                        if matches!(key.as_bytes().first(), Some(b'#')) && self.private_set_slow(func_id, ip, name, o, key, v)? {
+                            ip += 1;
+                            continue;
                         }
                         // A class value's own writable static data property
                         // (`Entity.count++`), or a function's, which the
@@ -3966,73 +3805,18 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SetPrivate { obj, name, val } => {
-                        // PrivateSet (user `this.#x = v`): brand-check first â€” the
-                        // private element must be present on the receiver, else a
-                        // TypeError (mirrors the GetProp brand check). Private writes
-                        // are always strict.
+                        // PrivateSet (user `this.#x = v`): the site's way-0 field
+                        // hit (`IcEntry::Private`, the only way such a site
+                        // fills), else `private_set_strict`.
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        // The site's way-0 field hit (`IcEntry::Private`, the
-                        // only way such a site fills).
                         #[cfg(not(feature = "safe-sandbox"))]
                         if self.ic_set_prop_own_hit(func_id, ip, o, v) {
                             ip += 1;
                             continue;
                         }
                         let key = strs[name as usize].as_str();
-                        let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
-                        let site = super::values::private_site(func_id as u32, name as u32);
-                        if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
-                            // Declaring-class-resolved, KIND-aware write (spec
-                            // PrivateSet). A field's entry must EXIST, which
-                            // is also its brand check: the entry for this
-                            // brand is on this receiver only once the brand
-                            // is installed. A method or accessor checks the
-                            // receiver's brand.
-                            if kind & 7 == 0 {
-                                if !self.private_field_set_id(o, b, pid, v, false) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                                    )));
-                                }
-                                #[cfg(not(feature = "safe-sandbox"))]
-                                self.ic_private_fill(func_id, ip, ctx, b, pid, o);
-                            } else if !self.private_receiver_ok(o, b, kind, owner) {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                                )));
-                            } else if kind & 4 != 0 {
-                                let s = self
-                                    .private_member_from_owner(owner, &key, (kind & 8) | 4)
-                                    .unwrap_or(Value::UNDEFINED);
-                                self.call_value(s, o, &[v])?;
-                            } else if kind & 2 != 0 {
-                                // Getter-only accessor: no [[Set]].
-                                return Err(Thrown(format!(
-                                    "TypeError: '{key}' was defined without a setter"
-                                )));
-                            } else {
-                                // A private METHOD is not writable.
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot assign to private method {key}"
-                                )));
-                            }
-                        } else {
-                            let textual = self.has_property_str(o, &key)
-                                || self.private_field_scan_has(o, &key);
-                            let present = match self.private_brand_ok(o, &key) {
-                                Some(b) => textual && b,
-                                None => textual,
-                            };
-                            if !present {
-                                return Err(Thrown(format!(
-                                    "TypeError: Cannot write private member {key} to an object whose class did not declare it"
-                                )));
-                            }
-                            if !self.private_field_scan_set(o, &key, v) {
-                                self.set_prop(o, &key, v, true)?;
-                            }
-                        }
+                        self.private_set_strict(func_id, ip, name, o, key, v)?;
                         ip += 1;
                     }
                     Instr::SetLiteralProto { obj, val } => {
