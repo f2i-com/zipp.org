@@ -4,7 +4,8 @@
 The public Zipp benchmark harness deliberately knows only its canonical engine
 set (Node, Bun, Deno and Zipp, every one with its production JIT).  This
 separate runner keeps the other comparisons explicit and avoids changing that
-publication series: Zipp's interpreter (`ZIPP_NOJIT=1`) against QuickJS
+publication series: Zipp's interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, no
+native code at all; see `ZIPP_LANES`) against QuickJS
 (Bellard's and QuickJS-NG, neither of which has a JIT), Boa, and Node, Deno and
 Bun with their JITs switched off (`--jitless`, `--v8-flags=--jitless`,
 `BUN_JSC_useJIT=0`).  It stages identical source bytes for every engine,
@@ -121,6 +122,36 @@ CONTROL_ENV_PREFIXES = (
 )
 
 
+# Zipp's lanes: one binary, its native tiers switched in the child's own
+# environment (`controlled_environment` drops every inherited `ZIPP_` variable,
+# so a setting exported around this runner never reaches a lane). Zipp has two
+# native tiers with separate switches: the JavaScript JIT (`ZIPP_NOJIT`) and the
+# regex JIT (`ZIPP_NO_RX_JIT`), which `ZIPP_NOJIT` alone leaves on.
+#   zipp-jit            the product: both tiers on
+#   zipp-jit-norx       the JavaScript JIT alone, to measure its effect apart
+#                       from the regex tier's
+#   zipp-interp         the strict interpreter: no native code at all, the lane
+#                       an interpreter is compared with
+#   zipp-interp-rxjit   the JavaScript interpreter with the regex JIT on: what
+#                       `zipp-interp` ran until 2026-10-22, kept so its
+#                       captures can be reproduced
+ZIPP_LANES: dict[str, dict[str, Any]] = {
+    "zipp-jit": {"environment": {}, "tiers": {"js_jit": True, "regex_jit": True}},
+    "zipp-jit-norx": {
+        "environment": {"ZIPP_NO_RX_JIT": "1"},
+        "tiers": {"js_jit": True, "regex_jit": False},
+    },
+    "zipp-interp": {
+        "environment": {"ZIPP_NOJIT": "1", "ZIPP_NO_RX_JIT": "1"},
+        "tiers": {"js_jit": False, "regex_jit": False},
+    },
+    "zipp-interp-rxjit": {
+        "environment": {"ZIPP_NOJIT": "1"},
+        "tiers": {"js_jit": False, "regex_jit": True},
+    },
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class Engine:
     name: str
@@ -164,6 +195,27 @@ def controlled_environment(delta: dict[str, str]) -> dict[str, str]:
     }
     environment.update(delta)
     return environment
+
+
+def make_engine_for(name: str, binary: Path) -> Engine:
+    """The engine `name` as `binary` runs it: its command and the settings its
+    child environment gets (on top of `controlled_environment`)."""
+    if name in ZIPP_LANES:
+        return Engine(name, (str(binary), "js"), dict(ZIPP_LANES[name]["environment"]), binary)
+    command, environment = {
+        "node": ((str(binary),), {}),
+        "node-jitless": ((str(binary), "--jitless"), {}),
+        "deno": ((str(binary), "run", "-q"), {}),
+        "deno-jitless": ((str(binary), "run", "-q", "--v8-flags=--jitless"), {}),
+        "bun": ((str(binary),), {}),
+        # JavaScriptCore's option switch: every JIT tier off, LLInt only.
+        "bun-nojit": ((str(binary),), {"BUN_JSC_useJIT": "0"}),
+        "quickjs": ((str(binary),), {}),
+        "quickjs-ng": ((str(binary),), {}),
+        "boa": ((str(binary),), {}),
+        "boa-opt": ((str(binary), "--optimize"), {}),
+    }[name]
+    return Engine(name, command, environment, binary)
 
 
 def read_manifest(path: Path) -> dict[str, Any]:
@@ -477,16 +529,16 @@ def summarize_metric(
         for engine in engine_names
     }
     comparisons: dict[str, Any] = {}
-    for numerator in ("zipp-jit", "zipp-interp"):
+    for numerator in ZIPP_LANES:
         if numerator not in engine_names:
             continue
         comparisons[numerator] = {}
         for competitor in engine_names:
             if competitor == numerator:
                 continue
-            if competitor.startswith("zipp-") and not (
-                numerator == "zipp-interp" and competitor == "zipp-jit"
-            ):
+            # Zipp lanes are compared with the other engines, and each other
+            # lane with the product's.
+            if competitor in ZIPP_LANES and competitor != "zipp-jit":
                 continue
             by_case: dict[str, float] = {}
             unavailable = []
@@ -624,8 +676,9 @@ def parse_args() -> argparse.Namespace:
         default="node,zipp-jit,zipp-interp,quickjs-ng,boa,boa-opt",
         help=(
             "comma-separated subset of node, node-jitless, deno, deno-jitless, "
-            "bun, bun-nojit, zipp-jit, zipp-interp, quickjs, quickjs-ng, boa, "
-            "boa-opt (default: the original six)"
+            "bun, bun-nojit, zipp-jit, zipp-jit-norx, zipp-interp, "
+            "zipp-interp-rxjit, quickjs, quickjs-ng, boa, boa-opt (default: "
+            "the original six)"
         ),
     )
     parser.add_argument("--zipp-revision")
@@ -650,15 +703,13 @@ def main() -> int:
     # Each engine is built only when requested, so a run needs only the
     # binaries it names.
     def binary_for(name: str) -> Path:
-        flag = {
+        flag = args.zipp if name in ZIPP_LANES else {
             "node": args.node,
             "node-jitless": args.node,
             "deno": args.deno,
             "deno-jitless": args.deno,
             "bun": args.bun,
             "bun-nojit": args.bun,
-            "zipp-jit": args.zipp,
-            "zipp-interp": args.zipp,
             "quickjs": args.quickjs,
             "quickjs-ng": args.quickjs_ng,
             "boa": args.boa,
@@ -669,27 +720,11 @@ def main() -> int:
         return executable(flag)
 
     def make_engine(name: str) -> Engine:
-        binary = binary_for(name)
-        command, environment = {
-            "node": ((str(binary),), {}),
-            "node-jitless": ((str(binary), "--jitless"), {}),
-            "deno": ((str(binary), "run", "-q"), {}),
-            "deno-jitless": ((str(binary), "run", "-q", "--v8-flags=--jitless"), {}),
-            "bun": ((str(binary),), {}),
-            # JavaScriptCore's option switch: every JIT tier off, LLInt only.
-            "bun-nojit": ((str(binary),), {"BUN_JSC_useJIT": "0"}),
-            "zipp-jit": ((str(binary), "js"), {}),
-            "zipp-interp": ((str(binary), "js"), {"ZIPP_NOJIT": "1"}),
-            "quickjs": ((str(binary),), {}),
-            "quickjs-ng": ((str(binary),), {}),
-            "boa": ((str(binary),), {}),
-            "boa-opt": ((str(binary), "--optimize"), {}),
-        }[name]
-        return Engine(name, command, environment, binary)
+        return make_engine_for(name, binary_for(name))
 
     known = {
         "node", "node-jitless", "deno", "deno-jitless", "bun", "bun-nojit",
-        "zipp-jit", "zipp-interp", "quickjs", "quickjs-ng", "boa", "boa-opt",
+        "quickjs", "quickjs-ng", "boa", "boa-opt", *ZIPP_LANES,
     }
     unknown = sorted(set(requested) - known)
     if unknown or not requested or len(requested) != len(set(requested)):
@@ -713,7 +748,7 @@ def main() -> int:
             "version probe failed for: " + ", ".join(failed_version_probes)
         )
     if args.zipp_revision:
-        for name in ("zipp-jit", "zipp-interp"):
+        for name in ZIPP_LANES:
             if name not in engine_identities_before:
                 continue
             raw = engine_identities_before[name]["version_probe"]["stdout"]
@@ -934,8 +969,7 @@ def main() -> int:
         "deno-jitless": None,
         "bun": None,
         "bun-nojit": None,
-        "zipp-jit": "zipp",
-        "zipp-interp": "zipp",
+        **{lane: "zipp" for lane in ZIPP_LANES},
         "quickjs": "quickjs",
         "quickjs-ng": "quickjs-ng",
         "boa": "boa",
@@ -980,6 +1014,8 @@ def main() -> int:
             engine.name: {
                 "command": list(engine.command),
                 "environment": engine.environment,
+                # Which of Zipp's native tiers the lane ran (`ZIPP_LANES`).
+                "zipp_tiers": ZIPP_LANES.get(engine.name, {}).get("tiers"),
                 **engine_identities_before[engine.name],
                 "revision": revisions.get(revision_keys[engine.name]),
             }

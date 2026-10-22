@@ -3,6 +3,29 @@
 This is a **diagnostic ecosystem comparison**, separate from Zipp's canonical
 Node/Bun/Deno publication series.
 
+## Zipp's lanes
+
+`run_native.py` runs one Zipp binary in named lanes (`ZIPP_LANES`), each
+setting Zipp's two native tiers in the child's own environment (the runner
+drops every inherited `ZIPP_` variable, so exporting one around it changes
+nothing):
+
+| Lane | Environment | JavaScript JIT | Regex JIT |
+|---|---|---|---|
+| `zipp-jit` | (none) | on | on |
+| `zipp-jit-norx` | `ZIPP_NO_RX_JIT=1` | on | off |
+| `zipp-interp` | `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1` | off | off |
+| `zipp-interp-rxjit` | `ZIPP_NOJIT=1` | off | on |
+
+Every artifact records each lane's `zipp_tiers`. Until 22 October 2026
+`zipp-interp` set `ZIPP_NOJIT=1` alone, which leaves the regex JIT on (a
+5,000-iteration `RegExp.test` loop under it made 4,933 native regex attempts).
+The regex JIT landed on 3 August 2026, before every interpreter capture below,
+so each of them ran what is now `zipp-interp-rxjit`: the JavaScript
+interpreter with native regex matching, not an interpreter emitting no native
+code. They stay as recorded; `tools/test_run_native.py` checks each lane's
+child environment.
+
 ## Interpreter versus interpreter, 2026-10-21
 
 The 0.0.28 engine's canonical PGO binary (`84012a2d`) ran the same way over

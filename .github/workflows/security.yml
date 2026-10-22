@@ -108,7 +108,7 @@ jobs:
           node-version: 22
       - name: Run benchmark harness adversarial tests
         run: |
-          python -m unittest tools.test_bench tools.test_bench_hostile tools.test_bench_peak_rss
+          python -m unittest tools.test_bench tools.test_bench_hostile tools.test_bench_peak_rss tools.test_run_native
           node --no-warnings --test bench/comparison/test_run_wasm_suites.mjs
 
   native-workspace:
