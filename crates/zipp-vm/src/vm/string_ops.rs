@@ -1658,7 +1658,7 @@ impl<'p> Vm<'p> {
     /// A needle of up to [`SHORT_NEEDLE`] bytes is found by `memchr` on its
     /// first byte and a compare (at most that many compares per byte); a
     /// longer one keeps memmem's linear bound.
-    fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
+    pub(crate) fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
         let Some((first, rest)) = n.split_first().filter(|_| n.len() <= SHORT_NEEDLE) else {
             return memchr::memmem::find(h, n);
         };

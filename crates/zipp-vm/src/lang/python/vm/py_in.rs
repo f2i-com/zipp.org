@@ -114,11 +114,15 @@ impl<'p> Vm<'p> {
                 return None;
             }
             let (h, n) = (hay.as_bytes(), n.as_bytes());
-            let cost = 4 + (h.len() as u64 / 8);
+            // The engine's own substring search (`String.prototype.includes`),
+            // linear in both lengths, so the charge covers the work: a
+            // compare at every start was (|h| - |n| + 1) * |n| for an
+            // almost-matching needle.
+            let cost = 4 + (h.len() as u64 + n.len() as u64) / 8;
             if !self.native_kernel_admits(cost, 0) {
                 return None;
             }
-            let found = n.is_empty() || h.windows(n.len()).any(|w| w == n);
+            let found = Self::find_bytes(h, n).is_some();
             self.charge_steps(cost as i64);
             return Some(found);
         }

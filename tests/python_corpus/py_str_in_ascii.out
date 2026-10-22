@@ -1,0 +1,57 @@
+found True False
+absent False True
+empty in empty True False
+empty in text True False
+longer False True
+whole True False
+at end True False
+at start True False
+short 1 last True False
+short 1 absent False True
+short 1 first True False
+short 2 last True False
+short 2 absent False True
+short 2 first True False
+short 3 last True False
+short 3 absent False True
+short 3 first True False
+short 4 last True False
+short 4 absent False True
+short 4 first True False
+short 5 last True False
+short 5 absent False True
+short 5 first True False
+short 6 last True False
+short 6 absent False True
+short 6 first True False
+short 7 last True False
+short 7 absent False True
+short 7 first True False
+short 8 last True False
+short 8 absent False True
+short 8 first True False
+short 9 last True False
+short 9 absent False True
+short 9 first True False
+short 10 last True False
+short 10 absent False True
+short 10 first True False
+short 11 last True False
+short 11 absent False True
+short 11 first True False
+near 1024 absent False True
+near 1024 at end True False
+near 1024 in middle True False
+near 4096 absent False True
+near 4096 at end True False
+near 4096 in middle True False
+near 20000 absent False True
+near 20000 at end True False
+near 20000 in middle True False
+periodic False True
+periodic found True False
+non-ascii True False
+non-ascii absent False True
+non-ascii hay True False
+non-ascii needle False True
+astral True False
