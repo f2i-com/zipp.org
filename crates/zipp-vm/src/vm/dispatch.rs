@@ -3568,13 +3568,6 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let key = strs[name as usize].as_str();
-                        // Its inherited-data hit, likewise.
-                        #[cfg(not(feature = "safe-sandbox"))]
-                        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
-                        }
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -3621,9 +3614,12 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                                 // Private FIELD: PrivateFieldFind in the
-                                // side table (empty -> TypeError).
+                                // side table (empty -> TypeError). Found, the
+                                // site's way 0 remembers it for the own hit.
                                 match self.private_field_get_id(o, b, pid) {
                                     Some(v) => {
+                                        #[cfg(not(feature = "safe-sandbox"))]
+                                        self.ic_private_fill(func_id, ip, ctx, b, pid, o);
                                         self.set(base, dst, v);
                                         ip += 1;
                                         continue;
@@ -3652,6 +3648,18 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                        }
+                        // The cache's inherited-data hit for a receiver whose
+                        // mirror holds no shape (any other was the own hit's).
+                        // After the private names, which fill no way: a private
+                        // read paid this probe's site and receiver fetches for
+                        // nothing, a twentieth of a class's private-heavy method.
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                            self.ic_proto_hit_settle(o);
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
                         }
                         // `.length` of a string, an Array or a TypedArray is
                         // an internal slot, not a property the shape-keyed IC
@@ -3788,6 +3796,8 @@ impl<'p> Vm<'p> {
                                 // and private fields ignore integrity levels,
                                 // so the store needs no other check.
                                 if kind & 7 == 0 && self.private_field_set_id(o, b2, pid, v, false) {
+                                    #[cfg(not(feature = "safe-sandbox"))]
+                                    self.ic_private_fill(func_id, ip, ctx, b2, pid, o);
                                     ip += 1;
                                     continue;
                                 }
@@ -3962,6 +3972,13 @@ impl<'p> Vm<'p> {
                         // are always strict.
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
+                        // The site's way-0 field hit (`IcEntry::Private`, the
+                        // only way such a site fills).
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if self.ic_set_prop_own_hit(func_id, ip, o, v) {
+                            ip += 1;
+                            continue;
+                        }
                         let key = strs[name as usize].as_str();
                         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
                         let site = super::values::private_site(func_id as u32, name as u32);
@@ -3978,6 +3995,8 @@ impl<'p> Vm<'p> {
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                     )));
                                 }
+                                #[cfg(not(feature = "safe-sandbox"))]
+                                self.ic_private_fill(func_id, ip, ctx, b, pid, o);
                             } else if !self.private_receiver_ok(o, b, kind, owner) {
                                 return Err(Thrown(format!(
                                     "TypeError: Cannot write private member {key} to an object whose class did not declare it"

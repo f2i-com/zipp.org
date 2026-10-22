@@ -948,6 +948,7 @@ impl<'p> Vm<'p> {
                     let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
                     #[cfg(not(feature = "safe-sandbox"))]
                     if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                        self.ic_proto_hit_settle(o);
                         self.set(base, dst, v);
                         ip += 1;
                         continue;

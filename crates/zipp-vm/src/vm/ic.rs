@@ -333,6 +333,23 @@ pub(crate) enum IcEntry {
         id: u16,
         bits: u64,
     },
+    /// `obj.#x` (a read, or a write of the field already there) at a site
+    /// whose code, running as the callee `head` (`Vm::private_memo_key`: its
+    /// heap index and slot version), resolved the name to the private FIELD
+    /// `(brand, id)`, which the receiver it filled from held at `pos` of its
+    /// `private_fields` list. A hit is the running callee's key and the
+    /// receiver's entry for the pair; the entry's presence is the brand check
+    /// itself, as on the uncached path. Methods and accessors are not cached
+    /// here. Only the way-0 own hits read it (`ic_private_get_tail`,
+    /// `ic_private_set_tail`): a private name fills no other way. Last, like
+    /// `NsExport`. The safe profile has no own hits and never fills one.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    Private {
+        head: u64,
+        brand: u64,
+        id: u32,
+        pos: u32,
+    },
 }
 
 // `SuperData` already established this interpreter-cache entry budget. Keep
@@ -1036,6 +1053,16 @@ impl<'p> Vm<'p> {
     /// settles the mirror (`ic_get_prop`). Only the mirror check is inline:
     /// with the map's check beside it, the larger arm slowed unrelated rows
     /// by up to 12%.
+    ///
+    /// A site whose way 0 is an inherited-data entry is answered here too,
+    /// out of line (`ic_proto_hit_tail`): the mirror's shape is the
+    /// receiver's, which is what the entry guards, and the site is already in
+    /// hand. `ic_get_prop_proto_hit`, after this declined, fetched the site
+    /// again and the receiver's map with it: a read through
+    /// `Object.create(p)` ran 13% faster, polymorphic-objects 2.4% and
+    /// property-ic-shapes 3%. Its own hits settle the mirror
+    /// (`ic_proto_hit_settle`), so a receiver that is only ever read through
+    /// its prototype reaches this one from its second read on.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
@@ -1054,16 +1081,142 @@ impl<'p> Vm<'p> {
         if site.n == 0 {
             return None;
         }
-        let IcEntry::OwnData { shape, slot } = site.entries[0] else {
-            return None;
-        };
-        if shape != mir.shape {
+        match site.entries[0] {
+            IcEntry::OwnData { shape, slot } if shape == mir.shape => {
+                // SAFETY: the matching shape proves `vals` is the map's live value
+                // column and that it holds `slot` (the way was filled against a map
+                // of this shape, which has that many slots).
+                Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
+            }
+            IcEntry::ProtoData { .. } | IcEntry::Private { .. } => {
+                self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape)
+            }
+            _ => None,
+        }
+    }
+
+    /// `ic_get_prop_own_hit`'s other way-0 hits, out of line: one call with
+    /// the entry by reference keeps the inline arm small.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(never)]
+    #[cfg_attr(not(feature = "jit"), allow(unused_variables))]
+    fn ic_get_way0_tail(&self, idx: u32, e: &IcEntry, shape: u32) -> Option<Value> {
+        match *e {
+            #[cfg(feature = "jit")]
+            IcEntry::ProtoData {
+                recv_shape,
+                first,
+                ref hops,
+                slot,
+            } if recv_shape == shape => self.ic_proto_hit_tail(idx, first, hops, slot),
+            IcEntry::Private { head, brand, id, pos } => self.ic_private_get_tail(idx, head, brand, id, pos),
+            _ => None,
+        }
+    }
+
+    /// A private-name site's way-0 field hit (`IcEntry::Private`): the field
+    /// when the running callee is the one the way was filled under and the
+    /// receiver holds the pair. The read had paid the failed own hit, the
+    /// name's text and test, the memo's hash and the list's scan.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn ic_private_get_tail(&self, idx: u32, head: u64, brand: u64, id: u32, pos: u32) -> Option<Value> {
+        let ctx = self.frames.last()?.callee;
+        if self.private_memo_key(ctx) != Some(head) {
             return None;
         }
-        // SAFETY: the matching shape proves `vals` is the map's live value
-        // column and that it holds `slot` (the way was filled against a map
-        // of this shape, which has that many slots).
-        Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
+        self.private_field_at(idx, brand, id, pos).map(|(_, v)| v)
+    }
+
+    /// [`Self::ic_private_get_tail`] for a write of the field, which must
+    /// already be there (PrivateSet; an add takes the uncached path). The
+    /// own hit hands over only the site: its way 0 is read again here, which
+    /// keeps the inline arm to one call.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(never)]
+    fn ic_private_set_tail(&mut self, func_id: u32, ip: usize, idx: u32, val: Value) -> bool {
+        let Some(IcEntry::Private { head, brand, id, pos }) = self
+            .site_ics
+            .get(func_id as usize)
+            .and_then(|f| f.as_ref())
+            .and_then(|f| f.get(ip))
+            .and_then(|s| s.as_deref())
+            .map(|s| s.entries[0])
+        else {
+            return false;
+        };
+        let Some(ctx) = self.frames.last().map(|f| f.callee) else {
+            return false;
+        };
+        if self.private_memo_key(ctx) != Some(head) {
+            return false;
+        }
+        let Some((at, _)) = self.private_field_at(idx, brand, id, pos) else {
+            return false;
+        };
+        // No barrier: the collector roots every private field value.
+        if let Some(fields) = self.private_fields_mut(idx) {
+            fields[at].2 = val;
+        }
+        true
+    }
+
+    /// Fill a private-name site's way 0 after its code, running as `ctx`,
+    /// resolved the name to the field `(brand, id)` and found it on `recv`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ic_private_fill(&mut self, func_id: u32, ip: usize, ctx: Value, brand: u64, id: u32, recv: Value) {
+        if !recv.is_heap() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_)) {
+            return;
+        }
+        let Some(head) = self.private_memo_key(ctx) else {
+            return;
+        };
+        let Some((pos, _)) = self.private_field_at(recv.heap_index(), brand, id, 0) else {
+            return;
+        };
+        if let Some(site) = self.ic_site_mut(func_id, ip) {
+            site.entries[0] = IcEntry::Private {
+                head,
+                brand,
+                id,
+                pos: pos as u32,
+            };
+            site.n = site.n.max(1);
+        }
+        // The own hit reads the receiver through its mirror.
+        self.heap.refresh_mirror(recv.heap_index());
+    }
+
+    /// After `ic_get_prop_proto_hit` answered for `recv`: settle its mirror,
+    /// so its next read through the site is `ic_get_prop_own_hit`'s. That
+    /// hit is reached only by a receiver whose mirror holds no shape, as any
+    /// other was answered by the own hit first. (Nothing to settle without
+    /// the JIT's mirrors: `refresh_mirror` is empty there.)
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    pub(crate) fn ic_proto_hit_settle(&mut self, recv: Value) {
+        self.heap.refresh_mirror(recv.heap_index());
+    }
+
+    /// `ic_get_prop_proto_hit`'s guards for a receiver whose shape the
+    /// mirror has already matched against the entry's: an inherited value,
+    /// not a miss; a pure interpreter (the JIT keeps its feedback path); not
+    /// a class instance, whose chain is its class's, which a plain object of
+    /// the same shape does not share; and the chain as it was.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    fn ic_proto_hit_tail(&self, idx: u32, first: u8, hops: &IcHops, slot: u32) -> Option<Value> {
+        if slot == u32::MAX || !self.interp_own_resolve_vm_is_interpreter() {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        if m.class.is_some() {
+            return None;
+        }
+        let hm = self.ic_chain_ok(idx, first, hops)?;
+        Some(hm.val_at(slot as usize))
     }
 
     /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
@@ -1074,7 +1227,7 @@ impl<'p> Vm<'p> {
         // The receiver first: the dispatch loop asks before its `length` and
         // shapeless-receiver leaves, so a string's or an array's `.length`
         // must fail here before the site lookup, not after it.
-        let (_, m) = self.ic_recv_map(recv)?;
+        let (idx, m) = self.ic_recv_map(recv)?;
         if !self.ic_func_eligible(func_id) {
             return None;
         }
@@ -1082,11 +1235,14 @@ impl<'p> Vm<'p> {
         if site.n == 0 {
             return None;
         }
-        let IcEntry::OwnData { shape, slot } = site.entries[0] else {
-            return None;
-        };
-        let sh = m.shape();
-        (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
+        match site.entries[0] {
+            IcEntry::OwnData { shape, slot } => {
+                let sh = m.shape();
+                (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
+            }
+            IcEntry::Private { .. } => self.ic_get_way0_tail(idx, &site.entries[0], crate::shape::DICT),
+            _ => None,
+        }
     }
 
     /// The way-0 inherited-data hit of [`Self::ic_get_prop`], for the
@@ -1696,12 +1852,11 @@ impl<'p> Vm<'p> {
         if site.n == 0 {
             return false;
         }
-        let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
-            return false;
+        let slot = match site.entries[0] {
+            IcEntry::OwnData { shape: cached, slot } if cached == mir.shape => slot,
+            IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
+            _ => return false,
         };
-        if cached != mir.shape {
-            return false;
-        }
         if val.is_heap() {
             self.heap.write_barrier_val(idx, val);
         }
@@ -1741,8 +1896,10 @@ impl<'p> Vm<'p> {
         if site.n == 0 {
             return false;
         }
-        let IcEntry::OwnData { shape: cached, slot } = site.entries[0] else {
-            return false;
+        let (cached, slot) = match site.entries[0] {
+            IcEntry::OwnData { shape, slot } => (shape, slot),
+            IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
+            _ => return false,
         };
         let sh = m.shape();
         if sh == crate::shape::DICT || sh != cached {

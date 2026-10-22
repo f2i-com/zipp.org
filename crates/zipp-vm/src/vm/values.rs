@@ -892,6 +892,29 @@ impl<'p> Vm<'p> {
             .map(|&(_, _, v)| v)
     }
 
+    /// Heap `idx`'s private field `(brand, id)`, looked for at `pos` of its
+    /// list first (where its class's instances keep it): its position there
+    /// and its value.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn private_field_at(&self, idx: u32, brand: u64, id: u32, pos: u32) -> Option<(usize, Value)> {
+        let fields = self.private_fields.get(&idx)?;
+        if let Some(&(b, n, v)) = fields.get(pos as usize) {
+            if b == brand && n == id {
+                return Some((pos as usize, v));
+            }
+        }
+        let at = fields.iter().position(|&(b, n, _)| b == brand && n == id)?;
+        Some((at, fields[at].2))
+    }
+
+    /// Heap `idx`'s private field list, to write an entry in place.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn private_fields_mut(&mut self, idx: u32) -> Option<&mut Vec<(u64, u32, Value)>> {
+        self.private_fields.get_mut(&idx)
+    }
+
     /// Whether the instance has the private field `(brand, key)`.
     pub(crate) fn private_field_has(&self, inst: Value, brand: u64, key: &str) -> bool {
         self.private_field_get(inst, brand, key).is_some()
@@ -1016,6 +1039,10 @@ impl<'p> Vm<'p> {
     /// declaring class can die while one of its methods lives on, which makes
     /// the search answer `None`; the collector clears the memo whenever it
     /// drops an entry there.
+    ///
+    /// The hit is inline at the access sites and the search out of line: as
+    /// one call, every `this.#x` paid the search's prologue and epilogue.
+    #[inline(always)]
     pub(crate) fn resolve_private_site(
         &mut self,
         ctx: Value,
@@ -1024,10 +1051,23 @@ impl<'p> Vm<'p> {
     ) -> Option<(u64, u8, u32, u32)> {
         let head = self.private_memo_key(ctx)?;
         let slot = private_memo_index(head, site);
-        let e = self.private_memo[slot];
+        let e = &self.private_memo[slot];
         if e.head == head && e.site == site {
             return Some((e.brand, e.kind, e.owner, e.id));
         }
+        self.resolve_private_site_miss(ctx, head, slot, site, key)
+    }
+
+    /// [`Self::resolve_private_site`]'s search, and the memo's fill.
+    #[inline(never)]
+    fn resolve_private_site_miss(
+        &mut self,
+        ctx: Value,
+        head: u64,
+        slot: usize,
+        site: u64,
+        key: &str,
+    ) -> Option<(u64, u8, u32, u32)> {
         self.private_brands_of(ctx)?.first()?;
         let (brand, kind, owner) = self.resolve_private_in(ctx, key)?;
         let id = self.private_name_id(key);
@@ -1056,7 +1096,7 @@ impl<'p> Vm<'p> {
     /// index and the slot's version, which a reuse of the slot bumps, so a
     /// live callee, and the brand chain it was made with, owns its entries.
     #[inline]
-    fn private_memo_key(&self, ctx: Value) -> Option<u64> {
+    pub(crate) fn private_memo_key(&self, ctx: Value) -> Option<u64> {
         if !ctx.is_heap() {
             return None;
         }
