@@ -239,3 +239,36 @@ fn the_rich_form_reports_the_same_frames() {
         zipp_vm::embed::HostValue::String("Error: s\n    at stackOf (<anonymous>:1:29)\n    at <anonymous>:1:1".into())
     );
 }
+
+#[test]
+fn a_syntax_error_in_the_preamble_is_the_preambles() {
+    // The host's own broken line, not the guest's line 1 (the guest is fine).
+    let err = compile_script_with_preamble_and_origin(
+        "var hostOk = 1;\nconst hostBroken = ;\n",
+        "console.log('guest');\n",
+        &CompileOptions::default(),
+        &origin("app.js", 0, 0),
+    )
+    .err()
+    .expect("a syntax error");
+    assert_eq!(err, "SyntaxError: unexpected token ';'\n    at zipp:preamble:2:20");
+}
+
+#[test]
+fn a_preamble_function_that_calls_nothing_is_still_the_preambles() {
+    // `hostLeaf` records no call site, so its frame has no position; it is
+    // still named for the preamble, and the guest's frame for the guest.
+    let st = compile_script_with_preamble_and_origin(
+        "function hostLeaf(o) {\n  return o.x;\n}\n",
+        "try { hostLeaf(null); } catch (e) { console.log(e.stack); }\n\
+         function guestLeaf(o) { return o.x; }\n\
+         try { guestLeaf(null); } catch (e) { console.log(e.stack); }\n",
+        &CompileOptions::default(),
+        &origin("app.js", 0, 0),
+    )
+    .expect("compiles");
+    let out = output(st);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(out[0].contains("\n    at hostLeaf (zipp:preamble)\n    at app.js:1:7"), "{}", out[0]);
+    assert!(out[1].contains("\n    at guestLeaf (app.js)\n    at app.js:3:7"), "{}", out[1]);
+}

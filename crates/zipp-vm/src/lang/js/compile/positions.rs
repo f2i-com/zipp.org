@@ -140,7 +140,9 @@ impl SourceOrigin {
 /// `message` with the position of byte `pos` of `src` appended as a stack
 /// frame: `SyntaxError: ...\n    at name:line:col`. `origin` maps it into the
 /// host's text when the source was not the host's alone; without it the
-/// position is `src`'s own.
+/// position is `src`'s own. An error in an embedding preamble is the
+/// preamble's, at its line there (`zipp:preamble:line:col`, as a stack names
+/// the preamble's frames).
 pub(crate) fn locate_message(
     message: &str,
     src: &str,
@@ -148,6 +150,10 @@ pub(crate) fn locate_message(
     name: Option<&str>,
     origin: Option<&SourceOrigin>,
 ) -> String {
+    if origin.is_some_and(|o| o.preamble && pos < o.guest.start) {
+        let (line, col) = SourceIndex::new(src).line_col(pos);
+        return format!("{message}\n    at zipp:preamble:{line}:{col}");
+    }
     let at = match origin {
         Some(origin) => origin.locate(src, pos),
         None => Some(SourceIndex::new(src).line_col(pos.min(src.len() as u32))),

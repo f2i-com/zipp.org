@@ -152,6 +152,19 @@ impl Compiler {
             .unwrap_or_default()
     }
 
+    /// Give a function of an embedding preamble that records no call site one
+    /// that holds no code, `start` being its node's offset: a stack then names
+    /// its frames `zipp:preamble` (`FuncProto::is_plumbing`) as it names those
+    /// of the preamble's functions that call something, rather than the
+    /// script's.
+    pub(crate) fn mark_preamble_fn(&self, proto: &mut FuncProto, start: u32) {
+        use crate::bytecode::CallSite;
+        let Some(origin) = &self.origin else { return };
+        if origin.preamble && start < origin.guest.start && proto.call_sites.is_empty() {
+            proto.call_sites = Box::new([CallSite { start: 0, end: 0, line: CallSite::PLUMBING, col: 0 }]);
+        }
+    }
+
     /// The `(line, column)` a call site at source byte offset `off` records
     /// (see `positions`): the source's own, or the host's under `origin`.
     pub(crate) fn line_col(&self, off: u32) -> (u32, u32) {
