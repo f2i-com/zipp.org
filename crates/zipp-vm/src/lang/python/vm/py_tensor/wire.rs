@@ -172,15 +172,23 @@ pub(crate) fn encode_request<'b>(op: u32, args: &[Arg], budget: Budget, bytes: i
     w.0
 }
 
-/// One buffer the kernels see: its bytes from `lo` placed at their own
-/// offsets (the bytes below `lo`, which no view covers, are zeros).
+/// One buffer the kernels see: the bytes the request carried, from `lo`,
+/// and every view of the buffer moved down by `base` (`lo` rounded down to
+/// [`ALIGN`]), so `data` starts at `base` and an element keeps its alignment.
+/// It once started at byte 0, zeros up to `lo`: a 64-byte view 16 MiB into
+/// its buffer cost the decoder a 16 MiB allocation.
 pub(crate) struct WireBuffer {
     pub id: u32,
     pub detached: bool,
     pub lo: usize,
+    pub base: usize,
     pub data: Vec<u8>,
     pub written: bool,
 }
+
+/// What a view's offset keeps modulo, when its buffer is moved down to the
+/// bytes the request carries: the widest element's size, and more.
+const ALIGN: usize = 16;
 
 /// A decoded request: the kernels' `Host` (see `kernels::Host`).
 pub(crate) struct WireHost {
@@ -232,16 +240,34 @@ pub(crate) fn decode_request(b: &[u8]) -> Option<WireHost> {
         });
     }
     let nbuf = r.u32()? as usize;
-    let mut buffers = Vec::with_capacity(nbuf.min(64));
+    let mut buffers: Vec<WireBuffer> = Vec::with_capacity(nbuf.min(64));
     for _ in 0..nbuf {
         let id = r.u32()?;
         let detached = r.u8()? != 0;
         let lo = r.usize()?;
         let len = r.usize()?;
         let bytes = r.take(len)?;
-        let mut data = vec![0u8; lo.checked_add(len)?];
-        data[lo..].copy_from_slice(bytes);
-        buffers.push(WireBuffer { id, detached, lo, data, written: false });
+        // One entry per buffer, as the encoder writes them.
+        if buffers.iter().any(|b| b.id == id) {
+            return None;
+        }
+        // At most ALIGN - 1 bytes beyond what the request carried.
+        let base = lo - lo % ALIGN;
+        let mut data = Vec::new();
+        data.try_reserve_exact((lo - base).checked_add(len)?).ok()?;
+        data.resize(lo - base, 0);
+        data.extend_from_slice(bytes);
+        buffers.push(WireBuffer { id, detached, lo, base, data, written: false });
+    }
+    // Each view moves with its buffer. The encoder sends every view's whole
+    // range, so none starts below its buffer's base; a request in which one
+    // does is not one this module can run (it declines it).
+    for arg in &mut args {
+        if let Arg::View(v) = arg {
+            if let Some(b) = buffers.iter().find(|b| b.id == v.buffer) {
+                v.offset = v.offset.checked_sub(b.base)?;
+            }
+        }
     }
     Some(WireHost { op, budget, args, buffers, charged: 0 })
 }
@@ -274,10 +300,12 @@ impl WireHost {
         let written: Vec<&WireBuffer> = self.buffers.iter().filter(|b| b.written).collect();
         w.u32(written.len() as u32);
         for b in written {
+            // Back at the offsets the request named.
+            let carried = &b.data[b.lo - b.base..];
             w.u32(b.id);
             w.u64(b.lo as u64);
-            w.u64((b.data.len() - b.lo) as u64);
-            w.0.extend_from_slice(&b.data[b.lo..]);
+            w.u64(carried.len() as u64);
+            w.0.extend_from_slice(carried);
         }
         w.0
     }
@@ -311,4 +339,120 @@ pub(crate) fn decode_response(b: &[u8]) -> Option<Response<'_>> {
         written.push((id, lo, r.take(len)?));
     }
     Some(Response { outcome, charged, written })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `args` beside this file, in the engine and in the torch package alike.
+    use super::super::args::{KIND_F32, KIND_F64, KIND_U8};
+
+    const OPEN: Budget = Budget { unlimited: true, open: true, heap_room: u64::MAX, steps_left: None };
+
+    fn view(buffer: u32, kind: u8, offset: usize, len: usize) -> Arg {
+        Arg::View(View { buffer, kind, offset, len })
+    }
+
+    fn views(host: &WireHost) -> Vec<View> {
+        host.args.iter().filter_map(|a| if let Arg::View(v) = a { Some(*v) } else { None }).collect()
+    }
+
+    /// `buffers[id]` as the engine holds it, a request over `args`, decoded
+    /// as the torch module decodes it.
+    fn round_trip(buffers: &[Vec<u8>], args: &[Arg]) -> WireHost {
+        let request = encode_request(1, args, OPEN, |id| buffers.get(id as usize).map(|b| &b[..]));
+        decode_request(&request).expect("a request the encoder wrote decodes")
+    }
+
+    /// What the engine does with the response: each written buffer's bytes
+    /// copied back at the offset it names (`Vm::pt_bridge`).
+    fn apply(buffers: &mut [Vec<u8>], response: &[u8]) {
+        for (id, lo, bytes) in decode_response(response).expect("the response decodes").written {
+            buffers[id as usize][lo..lo + bytes.len()].copy_from_slice(bytes);
+        }
+    }
+
+    #[test]
+    fn a_high_view_allocates_what_it_carries_and_writes_back_in_place() {
+        // 64 bytes at the end of a 16 MiB buffer: the decoder allocated the
+        // whole 16 MiB (zeros up to the view) and now 64 bytes.
+        let at = 16 << 20;
+        let mut buffers = vec![(0..at + 64).map(|i| i as u8).collect::<Vec<u8>>()];
+        let mut host = round_trip(&buffers, &[view(0, KIND_F32, at, 16)]);
+        assert_eq!(host.buffers[0].data.len(), 64);
+        let v = views(&host)[0];
+        assert_eq!(v.offset, 0);
+        assert_eq!(&host.bytes(0).unwrap()[v.offset..v.offset + 64], &buffers[0][at..]);
+        host.bytes_mut(0).unwrap()[v.offset..v.offset + 4].copy_from_slice(&[9, 9, 9, 9]);
+        let expected = { let mut b = buffers[0].clone(); b[at..at + 4].copy_from_slice(&[9, 9, 9, 9]); b };
+        apply(&mut buffers, &host.response(Outcome::Done));
+        assert_eq!(buffers[0], expected);
+    }
+
+    #[test]
+    fn a_view_keeps_its_alignment_and_one_byte_tails_stay_one_byte() {
+        // A one-byte view at an odd offset: at most ALIGN - 1 bytes of prefix,
+        // and the offset keeps its value modulo ALIGN.
+        let buffers = vec![vec![7u8; 1_000_004]];
+        let host = round_trip(&buffers, &[view(0, KIND_U8, 1_000_003, 1)]);
+        let v = views(&host)[0];
+        assert_eq!(v.offset % ALIGN, 1_000_003 % ALIGN);
+        assert!(host.buffers[0].data.len() <= 1 + ALIGN - 1);
+        assert_eq!(host.bytes(0).unwrap()[v.offset], 7);
+    }
+
+    #[test]
+    fn views_of_one_buffer_move_together_and_stay_one_alias() {
+        // Overlapping f64 and u8 views and a distant f32 view of one buffer,
+        // and a second buffer: each buffer's views keep their distances.
+        let mut buffers = vec![(0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(), vec![1u8; 64]];
+        let args = [view(0, KIND_F64, 1024, 4), view(0, KIND_U8, 1029, 8), view(0, KIND_F32, 4000, 8), view(1, KIND_U8, 32, 8)];
+        let mut host = round_trip(&buffers, &args);
+        let v = views(&host);
+        assert_eq!((v[1].offset - v[0].offset, v[2].offset - v[0].offset), (5, 4000 - 1024));
+        assert_eq!(v[0].offset % 8, 0);
+        assert_eq!(host.buffers[0].data.len(), 4032 - 1024);
+        // A write through one view is seen through the other, and returns to
+        // the engine's buffer in place.
+        host.bytes_mut(0).unwrap()[v[1].offset] = 200;
+        assert_eq!(host.bytes(0).unwrap()[v[0].offset + 5], 200);
+        let mut expected = buffers.clone();
+        expected[0][1029] = 200;
+        apply(&mut buffers, &host.response(Outcome::Declined));
+        assert_eq!(buffers, expected);
+    }
+
+    #[test]
+    fn empty_and_detached_buffers_still_decode() {
+        let buffers = vec![vec![5u8; 128]];
+        let host = round_trip(&buffers, &[view(0, KIND_F32, 96, 0), view(3, KIND_F32, 0, 4)]);
+        let v = views(&host);
+        assert_eq!(v[0].offset % ALIGN, 0);
+        assert!(host.buffers[0].data.is_empty());
+        assert!(host.buffers[1].detached && host.bytes(3).is_none());
+        assert_eq!(v[1].offset, 0);
+    }
+
+    #[test]
+    fn a_malformed_request_is_declined() {
+        let buffers = vec![vec![0u8; 256]];
+        let good = encode_request(1, &[view(0, KIND_U8, 128, 16)], OPEN, |id| buffers.get(id as usize).map(|b| &b[..]));
+        assert!(decode_request(&good).is_some());
+        // The view's offset is the u64 after the tag, buffer and kind bytes
+        // that follow `nargs`; one below the buffer's base cannot be run.
+        let mut low = good.clone();
+        let at = 4 + 1 + 8 + 8 + 4 + 1 + 4 + 1;
+        low[at..at + 8].copy_from_slice(&64u64.to_le_bytes());
+        assert!(decode_request(&low).is_none());
+        // The same buffer twice.
+        let twice = encode_request(1, &[view(0, KIND_U8, 128, 16)], OPEN, |id| buffers.get(id as usize).map(|b| &b[..]));
+        let nbuf_at = twice.len() - (4 + 1 + 8 + 8 + 16) - 4;
+        let mut dup = twice[..nbuf_at].to_vec();
+        dup.extend_from_slice(&2u32.to_le_bytes());
+        dup.extend_from_slice(&twice[nbuf_at + 4..]);
+        dup.extend_from_slice(&twice[nbuf_at + 4..]);
+        assert!(decode_request(&dup).is_none());
+        // Truncated.
+        assert!(decode_request(&good[..good.len() - 1]).is_none());
+    }
 }
