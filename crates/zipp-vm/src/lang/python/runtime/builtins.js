@@ -808,6 +808,7 @@
     });
     methodkw(T.bytes, "decode", (a) => { const kw = kwOf(a, ["encoding", "errors"]); return rt.decodeBytes(a[0], a[1] === undefined ? kwget(kw, "encoding", "utf-8") : a[1], a[2] === undefined ? kwget(kw, "errors", "strict") : a[2]); });
     method(T.bytes, "__len__", 1, (a) => BigInt(a[0].items.length));
+    method(T.bytes, "__contains__", 2, (a) => rt.baseContains(a[0], a[1]));
     method(T.bytes, "hex", 1, (a) => a[0].items.map((c) => c.toString(16).padStart(2, "0")).join(""));
     // Byte strings borrow the str algorithms through a Latin-1 view.
     const b2s = (b) => { let s = ""; for (const c of b.items) s += String.fromCharCode(c); return s; };

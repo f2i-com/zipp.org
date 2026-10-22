@@ -122,3 +122,30 @@ fn ints_past_two_to_the_twenty_bits_work_on_the_helper_paths() {
         vec!["3000000 3000000 3000001 3000001 1100001"]
     );
 }
+
+#[test]
+fn a_range_membership_that_asks_user_equality_is_metered() {
+    // `x in range(n)` asks a user __eq__ of each member in turn (CPython's
+    // iteration search): an ordinary metered loop, which a step budget stops
+    // in a range too long to finish rather than letting it run to the end.
+    let class = "class Never:\n    def __eq__(self, other):\n        return False\n";
+    assert_eq!(
+        run(&format!("{class}print(Never() in range(1000))\n"), false).unwrap(),
+        vec!["False"]
+    );
+    let src = format!("{class}print(Never() in range(10 ** 15))\n");
+    let out = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let modules = vec![("main".to_string(), src)];
+            let mut compiled = compile_python_project_hosted("main", &modules, false).expect("compiles");
+            let state = compiled.state_mut();
+            state.set_limits(2_000_000, None);
+            (state.run_init().is_err(), state.take_output())
+        })
+        .expect("spawn")
+        .join()
+        .expect("test thread");
+    assert!(out.0, "the budget must stop the scan");
+    assert!(!out.1.iter().any(|l| l == "True" || l == "False"), "the scan finished: {:?}", out.1);
+}

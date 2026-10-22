@@ -864,20 +864,42 @@
         if (container.map !== undefined) return rt.setHas(container, needle);
         if (container.pyval !== undefined) return baseContains(container.pyval, needle);
         if (isInstance(container, T.range)) {
-            if (typeof needle === "number" && Number.isInteger(needle)) needle = BigInt(needle);
-            if (!isInt(needle)) return false;
-            const x = asInt(needle), r = container;
-            return (r.step > 0n ? x >= r.start && x < r.stop : x <= r.start && x > r.stop) && (x - r.start) % r.step === 0n;
+            // An int or bool is a member by arithmetic, and so is an integral
+            // float (equal to the int of its value). Anything else Python
+            // asks each member's equality with, an int subclass's or a user
+            // __eq__ included; a str, None or other float equals no int, so
+            // the walk would answer False.
+            if (typeof needle === "number") {
+                if (!Number.isInteger(needle)) return false;
+                needle = BigInt(needle);
+            }
+            if (isInt(needle)) {
+                const x = asInt(needle), r = container;
+                return (r.step > 0n ? x >= r.start && x < r.stop : x <= r.start && x > r.stop) && (x - r.start) % r.step === 0n;
+            }
+            if (typeof needle === "string" || needle === null) return false;
+            return iterContains(container, needle);
         }
         if (isInstance(container, T.bytes)) {
-            if (isInt(needle)) return container.items.indexOf(Number(asInt(needle))) >= 0;
-            if (needle !== null && typeof needle === "object" && needle.cls === T.bytes) return rt.bytesToLatin1(container).indexOf(rt.bytesToLatin1(needle)) >= 0;
-            fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(needle).name + "'");
+            // bytes and bytearray (a subtype here), as _Py_bytes_contains: an
+            // integer (anything with __index__) is one byte, in range(0, 256);
+            // anything else must be bytes-like, and is a subsequence.
+            let byte;
+            if (isInt(needle)) byte = asInt(needle);
+            else if (typeMethod(needle, "__index__") !== undefined) byte = rt.indexOf(needle);
+            else if (needle !== null && typeof needle === "object" && needle.items !== undefined && isInstance(needle, T.bytes)) return rt.bytesToLatin1(container).indexOf(rt.bytesToLatin1(needle)) >= 0;
+            else fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(needle).name + "'");
+            if (byte < 0n || byte > 255n) fail(E.ValueError, "byte must be in range(0, 256)");
+            return container.items.indexOf(Number(byte)) >= 0;
         }
+        return iterContains(container, needle);
+    }
+    rt.baseContains = baseContains;
+    // Membership by iteration: equality with each item in turn.
+    function iterContains(container, needle) {
         const it = rt.iter(container);
         for (;;) { const v = rt.fornext(it); if (v === STOP) return false; if (eq(v, needle)) return true; }
     }
-    rt.baseContains = baseContains;
     function contains(container, needle) {
         if (typeof container === "string") return baseContains(container, needle);
         if (container !== null && typeof container === "object") {

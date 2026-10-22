@@ -1,0 +1,65 @@
+bytes -1 ValueError byte must be in range(0, 256)
+bytearray -1 ValueError byte must be in range(0, 256)
+bytes 0 True
+bytearray 0 True
+bytes 97 True
+bytearray 97 True
+bytes 255 True
+bytearray 255 True
+bytes 256 ValueError byte must be in range(0, 256)
+bytearray 256 ValueError byte must be in range(0, 256)
+bytes 1267650600228229401496703205376 ValueError byte must be in range(0, 256)
+bytearray 1267650600228229401496703205376 ValueError byte must be in range(0, 256)
+bytes -1267650600228229401496703205376 ValueError byte must be in range(0, 256)
+bytearray -1267650600228229401496703205376 ValueError byte must be in range(0, 256)
+bytes True True
+bytearray True True
+bytes False True
+bytearray False True
+bytes sub True
+bytes sub absent False
+bytes empty sub True
+bytes bytearray needle True
+bytearray sub True
+bytearray bytearray True
+bytes int subclass True
+bytes int subclass absent False
+bytes __index__ True
+bytes __index__ out of range ValueError byte must be in range(0, 256)
+bytes str TypeError a bytes-like object is required, not 'str'
+bytes float TypeError a bytes-like object is required, not 'float'
+bytes None TypeError a bytes-like object is required, not 'NoneType'
+bytes list TypeError a bytes-like object is required, not 'list'
+bytes not in True
+bytes not in out of range ValueError byte must be in range(0, 256)
+bytes dunder True
+bytes dunder sub True
+bytes dunder range ValueError byte must be in range(0, 256)
+bytearray dunder True
+bytes has dunder True
+range custom eq True
+range custom eq absent False
+range custom eq descending True
+range custom eq stepped True
+range custom eq stepped absent False
+range custom eq empty False
+range not in False
+range raising eq KeyError 'boom'
+range raising eq empty False
+range int subclass True
+range int subclass absent False
+range int subclass eq True
+range float True
+range float fraction False
+range float nan False
+range float inf False
+range str False
+range None False
+range complex True
+range bool True
+range big True
+range big absent False
+range negative step True
+range dunder True
+range scan count False
+range eq calls 7
