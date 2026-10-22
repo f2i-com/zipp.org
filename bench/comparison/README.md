@@ -21,7 +21,9 @@ The same directory holds the release-build check
 ([`release_real13_da0fe6b1_2026-10-21.json`](release_real13_da0fe6b1_2026-10-21.json), the published 0.0.28 CLI
 against Node, Bun and Deno) and the A/B of that build against the PGO one
 ([`pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json`](pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json):
-the PGO build takes 0.891× the release build's time).
+the PGO build takes 0.891× the release build's time). That compares the two
+products, not profile guidance alone: the PGO build also leaves out the GPU
+and Python features and has its own CPU target and linker.
 
 ## Interpreter versus interpreter, 2026-10-18
 
@@ -41,7 +43,8 @@ The same directory holds the release-build check
 ([`release_real13_5f1c0578_2026-10-18.json`](release_real13_5f1c0578_2026-10-18.json), the published 0.0.26 CLI
 against Node, Bun and Deno) and the A/B of that build against the PGO one
 ([`pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json`](pgo_ab_real13_5f1c0578_f1739644_2026-10-18.json):
-the PGO build takes 0.901× the release build's time).
+the PGO build takes 0.901× the release build's time; the same two kinds of
+build, so the same reading).
 
 ## Interpreter versus interpreter, 2026-10-15
 

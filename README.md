@@ -218,7 +218,7 @@ Measured the same day:
 | Interpreter against interpreter: ZIPP with `ZIPP_NOJIT=1` / Bellard's QuickJS, 30 rows | **0.685×** |
 | ZIPP's interpreter / QuickJS-NG, 30 rows | **0.387×** |
 | ZIPP Python / CPython 3.13.14, 36 programs, in-process work time | 1.067× (0.975× on the micro kernels) |
-| The published release build / the PGO build, 13 everyday rows | 1.12× |
+| The published release build / the canonical PGO build, 13 everyday rows (the builds also differ in features, flags and linker, so this is not PGO alone) | 1.12× |
 
 The full tables, confidence intervals and the remaining gaps are in
 [Performance](docs/PERFORMANCE.md) and on [zipp.org](https://www.zipp.org/benchmarks/).

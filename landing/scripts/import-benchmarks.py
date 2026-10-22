@@ -278,7 +278,8 @@ def release_section() -> dict:
         "normalVsNode": {name: {"value": r(v["geomean_paired_ratio"]), "ci": interval(v["ci95"])} for name, v in sets.items()},
         "allCorrect": release["all_correct"],
         # tools/bench.py --ab OLD NEW reports NEW / OLD: the PGO build's time
-        # over the release build's.
+        # over the release build's. The two differ in features, CPU target and
+        # linker as well as the profile, so this compares products, not PGO alone.
         "pgoOverRelease": {name: {"value": r(v["geomean_paired_ratio"]), "ci": interval(v["ci95"])} for name, v in ab_sets.items()},
         "artifacts": {"release": CAPTURES["release_normal"], "pgoAb": CAPTURES["pgo_ab"]},
     }

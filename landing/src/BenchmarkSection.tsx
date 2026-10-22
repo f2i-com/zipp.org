@@ -400,7 +400,8 @@ export function BenchmarkSection() {
               <p>
                 <strong>The download is a plain release build.</strong> The published <code>zipp-{versionOf(release.zipp.version)}-windows-x86_64-portable.exe</code> runs
                 the normal 13 rows at {x(release.normalVsNode.all_measured.value)} Node ({range(release.normalVsNode.all_measured.ci)}); the PGO build takes{' '}
-                {release.pgoOverRelease.all_measured ? x(release.pgoOverRelease.all_measured.value) : '—'} of its time on the same rows.
+                {release.pgoOverRelease.all_measured ? x(release.pgoOverRelease.all_measured.value) : '—'} of its time on the same rows. That compares the two
+                builds, not profile guidance alone: the PGO build also leaves out the GPU and Python features and has its own CPU target and linker.
               </p>
               <p className="gap-list">
                 <strong>Rows still behind Node ({jitGaps.length}):</strong>{' '}

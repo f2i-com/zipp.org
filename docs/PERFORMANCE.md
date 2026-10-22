@@ -122,7 +122,12 @@ the same four engines, 15 repetitions) runs the 13 normal rows at **0.608× Node
 every row. A paired A/B of the same rows
 ([`pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json`](../bench/comparison/pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json)) puts the PGO
 build at 0.891× the release build's time [0.881, 0.901]: the download
-takes about 1.12× the canonical figures' time.
+takes about 1.12× the canonical figures' time. The two builds differ in more
+than the profile: the PGO build has JavaScript only (no GPU or Python
+features, 9.1 MB against 17.8 MB), an explicit `x86-64` CPU target and the lld
+linker. The ratio compares the release product with the canonical benchmark
+product; it is not the effect of profile guidance alone, which would take a
+feature- and flag-matched pair to measure.
 
 ### Interpreter versus interpreter
 

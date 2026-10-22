@@ -59,6 +59,13 @@ force `publishable:false`.
 The exact retained 10/3 split and hostile manifest membership are pinned by
 benchmark-integrity tests. Changing either starts a new publication series.
 
+A frozen source's own comments are corrected here rather than in the file,
+since every capture records its SHA-256. `bench/real/property-ic-shapes.js`
+says `diffShapes(n)` builds `n` distinct shapes, but it adds `i % 12` filler
+properties before the one it reads, so it builds `min(n, 12)` key layouts: its
+`read/diff/16` and `read/diff/1024` phases are 16 and 1,024 receivers over 12
+layouts, not 1,024 layouts.
+
 ## Focused development A/Bs
 
 Compare two binaries on one or more retained rows with exact counterbalancing:
