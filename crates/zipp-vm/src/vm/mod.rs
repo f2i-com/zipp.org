@@ -2171,6 +2171,9 @@ pub struct Vm<'p> {
     /// accepting ANY chain brand. A name absent here falls back to the lenient
     /// any-brand check. Keyed by brand; pruned by GC to brands still referenced.
     brand_private_names: rustc_hash::FxHashMap<u64, Vec<(String, u8)>>,
+    /// `brand_private_names.len()` after its last prune: a minor prunes it
+    /// again only once it has doubled since (`gc.rs`).
+    brand_names_pruned_len: usize,
     /// Brand -> heap index of the class VALUE that minted it (the DECLARING
     /// class), so a private access resolves members from the declaring class
     /// rather than the receiver's chain (kind-aware: shadowed/missing

@@ -1106,6 +1106,7 @@ impl Vm<'_> {
             self.brand_private_names
                 .retain(|b, _| live_brands.contains(b));
         }
+        self.brand_names_pruned_len = self.brand_private_names.len();
         self.shared_buffers.retain_marked(&marks);
         self.immutable_buffers.retain_marked(&marks);
         self.pinned_buffers.retain_marked(&marks);
@@ -1445,8 +1446,16 @@ impl Vm<'_> {
         // declared anyway. Deferring it further is safe regardless: brand ids
         // are minted from a monotone counter (`next_private_brand`) and never
         // recycled, so a stale record can never be misread — it is memory,
-        // reclaimed at the next recompute.
-        if !self.brand_private_names.is_empty() && self.method_brand.len() != method_brand_entries {
+        // reclaimed at the next recompute. And a minor runs it only once the
+        // records have doubled since the last: a class expression evaluated
+        // in a loop (a fresh brand and methods every call) let a method's
+        // chain die at nearly every minor, and the walk, set and all, was 2-4%
+        // of such a program. Between, the dead records are at most as many as
+        // the live ones were, plus 64.
+        if !self.brand_private_names.is_empty()
+            && self.method_brand.len() != method_brand_entries
+            && self.brand_private_names.len() >= 2 * self.brand_names_pruned_len + 64
+        {
             let mut live_brands: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
@@ -1456,6 +1465,7 @@ impl Vm<'_> {
             }
             self.brand_private_names
                 .retain(|b, _| live_brands.contains(b));
+            self.brand_names_pruned_len = self.brand_private_names.len();
         }
         prune_set!(self.shared_buffers);
         prune_set!(self.immutable_buffers);

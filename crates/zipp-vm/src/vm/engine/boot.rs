@@ -413,6 +413,7 @@ impl<'p> Vm<'p> {
             ctor_owner: crate::slot_table::SlotTable::default(),
             instance_brand: crate::slot_table::SlotTable::default(),
             brand_private_names: rustc_hash::FxHashMap::default(),
+            brand_names_pruned_len: 0,
             brand_owner: rustc_hash::FxHashMap::default(),
             private_memo: vec![
                 crate::vm::values::PrivateMemo::EMPTY;
