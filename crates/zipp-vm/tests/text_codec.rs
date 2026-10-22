@@ -109,3 +109,57 @@ fn run(src: &str) -> String {
 fn text_encoder_and_decoder_match_node() {
     assert_eq!(run(PROBE), EXPECTED);
 }
+
+/// A decoder's state across calls that re-enter it and calls that fail: a
+/// `stream` getter that decodes with the same decoder (the outer call goes
+/// on from the inner one's state, as the Encoding Standard's argument
+/// conversion before the method steps has it, warm or cold), a getter
+/// that throws (nothing changes), and a fatal error, after which a
+/// streaming decoder's BOM is still seen and a final one starts afresh.
+/// The expected lines are Node's (v24), which Chromium's agree with.
+const STATE_PROBE: &str = r###""use strict";
+const out = [];
+const log = (...a) => out.push(a.map(String).join(" "));
+const cps = (s) => JSON.stringify(Array.from(s, (c) => c.codePointAt(0)));
+const u8 = (...b) => new Uint8Array(b);
+const thrown = (f) => { try { return "returned " + JSON.stringify(f()); } catch (e) { return e.name; } };
+const warm = new TextDecoder();
+warm.decode(u8(), { stream: true });
+log("reenter-warm", cps(warm.decode(u8(0xa9), { get stream() { warm.decode(u8(0xc3), { stream: true }); return false; } })));
+const cold = new TextDecoder();
+log("reenter-cold", cps(cold.decode(u8(0xa9), { get stream() { cold.decode(u8(0xc3), { stream: true }); return false; } })));
+const held = new TextDecoder();
+held.decode(u8(0xc3), { stream: true });
+log("getter-throws", thrown(() => held.decode(u8(0x41), { get stream() { throw new RangeError("no"); } })), cps(held.decode(u8(0xa9))));
+const f = new TextDecoder("utf-8", { fatal: true });
+f.decode(u8(0x41), { stream: true });
+log("fatal-stream", thrown(() => f.decode(u8(0xff), { stream: true })), cps(f.decode(u8(0xef, 0xbb, 0xbf, 0x42), { stream: true })), cps(f.decode()));
+const g = new TextDecoder("utf-8", { fatal: true });
+log("fatal-final", cps(g.decode(u8(0xef, 0xbb, 0xbf, 0x41), { stream: true })), thrown(() => g.decode(u8(0xff))), cps(g.decode(u8(0xef, 0xbb, 0xbf, 0x42))));
+const h = new TextDecoder("utf-8", { fatal: true });
+log("fatal-first", thrown(() => h.decode(u8(0xff), { stream: true })), cps(h.decode(u8(0xef, 0xbb, 0xbf, 0x43))));
+const split = new TextDecoder();
+log("split-bom", cps(split.decode(u8(0xef), { stream: true })), cps(split.decode(u8(0xbb, 0xbf, 0x41), { stream: true })), cps(split.decode(u8(0xef, 0xbb, 0xbf))), cps(split.decode(u8(0xef, 0xbb, 0xbf, 0x44))));
+const keep = new TextDecoder("utf-8", { ignoreBOM: true });
+log("ignore-bom", cps(keep.decode(u8(0xef, 0xbb), { stream: true })), cps(keep.decode(u8(0xbf, 0x41))));
+const w = new TextDecoder("utf-16le", { fatal: true });
+log("utf16-odd", thrown(() => w.decode(u8(0x41))), cps(w.decode(u8(0xff, 0xfe, 0x41, 0x00))));
+log("utf16-lone", thrown(() => w.decode(u8(0x00, 0xd8, 0x41, 0x00), { stream: true })), cps(w.decode(u8(0x42, 0x00))));
+console.log(out.join("\n"));
+"###;
+
+const STATE_EXPECTED: &str = r###"reenter-warm [233]
+reenter-cold [233]
+getter-throws RangeError [233]
+fatal-stream TypeError [65279,66] []
+fatal-final [65] TypeError [66]
+fatal-first TypeError [67]
+split-bom [] [65] [65279] [68]
+ignore-bom [] [65279,65]
+utf16-odd TypeError [65]
+utf16-lone TypeError [66]"###;
+
+#[test]
+fn decoder_state_across_reentry_and_errors_matches_node() {
+    assert_eq!(run(STATE_PROBE), STATE_EXPECTED);
+}

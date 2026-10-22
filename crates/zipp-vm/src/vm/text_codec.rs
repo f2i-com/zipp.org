@@ -275,7 +275,8 @@ impl<'p> Vm<'p> {
                 }
             }
             native::TD_DECODE => {
-                let (idx, mut c) = self.text_codec_of(this, true, "TextDecoder.prototype.decode")?;
+                const WHAT: &str = "TextDecoder.prototype.decode";
+                self.text_codec_of(this, true, WHAT)?;
                 let input = if a0 == Value::UNDEFINED { Vec::new() } else { self.buffer_source_bytes(a0)? };
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let stream = if opts.is_nullish() {
@@ -288,13 +289,23 @@ impl<'p> Vm<'p> {
                         "TypeError: TextDecoder.prototype.decode options must be an object",
                     ));
                 };
+                // The decoder's state as it is now: a `stream` getter runs
+                // guest code, which can decode with this decoder too, and
+                // this call continues from where that left it (a copy taken
+                // before the getter wrote the nested call's state over).
+                let (idx, mut c) = self.text_codec_of(this, true, WHAT)?;
                 let mut buf = c.pending[..c.pending_len as usize].to_vec();
                 buf.extend_from_slice(&input);
                 let decoded = decode_bytes(&buf, c.encoding, stream, c.fatal);
                 let Some((mut text, keep)) = decoded else {
-                    // A fatal decoder's error ends the stream it was in.
+                    // A fatal error drops the sequence it is in. A streaming
+                    // call's stream goes on, its BOM seen or not as before
+                    // (the next call's U+FEFF is text if one was); a final
+                    // call's ends, as every final call's does.
                     c.pending_len = 0;
-                    c.bom_seen = false;
+                    if !stream {
+                        c.bom_seen = false;
+                    }
                     if let HeapObj::TextCodec(s) = self.heap.get_mut(idx) {
                         *s = c;
                     }
