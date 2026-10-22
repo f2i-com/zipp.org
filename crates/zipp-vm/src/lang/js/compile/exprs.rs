@@ -45,7 +45,11 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
 /// suites; an interpreter-only rewrite belongs in `FusedCode`, which keeps
 /// the bytecode's length and positions.
 pub(crate) fn interp_only_bytecode() -> bool {
-    cfg!(not(feature = "jit"))
+    if cfg!(not(feature = "jit")) {
+        return true;
+    }
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*KEEP.get_or_init(|| std::env::var_os("ZIPP_KEEP_COPIES").is_some())
 }
 
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
