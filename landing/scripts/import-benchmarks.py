@@ -27,8 +27,8 @@ OUT = ROOT / "landing/src/benchmark-data.json"
 CAPTURES = {
     "jit_normal": "bench/real13_84012a2d_pgo_2026-10-21.json",
     "jit_hostile": "bench/hostile/head_clean_84012a2d_pgo_2026-10-21.json",
-    "interp_normal": "bench/comparison/interp_real13_84012a2d_2026-10-21.json",
-    "interp_hostile": "bench/comparison/interp_hostile17_84012a2d_2026-10-21.json",
+    "interp_normal": "bench/comparison/interp_real13_84012a2d_2026-10-22.json",
+    "interp_hostile": "bench/comparison/interp_hostile17_84012a2d_2026-10-22.json",
     "release_normal": "bench/comparison/release_real13_da0fe6b1_2026-10-21.json",
     "pgo_ab": "bench/comparison/pgo_ab_real13_da0fe6b1_84012a2d_2026-10-21.json",
     "python_jit": "bench/python/cpython_da0fe6b1_2026-10-21.json",
@@ -225,7 +225,7 @@ def interp_suite(key: str, names: dict) -> dict:
                            "wins": comparison["point_wins"], "of": comparison["case_count"]}
         else:
             geo[engine] = {"unavailable": (comparison or {}).get("unavailable_cases", [])}
-    engines = {name: version_number((e.get("version_probe") or {}).get("stdout")) for name, e in report["engines"].items() if name != "zipp-interp"}
+    engines = {name: version_number((e.get("version_probe") or {}).get("stdout")) for name, e in report["engines"].items() if not name.startswith("zipp-")}
     return {"rows": rows, "geomean": geo, "excluded": report.get("excluded") or {}, "reps": report["reps"],
             "capturedAt": report["created_at"][:10], "engines": engines}
 

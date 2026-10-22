@@ -26,6 +26,25 @@ interpreter with native regex matching, not an interpreter emitting no native
 code. They stay as recorded; `tools/test_run_native.py` checks each lane's
 child environment.
 
+## Interpreter versus interpreter, 2026-10-22: the strict lane
+
+The same canonical PGO binary (`84012a2d`), rerun in the strict `zipp-interp`
+lane (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, no native code), with `zipp-interp-rxjit`, the lane every
+earlier capture ran, beside it; 8 counterbalanced repetitions each:
+
+- [`interp_real13_84012a2d_2026-10-22.json`](interp_real13_84012a2d_2026-10-22.json):
+  the 13 normal rows. Zipp's interpreter is 0.615× Bellard's QuickJS [0.600, 0.621] (11 / 13 point wins), 0.390× QuickJS-NG [0.385, 0.396] (13 / 13 point wins), 0.829× Bun no-JIT, 1.168× Deno jitless, 1.224× Node jitless.
+- [`interp_hostile17_84012a2d_2026-10-22.json`](interp_hostile17_84012a2d_2026-10-22.json):
+  the 17 hostile rows. 0.740× Bellard's QuickJS [0.733, 0.747] (14 / 17 point wins), 0.387× QuickJS-NG [0.384, 0.391] (17 / 17 point wins), 0.785× Bun no-JIT, 0.880× Deno jitless, 1.022× Node jitless.
+
+Over all 30 rows that is 0.683× Bellard's QuickJS (25 / 30) and 0.388×
+QuickJS-NG. The `zipp-interp-rxjit` lane, run alongside, measured 0.680×
+QuickJS: the regex JIT is worth about 3% on `regex-log-scan` (the median of the
+eight paired repetitions, six of them slower without it), and nothing
+measurable on the rows without a regex, so the earlier captures' figures stand
+for what they measured ([`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#interpreter-versus-interpreter)
+has the tables).
+
 ## Interpreter versus interpreter, 2026-10-21
 
 The 0.0.28 engine's canonical PGO binary (`84012a2d`) ran the same way over

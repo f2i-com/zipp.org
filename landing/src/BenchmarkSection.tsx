@@ -119,7 +119,7 @@ const READING: Record<Mode, { title: string; copy: string }[]> = {
     { title: 'One number, then the table', copy: 'The all-30 figure weights every normal and hostile row equally. It summarises; the rows are the evidence, and the slower ones are listed under the table.' },
   ],
   interp: [
-    { title: 'Interpreter against interpreter', copy: 'The same ZIPP build with ZIPP_NOJIT=1 emits no native code. It runs against Bellard’s QuickJS and QuickJS-NG, which have no JIT, and against Node, Deno and Bun with their JITs switched off (V8’s Ignition, JavaScriptCore’s LLInt).' },
+    { title: 'Interpreter against interpreter', copy: 'The same ZIPP build with ZIPP_NOJIT=1 and ZIPP_NO_RX_JIT=1 emits no native code: its JavaScript JIT and its regex JIT are both off. It runs against Bellard’s QuickJS and QuickJS-NG, which have no JIT, and against Node, Deno and Bun with their JITs switched off (V8’s Ignition, JavaScriptCore’s LLInt).' },
     { title: 'The ratio is ZIPP over the other', copy: `Lower is faster. Each row is a fresh process, ${interp.normal.reps} counterbalanced repetitions, every output checked against Node’s. The headline is against Bellard’s QuickJS, the interpreter ZIPP is most often compared with.` },
     { title: 'Why it matters', copy: 'The WebAssembly build, the safe-sandbox profile and arm64 hosts without the JIT all run this interpreter, so these rows are what most embedders get.' },
   ],
@@ -412,7 +412,7 @@ export function BenchmarkSection() {
           {mode === 'interp' && (
             <>
               <p>
-                The same PGO build with <code>ZIPP_NOJIT=1</code>, Bellard’s QuickJS 2026-06-04, QuickJS-NG 0.17.0, Node{' '}
+                The same PGO build with <code>ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1</code> (no native code; the captures before 22 October left its regex JIT on), Bellard’s QuickJS 2026-06-04, QuickJS-NG 0.17.0, Node{' '}
                 <code>--jitless</code>, Deno <code>--v8-flags=--jitless</code> and Bun with <code>BUN_JSC_useJIT=0</code>. Identical staged sources for every
                 engine, every output checked against Node’s, {interp.normal.reps} counterbalanced repetitions, cold medians including launch.
                 Over all 30 rows ZIPP’s interpreter measures {interp.all30['node-jitless'] ? x(interp.all30['node-jitless'].value) : '—'} Node’s

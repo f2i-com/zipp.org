@@ -14,8 +14,8 @@ All of them were measured on 21 October 2026 with the 0.0.28 engine.
 | Hostile workloads | **0.748×** | All 17 stress-oriented rows. |
 
 Those are JIT against JIT: every engine runs as it ships. Run as a pure
-interpreter (`ZIPP_NOJIT=1`), Zipp measures **0.685×** Bellard's QuickJS and
-**0.387×** QuickJS-NG over the same 30 rows; see
+interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`: no native code), Zipp measures **0.683×** Bellard's QuickJS and
+**0.388×** QuickJS-NG over the same 30 rows; see
 [Interpreter versus interpreter](#interpreter-versus-interpreter). Its Python
 frontend measures 1.067× CPython 3.13.14 by in-process work time over 36
 programs (0.975× on the 30 micro kernels); see [Python versus CPython](#python-versus-cpython).
@@ -133,25 +133,27 @@ feature- and flag-matched pair to measure.
 
 The tables above compare production JITs. This one asks the other question:
 how fast is Zipp's interpreter against other interpreters? The same canonical
-PGO binary runs with `ZIPP_NOJIT=1`, emitting no native code at all, against
+PGO binary runs with `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, emitting no native code at all (its JavaScript
+JIT and its regex JIT both off; `ZIPP_NOJIT=1` alone leaves the regex JIT on,
+as every capture before 22 October did), against
 Bellard's QuickJS 2026-06-04 and QuickJS-NG 0.17.0 (neither has a JIT), and
 against the three JIT engines with their JITs switched off: Node `--jitless`
 (V8's Ignition), Deno `--v8-flags=--jitless`, and Bun with `BUN_JSC_useJIT=0`
 (JavaScriptCore's LLInt). [`run_native.py`](../bench/comparison/run_native.py)
 staged identical inputs for every engine, checked every output against Node,
 and ran 8 counterbalanced repetitions. The artifacts,
-[`interp_real13_84012a2d_2026-10-21.json`](../bench/comparison/interp_real13_84012a2d_2026-10-21.json) and
-[`interp_hostile17_84012a2d_2026-10-21.json`](../bench/comparison/interp_hostile17_84012a2d_2026-10-21.json),
+[`interp_real13_84012a2d_2026-10-22.json`](../bench/comparison/interp_real13_84012a2d_2026-10-22.json) and
+[`interp_hostile17_84012a2d_2026-10-22.json`](../bench/comparison/interp_hostile17_84012a2d_2026-10-22.json),
 are diagnostics, not canonical captures. Zipp's interpreter runs as it ships,
 including its exact recognizers for a few loop shapes.
 
 | Zipp interpreter / engine | Normal 13 | Hostile 17 | All 30 | Rows Zipp wins |
 |---|---:|---:|---:|---:|
-| QuickJS | 0.614× [0.611, 0.617] | 0.745× [0.740, 0.758] | **0.685×** | 24 / 30 |
-| QuickJS-NG | 0.385× [0.382, 0.388] | 0.389× [0.386, 0.396] | **0.387×** | 30 / 30 |
-| Node jitless | 1.207× [1.175, 1.213] | 1.009× [0.988, 1.028] | **1.090×** | 10 / 30 |
-| Deno jitless | 1.164× [1.154, 1.173] | 0.881× [0.874, 0.899] | **0.994×** | 15 / 30 |
-| Bun no-JIT | 0.834× [0.829, 0.838] | 0.790× [0.785, 0.801] | **0.809×** | 25 / 30 |
+| QuickJS | 0.615× [0.600, 0.621] | 0.740× [0.733, 0.747] | **0.683×** | 25 / 30 |
+| QuickJS-NG | 0.390× [0.385, 0.396] | 0.387× [0.384, 0.391] | **0.388×** | 30 / 30 |
+| Node jitless | 1.224× [1.213, 1.241] | 1.022× [1.015, 1.029] | **1.105×** | 9 / 30 |
+| Deno jitless | 1.168× [1.155, 1.185] | 0.880× [0.863, 0.887] | **0.995×** | 15 / 30 |
+| Bun no-JIT | 0.829× [0.812, 0.840] | 0.785× [0.773, 0.794] | **0.804×** | 24 / 30 |
 
 <details>
 <summary><strong>Interpreter results, row by row</strong></summary>
@@ -160,49 +162,53 @@ Cold medians include process launch; bold marks the fastest interpreter.
 
 | Benchmark | Zipp interpreter | QuickJS | QuickJS-NG | Node jitless | Deno jitless | Bun no-JIT |
 |---|---:|---:|---:|---:|---:|---:|
-| async-promise-chain | **397 ms** | 3,888 ms | 3,822 ms | 444 ms | 443 ms | 555 ms |
-| class-prototype-hot | 3,625 ms | 3,776 ms | 7,128 ms | **1,708 ms** | 1,710 ms | 4,942 ms |
-| json-large | **512 ms** | 771 ms | 1,409 ms | 523 ms | 533 ms | 622 ms |
-| map-set-heavy | **665 ms** | 1,406 ms | 2,148 ms | 777 ms | 1,167 ms | 1,032 ms |
-| markdown-render | **651 ms** | 1,069 ms | 2,060 ms | 764 ms | 791 ms | 965 ms |
-| parse-large-js | 1,694 ms | 2,001 ms | 3,630 ms | 1,360 ms | **1,356 ms** | 1,587 ms |
-| polymorphic-objects | 807 ms | 860 ms | 1,411 ms | 590 ms | **557 ms** | 1,294 ms |
-| regex-log-scan | 1,631 ms | 2,523 ms | 3,958 ms | 1,539 ms | **1,522 ms** | 2,737 ms |
-| sparse-array | 285 ms | 381 ms | 790 ms | **205 ms** | 218 ms | 272 ms |
-| typedarray-math | 4,143 ms | 3,841 ms | 6,410 ms | **2,213 ms** | 2,272 ms | 3,186 ms |
-| polymorphic-objects-v2 | 390 ms | 395 ms | 844 ms | **295 ms** | 312 ms | 415 ms |
-| property-ic-shapes | 2,666 ms | 2,021 ms | 5,271 ms | 1,907 ms | 1,946 ms | **1,799 ms** |
-| sparse-array-v2 | 318 ms | 1,842 ms | 866 ms | 324 ms | **300 ms** | 475 ms |
-| **Zipp interpreter / engine geomean** | — | **0.614×** [0.611, 0.617] | **0.385×** [0.382, 0.388] | 1.207× [1.175, 1.213] | 1.164× [1.154, 1.173] | **0.834×** [0.829, 0.838] |
+| async-promise-chain | **399 ms** | 3,925 ms | 3,862 ms | 457 ms | 453 ms | 571 ms |
+| class-prototype-hot | 3,692 ms | 3,844 ms | 7,243 ms | 1,737 ms | **1,726 ms** | 4,939 ms |
+| json-large | **541 ms** | 805 ms | 1,458 ms | 546 ms | 566 ms | 662 ms |
+| map-set-heavy | **669 ms** | 1,574 ms | 2,118 ms | 751 ms | 1,147 ms | 1,147 ms |
+| markdown-render | **687 ms** | 1,095 ms | 2,100 ms | 775 ms | 815 ms | 1,012 ms |
+| parse-large-js | 1,736 ms | 2,038 ms | 3,668 ms | **1,371 ms** | 1,380 ms | 1,609 ms |
+| polymorphic-objects | 853 ms | 883 ms | 1,439 ms | 603 ms | **580 ms** | 1,370 ms |
+| regex-log-scan | 1,708 ms | 2,566 ms | 4,068 ms | 1,560 ms | **1,518 ms** | 2,800 ms |
+| sparse-array | 290 ms | 387 ms | 808 ms | **208 ms** | 220 ms | 278 ms |
+| typedarray-math | 4,238 ms | 3,808 ms | 6,522 ms | **2,239 ms** | 2,368 ms | 3,240 ms |
+| polymorphic-objects-v2 | 390 ms | 398 ms | 856 ms | **299 ms** | 319 ms | 426 ms |
+| property-ic-shapes | 2,678 ms | 2,036 ms | 5,261 ms | 1,921 ms | 1,969 ms | **1,817 ms** |
+| sparse-array-v2 | 327 ms | 1,855 ms | 877 ms | 323 ms | **314 ms** | 476 ms |
+| **Zipp interpreter / engine geomean** | — | **0.615×** [0.600, 0.621] | **0.390×** [0.385, 0.396] | 1.224× [1.213, 1.241] | 1.168× [1.155, 1.185] | **0.829×** [0.812, 0.840] |
 
 | Hostile row | Zipp interpreter | QuickJS | QuickJS-NG | Node jitless | Deno jitless | Bun no-JIT |
 |---|---:|---:|---:|---:|---:|---:|
-| calls-baseline | **100 ms** | 111 ms | 251 ms | 104 ms | 116 ms | 107 ms |
-| calls-closures | 231 ms | 227 ms | 452 ms | **177 ms** | 189 ms | 248 ms |
-| shapes-stable | 88 ms | 131 ms | 232 ms | **86 ms** | 101 ms | 89 ms |
-| shapes-megamorphic | 157 ms | 192 ms | 325 ms | **114 ms** | 126 ms | 187 ms |
-| types-stable | 156 ms | 163 ms | 376 ms | **127 ms** | 144 ms | 129 ms |
-| types-churn | 104 ms | **96 ms** | 200 ms | 101 ms | 111 ms | 112 ms |
-| branch-control | 102 ms | 109 ms | 239 ms | **100 ms** | 113 ms | 102 ms |
-| throw-catch | 99 ms | **97 ms** | 291 ms | 163 ms | 140 ms | 149 ms |
-| allocation-ephemeral | **113 ms** | 251 ms | 364 ms | 121 ms | 160 ms | 257 ms |
-| allocation-survival | 113 ms | 173 ms | 272 ms | **104 ms** | 131 ms | 133 ms |
-| async-burst | **33 ms** | 103 ms | 123 ms | 62 ms | 76 ms | 43 ms |
-| async-lived | **33 ms** | 107 ms | 126 ms | 49 ms | 69 ms | 64 ms |
-| reactish-reconcile | 81 ms | 120 ms | 177 ms | **72 ms** | 90 ms | 106 ms |
-| warm-router | 118 ms | 123 ms | 477 ms | **78 ms** | 99 ms | 140 ms |
-| bytecode-vm | 331 ms | 404 ms | 941 ms | **298 ms** | 308 ms | 480 ms |
-| module-hot-graph | 115 ms | **98 ms** | 200 ms | 102 ms | 117 ms | 145 ms |
-| npm-nanoid | 510 ms | 697 ms | 1,158 ms | **460 ms** | 462 ms | 800 ms |
-| **Zipp interpreter / engine geomean** | — | **0.745×** [0.740, 0.758] | **0.389×** [0.386, 0.396] | 1.009× [0.988, 1.028] | **0.881×** [0.874, 0.899] | **0.790×** [0.785, 0.801] |
+| calls-baseline | **99 ms** | 111 ms | 252 ms | 103 ms | 117 ms | 107 ms |
+| calls-closures | 232 ms | 234 ms | 453 ms | **176 ms** | 195 ms | 246 ms |
+| shapes-stable | 87 ms | 131 ms | 261 ms | **87 ms** | 104 ms | 90 ms |
+| shapes-megamorphic | 156 ms | 190 ms | 329 ms | **112 ms** | 131 ms | 186 ms |
+| types-stable | 158 ms | 163 ms | 374 ms | **126 ms** | 146 ms | 130 ms |
+| types-churn | 105 ms | **97 ms** | 202 ms | 98 ms | 111 ms | 114 ms |
+| branch-control | 103 ms | 109 ms | 236 ms | **98 ms** | 116 ms | 103 ms |
+| throw-catch | 100 ms | **98 ms** | 295 ms | 161 ms | 139 ms | 151 ms |
+| allocation-ephemeral | **112 ms** | 253 ms | 365 ms | 121 ms | 135 ms | 260 ms |
+| allocation-survival | 106 ms | 175 ms | 264 ms | **102 ms** | 122 ms | 131 ms |
+| async-burst | **33 ms** | 102 ms | 125 ms | 60 ms | 79 ms | 43 ms |
+| async-lived | **34 ms** | 108 ms | 126 ms | 49 ms | 70 ms | 68 ms |
+| reactish-reconcile | 82 ms | 123 ms | 178 ms | **72 ms** | 90 ms | 106 ms |
+| warm-router | 119 ms | 123 ms | 474 ms | **77 ms** | 102 ms | 140 ms |
+| bytecode-vm | 333 ms | 405 ms | 944 ms | **298 ms** | 310 ms | 484 ms |
+| module-hot-graph | 114 ms | **99 ms** | 195 ms | 103 ms | 122 ms | 143 ms |
+| npm-nanoid | 515 ms | 698 ms | 1,159 ms | **456 ms** | 469 ms | 801 ms |
+| **Zipp interpreter / engine geomean** | — | **0.740×** [0.733, 0.747] | **0.387×** [0.384, 0.391] | 1.022× [1.015, 1.029] | **0.880×** [0.863, 0.887] | **0.785×** [0.773, 0.794] |
 
 </details>
 
-Over all 30 rows Zipp's interpreter is faster than Bellard's QuickJS (0.685×, 24 of 30 rows;
-0.720× in the previous capture), faster than QuickJS-NG (0.387×, 30 of 30),
-faster than JavaScriptCore's LLInt (0.809×), faster than V8's Ignition under Deno
-(0.994×; 1.060× before) and slower than it under Node (1.090×; 1.147× before).
-Bellard's QuickJS wins property-ic-shapes (1.32×), module-hot-graph (1.18×), types-churn (1.09×), typedarray-math (1.08×), calls-closures (1.02×), throw-catch (1.02×).
+Over all 30 rows Zipp's interpreter is faster than Bellard's QuickJS (0.683×, 25 of 30 rows),
+faster than QuickJS-NG (0.388×, 30 of 30), faster than JavaScriptCore's LLInt
+(0.804×), faster than V8's Ignition under Deno (0.995×) and slower than it under
+Node (1.105×). Bellard's QuickJS wins property-ic-shapes (1.32×), module-hot-graph (1.14×), typedarray-math (1.11×), types-churn (1.08×), throw-catch (1.02×).
+The 21 October capture of the same binary left the regex JIT on (0.685× QuickJS,
+24 of 30 rows); run beside the strict lane on 22 October, that lane measured
+0.680×. The regex tier is worth about 3% on regex-log-scan (the median of the
+eight paired repetitions; the strict lane was slower in six) and nothing
+measurable on the rows without a regex.
 The five downscaled micro kernels were last measured on 15 October
 ([`interp_micro5_fa8e3b86_2026-10-15.json`](../bench/comparison/interp_micro5_fa8e3b86_2026-10-15.json)):
 there Zipp was 1.12× Bellard's QuickJS (179 ms against 108 on recursive `fib`),

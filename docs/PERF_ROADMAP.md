@@ -54,12 +54,13 @@ artifact links.
 
 ### Interpreter versus interpreter
 
-The same PGO binary with `ZIPP_NOJIT=1`, over the same 30 rows
-(`bench/comparison/interp_real13_84012a2d_2026-10-21.json` and its hostile pair, diagnostic `run_native.py`
-runs): **0.685×** Bellard's QuickJS (24 / 30 point wins; 0.720× in the
-0.0.26 capture), **0.387×** QuickJS-NG (30 / 30), 0.809× Bun with JavaScriptCore's
-JIT off, 0.994× Deno `--jitless` and 1.090× Node `--jitless`. Bellard's QuickJS still
-wins property-ic-shapes (1.32×), module-hot-graph (1.18×), types-churn (1.09×), typedarray-math (1.08×) and 2 more rows; on the five micro kernels
+The same PGO binary with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`; the captures before
+22 October left the regex JIT on), over the same 30 rows
+(`bench/comparison/interp_real13_84012a2d_2026-10-22.json` and its hostile pair, diagnostic `run_native.py`
+runs): **0.683×** Bellard's QuickJS (25 / 30 point wins; 0.685× on 21 October with the regex
+JIT on), **0.388×** QuickJS-NG (30 / 30), 0.804× Bun with JavaScriptCore's
+JIT off, 0.995× Deno `--jitless` and 1.105× Node `--jitless`. Bellard's QuickJS still
+wins property-ic-shapes (1.32×), module-hot-graph (1.14×), typedarray-math (1.11×), types-churn (1.08×), throw-catch (1.02×); on the five micro kernels
 (15 October) Zipp's interpreter was 1.12× Bellard's, most of it calls (`fib` 1.66×).
 
 ### Python versus CPython

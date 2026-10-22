@@ -154,8 +154,8 @@ capture with its geomean, interval and per-row ratios. Git history keeps the
 original files.
 
 The interpreter-versus-interpreter tables come from
-[`comparison/interp_real13_84012a2d_2026-10-21.json`](comparison/interp_real13_84012a2d_2026-10-21.json)
-and [`comparison/interp_hostile17_84012a2d_2026-10-21.json`](comparison/interp_hostile17_84012a2d_2026-10-21.json),
+[`comparison/interp_real13_84012a2d_2026-10-22.json`](comparison/interp_real13_84012a2d_2026-10-22.json)
+and [`comparison/interp_hostile17_84012a2d_2026-10-22.json`](comparison/interp_hostile17_84012a2d_2026-10-22.json),
 diagnostic `run_native.py` runs of the same PGO binary with `ZIPP_NOJIT=1`
 against interpreters and JIT-off engine modes (see
 [`comparison/README.md`](comparison/README.md)); the release build as downloaded
