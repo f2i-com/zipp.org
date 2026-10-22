@@ -58,7 +58,14 @@ export interface ZippNetworkPermission {
   maxResponseBytes?: number;
   /** Per request; default 30,000. */
   timeoutMs?: number;
-  /** Follow redirects to allowed URLs (default false: a redirect fails the request). */
+  /**
+   * Follow up to 5 redirects to allowed URLs, each destination checked before
+   * it is requested (default false: a redirect fails the request). A 303, or
+   * a 301 or 302 after a POST, continues as a GET without the body; an
+   * `authorization` header is not sent to another origin. A browser's fetch
+   * does not reveal where a redirect leads, so there a redirect fails the
+   * request even with this set.
+   */
   redirects?: boolean;
   /** A fetch to use instead of globalThis.fetch. */
   fetch?: typeof fetch;

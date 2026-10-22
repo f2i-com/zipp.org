@@ -844,6 +844,14 @@ const FORBIDDEN_HEADERS = new Set([
 
 const deny = (code, message) => ({ ok: false, error: { code, message } });
 
+// With `redirects`, at most this many are followed, each authorized before
+// it is requested.
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Headers that describe a request body, dropped with the body when a
+// redirect turns the request into a GET (the Fetch standard's list).
+const BODY_HEADERS = ["content-type", "content-encoding", "content-language", "content-location"];
+
 // The guest's `fetch` (and host.call("net.fetch")): an absolute http(s) URL
 // the allowlist names, a method it allows, no cookies or credentials, a
 // redirect only when permitted and to an allowed URL, a time limit and a
@@ -859,7 +867,7 @@ async function serveFetch(policy, args) {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return deny("denied", `${url.protocol} URLs are not permitted`);
   if (!allowed(url, policy.allow)) return deny("denied", `network access to ${url.origin} is not permitted`);
-  const method = String(request.method || "GET").toUpperCase();
+  let method = String(request.method || "GET").toUpperCase();
   if (!policy.methods.includes(method)) return deny("denied", `${method} requests are not permitted`);
   // The Fetch standard's forbidden request headers, dropped everywhere (a
   // browser drops them itself; Node's fetch would send them): the guest
@@ -873,29 +881,67 @@ async function serveFetch(policy, args) {
       headers[n] = String(value);
     }
   }
+  // One time limit for the request and all its redirects.
+  const signal = AbortSignal.timeout(policy.timeoutMs);
+  let body = request.body ?? undefined;
   try {
-    const response = await policy.fetch(url.href, {
-      method,
-      headers,
-      body: request.body ?? undefined,
-      credentials: "omit",
-      redirect: policy.redirects ? "follow" : "error",
-      signal: AbortSignal.timeout(policy.timeoutMs),
-    });
-    if (response.url && !allowed(new URL(response.url), policy.allow)) {
-      return deny("denied", `the request was redirected to ${new URL(response.url).origin}, which is not permitted`);
-    }
-    const body = await readLimited(response, policy.maxResponseBytes);
-    return {
-      ok: true,
-      value: {
-        status: response.status,
-        statusText: response.statusText,
-        url: response.url || url.href,
-        headers: [...response.headers].map(([k, v]) => [k.toLowerCase(), v]),
+    for (let hops = 0; ; hops++) {
+      const response = await policy.fetch(url.href, {
+        method,
+        headers,
         body,
-      },
-    };
+        credentials: "omit",
+        // fetch never follows a redirect itself: a permitted one is checked
+        // below before it is requested, so a URL the allowlist does not name
+        // is never contacted ("follow" would request it, then check).
+        redirect: policy.redirects ? "manual" : "error",
+        signal,
+      });
+      if (policy.redirects && response.type === "opaqueredirect") {
+        // A browser's fetch hides a manual redirect's destination, so it
+        // cannot be checked: the redirect fails the request.
+        return deny("denied", "the request was redirected, and this environment's fetch does not say where, so the redirect cannot be checked");
+      }
+      if (policy.redirects && REDIRECT_STATUSES.has(response.status) && response.headers.has("location")) {
+        try { await response.body?.cancel(); } catch {}
+        if (hops === MAX_REDIRECTS) return deny("network", `more than ${MAX_REDIRECTS} redirects`);
+        let next;
+        try {
+          next = new URL(response.headers.get("location"), url);
+        } catch {
+          return deny("network", "the request was redirected to an invalid URL");
+        }
+        if ((next.protocol !== "https:" && next.protocol !== "http:") || !allowed(next, policy.allow)) {
+          return deny("denied", `the request was redirected to ${next.origin}, which is not permitted`);
+        }
+        // The Fetch standard's rules: a 303 (except after HEAD), or a 301 or
+        // 302 after a POST, goes on as a GET without its body.
+        if ((response.status === 303 && method !== "HEAD") || ((response.status === 301 || response.status === 302) && method === "POST")) {
+          method = "GET";
+          body = undefined;
+          for (const name of BODY_HEADERS) delete headers[name];
+          if (!policy.methods.includes(method)) return deny("denied", `the request was redirected as a ${method} request, which is not permitted`);
+        }
+        // Credentials stay with the origin they were given for.
+        if (next.origin !== url.origin) delete headers.authorization;
+        url = next;
+        continue;
+      }
+      if (response.url && !allowed(new URL(response.url), policy.allow)) {
+        return deny("denied", `the request was redirected to ${new URL(response.url).origin}, which is not permitted`);
+      }
+      const text = await readLimited(response, policy.maxResponseBytes);
+      return {
+        ok: true,
+        value: {
+          status: response.status,
+          statusText: response.statusText,
+          url: response.url || url.href,
+          headers: [...response.headers].map(([k, v]) => [k.toLowerCase(), v]),
+          body: text,
+        },
+      };
+    }
   } catch (error) {
     return deny(error?.code === "too-large" ? "too-large" : error?.name === "TimeoutError" ? "timeout" : "network", String(error?.message ?? error));
   }

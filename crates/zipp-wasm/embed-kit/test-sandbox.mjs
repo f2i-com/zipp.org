@@ -44,6 +44,24 @@ const server = http.createServer((req, res) => {
   } else if (req.url === "/redirect") {
     res.writeHead(302, { location: "http://localhost:1/elsewhere" });
     res.end();
+  } else if (req.url.startsWith("/hop/")) {
+    // Redirects for `redirects: true`: to a denied origin, a relative chain,
+    // a loop, the method-changing and method-keeping statuses, and a hop to
+    // another allowed origin.
+    const to = {
+      "/hop/denied": [302, `${deniedOrigin}/secret`],
+      "/hop/a": [302, "/hop/b"],
+      "/hop/b": [301, "../data.json"],
+      "/hop/loop": [302, "/hop/loop"],
+      "/hop/303": [303, "/echo-any"],
+      "/hop/307": [307, "/echo-any"],
+      "/hop/cross": [302, `${otherOrigin}/echo-any`],
+    }[req.url];
+    req.resume();
+    res.writeHead(to ? to[0] : 404, to ? { location: to[1] } : {});
+    res.end();
+  } else if (req.url === "/echo-any") {
+    echoAny(req, res);
   } else if (req.url === "/big") {
     res.writeHead(200);
     res.end("x".repeat(2000));
@@ -52,8 +70,25 @@ const server = http.createServer((req, res) => {
     res.end("missing");
   }
 });
-await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+// What a request arrived as: method, body, and the headers a redirect may drop.
+function echoAny(req, res) {
+  let body = "";
+  req.on("data", c => { body += c; });
+  req.on("end", () => {
+    res.writeHead(200);
+    res.end(`${req.method} ${body || "-"} ${req.headers.authorization ?? "-"} ${req.headers["content-type"] ?? "-"}`);
+  });
+}
+// An origin the sandboxes are never allowed: it counts every request it gets.
+let deniedHits = 0;
+const deniedServer = http.createServer((req, res) => { deniedHits++; res.writeHead(200); res.end("reached"); });
+// A second allowed origin, for a cross-origin redirect.
+const otherServer = http.createServer(echoAny);
+const listen = s => new Promise(resolve => s.listen(0, "127.0.0.1", resolve));
+await Promise.all([listen(server), listen(deniedServer), listen(otherServer)]);
 const origin = `http://127.0.0.1:${server.address().port}`;
+const deniedOrigin = `http://127.0.0.1:${deniedServer.address().port}`;
+const otherOrigin = `http://127.0.0.1:${otherServer.address().port}`;
 
 let checks = 0;
 const ok = name => { checks++; console.log(`  ok   ${name}`); };
@@ -142,6 +177,47 @@ for (const isolate of [false, true]) {
     ok(`${mode}: fetch reaches allowed URLs only, within its method, redirect and size rules`);
   }
 
+  // Redirects, when permitted: each hop's destination is authorized before
+  // it is requested (a denied origin is never contacted), within a hop limit,
+  // with the Fetch standard's method rules and credentials kept to their
+  // origin.
+  {
+    const sb = await make({ permissions: { network: { allow: [`${origin}/`, `${otherOrigin}/`], redirects: true } } });
+    const before = deniedHits;
+    const { output } = await sb.run(`
+      async function show(path, init) {
+        try { const r = await fetch("${origin}" + path, init); console.log(r.status, r.url.replace(/^http:\\/\\/[^/]+/, ""), await r.text()); }
+        catch (e) { console.log(e.name, e.message.replace(/127\\.0\\.0\\.1:\\d+/, "HOST")); }
+      }
+      async function main() {
+        await show("/hop/denied");
+        await show("/hop/a");
+        await show("/hop/loop");
+        await show("/hop/303", { method: "POST", body: "p", headers: { authorization: "a", "content-type": "text/plain" } });
+        await show("/hop/307", { method: "POST", body: "p", headers: { authorization: "a", "content-type": "text/plain" } });
+        await show("/hop/cross", { headers: { authorization: "a" } });
+      }
+      main();
+    `);
+    assert.equal(deniedHits, before, "the denied origin was contacted");
+    assert.deepEqual(output, [
+      "TypeError fetch: the request was redirected to http://HOST, which is not permitted",
+      '200 /data.json {"hello":"world","cookie":null,"method":"GET"}',
+      "TypeError fetch: more than 5 redirects",
+      "200 /echo-any GET - a -",
+      "200 /echo-any POST p a text/plain",
+      "200 /echo-any GET - - -",
+    ]);
+    await sb.close();
+    // A browser's fetch answers a manual redirect with an opaque response
+    // that hides its destination: the redirect is refused, not followed.
+    const opaque = await make({ permissions: { network: { allow: [`${origin}/`], redirects: true, fetch: async () => ({ type: "opaqueredirect", status: 0, url: "", headers: new Headers(), body: null }) } } });
+    const hidden = await opaque.run(`fetch("${origin}/hop/a").then(() => console.log("followed"), e => console.log(e.name, e.message));`);
+    assert.deepEqual(hidden.output, ["TypeError fetch: the request was redirected, and this environment's fetch does not say where, so the redirect cannot be checked"]);
+    await opaque.close();
+    ok(`${mode}: a permitted redirect is checked before it is requested, within a hop limit`);
+  }
+
   // Host functions.
   {
     const sb = await make({ host: { "time.add": async (a, b) => Number(a) + Number(b), "fail.now": () => { throw new Error("no"); } } });
@@ -200,4 +276,6 @@ for (const isolate of [false, true]) {
 }
 
 server.close();
+deniedServer.close();
+otherServer.close();
 console.log(`${checks} sandbox checks passed`);
