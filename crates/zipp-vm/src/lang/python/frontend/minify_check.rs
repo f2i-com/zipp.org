@@ -78,7 +78,7 @@ fn minify_check_runtime_javascript_bytecode_unchanged() {
             let mut program = crate::compile_only(src, false)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for f in &mut program.functions {
-                f.source.clear();
+                f.source = Default::default();
             }
             format!("{program:?}")
         };

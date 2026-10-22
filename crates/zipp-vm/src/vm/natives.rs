@@ -3289,14 +3289,14 @@ impl<'p> Vm<'p> {
                 let stored: Option<String> = match self.heap.get(this.heap_index()) {
                     HeapObj::Func(id) => {
                         let s = &self.func(*id as usize).source;
-                        (!s.is_empty()).then(|| s.clone())
+                        (!s.is_empty()).then(|| s.to_string())
                     }
                     HeapObj::Closure { func, .. } => {
                         let s = &self.func(*func as usize).source;
-                        (!s.is_empty()).then(|| s.clone())
+                        (!s.is_empty()).then(|| s.to_string())
                     }
                     // A class value renders as its whole `class … { … }` source.
-                    HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
+                    HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.to_string()),
                     HeapObj::Native(_)
                     | HeapObj::NativeClosure { .. }
                     | HeapObj::BoundResolver { .. }

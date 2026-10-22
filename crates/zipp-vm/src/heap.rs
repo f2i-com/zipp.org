@@ -5478,7 +5478,7 @@ pub struct ClassData {
     /// during construction. Empty for classes with no computed instance fields.
     pub computed_field_keys: Vec<Value>,
     /// Exact `class … { … }` source text, for `Function.prototype.toString`.
-    pub source: String,
+    pub source: crate::bytecode::SourceText,
     /// Upvalue cells captured by the constructor (incl. its field initializers)
     /// from the frame where the class was defined — supplied when `new` runs the
     /// ctor. Empty unless the class is nested in a function and its ctor/fields
@@ -6919,7 +6919,7 @@ impl HeapObj {
             HeapObj::Class(class) => {
                 let mut n = std::mem::size_of::<ClassData>()
                     .saturating_add(class.name.capacity())
-                    .saturating_add(class.source.capacity())
+                    .saturating_add(class.source.len())
                     .saturating_add(named_value_vec_payload(&class.methods))
                     .saturating_add(named_value_vec_payload(&class.getters))
                     .saturating_add(named_value_vec_payload(&class.setters))

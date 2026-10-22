@@ -727,7 +727,7 @@ mod tests {
             name_global: None,
             upvalues: Vec::new(),
             eval_sites: Vec::new(),
-            source: String::new(),
+            source: Default::default(),
             fused: Default::default(),
         }
     }

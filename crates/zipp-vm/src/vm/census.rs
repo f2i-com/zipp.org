@@ -49,6 +49,8 @@ impl<'p> Vm<'p> {
         // Code: every function the VM can run, the program's and those
         // installed since (eval, new Function, modules), each once.
         let mut seen = std::collections::HashSet::new();
+        // Source texts are ranges of shared copies: each copy is counted once.
+        let (mut copies, mut source_range_bytes) = (std::collections::HashSet::new(), 0);
         let (mut functions, mut instrs, mut instr_bytes, mut constant_bytes, mut string_constant_bytes) = (0, 0, 0, 0, 0);
         let (mut bigints, mut wtf8_bytes, mut upvalue_bytes, mut eval_sites, mut source_bytes) = (0, 0, 0, 0, 0);
         let (mut call_site_bytes, mut name_bytes, mut plan_handles, mut proto_bytes) = (0, 0, 0, 0);
@@ -69,7 +71,11 @@ impl<'p> Vm<'p> {
             wtf8_bytes += size_of_val(f.wtf8_consts.as_slice());
             upvalue_bytes += size_of_val(f.upvalues.as_slice());
             eval_sites += f.eval_sites.len();
-            source_bytes += f.source.capacity();
+            let (copy, copy_len) = f.source.shared();
+            if copies.insert(copy) {
+                source_bytes += copy_len;
+            }
+            source_range_bytes += f.source.len();
             call_site_bytes += size_of_val(&*f.call_sites);
             name_bytes += f.name.capacity();
             let (fused, steps, switches) = f.fused.census_bytes();
@@ -97,6 +103,8 @@ impl<'p> Vm<'p> {
         put("code.upvalue_bytes", upvalue_bytes);
         put("code.eval_sites", eval_sites);
         put("code.source_bytes", source_bytes);
+        put("code.source_copies", copies.len());
+        put("code.source_range_bytes", source_range_bytes);
         put("code.call_site_bytes", call_site_bytes);
         put("code.name_bytes", name_bytes);
 

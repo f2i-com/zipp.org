@@ -13,7 +13,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 2;
+pub(crate) const FORMAT: u32 = 3;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -265,18 +265,53 @@ impl<'a> Reader<'a> {
 
 include!(concat!(env!("OUT_DIR"), "/instr_codec.rs"));
 
-/// A function's source text: a slice of the program's source when found
-/// there (the compiler slices it from there), so it is stored as a range.
+/// A function's or class's source text: a range of the program's source when
+/// it is one (the compiler slices it from there), so it is stored as a range
+/// and decoded as a range of one shared copy.
 struct Sources<'a> {
     base: Option<&'a str>,
     /// Where the last function's text started: functions come in source
     /// order, so the next one is usually just after it.
     cursor: usize,
+    /// The shared copies ([`SourceText::shared`]) last found to hold, and
+    /// not to hold, the same text as `base`: a text in the first is stored
+    /// by its range, with no search.
+    same: Option<*const u8>,
+    other: Option<*const u8>,
+    /// The decoder's one copy of `base`, made when first needed.
+    shared: std::cell::OnceCell<std::sync::Arc<str>>,
 }
 
-impl Sources<'_> {
-    fn encode(&mut self, w: &mut Writer, text: &str) {
-        if let Some(base) = self.base.filter(|_| !text.is_empty()) {
+impl<'a> Sources<'a> {
+    fn new(base: Option<&'a str>) -> Self {
+        Sources {
+            base,
+            cursor: 0,
+            same: None,
+            other: None,
+            shared: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn encode(&mut self, w: &mut Writer, source: &SourceText) {
+        if let Some(base) = self.base.filter(|_| !source.is_empty()) {
+            let (whole, start, end) = source.parts();
+            let copy = whole.as_ptr();
+            if self.same != Some(copy) && self.other != Some(copy) {
+                if whole == base {
+                    self.same = Some(copy);
+                } else {
+                    self.other = Some(copy);
+                }
+            }
+            if self.same == Some(copy) {
+                self.cursor = start;
+                w.u8(1);
+                w.len(start);
+                w.len(end - start);
+                return;
+            }
+            let text = source.as_str();
             // Any occurrence will do (the text is what is stored). Look near
             // the last function's text first: a nested function's text is
             // usually just after its predecessor's, or (functions listed
@@ -304,19 +339,23 @@ impl Sources<'_> {
             }
         }
         w.u8(0);
-        w.str(text);
+        w.str(source);
     }
 
-    fn decode(&self, r: &mut Reader) -> R<String> {
+    fn decode(&self, r: &mut Reader) -> R<SourceText> {
         match r.u8()? {
-            0 => r.str(),
+            0 => Ok(SourceText::from(r.str()?)),
             1 => {
                 let at = r.u64()? as usize;
                 let len = r.u64()? as usize;
-                self.base
-                    .and_then(|base| base.get(at..at.checked_add(len)?))
-                    .map(str::to_owned)
-                    .ok_or_else(|| "source range outside the program's source".into())
+                let end = at.checked_add(len);
+                match (self.base, end) {
+                    (Some(base), Some(end)) if base.get(at..end).is_some() => {
+                        let shared = self.shared.get_or_init(|| std::sync::Arc::from(base));
+                        Ok(SourceText::slice(shared, at, end))
+                    }
+                    _ => Err("source range outside the program's source".into()),
+                }
             }
             b => Err(format!("bad source kind {b}")),
         }
@@ -534,7 +573,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
     })
 }
 
-fn encode_class(w: &mut Writer, c: &ClassDef) {
+fn encode_class(w: &mut Writer, c: &ClassDef, sources: &mut Sources) {
     let ClassDef {
         name,
         ctor,
@@ -563,7 +602,7 @@ fn encode_class(w: &mut Writer, c: &ClassDef) {
     w.named(statics);
     w.named(static_getters);
     w.named(static_setters);
-    w.str(source);
+    sources.encode(w, source);
     w.strs(instance_field_names);
     w.strs(static_field_names);
     match dec_plan {
@@ -594,7 +633,7 @@ fn encode_class(w: &mut Writer, c: &ClassDef) {
     }
 }
 
-fn decode_class(r: &mut Reader) -> R<ClassDef> {
+fn decode_class(r: &mut Reader, sources: &Sources) -> R<ClassDef> {
     Ok(ClassDef {
         name: r.str()?,
         ctor: r.opt_u32()?,
@@ -607,7 +646,7 @@ fn decode_class(r: &mut Reader) -> R<ClassDef> {
         statics: r.named()?,
         static_getters: r.named()?,
         static_setters: r.named()?,
-        source: r.str()?,
+        source: sources.decode(r)?,
         instance_field_names: r.strs()?,
         static_field_names: r.strs()?,
         dec_plan: match r.u8()? {
@@ -687,10 +726,7 @@ pub(crate) fn encode_functions(functions: &[FuncProto]) -> Vec<u8> {
     };
     w.u32(FORMAT);
     w.u32(INSTR_VARIANTS as u32);
-    let mut sources = Sources {
-        base: None,
-        cursor: 0,
-    };
+    let mut sources = Sources::new(None);
     w.len(functions.len());
     for f in functions {
         encode_func(&mut w, f, &mut sources);
@@ -704,10 +740,7 @@ pub(crate) fn decode_functions(bytes: &[u8]) -> R<Vec<FuncProto>> {
     if r.u32()? != FORMAT || r.u32()? != INSTR_VARIANTS as u32 {
         return Err("bytecode from another format".into());
     }
-    let sources = Sources {
-        base: None,
-        cursor: 0,
-    };
+    let sources = Sources::new(None);
     let n = r.len()?;
     let mut functions = Vec::with_capacity(n);
     for _ in 0..n {
@@ -751,10 +784,7 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
     };
     w.u32(FORMAT);
     w.u32(INSTR_VARIANTS as u32);
-    let mut sources = Sources {
-        base: source,
-        cursor: 0,
-    };
+    let mut sources = Sources::new(source);
     w.len(functions.len());
     for f in functions {
         encode_func(&mut w, f, &mut sources);
@@ -762,7 +792,7 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
     w.u32(*global_count);
     w.len(classes.len());
     for c in classes {
-        encode_class(&mut w, c);
+        encode_class(&mut w, c, &mut sources);
     }
     w.strs(global_names);
     w.u32s(hoisted_globals);
@@ -799,10 +829,7 @@ pub(crate) fn encode(program: &Program, source: Option<&str>) -> Option<Vec<u8>>
 /// The program `bytes` encode (from [`encode`] of this same build, given the
 /// same `source`).
 pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
-    let sources = Sources {
-        base: source,
-        cursor: 0,
-    };
+    let sources = Sources::new(source);
     let mut r = Reader { data: bytes, at: 0 };
     if r.u32()? != FORMAT || r.u32()? != INSTR_VARIANTS as u32 {
         return Err("bytecode from another format".into());
@@ -816,7 +843,7 @@ pub(crate) fn decode(bytes: &[u8], source: Option<&str>) -> R<Program> {
     let n = r.len()?;
     let mut classes = Vec::with_capacity(n);
     for _ in 0..n {
-        classes.push(decode_class(&mut r)?);
+        classes.push(decode_class(&mut r, &sources)?);
     }
     let global_names = r.strs()?;
     let hoisted_globals = r.u32s()?;

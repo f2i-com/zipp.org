@@ -76,7 +76,7 @@ fn compile_program_with(
     origin: Option<SourceOrigin>,
 ) -> R<Program> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
-    let mut c = Compiler::new(source.to_string());
+    let mut c = Compiler::new(source);
     c.origin = origin;
     c.module_mode = module_mode;
     c.main_goal = main_goal;
@@ -281,7 +281,7 @@ pub fn compile_eval(
             }
         }
     }
-    let mut c = Compiler::new(source.to_string());
+    let mut c = Compiler::new(source);
     c.origin = origin;
     c.eval_mode = true;
     c.eval_locals = !is_module;

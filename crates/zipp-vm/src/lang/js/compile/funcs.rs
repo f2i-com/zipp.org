@@ -1002,7 +1002,7 @@ impl<'a> FnCompiler<'a> {
             statics: Vec::new(),
             static_getters: Vec::new(),
             static_setters: Vec::new(),
-            source: String::new(), // filled in below once the body is compiled
+            source: SourceText::default(), // filled in below once the body is compiled
             instance_field_names: Vec::new(),
             static_field_names: Vec::new(),
             dec_plan: None,

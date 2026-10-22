@@ -30,7 +30,7 @@ use crate::parse::ast::{self, *};
 use crate::parse::token::StrVal;
 
 use crate::bytecode::{
-    BitwiseOp, ClassDef, FuncProto, Instr, Program, Reg, UpvalSource, KEY_WRITEBACK,
+    BitwiseOp, ClassDef, FuncProto, Instr, Program, Reg, SourceText, UpvalSource, KEY_WRITEBACK,
 };
 use crate::capture;
 use crate::value::Value;
@@ -193,8 +193,9 @@ struct Compiler {
     /// `global_index` guarded against: one `contains` scan per top-level `var`.
     hoisted_set: rustc_hash::FxHashSet<u32>,
     /// The full program source, kept so each function can record its exact
-    /// source slice (by span) for `Function.prototype.toString`.
-    source: String,
+    /// source slice (by span) for `Function.prototype.toString`: one copy,
+    /// which every function's [`SourceText`] is a range of.
+    source: std::sync::Arc<str>,
     /// `source`'s lines, for the positions of call sites (`FuncProto::
     /// call_sites`); built when the first function with one is finished.
     source_index: std::cell::OnceCell<positions::SourceIndex>,
@@ -408,13 +409,14 @@ fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
 /// it is excluded from the method's [[SourceText]] (e.g. `static s(){}` →
 /// `s(){}`, `static get x(){}` → `get x(){}`). When `is_static` the slice begins
 /// with the `static` keyword (the parser flagged it), so strip it + trailing ws.
-fn method_source(text: String, is_static: bool) -> String {
+fn method_source(text: SourceText, is_static: bool) -> SourceText {
     if is_static {
         if let Some(rest) = text.strip_prefix("static") {
             // The MethodDefinition's [[SourceText]] starts at its first real token
             // (name / get / set / async / * / [). Whitespace AND comments between
             // `static` and that token are trivia, not part of the method source.
-            return skip_leading_trivia(rest).to_string();
+            let kept = skip_leading_trivia(rest).len();
+            return text.skip(text.len() - kept);
         }
     }
     text
@@ -465,7 +467,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         name_global: None,
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
-        source: String::new(),
+        source: crate::bytecode::SourceText::default(),
         fused: Default::default(),
         call_sites: Box::default(),
     }

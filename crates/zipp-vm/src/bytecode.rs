@@ -2872,11 +2872,12 @@ pub struct FuncProto {
     /// names visible at the call site — a sloppy eval's var/function name
     /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
     pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
-    /// Exact source text of this function (sliced from the program source by the
-    /// function node's span), used by `Function.prototype.toString`. Empty for
-    /// the synthetic top-level script body and for placeholders, in which case
-    /// `toString` falls back to the native-function form.
-    pub source: String,
+    /// Exact source text of this function (the function node's span of the
+    /// program source, which the program's functions share), used by
+    /// `Function.prototype.toString`. Empty for the synthetic top-level script
+    /// body and for placeholders, in which case `toString` falls back to the
+    /// native-function form.
+    pub source: SourceText,
     /// The interpreter's copy of `code` with superinstructions, built the
     /// first time the interpreter enters the function (see [`FusedCode`]).
     pub fused: FusedCode,
@@ -2885,6 +2886,91 @@ pub struct FuncProto {
     /// reports the innermost site whose code holds it. In code order of
     /// `start`; nested sites follow their enclosing one.
     pub call_sites: Box<[CallSite]>,
+}
+
+/// A function's or class's source text (`Function.prototype.toString`): a
+/// range of one shared copy of the script it was compiled from, or a text of
+/// its own. A function nested in others lies inside each of their texts; held
+/// as copies, TypeScript's 10 MB bundle kept 46 MB of them.
+#[derive(Clone)]
+pub struct SourceText {
+    text: std::sync::Arc<str>,
+    start: u32,
+    end: u32,
+}
+
+impl SourceText {
+    /// `script[start..end]`, sharing `script`; empty when the range is not a
+    /// slice of it.
+    pub fn slice(script: &std::sync::Arc<str>, start: usize, end: usize) -> SourceText {
+        match (script.get(start..end), u32::try_from(start), u32::try_from(end)) {
+            (Some(_), Ok(start), Ok(end)) => SourceText { text: script.clone(), start, end },
+            _ => SourceText::default(),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text[self.start as usize..self.end as usize]
+    }
+
+    /// Where this text lies in `script`, when it is a range of that very copy.
+    pub fn range_in(&self, script: &std::sync::Arc<str>) -> Option<(usize, usize)> {
+        std::sync::Arc::ptr_eq(&self.text, script).then_some((self.start as usize, self.end as usize))
+    }
+
+    /// The text without its first `n` bytes (a char boundary).
+    pub fn skip(&self, n: usize) -> SourceText {
+        let start = (self.start as usize + n).min(self.end as usize);
+        debug_assert!(self.text.is_char_boundary(start));
+        SourceText { text: self.text.clone(), start: start as u32, end: self.end }
+    }
+
+    /// The copy this text is a range of, and its length: what holding the
+    /// text keeps alive (the storage census counts each copy once).
+    pub fn shared(&self) -> (*const u8, usize) {
+        (self.text.as_ptr(), self.text.len())
+    }
+
+    /// The whole copy this text is a range of, and the range.
+    pub fn parts(&self) -> (&str, usize, usize) {
+        (&self.text, self.start as usize, self.end as usize)
+    }
+}
+
+impl Default for SourceText {
+    fn default() -> SourceText {
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+        SourceText { text: EMPTY.get_or_init(|| std::sync::Arc::from("")).clone(), start: 0, end: 0 }
+    }
+}
+
+impl From<String> for SourceText {
+    fn from(text: String) -> SourceText {
+        if text.is_empty() {
+            return SourceText::default();
+        }
+        let end = u32::try_from(text.len()).unwrap_or(0);
+        SourceText { text: std::sync::Arc::from(text), start: 0, end }
+    }
+}
+
+impl From<&str> for SourceText {
+    fn from(text: &str) -> SourceText {
+        SourceText::from(text.to_string())
+    }
+}
+
+impl std::ops::Deref for SourceText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Debug for SourceText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
 }
 
 /// One call or `new` expression's code and source position
@@ -4751,7 +4837,7 @@ pub struct ClassDef {
     pub static_setters: Vec<(String, u32)>,
     /// Exact source text of the whole `class … { … }` (by the class node's span),
     /// returned by `Function.prototype.toString` on the class value.
-    pub source: String,
+    pub source: SourceText,
     /// Names of instance + static FIELDS declared in the class body, including
     /// the "#" prefix for private fields. Used at `MakeClass` to register which
     /// private names this class's brand declares (methods/accessors are already

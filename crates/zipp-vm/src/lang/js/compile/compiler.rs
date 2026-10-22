@@ -57,7 +57,7 @@ impl Compiler {
             && !self.eval_outer_scope.iter().any(|n| n == name)
     }
 
-    pub(crate) fn new(source: String) -> Compiler {
+    pub(crate) fn new(source: &str) -> Compiler {
         Compiler {
             capture_memo: crate::capture::Session::new(),
             functions: Vec::new(),
@@ -69,7 +69,7 @@ impl Compiler {
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
-            source,
+            source: std::sync::Arc::from(source),
             source_index: std::cell::OnceCell::new(),
             origin: None,
             eval_mode: false,
@@ -142,14 +142,12 @@ impl Compiler {
         v
     }
 
-    /// Slice the program source by a function node's byte span, for
-    /// `Function.prototype.toString`. Empty if the range is degenerate or not on
-    /// a UTF-8 boundary (then `toString` uses the native-function fallback).
-    pub(crate) fn src_slice(&self, start: u32, end: u32) -> String {
-        self.source
-            .get(start as usize..end as usize)
-            .map(|s| s.to_string())
-            .unwrap_or_default()
+    /// The program source by a function node's byte span, for
+    /// `Function.prototype.toString`: a range of the one shared copy. Empty if
+    /// the range is degenerate or not on a UTF-8 boundary (then `toString`
+    /// uses the native-function fallback).
+    pub(crate) fn src_slice(&self, start: u32, end: u32) -> SourceText {
+        SourceText::slice(&self.source, start as usize, end as usize)
     }
 
     /// Give a function of an embedding preamble that records no call site one
@@ -1193,7 +1191,7 @@ impl Compiler {
             name_global: None, // set by the caller for top-level declarations
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            source: String::new(), // set by the caller from the function node's span
+            source: SourceText::default(), // set by the caller from the function node's span
             fused: Default::default(),
             call_sites,
         })
@@ -1546,7 +1544,7 @@ impl Compiler {
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            source: String::new(), // class methods: caller may override from span
+            source: SourceText::default(), // class methods: caller may override from span
             fused: Default::default(),
             call_sites,
         })
@@ -1836,7 +1834,7 @@ impl Compiler {
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            source: String::new(), // set by compile_arrow from the arrow's span
+            source: SourceText::default(), // set by compile_arrow from the arrow's span
             fused: Default::default(),
             call_sites,
         })
@@ -1891,7 +1889,7 @@ mod m1_tests {
 
     #[test]
     fn global_index_does_not_wrap_at_the_u16_boundary() {
-        let mut compiler = Compiler::new(String::new());
+        let mut compiler = Compiler::new("");
         for slot in 0..=(u16::MAX as u32 + 1) {
             let name = format!("global_{slot}");
             assert_eq!(compiler.global_slot(&name), slot);
