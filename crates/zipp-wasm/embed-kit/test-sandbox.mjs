@@ -62,6 +62,10 @@ const server = http.createServer((req, res) => {
     res.end();
   } else if (req.url === "/echo-any") {
     echoAny(req, res);
+  } else if (req.url === "/slow") {
+    // Answers after 5 s, unless the client gives up first (counted).
+    const timer = setTimeout(() => { res.writeHead(200); res.end("slow"); }, 5000);
+    res.on("close", () => { clearTimeout(timer); if (!res.writableEnded) slowAbandoned++; });
   } else if (req.url === "/big") {
     res.writeHead(200);
     res.end("x".repeat(2000));
@@ -81,6 +85,12 @@ function echoAny(req, res) {
 }
 // An origin the sandboxes are never allowed: it counts every request it gets.
 let deniedHits = 0;
+// Requests to /slow whose client gave up before the answer.
+let slowAbandoned = 0;
+const until = async (test, ms = 2000) => {
+  for (const end = Date.now() + ms; !test() && Date.now() < end;) await new Promise(r => setTimeout(r, 10));
+  return test();
+};
 const deniedServer = http.createServer((req, res) => { deniedHits++; res.writeHead(200); res.end("reached"); });
 // A second allowed origin, for a cross-origin redirect.
 const otherServer = http.createServer(echoAny);
@@ -228,6 +238,101 @@ for (const isolate of [false, true]) {
     assert.deepEqual(output.sort(), ["add true 5", "fail false no"]);
     await sb.close();
     ok(`${mode}: host functions answer host.call`);
+  }
+
+  // Host requests belong to their sandbox: at most 64 run at once, the rest
+  // waiting in order; a time limit gives a request up, aborting its signal
+  // (`this.signal`, a fetch's own); one that ignores the signal keeps its
+  // place until it returns, and its late answer is discarded.
+  {
+    let running = 0, maxRunning = 0, slowAborted = 0, stubbornStarted = 0;
+    let release;
+    const stubbornDone = new Promise(resolve => { release = resolve; });
+    const sb = await make({
+      limits: { timeoutMs: 700 },
+      permissions: { network: { allow: [`${origin}/`] } },
+      host: {
+        "wide.op": async function (n) {
+          running++;
+          maxRunning = Math.max(maxRunning, running);
+          await new Promise(resolve => setTimeout(resolve, 5));
+          running--;
+          return Number(n) * 2;
+        },
+        "slow.op": function () {
+          return new Promise((resolve, reject) => {
+            this.signal.addEventListener("abort", () => { slowAborted++; reject(this.signal.reason); });
+          });
+        },
+        "stubborn.op": function () { stubbornStarted++; return stubbornDone.then(() => "late"); },
+      },
+    });
+    await sb.run(`
+      var got = [];
+      function wide() { got = []; for (var i = 0; i < 200; i++) host.call("wide.op", [String(i)], function (r) { got.push(r.value); }); }
+      function total() { var s = 0; for (var i = 0; i < got.length; i++) s += got[i]; return got.length + " " + s; }
+      function slow() { host.call("slow.op", [], function (r) { got.push("slow " + r.ok); }); }
+      function slowFetch() { fetch("${origin}/slow").then(function () { got.push("fetched"); }, function () { got.push("failed"); }); }
+      function stubborn() { got = []; host.call("stubborn.op", [], function (r) { got.push(r.value); }); }
+      function seen() { return got.join(","); }
+    `);
+    await sb.call("wide");
+    assert.equal((await sb.call("total")).value, "200 39800");
+    assert.ok(maxRunning > 1 && maxRunning <= 64, `at most 64 at once, saw ${maxRunning}`);
+    await assert.rejects(sb.call("slow"), e => e.category === "timeout" && !e.terminal);
+    assert.ok(await until(() => slowAborted === 1), "the abandoned host function's signal aborted");
+    const abandonedBefore = slowAbandoned;
+    await assert.rejects(sb.call("slowFetch"), e => e.category === "timeout");
+    assert.ok(await until(() => slowAbandoned === abandonedBefore + 1), "the abandoned fetch was cancelled");
+    await assert.rejects(sb.call("stubborn"), e => e.category === "timeout");
+    assert.equal(stubbornStarted, 1);
+    assert.equal((await sb.usage()).hostRequestsRunning, 1, "a request that ignores its signal keeps its place");
+    release();
+    let left = 1;
+    for (const end = Date.now() + 2000; left && Date.now() < end;) {
+      left = (await sb.usage()).hostRequestsRunning;
+      if (left) await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(left, 0, "it gives its place back when it returns");
+    assert.equal((await sb.call("seen")).value, "", "its late answer is discarded");
+    await sb.close();
+    ok(`${mode}: host requests are bounded, abandoned at the time limit, and kept until they end`);
+  }
+
+  // close() ends a run waiting on host requests at once, aborts the running
+  // ones and starts none of those still waiting.
+  {
+    let started = 0, aborted = 0;
+    const sb = await make({
+      limits: { timeoutMs: 20000 },
+      host: {
+        "hang.op": function () {
+          started++;
+          return new Promise((resolve, reject) => {
+            this.signal.addEventListener("abort", () => { aborted++; reject(this.signal.reason); });
+          });
+        },
+      },
+    });
+    const t0 = Date.now();
+    const running = sb.run(`for (var i = 0; i < 70; i++) host.call("hang.op", [], function () {});`);
+    assert.ok(await until(() => started === 64), `64 started, saw ${started}`);
+    await sb.close();
+    await assert.rejects(running, e => e.category === "closed" && e.terminal);
+    assert.ok(Date.now() - t0 < 5000, "close() settled the run before its time limit");
+    assert.ok(await until(() => aborted === 64), `every running request aborted, saw ${aborted}`);
+    assert.equal(started, 64, "none of the waiting requests started");
+    // Two calls waiting at once both settle.
+    started = 0;
+    const two = await make({ limits: { timeoutMs: 20000 }, host: { "hang.op": function () { started++; return new Promise(() => {}); } } });
+    await two.run(`function hang() { host.call("hang.op", [], function () {}); }`);
+    const t1 = Date.now();
+    const calls = [two.call("hang"), two.call("hang")];
+    assert.ok(await until(() => started === 2), `both calls' requests started, saw ${started}`);
+    await two.close();
+    for (const c of calls) await assert.rejects(c, e => e.category === "closed");
+    assert.ok(Date.now() - t1 < 5000, "close() settled both calls before their time limit");
+    ok(`${mode}: close() settles a waiting run at once and aborts its host requests`);
   }
 
   // Calls and globals persist; the instruction limit ends the sandbox.

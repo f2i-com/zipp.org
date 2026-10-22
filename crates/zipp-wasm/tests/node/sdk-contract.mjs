@@ -337,5 +337,31 @@ await test("without moduleUrl the Worker gets the kit's loader and string URLs",
   pair.terminate();
 });
 
+await test("host.signal aborts once, with the death cause, when the generation dies", async (ctx) => {
+  // SDK 1.4: the application ties the work it starts for drained host calls
+  // to the generation, so that work stops with the guest.
+  const { host, worker } = await ctx.ready();
+  assert.equal(host.signal.aborted, false);
+  let fired = 0;
+  host.signal.addEventListener("abort", () => fired++);
+  const call = settled(host.call("f"));
+  ctx.fireAll(); // the deadline
+  await call;
+  assert.equal(host.signal.aborted, true);
+  assert.equal(host.signal.reason, host.deathCause);
+  assert.equal(host.signal.reason.category, "deadline");
+  host.terminate(); // already dead: no second abort
+  worker.reply(worker.sent.at(-1), { value: "late" });
+  assert.equal(fired, 1);
+  // A replacement host has its own, live signal.
+  const next = await ctx.ready();
+  assert.equal(next.host.signal.aborted, false);
+  next.host.terminate();
+  assert.equal(next.host.signal.reason.category, "terminated");
+  const crashed = await ctx.ready();
+  crashed.worker.crash("boom");
+  assert.equal(crashed.host.signal.reason.category, "host");
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);

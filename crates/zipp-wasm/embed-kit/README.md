@@ -82,6 +82,15 @@ const sandbox = await zipp.createSandbox({
 | `network: [allowed URLs]`, `true`, or `{ allow, methods, maxResponseBytes, timeoutMs, redirects }` | a `fetch(url, init)` that reaches only the URLs listed (an origin, or a URL prefix), with no cookies or credentials, the forbidden headers removed, redirects refused unless allowed (then up to 5, each destination checked against the list before it is requested; a browser does not reveal a redirect's destination, so there one still fails the request), a time limit and a 1 MB response limit by default; the reply has `status`, `ok`, `headers.get()`, `text()` and `json()` | `fetch` does not exist |
 | `host: { kind: fn }` | `host.call(kind, args, reply => ...)`; your function's return value (or promise) arrives as `{ ok: true, value }` | `{ ok: false, error: { code: "denied" } }` |
 
+A host function runs with `this.signal`, an `AbortSignal` that aborts when
+the sandbox closes or gives the request up (its time limit passed); a
+`fetch` the program makes is aborted the same way. At most 64 of a
+sandbox's host requests run at once and the rest wait, in order, without
+starting. A function that ignores the signal keeps its place until it
+returns, and whatever it returns then is discarded; `usage()` reports
+`hostRequestsRunning` and `hostRequestsWaiting`. `close()` settles a `run` or
+`call` still waiting on host requests at once, with a `closed` error.
+
 Unknown option names are errors, so a typo cannot quietly drop a limit.
 `network: true` allows any http(s) URL under the same rules; prefer listing
 the origins or URL prefixes a program needs.

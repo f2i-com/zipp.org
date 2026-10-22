@@ -1,4 +1,4 @@
-# zipp-host: the reference host adapter (v1.3.0)
+# zipp-host: the reference host adapter (v1.4.0)
 
 Two ES modules, shipped in the release's embed kit (`zipp-<version>-wasm-embed-kit.zip`)
 as `host-sdk/`, beside the kit's loader `zipp.mjs`:
@@ -47,8 +47,9 @@ selects the pair loading of SDK 1.2.0, with `wasmUrl` as its module.
 
 **Lifecycle.** `created → initializing → ready → dead`, forwards only. Every
 guest runs in its own dedicated Worker and WASM instance, so `terminate()` is
-the complete boundary: it ends the engine, its guest heap, and the compiled
-code the engine's own `dispose()` cannot reclaim. A dead host is never reused;
+the complete boundary: it ends the engine, its guest heap, and the instance's
+linear memory, which only grows (the engine's own `dispose()` frees what it
+compiled, but cannot shrink that). A dead host is never reused;
 create another. `host.dead` and `host.deathCause` say why. `dead` is
 monotonic: an initialization reply that was in flight when the host was
 terminated cannot make it `ready`, and a message from a dead generation
@@ -118,6 +119,11 @@ the engine's README lists the recognized operation names.
 `cancelHostCall(id)`, `takeConsole()`, `resourceUsage()`, `terminate()`. Each
 returns a promise (except `terminate`) and accepts an optional trailing
 `{ deadlineMs }`. `host.pendingRequests` counts requests awaiting a reply.
+`host.signal` (1.4.0) is an `AbortSignal` that aborts, with `host.deathCause`
+as its reason, when the generation dies: pass it to the work you start for the
+host calls you drain (a `fetch`, a timer), so it stops with the guest instead
+of finishing for nobody; a result that arrives anyway is refused by the dead
+host (`usage`).
 
 Proven in real Workers by `tests/browser/worker-smoke.mjs` on Chromium,
 Firefox and WebKit; the main-thread state handling is pinned by

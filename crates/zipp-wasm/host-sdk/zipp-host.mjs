@@ -1,5 +1,5 @@
 // zipp-host: a small reference host adapter for the zipp-wasm engine in a
-// browser, version 1.3.0. The 11 September 2026 audit's ZIPP-17 asked for one
+// browser, version 1.4.0. The 11 September 2026 audit's ZIPP-17 asked for one
 // consistent lifecycle/error/capability contract for embedders; this is it,
 // kept deliberately small so an application can read it in one sitting.
 //
@@ -26,8 +26,14 @@
 // Every guest runs in its own dedicated Worker and WASM instance, so
 // termination is the complete lifetime boundary: `terminate()` — or a
 // request that outlives its deadline — ends the Worker, and with it every
-// engine allocation, including the compiled code the engine's `dispose()`
-// cannot give back. A terminated host is not reused; create another.
+// engine allocation and the instance's linear memory, which only grows (the
+// engine's own `dispose()` frees what it compiled, but cannot shrink that).
+// A terminated host is not reused; create another.
+//
+// `host.signal` aborts, with the death cause as its reason, when this
+// generation dies: give it to the work the application starts for the host
+// calls it drains (a fetch, a timer), so that work stops with the guest
+// rather than finishing for nobody.
 //
 // Messages carry the host's GENERATION. A reply from a Worker that has since
 // been terminated is dropped, and every pending request of a terminated
@@ -65,7 +71,7 @@
 // afterwards — the engine enforces that, this adapter merely never asks
 // twice. Nothing here widens the engine's authority.
 
-export const ZIPP_HOST_SDK_VERSION = "1.3.0";
+export const ZIPP_HOST_SDK_VERSION = "1.4.0";
 
 /** The longest deadline a timer can hold exactly (2^31 − 1 ms). */
 export const MAX_DEADLINE_MS = 2147483647;
@@ -158,6 +164,8 @@ export function createZippHost(config) {
   let worker = new Worker(workerUrl, { type: "module", name: `zipp-host-${generation}` });
   let state = "created"; // created -> initializing -> ready -> dead
   let deathCause = null;
+  // Aborted once, when this generation dies (`host.signal`).
+  const lifetime = new AbortController();
 
   // One idempotent settlement per request: success, an error reply, a send
   // failure, the deadline and termination all go through here, so a promise
@@ -180,6 +188,7 @@ export function createZippHost(config) {
       settle(req, new ZippHostError(category, message, undefined, true));
     }
     pending.clear();
+    lifetime.abort(deathCause);
   }
 
   worker.addEventListener("message", (event) => {
@@ -247,6 +256,8 @@ export function createZippHost(config) {
     get deathCause() { return deathCause; },
     /** How many requests are awaiting a reply (0 after any settlement). */
     get pendingRequests() { return pending.size; },
+    /** Aborts, with `deathCause` as its reason, when this generation dies. */
+    get signal() { return lifetime.signal; },
 
     /** Load the engine, apply the immutable configuration, compile and run the guest. */
     async init(source, options = {}) {

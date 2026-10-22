@@ -26,7 +26,7 @@
 // Node from a `data:` URL; a Content-Security-Policy must allow one of them
 // in `script-src`. One file, no dependencies: copy it anywhere.
 
-export const ZIPP_LOADER_VERSION = "1.2.0";
+export const ZIPP_LOADER_VERSION = "1.3.0";
 
 const GLUE_SECTION = "zipp.glue";
 const META_SECTION = "zipp.meta";
@@ -651,9 +651,10 @@ function makeFiles(spec) {
   return { bridge, snapshot: () => Object.fromEntries(files) };
 }
 
-// One program in one engine. `dispatch(kind, args)` answers its host.call
-// requests (a promise of the engine's reply shape); it runs here, or on the
-// thread that created an isolated sandbox.
+// One program in one engine. `dispatch(kind, args, signal)` answers its
+// host.call requests (a promise of the engine's reply shape); it runs here,
+// or on the thread that created an isolated sandbox. `signal` aborts when
+// the request is given up: its time limit passed, or the sandbox closed.
 function sandboxCore(bindings, spec, dispatch, backend) {
   const engine = new bindings.Engine();
   const storage = spec.storage ? makeStorage(spec.storage, backend) : null;
@@ -661,6 +662,10 @@ function sandboxCore(bindings, spec, dispatch, backend) {
   let state = "new"; // new -> ready -> dead
   let dead = null;
   const output = [];
+  // The requests runs and calls are waiting on, and how `close()` ends every
+  // such wait at once (rather than at its time limit).
+  const outstanding = new Set();
+  const wakers = new Set();
 
   if (spec.language === "javascript") {
     const grants = [];
@@ -699,35 +704,59 @@ function sandboxCore(bindings, spec, dispatch, backend) {
   // callbacks make, until none is outstanding or the time runs out.
   async function settle(deadline) {
     const inflight = new Map();
+    let wake;
+    const closing = new Promise(resolve => { wake = resolve; });
+    wakers.add(wake);
+    try {
+      return await settleUntil(deadline, inflight, closing);
+    } finally {
+      wakers.delete(wake);
+    }
+  }
+  async function settleUntil(deadline, inflight, closing) {
+    const abandon = reason => {
+      for (const { controller } of inflight.values()) {
+        controller.abort(reason);
+        outstanding.delete(controller);
+      }
+    };
     for (;;) {
       check();
       let status;
       do {
         status = engine.drainPendingHostCallsStatus();
         for (const call of status.calls) {
+          const controller = new AbortController();
+          outstanding.add(controller);
           const reply = Promise.resolve()
-            .then(() => dispatch(call.kind, call.args))
+            .then(() => dispatch(call.kind, call.args, controller.signal))
             .then(
               value => value,
-              error => ({ ok: false, error: { code: "host", message: String(error?.message ?? error) } }),
+              error => ({ ok: false, error: { code: "host", message: describeError(error) } }),
             )
             .then(result => ({ call, result }));
-          inflight.set(call.id, reply);
+          inflight.set(call.id, { reply, controller });
         }
       } while (status.hasMore);
       if (inflight.size === 0) return;
       const remaining = deadline - Date.now();
       let timer;
       const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(null), Math.max(0, remaining)); });
-      const next = await Promise.race([...inflight.values(), timeout]);
+      const next = await Promise.race([...[...inflight.values()].map(entry => entry.reply), timeout, closing]);
       clearTimeout(timer);
+      if (next === "closed") {
+        abandon(new ZippSandboxError("closed", "zipp: the sandbox is closed", { terminal: true }));
+        throw new ZippSandboxError("closed", "zipp: the sandbox was closed with host request(s) pending", { terminal: true });
+      }
       if (next === null) {
+        abandon(new ZippSandboxError("timeout", "zipp: the time limit passed"));
         for (const id of inflight.keys()) {
           try { engine.cancelHostCallback(id); } catch { /* disposed */ }
         }
         collect();
         throw new ZippSandboxError("timeout", `zipp: ${inflight.size} host request(s) still pending after the time limit`, { output: output.splice(0) });
       }
+      outstanding.delete(inflight.get(next.call.id).controller);
       inflight.delete(next.call.id);
       try {
         engine.resolveHostCallback(next.call.id, next.result);
@@ -796,6 +825,9 @@ function sandboxCore(bindings, spec, dispatch, backend) {
         state = "dead";
         dead = new ZippSandboxError("closed", "closed", { terminal: true });
       }
+      for (const controller of outstanding) controller.abort(dead);
+      outstanding.clear();
+      for (const wake of wakers) wake("closed");
     },
   };
 }
@@ -856,7 +888,7 @@ const BODY_HEADERS = ["content-type", "content-encoding", "content-language", "c
 // the allowlist names, a method it allows, no cookies or credentials, a
 // redirect only when permitted and to an allowed URL, a time limit and a
 // size limit on the response.
-async function serveFetch(policy, args) {
+async function serveFetch(policy, args, cancel) {
   let url;
   let request;
   try {
@@ -881,8 +913,10 @@ async function serveFetch(policy, args) {
       headers[n] = String(value);
     }
   }
-  // One time limit for the request and all its redirects.
-  const signal = AbortSignal.timeout(policy.timeoutMs);
+  // One time limit for the request and all its redirects, and the request's
+  // own signal (the sandbox closed, or gave the request up).
+  const timeout = AbortSignal.timeout(policy.timeoutMs);
+  const signal = cancel ? eitherSignal(timeout, cancel) : timeout;
   let body = request.body ?? undefined;
   try {
     for (let hops = 0; ; hops++) {
@@ -943,22 +977,98 @@ async function serveFetch(policy, args) {
       };
     }
   } catch (error) {
-    return deny(error?.code === "too-large" ? "too-large" : error?.name === "TimeoutError" ? "timeout" : "network", String(error?.message ?? error));
+    if (cancel?.aborted) return deny("cancelled", "the request was cancelled");
+    return deny(error?.code === "too-large" ? "too-large" : error?.name === "TimeoutError" ? "timeout" : "network", describeError(error));
   }
 }
 
+// At most this many of one sandbox's host requests run at once; the rest
+// wait, in order, without starting.
+const MAX_RUNNING_HOST_REQUESTS = 64;
+// The longest error message a host function's failure passes to the guest.
+const MAX_HOST_ERROR_CHARS = 1000;
+
+// An error as bounded text, whatever it is: its getters may throw, and its
+// message may be any length.
+function describeError(error) {
+  let text;
+  try { text = String(error?.message ?? error); } catch { text = "<unprintable error>"; }
+  return text.length > MAX_HOST_ERROR_CHARS ? text.slice(0, MAX_HOST_ERROR_CHARS) + "…" : text;
+}
+
+// A signal that aborts when any of `signals` does.
+function eitherSignal(...signals) {
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(signals);
+  const controller = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) { controller.abort(s.reason); break; }
+    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
+  }
+  return controller.signal;
+}
+
+// The host requests of one sandbox (the guest's host.call and fetch), which
+// the sandbox owns. `dispatch(kind, args, signal)` answers one; `signal` is
+// the requester's: it aborts when the request is abandoned (its time limit
+// passed, or the isolated sandbox's Worker gave it up). Each request runs
+// with a signal that also aborts when the sandbox closes: `this.signal` in a
+// host function, the request's own in fetch. A request that ignores it keeps
+// its running slot until it actually finishes, so abandoned work cannot be
+// replaced by new work past the limit; what it finally answers is discarded,
+// as the requester has gone. After `close()` nothing starts.
 function dispatcher(local) {
-  return async (kind, args) => {
+  const owner = new AbortController();
+  const waiting = [];
+  let running = 0;
+  function serve(kind, args, signal) {
     if (kind === "net.fetch") {
-      return local.network ? serveFetch(local.network, args) : deny("denied", "network access is not permitted");
+      return local.network ? serveFetch(local.network, args, signal) : deny("denied", "network access is not permitted");
     }
     const fn = local.host.get(kind);
     if (!fn) return deny("denied", `host.call("${kind}") is not permitted`);
-    try {
-      return { ok: true, value: await fn(...args) };
-    } catch (error) {
-      return deny("host", String(error?.message ?? error));
-    }
+    return Promise.resolve()
+      .then(() => fn.apply({ signal, kind }, args))
+      .then(value => ({ ok: true, value }), error => deny("host", describeError(error)));
+  }
+  function start(item) {
+    running++;
+    const signal = eitherSignal(item.signal, owner.signal);
+    Promise.resolve()
+      .then(() => serve(item.kind, item.args, signal))
+      .then(result => result, error => deny("host", describeError(error)))
+      .then(result => {
+        running--;
+        item.resolve(result);
+        pump();
+      });
+  }
+  function pump() {
+    while (!owner.signal.aborted && running < MAX_RUNNING_HOST_REQUESTS && waiting.length) start(waiting.shift());
+  }
+  const cancelled = (why) => deny("cancelled", `the request was ${why} before it started`);
+  return {
+    dispatch(kind, args, signal) {
+      if (owner.signal.aborted) return Promise.resolve(deny("closed", "the sandbox is closed"));
+      if (signal.aborted) return Promise.resolve(cancelled("abandoned"));
+      return new Promise(resolve => {
+        const item = { kind, args, signal, resolve };
+        waiting.push(item);
+        signal.addEventListener("abort", () => {
+          const at = waiting.indexOf(item);
+          if (at >= 0) {
+            waiting.splice(at, 1);
+            resolve(cancelled("abandoned"));
+          }
+        }, { once: true });
+        pump();
+      });
+    },
+    close(reason) {
+      if (owner.signal.aborted) return;
+      owner.abort(reason);
+      for (const item of waiting.splice(0)) item.resolve(cancelled("closed"));
+    },
+    counts: () => ({ hostRequestsRunning: running, hostRequestsWaiting: waiting.length }),
   };
 }
 
@@ -980,27 +1090,32 @@ function sandboxApi(impl) {
 
 async function createSandbox(zipp, options) {
   const { spec, local, isolate, workerUrl } = normalize(zipp, options);
-  const dispatch = dispatcher(local);
+  const requests = dispatcher(local);
   if (!isolate) {
-    const core = sandboxCore(zipp.bindings, spec, dispatch, local.backend);
+    const core = sandboxCore(zipp.bindings, spec, requests.dispatch, local.backend);
     let closed = false;
     return sandboxApi({
       request: async (op, args) => {
         if (closed) throw new ZippSandboxError("closed", "zipp: the sandbox is closed", { terminal: true });
-        return core[op](...args);
+        const value = await core[op](...args);
+        return op === "usage" ? { ...value, ...requests.counts() } : value;
       },
-      close: async () => { closed = true; core.close(); },
+      close: async () => {
+        closed = true;
+        core.close();
+        requests.close(new ZippSandboxError("closed", "zipp: the sandbox is closed", { terminal: true }));
+      },
       closed: () => closed,
     });
   }
-  return isolatedSandbox(zipp, spec, dispatch, workerUrl);
+  return isolatedSandbox(zipp, spec, requests, workerUrl);
 }
 
 // A Worker (browsers, Deno, Bun) or worker thread (Node) running this same
 // file, with the engine and packages compiled once and posted to it. A
 // request that outlives `limits.timeoutMs` terminates it: the only way to
 // stop a program that never yields.
-async function isolatedSandbox(zipp, spec, dispatch, workerUrl) {
+async function isolatedSandbox(zipp, spec, requests, workerUrl) {
   const url = workerUrl ? new URL(workerUrl, globalThis.location?.href) : new URL(import.meta.url);
   let port;
   if (nodeLike() && typeof globalThis.Worker !== "function") {
@@ -1029,12 +1144,16 @@ async function isolatedSandbox(zipp, spec, dispatch, workerUrl) {
   }
 
   const pending = new Map();
+  // The Worker's host requests being served here, by its id for them, so the
+  // Worker can give one up (`host-abandon`).
+  const serving = new Map();
   let nextId = 0;
   let dead = null;
   function die(error) {
     if (dead) return;
     dead = error;
     port.terminate();
+    requests.close(error);
     for (const p of pending.values()) {
       clearTimeout(p.timer);
       p.reject(error);
@@ -1044,8 +1163,13 @@ async function isolatedSandbox(zipp, spec, dispatch, workerUrl) {
   port.listen(async message => {
     if (dead) return;
     if (message.type === "host") {
-      const result = await dispatch(message.kind, message.args);
-      if (!dead) port.post({ type: "host-reply", hid: message.hid, result });
+      const controller = new AbortController();
+      serving.set(message.hid, controller);
+      const result = await requests.dispatch(message.kind, message.args, controller.signal);
+      serving.delete(message.hid);
+      if (!dead && !controller.signal.aborted) port.post({ type: "host-reply", hid: message.hid, result });
+    } else if (message.type === "host-abandon") {
+      serving.get(message.hid)?.abort(new ZippSandboxError("timeout", "zipp: the sandbox gave the request up"));
     } else if (message.type === "crash") {
       die(new ZippSandboxError("host", `zipp: the sandbox Worker failed: ${message.message}`, { terminal: true }));
     } else if (message.id !== undefined && pending.has(message.id)) {
@@ -1084,7 +1208,7 @@ async function isolatedSandbox(zipp, spec, dispatch, workerUrl) {
   // allowance.
   await request("init", [{ engine: zipp.module, packages: [...zipp.packages], spec }], Math.max(spec.timeoutMs, 30000));
   return sandboxApi({
-    request: (op, args) => request(op, args),
+    request: (op, args) => op === "usage" ? request(op, args).then(usage => ({ ...usage, ...requests.counts() })) : request(op, args),
     close: async () => { die(new ZippSandboxError("closed", "zipp: the sandbox is closed", { terminal: true })); },
     closed: () => dead !== null,
   });
@@ -1096,10 +1220,16 @@ function serveSandbox(port) {
   let core = null;
   let hostId = 0;
   const hostWaits = new Map();
-  const dispatch = (kind, args) =>
+  // Served by the creating side; a request given up here is given up there.
+  const dispatch = (kind, args, signal) =>
     new Promise(resolve => {
       const hid = ++hostId;
       hostWaits.set(hid, resolve);
+      signal.addEventListener("abort", () => {
+        if (!hostWaits.delete(hid)) return;
+        port.post({ type: "host-abandon", hid });
+        resolve({ ok: false, error: { code: "cancelled", message: "the request was given up" } });
+      }, { once: true });
       port.post({ type: "host", hid, kind, args });
     });
   port.listen(async message => {

@@ -88,10 +88,22 @@ export interface ZippSandboxOptions {
     files?: Record<string, string> | ZippFilesPermission;
     network?: boolean | string | string[] | ZippNetworkPermission;
   };
-  /** Functions the program may call with host.call(kind, args, reply). */
-  host?: Record<string, (...args: string[]) => unknown>;
+  /**
+   * Functions the program may call with host.call(kind, args, reply). Each
+   * runs with `this.signal`, aborted when the sandbox closes or gives the
+   * request up; at most 64 run at once, the rest waiting in order.
+   */
+  host?: Record<string, (this: ZippHostRequest, ...args: string[]) => unknown>;
   /** A served copy of zipp.mjs for the Worker, when zipp.mjs is bundled. */
   workerUrl?: string | URL;
+}
+
+/** What a host function's `this` is. */
+export interface ZippHostRequest {
+  /** Aborts when the sandbox closes or gives this request up. */
+  readonly signal: AbortSignal;
+  /** The host.call kind this function answers. */
+  readonly kind: string;
 }
 
 export declare class ZippSandboxError extends Error {
@@ -110,8 +122,9 @@ export interface ZippSandbox {
   call(name: string, args?: unknown[]): Promise<{ value: unknown; output: string[] }>;
   /** Its storage and files as they are now. */
   snapshot(): Promise<{ storage: Record<string, string> | null; files: Record<string, string> | null }>;
-  /** The engine's resource account. */
+  /** The engine's resource account, with `hostRequestsRunning` and `hostRequestsWaiting`. */
   usage(): Promise<Record<string, unknown>>;
+  /** End it: a run or call waiting on host requests settles with a `closed` error, and every host request is aborted. */
   close(): Promise<void>;
   readonly closed: boolean;
 }
