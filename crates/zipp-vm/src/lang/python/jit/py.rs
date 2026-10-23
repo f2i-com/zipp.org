@@ -236,7 +236,7 @@ pub(crate) fn emit_py_step(
     labels: &PyLabels,
     refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
 ) {
-    emit_py_step_with(ops, crate::vm::Vm::jit_py_op as usize, func_id, ip, None, labels, refetch);
+    emit_py_step_with(ops, crate::vm::Vm::jit_py_op as *const () as usize, func_id, ip, None, labels, refetch);
 }
 
 /// [`emit_py_step`] through `helper`, which answers as `Vm::jit_py_op`
@@ -295,7 +295,7 @@ pub(crate) fn emit_py_load_bigint(
     refetch: &mut dyn FnMut(&mut dynasmrt::x64::Assembler),
 ) {
     let packed = ((func_id as u64) << 32) | ip as u64;
-    let helper = crate::vm::Vm::jit_py_load_bigint as usize;
+    let helper = crate::vm::Vm::jit_py_load_bigint as *const () as usize;
     dynasm!(ops
         ; mov rcx, rdi
         ; mov r8, QWORD packed as i64
@@ -406,7 +406,7 @@ pub(crate) fn emit_py_jump_if_not(
         ; mov r8, [rbx + dreg(b)]
         ; mov rcx, rdi
         ; mov r9d, le as i32
-        ; mov rax, QWORD crate::vm::Vm::jit_py_rel as usize as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_rel as *const () as usize as i64
         ; call rax
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
@@ -462,7 +462,7 @@ pub(crate) fn emit_py_add_int(
         ; mov rcx, rdi
         ; mov rdx, [rbx + dreg(a)]
         ; mov r8, QWORD packed as i64
-        ; mov rax, QWORD crate::vm::Vm::jit_py_add_int as usize as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_add_int as *const () as usize as i64
         ; call rax
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
@@ -706,7 +706,7 @@ pub(crate) fn emit_py_op(
                 ; mov rdx, [rbx + dreg(a)]
                 ; mov r8, [rbx + dreg(b)]
                 ; mov r9d, py_arith_op_code(op) as i32
-                ; mov rax, QWORD crate::vm::Vm::jit_py_arith as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_arith as *const () as usize as i64
                 ; call rax
             );
             emit_value_outcome(ops, dst, labels, refetch);
@@ -753,7 +753,7 @@ pub(crate) fn emit_py_op(
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(a)]
                 ; mov r8d, imm
-                ; mov rax, QWORD crate::vm::Vm::jit_py_add_imm as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_add_imm as *const () as usize as i64
                 ; call rax
             );
             emit_value_outcome(ops, dst, labels, refetch);
@@ -805,7 +805,7 @@ pub(crate) fn emit_py_op(
                 ; mov rdx, [rbx + dreg(a)]
                 ; mov r8, [rbx + dreg(b)]
                 ; mov r9d, py_cmp_op_code(op) as i32
-                ; mov rax, QWORD crate::vm::Vm::jit_py_cmp as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_cmp as *const () as usize as i64
                 ; call rax
                 ; cmp eax, PY_SLOW as i32
                 ; je => labels.slow
@@ -854,7 +854,7 @@ pub(crate) fn emit_py_op(
                 ; mov r9, [rbx + dreg(seq)]
                 ; mov rax, [rbx + dreg(dict)]
                 ; mov [rsp + 32], rax
-                ; mov rax, QWORD crate::vm::Vm::jit_py_get_item as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_get_item as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -884,7 +884,7 @@ pub(crate) fn emit_py_op(
                 ; mov rdx, rbx
                 ; mov r8, QWORD packed as i64
                 ; mov r9d, dict as i32
-                ; mov rax, QWORD crate::vm::Vm::jit_py_set_item as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_set_item as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -913,7 +913,7 @@ pub(crate) fn emit_py_op(
                 ; mov r9, QWORD outs as i64
                 ; mov rax, QWORD ins as i64
                 ; mov [rsp + 32], rax
-                ; mov rax, QWORD crate::vm::Vm::jit_py_new as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_new as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -935,15 +935,15 @@ pub(crate) fn emit_py_op(
         // instruction again first. (A `ZIPP_PY_PROF` run takes the ordinary
         // step, which counts.)
         Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_global as usize;
+            let h = crate::vm::Vm::jit_py_global as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
         }
         Instr::PyModGet { dst, obj, rt, key, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_mod_get as usize;
+            let h = crate::vm::Vm::jit_py_mod_get as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
         }
         Instr::PyMethod { dst, obj, rt, key, gb, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_method as usize;
+            let h = crate::vm::Vm::jit_py_method as *const () as usize;
             let keys = key as u64 | (gb as u64) << 32;
             // A planned site answers inline (`emit_py_method_inline`); a
             // failed guard calls the helper, which first settles the
@@ -959,11 +959,11 @@ pub(crate) fn emit_py_op(
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
         }
         Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_class_of as usize;
+            let h = crate::vm::Vm::jit_py_class_of as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels, refetch);
         }
         Instr::PyCaught { dst, e, line, rt, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_caught as usize;
+            let h = crate::vm::Vm::jit_py_caught as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels, refetch);
         }
         // An instance dict's entry (`PyDictGet`): as a value helper, with
@@ -975,7 +975,7 @@ pub(crate) fn emit_py_op(
                 ; mov rdx, [rbx + dreg(obj)]
                 ; mov r8, QWORD site(func_id, ip) as i64
                 ; mov r9, QWORD keys as i64
-                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_get as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_get as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -1005,7 +1005,7 @@ pub(crate) fn emit_py_op(
                 ; mov rdx, [rbx + dreg(d)]
                 ; mov r8, [rbx + dreg(k)]
                 ; mov r9, [rbx + dreg(rt)]
-                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_dict_lookup as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -1026,7 +1026,7 @@ pub(crate) fn emit_py_op(
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, [rbx + dreg(rt)]
-                ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as usize as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_exc_pop as *const () as usize as i64
                 ; call rax
                 ; mov [rsp + 32], rax
             );
@@ -1042,30 +1042,30 @@ pub(crate) fn emit_py_op(
             );
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_isinstance as usize;
+            let h = crate::vm::Vm::jit_py_isinstance as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels, refetch);
         }
         Instr::PyLen { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_len as usize;
+            let h = crate::vm::Vm::jit_py_len as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels, refetch);
         }
         Instr::PySeq { dst, items, rt, tuple, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_seq as usize;
+            let h = crate::vm::Vm::jit_py_seq as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(items), V::Reg(rt), V::Imm(tuple as u64), V::None], dst, labels, refetch);
         }
         Instr::PyUnpack { dst, v, rt, n, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_unpack as usize;
+            let h = crate::vm::Vm::jit_py_unpack as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(v), V::Reg(rt), V::Imm(n as u64), V::None], dst, labels, refetch);
         }
         Instr::PyMakeExc { dst, cls, args, rt, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_make_exc as usize;
+            let h = crate::vm::Vm::jit_py_make_exc as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(cls), V::Reg(args), V::Reg(rt), V::None], dst, labels, refetch);
         }
         // A generator's step (a `for` over a generator, every iteration):
         // through `Vm::jit_py_gen_next`, which resumes it as the step does.
         // Its bail answer covers a raise in the body and a nesting too deep.
         Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
-            let h = crate::vm::Vm::jit_py_gen_next as usize;
+            let h = crate::vm::Vm::jit_py_gen_next as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
         }
         // A call: through `Vm::jit_py_call` with the operands packed, which
@@ -1073,14 +1073,14 @@ pub(crate) fn emit_py_op(
         // callee to `Vm::jit_py_op`; the same outcomes as the step's.
         Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
             let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
-            emit_py_step_with(ops, crate::vm::Vm::jit_py_call as usize, func_id, ip, Some(regs), labels, refetch);
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_call as *const () as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // A raise: through `Vm::jit_py_raise` with the operands packed, the
         // step's own `py_raise_step` without the instruction found and
         // decoded again; the same outcomes as `jit_py_op`'s.
         Instr::PyRaise { e, rt, catch, .. } if !crate::vm::prof_py::on() && py_raise_helper_enabled() => {
             let regs = e as u64 | (rt as u64) << 16 | (catch as u64) << 32;
-            emit_py_step_with(ops, crate::vm::Vm::jit_py_raise as usize, func_id, ip, Some(regs), labels, refetch);
+            emit_py_step_with(ops, crate::vm::Vm::jit_py_raise as *const () as usize, func_id, ip, Some(regs), labels, refetch);
         }
         // An attribute of layout-mode instance storage (`py_attr_inline`),
         // when the body's plan has the site; the ordinary step otherwise.
@@ -1365,7 +1365,7 @@ pub(crate) fn emit_py_array_append(
         ; mov rcx, rdi
         ; mov rdx, [rbx + dreg(arr)]
         ; mov r8, [rbx + dreg(val)]
-        ; mov rax, QWORD crate::vm::Vm::jit_py_array_append as usize as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_array_append as *const () as usize as i64
         ; call rax
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
@@ -1389,7 +1389,7 @@ pub(crate) fn emit_py_new_array(
         ; mov rcx, rdi
         ; mov rdx, rbx
         ; mov r8, QWORD packed as i64
-        ; mov rax, QWORD crate::vm::jit_new_array as usize as i64
+        ; mov rax, QWORD crate::vm::jit_new_array as *const () as usize as i64
         ; call rax
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
@@ -1711,7 +1711,7 @@ pub(crate) fn emit_py_load_const(
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rdx, QWORD packed as i64
-        ; mov rax, QWORD crate::vm::Vm::jit_py_load_const as usize as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_load_const as *const () as usize as i64
         ; call rax
         ; mov [rbx + dreg(dst)], rax
     );
@@ -1726,7 +1726,7 @@ pub(crate) fn emit_py_push_handler(ops: &mut dynasmrt::x64::Assembler, catch_tar
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rdx, QWORD packed as i64
-        ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as usize as i64
+        ; mov rax, QWORD crate::vm::Vm::jit_py_push_handler as *const () as usize as i64
         ; call rax
     );
 }

@@ -1484,7 +1484,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 ; mov edx, global as i32
                 ; mov r8, QWORD guard.receiver_bits as i64
                 ; mov r9, QWORD guard.callee_bits as i64
-                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as usize as i64
+                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as *const () as usize as i64
                 ; call rax
             );
             if pad != 0 {
@@ -1530,7 +1530,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             dynasm!(ops
                 ; mov rcx, rdi                                  // vm
                 ; mov rdx, [rsp + ta_base + 32 * j as i32]      // pinned receiver bits
-                ; mov rax, QWORD crate::vm::jit_array_push_gate as usize as i64
+                ; mov rax, QWORD crate::vm::jit_array_push_gate as *const () as usize as i64
                 ; call rax
                 ; test rax, rax
                 ; jz => entry_bail
@@ -2438,7 +2438,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ; lea rdx, [rsp + ta_base]
                         ; mov r8d, packed as i32
                         ; lea r9, [rsp + push3_vals_off]
-                        ; mov rax, QWORD crate::vm::jit_array_push3_pinned as usize as i64
+                        ; mov rax, QWORD crate::vm::jit_array_push3_pinned as *const () as usize as i64
                         ; call rax
                     );
                     for (k, &gb) in save_gprs.iter().enumerate() {
@@ -2525,7 +2525,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movq r8, Rx(vx)                    // the raw i64 home value
                     ; mov rcx, rdi                       // vm
                     ; lea r9, [rsp + off]                // out: this pin's slot
-                    ; mov rax, QWORD crate::vm::jit_array_push_pinned as usize as i64
+                    ; mov rax, QWORD crate::vm::jit_array_push_pinned as *const () as usize as i64
                     ; call rax
                     // The sentinel goes into rcx BEFORE the restore, and the
                     // compare happens AFTER it. Two reasons, both load-bearing:

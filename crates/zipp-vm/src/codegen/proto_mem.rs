@@ -2551,7 +2551,7 @@ fn emit_tierc_general_method(
     let method_cross = tierc_method_crosscall_enabled();
     let method_done = ops.new_dynamic_label();
     if own_slot_direct {
-        let direct_helper = crate::vm::jit_cross_own_method_call as usize;
+        let direct_helper = crate::vm::jit_cross_own_method_call as *const () as usize;
         let direct_fallback = ops.new_dynamic_label();
         dynasm!(ops
             ; mov rcx, rdi                        // vm
@@ -2577,7 +2577,7 @@ fn emit_tierc_general_method(
         );
     }
     if method_cross {
-        let method_cross_helper = crate::vm::jit_cross_method_call as usize;
+        let method_cross_helper = crate::vm::jit_cross_method_call as *const () as usize;
         let method_fallback = ops.new_dynamic_label();
         dynasm!(ops
             ; mov rcx, rdi                        // vm
@@ -3690,7 +3690,7 @@ pub(crate) fn compile_proto_mem(
                 // active callable's exact function id before allocating.  A
                 // decline is therefore a pure prefix and resumes MakeFunc;
                 // any panic after allocation is fail-stop in the helper.
-                let helper = crate::vm::jit_make_func as usize;
+                let helper = crate::vm::jit_make_func as *const () as usize;
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 if let Some(&child) = plain_makefunc.get(&ip) {
                     // B257 plain lane: with the realm and eval-scope side
@@ -3703,7 +3703,7 @@ pub(crate) fn compile_proto_mem(
                     use crate::vm::host_api::{
                         JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
                     };
-                    let plain = crate::vm::jit_make_func_plain as usize;
+                    let plain = crate::vm::jit_make_func_plain as *const () as usize;
                     let full = ops.new_dynamic_label();
                     let join = ops.new_dynamic_label();
                     dynasm!(ops
@@ -3754,7 +3754,7 @@ pub(crate) fn compile_proto_mem(
                 // window through the validated pointer, so success needs no
                 // destination store here. The helper re-reads the immutable
                 // site and validates the activation before any effect.
-                let helper = crate::vm::jit_make_cell as usize;
+                let helper = crate::vm::jit_make_cell as *const () as usize;
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let window = proto.reg_count.max(1) as u64;
                 dynasm!(ops
@@ -3778,7 +3778,7 @@ pub(crate) fn compile_proto_mem(
                 // the live window and the verified activation, and replicates
                 // the interpreter's lexical this/home/new.target/EvalScope
                 // inheritance before returning the fresh callable's bits.
-                let helper = crate::vm::jit_make_closure as usize;
+                let helper = crate::vm::jit_make_closure as *const () as usize;
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let window = proto.reg_count.max(1) as u64;
                 dynasm!(ops
@@ -3827,7 +3827,7 @@ pub(crate) fn compile_proto_mem(
             Instr::CellSetChecked { cell, src } => {
                 // TDZ-checked store: the decline precedes the write, so the
                 // interpreter replays its exact ReferenceError.
-                let helper = crate::vm::jit_cell_set_tdz_checked as usize;
+                let helper = crate::vm::jit_cell_set_tdz_checked as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(cell)]
@@ -3896,7 +3896,7 @@ pub(crate) fn compile_proto_mem(
             } => {
                 // Dense `new Array(…)` subset; RangeError/sparse lengths and
                 // malformed windows decline before any allocation.
-                let helper = crate::vm::jit_array_ctor as usize;
+                let helper = crate::vm::jit_array_ctor as *const () as usize;
                 let mut packed = ((proto.reg_count.max(1) as u64) << 32)
                     | ((arg_base as u64) << 16)
                     | argc as u64;
@@ -3931,7 +3931,7 @@ pub(crate) fn compile_proto_mem(
             Instr::GetIterator { dst, src } => {
                 // Pristine dense-array identity only; every observable
                 // protocol step declines. Pure → no refetch.
-                let helper = crate::vm::jit_get_iterator as usize;
+                let helper = crate::vm::jit_get_iterator as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(src)]
@@ -3946,7 +3946,7 @@ pub(crate) fn compile_proto_mem(
             }
             Instr::IterPrime { dst, iter } => {
                 // Built-in iterables prime `undefined` with no observable get.
-                let helper = crate::vm::jit_iter_prime as usize;
+                let helper = crate::vm::jit_iter_prime as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(iter)]
@@ -4066,7 +4066,7 @@ pub(crate) fn compile_proto_mem(
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(src)]          // the thrown value
-                    ; mov rax, QWORD crate::vm::jit_throw as i64
+                    ; mov rax, QWORD crate::vm::jit_throw as *const () as i64
                     ; call rax
                     ; mov DWORD [rsi], ip as i32
                     ; jmp => epilogue
@@ -4095,7 +4095,7 @@ pub(crate) fn compile_proto_mem(
             Instr::EndFinally { kind_reg, .. } => {
                 // Only the NORMAL completion falls through natively; abrupt
                 // completions decline into the interpreter's routing.
-                let helper = crate::vm::jit_end_finally as usize;
+                let helper = crate::vm::jit_end_finally as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]
@@ -4110,7 +4110,7 @@ pub(crate) fn compile_proto_mem(
             Instr::IterCloseFinally { kind_reg, .. } => {
                 // Normal/jump completions do not close; return/throw decline
                 // (IteratorClose is observable user code).
-                let helper = crate::vm::jit_iter_close_finally as usize;
+                let helper = crate::vm::jit_iter_close_finally as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]
@@ -4154,7 +4154,7 @@ pub(crate) fn compile_proto_mem(
             } => {
                 // Ordinary-object/array own-key snapshot (allocates; no user
                 // code). Proxies and primitives decline purely.
-                let helper = crate::vm::jit_object_keys as usize;
+                let helper = crate::vm::jit_object_keys as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(obj)]
@@ -4181,7 +4181,7 @@ pub(crate) fn compile_proto_mem(
                 // returning the new object's bits.  A defensive decline is
                 // still a pure prefix: the unreachable fresh allocation has
                 // not escaped and the interpreter may replay NewObject.
-                let helper = crate::vm::jit_new_object as usize;
+                let helper = crate::vm::jit_new_object as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov edx, hint as i32
@@ -4204,7 +4204,7 @@ pub(crate) fn compile_proto_mem(
                 // The helper validates the unified FuncProto id and plan index
                 // before its GC/allocation commit point. Packing uses the same
                 // immutable-id convention as AppendDataProp.
-                let helper = crate::vm::jit_new_planned_object as usize;
+                let helper = crate::vm::jit_new_planned_object as *const () as usize;
                 let packed = ((func_id as u64) << 32) | plan as u64;
                 dynasm!(ops
                     ; mov rcx, rdi
@@ -4230,7 +4230,7 @@ pub(crate) fn compile_proto_mem(
                 // entire window lies inside vm.regs, collects before copying
                 // the rooted Values, allocates, and applies current-realm
                 // Array provenance.
-                let helper = crate::vm::jit_new_array as usize;
+                let helper = crate::vm::jit_new_array as *const () as usize;
                 let packed =
                     ((proto.reg_count as u64) << 32) | ((arg_base as u64) << 16) | argc as u64;
                 dynasm!(ops
@@ -4253,7 +4253,7 @@ pub(crate) fn compile_proto_mem(
                 // Pack the immutable unified function id with its static
                 // name slot. The helper verifies exact Object kind before
                 // its barrier and interpreter-equivalent push_data.
-                let helper = crate::vm::jit_append_data_prop as usize;
+                let helper = crate::vm::jit_append_data_prop as *const () as usize;
                 let packed_name = ((func_id as u64) << 32) | name as u64;
                 dynasm!(ops
                     ; mov rcx, rdi
@@ -4317,7 +4317,7 @@ pub(crate) fn compile_proto_mem(
                     let thin = crate::heap::thin_alloc_enabled()
                         && (val_base as usize + count as usize) <= proto.reg_count as usize;
                     if thin {
-                        let helper = crate::vm::jit_finalize_object_thin as usize;
+                        let helper = crate::vm::jit_finalize_object_thin as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
                             ; mov rdx, rbx
@@ -4331,7 +4331,7 @@ pub(crate) fn compile_proto_mem(
                             ; mov [rbx + dreg(dst)], rax
                         );
                     } else {
-                        let helper = crate::vm::jit_finalize_object_baked as usize;
+                        let helper = crate::vm::jit_finalize_object_baked as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
                             ; mov rdx, rbx
@@ -4347,7 +4347,7 @@ pub(crate) fn compile_proto_mem(
                         );
                     }
                 } else {
-                    let helper = crate::vm::jit_finalize_object as usize;
+                    let helper = crate::vm::jit_finalize_object as *const () as usize;
                     let packed_plan = ((func_id as u64) << 32) | plan as u64;
                     let packed_window =
                         ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
@@ -4374,7 +4374,7 @@ pub(crate) fn compile_proto_mem(
                 // The helper duplicates that no-op, validates heap indices
                 // before mutation, then publishes the barrier-backed home
                 // edge.  A post-commit panic aborts instead of replaying it.
-                let helper = crate::vm::jit_set_home_object as usize;
+                let helper = crate::vm::jit_set_home_object as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(method)]
@@ -4388,7 +4388,7 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LooseEq { dst, a, b } => {
-                let helper = crate::vm::jit_loose_null_eq as usize;
+                let helper = crate::vm::jit_loose_null_eq as *const () as usize;
                 if crate::vm::tierc_loose_null_inline_enabled() {
                     use crate::vm::host_api::{
                         JIT_HTMLDDA_IDX_OFFSET, JIT_HTMLDDA_SCALAR_ENABLED_OFFSET,
@@ -4594,7 +4594,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov rcx, rdi
                         ; mov edx, plan.idx as i32
                         ; mov r8, QWORD plan.packed as i64
-                        ; mov rax, QWORD crate::vm::jit_tierc_upval_xorshift_i32 as i64
+                        ; mov rax, QWORD crate::vm::jit_tierc_upval_xorshift_i32 as *const () as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -4997,7 +4997,7 @@ pub(crate) fn compile_proto_mem(
                 // Any other live value declines before effects and resumes the
                 // interpreter at this GlobalFn bytecode, preserving Symbol and
                 // observable object-coercion semantics.
-                let helper = crate::vm::jit_int_string as usize;
+                let helper = crate::vm::jit_int_string as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(arg_base)]
@@ -5908,7 +5908,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_load_class_value_ic as usize,
+                    crate::vm::jit_load_class_value_ic as *const () as usize,
                     packed_fip,
                     class_id as u64 | crate::vm::LOAD_CLASS_FROM_TIER_C,
                     0,
@@ -5925,7 +5925,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_to_str_ic as usize,
+                    crate::vm::jit_to_str_ic as *const () as usize,
                     packed_fip,
                     a as u64,
                     0,
@@ -5944,7 +5944,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_instanceof_ic as usize,
+                    crate::vm::jit_instanceof_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     0,
@@ -5962,7 +5962,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_static_fn_ic as usize,
+                    crate::vm::jit_static_fn_ic as *const () as usize,
                     packed_fip,
                     0,
                     0,
@@ -5986,7 +5986,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_new_ic as usize,
+                    crate::vm::jit_new_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     argc,
@@ -6067,7 +6067,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_call_with_this_ic as usize,
+                    crate::vm::jit_call_with_this_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     argc,
@@ -6108,7 +6108,7 @@ pub(crate) fn compile_proto_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_call_with_this_ic as usize,
+                    crate::vm::jit_call_with_this_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     argc,
@@ -6205,7 +6205,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov r9, [rbx + dreg(key)]
                         ; lea r10, [rsp + cursor_off]
                         ; mov [rsp + 32], r10
-                        ; mov rax, QWORD crate::vm::jit_str_append_cursor_begin as usize as i64
+                        ; mov rax, QWORD crate::vm::jit_str_append_cursor_begin as *const () as usize as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -6263,9 +6263,9 @@ pub(crate) fn compile_proto_mem(
                 // coercion code, so always refetch pinned state after a served
                 // call; CALL_THREW is a committed unwind, never a redo.
                 let pair_helper = if in_place {
-                    crate::vm::jit_append_right_pair as usize
+                    crate::vm::jit_append_right_pair as *const () as usize
                 } else {
-                    crate::vm::jit_add_right_pair as usize
+                    crate::vm::jit_add_right_pair as *const () as usize
                 };
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
@@ -6326,7 +6326,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(src)]          // RHS bits
                     ; mov r8d, zero as i32                // literal prefix selector
-                    ; mov rax, QWORD crate::vm::jit_pad2_concat as usize as i64
+                    ; mov rax, QWORD crate::vm::jit_pad2_concat as *const () as usize as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -6369,7 +6369,7 @@ pub(crate) fn compile_proto_mem(
                     ; => slow
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(src)]
-                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as usize as i64
+                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as *const () as usize as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -6420,17 +6420,17 @@ pub(crate) fn compile_proto_mem(
                     if let Some(next_b) = next_leaf {
                         let helper_ready = ops.new_dynamic_label();
                         dynasm!(ops
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as usize as i64
                             ; mov r10, [rbx + dreg(next_b)]
                             ; shr r10, 48
                             ; cmp r10d, INT_TAG_HI as i32
                             ; jne => helper_ready
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as *const () as usize as i64
                             ; => helper_ready
                         );
                     } else {
                         dynasm!(ops
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as usize as i64
                         );
                     }
                     dynasm!(ops
@@ -6472,7 +6472,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(a)]            // acc bits
                         ; mov r8, [rbx + dreg(b)]             // leaf bits
-                        ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                        ; mov rax, QWORD crate::vm::jit_concat_chain as *const () as usize as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -6575,7 +6575,7 @@ pub(crate) fn compile_proto_mem(
             ; mov rcx, rdi
             ; lea rdx, [rsp + cursor_off]
             ; mov r8, rax
-            ; mov r11, QWORD crate::vm::jit_str_append_cursor_commit as usize as i64
+            ; mov r11, QWORD crate::vm::jit_str_append_cursor_commit as *const () as usize as i64
             ; call r11
         );
     }

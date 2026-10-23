@@ -4196,9 +4196,9 @@ impl<'p> Vm<'p> {
                 self.jit.compile(
                     func_id,
                     proto_ref,
-                    jit_self_call_at as usize,
+                    jit_self_call_at as *const () as usize,
                     self_val,
-                    jit_globals_base as usize,
+                    jit_globals_base as *const () as usize,
                     heap_helper_addrs,
                     &const_strs,
                     &leaf_plan,

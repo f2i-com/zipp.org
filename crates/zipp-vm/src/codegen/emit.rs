@@ -678,7 +678,7 @@ pub(crate) fn emit_ic_probe(
                 ; mov rax, [rbx + dreg(obj)]
                 ; mov edx, eax                        // holder heap idx
                 ; mov r8, [rbx + dreg(val)]           // val_bits
-                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as i64
+                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
                 ; call rax
                 ; jmp => cont
                 ; => skip
@@ -853,7 +853,7 @@ pub(crate) fn emit_ic_probe(
             dynasm!(ops
                 ; mov rcx, rdi                    // vm
                 ; mov r8, [rbx + dreg(val)]       // val_bits
-                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as i64
+                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
                 ; call rax
             );
         }

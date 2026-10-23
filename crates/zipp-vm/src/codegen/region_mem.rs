@@ -545,7 +545,7 @@ pub(crate) fn compile_region_mem(
             ; mov rcx, rdi
             ; mov rdx, rbx
             ; mov r8, QWORD packed as i64
-            ; mov rax, QWORD crate::vm::jit_field_read_loop as usize as i64
+            ; mov rax, QWORD crate::vm::jit_field_read_loop as *const () as usize as i64
             ; call rax
             ; test rax, rax
             ; je => fallback
@@ -580,7 +580,7 @@ pub(crate) fn compile_region_mem(
             ; mov rcx, rdi
             ; mov rdx, rbx
             ; mov r8, QWORD packed as i64
-            ; mov rax, QWORD crate::vm::jit_field_write_loop as usize as i64
+            ; mov rax, QWORD crate::vm::jit_field_write_loop as *const () as usize as i64
             ; call rax
             ; test rax, rax
             ; je => fallback
@@ -1956,7 +1956,7 @@ pub(crate) fn compile_region_mem(
                         call_arg_base,
                         0,
                         call_dst,
-                        crate::vm::jit_call_with_this_ic as usize,
+                        crate::vm::jit_call_with_this_ic as *const () as usize,
                         packed_fip,
                         packed_args,
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
@@ -3111,7 +3111,7 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
-                        ; mov rax, QWORD crate::vm::jit_array_pop as i64
+                        ; mov rax, QWORD crate::vm::jit_array_pop as *const () as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -3444,7 +3444,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_new_ic as usize,
+                    crate::vm::jit_new_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     argc,
@@ -3466,7 +3466,7 @@ pub(crate) fn compile_region_mem(
                 // entire window lies inside vm.regs, collects before copying
                 // the rooted Values, allocates, and applies current-realm
                 // Array provenance.
-                let helper = crate::vm::jit_new_array as usize;
+                let helper = crate::vm::jit_new_array as *const () as usize;
                 let packed =
                     ((proto.reg_count as u64) << 32) | ((arg_base as u64) << 16) | argc as u64;
                 dynasm!(ops
@@ -3494,7 +3494,7 @@ pub(crate) fn compile_region_mem(
                 // returning the new object's bits.  A defensive decline is
                 // still a pure prefix: the unreachable fresh allocation has
                 // not escaped and the interpreter may replay NewObject.
-                let helper = crate::vm::jit_new_object as usize;
+                let helper = crate::vm::jit_new_object as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov edx, hint as i32
@@ -3520,7 +3520,7 @@ pub(crate) fn compile_region_mem(
                 // The helper validates the unified FuncProto id and plan index
                 // before its GC/allocation commit point. Packing uses the same
                 // immutable-id convention as AppendDataProp.
-                let helper = crate::vm::jit_new_planned_object as usize;
+                let helper = crate::vm::jit_new_planned_object as *const () as usize;
                 let packed = ((heap.func_id as u64) << 32) | plan as u64;
                 dynasm!(ops
                     ; mov rcx, rdi
@@ -3544,7 +3544,7 @@ pub(crate) fn compile_region_mem(
                 // Pack the immutable unified function id with its static
                 // name slot. The helper verifies exact Object kind before
                 // its barrier and interpreter-equivalent push_data.
-                let helper = crate::vm::jit_append_data_prop as usize;
+                let helper = crate::vm::jit_append_data_prop as *const () as usize;
                 let packed_name = ((heap.func_id as u64) << 32) | name as u64;
                 dynasm!(ops
                     ; mov rcx, rdi
@@ -3608,7 +3608,7 @@ pub(crate) fn compile_region_mem(
                     let thin = crate::heap::thin_alloc_enabled()
                         && (val_base as usize + count as usize) <= proto.reg_count as usize;
                     if thin {
-                        let helper = crate::vm::jit_finalize_object_thin as usize;
+                        let helper = crate::vm::jit_finalize_object_thin as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
                             ; mov rdx, rbx
@@ -3622,7 +3622,7 @@ pub(crate) fn compile_region_mem(
                             ; mov [rbx + dreg(dst)], rax
                         );
                     } else {
-                        let helper = crate::vm::jit_finalize_object_baked as usize;
+                        let helper = crate::vm::jit_finalize_object_baked as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
                             ; mov rdx, rbx
@@ -3638,7 +3638,7 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                 } else {
-                    let helper = crate::vm::jit_finalize_object as usize;
+                    let helper = crate::vm::jit_finalize_object as *const () as usize;
                     let packed_plan = ((heap.func_id as u64) << 32) | plan as u64;
                     let packed_window =
                         ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
@@ -3671,7 +3671,7 @@ pub(crate) fn compile_region_mem(
                 // `jit_region_make_fn` runs the interpreter's code in this
                 // frame and returns the callable's bits; a decline precedes
                 // every effect and resumes the interpreter at this op.
-                let helper = crate::vm::jit_region_make_fn as usize;
+                let helper = crate::vm::jit_region_make_fn as *const () as usize;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let window = proto.reg_count.max(1) as u64;
                 dynasm!(ops
@@ -3701,7 +3701,7 @@ pub(crate) fn compile_region_mem(
                 if !py =>
             {
                 // The same helper writes the fresh cell into the window.
-                let helper = crate::vm::jit_region_make_fn as usize;
+                let helper = crate::vm::jit_region_make_fn as *const () as usize;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let window = proto.reg_count.max(1) as u64;
                 dynasm!(ops
@@ -3731,7 +3731,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_iter_to_array_ic as usize,
+                    crate::vm::jit_iter_to_array_ic as *const () as usize,
                     packed_fip,
                     src as u64 | (count as u64) << 16,
                     0,
@@ -3748,7 +3748,7 @@ pub(crate) fn compile_region_mem(
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(arr)]          // array bits
                     ; mov r8, [rbx + dreg(val)]           // value bits
-                    ; mov rax, QWORD crate::vm::jit_array_append_plain as i64
+                    ; mov rax, QWORD crate::vm::jit_array_append_plain as *const () as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -3768,7 +3768,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_array_append_ic as usize,
+                    crate::vm::jit_array_append_ic as *const () as usize,
                     packed_fip,
                     arr as u64 | (val as u64) << 16 | (spread as u64) << 32,
                     0,
@@ -3785,7 +3785,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_call_spread_ic as usize,
+                    crate::vm::jit_call_spread_ic as *const () as usize,
                     packed_fip,
                     callee as u64 | (args as u64) << 16,
                     0,
@@ -3812,7 +3812,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_obj_enum_ic as usize,
+                    crate::vm::jit_obj_enum_ic as *const () as usize,
                     packed_fip,
                     obj as u64 | (callee as u64) << 16 | (this_v as u64) << 32 | op << 56,
                     0,
@@ -3834,7 +3834,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_obj_enum_ic as usize,
+                    crate::vm::jit_obj_enum_ic as *const () as usize,
                     packed_fip,
                     obj as u64 | op << 56,
                     0,
@@ -3852,7 +3852,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_obj_init_ic as usize,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
                     packed_fip,
                     target as u64 | (src as u64) << 16,
                     0,
@@ -3869,7 +3869,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_obj_init_ic as usize,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
                     packed_fip,
                     obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
                     0,
@@ -3887,7 +3887,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_load_class_value_ic as usize,
+                    crate::vm::jit_load_class_value_ic as *const () as usize,
                     packed_fip,
                     class_id as u64,
                     0,
@@ -3904,7 +3904,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_to_str_ic as usize,
+                    crate::vm::jit_to_str_ic as *const () as usize,
                     packed_fip,
                     a as u64,
                     0,
@@ -3923,7 +3923,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_instanceof_ic as usize,
+                    crate::vm::jit_instanceof_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     0,
@@ -4043,7 +4043,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_call_with_this_ic as usize,
+                    crate::vm::jit_call_with_this_ic as *const () as usize,
                     packed_fip,
                     packed_args,
                     argc,
@@ -4110,7 +4110,7 @@ pub(crate) fn compile_region_mem(
                         arg_base,
                         argc,
                         dst,
-                        crate::vm::jit_call_with_this_ic as usize,
+                        crate::vm::jit_call_with_this_ic as *const () as usize,
                         packed_fip,
                         packed_args,
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
@@ -4123,7 +4123,7 @@ pub(crate) fn compile_region_mem(
                         ip,
                         bail,
                         epilogue,
-                        crate::vm::jit_call_with_this_ic as usize,
+                        crate::vm::jit_call_with_this_ic as *const () as usize,
                         packed_fip,
                         packed_args,
                         argc,
@@ -4180,9 +4180,9 @@ pub(crate) fn compile_region_mem(
                 // pinned/TA refetch discipline, and a committed throw exits as
                 // CALL_THREW (never redo).
                 let pair_helper = if in_place {
-                    crate::vm::jit_append_right_pair as usize
+                    crate::vm::jit_append_right_pair as *const () as usize
                 } else {
-                    crate::vm::jit_add_right_pair as usize
+                    crate::vm::jit_add_right_pair as *const () as usize
                 };
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
@@ -4248,7 +4248,7 @@ pub(crate) fn compile_region_mem(
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(src)]          // RHS bits
                     ; mov r8d, zero as i32                // literal prefix selector
-                    ; mov rax, QWORD crate::vm::jit_pad2_concat as usize as i64
+                    ; mov rax, QWORD crate::vm::jit_pad2_concat as *const () as usize as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -4296,7 +4296,7 @@ pub(crate) fn compile_region_mem(
                     ; => slow
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(src)]
-                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as usize as i64
+                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as *const () as usize as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
@@ -4349,17 +4349,17 @@ pub(crate) fn compile_region_mem(
                     if let Some(next_b) = next_leaf {
                         let helper_ready = ops.new_dynamic_label();
                         dynasm!(ops
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as usize as i64
                             ; mov r10, [rbx + dreg(next_b)]
                             ; shr r10, 48
                             ; cmp r10d, INT_TAG_HI as i32
                             ; jne => helper_ready
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as *const () as usize as i64
                             ; => helper_ready
                         );
                     } else {
                         dynasm!(ops
-                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as *const () as usize as i64
                         );
                     }
                     dynasm!(ops
@@ -4410,7 +4410,7 @@ pub(crate) fn compile_region_mem(
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(a)]            // acc bits
                         ; mov r8, [rbx + dreg(b)]             // leaf bits
-                        ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                        ; mov rax, QWORD crate::vm::jit_concat_chain as *const () as usize as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -4440,7 +4440,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_static_fn_ic as usize,
+                    crate::vm::jit_static_fn_ic as *const () as usize,
                     packed_fip,
                     0,
                     0,
@@ -4554,7 +4554,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_iter_op_ic as usize,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
                     packed_fip,
                     src as u64,
                     0,
@@ -4572,7 +4572,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_iter_op_ic as usize,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
                     packed_fip,
                     iter as u64 | 1u64 << 56,
                     0,
@@ -4589,7 +4589,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_iter_op_ic as usize,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
                     packed_fip,
                     iter as u64 | op << 56,
                     0,
@@ -4607,7 +4607,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_iter_op_ic as usize,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
                     packed_fip,
                     iter as u64 | (kind_reg as u64) << 16 | 4u64 << 56,
                     0,
@@ -4624,7 +4624,7 @@ pub(crate) fn compile_region_mem(
                     ip,
                     bail,
                     epilogue,
-                    crate::vm::jit_array_ctor_ic as usize,
+                    crate::vm::jit_array_ctor_ic as *const () as usize,
                     packed_fip,
                     callee as u64 | (arg_base as u64) << 16 | (is_construct as u64) << 32,
                     argc,
@@ -4802,7 +4802,7 @@ pub(crate) fn compile_region_mem(
                 // handler) completing normally falls through; any abrupt
                 // completion leaves the region at the instruction for the
                 // interpreter's routing (Tier C's arm, `proto_mem`).
-                let helper = crate::vm::jit_end_finally as usize;
+                let helper = crate::vm::jit_end_finally as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]

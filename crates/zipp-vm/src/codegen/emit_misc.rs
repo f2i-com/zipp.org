@@ -431,7 +431,7 @@ pub(crate) fn emit_math_identity_guard(
                 return;
             }
         }
-        let identity = crate::vm::jit_math_bare_is_intrinsic as usize;
+        let identity = crate::vm::jit_math_bare_is_intrinsic as *const () as usize;
         dynasm!(ops
             ; mov rcx, rdi
             ; mov edx, op as i32
@@ -471,7 +471,7 @@ pub(crate) fn emit_math_identity_guard(
         }
     }
 
-    let identity = crate::vm::jit_math_is_intrinsic as usize;
+    let identity = crate::vm::jit_math_is_intrinsic as *const () as usize;
     dynasm!(ops
         ; mov rcx, rdi
         ; mov edx, op as i32

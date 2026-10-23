@@ -2862,7 +2862,7 @@ pub(crate) fn compile_region_int_gpr(
                 ; mov edx, global as i32
                 ; mov r8, QWORD guard.receiver_bits as i64
                 ; mov r9, QWORD guard.callee_bits as i64
-                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as usize as i64
+                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as *const () as usize as i64
                 ; call rax
                 ; test rax, rax
                 ; jz => entry_bail

@@ -150,7 +150,7 @@ pub(crate) fn emit_py_attr_site(
         return false;
     }
     let packed = ((func_id as u64) << 32) | ip as u64;
-    let helper = crate::vm::Vm::jit_py_attr_miss as usize;
+    let helper = crate::vm::Vm::jit_py_attr_miss as *const () as usize;
     let call = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
     dynasm!(ops

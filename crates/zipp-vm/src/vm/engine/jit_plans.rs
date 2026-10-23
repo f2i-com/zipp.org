@@ -310,7 +310,7 @@ fn span_code_unit_pred_plan(
         | ((globals[3] as u64) << 48);
     Some(crate::codegen::SpanCodeUnitPredPlan {
         packed_globals,
-        helper: crate::vm::helpers_misc::jit_span_code_unit_pred as usize,
+        helper: crate::vm::helpers_misc::jit_span_code_unit_pred as *const () as usize,
         pair: None,
     })
 }
@@ -1427,7 +1427,7 @@ impl<'p> Vm<'p> {
                     callee_bits: callee_value.bits(),
                     callee_ver: self.heap.version_of(callee_value.heap_index()),
                     same_proto_fid: None,
-                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as usize,
+                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
                     reg_window: caller.reg_count,
                     callee_reg_count: callee.reg_count,
                     this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
@@ -1437,9 +1437,9 @@ impl<'p> Vm<'p> {
                     consts,
                     string_constants: callee.string_constants.clone(),
                     upvals: FxHashMap::default(),
-                    cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
-                    cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
-                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as usize,
+                    cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
+                    cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
+                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,
                     callee_fid: fid,
                     nested: FxHashMap::default(),
                     uninit_mask,
@@ -1468,7 +1468,7 @@ impl<'p> Vm<'p> {
                     fallback_ip: fallback_ip as u32,
                     drop_obj_def: drop_obj_def.map(|v| v as u32),
                     variants,
-                    guard_helper: crate::vm::helpers_misc::jit_dense_computed_leaf_guard as usize,
+                    guard_helper: crate::vm::helpers_misc::jit_dense_computed_leaf_guard as *const () as usize,
                 },
             );
         }
@@ -2566,7 +2566,7 @@ impl<'p> Vm<'p> {
         Some(crate::codegen::SpanCodeUnitPairPlan {
             packed_units,
             resume_ip: (call_ip + 6) as u32,
-            helper: crate::vm::helpers_misc::jit_span_code_unit_pair as usize,
+            helper: crate::vm::helpers_misc::jit_span_code_unit_pair as *const () as usize,
         })
     }
 
@@ -3184,7 +3184,7 @@ impl<'p> Vm<'p> {
                     callee_bits,
                     callee_ver,
                     same_proto_fid: same_proto.then_some(fid),
-                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as usize,
+                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
                     this_bits,
                     reg_window,
                     callee_reg_count: callee.reg_count + extra_regs,
@@ -3195,9 +3195,9 @@ impl<'p> Vm<'p> {
                     string_constants: callee.string_constants.clone(),
                     nested,
                     upvals,
-                    cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
-                    cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
-                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as usize,
+                    cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
+                    cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
+                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,
                     callee_fid: fid,
                     uninit_mask,
                     alias_params,

@@ -315,7 +315,7 @@ pub(crate) fn emit_captured_method_lane(
         ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
         ; mov r9, [rbx + dreg(callee)]          // captured callee bits
         ; mov DWORD [rsp + 32], packed as i32   // 5th arg: (argc << 8) | selector
-        ; mov rax, QWORD crate::vm::jit_captured_method as usize as i64
+        ; mov rax, QWORD crate::vm::jit_captured_method as *const () as usize as i64
         ; call rax
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
@@ -503,7 +503,7 @@ pub(crate) fn emit_inline_leaf_call(
                 // Diagnostic builds alone pay this call.  The marker is a
                 // runtime hit witness, not just an emission witness.
                 dynasm!(ops
-                    ; mov rax, QWORD note_inline_same_proto_guard_hit as usize as i64
+                    ; mov rax, QWORD note_inline_same_proto_guard_hit as *const () as usize as i64
                     ; call rax
                 );
             }

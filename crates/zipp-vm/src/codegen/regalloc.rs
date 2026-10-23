@@ -780,7 +780,7 @@ pub(crate) fn compile_region_regalloc(
                 ; mov rcx, rdi
                 ; mov rdx, rbx
                 ; mov r8, QWORD packed as i64
-                ; mov rax, QWORD crate::vm::jit_field_read_loop as usize as i64
+                ; mov rax, QWORD crate::vm::jit_field_read_loop as *const () as usize as i64
                 ; call rax
                 ; test rax, rax
                 ; je => fallback
