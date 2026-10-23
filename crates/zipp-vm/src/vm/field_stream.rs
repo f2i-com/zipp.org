@@ -110,6 +110,46 @@ struct FieldWriteLoop {
     name: u32,
 }
 
+/// One instruction of a region at a time, for the function-body recognizers
+/// below. `copy_of(r)` steps over a `Move` out of `r`: the copy a discarded
+/// assignment's or update's value leaves when the compiler keeps those copies
+/// (`ZIPP_KEEP_COPIES`; every build before it dropped them for code a JIT may
+/// compile), so each recognizer takes its loop with them or without. Nothing
+/// in these loops reads the copy, and the reduction never wrote it.
+struct RegionCursor<'a> {
+    code: &'a [Instr],
+    ip: usize,
+    end: usize,
+}
+
+impl RegionCursor<'_> {
+    fn next(&mut self) -> Option<Instr> {
+        if self.ip > self.end {
+            return None;
+        }
+        let instr = *self.code.get(self.ip)?;
+        self.ip += 1;
+        Some(instr)
+    }
+
+    fn copy_of(&mut self, r: u16) {
+        if self.ip <= self.end && matches!(self.code.get(self.ip), Some(Instr::Move { src, .. }) if *src == r) {
+            self.ip += 1;
+        }
+    }
+}
+
+/// Codegen's admission screen for the cyclic field-read reducer: this file's
+/// own recognizer, so the two cannot drift apart.
+pub(crate) fn field_cyclic_read_shape(proto: &crate::bytecode::FuncProto, start: usize, end: usize) -> bool {
+    recognize(proto, start, end).is_some()
+}
+
+/// Codegen's admission screen for the cyclic field-write reducer.
+pub(crate) fn field_cyclic_write_shape(proto: &crate::bytecode::FuncProto, start: usize, end: usize) -> bool {
+    recognize_write(proto, start, end).is_some()
+}
+
 /// Re-recognize the exact region shape at the FFI boundary.  Codegen performs
 /// the same screen before planting the call; doing it again here makes malformed
 /// metadata fail closed rather than turning an optimizer assumption into memory
@@ -119,41 +159,45 @@ fn recognize(
     start: usize,
     end: usize,
 ) -> Option<FieldReadLoop> {
-    if end.checked_sub(start)? != 16 || end + 1 >= proto.code.len() {
+    if end <= start || end + 1 >= proto.code.len() {
         return None;
     }
-    let c = &proto.code;
-    let (limit, limit_source) = match c[start] {
+    let mut c = RegionCursor {
+        code: &proto.code,
+        ip: start,
+        end,
+    };
+    let (limit, limit_source) = match c.next()? {
         Instr::LoadGlobal { dst, idx } => (dst, FieldLoopLimit::Global(idx)),
         Instr::UpvalGet { dst, idx } if (idx as usize) < proto.upvalues.len() => {
             (dst, FieldLoopLimit::Upval(idx))
         }
         _ => return None,
     };
-    let (i, exit) = match c[start + 1] {
+    let (i, exit) = match c.next()? {
         Instr::JumpIfNotLt { a, b, target } if b == limit => (a, target),
         _ => return None,
     };
     if exit as usize != end + 1 {
         return None;
     }
-    let (elem, array, k) = match c[start + 2] {
+    let (elem, array, k) = match c.next()? {
         Instr::GetIndex { dst, obj, key } => (dst, obj, key),
         _ => return None,
     };
-    let (field, name) = match c[start + 3] {
+    let (field, name) = match c.next()? {
         Instr::GetProp { dst, obj, name } if obj == elem => (dst, name),
         _ => return None,
     };
-    let (add, sum) = match c[start + 4] {
+    let (add, sum) = match c.next()? {
         Instr::Add { dst, a, b } if b == field => (dst, a),
         _ => return None,
     };
-    let zero = match c[start + 5] {
+    let zero = match c.next()? {
         Instr::LoadInt { dst, val: 0 } => dst,
         _ => return None,
     };
-    match c[start + 6] {
+    match c.next()? {
         Instr::Bitwise {
             dst,
             a,
@@ -162,10 +206,8 @@ fn recognize(
         } if dst == sum && a == add && b == zero => {}
         _ => return None,
     }
-    if !matches!(c[start + 7], Instr::Move { src, .. } if src == sum) {
-        return None;
-    }
-    match c[start + 8] {
+    c.copy_of(sum);
+    match c.next()? {
         Instr::AddInt {
             dst,
             a,
@@ -174,25 +216,24 @@ fn recognize(
         } if dst == k && a == k => {}
         _ => return None,
     }
-    if !matches!(c[start + 9], Instr::Move { src, .. } if src == k) {
-        return None;
-    }
-    let (flag, n) = match c[start + 10] {
+    c.copy_of(k);
+    let (flag, n) = match c.next()? {
         Instr::Eq { dst, a, b } if a == k => (dst, b),
         _ => return None,
     };
-    match c[start + 11] {
-        Instr::JumpIfFalse { cond, target } if cond == flag && target as usize == start + 14 => {}
+    let past_wrap = match c.next()? {
+        Instr::JumpIfFalse { cond, target } if cond == flag => target as usize,
         _ => return None,
-    }
-    match c[start + 12] {
+    };
+    match c.next()? {
         Instr::LoadInt { dst, val: 0 } if dst == k => {}
         _ => return None,
     }
-    if !matches!(c[start + 13], Instr::Move { src, .. } if src == k) {
+    c.copy_of(k);
+    if c.ip != past_wrap {
         return None;
     }
-    match c[start + 14] {
+    match c.next()? {
         Instr::AddInt {
             dst,
             a,
@@ -201,10 +242,11 @@ fn recognize(
         } if dst == i && a == i => {}
         _ => return None,
     }
-    if !matches!(c[start + 15], Instr::Move { src, .. } if src == i) {
+    c.copy_of(i);
+    if c.ip != end || limit == sum || n == sum {
         return None;
     }
-    if !matches!(c[start + 16], Instr::Jump { target } if target as usize == start) {
+    if !matches!(c.next()?, Instr::Jump { target } if target as usize == start) {
         return None;
     }
     Some(FieldReadLoop {
@@ -611,33 +653,38 @@ fn recognize_write(
     start: usize,
     end: usize,
 ) -> Option<FieldWriteLoop> {
-    if end.checked_sub(start)? != 13 || end + 1 >= proto.code.len() {
+    if end <= start || end + 1 >= proto.code.len() {
         return None;
     }
-    let c = &proto.code;
-    let (limit, limit_source) = match c[start] {
+    let mut c = RegionCursor {
+        code: &proto.code,
+        ip: start,
+        end,
+    };
+    let (limit, limit_source) = match c.next()? {
         Instr::LoadGlobal { dst, idx } => (dst, FieldLoopLimit::Global(idx)),
         Instr::UpvalGet { dst, idx } if (idx as usize) < proto.upvalues.len() => {
             (dst, FieldLoopLimit::Upval(idx))
         }
         _ => return None,
     };
-    let (i, exit) = match c[start + 1] {
+    let (i, exit) = match c.next()? {
         Instr::JumpIfNotLt { a, b, target } if b == limit => (a, target),
         _ => return None,
     };
     if exit as usize != end + 1 {
         return None;
     }
-    let (receiver, array, k) = match c[start + 2] {
+    let (receiver, array, k) = match c.next()? {
         Instr::GetIndex { dst, obj, key } => (dst, obj, key),
         _ => return None,
     };
-    let value = match c[start + 3] {
+    // The stored value's own register: a real copy, not a discarded one.
+    let value = match c.next()? {
         Instr::Move { dst, src } if src == i => dst,
         _ => return None,
     };
-    let name = match c[start + 4] {
+    let name = match c.next()? {
         Instr::SetProp {
             obj,
             name,
@@ -646,7 +693,7 @@ fn recognize_write(
         } if obj == receiver && val == value => name,
         _ => return None,
     };
-    match c[start + 5] {
+    match c.next()? {
         Instr::AddInt {
             dst,
             a,
@@ -655,25 +702,24 @@ fn recognize_write(
         } if dst == k && a == k => {}
         _ => return None,
     }
-    if !matches!(c[start + 6], Instr::Move { src, .. } if src == k) {
-        return None;
-    }
-    let (flag, n) = match c[start + 7] {
+    c.copy_of(k);
+    let (flag, n) = match c.next()? {
         Instr::Eq { dst, a, b } if a == k => (dst, b),
         _ => return None,
     };
-    match c[start + 8] {
-        Instr::JumpIfFalse { cond, target } if cond == flag && target as usize == start + 11 => {}
+    let past_wrap = match c.next()? {
+        Instr::JumpIfFalse { cond, target } if cond == flag => target as usize,
         _ => return None,
-    }
-    match c[start + 9] {
+    };
+    match c.next()? {
         Instr::LoadInt { dst, val: 0 } if dst == k => {}
         _ => return None,
     }
-    if !matches!(c[start + 10], Instr::Move { src, .. } if src == k) {
+    c.copy_of(k);
+    if c.ip != past_wrap {
         return None;
     }
-    match c[start + 11] {
+    match c.next()? {
         Instr::AddInt {
             dst,
             a,
@@ -682,9 +728,11 @@ fn recognize_write(
         } if dst == i && a == i => {}
         _ => return None,
     }
-    if !matches!(c[start + 12], Instr::Move { src, .. } if src == i)
-        || !matches!(c[start + 13], Instr::Jump { target } if target as usize == start)
-    {
+    c.copy_of(i);
+    if c.ip != end || limit == i || n == i {
+        return None;
+    }
+    if !matches!(c.next()?, Instr::Jump { target } if target as usize == start) {
         return None;
     }
     Some(FieldWriteLoop {

@@ -174,55 +174,12 @@ fn field_mixed_stream_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
 }
 
-/// Codegen-side copy of `vm::field_stream`'s exact bytecode recognition.  This
-/// is only an admission filter: the FFI helper repeats every structural and
-/// runtime guard before committing a write, and a miss falls through to the
-/// unchanged MEM region.
+/// The helper's own bytecode screen (`vm::field_stream`), as an admission
+/// filter only: the FFI helper repeats every structural and runtime guard
+/// before committing a write, and a miss falls through to the unchanged MEM
+/// region.
 fn field_write_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
-    if end.checked_sub(start) != Some(13) || end + 1 >= proto.code.len() {
-        return false;
-    }
-    let c = &proto.code;
-    let limit = match &c[start] {
-        Instr::LoadGlobal { dst, .. } => *dst,
-        Instr::UpvalGet { dst, idx } if (*idx as usize) < proto.upvalues.len() => *dst,
-        _ => return false,
-    };
-    let i = match &c[start + 1] {
-        Instr::JumpIfNotLt { a, b, target } if *b == limit && *target as usize == end + 1 => *a,
-        _ => return false,
-    };
-    let (receiver, k) = match &c[start + 2] {
-        Instr::GetIndex { dst, key, .. } => (*dst, *key),
-        _ => return false,
-    };
-    let value = match &c[start + 3] {
-        Instr::Move { dst, src } if *src == i => *dst,
-        _ => return false,
-    };
-    if !matches!(&c[start + 4],
-        Instr::SetProp { obj, val, strict: false, .. }
-            if *obj == receiver && *val == value)
-        || !matches!(&c[start + 5],
-            Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == k && *a == k)
-        || !matches!(&c[start + 6], Instr::Move { src, .. } if *src == k)
-    {
-        return false;
-    }
-    let (flag, n) = match &c[start + 7] {
-        Instr::Eq { dst, a, b } if *a == k => (*dst, *b),
-        _ => return false,
-    };
-    matches!(&c[start + 8], Instr::JumpIfFalse { cond, target }
-            if *cond == flag && *target as usize == start + 11)
-        && matches!(&c[start + 9], Instr::LoadInt { dst, val: 0 } if *dst == k)
-        && matches!(&c[start + 10], Instr::Move { src, .. } if *src == k)
-        && matches!(&c[start + 11],
-            Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == i && *a == i)
-        && matches!(&c[start + 12], Instr::Move { src, .. } if *src == i)
-        && matches!(&c[start + 13], Instr::Jump { target } if *target as usize == start)
-        && limit != i
-        && n != i
+    crate::vm::field_cyclic_write_shape(proto, start, end)
 }
 
 /// Cheap admission copy for the exact global cyclic read/write reducer.  The

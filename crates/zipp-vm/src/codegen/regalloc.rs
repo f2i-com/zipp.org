@@ -15,67 +15,12 @@ fn field_sum_stream_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none()
 }
 
-/// Codegen-side copy of the helper's exact bytecode screen.  Returning false
-/// merely omits the prefix; the helper repeats the full recognition before it
-/// can commit, so this function is a profitability/admission filter, never a
-/// correctness assumption.
+/// The helper's own bytecode screen (`vm::field_stream`), as an admission
+/// filter: returning false merely omits the prefix, and the helper repeats the
+/// full recognition before it can commit. One recognizer, so the loop with or
+/// without its discarded copies is the same loop on both sides.
 pub(crate) fn field_cyclic_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
-    use crate::bytecode::BitwiseOp;
-    if end.checked_sub(start) != Some(16) || end + 1 >= proto.code.len() {
-        return false;
-    }
-    let c = &proto.code;
-    let limit = match &c[start] {
-        Instr::LoadGlobal { dst, .. } => *dst,
-        Instr::UpvalGet { dst, idx } if (*idx as usize) < proto.upvalues.len() => *dst,
-        _ => return false,
-    };
-    let i = match &c[start + 1] {
-        Instr::JumpIfNotLt { a, b, target } if *b == limit && *target as usize == end + 1 => *a,
-        _ => return false,
-    };
-    let (elem, k) = match &c[start + 2] {
-        Instr::GetIndex { dst, key, .. } => (*dst, *key),
-        _ => return false,
-    };
-    let (field, sum) = match (&c[start + 3], &c[start + 4]) {
-        (
-            Instr::GetProp {
-                dst: field, obj, ..
-            },
-            Instr::Add {
-                dst: add,
-                a: sum,
-                b,
-            },
-        ) if *obj == elem && b == field => (*add, *sum),
-        _ => return false,
-    };
-    let zero = match &c[start + 5] {
-        Instr::LoadInt { dst, val: 0 } => *dst,
-        _ => return false,
-    };
-    if !matches!(&c[start + 6], Instr::Bitwise { dst, a, b, op: BitwiseOp::Or }
-        if *dst == sum && *a == field && *b == zero)
-        || !matches!(&c[start + 7], Instr::Move { src, .. } if *src == sum)
-        || !matches!(&c[start + 8], Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == k && *a == k)
-        || !matches!(&c[start + 9], Instr::Move { src, .. } if *src == k)
-    {
-        return false;
-    }
-    let (flag, n) = match &c[start + 10] {
-        Instr::Eq { dst, a, b } if *a == k => (*dst, *b),
-        _ => return false,
-    };
-    matches!(&c[start + 11], Instr::JumpIfFalse { cond, target }
-            if *cond == flag && *target as usize == start + 14)
-        && matches!(&c[start + 12], Instr::LoadInt { dst, val: 0 } if *dst == k)
-        && matches!(&c[start + 13], Instr::Move { src, .. } if *src == k)
-        && matches!(&c[start + 14], Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == i && *a == i)
-        && matches!(&c[start + 15], Instr::Move { src, .. } if *src == i)
-        && matches!(&c[start + 16], Instr::Jump { target } if *target as usize == start)
-        && limit != sum
-        && n != sum
+    crate::vm::field_cyclic_read_shape(proto, start, end)
 }
 
 /// Script-body sibling: `sum = (sum + objects[i & mask].field) | 0` with a

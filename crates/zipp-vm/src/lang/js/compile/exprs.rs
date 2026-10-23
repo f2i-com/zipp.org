@@ -32,18 +32,21 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
     }
 }
 
-/// Whether the code being compiled can only ever be interpreted: a build
-/// without the JIT. Such code can drop the copies the JIT's pattern matchers
-/// expect (`expr_discarded`).
+/// Whether a discarded assignment or update of a register local leaves its
+/// value's copy out (`expr_discarded`). Every build, with or without the JIT,
+/// and whether or not the JIT runs: the bytecode must not depend on that, or
+/// a metered VM stops at another step and heap figure with the JIT off than
+/// on (str_append_index's
+/// `reserved_first_builder_tiny_heap_boundary_matches_all_modes`).
 ///
-/// Not a process run with `ZIPP_NOJIT`: the bytecode a JIT build compiles
-/// must not depend on whether its JIT runs, or a metered VM stops at another
-/// step and heap figure with the JIT off than on (str_append_index's
-/// `reserved_first_builder_tiny_heap_boundary_matches_all_modes`, in CI's
-/// workspace lane, where `instrument` and the JIT meet). Dropping the copies
-/// under `ZIPP_NOJIT` had bought 4% of the interpreter's real and hostile
-/// suites; an interpreter-only rewrite belongs in `FusedCode`, which keeps
-/// the bytecode's length and positions.
+/// Builds with the JIT kept the copies until the JIT's exact loop
+/// recognizers (`vm::field_stream`) took the loop either way, and the
+/// register tier's identity-thrash eviction stopped marking a site direct-
+/// miss (`Jit::direct_miss_gate`): one copy reusing a temporary had kept
+/// such loops off a tier that served them badly. One binary, copies dropped
+/// against kept: the interpreter's 51 rows 1.8% faster (types-stable 10%,
+/// types-churn, calls-baseline and dataview-binary 6%), the JIT's 1.1%.
+/// `ZIPP_KEEP_COPIES=1` keeps them, for A/B.
 pub(crate) fn interp_only_bytecode() -> bool {
     if cfg!(not(feature = "jit")) {
         return true;
@@ -303,15 +306,13 @@ impl<'a> FnCompiler<'a> {
     /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
     /// `i++` over `++i` in a position where the two cannot be told apart.
     ///
-    /// The other, for code only the interpreter will run: an update or an
-    /// assignment of a plain register local computes in the local's own
-    /// register, and what it then hands back is a copy of that register into
-    /// the result. Nobody reads a discarded result, so the local is named as
-    /// the result and the copy is never emitted. `s += i` and `i++` as
-    /// statements were two dead `Move`s in a six-instruction loop: a third of
-    /// what the interpreter dispatched. The JIT's planners and stream
-    /// recognisers match the compiler's exact output, copies included, so code
-    /// a JIT may compile keeps it ([`interp_only_bytecode`]).
+    /// The other: an update or an assignment of a plain register local
+    /// computes in the local's own register, and what it then hands back is a
+    /// copy of that register into the result. Nobody reads a discarded result,
+    /// so the local is named as the result and the copy is never emitted.
+    /// `s += i` and `i++` as statements were two dead `Move`s in a six-
+    /// instruction loop: a third of what the interpreter dispatched. Every
+    /// build drops them, `ZIPP_KEEP_COPIES` aside ([`interp_only_bytecode`]).
     pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
         if interp_only_bytecode() {
             match e {

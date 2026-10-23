@@ -5520,6 +5520,30 @@ impl Jit {
         {
             return DirectMissGate::Probe;
         }
+        // A BOXREF region's probe is identity-keyed: identities thrash there
+        // where the memory tier's probe, which the region would otherwise
+        // have, serves the receivers from shape memos. Send the recompile to
+        // that tier (as a deopt eviction does, `region_boxref_blacklist`)
+        // without marking the site: marked, the memory tier would call the
+        // miss helper on every access too. Rebuilt on the register path, a
+        // loop reading one property of eight objects ran 7x slower
+        // (polymorphic-objects-v2), of a thousand 11x (property-ic-shapes).
+        if m.region_entry != u32::MAX && self.regions.get(&owner).is_some_and(|r| r.is_boxref) {
+            if let Some(r) = self.regions.remove(&owner) {
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] EVICTED (BOXREF identity thrash, ip {})",
+                        owner.0, owner.1, m.op_ip
+                    );
+                }
+                self.region_boxref_blacklist.insert(owner);
+                *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
+                self.note_reg_region_removed(owner.0, &r);
+                self.retired.push(r);
+                self.region_counts.remove(&owner);
+            }
+            return DirectMissGate::Recompile;
+        }
         // Already marked: a recompile will emit the direct form. Until then
         // (a retired artifact still running, say) each miss asks again, and
         // the sibling scan below walks every IC site of the program.
