@@ -371,7 +371,14 @@ export class Engine {
         return this;
     }
     /**
-     * Lines the preamble prepends to the host's source.
+     * Lines a host still has to subtract from the positions this engine
+     * reports: 0. An error's `stack` and a syntax error from `initScript`
+     * count lines and columns from the host's own source (shifted by
+     * `setScriptOrigin`'s offsets, if it set any), and name a frame of the
+     * engine's preamble `zipp:preamble`. Up to 0.0.28 positions were those
+     * of the preamble and the source together, and this was the preamble's
+     * line count, one short of the true shift; it is 0 now so that a host
+     * that subtracts it stays right.
      * @returns {number}
      */
     get preambleLines() {
@@ -480,11 +487,10 @@ export class Engine {
      * - `dynamicCodeCalls`, `dynamicCodeSourceBytes`: every dynamic
      *   compilation attempt (`eval`, `Function`, `ShadowRealm`, host eval)
      *   and the source bytes charged;
-     * - `retainedFunctions`, `retainedClasses`: stable-address definitions
-     *   retained by successful dynamic compilations — the figure
-     *   `dispose()` does NOT reclaim within one WASM instance, so a host
-     *   recycles the Worker/WASM instance when their sum across tenants
-     *   passes what it accepts;
+     * - `retainedFunctions`, `retainedClasses`: the stable-address
+     *   definitions this engine's successful dynamic compilations installed,
+     *   which it keeps for its life and `dispose()` frees with it (they
+     *   then count in `zippInstanceUsage`'s `disposedDynamic*` totals);
      * - `retainedFunctionBytes`, `retainedClassBytes`: the bytes those
      *   definitions own (the definition, its bytecode, constants, tables
      *   and retained source) — owned bytes, not the allocator's
@@ -683,6 +689,28 @@ export class Engine {
         }
     }
     /**
+     * Name the script `initScript` compiles, and offset the positions its
+     * errors report, as Node's `vm.Script` options `filename`, `lineOffset`
+     * and `columnOffset` do. Frames then read `at f (name:line:col)`, and a
+     * syntax error `SyntaxError: ...\n    at name:line:col`; without a name
+     * they say `<anonymous>`. `lineOffset` is added to every line and
+     * `columnOffset` to the columns of the first line, so a host that put
+     * lines of its own ahead of the code it was given passes minus their
+     * count; a position the offsets move before line 1 or column 1 is
+     * reported without one. Call it before `initScript`.
+     * @param {string | null} [name]
+     * @param {number | null} [line_offset]
+     * @param {number | null} [column_offset]
+     */
+    setScriptOrigin(name, line_offset, column_offset) {
+        var ptr0 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        const ret = wasm.engine_setScriptOrigin(this.__wbg_ptr, ptr0, len0, !isLikeNone(line_offset), isLikeNone(line_offset) ? 0 : line_offset, !isLikeNone(column_offset), isLikeNone(column_offset) ? 0 : column_offset);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * Replace the exact allowlist for synchronous guest-to-host operations.
      * The list is fixed before initialization so guest execution cannot race
      * or influence a later authority upgrade. Unknown operation names reject
@@ -866,18 +894,28 @@ export function pythonPackages() {
 }
 
 /**
- * What this WASM instance has accumulated over every engine it has disposed
- * so far, as JSON-shaped data: `enginesCreated`, `enginesDisposed`, and the
- * disposed engines' summed `retainedFunctions`, `retainedClasses`,
- * `dynamicCodeCalls` and `dynamicCodeSourceBytes`. An engine's compiled
- * preamble-plus-guest program is freed with the engine since B306 stage two
- * (the state owns it; nothing is leaked); the stable-address definitions
- * that successful dynamic compilations install are what still survive
- * `dispose()`. When their total passes
- * what a host accepts, the host recycles the Worker/WASM instance, which is
- * the only reclamation this artifact offers (the 11 September 2026 audit's
- * ZIPP-06, stage 1: measure before reclaiming). Live engines are not
- * included; read each one's `resourceUsage()`.
+ * Running totals for this WASM instance, as JSON-shaped data:
+ *
+ * - `enginesCreated`, `enginesDisposed`, and `enginesLive` (the difference:
+ *   engines not yet disposed);
+ * - over the disposed engines, the dynamic code they compiled (`eval`,
+ *   `new Function`, class expressions in either):
+ *   `disposedDynamicFunctions`, `disposedDynamicClasses`,
+ *   `disposedDynamicFunctionBytes`, `disposedDynamicClassBytes`, and the
+ *   compilation work, `dynamicCodeCalls` and `dynamicCodeSourceBytes`.
+ *
+ * Every figure only grows. None of it is memory the instance still holds:
+ * an engine's program and its dynamic code are owned by its state and freed
+ * by `dispose()` (B306 stage two; the eval arena, #53), and the instance's
+ * allocator reuses that memory. A WASM instance's linear memory never
+ * shrinks, so its high-water mark (`memory.buffer.byteLength`) is the figure
+ * a fresh instance resets; these counters are not a reason to recycle one.
+ *
+ * `retainedFunctions`, `retainedClasses`, `retainedFunctionBytes` and
+ * `retainedClassBytes` are deprecated names for the four `disposedDynamic*`
+ * totals, with the same values: they were documented as definitions that
+ * outlive `dispose()`, which they have not done since #53. Live engines are
+ * not included; read each one's `resourceUsage()`.
  * @returns {any}
  */
 export function zippInstanceUsage() {
@@ -1055,7 +1093,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_8c60ada374b6fd21: function() { return handleError(function (arg0) {
+        __wbg_isArray_f4b386a82fe8d40f: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -1063,7 +1101,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_04160e53f65f8d3b: function() { return handleError(function (arg0) {
+        __wbg_keys_1e7140a89138576b: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -1083,14 +1121,14 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_5c9346200e0d7511: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
         },
+        __wbg_new_f2c6d56274c29f44: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
@@ -1152,7 +1190,7 @@ function __wbg_get_imports() {
             const ret = JSON.stringify(arg0);
             return ret;
         }, arguments); },
-        __wbg_zippTorchKernel_fc37bf5a2c235406: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+        __wbg_zippTorchKernel_78320425e29bddc2: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg1.zippTorchKernel(getArrayU8FromWasm0(arg2, arg3));
             var ptr1 = isLikeNone(ret) ? 0 : passArray8ToWasm0(ret, wasm.__wbindgen_malloc);
             var len1 = WASM_VECTOR_LEN;

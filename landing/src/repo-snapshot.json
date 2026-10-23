@@ -1,25 +1,31 @@
 {
-  "generated_at": "2026-10-21T19:50:58.149Z",
+  "generated_at": "2026-10-23T02:25:24.654Z",
   "stale": false,
   "source": {
     "repo": "f2i-com/zipp.org",
     "branch": "main",
-    "commit": "da0fe6b1bdf9472238827368d7fe5b96dfc8db8a"
+    "commit": "58c92a59b991b29f80fc7aa5d0d91e9dc119b17a"
   },
   "repo": {
     "stars": 7,
     "forks": 0,
     "open_issues": 0,
-    "pushed_at": "2026-10-21T18:40:00Z",
+    "pushed_at": "2026-10-23T01:50:23Z",
     "license": "Apache-2.0"
   },
   "release": {
-    "tag": "v0.0.28",
-    "name": "ZIPP v0.0.28",
-    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.28",
-    "published_at": "2026-10-21T19:00:19Z"
+    "tag": "v0.0.29",
+    "name": "ZIPP v0.0.29",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.29",
+    "published_at": "2026-10-23T02:13:06Z"
   },
   "releases": [
+    {
+      "tag": "v0.0.29",
+      "name": "ZIPP v0.0.29",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.29",
+      "published_at": "2026-10-23T02:13:06Z"
+    },
     {
       "tag": "v0.0.28",
       "name": "ZIPP v0.0.28",
@@ -31,23 +37,17 @@
       "name": "ZIPP v0.0.27",
       "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.27",
       "published_at": "2026-10-18T12:09:51Z"
-    },
-    {
-      "tag": "v0.0.26",
-      "name": "ZIPP v0.0.26",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.26",
-      "published_at": "2026-10-18T03:28:50Z"
     }
   ],
   "commits": {
     "latest": {
-      "sha": "da0fe6b1bdf9472238827368d7fe5b96dfc8db8a",
-      "message": "Prepare 0.0.28 [skip ci]",
-      "date": "2026-10-21T18:20:53Z",
-      "url": "https://github.com/f2i-com/zipp.org/commit/da0fe6b1bdf9472238827368d7fe5b96dfc8db8a"
+      "sha": "58c92a59b991b29f80fc7aa5d0d91e9dc119b17a",
+      "message": "Name the heap-ceiling fix in the 0.0.29 notes [skip ci]",
+      "date": "2026-10-23T01:50:09Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/58c92a59b991b29f80fc7aa5d0d91e9dc119b17a"
     }
   },
-  "version": "0.0.28",
+  "version": "0.0.29",
   "readme": {
     "test262_pct": 99.999,
     "test262_pass": 96229,
