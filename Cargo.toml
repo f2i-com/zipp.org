@@ -28,7 +28,7 @@ members = [
 exclude = ["crates/zipp-sandbox", "crates/zipp-wasm"]
 
 [workspace.package]
-version = "0.0.28"
+version = "0.0.29"
 edition = "2021"
 license = "Apache-2.0"
 
