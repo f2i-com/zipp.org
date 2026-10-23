@@ -349,6 +349,8 @@ impl Vm<'_> {
     #[cold]
     #[inline(never)]
     fn gc_from_poll(&mut self) {
+        #[cfg(feature = "instrument")]
+        let majors = self.heap.majors_done();
         self.gc();
         // Re-check the heap ceiling here, where the schedule is denominated in
         // BYTES, not just on the dispatch loop's instruction stride.
@@ -371,13 +373,14 @@ impl Vm<'_> {
         // cold.
         //
         // Running it AFTER the collection is what keeps it honest: only memory
-        // that survived a major counts, so churn is not mistaken for growth.
+        // that survived a major counts, so churn is not mistaken for growth
+        // (after a minor the poll asks for that major rather than deciding).
         // The poll latches sticky exhaustion via `Recorder::exhaust`, which the
         // next `instrument_step` reports through the terminal-message check it
         // already performs — hence discarding the result rather than plumbing a
         // `Result` return through every `maybe_gc` caller.
         #[cfg(feature = "instrument")]
-        let _ = self.instrument_heap_poll_after_gc();
+        let _ = self.instrument_heap_poll_after_gc(self.heap.majors_done() != majors);
     }
 
     /// Stage-3 write barrier + B6 oracle, one latched call per store

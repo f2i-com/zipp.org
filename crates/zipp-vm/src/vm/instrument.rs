@@ -2317,20 +2317,29 @@ impl super::Vm<'_> {
     /// The one case the cheap figure cannot see is a heap whose payload
     /// accounting has never been switched on — it is enabled lazily, by the
     /// first walk — so force a reconcile while that is still true.
+    ///
+    /// Only a major decides at once (`after_major`). A minor sweeps the young
+    /// generation alone, so a heap it leaves over the ceiling may still be
+    /// holding old garbage: it asks for a major, as the stride poll does.
+    /// Deciding after every collection convicted a script whose earlier
+    /// phases had died old (thirty thousand objects a phase, dropped one
+    /// phase after another under a 24 MiB ceiling) on a minor's figure.
     #[cold]
     #[inline(never)]
-    pub(crate) fn instrument_heap_poll_after_gc(&mut self) -> Tick {
+    pub(crate) fn instrument_heap_poll_after_gc(&mut self, after_major: bool) -> Tick {
         // A collection the footprint asked for: what grew may have grown in
         // place, which only the walk can add to the figure.
         if self.heap.take_growth_walk_due() {
             self.instrument_mark_external_heap_growth();
         }
-        // A conviction that waited for this collection is decided now.
-        if let Some(rec) = rec_mut!(self) {
-            rec.ceiling_gc_pending = false;
+        // A conviction that waited for this major is decided now.
+        if after_major {
+            if let Some(rec) = rec_mut!(self) {
+                rec.ceiling_gc_pending = false;
+            }
         }
         let force = !self.heap.payload_accounting_enabled();
-        self.instrument_heap_poll_inner(u32::from(force), false)
+        self.instrument_heap_poll_inner(u32::from(force), !after_major)
     }
 
     ///

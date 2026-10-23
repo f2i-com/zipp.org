@@ -9363,6 +9363,16 @@ impl Heap {
     /// reserve a small exact step instead. The tables still grow, the estimate
     /// crosses the ceiling on the next poll, and the guest gets its RangeError
     /// with the module intact. A heap with no ceiling never enters this path.
+    ///
+    /// The step is taken, and a major asked for, once doubling would bring the
+    /// estimate within a quarter of the ceiling. The slots may be full of
+    /// garbage the schedule has not reached (it lets the heap double what the
+    /// last major found alive): the major frees them for reuse before the
+    /// tables are sized for garbage, which they would hold, and be charged
+    /// for, for the rest of the run. Doubling to just under the ceiling left a
+    /// script thirty thousand objects a phase convicted at 24 MiB with a third
+    /// of that alive: 18 MB of the 25.6 its tables, at twice the slots it
+    /// needed.
     #[cold]
     #[inline(never)]
     fn reserve_slot_growth(&mut self) {
@@ -9372,9 +9382,11 @@ impl Heap {
         }
         let cap = self.objs.capacity();
         let doubled = cap.max(4).saturating_mul(self.slot_table_bytes_per_entry());
-        if self.resident_bytes().saturating_add(doubled) <= ceiling {
+        if self.resident_bytes().saturating_add(doubled) <= ceiling - ceiling / 4 {
             return;
         }
+        self.major_due = true;
+        self.gc_requested = true;
         let step = (cap / 16).max(1024);
         self.objs.reserve_exact(step);
         self.resident_payload_charged.reserve_exact(step);
