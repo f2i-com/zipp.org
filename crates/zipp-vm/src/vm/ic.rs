@@ -376,6 +376,12 @@ pub(crate) struct MiSuperResolved {
 
 /// Per-site cache: up to [`IC_WAYS`] entries, a fill-failure counter, and a
 /// round-robin eviction cursor.
+///
+/// `repr(C)` keeps the counters in FRONT of the ways. Left to the compiler
+/// they sat after all eight (`n` at byte 577), so every hit, which tests `n`
+/// and reads way 0, touched two cache lines of a 584-byte site: a fifth of
+/// the own-property hit's samples in Babel were that `n` load.
+#[repr(C)]
 pub(crate) struct SiteIc {
     pub(crate) misses: u8,
     pub(crate) n: u8,
