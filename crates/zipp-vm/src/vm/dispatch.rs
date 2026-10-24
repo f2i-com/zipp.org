@@ -2820,7 +2820,7 @@ impl<'p> Vm<'p> {
                                             .and_then(|f| self.site_ics.get(f))
                                             .and_then(|x| x.as_ref())
                                             .and_then(|slots| slots.get(s + off))
-                                            .and_then(|x| x.as_deref());
+                                            .and_then(|x| x.site.as_deref());
                                         if let Some(site) = site {
                                             if site.n == 0 && site.misses >= 4 {
                                                 fallback += 1;

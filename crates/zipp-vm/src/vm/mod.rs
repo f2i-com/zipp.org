@@ -1654,7 +1654,7 @@ pub struct Vm<'p> {
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
     /// guard model; intentionally NOT a GC root (entries are validated or
     /// re-read against live, guard-checked objects before any use).
-    site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
+    site_ics: Vec<Option<Box<[ic::SiteCell]>>>,
     /// The Python runtime's registry (`vm::py_rt`), once it bound itself.
     #[cfg(feature = "python")]
     py_rt: Option<Box<py_rt::PyRt>>,

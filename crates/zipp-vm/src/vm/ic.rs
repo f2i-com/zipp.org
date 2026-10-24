@@ -389,6 +389,48 @@ pub(crate) struct SiteIc {
     pub(crate) entries: [IcEntry; IC_WAYS],
 }
 
+/// One instruction's cell in its function's cache table: the site, once it
+/// has one, and beside it the last own-data answer the instruction found for
+/// its key — `(shape, slot)`, `own_shape` [`crate::shape::DICT`] for none.
+///
+/// A property read's commonest hit is an own data property of a shaped
+/// receiver, and a shape fixes its keys and their attributes for the VM's
+/// life, so that pair answers every receiver of the shape whatever the
+/// site's ways now hold. Held in the cell, a hit reads the table entry it
+/// had to read anyway and not the 584-byte site behind it (a fifth of the
+/// own-property hit's samples in Babel were the site's line), and a site
+/// whose first way was filled for a layout it no longer sees still hits.
+///
+/// [`SiteCell::WRITE_PROVEN`] in `own_slot` marks a pair a WRITE proved
+/// writable data (`ic_set_prop`'s fill); a write's hit needs that mark, a
+/// read's takes either.
+#[derive(Default)]
+pub(crate) struct SiteCell {
+    pub(crate) site: Option<Box<SiteIc>>,
+    own_shape: u32,
+    own_slot: u32,
+}
+
+impl SiteCell {
+    const WRITE_PROVEN: u32 = 1 << 31;
+
+    /// The slot of the key in a receiver of `shape`, if the cell knows it.
+    /// (The safe profile has no inline hits to ask.)
+    #[inline(always)]
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn own_read(&self, shape: u32) -> Option<u32> {
+        (self.own_shape == shape).then_some(self.own_slot & !Self::WRITE_PROVEN)
+    }
+
+    /// The slot a write of the key may store to in a receiver of `shape`.
+    #[inline(always)]
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn own_write(&self, shape: u32) -> Option<u32> {
+        (self.own_shape == shape && self.own_slot & Self::WRITE_PROVEN != 0)
+            .then_some(self.own_slot & !Self::WRITE_PROVEN)
+    }
+}
+
 /// Resolved action for a plain `Call` IC hit/fill. The meter-only build carries
 /// one cached specialization witness; other builds retain the same two-u32
 /// result shape as the former tuple.
@@ -615,7 +657,34 @@ impl<'p> Vm<'p> {
         if !self.ic_func_eligible(func_id) {
             return None;
         }
-        self.site_ics.get(f)?.as_ref()?.get(ip)?.as_deref()
+        self.site_ics.get(f)?.as_ref()?.get(ip)?.site.as_deref()
+    }
+
+    /// The table cell of `(func_id, ip)`, if its function has a table.
+    #[inline(always)]
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn ic_cell(&self, func_id: u32, ip: usize) -> Option<&SiteCell> {
+        self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)
+    }
+
+    /// Remember that the key of the property instruction at `(func_id, ip)`
+    /// is the data property in `slot` of a receiver of `shape` (writable,
+    /// with `write_proven`). A table that does not exist yet is not made for
+    /// it: the instruction's first fill makes one.
+    #[inline]
+    fn ic_cell_own(&mut self, func_id: u32, ip: usize, shape: u32, slot: usize, write_proven: bool) {
+        if shape == crate::shape::DICT || slot >= SiteCell::WRITE_PROVEN as usize {
+            return;
+        }
+        if let Some(cell) = self
+            .site_ics
+            .get_mut(func_id as usize)
+            .and_then(Option::as_mut)
+            .and_then(|table| table.get_mut(ip))
+        {
+            cell.own_shape = shape;
+            cell.own_slot = slot as u32 | if write_proven { SiteCell::WRITE_PROVEN } else { 0 };
+        }
     }
 
     /// Count a fill failure (or a full-set eviction) at a site, allocating the
@@ -638,7 +707,7 @@ impl<'p> Vm<'p> {
             .get_mut(func_id as usize)
             .and_then(Option::as_mut)
             .and_then(|table| table.get_mut(ip))
-            .and_then(Option::as_deref_mut)
+            .and_then(|cell| cell.site.as_deref_mut())
         else {
             return true;
         };
@@ -676,12 +745,10 @@ impl<'p> Vm<'p> {
             let site_new = ip < code_len
                 && self.site_ics[f]
                     .as_ref()
-                    .is_none_or(|table| table[ip].is_none());
+                    .is_none_or(|table| table[ip].site.is_none());
             let mut need = 0usize;
             if table_new {
-                need = need.saturating_add(
-                    code_len.saturating_mul(std::mem::size_of::<Option<Box<SiteIc>>>()),
-                );
+                need = need.saturating_add(code_len.saturating_mul(std::mem::size_of::<SiteCell>()));
             }
             if site_new {
                 need = need.saturating_add(std::mem::size_of::<SiteIc>());
@@ -696,11 +763,11 @@ impl<'p> Vm<'p> {
         }
         let slots = self.site_ics[f].get_or_insert_with(|| {
             let mut v = Vec::new();
-            v.resize_with(code_len, || None);
+            v.resize_with(code_len, SiteCell::default);
             v.into_boxed_slice()
         });
         let slot = slots.get_mut(ip)?;
-        Some(slot.get_or_insert_with(|| {
+        Some(slot.site.get_or_insert_with(|| {
             Box::new(SiteIc {
                 misses: 0,
                 n: 0,
@@ -1083,7 +1150,14 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        let cell = self.ic_cell(func_id, ip)?;
+        if let Some(slot) = cell.own_read(mir.shape) {
+            // SAFETY: the matching shape proves `vals` is the map's live value
+            // column and that it holds `slot` (the pair was recorded from a map
+            // of this shape, which has that many slots).
+            return Some(unsafe { *(mir.vals as *const Value).add(slot as usize) });
+        }
+        let site = cell.site.as_deref()?;
         if site.n == 0 {
             return None;
         }
@@ -1142,11 +1216,8 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     fn ic_private_set_tail(&mut self, func_id: u32, ip: usize, idx: u32, val: Value) -> bool {
         let Some(IcEntry::Private { head, brand, id, pos }) = self
-            .site_ics
-            .get(func_id as usize)
-            .and_then(|f| f.as_ref())
-            .and_then(|f| f.get(ip))
-            .and_then(|s| s.as_deref())
+            .ic_cell(func_id, ip)
+            .and_then(|c| c.site.as_deref())
             .map(|s| s.entries[0])
         else {
             return false;
@@ -1270,13 +1341,19 @@ impl<'p> Vm<'p> {
         if !self.ic_func_eligible(func_id) {
             return None;
         }
-        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        let cell = self.ic_cell(func_id, ip)?;
+        let sh = m.shape();
+        if sh != crate::shape::DICT {
+            if let Some(slot) = cell.own_read(sh) {
+                return Some(m.val_at(slot as usize));
+            }
+        }
+        let site = cell.site.as_deref()?;
         if site.n == 0 {
             return None;
         }
         match site.entries[0] {
             IcEntry::OwnData { shape, slot } => {
-                let sh = m.shape();
                 (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
             }
             IcEntry::Private { .. } => self.ic_get_way0_tail(idx, &site.entries[0], crate::shape::DICT),
@@ -1297,7 +1374,7 @@ impl<'p> Vm<'p> {
         if !self.ic_func_eligible(func_id) {
             return None;
         }
-        let site = self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)?.as_deref()?;
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
         if site.n == 0 {
             return None;
         }
@@ -1506,11 +1583,14 @@ impl<'p> Vm<'p> {
                     // training feedback for native property plans.
                     if let Some(slot) = own {
                         if self.interp_own_resolve_vm_is_interpreter() {
-                            return if m.attr_at(slot).accessor {
-                                self.ic_acc_get_from(m, slot)
-                            } else {
-                                GetAct::Value(m.val_at(slot))
-                            };
+                            if m.attr_at(slot).accessor {
+                                return self.ic_acc_get_from(m, slot);
+                            }
+                            // The cell's pair answers this layout's next read
+                            // inline (`ic_get_prop_own_hit`).
+                            let (v, sh) = (m.val_at(slot), m.shape());
+                            self.ic_cell_own(func_id, ip, sh, slot, false);
+                            return GetAct::Value(v);
                         }
                     }
                     for e in &site.entries[..site.n as usize] {
@@ -1586,6 +1666,7 @@ impl<'p> Vm<'p> {
                         slot: slot as u32,
                     },
                 );
+                self.ic_cell_own(func_id, ip, shape, slot, false);
                 GetAct::Value(v)
             }
             Walked::OwnAcc { slot } => {
@@ -1884,22 +1965,24 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let Some(site) = self
-            .site_ics
-            .get(func_id as usize)
-            .and_then(|f| f.as_ref())
-            .and_then(|f| f.get(ip))
-            .and_then(|s| s.as_deref())
-        else {
+        let Some(cell) = self.ic_cell(func_id, ip) else {
             return false;
         };
-        if site.n == 0 {
-            return false;
-        }
-        let slot = match site.entries[0] {
-            IcEntry::OwnData { shape: cached, slot } if cached == mir.shape => slot,
-            IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
-            _ => return false,
+        let slot = match cell.own_write(mir.shape) {
+            Some(slot) => slot,
+            None => {
+                let Some(site) = cell.site.as_deref() else {
+                    return false;
+                };
+                if site.n == 0 {
+                    return false;
+                }
+                match site.entries[0] {
+                    IcEntry::OwnData { shape: cached, slot } if cached == mir.shape => slot,
+                    IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
+                    _ => return false,
+                }
+            }
         };
         if val.is_heap() {
             self.heap.write_barrier_val(idx, val);
@@ -1928,27 +2011,30 @@ impl<'p> Vm<'p> {
         if !self.ic_func_eligible(func_id) {
             return false;
         }
-        let Some(site) = self
-            .site_ics
-            .get(func_id as usize)
-            .and_then(|f| f.as_ref())
-            .and_then(|f| f.get(ip))
-            .and_then(|s| s.as_deref())
-        else {
+        let Some(cell) = self.ic_cell(func_id, ip) else {
             return false;
-        };
-        if site.n == 0 {
-            return false;
-        }
-        let (cached, slot) = match site.entries[0] {
-            IcEntry::OwnData { shape, slot } => (shape, slot),
-            IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
-            _ => return false,
         };
         let sh = m.shape();
-        if sh == crate::shape::DICT || sh != cached {
-            return false;
-        }
+        let slot = match (sh != crate::shape::DICT).then(|| cell.own_write(sh)).flatten() {
+            Some(slot) => slot,
+            None => {
+                let Some(site) = cell.site.as_deref() else {
+                    return false;
+                };
+                if site.n == 0 {
+                    return false;
+                }
+                let (cached, slot) = match site.entries[0] {
+                    IcEntry::OwnData { shape, slot } => (shape, slot),
+                    IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
+                    _ => return false,
+                };
+                if sh == crate::shape::DICT || sh != cached {
+                    return false;
+                }
+                slot
+            }
+        };
         if val.is_heap() {
             self.heap.write_barrier_val(idx, val);
         }
@@ -1969,6 +2055,7 @@ impl<'p> Vm<'p> {
         val: Value,
     ) -> SetAct {
         let mut plan: Option<SetPlan> = None;
+        let mut own_rec: Option<(u32, u32)> = None;
         let mut disabled = false;
         if let Some(site) = self.ic_site(func_id, ip) {
             disabled = site.misses >= IC_MISS_LIMIT;
@@ -2015,6 +2102,11 @@ impl<'p> Vm<'p> {
                         let own = self.own_pos(m, key);
                         for e in &site.entries[..site.n as usize] {
                             if let Some(p) = self.ic_validate_set(e, idx, m, own) {
+                                // A later way's own-data write: the cell's pair
+                                // takes this layout's next one inline.
+                                if let (SetPlan::WriteOwn { slot, .. }, true) = (&p, m.shape_guardable()) {
+                                    own_rec = Some((shape, *slot));
+                                }
                                 plan = Some(p);
                                 break;
                             }
@@ -2022,6 +2114,9 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+        }
+        if let Some((sh, slot)) = own_rec {
+            self.ic_cell_own(func_id, ip, sh, slot as usize, true);
         }
         if let Some(p) = plan {
             return self.ic_apply_set(p, key, val);
@@ -2066,6 +2161,7 @@ impl<'p> Vm<'p> {
                                 slot: slot as u32,
                             },
                         );
+                        self.ic_cell_own(func_id, ip, shape, slot, true);
                         self.ic_apply_set(p, key, val)
                     }
                     None => SetAct::None,
