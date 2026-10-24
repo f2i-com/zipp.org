@@ -1027,11 +1027,14 @@ impl<'p> Vm<'p> {
             // virtual length past the dense storage (`new Array(n)` beyond the
             // dense cap, `a.length = n`) would otherwise pass ZERO arguments,
             // and a hole copied verbatim would surface as an absent `arguments`
-            // index where Get yields `undefined` or an inherited element.
+            // index where Get yields `undefined` or an inherited element. An
+            // index redefined in the side table (an accessor, above all)
+            // overrides its dense slot, which still holds the old value.
             let idx = obj.heap_index();
             if !self.arguments_objs.contains_key(&idx)
                 && self.js_array_len(idx) == items.len()
                 && !items.iter().any(|v| v.is_hole())
+                && !self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
             {
                 self.preflight_native_iteration_work(items.len() as u64)?;
                 let mut out = Vec::new();

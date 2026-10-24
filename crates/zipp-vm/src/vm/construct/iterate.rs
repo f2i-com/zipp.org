@@ -2004,6 +2004,27 @@ impl<'p> Vm<'p> {
             }
             return Ok(out);
         }
+        // An index redefined in the side table (an accessor above all)
+        // overrides its dense slot, which still holds the old value: every
+        // index by Get, against the length as each step of the iterator reads
+        // it (a getter may grow or shrink the array).
+        if self.arr_props.get(&arr_idx).is_some_and(|m| m.has_element_key()) {
+            let mut admitted = self.js_array_len(arr_idx);
+            self.preflight_materialized_array(admitted)?;
+            let _gc = self.gc_lock_guard();
+            let arr = Value::heap(arr_idx);
+            let mut out = Vec::with_capacity(admitted.min(4096));
+            let mut i = 0;
+            while i < self.js_array_len(arr_idx) {
+                if i >= admitted {
+                    admitted = admitted.saturating_mul(2).max(i + 1);
+                    self.preflight_materialized_array(admitted)?;
+                }
+                out.push(self.get_index(arr, Value::num(i as f64))?);
+                i += 1;
+            }
+            return Ok(out);
+        }
         let items = match self.heap.get(arr_idx) {
             HeapObj::Array(items) => items.clone(),
             _ => return Ok(Vec::new()),

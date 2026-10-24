@@ -610,7 +610,12 @@ impl<'p> Vm<'p> {
             return None;
         }
         if !self.arguments_objs.contains_key(&idx) {
-            if self.js_array_len(idx) != n || self.preflight_native_iteration_work(n as u64).is_err() {
+            // A redefined index (an accessor above all) overrides its dense
+            // slot, which still holds the old value.
+            if self.js_array_len(idx) != n
+                || self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
+                || self.preflight_native_iteration_work(n as u64).is_err()
+            {
                 return None;
             }
             let HeapObj::Array(items) = self.heap.get(idx) else {
