@@ -3606,6 +3606,21 @@ impl ObjMap {
         debug_assert!(plan.keys()[..n] == *self.keys.as_ref() && plan.keys()[n] == key);
         match &mut self.keys {
             PropKeys::Planned { all, visible_len } if all.is(plan) => *visible_len = n + 1,
+            // The previous shape's plan: rebind the handle where it lies, as
+            // `set_keys` would leave it (a planned list owns no strings).
+            // Moving a whole new `PropKeys` in stored it as two words and
+            // reloaded it as one wider move: a stalled store-forward on every
+            // add of a constructor's `this.x = ...` chain, an eighth of it.
+            PropKeys::Planned { all, visible_len } => {
+                *all = if borrow {
+                    // SAFETY: this function's contract.
+                    unsafe { PlanHandle::borrowed(plan) }
+                } else {
+                    PlanHandle::owned(plan.clone())
+                };
+                *visible_len = n + 1;
+                self.key_bytes = key_bytes_count(0);
+            }
             _ => self.set_keys(PropKeys::Planned {
                 all: if borrow {
                     // SAFETY: this function's contract.

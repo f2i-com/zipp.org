@@ -2279,7 +2279,7 @@ pub struct Vm<'p> {
     /// from the proto, not stored). They're `configurable: true`, so `delete
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
     /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
-    deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
+    deleted_callable_intrinsics: rustc_hash::FxHashSet<(u32, u8)>,
     /// Names of built-in globals (`Number`, `Date`, …) removed via
     /// `delete globalThis.X`. They live in `builtin_globals`/`globals`, not as own
     /// `global_this` entries, so deletion is recorded here and `global_by_name`
@@ -3103,12 +3103,12 @@ pub struct Vm<'p> {
     /// can't hold. Consulted FIRST by the `.prototype` read / `prototype_of` /
     /// getOwnPropertyDescriptor, so a function whose prototype was set to a
     /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
-    fn_proto_override: std::collections::HashMap<u32, Value>,
+    fn_proto_override: rustc_hash::FxHashMap<u32, Value>,
     /// Ordinary functions whose `prototype` was made non-writable
     /// (`Object.defineProperty(f, "prototype", {writable: false})`,
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
     /// value), which roots the function, so no entry outlives it.
-    fn_proto_readonly: std::collections::HashSet<u32>,
+    fn_proto_readonly: rustc_hash::FxHashSet<u32>,
     /// `object_proto_native_resolves`'s memo for `hasOwnProperty`,
     /// `propertyIsEnumerable` and `isPrototypeOf`: (receiver shape,
     /// %Object.prototype% version, slot).
