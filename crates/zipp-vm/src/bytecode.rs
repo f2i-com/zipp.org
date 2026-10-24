@@ -3068,11 +3068,16 @@ pub struct FusedCode {
     /// The function's step call sites (`step_call_sites`), found the first
     /// time the interpreter asks.
     steps: std::sync::OnceLock<Box<[u32]>>,
-    /// The tables of the copy's `FuseStrSwitch` positions, in position
-    /// order, built the first time one runs.
-    switches: std::sync::OnceLock<Box<[StrSwitch]>>,
-    /// The same for its `FuseIntSwitch` positions.
-    int_switches: std::sync::OnceLock<Box<[IntSwitch]>>,
+    /// The tables of the copy's `FuseStrSwitch` and `FuseIntSwitch`
+    /// positions, built the first time one runs (boxed: most functions have
+    /// none, and every function carries the cell).
+    switches: std::sync::OnceLock<Box<SwitchTables>>,
+}
+
+/// [`FusedCode`]'s switch tables, each kind in position order.
+struct SwitchTables {
+    strs: Box<[StrSwitch]>,
+    ints: Box<[IntSwitch]>,
 }
 
 /// The cases of one `FuseIntSwitch`: each case's literal and branch target,
@@ -3148,8 +3153,9 @@ impl FusedCode {
         (
             self.code.get().map_or(0, |c| std::mem::size_of_val(&**c)),
             self.steps.get().map_or(0, |s| std::mem::size_of_val(&**s)),
-            self.switches.get().map_or(0, |s| std::mem::size_of_val(&**s))
-                + self.int_switches.get().map_or(0, |s| std::mem::size_of_val(&**s)),
+            self.switches.get().map_or(0, |s| {
+                std::mem::size_of::<SwitchTables>() + std::mem::size_of_val(&*s.strs) + std::mem::size_of_val(&*s.ints)
+            }),
         )
     }
 
@@ -3174,9 +3180,7 @@ impl FusedCode {
     /// is); every such position's is built the first time one asks.
     #[inline]
     pub fn str_switch(&self, f: &FuncProto, ip: usize) -> Option<&StrSwitch> {
-        let all = self
-            .switches
-            .get_or_init(|| str_switches(f, self.get().unwrap_or(&[])));
+        let all = &self.switch_tables(f).strs;
         all.binary_search_by_key(&(ip as u32), |s| s.ip)
             .ok()
             .map(|i| &all[i])
@@ -3185,12 +3189,21 @@ impl FusedCode {
     /// The table of the `FuseIntSwitch` at `ip` of `f`, as [`Self::str_switch`].
     #[inline]
     pub fn int_switch(&self, f: &FuncProto, ip: usize) -> Option<&IntSwitch> {
-        let all = self
-            .int_switches
-            .get_or_init(|| int_switches(&f.code, self.get().unwrap_or(&[])));
+        let all = &self.switch_tables(f).ints;
         all.binary_search_by_key(&(ip as u32), |s| s.ip)
             .ok()
             .map(|i| &all[i])
+    }
+
+    #[inline]
+    fn switch_tables(&self, f: &FuncProto) -> &SwitchTables {
+        self.switches.get_or_init(|| {
+            let fused = self.get().unwrap_or(&[]);
+            Box::new(SwitchTables {
+                strs: str_switches(f, fused),
+                ints: int_switches(&f.code, fused),
+            })
+        })
     }
 
     /// Whether the `Call` at `ip` of `f` (whose `fused` this is) writes a
@@ -4403,8 +4416,8 @@ mod static_key_plan_layout_tests {
 
     /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
     /// when the optimization never applies, and `fused` (the interpreter's
-    /// superinstruction copy, its step call sites and its string-switch
-    /// tables, `FusedCode`) another 72 until they are built, and `call_sites`
+    /// superinstruction copy, its step call sites and its boxed switch
+    /// tables, `FusedCode`) another 64 until they are built, and `call_sites`
     /// (a boxed slice: 16) the source positions error stacks report. Keep
     /// that startup/many-function cost, plus the retained-charge assumptions
     /// for non-empty plans, explicit.
@@ -4414,9 +4427,9 @@ mod static_key_plan_layout_tests {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<PlanHandle>(), 8);
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
-        assert_eq!(std::mem::size_of::<FusedCode>(), 72);
+        assert_eq!(std::mem::size_of::<FusedCode>(), 64);
         assert_eq!(std::mem::size_of::<CallSite>(), 16);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 360);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 352);
     }
 }
 
