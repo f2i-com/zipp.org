@@ -3201,14 +3201,7 @@ impl ObjMap {
         callee: Value,
         callee_attr: PropAttr,
     ) -> ObjMap {
-        static PLAN: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
-        let plan = PLAN.get_or_init(|| {
-            StaticKeyPlan::new(vec![
-                "length".to_string(),
-                "@@iterator".to_string(),
-                "callee".to_string(),
-            ])
-        });
+        let plan = arguments_side_plan();
         let hidden = PropAttr {
             writable: true,
             enumerable: false,
@@ -3320,6 +3313,15 @@ impl ObjMap {
     #[inline]
     pub fn has_element_key(&self) -> bool {
         self.has_element_key
+    }
+
+    /// Whether this is an arguments object's side table holding exactly the
+    /// three properties it was made with (`arguments_side_table`): the
+    /// shared plan, all three visible. Any add appends past the plan and any
+    /// delete materializes the keys, so no other key (an index above all)
+    /// can be present.
+    pub(crate) fn is_pristine_arguments_table(&self) -> bool {
+        matches!(&self.keys, PropKeys::Planned { all, visible_len: 3 } if all.is(arguments_side_plan()))
     }
 
     /// `Object.isSealed`: not extensible and every own property non-configurable.
@@ -7489,6 +7491,19 @@ pub struct Heap {
     /// value grain was built for) keep the value record. `ZIPP_VALGRAIN_SMALL_MAX`
     /// overrides the bound; 0 restores pure value grain.
     valgrain_small_max: usize,
+}
+
+/// The key list every arguments object's side table starts with
+/// (`ObjMap::arguments_side_table`), shared by all of them.
+fn arguments_side_plan() -> &'static StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        StaticKeyPlan::new(vec![
+            "length".to_string(),
+            "@@iterator".to_string(),
+            "callee".to_string(),
+        ])
+    })
 }
 
 /// Stage-3 generation states (low two bits of a `Heap::gen` byte).

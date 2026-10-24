@@ -228,6 +228,26 @@ pub(super) fn bind_fast_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_APPLY_FAST=1` sends `f.apply(t, list)` back through the general
+/// method call (`Vm::fn_apply_plain_target`), for an A/B on one binary.
+#[inline]
+pub(super) fn apply_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_APPLY_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_NO_PROMISE_PRISTINE=1` makes `promise_method_is_intrinsic` always
 /// decline, which restores the original `get_prop`-walk proof EXACTLY — the
 /// probe sits behind a `||`, so a `false` runs the old expression unchanged.
@@ -536,6 +556,89 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(idx, target_proto);
         }
         Some(Value::heap(idx))
+    }
+
+    /// The `(func id, closure)` a `recv.apply(t, list)` enters directly, as
+    /// [`Vm::fn_call_plain_target`] finds it for `call`: a plain function of
+    /// the running realm while a Get of `apply` finds the pristine
+    /// `%Function.prototype.apply%`. `ZIPP_NO_APPLY_FAST=1` declines always.
+    #[inline]
+    pub(crate) fn fn_apply_plain_target(&self, recv: Value) -> Option<(u32, u32)> {
+        if !apply_fast_enabled() {
+            return None;
+        }
+        let target = self.plain_fn_entry(recv)?;
+        if !self.fn_call_apply_pristine(recv, "apply")
+            || (!self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0)
+        {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// CreateListFromArrayLike(`list`) for `f.apply(t, list)`, when it can
+    /// run no code and be read without the generic [[Get]] per index:
+    /// nullish (no arguments; `apply` passes none for it), a dense array
+    /// with no holes (`create_list_from_array_like`'s own fast path), or an
+    /// arguments object as it was made, whose `length` is still a plain data
+    /// property holding its element count, whose elements have no holes and
+    /// no redefined index, read through its mapped formals as [[Get]] reads
+    /// them (`args_mapped_get`). `fn.apply(this, arguments)` forwarding,
+    /// which every compiled `super(...args)` and wrapper does, took the
+    /// generic `length` Get and an index Get per argument, then a nested run
+    /// loop for the call. `None` for anything else.
+    pub(crate) fn interp_apply_list(&mut self, list: Value) -> Option<Vec<Value>> {
+        if list.is_nullish() {
+            return Some(Vec::new());
+        }
+        if !list.is_heap() {
+            return None;
+        }
+        let idx = list.heap_index();
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        let n = items.len();
+        if items.iter().any(|v| v.is_hole()) {
+            return None;
+        }
+        if !self.arguments_objs.contains_key(&idx) {
+            if self.js_array_len(idx) != n || self.preflight_native_iteration_work(n as u64).is_err() {
+                return None;
+            }
+            let HeapObj::Array(items) = self.heap.get(idx) else {
+                return None;
+            };
+            return Some(items.to_vec());
+        }
+        // An arguments object: `length` is an ordinary own data property in
+        // its side table, beside `callee` and @@iterator, and no other key
+        // (a redefined index above all) may be there.
+        let props = self.arr_props.get(&idx)?;
+        if !props.is_pristine_arguments_table() {
+            return None;
+        }
+        let lp = props.pos("length")?;
+        let lv = props.val_at(lp);
+        // (Made as `Value::num(argc)`, which may be a double.)
+        if props.attr_at(lp).accessor || !lv.is_number() || lv.as_f64() != n as f64 {
+            return None;
+        }
+        if self.preflight_native_iteration_work(n as u64).is_err() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = match self.args_mapped_get(idx, i) {
+                Some(v) => v,
+                None => match self.heap.get(idx) {
+                    HeapObj::Array(items) => items[i],
+                    _ => return None,
+                },
+            };
+            out.push(v);
+        }
+        Some(out)
     }
 
     /// `Array.prototype.values.call(arr)` (`arr[Symbol.iterator].call(arr)`,

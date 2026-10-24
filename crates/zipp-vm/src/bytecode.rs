@@ -4117,6 +4117,12 @@ impl PlanHandle {
     pub(crate) fn runtime_valid(&self) -> bool {
         self.0.runtime_valid()
     }
+
+    /// Whether the handle is of `plan` itself (the same allocation).
+    #[inline]
+    pub(crate) fn is(&self, plan: &StaticKeyPlan) -> bool {
+        std::sync::Arc::ptr_eq(&self.0 .0, &plan.0)
+    }
 }
 
 /// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the

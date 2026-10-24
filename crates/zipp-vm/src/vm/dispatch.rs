@@ -4129,6 +4129,27 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                        } else if callee_v.is_heap()
+                            && matches!(self.heap.get(callee_v.heap_index()),
+                                HeapObj::Native(id) if *id == crate::vm::native::FN_APPLY)
+                            && super::builtins::apply_fast_enabled()
+                        {
+                            // `f.apply(t, list)` captured in spec order (`f` a
+                            // closure variable, so its Get came first): the
+                            // callee IS %Function.prototype.apply%, so on a
+                            // plain function of this realm whose list reads
+                            // without running code (`interp_apply_list`) the
+                            // call is `f`'s frame here, as in `CallMethod`.
+                            if let Some((fid, closure)) = self.plain_fn_entry(this_val) {
+                                if self.realm_global_objs.is_empty() || self.get_function_realm(this_val) == 0 {
+                                    let t = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
+                                    let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
+                                    if let Some(args) = self.interp_apply_list(list) {
+                                        self.setup_call_slice(fid, closure, t, &args, dst, ip + 1, this_val)?;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         // B289: a captured boot intrinsic (`arr.push(i % 13)`,
                         // `s.charCodeAt(starts[i])` — a member call whose
@@ -4649,6 +4670,22 @@ impl<'p> Vm<'p> {
                                 self.set(base, dst, b);
                                 ip += 1;
                                 continue;
+                            }
+                        }
+                        // `f.apply(t, list)` on a plain function while a Get of
+                        // `apply` finds the pristine %Function.prototype.apply%
+                        // and the list reads without running code (`arguments`
+                        // forwarding, a dense array): `f`'s frame in this loop,
+                        // as `f.call(t, ...)` enters, instead of the native
+                        // dispatcher's list walk and a nested run loop.
+                        if private_callee.is_none() && key == "apply" {
+                            if let Some((fid, closure)) = self.fn_apply_plain_target(recv) {
+                                let this_v = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
+                                let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
+                                if let Some(args) = self.interp_apply_list(list) {
+                                    self.setup_call_slice(fid, closure, this_v, &args, dst, ip + 1, recv)?;
+                                    break;
+                                }
                             }
                         }
                         // ── interpreter method-call IC ── a monomorphic /
@@ -7403,6 +7440,102 @@ impl<'p> Vm<'p> {
             eval_scope: u32::MAX,
             arg_win,
             argc,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: callee_val,
+        });
+        Ok(())
+    }
+
+    /// [`Self::setup_call`] for arguments held in a list rather than in the
+    /// caller's register window (`f.apply(t, list)`): the frame
+    /// `call_value_plain` pushes for a slice, its `this` bound as
+    /// `setup_call` binds it, and returned to this loop instead of a nested
+    /// run loop. With no window, `f.arguments` reads the frame's own
+    /// arguments, as for every slice call. The callee is a plain function
+    /// (`plain_fn_entry`): no generator, no async function.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn setup_call_slice(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this_val: Value,
+        args: &[Value],
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        let (callee_regs, callee_params, is_strict, lexical_this, rest_reg, arguments_reg, simple) = {
+            let proto = self.func(func_id as usize);
+            (
+                (proto.reg_count as usize).max(1),
+                proto.param_count as usize,
+                proto.is_strict,
+                proto.lexical_this,
+                proto.rest_reg,
+                proto.arguments_reg,
+                proto.simple_params,
+            )
+        };
+        let this_val = if lexical_this && closure != NO_CLOSURE {
+            self.rebind_arrow_this(func_id, closure, this_val)
+        } else if !is_strict && this_val.is_nullish() && self.global_this != 0 {
+            Value::heap(self.callee_this_global(callee_val))
+        } else if !is_strict && !self.is_object_value(this_val) && self.global_this != 0 {
+            let b = self.to_object(this_val)?;
+            self.realm_retag_boxed(callee_val, b);
+            b
+        } else {
+            this_val
+        };
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + callee_regs) {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+        self.regs[new_base] = this_val;
+        let n = args.len().min(callee_params);
+        for (i, &v) in args[..n].iter().enumerate() {
+            self.regs[new_base + 1 + i] = v;
+        }
+        if let Some(rreg) = rest_reg {
+            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            self.regs[new_base + rreg as usize] = arr;
+        }
+        let mut args_obj = u32::MAX;
+        if let Some(areg) = arguments_reg {
+            let mapinfo = (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+            let arr = self.build_arguments_object(args.to_vec(), callee_val, is_strict, mapinfo);
+            self.regs[new_base + areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
             is_eval: false,
             construct_this: false,
             gen: u32::MAX,
