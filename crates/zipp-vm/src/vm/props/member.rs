@@ -810,10 +810,11 @@ impl<'p> Vm<'p> {
     /// define its own `size`), no own `size` property, and its prototype's
     /// `size` still the intrinsic getter. A redefined or deleted one is
     /// observable, and was ignored.
-    fn plain_collection_size(&self, idx: u32, is_map: bool) -> bool {
+    pub(crate) fn plain_collection_size(&self, idx: u32, is_map: bool) -> bool {
         use crate::vm::native::{MAP_SIZE_GET, SET_SIZE_GET};
         if self.proto_of.contains_key(&idx)
-            || self.arr_props.get(&idx).is_some_and(|m| m.pos("size").is_some())
+            || (!self.arr_props.is_empty()
+                && self.arr_props.get(&idx).is_some_and(|m| m.pos("size").is_some()))
         {
             return false;
         }
@@ -825,7 +826,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(p) = self.heap.get(holder) else {
             return false;
         };
-        p.pos("size").is_some_and(|i| {
+        self.own_pos(p, "size").is_some_and(|i| {
             let g = p.val_at(i);
             p.attr_at(i).accessor
                 && g.is_heap()

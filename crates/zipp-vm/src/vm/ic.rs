@@ -1212,7 +1212,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline]
     fn ic_proto_hit_tail(&self, idx: u32, first: u8, hops: &IcHops, slot: u32) -> Option<Value> {
-        if slot == u32::MAX || !self.interp_own_resolve_vm_is_interpreter() {
+        if !self.interp_own_resolve_vm_is_interpreter() {
             return None;
         }
         let HeapObj::Object(m) = self.heap.get(idx) else {
@@ -1222,7 +1222,40 @@ impl<'p> Vm<'p> {
             return None;
         }
         let hm = self.ic_chain_ok(idx, first, hops)?;
+        // A guarded chain miss (`node.decorators` on a node without any).
+        if slot == u32::MAX {
+            return Some(Value::UNDEFINED);
+        }
         Some(hm.val_at(slot as usize))
+    }
+
+    /// [`Self::ic_get_prop_proto_hit`] for a receiver whose shape is not the
+    /// one way 0 was filled against: what `ic_validate_get` checks of that
+    /// way once the full call reaches it — the key among none of the
+    /// receiver's own, the chain as it was, the holder's slot still the
+    /// key's data property — without the call's site probe, receiver fetch
+    /// and namespace test first. A site reading one inherited name or one
+    /// absent field through many layouts took the whole call on every read.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(never)]
+    fn ic_proto_hit_other_shape(
+        &self,
+        idx: u32,
+        m: &ObjMap,
+        first: u8,
+        hops: &IcHops,
+        slot: u32,
+        key: &str,
+    ) -> Option<Value> {
+        if self.own_pos(m, key).is_some() {
+            return None;
+        }
+        let hm = self.ic_chain_ok(idx, first, hops)?;
+        if slot == u32::MAX {
+            return Some(Value::UNDEFINED);
+        }
+        let s = slot as usize;
+        (hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
     }
 
     /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
@@ -1278,15 +1311,20 @@ impl<'p> Vm<'p> {
             return None;
         };
         let sh = m.shape();
-        if slot == u32::MAX
-            || sh == crate::shape::DICT
-            || recv_shape != sh
-            || m.class.is_some()
-            || !self.interp_own_resolve_vm_is_interpreter()
-        {
+        if sh == crate::shape::DICT || m.class.is_some() || !self.interp_own_resolve_vm_is_interpreter() {
             return None;
         }
+        if recv_shape != sh {
+            // Another layout reading the same inherited name (`node.type`
+            // through dozens of AST node shapes, a field most nodes lack).
+            return self.ic_proto_hit_other_shape(idx, m, first, &hops, slot, key);
+        }
         let hm = self.ic_chain_ok(idx, first, &hops)?;
+        // A guarded chain miss: the shape proves the key absent here, the
+        // hops that no link of the chain has gained it.
+        if slot == u32::MAX {
+            return Some(Value::UNDEFINED);
+        }
         let s = slot as usize;
         // The holder is the last hop, and its version is the one the fill saw:
         // every key add, removal, compaction or descriptor change on it bumps

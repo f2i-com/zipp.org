@@ -1845,9 +1845,15 @@ impl<'p> Vm<'p> {
                     Instr::LooseEq { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = match self.loose_eq_nullish(va, vb) {
-                            Some(r) => r,
-                            None => self.loose_eq(va, vb)?,
+                        // Two small integers, as `Eq` decides them: `loose_eq`
+                        // tested objects, BigInts and tags before comparing.
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            match self.loose_eq_nullish(va, vb) {
+                                Some(r) => r,
+                                None => self.loose_eq(va, vb)?,
+                            }
                         };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
@@ -1855,9 +1861,13 @@ impl<'p> Vm<'p> {
                     Instr::LooseNe { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = match self.loose_eq_nullish(va, vb) {
-                            Some(r) => r,
-                            None => self.loose_eq(va, vb)?,
+                        let r = if va.is_int() && vb.is_int() {
+                            va.bits() == vb.bits()
+                        } else {
+                            match self.loose_eq_nullish(va, vb) {
+                                Some(r) => r,
+                                None => self.loose_eq(va, vb)?,
+                            }
                         };
                         self.set(base, dst, Value::bool(!r));
                         ip += 1;
@@ -3642,6 +3652,17 @@ impl<'p> Vm<'p> {
                             // function's own one (`counter.calls`), or a
                             // prototype intrinsic (`dv.getUint32`).
                             if let Some(v) = self.shapeless_read(o, &key) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        } else if o.is_heap()
+                            && matches!(self.heap.get(o.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                        {
+                            // `Array.isArray`, `Object.keys`: a constructor's own
+                            // data property. The property cache declines every
+                            // constructor map, so its probe and miss came first.
+                            if let Some(v) = self.ctor_own_data_read(o, &key) {
                                 self.set(base, dst, v);
                                 ip += 1;
                                 continue;

@@ -885,6 +885,16 @@ impl<'p> Vm<'p> {
                 let proto = *proto;
                 self.iterator_data_read(o, proto, key)
             }
+            // `m.size`, as the member walk's collection arm answers it
+            // (`plain_collection_size`). It went through the methods'
+            // intrinsic proof, which never holds for an accessor, the
+            // property cache's miss and the walk to that arm first.
+            HeapObj::Map { .. } | HeapObj::Set(_) if key == "size" && self.realm_global_objs.is_empty() => {
+                let idx = o.heap_index();
+                let is_map = matches!(self.heap.get(idx), HeapObj::Map { .. });
+                self.plain_collection_size(idx, is_map)
+                    .then(|| crate::vm::helpers_numeric::len_value(self.coll_live_len(idx)))
+            }
             _ => self.proto_intrinsic_read(o, key).map(Value::from_bits),
         }
     }
