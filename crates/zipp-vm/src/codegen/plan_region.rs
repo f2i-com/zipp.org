@@ -5327,6 +5327,8 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         // ── interpreter superinstructions ── never in the code the JIT
         // reads (`FusedCode`); both halves' reads, conservatively.
         Instr::FuseAddIntMove { a, msrc, .. } => vec![a, msrc],
+        Instr::FuseUpvalGetMove { msrc, .. } => vec![msrc],
+        Instr::FuseMove2 { src, src2, .. } => vec![src, src2],
         Instr::FuseLoadGlobal2 { .. } => vec![],
         Instr::FuseLoadIntBitwise { a, b, .. } | Instr::FuseEqJump { a, b, .. } => vec![a, b],
         Instr::FuseTypeOfJump { a, .. }

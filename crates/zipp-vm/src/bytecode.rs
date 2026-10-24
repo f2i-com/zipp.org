@@ -2581,6 +2581,23 @@ pub enum Instr {
         dst2: Reg,
         idx2: u32,
     },
+    /// `UpvalGet { dst, idx }` then `Move { dst: mdst, src: msrc }`: a
+    /// callee read from the closure, then the first argument copied into
+    /// the call's window (`checkExpression(node, …)`).
+    FuseUpvalGetMove {
+        dst: Reg,
+        idx: u16,
+        mdst: Reg,
+        msrc: Reg,
+    },
+    /// `Move { dst, src }` then `Move { dst: dst2, src: src2 }`: an argument
+    /// window's copies.
+    FuseMove2 {
+        dst: Reg,
+        src: Reg,
+        dst2: Reg,
+        src2: Reg,
+    },
     /// `LoadInt { dst: ldst, val }` then `Bitwise { dst, a, b, op }`.
     FuseLoadIntBitwise {
         ldst: Reg,
@@ -3501,6 +3518,12 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
             (Instr::LoadGlobal { dst, idx }, Instr::LoadGlobal { dst: dst2, idx: idx2 }) => {
                 Some(Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 })
             }
+            (Instr::UpvalGet { dst, idx }, Instr::Move { dst: mdst, src: msrc }) if move_fuse_enabled() => {
+                Some(Instr::FuseUpvalGetMove { dst, idx, mdst, msrc })
+            }
+            (Instr::Move { dst, src }, Instr::Move { dst: dst2, src: src2 }) if move_fuse_enabled() => {
+                Some(Instr::FuseMove2 { dst, src, dst2, src2 })
+            }
             (Instr::LoadInt { dst: ldst, val }, Instr::Bitwise { dst, a, b, op }) => {
                 Some(Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op })
             }
@@ -3836,6 +3859,21 @@ mod fused_code_tests {
 /// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
 /// same-binary A/B for [`FusedCode`]).
 #[inline]
+/// `ZIPP_NO_MOVE_FUSE=1` keeps `Move` pairs and `UpvalGet; Move` apart.
+fn move_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MOVE_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
 fn null_jump_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};

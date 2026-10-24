@@ -128,6 +128,7 @@ fn lite_small_instr(i: &Instr) -> bool {
             | Instr::FuseAddLoadInt { .. }
             | Instr::FuseAddIntMove { .. }
             | Instr::FuseLoadGlobal2 { .. }
+            | Instr::FuseMove2 { .. }
     )
 }
 
@@ -161,6 +162,7 @@ fn lite_instr(i: &Instr) -> bool {
             // default, a `Math` method.
             | Instr::LoadUndefined { .. }
             | Instr::UpvalGet { .. }
+            | Instr::FuseUpvalGetMove { .. }
             | Instr::UpvalSet { .. }
             | Instr::MathOp { .. }
             // A script's counters and accumulators.
@@ -607,6 +609,13 @@ impl<'p> Vm<'p> {
                     self.set(base, dst2, v2);
                     ip += 2;
                 }
+                Instr::FuseMove2 { dst, src, dst2, src2 } => {
+                    let v = self.get(base, src);
+                    self.set(base, dst, v);
+                    let v = self.get(base, src2);
+                    self.set(base, dst2, v);
+                    ip += 2;
+                }
                 Instr::AddInt { dst, a, imm, upd } => {
                     let va = self.get(base, a);
                     let r = self.add_int_value(va, imm, upd)?;
@@ -997,6 +1006,20 @@ impl<'p> Vm<'p> {
                     }
                     self.set(base, dst, v);
                     ip += 1;
+                }
+                Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } if FULL => {
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    let cell = self.closure_upvalue_cached(&mut upv, self.frames[top].closure, idx);
+                    #[cfg(feature = "safe-sandbox")]
+                    let cell = self.closure_upvalue(self.frames[top].closure, idx);
+                    let v = self.heap.cell_get(cell);
+                    if v.is_uninitialized() {
+                        hand_over!();
+                    }
+                    self.set(base, dst, v);
+                    let m = self.get(base, msrc);
+                    self.set(base, mdst, m);
+                    ip += 2;
                 }
                 Instr::UpvalSet { idx, src } if FULL => {
                     #[cfg(not(feature = "safe-sandbox"))]

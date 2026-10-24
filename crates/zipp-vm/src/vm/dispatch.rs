@@ -3265,6 +3265,30 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
+                        #[cfg(feature = "safe-sandbox")]
+                        let cell = self.closure_upvalue(cur_closure, idx);
+                        let v = self.heap.cell_get(cell);
+                        if v.is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
+                        }
+                        self.set(base, dst, v);
+                        let m = self.get(base, msrc);
+                        self.set(base, mdst, m);
+                        ip += 2;
+                    }
+                    Instr::FuseMove2 { dst, src, dst2, src2 } => {
+                        let v = self.get(base, src);
+                        self.set(base, dst, v);
+                        let v = self.get(base, src2);
+                        self.set(base, dst2, v);
+                        ip += 2;
+                    }
                     Instr::UpvalSet { idx, src } => {
                         #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);

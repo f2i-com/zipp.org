@@ -394,6 +394,19 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *r1 = m(*r1);
         }
         #[cfg(all())]
+        Instr::FuseUpvalGetMove { dst: r0, mdst: r1, msrc: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
+        #[cfg(all())]
+        Instr::FuseMove2 { dst: r0, src: r1, dst2: r2, src2: r3 } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
+        }
+        #[cfg(all())]
         Instr::FuseAddIntMove { dst: r0, a: r1, mdst: r2, msrc: r3, .. } => {
             *r0 = m(*r0);
             *r1 = m(*r1);
