@@ -2770,12 +2770,15 @@ impl<'p> Vm<'p> {
                 .arr_props
                 .get(&idx)
                 .map_or((false, false), |m| (m.frozen, m.sealed || !m.extensible));
-            if frozen || self.array_length_nonwritable.contains(&idx) {
+            let length_fixed = self.array_length_nonwritable.contains(&idx);
+            if frozen || (length_fixed && matches!(name, "push" | "unshift")) {
                 return Err(Thrown::from_static(
                     "TypeError: Cannot assign to read only property 'length' of object '[object Array]'",
                 ));
             }
-            if constrained {
+            // `pop`, `shift` and `splice` on a merely fixed `length` delete or
+            // move elements before the final Set of `length` throws.
+            if constrained || length_fixed {
                 return self.array_like_mutate(Value::heap(idx), name, args);
             }
         }

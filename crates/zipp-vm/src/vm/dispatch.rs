@@ -4502,6 +4502,32 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // Hot fast path: `arr.push(x)` — the most common
+                        // per-element array idiom — and `arr.pop()`, its
+                        // stack partner. Append or remove directly, skipping
+                        // the probes below (none serves an array) and the
+                        // try_builtin_method → dispatch_builtin_method →
+                        // array_method layering, then answer the new length
+                        // or the element. A FROZEN array (or one whose `length`
+                        // was made non-writable) must throw, so the lanes
+                        // decline it to array_method's guard. The side tables
+                        // are empty for an ordinary array.
+                        if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
+                            if argc == 1 && super::builtins::is_push_name(key) {
+                                let v = self.get(base, arg_base);
+                                if let Some(len) = self.interp_array_push_fast(recv, v) {
+                                    self.set(base, dst, len);
+                                    ip += 1;
+                                    continue;
+                                }
+                            } else if argc == 0 && super::builtins::is_pop_name(key) {
+                                if let Some(v) = self.interp_array_pop_fast(recv) {
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         // Pristine non-BigInt DataView getters are a sufficiently
                         // hot interpreter primitive to bypass the generic
                         // receiver-kind dispatcher and argument stack buffer.
@@ -4749,22 +4775,6 @@ impl<'p> Vm<'p> {
                                     self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
                                     break;
                                 }
-                            }
-                        }
-                        // Hot fast path: `arr.push(x)` â€” the most common
-                        // per-element array idiom. Append directly, skipping the
-                        // try_builtin_method â†’ dispatch_builtin_method â†’ array_method
-                        // layering (and the args-gather), then return the new length.
-                        // A FROZEN array (or one whose `length` was made non-writable)
-                        // must throw â€” skip the fast path so it routes through
-                        // array_method's guard. The side tables are empty for an
-                        // ordinary array, so this is a no-op in the build-a-list case.
-                        if argc == 1 && super::builtins::is_push_name(key) {
-                            let v = self.get(base, arg_base);
-                            if let Some(len) = self.interp_array_push_fast(recv, v) {
-                                self.set(base, dst, len);
-                                ip += 1;
-                                continue;
                             }
                         }
                         // Builtin methods (array/string) execute inline and

@@ -112,8 +112,9 @@ fn str_memo_id(name: &str) -> Option<usize> {
     })
 }
 
-/// `push`'s index in the B191 memo (`arr_memo_id`).
+/// `push`'s and `pop`'s indices in the B191 memo (`arr_memo_id`).
 const ARR_MEMO_PUSH: usize = 0;
+const ARR_MEMO_POP: usize = 1;
 
 /// The `arr_proto_baseline` keys of the collection methods' boot bits
 /// (`Vm::coll_boot_bits`): %Map.prototype% `get`, `has`, %Set.prototype%
@@ -130,11 +131,17 @@ pub(crate) fn is_push_name(key: &str) -> bool {
     matches!(key.as_bytes(), [b'p', b'u', b's', b'h'])
 }
 
+/// [`is_push_name`] for `pop`.
+#[inline(always)]
+pub(crate) fn is_pop_name(key: &str) -> bool {
+    matches!(key.as_bytes(), [b'p', b'o', b'p'])
+}
+
 /// B191 memo indices for the hot array names (see `ARR_MEMO_NAMES`).
 fn arr_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "push" => ARR_MEMO_PUSH,
-        "pop" => 1,
+        "pop" => ARR_MEMO_POP,
         "join" => 2,
         "indexOf" => 3,
         "includes" => 4,
@@ -843,8 +850,19 @@ impl<'p> Vm<'p> {
     /// call. Anything else takes the full proof, which also fills the memo.
     #[inline(always)]
     fn array_push_is_intrinsic(&mut self) -> bool {
+        self.array_memo_is_intrinsic(ARR_MEMO_PUSH, "push")
+    }
+
+    /// [`Vm::array_push_is_intrinsic`] for `pop`.
+    #[inline(always)]
+    fn array_pop_is_intrinsic(&mut self) -> bool {
+        self.array_memo_is_intrinsic(ARR_MEMO_POP, "pop")
+    }
+
+    #[inline(always)]
+    fn array_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
         if self.realm_global_objs.is_empty() {
-            if let Some((ver, slot, fn_bits)) = self.arr_intrinsic_memo[ARR_MEMO_PUSH] {
+            if let Some((ver, slot, fn_bits)) = self.arr_intrinsic_memo[memo_id] {
                 let proto = self.arr_proto;
                 if self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get_for_ic(proto) {
@@ -855,7 +873,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.array_method_is_intrinsic("push")
+        self.array_method_is_intrinsic(name)
     }
 
     /// `string_method_is_intrinsic("charCodeAt")` with the memo's hit inlined,
@@ -1429,6 +1447,42 @@ impl<'p> Vm<'p> {
             }
             _ => None,
         }
+    }
+
+    /// The interpreter's inline `arr.pop()` lane, the other half of a
+    /// printer's command stack: removes and answers the last element (or
+    /// `undefined` for an empty array) exactly when `array_method`'s dense
+    /// arm would, and declines read-only otherwise. That is a plain Array
+    /// with no side table (attribute overrides, frozen, sealed,
+    /// non-extensible, an own `pop`, an arguments object), no virtual or
+    /// non-writable length, whose last slot is not a hole (its Get would
+    /// consult the prototype chain), while `pop` is the boot intrinsic and
+    /// %Array.prototype% is the receiver's prototype and carries no index.
+    #[inline]
+    pub(crate) fn interp_array_pop_fast(&mut self, recv: Value) -> Option<Value> {
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(items)
+                if !items.last().is_some_and(|v| v.is_hole()))
+            || !self.array_pop_is_intrinsic()
+            || self.array_proto_has_index
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+            || (self.proto_of.has(idx)
+                && self.proto_of.get(&idx).is_some_and(|&actual| actual != Value::heap(self.arr_proto)))
+            || (!self.array_length_nonwritable.is_empty() && self.array_length_nonwritable.contains(&idx))
+            || (!self.array_js_len.is_empty() && self.array_js_len.has(idx))
+        {
+            return None;
+        }
+        let value = match self.heap.get_mut(idx) {
+            HeapObj::Array(items) => items.pop().unwrap_or(Value::UNDEFINED),
+            _ => return None,
+        };
+        // As `array_method`'s arm: a for-in snapshot's liveness guard sees it.
+        self.heap.bump_version(idx);
+        Some(value)
     }
 
     /// The interpreter's direct lane for `map.get(k)`, `map.set(k, v)` and

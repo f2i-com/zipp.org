@@ -1265,6 +1265,13 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, len);
                             ip += 1;
                         }
+                        HeapObj::Array(_) if argc == 0 && super::builtins::is_pop_name(key) => {
+                            let Some(v) = self.interp_array_pop_fast(recv) else {
+                                hand_over!();
+                            };
+                            self.set(base, dst, v);
+                            ip += 1;
+                        }
                         HeapObj::Str(_) | HeapObj::Cons { .. } if argc == 1 && key == "charCodeAt" => {
                             let arg = self.get(base, arg_base);
                             let Some(r) = self.interp_char_code_at_fast(recv, arg) else {
