@@ -1819,6 +1819,15 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    Instr::FuseNullJump { ldst, a, dst, ne, when, target } => {
+                        // `a == null`, as `loose_eq_nullish` decides it.
+                        self.set(base, ldst, Value::NULL);
+                        let va = self.get(base, a);
+                        let eq = va.is_nullish() || (va.is_heap() && self.is_htmldda_index(va.heap_index()));
+                        let r = eq != ne;
+                        self.set(base, dst, Value::bool(r));
+                        ip = if r == when { target as usize } else { ip + 3 };
+                    }
 
                     Instr::Lt { dst, a, b } => {
                         let r = self.cmp_lt(base, a, b, true)?;

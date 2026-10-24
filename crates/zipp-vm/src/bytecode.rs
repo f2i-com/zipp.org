@@ -2655,6 +2655,17 @@ pub enum Instr {
     /// `Not { dst, a }` then the conditional jump on `dst`, as
     /// [`Instr::FuseEqJump`]: `if (!node) …`, `while (!(s = it()).done)`.
     FuseNotJump { dst: Reg, a: Reg, when: bool, target: u32 },
+    /// `LoadNull { dst: ldst }`, `LooseEq { dst, a, b: ldst }` (`LooseNe`
+    /// when `ne`; either operand order), then the conditional jump on `dst`
+    /// past the three: `if (x == null)`, `x != null ? … : …`, `a?.b`.
+    FuseNullJump {
+        ldst: Reg,
+        a: Reg,
+        dst: Reg,
+        ne: bool,
+        when: bool,
+        target: u32,
+    },
     /// `LoadInt { dst: ldst, val }` then `JumpIfNotLt { a, b: ldst, target }`
     /// (`JumpIfNotLe` when `le`): a loop or branch bound that is a literal.
     FuseIntCmpJump {
@@ -3407,6 +3418,31 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
     let mut out: Option<Vec<Instr>> = None;
     let mut i = 0;
     while i + 1 < code.len() {
+        // `x == null` / `x != null` and the branch on it (forward, past the
+        // three).
+        if i + 2 < code.len() && null_jump_enabled() {
+            if let (
+                Instr::LoadNull { dst: ldst },
+                Instr::LooseEq { dst, a, b } | Instr::LooseNe { dst, a, b },
+                Instr::JumpIfTrue { cond, target } | Instr::JumpIfFalse { cond, target },
+            ) = (code[i], code[i + 1], code[i + 2])
+            {
+                let other = if b == ldst && a != ldst {
+                    Some(a)
+                } else if a == ldst && b != ldst {
+                    Some(b)
+                } else {
+                    None
+                };
+                if let Some(a) = other.filter(|_| cond == dst && target as usize > i + 2) {
+                    let ne = matches!(code[i + 1], Instr::LooseNe { .. });
+                    let when = matches!(code[i + 2], Instr::JumpIfTrue { .. });
+                    out.get_or_insert_with(|| code.to_vec())[i] = Instr::FuseNullJump { ldst, a, dst, ne, when, target };
+                    i += 3;
+                    continue;
+                }
+            }
+        }
         // A `switch` case or an `if (x === 0)`: a literal loaded, compared
         // with a value, and the branch on the result (forward, past the
         // three).
@@ -3800,6 +3836,21 @@ mod fused_code_tests {
 /// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
 /// same-binary A/B for [`FusedCode`]).
 #[inline]
+/// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
+fn null_jump_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_NULL_JUMP").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
 fn int_switch_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
