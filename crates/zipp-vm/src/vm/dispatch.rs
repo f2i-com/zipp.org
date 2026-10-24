@@ -5656,6 +5656,49 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `FuseIntSwitch` at `ip`: the `n` integer cases from `ip` in one
+    /// lookup, leaving `ldst` and `dst` as the cases would (the matched or
+    /// else the last case's literal, and whether one matched). `a === k` for
+    /// an integer `k` holds for an Int of that value or a Number equal to it
+    /// (-0 is 0, NaN equals nothing), so only those look up. Answers the
+    /// next ip.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    pub(crate) fn int_switch(
+        &mut self,
+        running: &'p crate::bytecode::FuncProto,
+        base: usize,
+        ip: usize,
+        ldst: u16,
+        a: u16,
+        dst: u16,
+        n: u16,
+    ) -> usize {
+        let v = self.get(base, a);
+        let key = if v.is_int() {
+            Some(v.as_int())
+        } else if v.is_double() {
+            let f = v.as_f64();
+            let k = f as i32;
+            (k as f64 == f).then_some(k)
+        } else {
+            None
+        };
+        let sw = running
+            .fused
+            .int_switch(running, ip)
+            .expect("FuseIntSwitch has its table");
+        let found = key.and_then(|k| sw.find(k));
+        let (val, target) = sw.cases[found.unwrap_or(n as usize - 1)];
+        self.set(base, ldst, Value::int(val));
+        self.set(base, dst, Value::bool(found.is_some()));
+        if found.is_some() {
+            target as usize
+        } else {
+            sw.after as usize
+        }
+    }
+
     /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,
     /// non-async) function or closure, rebuild the CURRENT frame's register
     /// window in place for it (constant stack for tail recursion) and return

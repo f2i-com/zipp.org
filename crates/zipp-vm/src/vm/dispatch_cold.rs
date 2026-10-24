@@ -110,6 +110,9 @@ impl<'p> Vm<'p> {
             Instr::FuseStrSwitch { ldst, a, dst, n } => {
                 ip = self.str_switch(running, func_id, base, ip, ldst, a, dst, n);
             }
+            Instr::FuseIntSwitch { ldst, a, dst, n } => {
+                ip = self.int_switch(running, base, ip, ldst, a, dst, n);
+            }
             Instr::LoadSpill { dst, vec, idx } => {
                 let holder = self.get(base, vec).heap_index();
                 let v = match self.heap.get(holder) {

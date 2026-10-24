@@ -2638,6 +2638,10 @@ pub enum Instr {
     /// text in the function's [`StrSwitch`] table for this position instead
     /// of a compare per case. The cases around it keep their own fused form.
     FuseStrSwitch { ldst: Reg, a: Reg, dst: Reg, n: u16 },
+    /// `n` [`Instr::FuseIntEqJump`] cases in a row, as [`Instr::FuseStrSwitch`]
+    /// takes string cases: `switch (node.kind)` over integer literals,
+    /// answered by one lookup in the function's [`IntSwitch`] table.
+    FuseIntSwitch { ldst: Reg, a: Reg, dst: Reg, n: u16 },
     /// `TypeOfIs { dst, a, code, neg }` then the conditional jump on `dst`,
     /// as [`Instr::FuseEqJump`].
     FuseTypeOfJump {
@@ -3039,6 +3043,32 @@ pub struct FusedCode {
     /// The tables of the copy's `FuseStrSwitch` positions, in position
     /// order, built the first time one runs.
     switches: std::sync::OnceLock<Box<[StrSwitch]>>,
+    /// The same for its `FuseIntSwitch` positions.
+    int_switches: std::sync::OnceLock<Box<[IntSwitch]>>,
+}
+
+/// The cases of one `FuseIntSwitch`: each case's literal and branch target,
+/// in order, the position after the last, and the first case of each value:
+/// by `value - min` in `dense` when the values cluster, else in `sparse`.
+pub struct IntSwitch {
+    ip: u32,
+    pub after: u32,
+    pub cases: Box<[(i32, u32)]>,
+    min: i32,
+    dense: Box<[u16]>,
+    sparse: rustc_hash::FxHashMap<i32, u16>,
+}
+
+impl IntSwitch {
+    /// The first case whose literal is `val`.
+    #[inline]
+    pub fn find(&self, val: i32) -> Option<usize> {
+        if !self.dense.is_empty() {
+            let k = *self.dense.get((val as i64 - self.min as i64) as usize)?;
+            return (k != u16::MAX).then_some(k as usize);
+        }
+        self.sparse.get(&val).map(|&k| k as usize)
+    }
 }
 
 /// The cases of one `FuseStrSwitch`: each case's string constant and branch
@@ -3090,7 +3120,8 @@ impl FusedCode {
         (
             self.code.get().map_or(0, |c| std::mem::size_of_val(&**c)),
             self.steps.get().map_or(0, |s| std::mem::size_of_val(&**s)),
-            self.switches.get().map_or(0, |s| std::mem::size_of_val(&**s)),
+            self.switches.get().map_or(0, |s| std::mem::size_of_val(&**s))
+                + self.int_switches.get().map_or(0, |s| std::mem::size_of_val(&**s)),
         )
     }
 
@@ -3118,6 +3149,17 @@ impl FusedCode {
         let all = self
             .switches
             .get_or_init(|| str_switches(f, self.get().unwrap_or(&[])));
+        all.binary_search_by_key(&(ip as u32), |s| s.ip)
+            .ok()
+            .map(|i| &all[i])
+    }
+
+    /// The table of the `FuseIntSwitch` at `ip` of `f`, as [`Self::str_switch`].
+    #[inline]
+    pub fn int_switch(&self, f: &FuncProto, ip: usize) -> Option<&IntSwitch> {
+        let all = self
+            .int_switches
+            .get_or_init(|| int_switches(&f.code, self.get().unwrap_or(&[])));
         all.binary_search_by_key(&(ip as u32), |s| s.ip)
             .ok()
             .map(|i| &all[i])
@@ -3269,8 +3311,74 @@ fn str_switches(f: &FuncProto, fused: &[Instr]) -> Box<[StrSwitch]> {
     out.into_boxed_slice()
 }
 
-/// Cases in a row that become one [`Instr::FuseStrSwitch`]; fewer stay a
-/// compare each.
+/// The tables of the `FuseIntSwitch` positions of `fused`, the copy of
+/// `f.code`: each case's literal and target from the original triples.
+fn int_switches(code: &[Instr], fused: &[Instr]) -> Box<[IntSwitch]> {
+    let mut out = Vec::new();
+    for (ip, ins) in fused.iter().enumerate() {
+        let Instr::FuseIntSwitch { n, .. } = *ins else {
+            continue;
+        };
+        let mut cases = Vec::with_capacity(n as usize);
+        for k in 0..n as usize {
+            let at = ip + 3 * k;
+            if let (Some(&Instr::LoadInt { val, .. }), Some(&Instr::JumpIfTrue { target, .. })) =
+                (code.get(at), code.get(at + 2))
+            {
+                cases.push((val, target));
+            }
+        }
+        debug_assert_eq!(cases.len(), n as usize, "FuseIntSwitch stands for integer cases");
+        let min = cases.iter().map(|c| c.0).min().unwrap_or(0);
+        let max = cases.iter().map(|c| c.0).max().unwrap_or(0);
+        let span = (max as i64 - min as i64 + 1) as usize;
+        let (mut dense, mut sparse) = (Vec::new(), rustc_hash::FxHashMap::default());
+        if span <= 8 * cases.len() && span <= 4096 {
+            dense = vec![u16::MAX; span];
+            for (k, &(val, _)) in cases.iter().enumerate() {
+                let slot = &mut dense[(val as i64 - min as i64) as usize];
+                if *slot == u16::MAX {
+                    *slot = k as u16;
+                }
+            }
+        } else {
+            for (k, &(val, _)) in cases.iter().enumerate() {
+                sparse.entry(val).or_insert(k as u16);
+            }
+        }
+        out.push(IntSwitch {
+            ip: ip as u32,
+            after: (ip + 3 * n as usize) as u32,
+            cases: cases.into_boxed_slice(),
+            min,
+            dense: dense.into_boxed_slice(),
+            sparse,
+        });
+    }
+    out.into_boxed_slice()
+}
+
+/// Whether `code[at..at + 3]` is a `LoadInt { dst: ldst }`,
+/// `Eq { dst, a, b: ldst }`, forward `JumpIfTrue { cond: dst }` case.
+fn int_case_at(code: &[Instr], at: usize, ldst: Reg, a: Reg, dst: Reg) -> bool {
+    matches!(
+        code.get(at..at + 3),
+        Some(&[Instr::LoadInt { dst: l, .. }, Instr::Eq { dst: d, a: x, b: y }, Instr::JumpIfTrue { cond, target }])
+            if l == ldst && d == dst && x == a && y == ldst && cond == dst && target as usize > at + 2
+    )
+}
+
+/// How many such cases run in a row from `i`.
+fn int_switch_run(code: &[Instr], i: usize, ldst: Reg, a: Reg, dst: Reg) -> usize {
+    let mut n = 0;
+    while n < u16::MAX as usize && int_case_at(code, i + 3 * n, ldst, a, dst) {
+        n += 1;
+    }
+    n
+}
+
+/// Cases in a row that become one [`Instr::FuseStrSwitch`] or
+/// [`Instr::FuseIntSwitch`]; fewer stay a compare each.
 const STR_SWITCH_MIN_CASES: usize = 4;
 
 /// Whether `code[at..at + 3]` is a `LoadConst { dst: ldst }`,
@@ -3312,7 +3420,16 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
                 if cond == dst && a != b && target as usize > i + 2 {
                     let triple = match code[i] {
                         Instr::LoadInt { dst: ldst, val } if b == ldst && a != ldst => Some(if when {
-                            Instr::FuseIntEqJump { ldst, val, a, dst, target }
+                            // From a run's second case, as the string cases.
+                            let second = i >= 3
+                                && int_case_at(code, i - 3, ldst, a, dst)
+                                && !(i >= 6 && int_case_at(code, i - 6, ldst, a, dst));
+                            let run = if second { int_switch_run(code, i, ldst, a, dst) } else { 0 };
+                            if run >= STR_SWITCH_MIN_CASES && int_switch_enabled() {
+                                Instr::FuseIntSwitch { ldst, a, dst, n: run as u16 }
+                            } else {
+                                Instr::FuseIntEqJump { ldst, val, a, dst, target }
+                            }
                         } else {
                             Instr::FuseIntNeJump { ldst, val, a, dst, target }
                         }),
@@ -3609,6 +3726,39 @@ mod fused_code_tests {
         assert!((0..4).all(|k| matches!(fused[3 * k], Instr::FuseConstEqJump { .. })));
     }
 
+    /// Integer cases run the same way, and the table built for the switch
+    /// finds each literal's first case, clustered or not.
+    #[test]
+    fn integer_case_runs_become_a_switch() {
+        let case = |val: i32, target: u32| {
+            [
+                Instr::LoadInt { dst: 4, val },
+                Instr::Eq { dst: 5, a: 1, b: 4 },
+                Instr::JumpIfTrue { cond: 5, target },
+            ]
+        };
+        if !int_switch_enabled() {
+            return;
+        }
+        let mut code: Vec<Instr> = [7, 8, 9, 8, 10].iter().enumerate().flat_map(|(k, &v)| case(v, 30 + k as u32)).collect();
+        code.push(Instr::Jump { target: 40 });
+        let fused = fuse_for_interpreter(&code).expect("cases fuse");
+        assert!(matches!(fused[0], Instr::FuseIntEqJump { val: 7, target: 30, .. }));
+        assert!(matches!(fused[3], Instr::FuseIntSwitch { ldst: 4, a: 1, dst: 5, n: 4 }));
+        for k in 2..5 {
+            assert!(matches!(fused[3 * k], Instr::FuseIntEqJump { .. }));
+        }
+        let tables = int_switches(&code, &fused);
+        let sw = &tables[0];
+        assert_eq!((sw.ip, sw.after), (3, 15));
+        assert_eq!((sw.find(8), sw.find(9), sw.find(10), sw.find(7), sw.find(11)), (Some(0), Some(1), Some(3), None, None));
+        let sparse: Vec<Instr> = [1, 1000, -5, 1 << 20, i32::MIN].iter().flat_map(|&v| case(v, 30)).collect();
+        let fused = fuse_for_interpreter(&sparse).expect("cases fuse");
+        let tables = int_switches(&sparse, &fused);
+        assert!(tables[0].dense.is_empty());
+        assert_eq!((tables[0].find(-5), tables[0].find(i32::MIN), tables[0].find(1)), (Some(1), Some(3), None));
+    }
+
     /// A program run on the interpreter builds the copies of the code that
     /// ran warm (a loop, a second call), and they hold every
     /// superinstruction: the dispatch really runs them.
@@ -3650,6 +3800,21 @@ mod fused_code_tests {
 /// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
 /// same-binary A/B for [`FusedCode`]).
 #[inline]
+/// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
+fn int_switch_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_SWITCH").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn interp_fuse_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;

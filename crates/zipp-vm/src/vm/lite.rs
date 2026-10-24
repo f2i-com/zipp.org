@@ -149,6 +149,7 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::Ne { .. }
             | Instr::FuseEqJump { .. }
             | Instr::FuseIntEqJump { .. }
+            | Instr::FuseIntSwitch { .. }
             | Instr::FuseIntNeJump { .. }
             | Instr::JumpIfFalse { .. }
             | Instr::JumpIfTrue { .. }
@@ -846,6 +847,10 @@ impl<'p> Vm<'p> {
                     };
                     self.set(base, dst, Value::bool(r));
                     ip = if r { target as usize } else { ip + 3 };
+                }
+                Instr::FuseIntSwitch { ldst, a, dst, n } if FULL => {
+                    let running = self.func(func_id as usize);
+                    ip = self.int_switch(running, base, ip, ldst, a, dst, n);
                 }
                 // A global's store where the main arms' is the slot write: an
                 // initialized slot no defineProperty'd own property governs,
