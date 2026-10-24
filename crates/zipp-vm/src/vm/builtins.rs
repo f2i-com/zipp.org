@@ -1154,13 +1154,19 @@ impl<'p> Vm<'p> {
     /// its map, read where it lies. The property caches decline constructor
     /// maps, so every such read took the general member walk, which reaches
     /// the same map lookup after synthesizing `prototype`, `name` and
-    /// `length` and handling realms and deferred namespaces. `None` for those
-    /// three keys, an accessor, an uninitialised slot or a miss, and while a
-    /// realm or a deferred namespace exists.
+    /// `length` and handling realms and deferred namespaces. `None` for
+    /// `name` and `length`, for `prototype` once `fn_proto_override` has an
+    /// entry for the constructor (the walk answers from it first; otherwise
+    /// it answers with this same own data property, `prototype_of`), an
+    /// accessor, an uninitialised slot or a miss, and while a realm or a
+    /// deferred namespace exists.
     #[inline]
     pub(crate) fn ctor_own_data_read(&self, o: Value, key: &str) -> Option<Value> {
         if !o.is_heap()
-            || matches!(key, "prototype" | "name" | "length")
+            || matches!(key, "name" | "length")
+            || (key == "prototype"
+                && !self.fn_proto_override.is_empty()
+                && self.fn_proto_override.contains_key(&o.heap_index()))
             || self.active_realm.is_some()
             || !self.realm_global_objs.is_empty()
             || !self.deferred_ns_state.is_empty()

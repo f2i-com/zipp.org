@@ -3667,6 +3667,24 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                        } else if o.is_heap()
+                            && self.arr_proto != 0
+                            && (o.heap_index() == self.arr_proto || o.heap_index() == self.str_proto)
+                            && self.realm_global_objs.is_empty()
+                            && self.active_realm.is_none()
+                        {
+                            // `Array.prototype.slice`, `String.prototype.at`:
+                            // a method of the prototype itself while its slot
+                            // still holds the boot intrinsic (the B191 proof
+                            // an array or string receiver's read takes). The
+                            // property cache declines these exotic objects, so
+                            // every read took the member walk and a hashed key.
+                            let is_arr = o.heap_index() == self.arr_proto;
+                            if let Some(bits) = self.proto_intrinsic_bits(&key, is_arr) {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // ── interpreter property IC ── own/chain data reads
                         // resolve through the per-site cache; a cached class /
