@@ -2999,11 +2999,15 @@ impl<'p> Vm<'p> {
                                 } if recv_shape == sh && slot != u32::MAX && m.class.is_none() => {
                                     if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
                                         let s = slot as usize;
-                                        if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor {
-                                            let v = hm.val_at(s);
-                                            if let Some((fid, closure)) = self.ic_plain_fn(v) {
-                                                return Some((fid, closure, v));
-                                            }
+                                        // The holder's version is the fill's, so
+                                        // its slot still holds the key as a data
+                                        // property (`ic_get_prop_proto_hit`'s
+                                        // argument): the key's text compare was
+                                        // a string read per inherited call.
+                                        debug_assert!(hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor);
+                                        let v = hm.val_at(s);
+                                        if let Some((fid, closure)) = self.ic_plain_fn(v) {
+                                            return Some((fid, closure, v));
                                         }
                                     }
                                 }
