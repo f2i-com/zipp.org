@@ -4149,6 +4149,19 @@ impl<'p> Vm<'p> {
                                         break;
                                     }
                                 }
+                            } else if self.realm_global_objs.is_empty() && this_val.is_heap() {
+                                // A native receiver, as the `call` branch runs one.
+                                if let HeapObj::Native(id) = self.heap.get(this_val.heap_index()) {
+                                    let id = *id;
+                                    let t = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
+                                    let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
+                                    if let Some(args) = self.interp_apply_list(list) {
+                                        let r = self.call_native(id, t, &args)?;
+                                        self.set(base, dst, r);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                             }
                         }
                         // A captured Map or Set method on a receiver of its
@@ -4745,6 +4758,16 @@ impl<'p> Vm<'p> {
                                 if let Some(args) = self.interp_apply_list(list) {
                                     self.setup_call_slice(fid, closure, this_v, &args, dst, ip + 1, recv)?;
                                     break;
+                                }
+                            } else if let Some(id) = self.fn_apply_native_target(recv) {
+                                // A native, as the `call` lane runs one.
+                                let this_v = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
+                                let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
+                                if let Some(args) = self.interp_apply_list(list) {
+                                    let r = self.call_native(id, this_v, &args)?;
+                                    self.set(base, dst, r);
+                                    ip += 1;
+                                    continue;
                                 }
                             }
                         }

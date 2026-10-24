@@ -583,6 +583,26 @@ impl<'p> Vm<'p> {
         Some(target)
     }
 
+    /// The native id a `recv.apply(t, list)` runs directly, as
+    /// [`Vm::fn_call_native_target`] finds it for `call`: a plain native with
+    /// no other realm in existence while a Get of `apply` finds the pristine
+    /// `%Function.prototype.apply%` (a bundler's method helper forwarding
+    /// its rest array, `(proto.at ?? o.at).apply(o, args)`).
+    /// `ZIPP_NO_APPLY_FAST=1` declines always.
+    #[inline]
+    pub(crate) fn fn_apply_native_target(&self, recv: Value) -> Option<u16> {
+        if !apply_fast_enabled() || !recv.is_heap() || !self.realm_global_objs.is_empty() {
+            return None;
+        }
+        match self.heap.get(recv.heap_index()) {
+            HeapObj::Native(id) => {
+                let id = *id;
+                self.fn_call_apply_pristine(recv, "apply").then_some(id)
+            }
+            _ => None,
+        }
+    }
+
     /// CreateListFromArrayLike(`list`) for `f.apply(t, list)`, when it can
     /// run no code and be read without the generic [[Get]] per index:
     /// nullish (no arguments; `apply` passes none for it), a dense array
