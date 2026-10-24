@@ -4661,6 +4661,16 @@ impl<'p> Vm<'p> {
                             let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
                             let site = super::values::private_site(func_id as u32, name as u32);
                             private_callee = self.private_method_callee(ctx, recv, key, Some(site))?;
+                            // `this.#m(x)` resolved to a plain function: the
+                            // call the general tail below makes of it (no
+                            // lane between here and there serves a private
+                            // name), as a frame of this loop.
+                            if let Some(f) = private_callee {
+                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                                    self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, f)?;
+                                    break;
+                                }
+                            }
                         }
                         // `map.get(k)` / `map.set(k, v)` / `map.has(k)` on a
                         // Map receiver: the receiver-kind dispatcher's Map
