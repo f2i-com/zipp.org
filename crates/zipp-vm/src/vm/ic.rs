@@ -91,6 +91,21 @@ const IC_PROBATION: u8 = 64;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
 
+/// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
+fn class_miss_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CLASS_MISS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `Vm::own_slot_cache`'s size, a power of two.
 pub(crate) const OWN_SLOT_CACHE_SLOTS: usize = 4096;
 
@@ -303,6 +318,20 @@ pub(crate) enum IcEntry {
     AddClass {
         before: u32,
         after: u32,
+        class: u32,
+        ver: u32,
+        epoch: u32,
+        nhops: u8,
+        hops: [(u32, u32); 5],
+    },
+    /// A class instance's read of a key nothing on its chain has: the
+    /// receiver of `recv_shape` owns no such key, no member table of
+    /// `class`'s chain declares it (`ver` and `epoch` guard the tables, as
+    /// `AddClass` guards them), and the ordinary chain where the tables end
+    /// (`hops`) has no property of it. The read yields `undefined`
+    /// (`node.comments` on an AST node that has none).
+    ClassMiss {
+        recv_shape: u32,
         class: u32,
         ver: u32,
         epoch: u32,
@@ -568,6 +597,13 @@ pub(crate) enum Walked {
     ChainMiss {
         first: u8,
         hops: IcHops,
+    },
+    /// A class instance's key that neither its class chain's tables nor the
+    /// ordinary chain past them has → `undefined` (`IcEntry::ClassMiss`).
+    ClassMiss {
+        class: u32,
+        nhops: u8,
+        hops: [(u32, u32); 5],
     },
     /// Not cacheable (exotic receiver/chain, too deep, non-Object hop, …).
     No,
@@ -911,7 +947,16 @@ impl<'p> Vm<'p> {
                 ClassLookup::Accessor { getter, .. } if getter != Value::UNDEFINED => {
                     Walked::ClassGetter { class, getter }
                 }
-                _ => Walked::No, // chain miss / live level → slow path
+                // Absent from the tables: absent from the ordinary chain
+                // past them too is a guardable miss.
+                ClassLookup::Miss if class_miss_enabled() => {
+                    let mut hops = [(0u32, 0u32); 5];
+                    match self.class_chain_proof(idx, class, key, &mut hops, true) {
+                        Some(n) => Walked::ClassMiss { class, nhops: n as u8, hops },
+                        None => Walked::No,
+                    }
+                }
+                _ => Walked::No, // live level, setter-only accessor → slow path
             };
         }
         // Plain-object proto_of chain, recording (idx, version) per hop.
@@ -1726,6 +1771,13 @@ impl<'p> Vm<'p> {
                                     return GetAct::Value(callee);
                                 }
                             }
+                            // A class instance's absent key, by the same
+                            // shape proof.
+                            IcEntry::ClassMiss { recv_shape, .. } if recv_shape == sh => {
+                                if self.ic_class_miss_ok(&site.entries[0], idx, m) {
+                                    return GetAct::Value(Value::UNDEFINED);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1965,6 +2017,24 @@ impl<'p> Vm<'p> {
                 );
                 GetAct::Value(Value::UNDEFINED)
             }
+            Walked::ClassMiss { class, nhops, hops } => {
+                let recv_shape = self.ic_recv_shape(recv);
+                let ver = self.heap.version_of(class);
+                let epoch = self.class_proto_epoch;
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ClassMiss {
+                        recv_shape,
+                        class,
+                        ver,
+                        epoch,
+                        nhops,
+                        hops,
+                    },
+                );
+                GetAct::Value(Value::UNDEFINED)
+            }
             Walked::No => {
                 self.ic_note_miss(func_id, ip);
                 GetAct::None
@@ -1995,6 +2065,13 @@ impl<'p> Vm<'p> {
                 let s = slot as usize;
                 if own == Some(s) && m.attr_at(s).accessor {
                     self.ic_acc_get_from(m, s)
+                } else {
+                    GetAct::None
+                }
+            }
+            IcEntry::ClassMiss { .. } => {
+                if own.is_none() && self.ic_class_miss_ok(e, idx, m) {
+                    GetAct::Value(Value::UNDEFINED)
                 } else {
                     GetAct::None
                 }
@@ -2469,7 +2546,9 @@ impl<'p> Vm<'p> {
                 self.ic_note_miss(func_id, ip);
                 SetAct::None
             }
-            Walked::No | Walked::ChainData { .. } => {
+            // A class instance's absent key (a read's `ClassMiss`): its write
+            // appends, as for any other class-chain miss.
+            Walked::No | Walked::ChainData { .. } | Walked::ClassMiss { .. } => {
                 if let Some(p) = self.ic_add_class_fill(func_id, ip, recv, key) {
                     return self.ic_apply_set(p, key, val);
                 }
@@ -2529,6 +2608,20 @@ impl<'p> Vm<'p> {
         key: &str,
         hops: &mut [(u32, u32)],
     ) -> Option<usize> {
+        self.class_chain_proof(idx, class, key, hops, false)
+    }
+
+    /// [`Vm::class_add_chain`]'s walk, for an append (`read` false) or for a
+    /// read that finds nothing (`read`): there no level of the ordinary
+    /// chain may hold `key` at all, since a read would return it.
+    pub(crate) fn class_chain_proof(
+        &self,
+        idx: u32,
+        class: u32,
+        key: &str,
+        hops: &mut [(u32, u32)],
+        read: bool,
+    ) -> Option<usize> {
         if self.proto_of.has(idx) {
             return None;
         }
@@ -2566,8 +2659,8 @@ impl<'p> Vm<'p> {
             n += 1;
             if let Some(i) = m.pos(key) {
                 // A writable data property is shadowed by the append; anything
-                // else governs the write.
-                if m.attr_at(i).accessor || !m.attr_at(i).writable {
+                // else governs the write. A read would find any of them.
+                if read || m.attr_at(i).accessor || !m.attr_at(i).writable {
                     return None;
                 }
                 break;
@@ -2579,6 +2672,34 @@ impl<'p> Vm<'p> {
             };
         }
         Some(n)
+    }
+
+    /// A `ClassMiss` entry's guards past the receiver's shape (or its own
+    /// miss): still an instance of the entry's class, no [[Prototype]] or
+    /// side-table properties of its own, the class tables as filled, and the
+    /// chain past them unchanged.
+    #[inline]
+    fn ic_class_miss_ok(&self, e: &IcEntry, idx: u32, m: &ObjMap) -> bool {
+        let IcEntry::ClassMiss {
+            class,
+            ver,
+            epoch,
+            nhops,
+            hops,
+            ..
+        } = *e
+        else {
+            return false;
+        };
+        m.class == Some(class)
+            && !m.is_ctor
+            && self.heap.version_of(class) == ver
+            && self.class_proto_epoch == epoch
+            && !self.proto_of.has(idx)
+            && (self.arr_props.is_empty() || !self.arr_props.contains_key(&idx))
+            && hops[..nhops as usize]
+                .iter()
+                .all(|&(h, v)| self.heap.version_of(h) == v)
     }
 
     /// An `AddData` hit: `m` (heap `idx`) is a plain extensible object of the
