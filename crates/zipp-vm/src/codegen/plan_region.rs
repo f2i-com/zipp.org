@@ -2241,7 +2241,13 @@ fn plan_region_cold_inner(
             // Captured method lookup produces a boxed callable in the frame,
             // not a numeric result. Its paired call below owns the Num dst.
             Instr::GetProp { .. } if captured_pin_get(s + off).is_some() => (None, VTy::Num),
-            Instr::GetProp { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
+            // A pinned length (`str.length`, `arr.length`, a TypedArray's) is a
+            // Num read from the pin snapshot. Its dst is usually a temp a Move
+            // then reads, which types it; with no discarded copy, `n =
+            // arr.length` writes the local itself, and nothing else would.
+            Instr::GetProp { dst, .. } if pinned_str(s + off) || pinned_len(s + off) => {
+                (Some(dst), VTy::Num)
+            }
             // W20: an admitted `GetProp` lands its probe result in a Num home
             // under a tag guard (`emit_box_to_home`) that DEOPTs on anything
             // else -- the same contract the dense-Array element read has used
