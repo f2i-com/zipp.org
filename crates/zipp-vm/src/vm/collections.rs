@@ -689,6 +689,46 @@ pub(crate) fn svz_eq(heap: &Heap, a: Value, b: Value) -> bool {
     strict_eq(heap, a, b)
 }
 
+/// `keys.iter().position(|&k| svz_eq(heap, k, key))`, split by the kind of
+/// `key` so each entry costs what its comparison needs: a flat string's
+/// bytes are fetched once and compared against each flat string entry (a
+/// rope entry keeps `str_eq`), a number compares by value against number
+/// entries, a BigInt keeps `svz_eq`, and every other key (object, symbol,
+/// boolean, null, undefined) is equal only to its own bits, which is what
+/// `strict_eq` answers for it. A small Set of strings probed with a string
+/// paid two kind tests and a second lookup of the probe per entry.
+#[inline]
+fn svz_position(heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
+    if key.is_number() {
+        let n = key.as_f64();
+        if n.is_nan() {
+            return keys.iter().position(|&k| k.is_number() && k.as_f64().is_nan());
+        }
+        return keys.iter().position(|&k| k.is_number() && k.as_f64() == n);
+    }
+    if key.is_heap() {
+        match heap.get(key.heap_index()) {
+            HeapObj::Str(s) => {
+                let want = s.as_bytes();
+                return keys.iter().position(|&k| {
+                    k.bits() == key.bits()
+                        || (k.is_heap()
+                            && match heap.get(k.heap_index()) {
+                                HeapObj::Str(t) => t.as_bytes() == want,
+                                HeapObj::Cons { .. } => heap.str_eq(k.heap_index(), key.heap_index()),
+                                _ => false,
+                            })
+                });
+            }
+            HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
+                return keys.iter().position(|&k| svz_eq(heap, k, key));
+            }
+            _ => {}
+        }
+    }
+    keys.iter().position(|&k| k.bits() == key.bits())
+}
+
 /// Incremental SameValueZero finder over a LOCAL keys Vec still being built
 /// (Map.groupBy's key list, the `extends Set` constructor dedup): linear
 /// below the index threshold, hash-indexed once the Vec grows past it. The
@@ -761,7 +801,7 @@ impl<'p> Vm<'p> {
         // A user key can never be HOLE (its bit pattern is engine-internal),
         // so tombstoned slots never match — same as the pre-index scans.
         if keys.len() < INDEX_THRESHOLD {
-            return keys.iter().position(|&k| svz_eq(heap, k, key));
+            return svz_position(heap, keys, key);
         }
         // Crossed the threshold: build the index once; maintained from now on.
         let ix = CollIndex::build(heap, keys);

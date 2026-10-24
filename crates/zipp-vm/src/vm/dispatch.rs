@@ -4151,6 +4151,30 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        // A captured Map or Set method on a receiver of its
+                        // kind (`set.has(keys[i])`): the native IS the callee,
+                        // so the call is the native run with that `this`, as
+                        // `call_value` runs one with no other realm in
+                        // existence. The captured lane below proved it the live
+                        // prototype intrinsic and then dispatched by name,
+                        // which proved it again: three proofs per call with the
+                        // read's.
+                        if callee_v.is_heap() && this_val.is_heap() && self.realm_global_objs.is_empty() {
+                            if let HeapObj::Native(id) = self.heap.get(callee_v.heap_index()) {
+                                let id = *id;
+                                let kind_ok = match crate::vm::native::proto_method(id) {
+                                    Some((_, 3, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Set(_)),
+                                    Some((_, 4, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Map { .. }),
+                                    _ => false,
+                                };
+                                if kind_ok {
+                                    let r = self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, this_val, argv))?;
+                                    self.set(base, dst, r);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         // B289: a captured boot intrinsic (`arr.push(i % 13)`,
                         // `s.charCodeAt(starts[i])` — a member call whose
                         // argument was not order-transparent, so the strict
