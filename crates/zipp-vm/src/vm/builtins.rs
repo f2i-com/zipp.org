@@ -1018,6 +1018,10 @@ impl<'p> Vm<'p> {
     /// the property cache and the member walk.
     pub(crate) fn shapeless_read(&mut self, o: Value, key: &str) -> Option<Value> {
         match self.heap.get(o.heap_index()) {
+            // `C.prototype`, `fn.prototype`: the member walk's `prototype` arm.
+            HeapObj::Class(_) | HeapObj::Func(_) | HeapObj::Closure { .. } if key == "prototype" => {
+                self.fn_prototype_read(o)
+            }
             HeapObj::Class(_) => self.class_static_data_read(o, key),
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
@@ -1041,7 +1045,10 @@ impl<'p> Vm<'p> {
                 self.plain_collection_size(idx, is_map)
                     .then(|| crate::vm::helpers_numeric::len_value(self.coll_live_len(idx)))
             }
-            _ => self.proto_intrinsic_read(o, key).map(Value::from_bits),
+            _ => match self.proto_intrinsic_read(o, key) {
+                Some(bits) => Some(Value::from_bits(bits)),
+                None => self.shapeless_chain_read(o, key),
+            },
         }
     }
 

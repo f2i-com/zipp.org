@@ -764,6 +764,126 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `o.key` on a string, an Array or a RegExp where the property caches
+    /// cannot help (they have no shape) and `shapeless_read`'s intrinsic
+    /// proof declined: answered as `get_member_slow` answers it, without its
+    /// twenty receiver-kind tests first. A string's own properties are its
+    /// indices and `length`; an Array's named ones are side-table data; a
+    /// RegExp's slot-backed ones are `lastIndex`, `source`, `flags` and the
+    /// flag accessors. Past those, every receiver is a prototype walk
+    /// (`plain_chain_data`). `None` (an accessor, an exotic level, a realm, a
+    /// deferred namespace, an index key) leaves the read to that walk. The
+    /// reads it serves are a bundle's absent keys (`node.type` on a string,
+    /// `arr.peek`), NodeArray's `pos`/`end`, `arguments.length` and a
+    /// captured `re.test`.
+    pub(crate) fn shapeless_chain_read(&mut self, o: Value, key: &str) -> Option<Value> {
+        if self.active_realm.is_some()
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+            || key.starts_with('#')
+            || canonical_index_str(key).is_some()
+        {
+            return None;
+        }
+        let idx = o.heap_index();
+        let start = match self.heap.get(idx) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                if key == "length" || self.str_proto == 0 {
+                    return None;
+                }
+                self.str_proto
+            }
+            HeapObj::Array(_) => {
+                if let Some(m) = self.arr_props.get(&idx) {
+                    if let Some(i) = m.pos(key) {
+                        let v = m.val_at(i);
+                        return (!m.attr_at(i).accessor && !v.is_uninitialized()).then_some(v);
+                    }
+                }
+                if matches!(key, "length" | "raw" | "name") {
+                    return None;
+                }
+                if let Some(v) = self.regexp_result_prop(idx, key) {
+                    return Some(v);
+                }
+                match self.array_eff_proto(idx) {
+                    0 => return None,
+                    p => p,
+                }
+            }
+            HeapObj::RegExp { .. } => {
+                if self.arr_props.contains_key(&idx)
+                    || matches!(key, "lastIndex" | "length" | "name")
+                    || regexp_intrinsic_accessor(key).is_some()
+                    || regexp_flag_char(key).is_some()
+                    || self.regexp_proto == 0
+                {
+                    return None;
+                }
+                match self.proto_of.get_copied(idx) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return None,
+                    None => self.regexp_proto,
+                }
+            }
+            _ => return None,
+        };
+        self.plain_chain_data(start, key)
+    }
+
+    /// `key` read along a prototype chain of ordinary maps from `start`: the
+    /// first level's own data value, or `undefined` past the chain's end.
+    /// `None` at an accessor, an uninitialised slot, a class's map, the
+    /// global object, a module namespace or any level that is not an
+    /// ordinary object (the member walk answers those).
+    fn plain_chain_data(&self, start: u32, key: &str) -> Option<Value> {
+        let mut cur = start;
+        for _ in 0..64 {
+            if cur == self.global_this && self.global_this != 0 {
+                return None;
+            }
+            if !self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&cur) {
+                return None;
+            }
+            let HeapObj::Object(m) = self.heap.get(cur) else {
+                return None;
+            };
+            if m.class.is_some() {
+                return None;
+            }
+            if let Some(i) = self.own_pos(m, key) {
+                let v = m.val_at(i);
+                return (!m.attr_at(i).accessor && !v.is_uninitialized()).then_some(v);
+            }
+            cur = match self.proto_of.get_copied(cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return Some(Value::UNDEFINED),
+                None if self.obj_proto != 0 && cur != self.obj_proto => self.obj_proto,
+                None => return Some(Value::UNDEFINED),
+            };
+        }
+        None
+    }
+
+    /// `f.prototype` on a class or a function that owns one, as the member
+    /// walk's `prototype` arm answers it: an assigned override first, else
+    /// the (lazily made) prototype object. `None` while a realm or a deferred
+    /// namespace exists, and for callables without one.
+    pub(crate) fn fn_prototype_read(&mut self, o: Value) -> Option<Value> {
+        if self.active_realm.is_some() || !self.realm_global_objs.is_empty() || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        if !self.fn_proto_override.is_empty() {
+            if let Some(&v) = self.fn_proto_override.get(&o.heap_index()) {
+                return Some(v);
+            }
+        }
+        if !self.callable_has_prototype(o) {
+            return None;
+        }
+        self.prototype_of(o)
+    }
+
     pub(crate) fn func_has_prototype(&self, id: u32) -> bool {
         let f = self.func(id as usize);
         // Generator and async-generator functions/methods always own `prototype`.
