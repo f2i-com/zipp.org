@@ -29,6 +29,7 @@ const CHECKS = [
   ["check-wasm-memory.cjs", [pkgWasm]],
   ["host-contract.cjs"],
   ["app-bridge.cjs"],
+  ["accelerator-reply-budget.cjs"],
   ["buffer-ceiling.cjs"],
   ["budget-and-seed.cjs"],
   ["large-alloc-gc.cjs"],

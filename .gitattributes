@@ -10,6 +10,9 @@ bench/pgo-training/** text eol=lf
 crates/zipp-vm/src/lang/python/lib/** text eol=lf
 crates/zipp-vm/src/lang/python/runtime/** text eol=lf
 crates/zipp-wasm/src/preamble.js text eol=lf
+# The embed-kit loader is copied byte for byte into the hash-pinned served
+# sandbox asset; keep its checkout bytes stable across Windows and Linux.
+crates/zipp-wasm/embed-kit/zipp.mjs text eol=lf
 
 # The WASM engine pairs are hash-checked against their manifests; never convert line endings.
 landing/public/playground-runtime/** -text

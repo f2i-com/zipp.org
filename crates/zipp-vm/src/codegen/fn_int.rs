@@ -154,7 +154,17 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
                 // The native window copies only actual arguments. Missing
                 // formal slots in a reused high-water window would otherwise
                 // retain values written by an earlier activation.
-                if *argc < proto.param_count || !is_self_call(code, ip, *callee, self_slot) {
+                // The slow/finish helper carries argc in eight bits. A wider
+                // call would lose arguments after the native depth/high-water
+                // guard routes it through that helper. The fast path also
+                // writes reg 0 plus every argument into the callee window;
+                // validate that whole write even for malformed bytecode with
+                // an arg_base of zero.
+                if *argc < proto.param_count
+                    || *argc > u8::MAX as u16
+                    || *argc as u32 + 1 > proto.reg_count as u32
+                    || !is_self_call(code, ip, *callee, self_slot)
+                {
                     return false;
                 }
             }
@@ -623,6 +633,16 @@ pub(crate) fn compile_proto(
 ) -> Option<JitFn> {
     let self_slot = proto.name_global;
     if !can_compile(proto, self_slot) {
+        return None;
+    }
+    // The self-call slow/finish helper carries the function id in 24 bits.
+    // Other tiers keep the full id, so decline this tier when it would wrap.
+    if self_func_id > 0x00FF_FFFF
+        && proto
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::Call { .. }))
+    {
         return None;
     }
     // If the callee (== self for our self-calls) returns its argument unchanged
@@ -1228,5 +1248,43 @@ mod control_target_tests {
             _ => unreachable!(),
         };
         assert!(!can_compile(&proto, proto.name_global));
+    }
+
+    #[test]
+    fn self_call_packed_argument_and_function_id_bounds() {
+        let mut proto = tier_a_proto();
+        proto.reg_count = 512;
+        let set_argc = |proto: &mut FuncProto, count| {
+            let call = proto
+                .code
+                .iter_mut()
+                .find(|instr| matches!(instr, Instr::Call { .. }))
+                .expect("fixture recursive call");
+            let Instr::Call { argc, .. } = call else {
+                unreachable!()
+            };
+            *argc = count;
+        };
+        set_argc(&mut proto, u8::MAX as u16);
+        assert!(can_compile(&proto, proto.name_global));
+        set_argc(&mut proto, u8::MAX as u16 + 1);
+        assert!(!can_compile(&proto, proto.name_global));
+
+        let mut full_window = tier_a_proto();
+        full_window.reg_count = u8::MAX as u16;
+        let call = full_window
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::Call { .. }))
+            .expect("fixture recursive call");
+        let Instr::Call { arg_base, argc, .. } = call else {
+            unreachable!()
+        };
+        *arg_base = 0;
+        *argc = u8::MAX as u16;
+        assert!(!can_compile(&full_window, full_window.name_global));
+
+        let proto = tier_a_proto();
+        assert!(compile_proto(&proto, 0x0100_0000, 0, 0, None).is_none());
     }
 }

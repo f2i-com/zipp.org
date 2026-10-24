@@ -541,6 +541,10 @@ jobs:
         run: cargo +stable audit --deny warnings --file Cargo.lock
       - name: Audit isolated WebAssembly dependencies
         run: cargo +stable audit --deny warnings --file crates/zipp-wasm/Cargo.lock
+      - name: Audit isolated WebAssembly kernel dependencies
+        run: cargo +stable audit --deny warnings --file crates/zipp-wasm/rust/Cargo.lock
+      - name: Audit isolated Torch module dependencies
+        run: cargo +stable audit --deny warnings --file crates/zipp-wasm/torch/Cargo.lock
       - name: Audit isolated native-sandbox dependencies
         run: cargo +stable audit --deny warnings --file crates/zipp-sandbox/Cargo.lock
       - name: Select Node.js for the landing-page lockfile audit

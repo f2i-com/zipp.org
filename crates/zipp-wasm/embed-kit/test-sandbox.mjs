@@ -104,6 +104,40 @@ let checks = 0;
 const ok = name => { checks++; console.log(`  ok   ${name}`); };
 
 const js = await loadZipp(find("-javascript.wasm"));
+// Ambient prototype pollution must not supply capabilities or switch off the
+// default Worker. Only own option properties have authority.
+{
+  const keys = ["isolate", "permissions", "allow", "files"];
+  const previous = keys.map(key => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)]);
+  Object.defineProperties(Object.prototype, {
+    isolate: { value: false, configurable: true },
+    permissions: { value: { network: true }, configurable: true },
+    allow: { value: ["*"], configurable: true },
+    files: { value: { "unexpected.txt": "secret" }, configurable: true },
+  });
+  try {
+    const sb = await js.createSandbox({});
+    try {
+      assert.deepEqual((await sb.run("console.log(typeof fetch, typeof process)")).output, ["undefined undefined"]);
+    } finally {
+      await sb.close();
+    }
+    await assert.rejects(js.createSandbox({ workerUrl: "not a URL" }), TypeError);
+    await assert.rejects(js.createSandbox({ permissions: { network: {} } }), /lists no URL/);
+    const emptyFiles = await js.createSandbox({ isolate: false, permissions: { files: {} } });
+    try {
+      assert.deepEqual((await emptyFiles.run('console.log(host.callSync("fs.exists", "unexpected.txt"))')).output, ["false"]);
+    } finally {
+      await emptyFiles.close();
+    }
+  } finally {
+    for (const [key, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(Object.prototype, key, descriptor);
+      else delete Object.prototype[key];
+    }
+  }
+  ok("inherited options cannot change default isolation or grant capabilities");
+}
 for (const isolate of [false, true]) {
   const mode = isolate ? "isolated" : "in-process";
   const make = (options = {}) => js.createSandbox({ isolate, ...options });
@@ -187,6 +221,36 @@ for (const isolate of [false, true]) {
     ok(`${mode}: fetch reaches allowed URLs only, within its method, redirect and size rules`);
   }
 
+  // A root URL with a query is a URL prefix, even when URL normalization
+  // folds a path segment back to "/".
+  for (const entry of [`${origin}/?scope=read`, `${origin}/%2e/?scope=read`]) {
+    const sb = await make({ permissions: { network: [entry] } });
+    const { output } = await sb.run(`
+      async function main() {
+        const specific = await fetch(${JSON.stringify(entry)});
+        console.log("specific", specific.status);
+        try { await fetch("${origin}/data.json"); console.log("broader path reached"); }
+        catch (error) { console.log("broader path denied", error.name); }
+      }
+      main();
+    `);
+    assert.deepEqual(output, ["specific 404", "broader path denied TypeError"]);
+    await sb.close();
+  }
+  // A fragment does not make a root URL into an origin grant either.
+  {
+    const sb = await make({ permissions: { network: [`${origin}/#read`] } });
+    const { output } = await sb.run(`
+      fetch("${origin}/data.json").then(
+        () => console.log("broader path reached"),
+        error => console.log("broader path denied", error.name)
+      );
+    `);
+    assert.deepEqual(output, ["broader path denied TypeError"]);
+    await sb.close();
+  }
+  ok(`${mode}: root query and fragment allow entries do not grant the whole origin`);
+
   // Redirects, when permitted: each hop's destination is authorized before
   // it is requested (a denied origin is never contacted), within a hop limit,
   // with the Fetch standard's method rules and credentials kept to their
@@ -238,6 +302,17 @@ for (const isolate of [false, true]) {
     assert.deepEqual(output.sort(), ["add true 5", "fail false no"]);
     await sb.close();
     ok(`${mode}: host functions answer host.call`);
+  }
+
+  if (isolate) {
+    const sb = await make({ host: { "bad.value": () => () => 1, "good.value": () => 7 } });
+    const { output } = await sb.run(`
+      host.call("bad.value", [], r => console.log("bad", r.ok, r.error.code));
+      host.call("good.value", [], r => console.log("good", r.ok, r.value));
+    `);
+    assert.deepEqual(output.sort(), ["bad false host", "good true 7"]);
+    await sb.close();
+    ok("isolated: an uncloneable host result fails its call and leaves the Worker usable");
   }
 
   // Host requests belong to their sandbox: at most 64 run at once, the rest
@@ -350,7 +425,37 @@ for (const isolate of [false, true]) {
   // Unknown options are refused, not ignored.
   await assert.rejects(make({ permissions: { netwrok: true } }), /unknown permissions option "netwrok"/);
   await assert.rejects(make({ permissions: { network: ["ftp://x"] } }), /not an http\(s\) URL/);
+  await assert.rejects(make({ permissions: { network: { allow: ["http://[", origin] } } }), /not an http\(s\) URL/);
+  await assert.rejects(make({ permissions: { network: ["https://trusted.example@untrusted.example/"] } }), /must not contain credentials/);
+  for (const bad of [NaN, Infinity, -1, "100", 1.5]) {
+    await assert.rejects(make({ permissions: { storage: { quota: bad } } }), /storage.quota must be a nonnegative integer/);
+    await assert.rejects(make({ permissions: { files: { files: {}, quota: bad } } }), /files.quota must be a nonnegative integer/);
+    await assert.rejects(make({ permissions: { network: { allow: ["*"], maxResponseBytes: bad } } }), /network.maxResponseBytes must be a nonnegative integer/);
+  }
+  await assert.rejects(make({ permissions: { storage: { initial: { key: "x".repeat(100) }, quota: 10 } } }), /storage.initial exceeds its quota/);
+  await assert.rejects(make({ permissions: { files: { files: { "a.txt": "x".repeat(100) }, quota: 10 } } }), /files entries exceed their quota/);
+  const backend = { length: 0, getItem: () => null, setItem: () => {}, removeItem: () => {}, key: () => null };
+  await assert.rejects(make({ permissions: { storage: { backend, quota: 10 } } }), /backend owns its data and quota/);
+  await assert.rejects(make({ permissions: { storage: { backend, initial: { key: "seed" } } } }), /backend owns its data and quota/);
+  await assert.rejects(make({ permissions: { storage: { backend, prefix: "" } } }), /storage.prefix must be a nonempty string/);
+  for (const bad of [0, "", "false"]) {
+    await assert.rejects(make({ isolate: bad }), /isolate must be a boolean/);
+  }
+  for (const bad of [NaN, Infinity, 0, -1, "1", 1.5]) {
+    await assert.rejects(make({ limits: { timeoutMs: bad } }), /limits.timeoutMs must be a number of milliseconds/);
+    await assert.rejects(make({ permissions: { network: { allow: ["*"], timeoutMs: bad } } }), /network.timeoutMs must be a number of milliseconds/);
+  }
   ok(`${mode}: unknown or malformed options are refused`);
+
+  // Output is paged through the host even when it has many short lines.
+  {
+    const sb = await make({ limits: { timeoutMs: 60000 } });
+    const { output } = await sb.run(`for (let i = 0; i < 150000; i++) console.log("");`);
+    assert.equal(output.length, 150000);
+    assert.equal(output.at(-1), "");
+    await sb.close();
+    ok(`${mode}: a large number of output lines is delivered without loss`);
+  }
 }
 
 // Only isolation can stop a program that never yields.

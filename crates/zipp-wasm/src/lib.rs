@@ -2954,10 +2954,36 @@ fn host_dispatch_ctx(
         _ => return Err(format!("TypeError: unknown host call '{kind}'")),
     };
     let ret = call.map_err(|_| "Error: host bridge call failed".to_owned())?;
-    let reply = match js_sys::JSON::stringify(&ret) {
-        Ok(serialized) => serialized.as_string().unwrap_or_else(|| "null".to_owned()),
-        Err(_) => return Err("Error: host bridge reply is not serializable".into()),
+    serialize_host_bridge_reply(&ret, "Error: host bridge reply is not serializable")
+}
+
+/// Both synchronous bridge paths use the same reply ceiling. Check the JS
+/// string's UTF-16 length before copying it into WASM, then check the exact
+/// UTF-8 byte count after conversion (non-ASCII may use several bytes/unit).
+fn serialize_host_bridge_reply(
+    ret: &JsValue,
+    unserializable_error: &'static str,
+) -> Result<String, String> {
+    let serialized = js_sys::JSON::stringify(ret).map_err(|_| unserializable_error.to_owned())?;
+    // JSON.stringify(undefined) yields undefined despite js-sys's JsString
+    // return type. Void host methods are represented as JSON null.
+    let raw: JsValue = serialized.into();
+    let reply = if !raw.is_string() {
+        "null".to_owned()
+    } else {
+        let text: &js_sys::JsString = raw.unchecked_ref();
+        if text.length() as usize > MAX_SYNC_BRIDGE_BYTES {
+            return Err(format!(
+                "RangeError: host bridge reply exceeds the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
+            ));
+        }
+        raw.as_string().unwrap_or_else(|| "null".to_owned())
     };
+    if reply.len() > MAX_SYNC_BRIDGE_BYTES {
+        return Err(format!(
+            "RangeError: host bridge reply exceeds the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
+        ));
+    }
     Ok(reply)
 }
 
@@ -3080,38 +3106,7 @@ fn host_dispatch(
     // site, but the guest receives only a stable opaque failure.
     let ret = call.map_err(|_| "Error: host bridge call failed".to_owned())?;
 
-    // Every reply crosses as JSON, including `undefined` — which `stringify`
-    // answers with the JS value `undefined`, NOT a string. Converting that to a
-    // Rust `String` unconditionally panics, and a void bridge method
-    // (`setItem`, `delete`, `startSync`) hits it on every call.
-    let reply = match js_sys::JSON::stringify(&ret) {
-        Ok(serialized) => {
-            // js-sys types JSON.stringify as JsString even though JavaScript
-            // returns `undefined` for a void result. Inspect the underlying
-            // value first, then reject a definitely-oversized UTF-16 string
-            // before copying it into Rust/WASM memory. The byte check below is
-            // still authoritative for non-ASCII text.
-            let raw: JsValue = serialized.into();
-            if !raw.is_string() {
-                "null".into()
-            } else {
-                let text: &js_sys::JsString = raw.unchecked_ref();
-                if text.length() as usize > MAX_SYNC_BRIDGE_BYTES {
-                    return Err(format!(
-                        "RangeError: host bridge reply exceeds the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
-                    ));
-                }
-                raw.as_string().unwrap_or_else(|| "null".into())
-            }
-        }
-        Err(_) => return Err("Error: host bridge returned an unserializable value".into()),
-    };
-    if reply.len() > MAX_SYNC_BRIDGE_BYTES {
-        return Err(format!(
-            "RangeError: host bridge reply exceeds the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
-        ));
-    }
-    Ok(reply)
+    serialize_host_bridge_reply(&ret, "Error: host bridge returned an unserializable value")
 }
 
 /// A `host.call` request id as the host hands it back: the exact Number the

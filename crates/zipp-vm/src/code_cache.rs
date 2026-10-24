@@ -39,6 +39,9 @@ const KEEP: usize = 3;
 /// The marker whose modification time says when an executable's folder was
 /// last used (refreshed at most hourly).
 const USED: &str = "used";
+/// Ownership marker for namespaces created by this version. Older namespaces
+/// have an empty `used` file and are recognized by their cache entry headers.
+const USED_CONTENT: &[u8] = b"zipp-code-cache-v1\n";
 /// Bytes of entries kept in one executable's folder. A combination of
 /// settings needs the Python runtime (0.76 MB) and each library module a
 /// program imports (the bundled library has about fifty), and a large
@@ -154,9 +157,16 @@ fn checksum(bytes: &[u8]) -> u64 {
 /// written for `key`.
 pub(crate) fn load(dir: &Path, name: &str, key: u64) -> Option<Vec<u8>> {
     use std::io::Read;
+    // A caller may point ZIPP_CACHE_DIR at a folder with unrelated hex-named
+    // children. Never deserialize a cache entry from one of those children.
+    cache_namespace_owned(dir)?;
     let path = dir.join(name);
+    plain_metadata(&path, false)?;
     let mut file = std::fs::File::open(&path).ok()?;
     let metadata = file.metadata().ok()?;
+    if metadata.len() > FOLDER_BYTES {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes).ok()?;
     drop(file);
@@ -192,13 +202,24 @@ pub(crate) fn load(dir: &Path, name: &str, key: u64) -> Option<Vec<u8>> {
 /// executable's folder also removes the oldest other executables' folders.
 /// Failures only cost a later process a compile.
 pub(crate) fn store(dir: &Path, name: &str, key: u64, payload: &[u8]) {
-    let fresh = !dir.exists();
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    if fresh {
-        let _ = std::fs::write(dir.join(USED), b"");
-    }
+    let fresh = if std::fs::symlink_metadata(dir).is_ok() {
+        // Never adopt an existing, unidentified directory and then trim its
+        // unrelated `.bin` files. Old empty-marker namespaces are accepted by
+        // `cache_namespace_owned` when their entries match our format.
+        if cache_namespace_owned(dir).is_none() {
+            return;
+        }
+        false
+    } else {
+        let Some(parent) = dir.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() || std::fs::create_dir(dir).is_err() {
+            return;
+        }
+        if std::fs::write(dir.join(USED), USED_CONTENT).is_err() {
+            return;
+        }
+        true
+    };
     let mut bytes = Vec::with_capacity(32 + payload.len());
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&key.to_le_bytes());
@@ -221,20 +242,27 @@ pub(crate) fn store(dir: &Path, name: &str, key: u64, payload: &[u8]) {
 /// and remove writes left unfinished over [`REFRESH_SECS`] ago (a process
 /// ended while it wrote one).
 fn trim(dir: &Path, limit: u64) {
+    if cache_namespace_owned(dir).is_none() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut used: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Some(metadata) = plain_metadata(&path, false) else {
             continue;
         };
         let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let extension = path.extension().map(|e| e.as_encoded_bytes());
-        if extension == Some(b"bin") {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if cache_entry_key(name).is_some() {
             used.push((modified, metadata.len(), path));
-        } else if extension.is_some_and(|e| e.starts_with(b"tmp"))
-            && modified.elapsed().is_ok_and(|age| age.as_secs() > REFRESH_SECS)
+        } else if cache_temp_name(name)
+            && modified
+                .elapsed()
+                .is_ok_and(|age| age.as_secs() > REFRESH_SECS)
         {
             let _ = std::fs::remove_file(path);
         }
@@ -260,9 +288,130 @@ pub(crate) fn touch(dir: &Path) {
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_none_or(|age| age.as_secs() > 3600);
-    if stale && dir.exists() {
-        let _ = std::fs::write(marker, b"");
+    if stale && cache_namespace_owned(dir).is_some() {
+        let _ = std::fs::write(marker, USED_CONTENT);
     }
+}
+
+/// A namespace may be pruned only if all of its contents are recognizable
+/// cache files. The caller can choose `ZIPP_CACHE_DIR`, so a hex directory name
+/// alone is not evidence that the directory belongs to us. Reject symlinks
+/// (including Windows junctions/reparse points) before recursive deletion.
+fn plain_metadata(path: &Path, directory: bool) -> Option<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let kind = metadata.file_type();
+    if if directory {
+        !kind.is_dir()
+    } else {
+        !kind.is_file()
+    } {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
+    }
+    Some(metadata)
+}
+
+fn cache_entry_key(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".bin")?;
+    let key = ["script-", "runtime-", "module-"]
+        .into_iter()
+        .find_map(|prefix| stem.strip_prefix(prefix))?;
+    if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(key, 16).ok()
+}
+
+fn cache_temp_name(name: &str) -> bool {
+    let Some((entry, pid)) = name.split_once(".tmp") else {
+        return false;
+    };
+    cache_entry_key(entry).is_some() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheMarker {
+    Current,
+    Legacy,
+}
+
+fn cache_marker(path: &Path) -> Option<(CacheMarker, std::time::SystemTime)> {
+    use std::io::Read;
+
+    plain_metadata(path, true)?;
+    let marker = path.join(USED);
+    let metadata = plain_metadata(&marker, false)?;
+    let mut contents = Vec::new();
+    std::fs::File::open(&marker)
+        .ok()?
+        .take(USED_CONTENT.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    let kind = if contents == USED_CONTENT {
+        CacheMarker::Current
+    } else if contents.is_empty() {
+        CacheMarker::Legacy
+    } else {
+        return None;
+    };
+    Some((kind, metadata.modified().unwrap_or(std::time::UNIX_EPOCH)))
+}
+
+/// A current marker makes normal cache reads and writes constant-time. Legacy
+/// empty markers get one strict directory check before being upgraded.
+fn cache_namespace_owned(path: &Path) -> Option<()> {
+    let (kind, _) = cache_marker(path)?;
+    if kind == CacheMarker::Legacy {
+        cache_namespace_used(path)?;
+        let _ = std::fs::write(path.join(USED), USED_CONTENT);
+    }
+    Some(())
+}
+
+/// Full validation is reserved for recursive pruning: every child must be a
+/// cache file, never a symlink, junction, unknown file, or subdirectory.
+fn cache_namespace_used(path: &Path) -> Option<std::time::SystemTime> {
+    use std::io::Read;
+
+    let (_, used) = cache_marker(path)?;
+
+    let mut found_entry = false;
+    for entry in std::fs::read_dir(path).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_name() == USED {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let entry_metadata = plain_metadata(&entry.path(), false)?;
+        if cache_temp_name(name) {
+            continue;
+        }
+        let key = cache_entry_key(name)?;
+        if entry_metadata.len() < 32 {
+            return None;
+        }
+        let mut header = [0_u8; 32];
+        std::fs::File::open(entry.path())
+            .ok()?
+            .read_exact(&mut header)
+            .ok()?;
+        if &header[..8] != MAGIC
+            || u64::from_le_bytes(header[8..16].try_into().ok()?) != key
+            || u64::from_le_bytes(header[16..24].try_into().ok()?) != entry_metadata.len() - 32
+        {
+            return None;
+        }
+        found_entry = true;
+    }
+    found_entry.then_some(used)
 }
 
 /// Remove all but the [`KEEP`] most recently used other executables'
@@ -277,23 +426,20 @@ fn prune(current: &Path) {
     let mut others: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p != current && p.is_dir())
+        .filter(|p| p != current)
         .filter(|p| {
             // Only folders this cache made: sixteen hex digits.
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
         })
-        .map(|p| {
-            let used = std::fs::metadata(p.join(USED))
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            (used, p)
-        })
+        .filter_map(|p| cache_namespace_used(&p).map(|used| (used, p)))
         .collect();
     crate::cold_sort::sort_by(&mut others, |a, b| b.0.cmp(&a.0));
     for (_, old) in others.into_iter().skip(KEEP) {
-        let _ = std::fs::remove_dir_all(old);
+        if cache_namespace_used(&old).is_some() {
+            let _ = std::fs::remove_dir_all(old);
+        }
     }
 }
 
@@ -407,26 +553,113 @@ mod cache_check {
         let dir = std::env::temp_dir().join(format!("zipp-code-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let entry = dir.join("0123456789abcdef");
-        super::store(&entry, "e.bin", 7, b"payload");
+        let name = "runtime-0000000000000007.bin";
+        super::store(&entry, name, 7, b"payload");
         assert!(entry.join(super::USED).exists());
-        assert_eq!(super::load(&entry, "e.bin", 7).as_deref(), Some(&b"payload"[..]));
-        assert_eq!(super::load(&entry, "e.bin", 8), None);
-        let path = entry.join("e.bin");
+        assert_eq!(
+            super::load(&entry, name, 7).as_deref(),
+            Some(&b"payload"[..])
+        );
+        assert_eq!(super::load(&entry, name, 8), None);
+        let path = entry.join(name);
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(super::load(&entry, "e.bin", 7), None);
+        assert_eq!(super::load(&entry, name, 7), None);
         std::fs::write(&path, &bytes[..20]).unwrap();
-        assert_eq!(super::load(&entry, "e.bin", 7), None);
-        // Other executables' folders beyond the most recent few are removed.
-        for i in 0..5 {
-            let other = dir.join(format!("{i:016x}"));
-            super::store(&other, "e.bin", 1, b"x");
-        }
-        let left = std::fs::read_dir(&dir).unwrap().count();
-        assert!(left <= super::KEEP + 1, "{left} folders left");
+        assert_eq!(super::load(&entry, name, 7), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller-selected cache root may contain unrelated hex-named folders.
+    /// Legacy namespaces with empty markers are still pruned when their files
+    /// have recognizable cache names and headers.
+    #[test]
+    fn code_cache_prunes_only_identifiable_namespaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "zipp-code-cache-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+
+        let foreign = dir.join("cccccccccccccccc");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("important.txt"), b"keep").unwrap();
+        super::store(&foreign, "runtime-0000000000000009.bin", 9, b"cache");
+        super::touch(&foreign);
+        assert!(!foreign.join(super::USED).exists());
+        let deceptive = dir.join("dddddddddddddddd");
+        std::fs::create_dir(&deceptive).unwrap();
+        std::fs::write(deceptive.join(super::USED), b"").unwrap();
+        std::fs::write(deceptive.join("important.txt"), b"keep").unwrap();
+        super::store(&deceptive, "runtime-0000000000000009.bin", 9, b"cache");
+        assert!(!deceptive.join("runtime-0000000000000009.bin").exists());
+
+        let mut old = Vec::new();
+        for i in 0..5_u64 {
+            let path = dir.join(format!("{i:016x}"));
+            super::store(&path, &format!("runtime-{i:016x}.bin"), i, b"old");
+            std::fs::write(path.join(super::USED), b"").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path.join(super::USED))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i))
+                .unwrap();
+            old.push(path);
+        }
+
+        let current = dir.join("eeeeeeeeeeeeeeee");
+        super::store(&current, "script-0000000000000009.bin", 9, b"new");
+        std::fs::copy(
+            current.join("script-0000000000000009.bin"),
+            foreign.join("script-0000000000000009.bin"),
+        )
+        .unwrap();
+        assert_eq!(super::load(&foreign, "script-0000000000000009.bin", 9), None);
+
+        let interrupted = dir.join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir(&interrupted).unwrap();
+        std::fs::write(interrupted.join(super::USED), super::USED_CONTENT).unwrap();
+        std::fs::write(interrupted.join("runtime-000000000000000a.bin.tmp42"), b"partial")
+            .unwrap();
+        super::store(&interrupted, "runtime-000000000000000a.bin", 10, b"recovered");
+        assert_eq!(
+            super::load(&interrupted, "runtime-000000000000000a.bin", 10).as_deref(),
+            Some(&b"recovered"[..])
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("important.txt")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::read(deceptive.join("important.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(current.join(super::USED).exists());
+        assert_eq!(old.iter().filter(|path| path.exists()).count(), super::KEEP);
+        assert!(!old[0].exists() && !old[1].exists());
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&current, dir.join("ffffffffffffffff")).is_ok();
+        #[cfg(windows)]
+        let linked =
+            std::os::windows::fs::symlink_dir(&current, dir.join("ffffffffffffffff")).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
+        if linked {
+            assert!(super::cache_namespace_used(&dir.join("ffffffffffffffff")).is_none());
+            super::prune(&current);
+            assert!(dir.join("ffffffffffffffff").exists());
+            assert!(current.exists());
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A folder keeps a bounded size of entries: those used most recently,
@@ -448,7 +681,10 @@ mod cache_check {
             file.set_modified(long_ago(i)).unwrap();
         }
         let present = |i: u64| entry.join(name(i)).exists();
-        let (old_tmp, new_tmp) = (entry.join("script-1.bin.tmp41"), entry.join("script-2.bin.tmp42"));
+        let (old_tmp, new_tmp) = (
+            entry.join("script-0000000000000001.bin.tmp41"),
+            entry.join("script-0000000000000002.bin.tmp42"),
+        );
         std::fs::write(&old_tmp, b"torn").unwrap();
         std::fs::File::options().write(true).open(&old_tmp).unwrap().set_modified(long_ago(0)).unwrap();
         std::fs::write(&new_tmp, b"writing").unwrap();

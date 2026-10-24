@@ -5,6 +5,25 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// The CROSS3 finish helper decodes the callee id from the low 24 bits of its
+/// packed argument. Wider ids must keep the generic cross-call fallback.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn cross3_finish_fid_fits(fid: u32) -> bool {
+    fid <= 0x00FF_FFFF
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod cross3_finish_abi_tests {
+    use super::cross3_finish_fid_fits;
+
+    #[test]
+    fn callee_id_must_fit_the_finish_helpers_low_24_bits() {
+        assert!(cross3_finish_fid_fits(0x00FF_FFFF));
+        assert!(!cross3_finish_fid_fits(0x0100_0000));
+    }
+}
+
 /// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
 /// ways contain multiple plain-function FuncProto ids. This is a plan-time
 /// profitability decision only: the existing helper still resolves and checks
@@ -1912,6 +1931,9 @@ impl<'p> Vm<'p> {
         pending: &mut Vec<u32>,
         baked: &mut Vec<u32>,
     ) -> Option<crate::codegen::SameProtoCross3Plan> {
+        if !cross3_finish_fid_fits(fid) {
+            return None;
+        }
         if (fid as usize)
             >= self
                 .main_func_count
@@ -2341,6 +2363,9 @@ impl<'p> Vm<'p> {
                         crate::heap::HeapObj::Closure { func, .. } => *func,
                         _ => continue,
                     };
+                    if !cross3_finish_fid_fits(fid) {
+                        continue;
+                    }
                     if (fid as usize)
                         >= self
                             .main_func_count

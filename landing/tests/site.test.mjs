@@ -51,6 +51,38 @@ test('inline markup escapes HTML and renders bold, code and links', () => {
   assert.equal(escapeHtml('<a href="x">&'), '&lt;a href=&quot;x&quot;&gt;&amp;')
   assert.equal(inline('**bold** and `code` and [link](/x/) and <b>'), '<strong>bold</strong> and <code>code</code> and <a href="/x/">link</a> and &lt;b&gt;')
   assert.equal(inline('[out](https://example.com/)'), '<a href="https://example.com/" rel="noopener">out</a>')
+  assert.equal(inline('[jump](#section)'), '<a href="#section">jump</a>')
+  assert.equal(inline('[same](https://www.zipp.org/path)'), '<a href="https://www.zipp.org/path">same</a>')
+  assert.equal(inline('[lookalike](https://www.zipp.org.evil/path)'), '<a href="https://www.zipp.org.evil/path" rel="noopener">lookalike</a>')
+  for (const href of ['javascript:alert%281%29', 'data:text/html,hello', '//example.com/', '/\\example.com/']) {
+    assert.equal(inline(`[blocked](${href})`), 'blocked')
+  }
+})
+
+test('content links and images cannot use active URL schemes', () => {
+  const altered = () => structuredClone(content)
+  const cases = [
+    copy => { copy.site.nav[0].href = 'javascript:alert%281%29' },
+    copy => { copy.site.footer.links[0].href = '//example.com/' },
+    copy => { copy.pages.find(page => page.related?.length).related[0].href = 'data:text/html,hello' },
+    copy => { copy.pages.flatMap(page => page.sections.flatMap(section => section.blocks)).find(block => block.type === 'cards').items[0].href = 'javascript:1' },
+    copy => { copy.pages.flatMap(page => page.sections.flatMap(section => section.blocks)).find(block => block.type === 'figure').src = 'data:image/svg+xml,hello' },
+  ]
+  for (const change of cases) {
+    const copy = altered()
+    change(copy)
+    assert.throws(() => renderSite(copy, assets), /Unsafe site (link|image)/)
+  }
+  const copy = altered()
+  copy.site.origin = 'javascript:alert'
+  assert.ok(validateContent(copy).includes('site.origin must be an HTTPS origin'))
+
+  const pageTraversal = altered()
+  pageTraversal.pages[0].slug = '../outside'
+  assert.ok(validateContent(pageTraversal).some(error => error.includes('invalid page slug')))
+  const journalTraversal = altered()
+  journalTraversal.journal.entries[0].slug = '../../outside'
+  assert.ok(validateContent(journalTraversal).some(error => error.includes('invalid journal slug')))
 })
 
 test('sitemap lists every route once with a lastmod, and robots points at it', () => {

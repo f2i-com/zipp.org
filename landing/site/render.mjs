@@ -11,6 +11,36 @@ const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'
 export const escapeHtml = value => String(value).replace(/[&<>"']/g, char => HTML_ESCAPES[char])
 const escapeAttr = escapeHtml
 
+function safeLinkTarget(href) {
+  if (typeof href !== 'string') return false
+  if (href.startsWith('#')) return true
+  if (href.startsWith('/')) return !href.startsWith('//') && !href.includes('\\')
+  if (!href.startsWith('https://')) return false
+  try {
+    const url = new URL(href)
+    return url.protocol === 'https:' && !url.username && !url.password
+  } catch { return false }
+}
+
+function linkHrefAttr(href) {
+  if (!safeLinkTarget(href)) throw new Error(`Unsafe site link: ${JSON.stringify(href)}`)
+  return escapeAttr(href)
+}
+
+function imageSrcAttr(src) {
+  if (!safeLinkTarget(src) || src.startsWith('#')) throw new Error(`Unsafe site image: ${JSON.stringify(src)}`)
+  return escapeAttr(src)
+}
+
+function assetPathAttr(path) {
+  // The build-start validation pass uses empty placeholders; emitted assets
+  // must otherwise stay on this site.
+  if (path !== '' && (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//') || path.includes('\\'))) {
+    throw new Error(`Unsafe site asset: ${JSON.stringify(path)}`)
+  }
+  return escapeAttr(path)
+}
+
 // Inline markup allowed inside JSON text fields, applied after HTML escaping so
 // authors can never inject raw markup by accident:
 //   **bold**   `code`   [label](href)   _emphasis_
@@ -20,9 +50,12 @@ export function inline(text) {
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
   html = html.replace(/(^|[\s(])_([^_\n]+)_(?=[\s.,;:!?)]|$)/g, '$1<em>$2</em>')
   html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, href) => {
-    const external = /^https?:\/\//.test(href) && !href.startsWith('https://www.zipp.org')
+    // Escaping an attribute does not make a URL safe to navigate. Content
+    // currently uses only page fragments, root-relative paths and HTTPS URLs.
+    if (!safeLinkTarget(href)) return label
+    const external = href.startsWith('https://') && new URL(href).origin !== 'https://www.zipp.org'
     const rel = external ? ' rel="noopener"' : ''
-    return `<a href="${escapeAttr(href)}"${rel}>${label}</a>`
+    return `<a href="${linkHrefAttr(href)}"${rel}>${label}</a>`
   })
   return html
 }
@@ -75,7 +108,7 @@ const renderers = {
       .map(item => `<div class="stat"><dt>${inline(item.label)}</dt><dd>${inline(item.value)}</dd>${item.note ? `<p class="stat-note">${inline(item.note)}</p>` : ''}</div>`)
       .join('')}</dl>`,
   figure: block =>
-    `<figure class="media"><img src="${escapeAttr(block.src)}" alt="${escapeAttr(block.alt)}" loading="lazy" decoding="async"${
+    `<figure class="media"><img src="${imageSrcAttr(block.src)}" alt="${escapeAttr(block.alt)}" loading="lazy" decoding="async"${
       block.width ? ` width="${escapeAttr(block.width)}"` : ''
     }${block.height ? ` height="${escapeAttr(block.height)}"` : ''}>${block.caption ? `<figcaption>${inline(block.caption)}</figcaption>` : ''}</figure>`,
   timeline: block =>
@@ -95,7 +128,7 @@ const renderers = {
     `<div class="cards">${block.items
       .map(
         item =>
-          `<a class="card" href="${escapeAttr(item.href)}"><strong>${inline(item.title)}</strong><p>${inline(item.text)}</p></a>`,
+          `<a class="card" href="${linkHrefAttr(item.href)}"><strong>${inline(item.title)}</strong><p>${inline(item.text)}</p></a>`,
       )
       .join('')}</div>`,
   steps: block =>
@@ -144,7 +177,7 @@ function breadcrumbs(site, trail) {
     .map((item, index) =>
       index === items.length - 1
         ? `<li aria-current="page">${inline(item.label)}</li>`
-        : `<li><a href="${escapeAttr(item.href)}">${inline(item.label)}</a></li>`,
+        : `<li><a href="${linkHrefAttr(item.href)}">${inline(item.label)}</a></li>`,
     )
     .join('')}</ol></nav>`
   const data = {
@@ -173,10 +206,10 @@ function shell({ site, assets, route, title, description, canonicalPath, body, s
 <title>${escapeHtml(title)}</title>
 <meta name="description" content="${escapeAttr(description)}">
 ${robots ? `<meta name="robots" content="${escapeAttr(robots)}">
-` : ''}${keywords?.length ? `<meta name="keywords" content="${escapeAttr(keywords.join(', '))}">\n` : ''}<link rel="canonical" href="${escapeAttr(canonical)}">
+` : ''}${keywords?.length ? `<meta name="keywords" content="${escapeAttr(keywords.join(', '))}">\n` : ''}<link rel="canonical" href="${linkHrefAttr(canonical)}">
 <link rel="icon" href="/zipp-bolt.svg" type="image/svg+xml">
-<link rel="stylesheet" href="${escapeAttr(assets.css)}">
-<link rel="alternate" type="application/rss+xml" title="${escapeAttr(site.name)} engineering journal" href="${escapeAttr(site.origin + '/journal/feed.xml')}">
+<link rel="stylesheet" href="${assetPathAttr(assets.css)}">
+<link rel="alternate" type="application/rss+xml" title="${escapeAttr(site.name)} engineering journal" href="${linkHrefAttr(site.origin + '/journal/feed.xml')}">
 <meta name="theme-color" content="#101016">
 <meta name="color-scheme" content="dark">
 <meta property="og:site_name" content="${escapeAttr(site.name)}">
@@ -184,14 +217,14 @@ ${robots ? `<meta name="robots" content="${escapeAttr(robots)}">
 <meta property="og:url" content="${escapeAttr(canonical)}">
 <meta property="og:title" content="${escapeAttr(title)}">
 <meta property="og:description" content="${escapeAttr(description)}">
-<meta property="og:image" content="${escapeAttr(image)}">
+<meta property="og:image" content="${imageSrcAttr(image)}">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="${escapeAttr(site.imageAlt)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${escapeAttr(title)}">
 <meta name="twitter:description" content="${escapeAttr(description)}">
-<meta name="twitter:image" content="${escapeAttr(image)}">
+<meta name="twitter:image" content="${imageSrcAttr(image)}">
 ${dateModified ? `<meta property="article:modified_time" content="${escapeAttr(dateModified)}">\n` : ''}${jsonLd(structuredData)}
 </head>
 <body class="docs${route ? ` route-${escapeAttr(route)}` : ''}">
@@ -199,13 +232,13 @@ ${dateModified ? `<meta property="article:modified_time" content="${escapeAttr(d
 <header class="site-header">
   <a class="brand" href="/"><img src="/zipp-bolt.svg" alt="" width="28" height="28"><span>${escapeHtml(site.name)}</span></a>
   <nav class="site-nav" aria-label="Documentation">${site.nav
-    .map(item => `<a href="${escapeAttr(item.href)}"${item.href === canonicalPath ? ' aria-current="page"' : ''}>${escapeHtml(item.label)}</a>`)
+    .map(item => `<a href="${linkHrefAttr(item.href)}"${item.href === canonicalPath ? ' aria-current="page"' : ''}>${escapeHtml(item.label)}</a>`)
     .join('')}</nav>
 </header>
 ${body}
 <footer class="site-footer">
   <p>${inline(site.footer.text)}</p>
-  <nav aria-label="Footer">${site.footer.links.map(item => `<a href="${escapeAttr(item.href)}">${escapeHtml(item.label)}</a>`).join('')}</nav>
+  <nav aria-label="Footer">${site.footer.links.map(item => `<a href="${linkHrefAttr(item.href)}">${escapeHtml(item.label)}</a>`).join('')}</nav>
 </footer>
 </body>
 </html>
@@ -237,7 +270,7 @@ const wordCount = html => html.replace(/<[^>]+>/g, ' ').split(/\s+/).filter(Bool
 function relatedLinks(items) {
   if (!items?.length) return ''
   return `<nav class="related" aria-label="Related pages"><h2>Keep reading</h2><ul>${items
-    .map(item => `<li><a href="${escapeAttr(item.href)}">${inline(item.label)}</a>${item.text ? ` <span>${inline(item.text)}</span>` : ''}</li>`)
+    .map(item => `<li><a href="${linkHrefAttr(item.href)}">${inline(item.label)}</a>${item.text ? ` <span>${inline(item.text)}</span>` : ''}</li>`)
     .join('')}</ul></nav>`
 }
 
@@ -300,7 +333,7 @@ ${relatedLinks(page.related)}
 function journalEntryCard(entry, { full = false } = {}) {
   const href = `/journal/${entry.slug}/`
   return `<article class="entry" data-tags="${escapeAttr((entry.tags || []).join(' '))}" data-date="${escapeAttr(entry.date)}">
-<header><time datetime="${escapeAttr(entry.date)}">${humanDate(entry.date)}</time><h2><a href="${escapeAttr(href)}">${inline(entry.title)}</a></h2></header>
+<header><time datetime="${escapeAttr(entry.date)}">${humanDate(entry.date)}</time><h2><a href="${linkHrefAttr(href)}">${inline(entry.title)}</a></h2></header>
 <p class="entry-summary">${inline(entry.summary)}</p>
 ${full ? entry.blocks.map(renderBlock).join('\n') : ''}
 <footer>${(entry.tags || []).map(tag => `<a class="tag" href="/journal/#tag-${escapeAttr(tag)}" data-tag="${escapeAttr(tag)}">${escapeHtml(tag)}</a>`).join('')}${
@@ -344,7 +377,7 @@ ${entries
 </div>
 <p class="search-empty" id="journal-empty" hidden>No entries match that search. Try a different word, or clear the filters.</p>
 </main>
-<script src="${escapeAttr(assets.journalJs)}" defer></script>`
+<script src="${assetPathAttr(assets.journalJs)}" defer></script>`
   const structured = [
     {
       '@context': 'https://schema.org',
@@ -510,6 +543,16 @@ Sitemap: ${site.origin}/sitemap.xml
 
 export function validateContent(content) {
   const errors = []
+  // Slugs become output file names as well as links. Each path segment must
+  // be an ordinary URL slug; a dot segment could otherwise escape the output
+  // directory when the Vite plugin emits the generated page.
+  const safeSlug = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/
+  try {
+    const origin = new URL(content.site.origin)
+    if (origin.protocol !== 'https:' || origin.origin !== content.site.origin || origin.username || origin.password) {
+      errors.push('site.origin must be an HTTPS origin')
+    }
+  } catch { errors.push('site.origin must be an HTTPS origin') }
   const seenTitles = new Map()
   const seenPaths = new Set()
   const register = (path, title, description) => {
@@ -522,6 +565,7 @@ export function validateContent(content) {
   }
   for (const page of content.pages) {
     const path = `/${page.slug}/`
+    if (typeof page.slug !== 'string' || !safeSlug.test(page.slug)) errors.push(`${path}: invalid page slug`)
     register(path, page.title, page.description)
     if (!page.h1) errors.push(`${path}: missing h1`)
     if (!page.lede) errors.push(`${path}: missing lede`)
@@ -540,6 +584,7 @@ export function validateContent(content) {
   const slugs = new Set()
   for (const entry of content.journal.entries) {
     const path = `/journal/${entry.slug}/`
+    if (typeof entry.slug !== 'string' || !safeSlug.test(entry.slug)) errors.push(`${path}: invalid journal slug`)
     if (slugs.has(entry.slug)) errors.push(`Duplicate journal slug ${entry.slug}`)
     slugs.add(entry.slug)
     register(path, entry.title, entryDescription(entry))

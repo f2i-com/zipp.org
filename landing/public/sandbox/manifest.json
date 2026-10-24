@@ -6,7 +6,7 @@
   "commit": "58c92a59b991b29f80fc7aa5d0d91e9dc119b17a",
   "loader": {
     "file": "zipp.mjs",
-    "sha256": "bcd3ed044994197572f36f6a8b9e64fad6825d19d743ff4d24b7d64a85916654",
+    "sha256": "a12d5fae49ebc9e95911ce7ce35a781c0246a08d933c2a2d0fac8ac81e9b640b",
     "version": "1.3.0"
   }
 }

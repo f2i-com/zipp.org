@@ -50,3 +50,8 @@ restricted account, container, or platform sandbox with filesystem, network,
 process, CPU, and memory controls. Keep any enabled import root host-controlled
 and read-only. Where native execution is unnecessary, the repository's
 `zipp-wasm` dedicated-Worker design provides the stronger memory boundary.
+
+The VM heap ceiling starts after parsing and compilation. The worker's source
+is limited to 2 MiB and the supervisor enforces a deadline, but neither is a
+process-memory ceiling. Apply an OS memory limit before starting the worker
+when the source is hostile.

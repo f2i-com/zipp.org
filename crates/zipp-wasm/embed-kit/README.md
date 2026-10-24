@@ -82,6 +82,11 @@ const sandbox = await zipp.createSandbox({
 | `network: [allowed URLs]`, `true`, or `{ allow, methods, maxResponseBytes, timeoutMs, redirects }` | a `fetch(url, init)` that reaches only the URLs listed (an origin, or a URL prefix), with no cookies or credentials, the forbidden headers removed, redirects refused unless allowed (then up to 5, each destination checked against the list before it is requested; a browser does not reveal a redirect's destination, so there one still fails the request), a time limit and a 1 MB response limit by default; the reply has `status`, `ok`, `headers.get()`, `text()` and `json()` | `fetch` does not exist |
 | `host: { kind: fn }` | `host.call(kind, args, reply => ...)`; your function's return value (or promise) arrives as `{ ok: true, value }` | `{ ok: false, error: { code: "denied" } }` |
 
+Seeded storage and file entries must fit their quotas before a sandbox starts.
+A trusted in-process storage `backend` owns its data and limits, so it cannot
+be combined with `initial` or `quota`. Sandboxes using the same backend and
+prefix share that backend's state; assign a distinct prefix per tenant.
+
 A host function runs with `this.signal`, an `AbortSignal` that aborts when
 the sandbox closes or gives the request up (its time limit passed); a
 `fetch` the program makes is aborted the same way. At most 64 of a
@@ -90,10 +95,20 @@ starting. A function that ignores the signal keeps its place until it
 returns, and whatever it returns then is discarded; `usage()` reports
 `hostRequestsRunning` and `hostRequestsWaiting`. `close()` settles a `run` or
 `call` still waiting on host requests at once, with a `closed` error.
+Under isolation, a host function's return value must be transferable by the
+Worker's structured clone operation. An unsupported value answers that call
+with `{ ok: false, error: { code: "host" } }`.
 
 Unknown option names are errors, so a typo cannot quietly drop a limit.
+Only an options object's own properties are read; inherited properties cannot
+grant permissions or change the default Worker isolation.
 `network: true` allows any http(s) URL under the same rules; prefer listing
 the origins or URL prefixes a program needs.
+A bare canonical origin such as `https://api.example.com` grants that whole
+origin; its root-slash prefix (`https://api.example.com/`) covers the same
+paths. Other entries are matched as full URL prefixes. For example,
+`https://api.example.com/?scope=read` does not allow
+`https://api.example.com/other`.
 
 What each language can be given in this release:
 

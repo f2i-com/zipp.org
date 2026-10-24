@@ -31,13 +31,13 @@ export interface ZippMeta {
 }
 
 export interface ZippStoragePermission {
-  /** Items the program's localStorage starts with. */
+  /** Items the in-memory localStorage starts with; omit when using backend. */
   initial?: Record<string, string>;
-  /** Characters of keys plus values it may hold (default 5,000,000). */
+  /** Characters of keys plus values it may hold, including initial items (default 5,000,000); in-memory only. */
   quota?: number;
-  /** A trusted Storage (getItem/setItem/removeItem/key/length), seen only under `prefix`; isolate: false only. */
+  /** A trusted Storage (getItem/setItem/removeItem/key/length), seen only under `prefix`; isolate: false only. The backend owns its quota; give each tenant a distinct prefix. */
   backend?: Storage;
-  /** The key prefix in `backend` (default "zipp:"). */
+  /** Nonempty key prefix in `backend` (default "zipp:"); use a distinct prefix per tenant. */
   prefix?: string;
 }
 
@@ -45,7 +45,7 @@ export interface ZippFilesPermission {
   files: Record<string, string>;
   /** Allow fs.write and fs.remove (default false). */
   writable?: boolean;
-  /** Characters of paths plus contents the files may hold (default 16,000,000). */
+  /** Characters of paths plus contents the files may hold, including initial entries (default 16,000,000). */
   quota?: number;
 }
 
@@ -91,7 +91,8 @@ export interface ZippSandboxOptions {
   /**
    * Functions the program may call with host.call(kind, args, reply). Each
    * runs with `this.signal`, aborted when the sandbox closes or gives the
-   * request up; at most 64 run at once, the rest waiting in order.
+   * request up; at most 64 run at once, the rest waiting in order. Under
+   * isolation, return values must support the Worker's structured clone.
    */
   host?: Record<string, (this: ZippHostRequest, ...args: string[]) => unknown>;
   /** A served copy of zipp.mjs for the Worker, when zipp.mjs is bundled. */

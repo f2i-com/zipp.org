@@ -77,6 +77,9 @@ a complete memory-safety boundary: the native allocator, standard library,
 toolchain output, and OS remain outside the engines' unsafe-code prohibition.
 Resource meters are also not exact RSS accounting, and a single expensive
 native operation may run between instruction polls.
+The VM heap limit starts after parsing and compilation; the source-size cap and
+supervisor deadline cover that phase, but an OS memory limit is needed to bound
+the worker's total resident memory.
 
 In `safe-sandbox`, regular-expression execution has bounded backtracking steps,
 scratch space, captures, scan results, and replacement-result retention.

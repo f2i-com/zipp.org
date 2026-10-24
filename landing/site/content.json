@@ -3205,7 +3205,7 @@
               "type": "code",
               "caption": "zipp --help, abridged",
               "lang": "text",
-              "code": "zipp js  <file.js>            run a script (compat goal; --script-goal for pure Script)\nzipp mjs <file.mjs>           run a file as an ES module\nzipp py  <file.py | dir>      run a Python program or project\nzipp run [--lang=L] <file>    pick the frontend by flag, extension or shebang\nzipp sandbox <flags> <file>   hardened run with explicit limits\nzipp --version --json         build identity: source commit, dirty flag, rustc, jit"
+              "code": "zipp js  <file.js>            run a script (compat goal; --script-goal for pure Script)\nzipp mjs <file.mjs>           run a file as an ES module\nzipp py  <file.py | dir>      run a Python program or project\nzipp run [--lang=L] <file>    pick the frontend by flag, extension or shebang\nzipp sandbox <flags> <file>   supervised run with explicit limits\nzipp --version --json         build identity: source commit, dirty flag, rustc, jit"
             },
             {
               "type": "p",

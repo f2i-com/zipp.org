@@ -230,12 +230,14 @@ fn run_supervisor(args: &[String], frontend: Frontend) -> Result<(), String> {
         }
     };
 
-    let out = out_thread
+    let out_result = out_thread
         .join()
         .map_err(|_| "sandbox stdout reader panicked")?;
-    let err = err_thread
+    let err_result = err_thread
         .join()
         .map_err(|_| "sandbox stderr reader panicked")?;
+    let out = out_result.map_err(|e| format!("cannot read sandbox stdout: {e}"))?;
+    let err = err_result.map_err(|e| format!("cannot read sandbox stderr: {e}"))?;
     // A fast child can exit between filling the pipe and the reader flagging
     // overflow. Joining the readers closes that race before success is reported.
     if stopped_for.is_none() && overflow.load(Ordering::Acquire) {
@@ -716,14 +718,16 @@ fn drain_bounded<R: Read + Send + 'static>(
     limit: usize,
     total: Arc<AtomicUsize>,
     overflow: Arc<AtomicBool>,
-) -> Result<std::thread::JoinHandle<Vec<u8>>, String> {
+) -> Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>, String> {
     std::thread::Builder::new()
         .spawn(move || {
             let mut kept = Vec::new();
             let mut chunk = [0_u8; 8192];
             loop {
                 let n = match reader.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
                     Ok(n) => n,
                 };
                 let before = total.fetch_add(n, Ordering::AcqRel);
@@ -733,7 +737,7 @@ fn drain_bounded<R: Read + Send + 'static>(
                     overflow.store(true, Ordering::Release);
                 }
             }
-            kept
+            Ok(kept)
         })
         .map_err(|e| format!("cannot start sandbox output reader: {e}"))
 }
@@ -790,5 +794,39 @@ mod tests {
         let forwarded = String::from_utf8(sanitize_terminal(input.as_bytes())).unwrap();
         assert_eq!(forwarded, "prefix?]0;pwn?\nline\ttab?spoof?✓");
         assert_eq!(sanitize_text(b"ok\xff\x1b", false), b"ok??");
+    }
+
+    #[test]
+    fn output_reader_errors_are_not_treated_as_eof() {
+        struct FailingReader(u8);
+        impl Read for FailingReader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    self.0 += 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.0 > 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected pipe failure",
+                    ));
+                }
+                self.0 += 1;
+                bytes[..2].copy_from_slice(b"ok");
+                Ok(2)
+            }
+        }
+
+        let total = Arc::new(AtomicUsize::new(0));
+        let overflow = Arc::new(AtomicBool::new(false));
+        let read = drain_bounded(FailingReader(0), 16, Arc::clone(&total), overflow)
+            .expect("start output reader")
+            .join()
+            .expect("output reader did not panic");
+        assert_eq!(
+            read.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(total.load(Ordering::Acquire), 2);
     }
 }

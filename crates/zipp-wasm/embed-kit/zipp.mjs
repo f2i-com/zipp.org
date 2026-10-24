@@ -406,10 +406,32 @@ const MAX_RESPONSE_BYTES = 1000000; // a guest string holds at most 1,048,576 by
 const STORAGE_QUOTA = 5000000;
 const FILES_QUOTA = 16000000;
 
+function sizeLimit(value, what) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`zipp: ${what} must be a nonnegative integer`);
+  }
+  return value;
+}
+
+function timeLimit(value, what) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > 2147483647) {
+    throw new TypeError(`zipp: ${what} must be a number of milliseconds in (0, 2147483647]`);
+  }
+  return value;
+}
+
+function mapSize(entries) {
+  let size = 0;
+  for (const [key, value] of new Map(entries)) size += key.length + value.length;
+  return size;
+}
+
 function onlyKeys(object, allowed, what) {
   for (const key of Object.keys(object)) {
     if (!allowed.has(key)) throw new TypeError(`zipp: unknown ${what} option "${key}"`);
   }
+  // Missing options must not be supplied by a polluted Object.prototype.
+  return Object.assign(Object.create(null), object);
 }
 
 function plainObject(value) {
@@ -430,38 +452,46 @@ function filePath(path) {
 // storage backend).
 function normalize(zipp, options) {
   if (!plainObject(options)) throw new TypeError("zipp: sandbox options must be an object");
-  onlyKeys(options, SANDBOX_OPTIONS, "sandbox");
+  options = onlyKeys(options, SANDBOX_OPTIONS, "sandbox");
   const language = options.language ?? "javascript";
   if (!zipp.languages.includes(language)) {
     throw new TypeError(`zipp: the ${zipp.meta.variant} engine runs ${zipp.languages.join(" and ")}, not ${language}`);
   }
-  const limits = options.limits ?? {};
+  let limits = options.limits ?? {};
   if (!plainObject(limits)) throw new TypeError("zipp: limits must be an object");
-  onlyKeys(limits, LIMIT_OPTIONS, "limits");
-  const timeoutMs = limits.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  if (!(timeoutMs > 0 && timeoutMs <= 2147483647)) throw new TypeError("zipp: limits.timeoutMs must be a number of milliseconds in (0, 2147483647]");
+  limits = onlyKeys(limits, LIMIT_OPTIONS, "limits");
+  const timeoutMs = timeLimit(limits.timeoutMs ?? DEFAULT_TIMEOUT_MS, "limits.timeoutMs");
   const instructions = limits.instructions ?? null;
-  if (instructions !== null && !(Number.isFinite(instructions) && instructions > 0)) {
-    throw new TypeError("zipp: limits.instructions must be a positive number");
+  if (instructions !== null && !(typeof instructions === "number" && Number.isSafeInteger(instructions) && instructions > 0)) {
+    throw new TypeError("zipp: limits.instructions must be a positive integer");
   }
 
-  const permissions = options.permissions ?? {};
+  let permissions = options.permissions ?? {};
   if (!plainObject(permissions)) throw new TypeError("zipp: permissions must be an object");
-  onlyKeys(permissions, PERMISSION_OPTIONS, "permissions");
+  permissions = onlyKeys(permissions, PERMISSION_OPTIONS, "permissions");
   const local = { backend: null, network: null, host: new Map() };
 
   let storage = null;
   if (permissions.storage) {
-    const s = permissions.storage === true ? {} : permissions.storage;
+    let s = permissions.storage === true ? {} : permissions.storage;
     if (!plainObject(s)) throw new TypeError("zipp: permissions.storage must be true or an object");
-    onlyKeys(s, STORAGE_OPTIONS, "storage");
+    s = onlyKeys(s, STORAGE_OPTIONS, "storage");
     const initial = s.initial ?? {};
     if (!plainObject(initial)) throw new TypeError("zipp: permissions.storage.initial must be an object of strings");
+    if (s.backend && (s.quota !== undefined || Object.keys(initial).length)) {
+      throw new TypeError("zipp: a storage backend owns its data and quota; omit initial and quota");
+    }
+    if (s.backend && s.prefix !== undefined && (typeof s.prefix !== "string" || s.prefix.length === 0)) {
+      throw new TypeError("zipp: permissions.storage.prefix must be a nonempty string");
+    }
     storage = {
       initial: Object.entries(initial).map(([k, v]) => [String(k), String(v)]),
-      quota: s.quota ?? STORAGE_QUOTA,
-      prefix: s.backend ? String(s.prefix ?? "zipp:") : null,
+      quota: sizeLimit(s.quota ?? STORAGE_QUOTA, "permissions.storage.quota"),
+      prefix: s.backend ? (s.prefix ?? "zipp:") : null,
     };
+    if (mapSize(storage.initial) > storage.quota) {
+      throw new TypeError("zipp: permissions.storage.initial exceeds its quota");
+    }
     if (s.backend) {
       for (const m of ["getItem", "setItem", "removeItem", "key"]) {
         if (typeof s.backend[m] !== "function") throw new TypeError(`zipp: permissions.storage.backend needs ${m}()`);
@@ -472,14 +502,17 @@ function normalize(zipp, options) {
 
   let files = null;
   if (permissions.files) {
-    const f = plainObject(permissions.files) && "files" in permissions.files ? permissions.files : { files: permissions.files };
+    let f = plainObject(permissions.files) && Object.hasOwn(permissions.files, "files") ? permissions.files : { files: permissions.files };
     if (!plainObject(f.files)) throw new TypeError("zipp: permissions.files must map paths to text");
-    onlyKeys(f, FILES_OPTIONS, "files");
+    f = onlyKeys(f, FILES_OPTIONS, "files");
     files = {
       entries: Object.entries(f.files).map(([p, text]) => [filePath(p), String(text)]),
       writable: f.writable === true,
-      quota: f.quota ?? FILES_QUOTA,
+      quota: sizeLimit(f.quota ?? FILES_QUOTA, "permissions.files.quota"),
     };
+    if (mapSize(files.entries) > files.quota) {
+      throw new TypeError("zipp: permissions.files entries exceed their quota");
+    }
   }
 
   let network = false;
@@ -488,17 +521,25 @@ function normalize(zipp, options) {
     if (n === true) n = { allow: ["*"] };
     else if (Array.isArray(n) || typeof n === "string") n = { allow: [].concat(n) };
     if (!plainObject(n)) throw new TypeError("zipp: permissions.network must be true, a list of allowed URLs, or an object");
-    onlyKeys(n, NETWORK_OPTIONS, "network");
+    n = onlyKeys(n, NETWORK_OPTIONS, "network");
     const allow = [].concat(n.allow ?? []).map(String);
     if (allow.length === 0) throw new TypeError("zipp: permissions.network.allow lists no URL");
     for (const entry of allow) {
-      if (entry !== "*" && !/^https?:\/\//i.test(entry)) throw new TypeError(`zipp: allowed network entry "${entry}" is not an http(s) URL or "*"`);
+      if (entry === "*") continue;
+      let url;
+      try { url = new URL(entry); } catch { /* rejected below */ }
+      if (!/^https?:\/\//i.test(entry) || !url || !["http:", "https:"].includes(url.protocol)) {
+        throw new TypeError(`zipp: allowed network entry "${entry}" is not an http(s) URL or "*"`);
+      }
+      if (url.username || url.password) {
+        throw new TypeError(`zipp: allowed network entry "${entry}" must not contain credentials`);
+      }
     }
     local.network = {
       allow,
       methods: [].concat(n.methods ?? ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]).map(m => String(m).toUpperCase()),
-      maxResponseBytes: n.maxResponseBytes ?? MAX_RESPONSE_BYTES,
-      timeoutMs: n.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxResponseBytes: sizeLimit(n.maxResponseBytes ?? MAX_RESPONSE_BYTES, "permissions.network.maxResponseBytes"),
+      timeoutMs: timeLimit(n.timeoutMs ?? DEFAULT_TIMEOUT_MS, "permissions.network.timeoutMs"),
       redirects: n.redirects === true,
       fetch: n.fetch ?? globalThis.fetch?.bind(globalThis),
     };
@@ -522,11 +563,12 @@ function normalize(zipp, options) {
   }
 
   const isolate = options.isolate ?? true;
+  if (typeof isolate !== "boolean") throw new TypeError("zipp: isolate must be a boolean");
   if (isolate && local.backend) {
     throw new TypeError("zipp: a storage backend stays on this thread; give an isolated sandbox `initial` data instead, or set isolate: false");
   }
   const spec = { language, instructions, timeoutMs, storage, files, network };
-  return { spec, local, isolate: Boolean(isolate), workerUrl: options.workerUrl ?? null };
+  return { spec, local, isolate, workerUrl: options.workerUrl ?? null };
 }
 
 // --- The engine side: one program, its bridges and its host-call pump ------
@@ -693,10 +735,16 @@ function sandboxCore(bindings, spec, dispatch, backend) {
     return dead;
   }
   function collect() {
-    try {
-      output.push(...drain(() => engine.takeOutput(), line => line));
-    } catch {
-      // A disposed engine has no buffer left.
+    for (;;) {
+      let page;
+      try {
+        page = engine.takeOutput();
+      } catch (error) {
+        if (engine.disposed === true) return;
+        throw error;
+      }
+      if (!Array.isArray(page) || page.length === 0) return;
+      for (const line of page) output.push(line);
     }
   }
 
@@ -838,9 +886,9 @@ function allowed(url, allow) {
   return allow.some(entry => {
     if (entry === "*") return true;
     const base = new URL(entry);
-    // An origin ("https://api.example.com") allows its whole origin; a URL
-    // with a path allows that prefix.
-    return base.pathname === "/" && !entry.endsWith("/") ? url.origin === base.origin : url.href.startsWith(base.href);
+    // A canonical bare origin grants its whole origin. Other entries are URL
+    // prefixes; a root slash prefix also covers every path on that origin.
+    return entry === base.origin ? url.origin === base.origin : url.href.startsWith(base.href);
   });
 }
 
@@ -1167,7 +1215,19 @@ async function isolatedSandbox(zipp, spec, requests, workerUrl) {
       serving.set(message.hid, controller);
       const result = await requests.dispatch(message.kind, message.args, controller.signal);
       serving.delete(message.hid);
-      if (!dead && !controller.signal.aborted) port.post({ type: "host-reply", hid: message.hid, result });
+      if (!dead && !controller.signal.aborted) {
+        try {
+          port.post({ type: "host-reply", hid: message.hid, result });
+        } catch {
+          // A granted host function may return a value that cannot cross the
+          // Worker boundary. Answer the call instead of rejecting this listener.
+          try {
+            port.post({ type: "host-reply", hid: message.hid, result: deny("host", "the host result cannot be sent to the sandbox") });
+          } catch {
+            die(new ZippSandboxError("host", "zipp: the sandbox Worker could not receive a host reply", { terminal: true }));
+          }
+        }
+      }
     } else if (message.type === "host-abandon") {
       serving.get(message.hid)?.abort(new ZippSandboxError("timeout", "zipp: the sandbox gave the request up"));
     } else if (message.type === "crash") {
