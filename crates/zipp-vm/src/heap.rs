@@ -298,6 +298,21 @@ fn renumber_above(slots: &mut [u32], slot: u32) {
     }
 }
 
+/// A hint that the cache line at `p` is about to be read. A prefetch reads
+/// nothing architecturally and cannot fault, so any address will do. Written
+/// with SSE on x86_64 (baseline; not in the safe-sandbox profile, which has
+/// no unsafe code); nothing elsewhere.
+#[inline(always)]
+fn prefetch_line<T>(p: *const T) {
+    #[cfg(all(target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    // SAFETY: PREFETCHT0 is a hint with no architectural effect.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast::<i8>());
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "safe-sandbox"))))]
+    let _ = p;
+}
+
 /// [`ObjMap`]'s side index for canonical Array-index keys: index -> slot, in
 /// [`PropIndex::Split`]'s layout (parallel arrays, linear probing,
 /// backward-shift removal) so that a removal renumbers it with the same
@@ -8381,6 +8396,19 @@ impl Heap {
         // the heap (a `Box::new` on the pool-miss path is a malloc, not a
         // collection), so neither `shell` nor `reuse_base` can be stale.
         let mut shell = self.obj_pool.pop();
+        // The pool is the last sweep's dead shells, long cold by the time a
+        // literal pops one. Ask for the shell after next now, and for the
+        // value cell of the next one, whose map that request brought in at
+        // the previous pop.
+        let pooled = self.obj_pool.len();
+        if pooled >= 2 {
+            prefetch_line::<ObjMap>(&*self.obj_pool[pooled - 2]);
+        }
+        if let Some(next) = self.obj_pool.last() {
+            if let ValStore::Slab { base, .. } = &next.vals {
+                prefetch_line(std::ptr::with_exposed_provenance::<Value>(*base));
+            }
+        }
         let mut reuse_base = None;
         if let Some(b) = shell.as_deref_mut() {
             let attached = match &b.vals {
@@ -8515,6 +8543,13 @@ impl Heap {
         self.live += 1;
         if self.live >= self.gc_threshold {
             self.gc_requested = true;
+        }
+        // The next reuse writes the next free slot and its mirror, both
+        // last touched by the sweep that freed them: ask for them now.
+        if let Some(&next) = self.free.last() {
+            prefetch_line(self.objs.as_ptr().wrapping_add(next as usize));
+            #[cfg(feature = "jit")]
+            prefetch_line(self.hot_mirror.as_ptr().wrapping_add(next as usize));
         }
         // The same look `alloc_settled` takes: these lanes are how compiled
         // code allocates, and a loop that pushes an array to a megabyte and
@@ -9581,7 +9616,24 @@ impl Heap {
         {
             self.obj_pool_refill_scope(true);
         }
-        for &idx in &log {
+        // The log is in allocation order, which recycled slots scatter, so
+        // each dead entry's slot is a cold line, and an ordinary object's map
+        // behind its Box a second one (the two hottest lines of `free_slot`).
+        // Ask for the slot eight entries ahead and, once it has had time to
+        // arrive, a dead object's map four ahead.
+        const SLOT_AHEAD: usize = 8;
+        const MAP_AHEAD: usize = 4;
+        for (j, &idx) in log.iter().enumerate() {
+            if let Some(&ahead) = log.get(j + SLOT_AHEAD) {
+                prefetch_line(self.objs.as_ptr().wrapping_add(ahead as usize));
+            }
+            if let Some(&near) = log.get(j + MAP_AHEAD) {
+                if !marks[near as usize] {
+                    if let HeapObj::Object(m) = &self.objs[near as usize] {
+                        prefetch_line::<ObjMap>(&**m);
+                    }
+                }
+            }
             if !marks[idx as usize] {
                 self.free_slot(idx);
                 swept += 1;
