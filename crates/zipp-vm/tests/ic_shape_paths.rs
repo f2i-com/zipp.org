@@ -122,6 +122,31 @@ const w2 = new Wide(2); w2.extra = 1; const w3 = new Wide(3);
 log("wide siblings", Object.keys(w2).length, Object.keys(w3).length, w3.k17, "extra" in w3);
 function Branchy(f) { this.a = 1; if (f) { this.b = 2; this.c = 3; } else { this.c = 3; this.b = 2; } this.d = 4; }
 log("branchy", heat((i) => JSON.stringify(new Branchy(i & 1))), JSON.stringify(new Branchy(0)));
+
+// A string key that spells a private name never answers the private name.
+class Priv {
+  #flags = 1;
+  static read(o) { return o.#flags; }
+  static write(o, v) { o.#flags = v; return o.#flags; }
+}
+const p1 = new Priv(); p1["#flags"] = "string prop";
+const fake = { "#flags": "fake", other: 1 };
+log("private read", heat(() => Priv.read(p1)), p1["#flags"]);
+log("private write", heat((i) => Priv.write(p1, i)), p1["#flags"]);
+log("private fake", heat(() => { try { return Priv.read(fake); } catch (e) { return e.constructor.name; } }));
+log("private fake write", heat(() => { try { return Priv.write(fake, 5); } catch (e) { return e.constructor.name; } }), fake["#flags"]);
+
+// One field read and written through more layouts than a site's ways.
+const many = [];
+for (let i = 0; i < 40; i++) { const o = { kind: i, flags: 0 }; o["x" + (i % 13)] = i; if (i % 3) o.extra = 1; many.push(o); }
+log("mega rw", heat((i) => { const o = many[i % 40]; o.flags |= 4; const r = (o.flags & 4) !== 0; o.flags &= ~4; return r + ":" + o.kind; }));
+Object.defineProperty(many[7], "flags", { get() { return 99; }, set(v) {}, configurable: true });
+log("mega accessor", heat((i) => { const o = many[i % 40]; return o.flags; }), many[7].flags);
+Object.freeze(many[9]);
+log("mega frozen", heat((i) => { const o = many[i % 40]; try { o.flags = 7; } catch (e) { return e.constructor.name; } return o.flags; }), many[9].flags);
+log("mega frozen each", many.slice(0, 12).map((o) => { try { o.flags = 8; return o.flags; } catch (e) { return e.constructor.name; } }).join());
+delete many[11].flags;
+log("mega deleted", heat((i) => String(many[i % 40].flags)), String(many[11].flags));
 console.log(out.join("\n"));
 "##;
 

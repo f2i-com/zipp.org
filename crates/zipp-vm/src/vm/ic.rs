@@ -109,6 +109,12 @@ pub(crate) struct OwnSlot {
 
 impl OwnSlot {
     pub(crate) const EMPTY: OwnSlot = OwnSlot { shape: crate::shape::DICT, len: 0, slot: 0, w0: 0, w1: 0 };
+    /// In `slot`: the property there is an accessor. A shape fixes its
+    /// properties' attributes, so the bit holds as long as the answer does.
+    const ACCESSOR: u32 = 1 << 31;
+    /// In `slot`: the data property there is not writable.
+    const READONLY: u32 = 1 << 30;
+    const FLAGS: u32 = Self::ACCESSOR | Self::READONLY;
 }
 
 /// A key of at most 16 bytes as two little-endian words, zero-padded.
@@ -152,6 +158,28 @@ fn own_slot_index(shape: u32, w0: u64, len: usize) -> usize {
 }
 #[cfg(all(feature = "meter-only", not(feature = "jit")))]
 pub(crate) const IC_NO_FIB_GLOBAL: u32 = u32::MAX;
+
+/// `ZIPP_NO_IC_MEGA=1` turns off `Vm::ic_get_prop_mega` and
+/// `Vm::ic_set_prop_mega` (the reads and writes then take the full cache
+/// calls, as before), for an A/B on one binary.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[inline]
+fn ic_mega_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_IC_MEGA").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
 
 /// Let loader-installed module functions retain the same guarded call/property
 /// feedback as main-program functions. Runtime module and eval functions share
@@ -420,6 +448,15 @@ impl SiteCell {
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_read(&self, shape: u32) -> Option<u32> {
         (self.own_shape == shape).then_some(self.own_slot & !Self::WRITE_PROVEN)
+    }
+
+    /// Whether the instruction has found its key as an own data property of
+    /// some layout (`Vm::ic_get_prop_mega` and `Vm::ic_set_prop_mega` try only
+    /// there).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", not(feature = "safe-sandbox"))), allow(dead_code))]
+    fn knows_own(&self) -> bool {
+        self.own_shape != crate::shape::DICT
     }
 
     /// The slot a write of the key may store to in a receiver of `shape`.
@@ -894,7 +931,7 @@ impl<'p> Vm<'p> {
         let cell = &self.own_slot_cache[own_slot_index(sh, w0, b.len())];
         let e = cell.get();
         if e.shape == sh && e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 {
-            let r = (e.slot != u32::MAX).then_some(e.slot as usize);
+            let r = (e.slot != u32::MAX).then_some((e.slot & !OwnSlot::FLAGS) as usize);
             debug_assert_eq!(r, m.pos(key), "own_slot_cache: a stale answer for {key:?}");
             return r;
         }
@@ -902,11 +939,133 @@ impl<'p> Vm<'p> {
         cell.set(OwnSlot {
             shape: sh,
             len: b.len() as u32,
-            slot: r.map_or(u32::MAX, |s| s as u32),
+            slot: r.map_or(u32::MAX, |s| {
+                let a = m.attr_at(s);
+                s as u32
+                    | if a.accessor {
+                        OwnSlot::ACCESSOR
+                    } else if !a.writable {
+                        OwnSlot::READONLY
+                    } else {
+                        0
+                    }
+            }),
             w0,
             w1,
         });
         r
+    }
+
+    /// The slot of an own writable DATA property `key` of every object of
+    /// `shape`, when the (shape, key) memo already holds the answer.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn own_writable_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
+        let b = key.as_bytes();
+        if sh == crate::shape::DICT || b.len() > 16 {
+            return None;
+        }
+        let (w0, w1) = key_words(b);
+        let e = self.own_slot_cache[own_slot_index(sh, w0, b.len())].get();
+        (e.shape == sh && e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 && e.slot & OwnSlot::FLAGS == 0)
+            .then_some(e.slot)
+    }
+
+    /// [`Self::ic_get_prop_mega`] for a write: an own writable data property
+    /// stored through the receiver's mirror, as the cache's own-data hit
+    /// stores it (`ic_set_prop_own_hit`), from the (shape, key) memo. A class
+    /// prototype, whose writes must reach `set_prop`, is pinned to `DICT`
+    /// (`mark_class_proto`) and never matches. `false` for anything else.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn ic_set_prop_mega(&mut self, func_id: u32, ip: usize, recv: Value, key: &str, val: Value) -> bool {
+        if !recv.is_heap()
+            || is_private_key(key)
+            || !self.deferred_ns_state.is_empty()
+            || !self.interp_own_resolve_vm_is_interpreter()
+            || !ic_mega_enabled()
+        {
+            return false;
+        }
+        // As for the read: only where a write has stored an own field before.
+        if !self.ic_cell(func_id, ip).is_some_and(SiteCell::knows_own) {
+            return false;
+        }
+        let idx = recv.heap_index();
+        let mir = self.heap.hot_mirror_of(idx);
+        if mir.shape == crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE {
+            return false;
+        }
+        let Some(slot) = self.own_writable_slot_cached(mir.shape, key) else {
+            return false;
+        };
+        if val.is_heap() {
+            self.heap.write_barrier_val(idx, val);
+        }
+        // SAFETY: as for the read in `ic_get_prop_mega`; the barrier above
+        // allocates nothing and moves no column.
+        unsafe { *(mir.vals as *mut Value).add(slot as usize) = val };
+        self.ic_cell_own(func_id, ip, mir.shape, slot as usize, true);
+        true
+    }
+
+    /// The slot of an own DATA property `key` of every object of `shape`,
+    /// when the (shape, key) memo already holds the answer; `None` for an
+    /// accessor, an absent key and a memo miss alike.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn own_data_slot_cached(&self, sh: u32, key: &str) -> Option<u32> {
+        let b = key.as_bytes();
+        if sh == crate::shape::DICT || b.len() > 16 {
+            return None;
+        }
+        let (w0, w1) = key_words(b);
+        let e = self.own_slot_cache[own_slot_index(sh, w0, b.len())].get();
+        (e.shape == sh
+            && e.len == b.len() as u32
+            && e.w0 == w0
+            && e.w1 == w1
+            && e.slot & OwnSlot::ACCESSOR == 0)
+            .then_some(e.slot & !OwnSlot::FLAGS)
+    }
+
+    /// A read of `recv.key` that missed the inline hits, in a pure-
+    /// interpreter VM: an own data property answered from the receiver's
+    /// mirror and the (shape, key) memo alone, as `ic_get_prop`'s own
+    /// resolve would answer it after its site probe, the receiver's heap
+    /// slot and map, the namespace test and the ways. A field read through
+    /// more layouts than the inline hits keep (`node.flags` over a
+    /// compiler's AST) took that whole call on most reads. `None` for
+    /// anything else, which goes on to the call.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn ic_get_prop_mega(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
+        // A private name is its brand's, never a string key's that spells it.
+        if !recv.is_heap()
+            || is_private_key(key)
+            || !self.deferred_ns_state.is_empty()
+            || !self.interp_own_resolve_vm_is_interpreter()
+            || !ic_mega_enabled()
+        {
+            return None;
+        }
+        // Only an instruction that has read an own data property before (its
+        // cell holds a layout): an inherited method's, an accessor's or a
+        // miss's site would probe the memo for nothing before the full call
+        // asks it again.
+        if !self.ic_cell(func_id, ip).is_some_and(SiteCell::knows_own) {
+            return None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE {
+            return None;
+        }
+        let slot = self.own_data_slot_cached(mir.shape, key)?;
+        // SAFETY: the mirror's shape proves `vals` is the map's live value
+        // column, and the memo's answer for that shape that it holds `slot`.
+        let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
+        self.ic_cell_own(func_id, ip, mir.shape, slot as usize, false);
+        Some(v)
     }
 
     /// The proto-chain leg of [`Vm::ic_walk`], starting from the link OUT of
@@ -1370,8 +1529,24 @@ impl<'p> Vm<'p> {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_proto_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
-        let (idx, m) = self.ic_recv_map(recv)?;
-        if !self.ic_func_eligible(func_id) {
+        // The site's way 0 before the receiver's map: an own-data site, which
+        // the own hit just missed through another layout, leaves here
+        // without touching the receiver's heap slot and map (two cold lines
+        // of a megamorphic field read, on every read the own hit missed). A
+        // shaped mirror (the own hit's, just read) already proves an object;
+        // anything else is told apart by its slot's kind first, so a string's
+        // or an array's `length` still leaves on that one load.
+        if !recv.is_heap() || !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        #[cfg(feature = "jit")]
+        if self.heap.hot_mirror_of(recv.heap_index()).shape == crate::shape::DICT
+            && !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_))
+        {
+            return None;
+        }
+        #[cfg(not(feature = "jit"))]
+        if !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
             return None;
         }
         let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
@@ -1387,6 +1562,7 @@ impl<'p> Vm<'p> {
         else {
             return None;
         };
+        let (idx, m) = self.ic_recv_map(recv)?;
         let sh = m.shape();
         if sh == crate::shape::DICT || m.class.is_some() || !self.interp_own_resolve_vm_is_interpreter() {
             return None;
@@ -1446,6 +1622,15 @@ impl<'p> Vm<'p> {
         recv: Value,
         key: &str,
     ) -> GetAct {
+        // A field read through more layouts than the inline hits keep: the
+        // mirror and the (shape, key) memo before this call's site probe and
+        // the receiver's map (`ic_get_prop_mega`), here rather than as its own
+        // step in the dispatch loops, where every read the hits missed paid
+        // its call whether or not it could answer.
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if let Some(v) = self.ic_get_prop_mega(func_id, ip, recv, key) {
+            return GetAct::Value(v);
+        }
         // Receiver guards + own-`pos` are entry-independent: derive ONCE per
         // probe (a 4-way site otherwise pays the heap fetch + key scan per
         // entry). The site is fetched once for both probe and disable check.
@@ -1587,9 +1772,13 @@ impl<'p> Vm<'p> {
                                 return self.ic_acc_get_from(m, slot);
                             }
                             // The cell's pair answers this layout's next read
-                            // inline (`ic_get_prop_own_hit`).
+                            // inline (`ic_get_prop_own_hit`). Never a private
+                            // name's: that hit comes before the brand checks,
+                            // and a string key may spell one (`o["#x"]`).
                             let (v, sh) = (m.val_at(slot), m.shape());
-                            self.ic_cell_own(func_id, ip, sh, slot, false);
+                            if !is_private_key(key) {
+                                self.ic_cell_own(func_id, ip, sh, slot, false);
+                            }
                             return GetAct::Value(v);
                         }
                     }
@@ -2054,6 +2243,11 @@ impl<'p> Vm<'p> {
         key: &str,
         val: Value,
     ) -> SetAct {
+        // As `ic_get_prop` does for a read (`ic_set_prop_mega`).
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if self.ic_set_prop_mega(func_id, ip, recv, key, val) {
+            return SetAct::Done;
+        }
         let mut plan: Option<SetPlan> = None;
         let mut own_rec: Option<(u32, u32)> = None;
         let mut disabled = false;
@@ -2100,15 +2294,40 @@ impl<'p> Vm<'p> {
                     // shape misses retain the complete old lookup and way scan.
                     if plan.is_none() {
                         let own = self.own_pos(m, key);
-                        for e in &site.entries[..site.n as usize] {
-                            if let Some(p) = self.ic_validate_set(e, idx, m, own) {
-                                // A later way's own-data write: the cell's pair
-                                // takes this layout's next one inline.
-                                if let (SetPlan::WriteOwn { slot, .. }, true) = (&p, m.shape_guardable()) {
-                                    own_rec = Some((shape, *slot));
+                        // In a pure-interpreter VM a write of an own writable
+                        // data property is decided by the live map, as the
+                        // read beside it is (`ic_get_prop`): no scan of ways
+                        // filled for other layouts, no install. A node field
+                        // written through more layouts than a site has ways
+                        // (`node.flags |= f` over a compiler's AST) evicted,
+                        // disabled the site and took `set_prop`'s walk on
+                        // every write. JIT-enabled VMs keep the scan and the
+                        // fills, which are their native plans' feedback.
+                        if let Some(s) = own {
+                            if self.interp_own_resolve_vm_is_interpreter()
+                                && !is_private_key(key)
+                                && m.shape_guardable()
+                                && !m.attr_at(s).accessor
+                                && m.attr_at(s).writable
+                                && !m.class_proto
+                            {
+                                own_rec = Some((shape, s as u32));
+                                plan = Some(SetPlan::WriteOwn { idx, slot: s as u32 });
+                            }
+                        }
+                        if plan.is_none() {
+                            for e in &site.entries[..site.n as usize] {
+                                if let Some(p) = self.ic_validate_set(e, idx, m, own) {
+                                    // A later way's own-data write: the cell's
+                                    // pair takes this layout's next one inline.
+                                    if let (SetPlan::WriteOwn { slot, .. }, true) =
+                                        (&p, m.shape_guardable() && !is_private_key(key))
+                                    {
+                                        own_rec = Some((shape, *slot));
+                                    }
+                                    plan = Some(p);
+                                    break;
                                 }
-                                plan = Some(p);
-                                break;
                             }
                         }
                     }
