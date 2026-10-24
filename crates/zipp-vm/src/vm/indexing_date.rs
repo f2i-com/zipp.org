@@ -178,8 +178,8 @@ impl<'p> Vm<'p> {
             return None;
         };
         if !matches!(self.heap.get(oidx), HeapObj::Array(_))
-            || self.arr_props.contains_key(&oidx)
-            || self.arguments_objs.contains_key(&oidx)
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&oidx))
+            || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&oidx))
             || self.proto_of.contains_key(&oidx)
             || self.arr_proto == 0
         {
@@ -188,7 +188,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Object(pm) = self.heap.get(self.arr_proto) else {
             return None;
         };
-        let i = pm.pos(prop_key)?;
+        let i = self.own_pos(pm, prop_key)?;
         if pm.attr_at(i).accessor {
             return None;
         }

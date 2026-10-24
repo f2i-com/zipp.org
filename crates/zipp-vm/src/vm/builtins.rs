@@ -207,6 +207,27 @@ pub(super) fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
 #[inline(always)]
 pub(super) fn builtin_stats_count(_vm: &Vm<'_>, _recv: Value, _name: &str) {}
 
+/// `ZIPP_NO_BIND_FAST=1` sends `f.bind(…)` and `Array.prototype.values.call
+/// (a)` back through the general method call (`Vm::interp_fn_bind_fast`,
+/// `Vm::interp_array_values_call`), for an A/B on one binary.
+#[inline]
+pub(super) fn bind_fast_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_BIND_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_NO_PROMISE_PRISTINE=1` makes `promise_method_is_intrinsic` always
 /// decline, which restores the original `get_prop`-walk proof EXACTLY — the
 /// probe sits behind a `||`, so a `false` runs the old expression unchanged.
@@ -409,8 +430,10 @@ impl<'p> Vm<'p> {
             "bind" => FN_BIND,
             _ => FN_CALL,
         };
+        // `own_pos`: %Function.prototype%'s shape answers `call`/`bind`
+        // from the (shape, key) memo, not a hash of the name per call.
         match self.heap.get(self.fn_proto) {
-            HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
+            HeapObj::Object(m) => self.own_pos(m, name).is_some_and(|slot| {
                 !m.attr_at(slot).accessor
                     && m.val_at(slot).is_heap()
                     && matches!(
@@ -455,6 +478,82 @@ impl<'p> Vm<'p> {
             }
             _ => None,
         }
+    }
+
+    /// `recv.bind(t, …args)` on a plain function or native while a Get of
+    /// `bind` finds the pristine `%Function.prototype.bind%`: the bound
+    /// function `FN_BIND`'s lazy arm makes, made here. A loose-mode for...of
+    /// binds its iterator's `next` once per loop (`it.next.bind(it)`), and the
+    /// call took the method cache's miss, the builtin dispatcher, the member
+    /// walk for `bind` and the exotic call into the native dispatcher first:
+    /// two thirds of the helper's setup. `None` (another realm, an own `bind`,
+    /// `name` or `length`, a replaced `bind`) is the unchanged general call.
+    /// `ZIPP_NO_BIND_FAST=1` declines always.
+    pub(crate) fn interp_fn_bind_fast(
+        &mut self,
+        recv: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        if !bind_fast_enabled()
+            || !recv.is_heap()
+            || !self.realm_global_objs.is_empty()
+            || !self.bind_lazy_name_length_ok(recv)
+            || !self.fn_call_apply_pristine(recv, "bind")
+        {
+            return None;
+        }
+        let this_v = if argc == 0 {
+            Value::UNDEFINED
+        } else {
+            self.get(base, arg_base)
+        };
+        let bound: Vec<Value> = (1..argc).map(|i| self.get(base, arg_base + i)).collect();
+        builtin_stats_count(self, recv, "bind");
+        // BoundFunctionCreate's prototype is the target's [[GetPrototypeOf]],
+        // which for a plain callable is `object_get_prototype_of`'s callable
+        // arm: an explicit one, else its dynamic-function intrinsic, else
+        // %Function.prototype%.
+        let tidx = recv.heap_index();
+        let default_proto = if self.fn_proto != 0 {
+            Value::heap(self.fn_proto)
+        } else {
+            Value::NULL
+        };
+        let target_proto = match self.proto_of.get_copied(tidx) {
+            Some(p) => p,
+            None => self.callable_dynfn_proto(tidx).map_or(default_proto, Value::heap),
+        };
+        let idx = self.heap.alloc(HeapObj::Bound {
+            target: recv,
+            this: this_v,
+            args: bound,
+        });
+        // A bound function's own [[Prototype]] is %Function.prototype% unless
+        // `proto_of` says otherwise.
+        if self.proto_of.get_copied(idx).unwrap_or(default_proto) != target_proto {
+            self.proto_of.insert(idx, target_proto);
+        }
+        Some(Value::heap(idx))
+    }
+
+    /// `Array.prototype.values.call(arr)` (`arr[Symbol.iterator].call(arr)`,
+    /// a loose-mode for...of's first step) on an ordinary dense array: the
+    /// live iterator the native's array arm makes, without the native
+    /// dispatcher's walk to its prototype-method arm and the array method
+    /// table's name match. `None` for any other native or receiver.
+    #[inline]
+    pub(crate) fn interp_array_values_call(&mut self, id: u16, this_v: Value) -> Option<Value> {
+        if id != crate::vm::native::array_values_method_id()
+            || !bind_fast_enabled()
+            || !this_v.is_heap()
+            || !matches!(self.heap.get(this_v.heap_index()), HeapObj::Array(_))
+            || self.array_is_virtual(this_v.heap_index())
+        {
+            return None;
+        }
+        Some(self.make_live_iterator(this_v.heap_index(), 1, self.array_iter_proto))
     }
 
     /// The `(func id, closure)` of `v` when calling it pushes a frame and
@@ -918,7 +1017,7 @@ impl<'p> Vm<'p> {
         if !m.is_ctor {
             return None;
         }
-        let i = m.pos(key)?;
+        let i = self.own_pos(m, key)?;
         if m.attr_at(i).accessor {
             return None;
         }

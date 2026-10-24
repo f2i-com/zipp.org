@@ -1462,6 +1462,21 @@ pub fn promise_proto_method_id(name: &str) -> Option<u16> {
     ids.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
 }
 
+/// The native id of `Array.prototype.values`, which is also
+/// `Array.prototype[@@iterator]` (one function object). Found by name once,
+/// for the reason [`promise_proto_method_id`] gives.
+pub fn array_values_method_id() -> u16 {
+    use std::sync::OnceLock;
+    static ID: OnceLock<u16> = OnceLock::new();
+    *ID.get_or_init(|| {
+        PROTO_METHODS
+            .iter()
+            .position(|(n, k, _)| *k == 0 && *n == "values")
+            .map(|i| PROTO_METHOD_BASE + i as u16)
+            .expect("Array.prototype.values missing from PROTO_METHODS")
+    })
+}
+
 /// The spec `name` and `length` of a static/namespace native (Object.*,
 /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
 /// `length` properties like any function. (Proto methods use `proto_method`.)

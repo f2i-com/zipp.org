@@ -4595,8 +4595,22 @@ impl<'p> Vm<'p> {
                                 break;
                             }
                             if let Some(id) = self.fn_call_native_target(recv) {
+                                if let Some(it) = self.interp_array_values_call(id, this_v) {
+                                    self.set(base, dst, it);
+                                    ip += 1;
+                                    continue;
+                                }
                                 let r = self.with_argv(base, args_at, n, |vm, argv| vm.call_native(id, this_v, argv))?;
                                 self.set(base, dst, r);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        // `f.bind(t, ...args)` while a Get of `bind` finds the
+                        // pristine %Function.prototype.bind% (`it.next.bind(it)`).
+                        if private_callee.is_none() && key == "bind" {
+                            if let Some(b) = self.interp_fn_bind_fast(recv, base, arg_base, argc) {
+                                self.set(base, dst, b);
                                 ip += 1;
                                 continue;
                             }

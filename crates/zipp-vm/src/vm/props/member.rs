@@ -7,7 +7,27 @@ use super::*;
 
 /// Whether `Vm::callable_name_length` answers for the builtin `id` (its
 /// `HeapObj::Native` arm), without building the name.
-fn native_has_name_length(id: u16) -> bool {
+///
+/// Remembered per id: the answer is fixed by the tables, and an id outside
+/// the early ones (an iterator's `next`) walked `static_name_length`'s whole
+/// range chain on every `bind`, a ninth of a loose-mode for...of's setup.
+pub(crate) fn native_has_name_length(id: u16) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = not yet asked, 1 = no, 2 = yes.
+    static KNOWN: [AtomicU8; 1 << 16] = [const { AtomicU8::new(0) }; 1 << 16];
+    let cell = &KNOWN[id as usize];
+    match cell.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let has = native_has_name_length_uncached(id);
+            cell.store(if has { 2 } else { 1 }, Ordering::Relaxed);
+            has
+        }
+    }
+}
+
+fn native_has_name_length_uncached(id: u16) -> bool {
     (native::BUFFER_GETTER_BASE..native::BUFFER_GETTER_BASE + native::BUFFER_GETTERS.len() as u16)
         .contains(&id)
         || (native::SAB_GETTER_BASE..native::SAB_GETTER_BASE + native::SAB_GETTERS.len() as u16)
@@ -706,8 +726,9 @@ impl<'p> Vm<'p> {
             _ => false,
         };
         plain
-            && !self.deleted_callable_intrinsics.contains(&(idx, 0))
-            && !self.deleted_callable_intrinsics.contains(&(idx, 1))
+            && (self.deleted_callable_intrinsics.is_empty()
+                || (!self.deleted_callable_intrinsics.contains(&(idx, 0))
+                    && !self.deleted_callable_intrinsics.contains(&(idx, 1))))
             && !self
                 .fn_props
                 .get(&idx)
