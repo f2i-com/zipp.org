@@ -316,6 +316,12 @@ pub(crate) enum IcEntry {
         ver: u32,
         fid: u32,
         closure: u32,
+        /// The callee's frame facts packed by `Vm::lean_call_desc`, so a hit
+        /// pushes its frame without reading the callee's `FuncProto` (a cold
+        /// line per call of a function not called lately; `FuncProto` is
+        /// immutable, so the facts never go stale).
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        desc: u32,
         /// Cached structural classification for the meter-only numeric fib
         /// lane. `u32::MAX` means this immutable FuncProto is not the exact
         /// accepted body. Keeping the result in the identity/version-guarded
@@ -475,6 +481,9 @@ impl SiteCell {
 pub(crate) struct CallIcHit {
     pub(crate) fid: u32,
     pub(crate) closure: u32,
+    /// `Vm::lean_call_desc(fid)`, for `Vm::setup_call_lean_desc`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) desc: u32,
     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
     pub(crate) fib_global: u32,
 }
@@ -3357,6 +3366,7 @@ impl<'p> Vm<'p> {
                 ver,
                 fid,
                 closure,
+                ..
             } => Some((bits, ver, fid, closure)),
             _ => None,
         }
@@ -3384,6 +3394,7 @@ impl<'p> Vm<'p> {
                 ver,
                 fid,
                 closure,
+                ..
             } => (bits, ver, fid, closure),
             _ => return None,
         };
@@ -3426,6 +3437,7 @@ impl<'p> Vm<'p> {
                 ver,
                 fid,
                 closure,
+                ..
             } = *entry
             else {
                 return None;
@@ -3808,6 +3820,8 @@ impl<'p> Vm<'p> {
                     ver,
                     fid,
                     closure,
+                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                    desc,
                     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                     fib_global,
                 } = *e
@@ -3816,6 +3830,8 @@ impl<'p> Vm<'p> {
                         return Some(CallIcHit {
                             fid,
                             closure,
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            desc,
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                             fib_global,
                         });
@@ -3839,6 +3855,8 @@ impl<'p> Vm<'p> {
                     // repeated structural scan.
                     IC_NO_FIB_GLOBAL
                 };
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                let desc = self.lean_call_desc(fid);
                 self.ic_install(
                     func_id,
                     ip,
@@ -3847,6 +3865,8 @@ impl<'p> Vm<'p> {
                         ver,
                         fid,
                         closure,
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        desc,
                         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                         fib_global,
                     },
@@ -3854,6 +3874,8 @@ impl<'p> Vm<'p> {
                 Some(CallIcHit {
                     fid,
                     closure,
+                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                    desc,
                     #[cfg(all(feature = "meter-only", not(feature = "jit")))]
                     fib_global,
                 })

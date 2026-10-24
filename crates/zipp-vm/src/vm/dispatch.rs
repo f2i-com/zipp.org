@@ -4197,6 +4197,21 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                            // The entry carries the callee's frame facts: the
+                            // push reads nothing of its `FuncProto`.
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            self.setup_call_lean_desc(
+                                call.fid,
+                                call.closure,
+                                call.desc,
+                                base,
+                                arg_base,
+                                argc,
+                                dst,
+                                ip + 1,
+                                callee_v,
+                            )?;
+                            #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
                             self.setup_call_lean(
                                 call.fid,
                                 call.closure,
