@@ -1155,9 +1155,9 @@ impl<'p> Vm<'p> {
                         HeapObj::Object(_)
                             | HeapObj::Proxy { .. }
                             | HeapObj::Iterator { .. }
-                            | HeapObj::IterHelper { .. }
+                            | HeapObj::IterHelper(_)
                             | HeapObj::Intl { .. }
-                    ) || (matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+                    ) || (matches!(self.heap.get(v.heap_index()), HeapObj::Generator(_))
                         && !self.gen_method_pristine(v.heap_index(), "next")));
                 if read {
                     self.get_prop(v, "next")
@@ -2072,7 +2072,7 @@ impl<'p> Vm<'p> {
         if argc == 0 && key == "next" && recv.is_heap() {
             let idx = recv.heap_index();
             let iter_proto = match self.heap.get(idx) {
-                HeapObj::Generator { .. } => None,
+                HeapObj::Generator(_) => None,
                 HeapObj::Iterator { proto, .. } => Some(*proto),
                 _ => Some(0),
             };

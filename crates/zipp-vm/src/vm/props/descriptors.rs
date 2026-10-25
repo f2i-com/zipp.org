@@ -262,7 +262,8 @@ impl<'p> Vm<'p> {
         // data property (a `defineProperty` or an `Object.freeze` may have cleared
         // its writable flag).
         if key == "lastIndex" {
-            if let HeapObj::RegExp { last_index, .. } = self.heap.get(idx) {
+            if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                let crate::heap::RegExpData { last_index, .. } = &**re;
                 let v = *last_index;
                 let writable = self.regexp_last_index_writable(idx);
                 return self.make_data_descriptor(v, writable, false, false);
@@ -797,7 +798,7 @@ impl<'p> Vm<'p> {
                 }
                 // A RegExp's only own property is `lastIndex` (plus any assigned);
                 // assigned integer keys still sort first, ascending.
-                HeapObj::RegExp { .. } => {
+                HeapObj::RegExp(_) => {
                     let assigned: Vec<String> = match self.arr_props.get(&idx) {
                         Some(m) => spec_key_order_map(&m)
                             .into_iter()
@@ -1042,10 +1043,10 @@ impl<'p> Vm<'p> {
             HeapObj::WeakRef(_) => self.weakref_proto,
             HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
             HeapObj::TextCodec(_) => self.text_encoder_proto,
-            HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+            HeapObj::FinalizationRegistry(_) => self.finreg_proto,
             HeapObj::Iterator { proto, .. } => *proto,
-            HeapObj::IterHelper { .. } => self.iterator_helper_proto,
-            HeapObj::Generator { .. } => self.gen_proto,
+            HeapObj::IterHelper(_) => self.iterator_helper_proto,
+            HeapObj::Generator(_) => self.gen_proto,
             HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
             HeapObj::Boxed { kind, .. } => match kind {
                 0 => self.str_proto,

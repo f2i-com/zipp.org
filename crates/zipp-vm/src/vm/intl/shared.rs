@@ -898,7 +898,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(_)
                     | HeapObj::Proxy { .. }
                     | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper { .. }
+                    | HeapObj::IterHelper(_)
             ) {
             let n = self.get_prop(iter, "next")?;
             self.is_callable(n).then_some(n)

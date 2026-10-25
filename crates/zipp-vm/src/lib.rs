@@ -1677,8 +1677,8 @@ mod tests {
         // bench suite, which is why `Object` and `Combinator` are boxed. A new
         // fat variant would silently undo that, so pin it.
         assert!(
-            std::mem::size_of::<crate::heap::HeapObj>() <= 80,
-            "HeapObj grew to {} bytes (cap 80) — box the new variant's payload",
+            std::mem::size_of::<crate::heap::HeapObj>() <= 64,
+            "HeapObj grew to {} bytes (cap 64) — box the new variant's payload",
             std::mem::size_of::<crate::heap::HeapObj>()
         );
     }

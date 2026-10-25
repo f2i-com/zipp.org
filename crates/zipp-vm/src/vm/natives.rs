@@ -2517,7 +2517,7 @@ impl<'p> Vm<'p> {
             REGEXP_EXEC => {
                 if !matches!(
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::RegExp { .. })
+                    Some(HeapObj::RegExp(_))
                 ) {
                     return Err(Thrown::from_static(
                         "TypeError: RegExp.prototype.exec called on a non-RegExp",
@@ -2538,7 +2538,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let is_re = this.is_heap()
-                    && matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. });
+                    && matches!(self.heap.get(this.heap_index()), HeapObj::RegExp(_));
                 // Fast path: a pristine RegExp whose `exec` is still the
                 // intrinsic. The Get and the call are then unobservable, so go
                 // straight to the builtin and skip the match-array build too.
@@ -2576,7 +2576,7 @@ impl<'p> Vm<'p> {
                 // RegExp.prototype.compile(pattern, flags): recompile in place.
                 if !matches!(
                     this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::RegExp { .. })
+                    Some(HeapObj::RegExp(_))
                 ) {
                     return Err(Thrown::from_static(
                         "TypeError: RegExp.prototype.compile called on a non-RegExp",
@@ -2607,7 +2607,7 @@ impl<'p> Vm<'p> {
                 // undefined (TypeError) — never stringified into a flags string.
                 if matches!(
                     a0.is_heap().then(|| self.heap.get(a0.heap_index())),
-                    Some(HeapObj::RegExp { .. })
+                    Some(HeapObj::RegExp(_))
                 ) && a1 != Value::UNDEFINED
                 {
                     return Err(Thrown::from_static(
@@ -2620,32 +2620,20 @@ impl<'p> Vm<'p> {
                 // retaining an un-preflighted duplicate program.
                 let built = self.build_regexp(a0, a1)?;
                 let (regex, source, flags) = match self.heap.get(built.heap_index()) {
-                    HeapObj::RegExp {
-                        regex,
-                        source,
-                        flags,
-                        ..
-                    } => (regex.clone(), source.clone(), flags.clone()),
+                    HeapObj::RegExp(re) => (re.regex.clone(), re.source.clone(), re.flags.clone()),
                     _ => unreachable!(),
                 };
                 // EXACT pattern bytes (lone surrogates): `build_regexp` recorded
                 // them for the throwaway `built` — take the entry so it can move
                 // to the receiver below (the struct's `source` is lossy).
                 let exact = self.regexp_exact_source.remove(&built.heap_index());
-                if let HeapObj::RegExp {
-                    regex: r,
-                    source: s,
-                    flags: fl,
-                    ascii_twin,
-                    ..
-                } = self.heap.get_mut(this.heap_index())
-                {
-                    *r = regex;
-                    *s = source;
-                    *fl = flags;
+                if let HeapObj::RegExp(re) = self.heap.get_mut(this.heap_index()) {
+                    re.regex = regex;
+                    re.source = source;
+                    re.flags = flags;
                     // The byte-optimized ASCII twin compiled the OLD pattern —
                     // drop it (rebuilt lazily on the next ASCII-subject exec).
-                    *ascii_twin = None;
+                    re.ascii_twin = None;
                 }
                 // Move the exact-source entry onto the receiver — or clear a
                 // stale one when the new pattern is well-formed.
@@ -2695,10 +2683,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::RegExp { source, flags, .. }) => {
+                    Some(HeapObj::RegExp(re)) => {
                         // Spec reads the `flags` getter, which assembles the
                         // canonical `dgimsuvy` order regardless of storage order.
-                        let (s, f) = (source.clone(), super::proxy_regexp::canonical_flags(flags));
+                        let (s, f) = (re.source.clone(), super::proxy_regexp::canonical_flags(&re.flags));
                         // Lone-surrogate pattern (exact-source side table):
                         // assemble `/src/flags` over the exact WTF-8 bytes so
                         // toString round-trips the surrogates too.
@@ -2757,7 +2745,8 @@ impl<'p> Vm<'p> {
                 let idx = this.heap_index();
                 if idx == self.native_home(self.regexp_proto) {
                     self.alloc_str("(?:)".to_string())
-                } else if let HeapObj::RegExp { source, .. } = self.heap.get(idx) {
+                } else if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                    let crate::heap::RegExpData { source, .. } = &**re;
                     let s = source.clone();
                     // Exact-WTF-8 when the side table has the pattern's exact
                     // bytes (lone surrogates round-trip), else lossy.
@@ -2872,22 +2861,16 @@ impl<'p> Vm<'p> {
                     // a plain number can take the fast path.
                     let li_number = matches!(
                         self.heap.get(re_idx),
-                        HeapObj::RegExp { last_index, .. } if last_index.is_number()
+                        HeapObj::RegExp(re) if re.last_index.is_number()
                     );
                     if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
                         let (regex, source, flags, li_raw, twin) = match self.heap.get(re_idx) {
-                            HeapObj::RegExp {
-                                regex,
-                                source,
-                                flags,
-                                last_index,
-                                ascii_twin,
-                            } => (
-                                regex.clone(),
-                                source.clone(),
-                                flags.clone(),
-                                *last_index,
-                                ascii_twin.clone(),
+                            HeapObj::RegExp(re) => (
+                                re.regex.clone(),
+                                re.source.clone(),
+                                re.flags.clone(),
+                                re.last_index,
+                                re.ascii_twin.clone(),
                             ),
                             _ => unreachable!("as_regexp checked the tag"),
                         };
@@ -2944,7 +2927,7 @@ impl<'p> Vm<'p> {
                         {
                             self.ensure_regexp_ascii_twin(re_idx);
                             match self.heap.get(re_idx) {
-                                HeapObj::RegExp { ascii_twin, .. } => ascii_twin.clone(),
+                                HeapObj::RegExp(re) => re.ascii_twin.clone(),
                                 _ => twin,
                             }
                         } else {
@@ -2960,13 +2943,15 @@ impl<'p> Vm<'p> {
                         // 2,000-char pattern that cost 3.2us per matchAll, against
                         // a flat 13ns for the same work on the ORIGINAL object,
                         // whose twin caching already worked.
-                        let matcher_idx = self.heap.alloc(HeapObj::RegExp {
-                            regex,
-                            source,
-                            flags,
-                            last_index: Value::num(li as f64),
-                            ascii_twin: twin,
-                        });
+                        let matcher_idx = self.heap.alloc(HeapObj::RegExp(Box::new(
+                            crate::heap::RegExpData {
+                                regex,
+                                source,
+                                flags,
+                                last_index: Value::num(li as f64),
+                                ascii_twin: twin,
+                            },
+                        )));
                         // A lone-surrogate pattern keeps its exact source bytes.
                         // `regexp_exact_source` is a SipHash `HashMap` that only ever
                         // holds lone-surrogate patterns, so for every ordinary regex
@@ -3126,7 +3111,8 @@ impl<'p> Vm<'p> {
                 // prototype (a realm copy's home is the realm's image).
                 if idx == self.native_home(self.regexp_proto) {
                     Value::UNDEFINED
-                } else if let HeapObj::RegExp { flags, .. } = self.heap.get(idx) {
+                } else if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                    let crate::heap::RegExpData { flags, .. } = &**re;
                     Value::bool(flags.contains(ch))
                 } else {
                     return Err(Thrown::from_static(
@@ -5051,7 +5037,7 @@ impl<'p> Vm<'p> {
             ITER_HELPER_NEXT => {
                 let kind =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                        Some(HeapObj::IterHelper { kind, .. }) => *kind,
+                        Some(HeapObj::IterHelper(ih)) => ih.kind,
                         _ => return Err(Thrown::from_static(
                             "TypeError: Iterator Helper next called on an incompatible receiver",
                         )),
@@ -5069,15 +5055,16 @@ impl<'p> Vm<'p> {
                         .is_heap()
                         .then(|| self.heap.get(this.heap_index()))
                     {
-                        Some(HeapObj::IterHelper {
-                            kind,
-                            source,
-                            inner,
-                            done,
-                            running,
-                            idx,
-                            ..
-                        }) => {
+                        Some(HeapObj::IterHelper(ih)) => {
+                            let crate::heap::IterHelperData {
+                                kind,
+                                source,
+                                inner,
+                                done,
+                                running,
+                                idx,
+                                ..
+                            } = &**ih;
                             // Re-entrant return() while a step is executing is a TypeError
                             // (GeneratorValidate), the same as a re-entrant next().
                             if *running {
@@ -5118,7 +5105,8 @@ impl<'p> Vm<'p> {
                     // `running` brand is held across the close so that a source's
                     // return() re-entering this helper's return()/next() is a TypeError
                     // (the spec models the close as the closure resuming "executing").
-                    if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
+                    if let HeapObj::IterHelper(ih) = self.heap.get_mut(this.heap_index()) {
+                let crate::heap::IterHelperData { done, .. } = &mut **ih;
                         *done = true;
                     }
                     if !was_done {
@@ -6157,7 +6145,7 @@ impl<'p> Vm<'p> {
                     _ => "throw",
                 };
                 if !this.is_heap()
-                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Generator { .. })
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Generator(_))
                 {
                     return Err(Thrown(format!(
                         "TypeError: {name} called on a non-generator object"

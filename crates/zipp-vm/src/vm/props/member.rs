@@ -811,7 +811,7 @@ impl<'p> Vm<'p> {
                     p => p,
                 }
             }
-            HeapObj::RegExp { .. } => {
+            HeapObj::RegExp(_) => {
                 if self.arr_props.contains_key(&idx)
                     || matches!(key, "lastIndex" | "length" | "name")
                     || regexp_intrinsic_accessor(key).is_some()
@@ -1553,7 +1553,7 @@ impl<'p> Vm<'p> {
         // A RegExp's accessor-like own properties (source/flags/lastIndex + the
         // flag booleans) and its match-result Array's `.index`/`.input`/`.groups`.
         // Cloned out of the heap borrow before any allocation.
-        if matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp { .. }) {
+        if matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp(_)) {
             // A custom own property (`re.exec = fn`, `re.x = …`, or an
             // Object.defineProperty'd `flags`/`source`/flag-boolean) in the side
             // table shadows the prototype AND the synthesized intrinsic accessor —
@@ -1672,10 +1672,8 @@ impl<'p> Vm<'p> {
             // pattern against 120ns for a 20,000-char one, on a read that returns
             // an integer. `re.flags` read nine such properties, so it cost 227ns
             // against node's 3ns.
-            if let HeapObj::RegExp {
-                flags, last_index, ..
-            } = self.heap.get(obj.heap_index())
-            {
+            if let HeapObj::RegExp(re) = self.heap.get(obj.heap_index()) {
+                let crate::heap::RegExpData { flags, last_index, .. } = &**re;
                 if key == "lastIndex" {
                     return Ok(*last_index);
                 }
@@ -1697,7 +1695,7 @@ impl<'p> Vm<'p> {
                 // An Arc bump, then a `&str` deref — `regexp_source_value` wants the
                 // latter, so no text is materialised here.
                 let src: Option<std::sync::Arc<str>> = match self.heap.get(obj.heap_index()) {
-                    HeapObj::RegExp { source, .. } => Some(source.clone()),
+                    HeapObj::RegExp(re) => Some(re.source.clone()),
                     _ => None,
                 };
                 return self.regexp_source_value(obj.heap_index(), src.as_deref().unwrap_or(""));
@@ -2484,7 +2482,7 @@ impl<'p> Vm<'p> {
                 let proto = if c.decoder { self.text_decoder_proto } else { self.text_encoder_proto };
                 self.exotic_own_or_proto(obj, receiver, proto, key)
             }
-            HeapObj::FinalizationRegistry { .. } => {
+            HeapObj::FinalizationRegistry(_) => {
                 self.exotic_own_or_proto(obj, receiver, self.finreg_proto, key)
             }
             // Own properties first, then a replaced [[Prototype]], then the
@@ -2493,7 +2491,7 @@ impl<'p> Vm<'p> {
                 let p = *proto;
                 self.exotic_own_or_proto(obj, receiver, p, key)
             }
-            HeapObj::IterHelper { .. } => {
+            HeapObj::IterHelper(_) => {
                 let p = self.iterator_helper_proto;
                 self.exotic_own_or_proto(obj, receiver, p, key)
             }
@@ -2503,7 +2501,7 @@ impl<'p> Vm<'p> {
             // @@iterator) which chains to %Iterator.prototype% (the helper
             // methods). So `g().next`, `g().map`, `g()[Symbol.iterator]` all
             // resolve, and a REPLACED g.prototype is honored.
-            HeapObj::Generator { .. } => {
+            HeapObj::Generator(_) => {
                 let p = match self.proto_of.get_copied(obj.heap_index()) {
                     Some(p) if p.is_heap() => p.heap_index(),
                     Some(_) => return Ok(Value::UNDEFINED), // null proto: no chain

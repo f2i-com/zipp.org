@@ -1647,7 +1647,7 @@ impl Vm<'_> {
                     HeapObj::WeakMap { .. }
                         | HeapObj::WeakSet(_)
                         | HeapObj::WeakRef(_)
-                        | HeapObj::FinalizationRegistry { .. }
+                        | HeapObj::FinalizationRegistry(_)
                 )
         });
         for &raw_idx in &weak_containers {
@@ -1703,12 +1703,8 @@ impl Vm<'_> {
                         *target = Value::UNDEFINED;
                     }
                 }
-                HeapObj::FinalizationRegistry {
-                    cells,
-                    cleared,
-                    cleanup_queued,
-                    ..
-                } => {
+                HeapObj::FinalizationRegistry(fr) => {
+                let crate::heap::FinRegData { cells, cleared, cleanup_queued, .. } = &mut **fr;
                     let token_is_dead = |token: Value| {
                         token.is_heap()
                             && ((token.heap_index() as usize) >= n
@@ -1850,7 +1846,7 @@ impl Vm<'_> {
             HeapObj::Wrapped { target, .. } => m_val!(*target),
             // `lastIndex` keeps the assigned Value as-is until exec applies
             // ToLength, so an object (a `valueOf` carrier) or string lives here.
-            HeapObj::RegExp { last_index, .. } => m_val!(*last_index),
+            HeapObj::RegExp(re) => m_val!(re.last_index),
             HeapObj::Array(items) => {
                 for &v in items {
                     m_val!(v);
@@ -1876,9 +1872,9 @@ impl Vm<'_> {
                 m_val!(*cap_reject);
             }
             HeapObj::CombinatorResolver { combinator, .. } => m_idx!(*combinator),
-            HeapObj::Generator { closure, regs, .. } => {
-                m_idx!(*closure);
-                for &v in regs {
+            HeapObj::Generator(g) => {
+                m_idx!(g.closure);
+                for &v in &g.regs {
                     m_val!(v);
                 }
             }
@@ -1926,12 +1922,8 @@ impl Vm<'_> {
             // the ordinary trace. WeakMap values are ephemerons, not ordinary
             // outgoing edges.
             HeapObj::WeakMap { .. } | HeapObj::WeakSet(_) | HeapObj::WeakRef(_) => {}
-            HeapObj::FinalizationRegistry {
-                cleanup,
-                cells,
-                cleared,
-                ..
-            } => {
+            HeapObj::FinalizationRegistry(fr) => {
+                let crate::heap::FinRegData { cleanup, cells, cleared, .. } = &**fr;
                 m_val!(*cleanup);
                 for cell in cells.iter().chain(cleared.iter()) {
                     // The holding remains strong until cleanup or unregister.
@@ -1958,7 +1950,8 @@ impl Vm<'_> {
                     m_idx!(*coll);
                 }
             }
-            HeapObj::IterHelper { source, arg, inner, next, .. } => {
+            HeapObj::IterHelper(ih) => {
+                let crate::heap::IterHelperData { source, arg, inner, next, .. } = &**ih;
                 m_val!(*source);
                 m_val!(*arg);
                 m_val!(*inner);
@@ -2295,12 +2288,12 @@ mod closure_side_table_gc_tests {
             // [[HomeObject]] edge must therefore keep `home` alive even though
             // this method's bytecode contains no `super`.
             let cleanup = vm.heap.alloc(HeapObj::Func(0));
-            let registry = vm.heap.alloc(HeapObj::FinalizationRegistry {
+            let registry = vm.heap.alloc(HeapObj::FinalizationRegistry(Box::new(crate::heap::FinRegData {
                 cleanup: Value::heap(cleanup),
                 cells: Vec::new(),
                 cleared: Vec::new(),
                 cleanup_queued: false,
-            });
+            })));
             vm.register_weak_container(registry);
             vm.globals[slot("registry")] = Value::heap(registry);
             vm.finreg_method(

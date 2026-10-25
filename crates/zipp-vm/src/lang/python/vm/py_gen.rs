@@ -163,7 +163,7 @@ impl<'p> Vm<'p> {
         if done != Value::FALSE || running != Value::FALSE || excs != Value::NULL || !js.is_heap() {
             return None;
         }
-        if !matches!(self.heap.get(js.heap_index()), HeapObj::Generator { .. }) {
+        if !matches!(self.heap.get(js.heap_index()), HeapObj::Generator(_)) {
             return None;
         }
         let rt = self.py_gen_runtime_cached(grt)?;
@@ -240,7 +240,7 @@ impl<'p> Vm<'p> {
             && self.py_gen_read(g, s_running) == Value::FALSE
             && self.py_gen_read(g, s_excs) == Value::NULL
             && js.is_heap()
-            && matches!(self.heap.get(js.heap_index()), HeapObj::Generator { .. });
+            && matches!(self.heap.get(js.heap_index()), HeapObj::Generator(_));
         let depth = self.py_exc_depth(rt.exc_stack);
         let (true, Some(depth)) = (plain, depth) else {
             return self.call_value(rt.gen_next, this, &[]);

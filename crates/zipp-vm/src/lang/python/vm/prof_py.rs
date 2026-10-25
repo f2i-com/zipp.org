@@ -225,7 +225,7 @@ impl<'p> Vm<'p> {
             HeapObj::NativeClosure { .. } => "NativeClosure",
             HeapObj::Bound { .. } => "Bound",
             HeapObj::Iterator { .. } => "Iterator",
-            HeapObj::Generator { .. } => "Generator",
+            HeapObj::Generator(_) => "Generator",
             HeapObj::TypedArray { .. } => "TypedArray",
             HeapObj::ArrayBuffer { .. } => "ArrayBuffer",
             _ => "other",

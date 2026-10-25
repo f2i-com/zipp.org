@@ -788,9 +788,10 @@ impl<'p> Vm<'p> {
         // Seed `existing` from the slot so the merge validates against the real
         // descriptor; the merged value is written back through to the slot below.
         let regexp_last_index =
-            key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. });
+            key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_));
         if regexp_last_index {
-            if let HeapObj::RegExp { last_index, .. } = self.heap.get(idx) {
+            if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                let crate::heap::RegExpData { last_index, .. } = &**re;
                 let li = *last_index;
                 let attrs = existing.map(|(a, _)| a).unwrap_or(PropAttr {
                     writable: true,
@@ -892,8 +893,8 @@ impl<'p> Vm<'p> {
         // Write a defined `lastIndex` VALUE through to the RegExp slot (the
         // getter and `exec` read the slot; arr_props only carries the attrs).
         if regexp_last_index && !attr.accessor {
-            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
-                *last_index = stored;
+            if let HeapObj::RegExp(re) = self.heap.get_mut(idx) {
+                re.last_index = stored;
             }
         }
         // A redefined callable/class `name`/`length` now lives as an explicit own

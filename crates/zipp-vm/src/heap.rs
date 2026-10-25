@@ -5995,6 +5995,104 @@ impl std::ops::DerefMut for AbData {
     }
 }
 
+/// Payload of `HeapObj::Generator`: a suspended generator (`function*`). Owns
+/// a DETACHED register window (off the contiguous live `regs` Vec, so the
+/// JIT's pinned-capacity invariant holds while parked); `func`/`closure`
+/// re-create the frame on resume, and `state` carries the resume ip /
+/// completion. `handlers` preserves the frame's active `try` handlers across
+/// a yield, so `gen.throw(e)` resumes into an enclosing `try`/`catch` (and
+/// `gen.return(v)` can run `finally`).
+#[derive(Clone, Debug)]
+pub struct GeneratorData {
+    pub func: u32,
+    pub closure: u32,
+    pub state: GenState,
+    pub regs: Vec<Value>,
+    pub handlers: Vec<Handler>,
+}
+
+/// Payload of `HeapObj::RegExp`: a JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);
+/// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
+/// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
+/// coerced offset) so an assigned object survives until `exec`/the @@-methods
+/// apply ToLength, invoking its `valueOf` at the spec-mandated time.
+///
+/// `ascii_twin` is the lazily-built BYTE-OPTIMIZED twin compile (regress
+/// `from_unicode_byteopt`) used by the ASCII-subject fast path, cached
+/// inline so a hot exec reads it with one `heap.get` instead of a per-exec
+/// side-table probe: `None` = not yet computed, `Some(None)` = compile
+/// failed (fall back to `regex`), `Some(Some(arc))` = the twin. Reset to
+/// `None` by `RegExp.prototype.compile`. Holds no `Value`s (an
+/// `Arc<regress::Regex>` is a pure compiled program), so GC need not trace it.
+#[derive(Clone, Debug)]
+pub struct RegExpData {
+    pub regex: std::sync::Arc<regress::Regex>,
+    /// `Arc<str>`, not `String`, so that cloning a RegExp shares its text instead
+    /// of copying it. `matchAll` clones a matcher per call — the iterator has to
+    /// advance a `lastIndex` independently of the source regex, and that object is
+    /// observable to a user `exec` as its receiver, so the clone cannot be elided —
+    /// which meant two heap `String` allocations on a path measured at 480ns
+    /// against node's 53. Sharing makes it two atomic increments.
+    ///
+    /// MEASURED: −2.0pp of `regex-log-scan` (the row went −0.9% with only the
+    /// `flags` shortcut below, −2.9% with both; B70). Larger than it looks because
+    /// `source`/`flags` are cloned on several regex paths, not just `matchAll`.
+    ///
+    /// (Size is the box's business now: with `Generator`, `IterHelper` and
+    /// `FinalizationRegistry` boxed too, `HeapObj` went from 80 bytes to 64: the
+    /// largest payloads left are 48 bytes, and `BigInt`'s `i128` aligns the
+    /// enum to 16.)
+    pub source: std::sync::Arc<str>,
+    pub flags: std::sync::Arc<str>,
+    pub last_index: Value,
+    pub ascii_twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+}
+
+/// Payload of `HeapObj::IterHelper`: a lazy Iterator Helper (the result of
+/// `Iterator.prototype.{map,filter,take,drop,flatMap,chunks,windows}`).
+/// `source` is the underlying iterator; `kind` selects the transform
+/// (0=map,1=filter,2=take,3=drop,4=flatMap,8=chunks,9=windows); `arg` is the
+/// callback (map/filter/flatMap) or the windows buffer; `n` is the remaining
+/// count (take/drop) or the chunk or window size (negative: windows'
+/// `allow-partial`); `idx` is the 0-based counter passed to callbacks; `done`
+/// marks exhaustion; `inner` is flatMap's current inner iterator (or
+/// UNDEFINED).
+#[derive(Clone, Debug)]
+pub struct IterHelperData {
+    pub source: Value,
+    pub kind: u8,
+    pub arg: Value,
+    pub n: i64,
+    pub idx: i64,
+    pub done: bool,
+    pub inner: Value,
+    /// The source's `next` method, read ONCE at creation (GetIteratorDirect), so
+    /// stepping calls the cached method rather than re-reading `source.next` each
+    /// time. `UNDEFINED` when the source needs the generic step path (a generator,
+    /// or a multi-source zip/concat helper).
+    pub next: Value,
+    /// `[[GeneratorState]] == "executing"` brand: set while a `.next()` step is in
+    /// flight so that a callback re-entering `.next()`/`.return()` on the same
+    /// helper is a TypeError (GeneratorValidate) rather than infinite recursion.
+    pub running: bool,
+}
+
+/// Payload of `HeapObj::FinalizationRegistry`: the callback and holdings are
+/// strong; each cell's target and optional unregister token are weak.
+/// `cleanup_queued` prevents a collection during a callback from scheduling
+/// the same cells twice.
+#[derive(Clone, Debug)]
+pub struct FinRegData {
+    pub cleanup: Value,
+    /// Registrations whose targets have not been cleared.
+    pub cells: Vec<FinalizationCell>,
+    /// Cleared registrations awaiting callback delivery. Keeping these in
+    /// a separate stack makes cleanup linear even when many live cells
+    /// remain registered.
+    pub cleared: Vec<FinalizationCell>,
+    pub cleanup_queued: bool,
+}
+
 /// Payload of `HeapObj::Combinator`, boxed out of the enum (see the variant).
 #[derive(Clone, Debug)]
 pub struct CombinatorData {
@@ -6653,19 +6751,9 @@ pub enum HeapObj {
         index: u32,
         is_reject: bool,
     },
-    /// A suspended generator (`function*`). Owns a DETACHED register window (off
-    /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
-    /// holds while parked); `func`/`closure` re-create the frame on resume, and
-    /// `state` carries the resume ip / completion. `handlers` preserves the
-    /// frame's active `try` handlers across a yield, so `gen.throw(e)` resumes
-    /// into an enclosing `try`/`catch` (and `gen.return(v)` can run `finally`).
-    Generator {
-        func: u32,
-        closure: u32,
-        state: GenState,
-        regs: Vec<Value>,
-        handlers: Vec<Handler>,
-    },
+    /// A suspended generator (`function*`), boxed ([`GeneratorData`]): its 72
+    /// bytes made every heap slot 80.
+    Generator(Box<GeneratorData>),
     /// An `async function*` activation — see [`AsyncGenState`]. Its `.next()`
     /// returns a Promise; the body may both `yield` and `await`.
     AsyncGenerator(Box<AsyncGenState>),
@@ -6689,59 +6777,17 @@ pub enum HeapObj {
     WeakRef(Value),
     /// A `TextEncoder` or `TextDecoder`.
     TextCodec(TextCodec),
-    /// A JS `FinalizationRegistry`: the callback and holdings are strong; each
-    /// cell's target and optional unregister token are weak. `cleanup_queued`
-    /// prevents a collection during a callback from scheduling the same cells
-    /// twice.
-    FinalizationRegistry {
-        cleanup: Value,
-        /// Registrations whose targets have not been cleared.
-        cells: Vec<FinalizationCell>,
-        /// Cleared registrations awaiting callback delivery. Keeping these in
-        /// a separate stack makes cleanup linear even when many live cells
-        /// remain registered.
-        cleared: Vec<FinalizationCell>,
-        cleanup_queued: bool,
-    },
+    /// A JS `FinalizationRegistry`, boxed ([`FinRegData`]): its 64 bytes made
+    /// every heap slot 80.
+    FinalizationRegistry(Box<FinRegData>),
     /// A boxed primitive wrapper (`new String(x)`/`new Number(x)`/`new Boolean(x)`,
     /// or `Object(primitive)`). `kind` 0=String/1=Number/2=Boolean; `value` is the
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
     /// the value; the kind's prototype provides the methods.
     Boxed { kind: u8, value: Value },
-    /// A JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);
-    /// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
-    /// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
-    /// coerced offset) so an assigned object survives until `exec`/the @@-methods
-    /// apply ToLength, invoking its `valueOf` at the spec-mandated time.
-    ///
-    /// `ascii_twin` is the lazily-built BYTE-OPTIMIZED twin compile (regress
-    /// `from_unicode_byteopt`) used by the ASCII-subject fast path, cached
-    /// inline so a hot exec reads it with one `heap.get` instead of a per-exec
-    /// side-table probe: `None` = not yet computed, `Some(None)` = compile
-    /// failed (fall back to `regex`), `Some(Some(arc))` = the twin. Reset to
-    /// `None` by `RegExp.prototype.compile`. Holds no `Value`s (an
-    /// `Arc<regress::Regex>` is a pure compiled program), so GC need not trace it.
-    RegExp {
-        regex: std::sync::Arc<regress::Regex>,
-        /// `Arc<str>`, not `String`, so that cloning a RegExp shares its text instead
-        /// of copying it. `matchAll` clones a matcher per call — the iterator has to
-        /// advance a `lastIndex` independently of the source regex, and that object is
-        /// observable to a user `exec` as its receiver, so the clone cannot be elided —
-        /// which meant two heap `String` allocations on a path measured at 480ns
-        /// against node's 53. Sharing makes it two atomic increments.
-        ///
-        /// MEASURED: −2.0pp of `regex-log-scan` (the row went −0.9% with only the
-        /// `flags` shortcut below, −2.9% with both; B70). Larger than it looks because
-        /// `source`/`flags` are cloned on several regex paths, not just `matchAll`.
-        ///
-        /// NOT for size — that hypothesis was refuted. This variant's payload does drop
-        /// 80 → 64 bytes, but `HeapObj` stays 80: `Generator` is 72 and something else
-        /// still pins the ceiling, so `heap_obj_slot_stays_small` sees no change.
-        source: std::sync::Arc<str>,
-        flags: std::sync::Arc<str>,
-        last_index: Value,
-        ascii_twin: Option<Option<std::sync::Arc<regress::Regex>>>,
-    },
+    /// A JS `RegExp`, boxed ([`RegExpData`]): its 64 bytes made every heap
+    /// slot 80.
+    RegExp(Box<RegExpData>),
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
     /// `detached` is set by transfer (we never detach via GC); `data` is the bytes
     /// ([`AbData`]: per-VM `Local` for ArrayBuffers, `Shared` for SharedArrayBuffers).
@@ -6818,32 +6864,10 @@ pub enum HeapObj {
         proto: u32,
         live: Option<(u32, u8)>,
     },
-    /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
-    /// take,drop,flatMap,chunks,windows}`). `source` is the underlying iterator;
-    /// `kind` selects the transform (0=map,1=filter,2=take,3=drop,4=flatMap,
-    /// 8=chunks,9=windows); `arg` is the callback (map/filter/flatMap) or the
-    /// windows buffer; `n` is the remaining count (take/drop) or the chunk or
-    /// window size (negative: windows' `allow-partial`);
-    /// `idx` is the 0-based counter passed to callbacks; `done` marks exhaustion;
-    /// `inner` is flatMap's current inner iterator (or UNDEFINED).
-    IterHelper {
-        source: Value,
-        kind: u8,
-        arg: Value,
-        n: i64,
-        idx: i64,
-        done: bool,
-        inner: Value,
-        /// The source's `next` method, read ONCE at creation (GetIteratorDirect), so
-        /// stepping calls the cached method rather than re-reading `source.next` each
-        /// time. `UNDEFINED` when the source needs the generic step path (a generator,
-        /// or a multi-source zip/concat helper).
-        next: Value,
-        /// `[[GeneratorState]] == "executing"` brand: set while a `.next()` step is in
-        /// flight so that a callback re-entering `.next()`/`.return()` on the same
-        /// helper is a TypeError (GeneratorValidate) rather than infinite recursion.
-        running: bool,
-    },
+    /// A lazy Iterator Helper, boxed ([`IterHelperData`]): its 56 bytes would
+    /// set every heap slot's size once `BigInt`'s 16-byte alignment stops
+    /// rounding the enum up to 64.
+    IterHelper(Box<IterHelperData>),
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its
@@ -6931,9 +6955,9 @@ impl HeapObj {
                 n = n.saturating_add(0);
                 n
             }
-            HeapObj::Generator { regs, handlers, .. } => {
-                vec_capacity_bytes(regs).saturating_add(vec_capacity_bytes(handlers))
-            }
+            HeapObj::Generator(g) => std::mem::size_of::<GeneratorData>()
+                .saturating_add(vec_capacity_bytes(&g.regs))
+                .saturating_add(vec_capacity_bytes(&g.handlers)),
             HeapObj::AsyncGenerator(state) => std::mem::size_of::<AsyncGenState>()
                 .saturating_add(vec_capacity_bytes(&state.regs))
                 .saturating_add(vec_capacity_bytes(&state.handlers))
@@ -6950,10 +6974,11 @@ impl HeapObj {
                 vec_capacity_bytes(keys).saturating_add(vec_capacity_bytes(vals))
             }
             HeapObj::Set(values) | HeapObj::WeakSet(values) => vec_capacity_bytes(values),
-            HeapObj::FinalizationRegistry { cells, cleared, .. } => {
-                vec_capacity_bytes(cells).saturating_add(vec_capacity_bytes(cleared))
-            }
-            HeapObj::RegExp { source, flags, .. } => {
+            HeapObj::FinalizationRegistry(fr) => std::mem::size_of::<FinRegData>()
+                .saturating_add(vec_capacity_bytes(&fr.cells))
+                .saturating_add(vec_capacity_bytes(&fr.cleared)),
+            HeapObj::RegExp(re) => {
+                let crate::heap::RegExpData { source, flags, .. } = &**re;
                 // Compiled programs (including the ASCII twin) are measured
                 // through Regex::resident_bytes and Arc-deduplicated by the
                 // VM audit. Keep the observable source/flag text charged here.
@@ -10900,10 +10925,8 @@ impl Heap {
         mut visit: impl FnMut(&std::sync::Arc<regress::Regex>),
     ) {
         for obj in &self.objs {
-            if let HeapObj::RegExp {
-                regex, ascii_twin, ..
-            } = obj
-            {
+            if let HeapObj::RegExp(re) = obj {
+                let crate::heap::RegExpData { regex, ascii_twin, .. } = &**re;
                 visit(regex);
                 if let Some(Some(twin)) = ascii_twin {
                     visit(twin);
@@ -11886,7 +11909,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
         assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
-        assert_eq!(std::mem::size_of::<HeapObj>(), 80);
+        assert_eq!(std::mem::size_of::<HeapObj>(), 64);
     }
 
     #[cfg(not(feature = "safe-sandbox"))]

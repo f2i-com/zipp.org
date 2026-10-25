@@ -4675,7 +4675,7 @@ impl<'p> Vm<'p> {
                         if key == "next"
                             && self.realm_global_objs.is_empty()
                             && recv.is_heap()
-                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Generator { .. })
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Generator(_))
                             && self.gen_method_pristine(recv.heap_index(), "next")
                         {
                             let sent = if argc == 0 {
@@ -5315,9 +5315,9 @@ impl<'p> Vm<'p> {
                                 HeapObj::Object(_)
                                     | HeapObj::Proxy { .. }
                                     | HeapObj::Iterator { .. }
-                                    | HeapObj::IterHelper { .. }
+                                    | HeapObj::IterHelper(_)
                                     | HeapObj::Intl { .. }
-                            ) || (matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                            ) || (matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
                                 && !self.gen_method_pristine(it.heap_index(), "next")))
                         {
                             self.get_prop(it, "next")?
@@ -5394,7 +5394,7 @@ impl<'p> Vm<'p> {
                         // A primed loop decided at `IterPrime` (its record's
                         // [[NextMethod]] is read once: undefined there means the
                         // intrinsic); an unprimed step asks now.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
                             && if next != u16::MAX {
                                 self.get(base, next).is_undefined()
                             } else {
@@ -5460,9 +5460,9 @@ impl<'p> Vm<'p> {
                             HeapObj::Object(_)
                                 | HeapObj::Proxy { .. }
                                 | HeapObj::Iterator { .. }
-                                | HeapObj::IterHelper { .. }
+                                | HeapObj::IterHelper(_)
                                 | HeapObj::Intl { .. }
-                                | HeapObj::Generator { .. }
+                                | HeapObj::Generator(_)
                         ) {
                             let next = if next != u16::MAX {
                                 self.get(base, next)

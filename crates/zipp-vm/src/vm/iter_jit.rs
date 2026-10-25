@@ -112,7 +112,7 @@ pub(crate) extern "win64" fn jit_iter_prime(vm: *mut core::ffi::c_void, it_bits:
                 HeapObj::Object(_)
                     | HeapObj::Proxy { .. }
                     | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper { .. }
+                    | HeapObj::IterHelper(_)
                     | HeapObj::Intl { .. }
             ) {
                 return crate::codegen::SELF_CALL_DEOPT;

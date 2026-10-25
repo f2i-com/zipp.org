@@ -670,12 +670,12 @@ impl<'p> Vm<'p> {
                 ));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.finreg_proto)?;
-            let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry {
+            let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry(Box::new(crate::heap::FinRegData {
                 cleanup: cb,
                 cells: Vec::new(),
                 cleared: Vec::new(),
                 cleanup_queued: false,
-            });
+            })));
             self.register_weak_container(fr_idx);
             let fr = Value::heap(fr_idx);
             return Ok(self.set_ctor_proto(fr, over));
@@ -1630,12 +1630,12 @@ impl<'p> Vm<'p> {
             }
             self.heap.replace(
                 oidx,
-                HeapObj::FinalizationRegistry {
+                HeapObj::FinalizationRegistry(Box::new(crate::heap::FinRegData {
                     cleanup: cb,
                     cells: Vec::new(),
                     cleared: Vec::new(),
                     cleanup_queued: false,
-                },
+                })),
             );
             self.register_weak_container(oidx);
             if sub_proto.is_heap() {
@@ -1952,10 +1952,7 @@ fn clone_builtin_instance(obj: &HeapObj) -> HeapObj {
         HeapObj::Boxed { kind, value } => HeapObj::Boxed { kind: *kind, value: *value },
         HeapObj::Date(value) => HeapObj::Date(*value),
         HeapObj::TextCodec(c) => HeapObj::TextCodec(*c),
-        HeapObj::RegExp { regex, source, flags, last_index, ascii_twin } => HeapObj::RegExp {
-            regex: regex.clone(), source: source.clone(), flags: flags.clone(),
-            last_index: *last_index, ascii_twin: ascii_twin.clone(),
-        },
+        HeapObj::RegExp(re) => HeapObj::RegExp(re.clone()),
         HeapObj::TypedArray { buffer, kind, byte_offset, length } => HeapObj::TypedArray {
             buffer: *buffer, kind: *kind, byte_offset: *byte_offset, length: *length,
         },

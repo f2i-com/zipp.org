@@ -638,8 +638,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::CombinatorResolver { .. }
                 | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                 | HeapObj::Iterator { .. }
-                | HeapObj::IterHelper { .. }
-                | HeapObj::Generator { .. }
+                | HeapObj::IterHelper(_)
+                | HeapObj::Generator(_)
                 | HeapObj::AsyncGenerator(_)
                 | HeapObj::Date(_)
                 | HeapObj::Temporal { .. }
@@ -655,8 +655,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakSet(_)
                 | HeapObj::WeakRef(_)
                 | HeapObj::TextCodec(_)
-                | HeapObj::FinalizationRegistry { .. }
-                | HeapObj::RegExp { .. }
+                | HeapObj::FinalizationRegistry(_)
+                | HeapObj::RegExp(_)
                 | HeapObj::Symbol { .. }
                 | HeapObj::BigInt(_)
                 | HeapObj::BigIntBig(_)

@@ -555,7 +555,7 @@ impl<'p> Vm<'p> {
         }
         // A RegExp's `lastIndex` is a non-configurable own property (writable,
         // but never configurable) — `delete re.lastIndex` fails (false).
-        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_)) {
             return Value::bool(false);
         }
         // An Array's `length` is a non-configurable own property — `delete arr.length`
@@ -1476,7 +1476,7 @@ impl<'p> Vm<'p> {
             }
         }
         // `re.lastIndex = n` — a RegExp's one writable data property by default.
-        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_)) {
             // `Object.defineProperty` or `Object.freeze` can make it non-writable:
             // then `Set(R,"lastIndex",..,true)` throws (strict) / is a silent no-op
             // (sloppy), per OrdinarySet — without touching the slot.
@@ -1485,8 +1485,8 @@ impl<'p> Vm<'p> {
             }
             // Store the assigned Value AS-IS — ToLength is applied later by `exec`
             // / the @@-methods, invoking a user `valueOf`/`toString` then, not now.
-            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
-                *last_index = val;
+            if let HeapObj::RegExp(re) = self.heap.get_mut(idx) {
+                re.last_index = val;
             }
             // The RegExp is usually old by the time its lastIndex is assigned.
             self.heap.write_barrier_val(idx, val);
@@ -1705,14 +1705,14 @@ impl<'p> Vm<'p> {
             // global/source/flags, Map/Set size) must govern the write: assigning it
             // is a sloppy no-op / strict TypeError, NOT a new own data property. The
             // `re.lastIndex` data property is handled (and returns) above this point.
-            HeapObj::RegExp { .. }
+            HeapObj::RegExp(_)
             | HeapObj::Map { .. }
             | HeapObj::Set(_)
             | HeapObj::WeakMap { .. }
             | HeapObj::WeakSet(_)
             | HeapObj::WeakRef(_)
             | HeapObj::TextCodec(_)
-            | HeapObj::FinalizationRegistry { .. }
+            | HeapObj::FinalizationRegistry(_)
             | HeapObj::Date(_)
             | HeapObj::Promise { .. }
             | HeapObj::Boxed { .. }
@@ -2073,11 +2073,11 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakSet(_)
                 | HeapObj::WeakRef(_)
                 | HeapObj::TextCodec(_)
-                | HeapObj::FinalizationRegistry { .. }
+                | HeapObj::FinalizationRegistry(_)
                 | HeapObj::Date(_)
                 | HeapObj::Promise { .. }
                 | HeapObj::Boxed { .. }
-                | HeapObj::RegExp { .. }
+                | HeapObj::RegExp(_)
                 | HeapObj::ArrayBuffer { .. }
                 | HeapObj::DataView { .. }
                 // Generators are ORDINARY objects — `it.next = f` must shadow
@@ -2085,12 +2085,12 @@ impl<'p> Vm<'p> {
                 // monkeypatched one). Omitting them fell through to the `_ => {}`
                 // at the bottom, which silently dropped the write while still
                 // reporting success; `defineProperty` already used this table.
-                | HeapObj::Generator { .. }
+                | HeapObj::Generator(_)
                 | HeapObj::AsyncGenerator(_)
                 // So are a built-in iterator and an iterator helper: `it.foo = 1`
                 // and an own `it.next = f` were dropped the same way.
                 | HeapObj::Iterator { .. }
-                | HeapObj::IterHelper { .. }
+                | HeapObj::IterHelper(_)
                 // An Intl service instance is exotic too, and a subclass of one
                 // must still take ordinary own properties
                 // (`class F extends Intl.ListFormat {}; f.x = 1`).
@@ -2486,7 +2486,7 @@ impl<'p> Vm<'p> {
                 return Some(data(false));
             }
         }
-        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_)) {
             return Some(data(self.regexp_last_index_writable(idx)));
         }
         let side = |m: &ObjMap| m.pos(key).map(|i| m.attr_at(i));

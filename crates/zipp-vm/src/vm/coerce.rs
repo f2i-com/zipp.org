@@ -3212,13 +3212,13 @@ impl<'p> Vm<'p> {
                 HeapObj::TextCodec(c) => {
                     out.push_str(if c.decoder { "[object TextDecoder]" } else { "[object TextEncoder]" });
                 }
-                HeapObj::FinalizationRegistry { .. } => {
+                HeapObj::FinalizationRegistry(_) => {
                     out.push_str("[object FinalizationRegistry]");
                 }
                 HeapObj::Iterator { .. } => {
                     out.push_str("[object Array Iterator]");
                 }
-                HeapObj::IterHelper { .. } => {
+                HeapObj::IterHelper(_) => {
                     out.push_str("[object Iterator Helper]");
                 }
                 HeapObj::Boxed { value, .. } => self.display_value_into(out, *value, depth + 1),
@@ -3235,7 +3235,8 @@ impl<'p> Vm<'p> {
                 HeapObj::BigIntBig(number) => {
                     let _ = write!(out, "{number}");
                 }
-                HeapObj::RegExp { source, flags, .. } => {
+                HeapObj::RegExp(re) => {
+                    let crate::heap::RegExpData { source, flags, .. } = &**re;
                     out.push_str("/");
                     out.push_str(if source.is_empty() { "(?:)" } else { source });
                     let _ = write!(out, "/{flags}");
@@ -3256,7 +3257,7 @@ impl<'p> Vm<'p> {
                 HeapObj::DataView { .. } => {
                     out.push_str("[object DataView]");
                 }
-                HeapObj::Generator { .. } => {
+                HeapObj::Generator(_) => {
                     out.push_str("[object Generator]");
                 }
                 HeapObj::AsyncGenerator(_) => {
@@ -3627,13 +3628,13 @@ impl<'p> Vm<'p> {
             HeapObj::TextCodec(c) => {
                 out.push_str(if c.decoder { "TextDecoder {}" } else { "TextEncoder {}" });
             }
-            HeapObj::FinalizationRegistry { .. } => {
+            HeapObj::FinalizationRegistry(_) => {
                 out.push_str("FinalizationRegistry {}");
             }
             HeapObj::Iterator { .. } => {
                 out.push_str("Object [Array Iterator] {}");
             }
-            HeapObj::IterHelper { .. } => {
+            HeapObj::IterHelper(_) => {
                 out.push_str("Object [Iterator Helper] {}");
             }
             HeapObj::Boxed { kind, value } => {
@@ -3660,7 +3661,8 @@ impl<'p> Vm<'p> {
             HeapObj::BigIntBig(big) => {
                 let _ = write!(out, "{big}n");
             }
-            HeapObj::RegExp { source, flags, .. } => {
+            HeapObj::RegExp(re) => {
+                let crate::heap::RegExpData { source, flags, .. } = &**re;
                 out.push_char('/');
                 out.push_str(if source.is_empty() { "(?:)" } else { source });
                 out.push_char('/');
@@ -3696,7 +3698,7 @@ impl<'p> Vm<'p> {
             HeapObj::DataView { byte_length, .. } => {
                 let _ = write!(out, "DataView {{ byteLength: {byte_length} }}");
             }
-            HeapObj::Generator { .. } => {
+            HeapObj::Generator(_) => {
                 out.push_str("Object [Generator] {}");
             }
             HeapObj::AsyncGenerator(_) => {

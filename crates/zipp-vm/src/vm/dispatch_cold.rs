@@ -2276,17 +2276,17 @@ impl<'p> Vm<'p> {
                         self.display(it)
                     )));
                 }
-                let gen_direct = matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. })
+                let gen_direct = matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
                     && self.gen_method_pristine(it.heap_index(), "next");
                 let result = match self.heap.get(it.heap_index()) {
                     HeapObj::AsyncGenerator(_) => self
                         .async_generator_method(it.heap_index(), "next", &[sent_v])
                         .unwrap_or(Value::UNDEFINED),
-                    HeapObj::Generator { .. } if gen_direct => self
+                    HeapObj::Generator(_) if gen_direct => self
                         .generator_method(it.heap_index(), "next", &[sent_v])?
                         .unwrap_or(Value::UNDEFINED),
                     // A generator whose `next` was replaced calls it.
-                    HeapObj::Object(_) | HeapObj::Generator { .. } => {
+                    HeapObj::Object(_) | HeapObj::Generator(_) => {
                         if self.is_callable(nf) {
                             self.call_value(nf, it, &[sent_v])?
                         } else {
@@ -2378,7 +2378,7 @@ impl<'p> Vm<'p> {
                     // Run the step as a frame of this loop; its yield or
                     // return completes this instruction.
                     if iter_v.is_heap()
-                        && matches!(self.heap.get(iter_v.heap_index()), HeapObj::Generator { .. })
+                        && matches!(self.heap.get(iter_v.heap_index()), HeapObj::Generator(_))
                         && self.gen_method_pristine(iter_v.heap_index(), "next")
                         && self.gen_enter_inline(iter_v.heap_index(), ip, value_dst, done_dst, sent_v, true)
                     {
@@ -2539,7 +2539,7 @@ impl<'p> Vm<'p> {
                         .async_generator_method(it.heap_index(), "next", &[])
                         .unwrap_or(Value::UNDEFINED),
                     // Sync generator: `.next()` returns {value,done} (awaited = no-op tick).
-                    HeapObj::Generator { .. }
+                    HeapObj::Generator(_)
                         if self.gen_method_pristine(it.heap_index(), "next") =>
                     {
                         self.generator_method(it.heap_index(), "next", &[])?
@@ -2553,8 +2553,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(_)
                     | HeapObj::Proxy { .. }
                     | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper { .. }
-                    | HeapObj::Generator { .. } => {
+                    | HeapObj::IterHelper(_)
+                    | HeapObj::Generator(_) => {
                         let next = self.get_prop(it, "next")?;
                         if self.is_callable(next) {
                             self.call_value(next, it, &[])?
@@ -3176,12 +3176,12 @@ impl<'p> Vm<'p> {
                         "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
                     ));
                 }
-                let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry {
+                let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry(Box::new(crate::heap::FinRegData {
                     cleanup: cb,
                     cells: Vec::new(),
                     cleared: Vec::new(),
                     cleanup_queued: false,
-                });
+                })));
                 self.register_weak_container(fr_idx);
                 let fr = Value::heap(fr_idx);
                 self.set(base, dst, fr);

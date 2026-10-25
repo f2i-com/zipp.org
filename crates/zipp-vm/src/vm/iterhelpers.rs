@@ -117,7 +117,7 @@ impl<'p> Vm<'p> {
     /// Pull one value from an iterator (calling its `.next()`), `Ok(None)` at end.
     pub(crate) fn iterator_step(&mut self, iter: Value) -> Result<Option<Value>, Thrown> {
         if iter.is_heap()
-            && matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+            && matches!(self.heap.get(iter.heap_index()), HeapObj::Generator(_))
             && self.gen_method_pristine(iter.heap_index(), "next")
         {
             // The step as a value, without the result object `next` would
@@ -612,7 +612,7 @@ impl<'p> Vm<'p> {
     /// Set the i-th open iterator of a zip helper to `null` (closed/exhausted).
     fn iz_close_slot(&mut self, helper_idx: u32, i: usize) {
         let source = match self.heap.get(helper_idx) {
-            HeapObj::IterHelper { source, .. } => *source,
+            HeapObj::IterHelper(ih) => ih.source,
             _ => return,
         };
         if let HeapObj::Array(items) = self.heap.get_mut(source.heap_index()) {
@@ -713,7 +713,7 @@ impl<'p> Vm<'p> {
     /// order, propagating the FIRST close error (later throws discarded, value+string).
     pub(crate) fn iz_close_all(&mut self, helper_idx: u32) -> Option<Thrown> {
         let source = match self.heap.get(helper_idx) {
-            HeapObj::IterHelper { source, .. } => *source,
+            HeapObj::IterHelper(ih) => ih.source,
             _ => return None,
         };
         let iters = match self.heap.get(source.heap_index()) {
@@ -728,10 +728,10 @@ impl<'p> Vm<'p> {
     /// re-enters this helper while a step is executing is a TypeError.
     pub(crate) fn iter_zip_next(&mut self, idx: u32) -> Result<Value, Thrown> {
         match self.heap.get(idx) {
-            HeapObj::IterHelper { running: true, .. } => {
+            HeapObj::IterHelper(ih) if ih.running => {
                 return Err(Thrown::from_static("TypeError: Iterator is already running"));
             }
-            HeapObj::IterHelper { .. } => {}
+            HeapObj::IterHelper(_) => {}
             _ => {
                 return Err(Thrown::from_static(
                     "TypeError: Iterator Helper next on incompatible receiver",
@@ -761,14 +761,7 @@ impl<'p> Vm<'p> {
 
     fn iter_zip_step(&mut self, idx: u32) -> Result<Value, Thrown> {
         let (source, arg, inner, mode, done) = match self.heap.get(idx) {
-            HeapObj::IterHelper {
-                source,
-                arg,
-                inner,
-                n,
-                done,
-                ..
-            } => (*source, *arg, *inner, *n as u8, *done),
+            HeapObj::IterHelper(ih) => (ih.source, ih.arg, ih.inner, ih.n as u8, ih.done),
             _ => {
                 return Err(Thrown::from_static(
                     "TypeError: Iterator Helper next on incompatible receiver",
@@ -951,7 +944,7 @@ impl<'p> Vm<'p> {
             && source.is_heap()
             && !matches!(
                 self.heap.get(source.heap_index()),
-                HeapObj::Generator { .. }
+                HeapObj::Generator(_)
             ) {
             self.get_prop(source, "next")?
         } else {
@@ -971,7 +964,7 @@ impl<'p> Vm<'p> {
         n: i64,
         next: Value,
     ) -> Result<Value, Thrown> {
-        let idx = self.heap.alloc(HeapObj::IterHelper {
+        let idx = self.heap.alloc(HeapObj::IterHelper(Box::new(crate::heap::IterHelperData {
             source,
             kind,
             arg,
@@ -981,7 +974,7 @@ impl<'p> Vm<'p> {
             inner: Value::UNDEFINED,
             next,
             running: false,
-        });
+        })));
         if self.iterator_helper_proto != 0 {
             self.proto_of
                 .insert(idx, Value::heap(self.iterator_helper_proto));
@@ -991,17 +984,20 @@ impl<'p> Vm<'p> {
 
     // Field mutators for an IterHelper (kept tiny to dodge borrow conflicts).
     fn ih_set_done(&mut self, idx: u32) {
-        if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(idx) {
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { done, .. } = &mut **ih;
             *done = true;
         }
     }
     fn ih_inc_idx(&mut self, idx: u32) {
-        if let HeapObj::IterHelper { idx: i, .. } = self.heap.get_mut(idx) {
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { idx: i, .. } = &mut **ih;
             *i += 1;
         }
     }
     fn ih_set_n(&mut self, idx: u32, v: i64) {
-        if let HeapObj::IterHelper { n, .. } = self.heap.get_mut(idx) {
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { n, .. } = &mut **ih;
             *n = v;
         }
     }
@@ -1009,12 +1005,14 @@ impl<'p> Vm<'p> {
         // Nursery barrier: flatMap's current inner iterator is the one
         // IterHelper field mutated after creation.
         self.heap.write_barrier_val(idx, v);
-        if let HeapObj::IterHelper { inner, .. } = self.heap.get_mut(idx) {
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { inner, .. } = &mut **ih;
             *inner = v;
         }
     }
     pub(crate) fn ih_set_running(&mut self, idx: u32, v: bool) {
-        if let HeapObj::IterHelper { running, .. } = self.heap.get_mut(idx) {
+        if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { running, .. } = &mut **ih;
             *running = v;
         }
     }
@@ -1027,7 +1025,8 @@ impl<'p> Vm<'p> {
     fn ih_chunk_step(&mut self, idx: u32, source: Value, next: Value, kind: u8, n: i64) -> Result<Value, Thrown> {
         let size = n.unsigned_abs() as usize;
         let buf = match self.heap.get(idx) {
-            HeapObj::IterHelper { arg, inner, .. } => {
+            HeapObj::IterHelper(ih) => {
+                let crate::heap::IterHelperData { arg, inner, .. } = &**ih;
                 if kind == 8 {
                     *inner
                 } else {
@@ -1046,7 +1045,8 @@ impl<'p> Vm<'p> {
                 self.ih_set_inner(idx, a);
             } else {
                 self.heap.write_barrier_val(idx, a);
-                if let HeapObj::IterHelper { arg, .. } = self.heap.get_mut(idx) {
+                if let HeapObj::IterHelper(ih) = self.heap.get_mut(idx) {
+                let crate::heap::IterHelperData { arg, .. } = &mut **ih;
                     *arg = a;
                 }
             }
@@ -1172,7 +1172,7 @@ impl<'p> Vm<'p> {
     /// cached method. A generator uses the internal step path (UNDEFINED).
     fn iter_direct_next(&mut self, iter: Value) -> Result<Value, Thrown> {
         let next = if iter.is_heap()
-            && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+            && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator(_))
         {
             self.get_prop(iter, "next")?
         } else {
@@ -1527,10 +1527,10 @@ impl<'p> Vm<'p> {
     /// stack overflow / silent wrong answer. The `running` brand is always cleared.
     pub(crate) fn iter_helper_next(&mut self, idx: u32) -> Result<Value, Thrown> {
         match self.heap.get(idx) {
-            HeapObj::IterHelper { running: true, .. } => {
+            HeapObj::IterHelper(ih) if ih.running => {
                 return Err(Thrown::from_static("TypeError: Iterator is already running"));
             }
-            HeapObj::IterHelper { .. } => {}
+            HeapObj::IterHelper(_) => {}
             _ => {
                 return Err(Thrown::from_static(
                     "TypeError: Iterator Helper next called on incompatible receiver",
@@ -1547,17 +1547,7 @@ impl<'p> Vm<'p> {
         let mut work = 0;
         loop {
             let (source, kind, arg, n, cidx, done, inner, next) = match self.heap.get(idx) {
-                HeapObj::IterHelper {
-                    source,
-                    kind,
-                    arg,
-                    n,
-                    idx,
-                    done,
-                    inner,
-                    next,
-                    ..
-                } => (*source, *kind, *arg, *n, *idx, *done, *inner, *next),
+                HeapObj::IterHelper(ih) => (ih.source, ih.kind, ih.arg, ih.n, ih.idx, ih.done, ih.inner, ih.next),
                 _ => {
                     return Err(Thrown::from_static(
                         "TypeError: Iterator Helper next called on incompatible receiver",

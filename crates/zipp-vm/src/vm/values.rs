@@ -133,7 +133,7 @@ impl<'p> Vm<'p> {
         let idx = recv.heap_index();
         let proto = match op {
             crate::bytecode::RegExpMethod::Test | crate::bytecode::RegExpMethod::Exec => {
-                if !matches!(self.heap.get(idx), HeapObj::RegExp { .. })
+                if !matches!(self.heap.get(idx), HeapObj::RegExp(_))
                     || self
                         .arr_props
                         .get(&idx)
@@ -471,7 +471,7 @@ impl<'p> Vm<'p> {
                     // A RegExp instance's `lastIndex` is an own data property held
                     // in the heap object itself (not arr_props) —
                     // `"lastIndex" in re` is true.
-                    if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+                    if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_)) {
                         return true;
                     }
                     // A callable's assigned own properties (`fn.x = …`) live in the
@@ -552,7 +552,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
                             HeapObj::Date(_) => self.date_proto,
                             HeapObj::Promise { .. } => self.promise_proto,
-                            HeapObj::RegExp { .. } => self.regexp_proto,
+                            HeapObj::RegExp(_) => self.regexp_proto,
                             // Map/Set previously answered ONLY `"size"` from a
                             // dedicated arm, so neither their assigned own props
                             // (`m.x = 1`) nor their inherited methods (`"has" in m`)
@@ -566,11 +566,11 @@ impl<'p> Vm<'p> {
                             HeapObj::WeakRef(_) => self.weakref_proto,
                             HeapObj::TextCodec(c) if c.decoder => self.text_decoder_proto,
                             HeapObj::TextCodec(_) => self.text_encoder_proto,
-                            HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
-                            HeapObj::Generator { .. } => self.gen_proto,
+                            HeapObj::FinalizationRegistry(_) => self.finreg_proto,
+                            HeapObj::Generator(_) => self.gen_proto,
                             HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
                             HeapObj::Iterator { proto, .. } => *proto,
-                            HeapObj::IterHelper { .. } => self.iterator_helper_proto,
+                            HeapObj::IterHelper(_) => self.iterator_helper_proto,
                             _ => 0,
                         };
                         (bp != 0).then_some(Value::heap(bp))
@@ -2131,7 +2131,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
                     HeapObj::Date(_) => self.date_proto,
                     HeapObj::Promise { .. } => self.promise_proto,
-                    HeapObj::RegExp { .. } => self.regexp_proto,
+                    HeapObj::RegExp(_) => self.regexp_proto,
                     _ => 0,
                 }
             };
@@ -2751,8 +2751,8 @@ impl<'p> Vm<'p> {
             // The RegExp CONSTRUCTOR needs owned text (it may append a sticky flag,
             // and the result becomes a different object's source), so materialise
             // here — once per `new RegExp(...)`, never on a match path.
-            Some(HeapObj::RegExp { source, flags, .. }) => {
-                Some((source.to_string(), flags.to_string()))
+            Some(HeapObj::RegExp(re)) => {
+                Some((re.source.to_string(), re.flags.to_string()))
             }
             _ => None,
         };
@@ -2932,13 +2932,13 @@ impl<'p> Vm<'p> {
                 rc
             }
         };
-        let idx = self.heap.alloc(HeapObj::RegExp {
+        let idx = self.heap.alloc(HeapObj::RegExp(Box::new(crate::heap::RegExpData {
             regex,
             source: source.into(),
             flags: flags.into(),
             last_index: Value::int(0),
             ascii_twin: None,
-        });
+        })));
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap

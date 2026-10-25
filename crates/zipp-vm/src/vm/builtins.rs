@@ -197,7 +197,7 @@ pub(super) fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
             HeapObj::Map { .. } => "map",
             HeapObj::Set(_) => "set",
             HeapObj::Promise { .. } => "promise",
-            HeapObj::RegExp { .. } => "regexp",
+            HeapObj::RegExp(_) => "regexp",
             HeapObj::Date(_) => "date",
             HeapObj::TypedArray { .. } => "typedarray",
             HeapObj::DataView { .. } => "dataview",
@@ -2302,7 +2302,7 @@ impl<'p> Vm<'p> {
         // Guarded, unlike its siblings — see `regexp_method_is_intrinsic`. `test` also
         // needs `exec` to be intrinsic (RegExpExec reads it), and the natives already
         // check that and fall back correctly, so only the entry point is guarded here.
-        if matches!(name, "test" | "exec") && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+        if matches!(name, "test" | "exec") && matches!(self.heap.get(idx), HeapObj::RegExp(_)) {
             let want = if name == "test" {
                 native::REGEXP_TEST
             } else {
@@ -2537,7 +2537,7 @@ impl<'p> Vm<'p> {
             // Only while the method resolves to the intrinsic: an own one, a
             // replaced one on the function's `prototype` object or on
             // %GeneratorPrototype% takes the caller's get + call instead.
-            HeapObj::Generator { .. } => {
+            HeapObj::Generator(_) => {
                 if matches!(name, "next" | "return" | "throw")
                     && !self.gen_method_pristine(idx, name)
                 {
@@ -2895,7 +2895,7 @@ impl<'p> Vm<'p> {
                 // Date/RegExp have built-in tags ([[DateValue]]/[[RegExpMatcher]]);
                 // Map/Set/Promise/etc instead carry a @@toStringTag (handled below).
                 HeapObj::Date(_) => "Date",
-                HeapObj::RegExp { .. } => "RegExp",
+                HeapObj::RegExp(_) => "RegExp",
                 // The built-in prototype objects are themselves exotics of their
                 // type (Number.prototype is a Number, String.prototype a String,
                 // …), so Object.prototype.toString tags them by that type. zipp
@@ -4916,7 +4916,7 @@ impl<'p> Vm<'p> {
         if !this.is_heap()
             || !matches!(
                 self.heap.get(this.heap_index()),
-                HeapObj::FinalizationRegistry { .. }
+                HeapObj::FinalizationRegistry(_)
             )
         {
             return Err(Thrown(format!(
@@ -4948,7 +4948,8 @@ impl<'p> Vm<'p> {
                 // Only the holding is a strong old-to-young edge. Recording the
                 // target or token in the remset would accidentally keep it live.
                 self.heap.write_barrier_val(idx, held);
-                if let HeapObj::FinalizationRegistry { cells, .. } = self.heap.get_mut(idx) {
+                if let HeapObj::FinalizationRegistry(fr) = self.heap.get_mut(idx) {
+                let crate::heap::FinRegData { cells, .. } = &mut **fr;
                     cells.push(crate::heap::FinalizationCell {
                         target: a0,
                         held,
@@ -4964,7 +4965,8 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let mut removed = false;
-                if let HeapObj::FinalizationRegistry { cells, cleared, .. } = self.heap.get_mut(idx) {
+                if let HeapObj::FinalizationRegistry(fr) = self.heap.get_mut(idx) {
+                let crate::heap::FinRegData { cells, cleared, .. } = &mut **fr;
                     let before = cells.len().saturating_add(cleared.len());
                     // Also removes cleared cells awaiting delivery: unregister is
                     // allowed to cancel after target collection but before cleanup.

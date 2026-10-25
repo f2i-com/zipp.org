@@ -865,7 +865,7 @@ impl<'p> Vm<'p> {
                 }
                 // A RegExp owns `lastIndex` (a writable data property).
                 if key == "lastIndex"
-                    && matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp { .. })
+                    && matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp(_))
                 {
                     return true;
                 }
@@ -1348,7 +1348,7 @@ impl<'p> Vm<'p> {
     /// `yield*` walk.
     pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap()
-            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator(_))
             && self.gen_method_pristine(v.heap_index(), "@@iterator")
         {
             return Ok(v);
@@ -1435,8 +1435,8 @@ impl<'p> Vm<'p> {
                 // Iterator objects the engine drives directly; a generator
                 // only while its `@@iterator` is the intrinsic (a patched
                 // one is called, below).
-                HeapObj::Generator { .. } if self.gen_method_pristine(idx, "@@iterator") => return Ok(v),
-                HeapObj::AsyncGenerator(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => {
+                HeapObj::Generator(_) if self.gen_method_pristine(idx, "@@iterator") => return Ok(v),
+                HeapObj::AsyncGenerator(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper(_) => {
                     return Ok(v)
                 }
                 // Everything else that is an object — a plain object, a Proxy, but
@@ -1566,7 +1566,7 @@ impl<'p> Vm<'p> {
         }
         let drain = match self.heap.get(v.heap_index()) {
             // A generator with a patched `@@iterator` calls it (below).
-            HeapObj::Generator { .. } if self.gen_method_pristine(v.heap_index(), "@@iterator") => {
+            HeapObj::Generator(_) if self.gen_method_pristine(v.heap_index(), "@@iterator") => {
                 DestructureIter::Existing
             }
             // An ITERATOR OBJECT is iterable through the protocol and nothing
@@ -1576,7 +1576,7 @@ impl<'p> Vm<'p> {
             // `var [p, q] = [10, 20].values()` bound two `undefined`s. Arrays,
             // Sets, strings and generators all worked, which is why it survived:
             // the broken shape is the one nobody writes by hand.
-            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => DestructureIter::Existing,
+            HeapObj::Iterator { .. } | HeapObj::IterHelper(_) => DestructureIter::Existing,
             // An array, string (or String wrapper), Map, Set or TypedArray: the
             // positional walk stands in for the iterator only while that is
             // unobservable (`builtin_iter_pristine`, including "no `return` for
@@ -1696,7 +1696,7 @@ impl<'p> Vm<'p> {
                 iter
             }
         };
-        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator(_))
             && self.gen_method_pristine(iter.heap_index(), "next");
         let lim = max as usize;
         let mut out = Vec::new();
@@ -1926,7 +1926,7 @@ impl<'p> Vm<'p> {
         // `return` finds the intrinsic: an own or prototype override is the
         // GetMethod below's, as for any iterator.
         match self.heap.get(iter.heap_index()) {
-            HeapObj::Generator { .. } if self.gen_method_pristine(iter.heap_index(), "return") => {
+            HeapObj::Generator(_) if self.gen_method_pristine(iter.heap_index(), "return") => {
                 self.generator_method(iter.heap_index(), "return", &[])?;
                 return Ok(());
             }
@@ -2161,7 +2161,7 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(it) {
             return Err(Thrown::from_static("TypeError: iterator is not an object"));
         }
-        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
+        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_)) {
             return self.iterator_to_vec(it);
         }
         // A method's result is always stepped through its `next` — even one
@@ -2190,7 +2190,7 @@ impl<'p> Vm<'p> {
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
         if v.is_heap()
-            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. })
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Generator(_))
             && self.gen_method_pristine(v.heap_index(), "next")
         {
             return self.drain_iterator_rooted(v, None);
@@ -2208,9 +2208,9 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(_)
                     | HeapObj::Proxy { .. }
                     | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper { .. }
+                    | HeapObj::IterHelper(_)
                     | HeapObj::Intl { .. }
-                    | HeapObj::Generator { .. }
+                    | HeapObj::Generator(_)
             )
         {
             let next = self.get_prop(v, "next")?;

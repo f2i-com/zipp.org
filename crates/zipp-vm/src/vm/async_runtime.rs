@@ -588,13 +588,13 @@ impl<'p> Vm<'p> {
             let back = self.regs.split_off(new_base);
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
             let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
-            let g = self.heap.alloc(HeapObj::Generator {
+            let g = self.heap.alloc(HeapObj::Generator(Box::new(crate::heap::GeneratorData {
                 func: func_id,
                 closure,
                 state: GenState::Suspended(genstart_ip),
                 regs: back,
                 handlers,
-            });
+            })));
             // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
             // the callee's `prototype` object (a replaced g.prototype flows
             // through); the HeapObj::Generator fallback stays %GeneratorProto%.
@@ -629,13 +629,13 @@ impl<'p> Vm<'p> {
         // completion. Either way the window is reclaimed.
         self.regs.truncate(new_base);
         match outcome {
-            Ok(_) => Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
+            Ok(_) => Ok(Value::heap(self.heap.alloc(HeapObj::Generator(Box::new(crate::heap::GeneratorData {
                 func: func_id,
                 closure,
                 state: GenState::Completed,
                 regs: Vec::new(),
                 handlers: Vec::new(),
-            }))),
+            }))))),
             Err(t) => Err(t),
         }
     }
@@ -650,12 +650,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let (state, fid, closure) = match self.heap.get(idx) {
-            HeapObj::Generator {
-                state,
-                func,
-                closure,
-                ..
-            } => (*state, *func, *closure),
+            HeapObj::Generator(g) => (g.state, g.func, g.closure),
             _ => return Ok(None),
         };
         match name {
@@ -699,12 +694,7 @@ impl<'p> Vm<'p> {
     /// the iterator-result object (`None`: `idx` is not a sync generator).
     pub(crate) fn generator_next_step(&mut self, idx: u32) -> Result<Option<GenStep>, Thrown> {
         let (state, fid, closure) = match self.heap.get(idx) {
-            HeapObj::Generator {
-                state,
-                func,
-                closure,
-                ..
-            } => (*state, *func, *closure),
+            HeapObj::Generator(g) => (g.state, g.func, g.closure),
             _ => return Ok(None),
         };
         match state {
@@ -731,12 +721,7 @@ impl<'p> Vm<'p> {
         }
         let idx = iter.heap_index();
         let (state, fid, closure) = match self.heap.get(idx) {
-            HeapObj::Generator {
-                state,
-                func,
-                closure,
-                ..
-            } => (*state, *func, *closure),
+            HeapObj::Generator(g) => (g.state, g.func, g.closure),
             _ => return Ok(None),
         };
         if !self.gen_method_pristine(idx, "next") {
@@ -784,12 +769,8 @@ impl<'p> Vm<'p> {
         input: GenResumeMode,
     ) -> Result<Option<GenStep>, Thrown> {
         let (saved, saved_handlers) = match self.heap.get_mut(idx) {
-            HeapObj::Generator {
-                state,
-                regs,
-                handlers,
-                ..
-            } => {
+            HeapObj::Generator(g) => {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                 *state = GenState::Running;
                 (std::mem::take(regs), std::mem::take(handlers))
             }
@@ -798,13 +779,8 @@ impl<'p> Vm<'p> {
         let reg_count = saved.len();
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
-            if let HeapObj::Generator {
-                state,
-                regs,
-                handlers,
-                ..
-            } = self.heap.get_mut(idx)
-            {
+            if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                 *state = GenState::Suspended(resume_ip);
                 *regs = saved;
                 *handlers = saved_handlers;
@@ -903,13 +879,8 @@ impl<'p> Vm<'p> {
                         // Uncaught in the body: unwind_to_handler already popped the frame
                         // and truncated its window. Complete the generator and surface the
                         // throw at the `gen.throw(e)` call site (value via pending_throw).
-                        if let HeapObj::Generator {
-                            state,
-                            regs,
-                            handlers,
-                            ..
-                        } = self.heap.get_mut(idx)
-                        {
+                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
                             regs.clear();
                             handlers.clear();
@@ -931,13 +902,8 @@ impl<'p> Vm<'p> {
                         // complete the generator with the return value.
                         self.frames.pop();
                         self.regs.truncate(new_base);
-                        if let HeapObj::Generator {
-                            state,
-                            regs,
-                            handlers,
-                            ..
-                        } = self.heap.get_mut(idx)
-                        {
+                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
                             regs.clear();
                             handlers.clear();
@@ -959,13 +925,8 @@ impl<'p> Vm<'p> {
             // Nursery barrier: the re-parked window may hold young values and
             // the generator may be old (holder-grain — the window is a batch).
             self.heap.write_barrier(idx);
-            if let HeapObj::Generator {
-                state,
-                regs,
-                handlers,
-                ..
-            } = self.heap.get_mut(idx)
-            {
+            if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                 *state = GenState::Suspended(yield_ip);
                 *regs = back;
                 *handlers = parked;
@@ -980,13 +941,8 @@ impl<'p> Vm<'p> {
         }
         match outcome {
             Ok(ret) => {
-                if let HeapObj::Generator {
-                    state,
-                    regs,
-                    handlers,
-                    ..
-                } = self.heap.get_mut(idx)
-                {
+                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
                     regs.clear();
                     handlers.clear();
@@ -995,13 +951,8 @@ impl<'p> Vm<'p> {
             }
             Err(t) => {
                 self.regs.truncate(new_base);
-                if let HeapObj::Generator {
-                    state,
-                    regs,
-                    handlers,
-                    ..
-                } = self.heap.get_mut(idx)
-                {
+                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
                     regs.clear();
                     handlers.clear();
@@ -1069,13 +1020,10 @@ impl<'p> Vm<'p> {
             return false;
         }
         let (fid, closure, resume_ip, reg_count) = match self.heap.get(idx) {
-            HeapObj::Generator {
-                state: GenState::Suspended(ip),
-                func,
-                closure,
-                regs,
-                ..
-            } => (*func, *closure, *ip, regs.len()),
+            HeapObj::Generator(g) => match g.state {
+                GenState::Suspended(ip) => (g.func, g.closure, ip, g.regs.len()),
+                _ => return false,
+            },
             _ => return false,
         };
         if resume_ip == usize::MAX || self.frames.len() >= MAX_FRAMES || !self.gen_inline_fn_ok(fid) {
@@ -1102,12 +1050,8 @@ impl<'p> Vm<'p> {
             return false;
         }
         let handlers = match self.heap.get_mut(idx) {
-            HeapObj::Generator {
-                state,
-                regs,
-                handlers,
-                ..
-            } => {
+            HeapObj::Generator(g) => {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                 *state = GenState::Running;
                 self.regs.extend_from_slice(regs);
                 std::mem::take(handlers)
@@ -1201,13 +1145,8 @@ impl<'p> Vm<'p> {
         if f.eval_scope != u32::MAX {
             self.closure_eval_scope.insert(idx, f.eval_scope);
         }
-        if let HeapObj::Generator {
-            state,
-            regs,
-            handlers,
-            ..
-        } = self.heap.get_mut(idx)
-        {
+        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
             *state = GenState::Suspended(yield_ip);
             regs.clear();
             regs.extend_from_slice(&self.regs[f.base..]);
@@ -1243,13 +1182,8 @@ impl<'p> Vm<'p> {
     /// Generator `idx` has completed (returned, or a throw left its body):
     /// nothing is parked any more.
     pub(crate) fn gen_complete(&mut self, idx: u32) {
-        if let HeapObj::Generator {
-            state,
-            regs,
-            handlers,
-            ..
-        } = self.heap.get_mut(idx)
-        {
+        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
             *state = GenState::Completed;
             regs.clear();
             handlers.clear();
@@ -4497,9 +4431,10 @@ impl<'p> Vm<'p> {
     fn run_finalization_cleanup(&mut self, registry: u32) {
         loop {
             let next = match self.heap.get_mut(registry) {
-                HeapObj::FinalizationRegistry {
-                    cleanup, cleared, ..
-                } => cleared.pop().map(|cell| (*cleanup, cell.held)),
+                HeapObj::FinalizationRegistry(fr) => {
+                    let cleanup = fr.cleanup;
+                    fr.cleared.pop().map(|cell| (cleanup, cell.held))
+                }
                 _ => None,
             };
             let Some((cleanup, held)) = next else {
@@ -4515,12 +4450,8 @@ impl<'p> Vm<'p> {
         }
 
         let mut reschedule = false;
-        if let HeapObj::FinalizationRegistry {
-            cleared,
-            cleanup_queued,
-            ..
-        } = self.heap.get_mut(registry)
-        {
+        if let HeapObj::FinalizationRegistry(fr) = self.heap.get_mut(registry) {
+                let crate::heap::FinRegData { cleared, cleanup_queued, .. } = &mut **fr;
             *cleanup_queued = false;
             if !cleared.is_empty() {
                 *cleanup_queued = true;

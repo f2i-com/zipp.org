@@ -85,7 +85,7 @@ impl<'p> Vm<'p> {
         }
         Ok(matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::RegExp { .. }
+            HeapObj::RegExp(_)
         ))
     }
 
@@ -267,7 +267,7 @@ impl<'p> Vm<'p> {
         }
         if !matches!(
             self.heap.get(re),
-            HeapObj::RegExp { flags, .. } if flags.contains('g')
+            HeapObj::RegExp(re) if re.flags.contains('g')
         ) {
             return None;
         }
@@ -364,7 +364,7 @@ impl<'p> Vm<'p> {
 
         let global = matches!(
             self.heap.get(re),
-            HeapObj::RegExp { flags, .. } if flags.contains('g')
+            HeapObj::RegExp(re) if re.flags.contains('g')
         );
         super::builtins::builtin_stats_count(self, recv, name);
         super::proxy_regexp::rxstats::count_string_call_direct_hit(true, from_jit);
@@ -1085,7 +1085,7 @@ impl<'p> Vm<'p> {
                 if direct && self.regexp_replace_fast_ok(re) {
                     let global = matches!(
                         self.heap.get(re),
-                        HeapObj::RegExp { flags, .. } if flags.contains('g')
+                        HeapObj::RegExp(re) if re.flags.contains('g')
                     );
                     Ok(Some(self.regex_replace(idx, re, repl, global)?))
                 } else {
