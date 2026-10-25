@@ -9349,7 +9349,46 @@ impl Heap {
         // filled the WebAssembly build's linked memory before any walk ran.
         if bytes != usize::MAX {
             self.payload_accounting.set(true);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.give_back_slot_reservation();
         }
+    }
+
+    /// Shrink the slot tables to the power of two that doubling would have
+    /// reached. A ceiling charges them at their capacity, and the uncapped
+    /// growth (`reserve_slot_growth`) reserves 131,072 slots at once, which
+    /// an embedder that compiles and boots before it sets its limit already
+    /// holds: 15 MB of the ceiling gone to address space no slot used. Phases
+    /// of 30,000 objects were convicted at 20 and 24 MiB
+    /// (tests/heap_ceiling_recovery.rs). Until now the figure charged them at
+    /// that same capacity (`charged_slot_bytes`), so arming does not move it.
+    #[cfg(all(feature = "instrument", not(target_arch = "wasm32")))]
+    fn give_back_slot_reservation(&mut self) {
+        let target = self.doubling_slot_capacity();
+        if self.objs.capacity() <= target {
+            return;
+        }
+        fn shrink<T>(v: &mut Vec<T>, cap: usize) {
+            if v.capacity() > cap {
+                v.shrink_to(cap);
+            }
+        }
+        shrink(&mut self.objs, target);
+        shrink(&mut self.resident_payload_charged, target);
+        shrink(&mut self.versions, target);
+        shrink(&mut self.cell_vals_mirror, target);
+        #[cfg(feature = "jit")]
+        {
+            shrink(&mut self.hot_mirror, target);
+            shrink(&mut self.this_mirror, target);
+            shrink(&mut self.upvals_mirror, target);
+        }
+        shrink(&mut self.gen, target);
+        shrink(&mut self.born, target);
+        self.align_slot_table_capacities();
+        // The tables moved; compiled code reads them through these bases.
+        self.recache_mirror_raws();
+        self.rebase_footprint();
     }
 
     /// Give every per-slot table the slot table's capacity, so they reach
@@ -10047,11 +10086,33 @@ impl Heap {
         self.majors_done
     }
 
+    /// The slot tables' capacity had they grown by `Vec`'s doubling from the
+    /// boot tables: the power of two at or above the slots ever used.
+    fn doubling_slot_capacity(&self) -> usize {
+        self.objs.len().next_power_of_two().max(256)
+    }
+
+    /// What a per-slot table is charged in the resident figure: its capacity,
+    /// except that without a ceiling the uncapped growth's reservation
+    /// (`reserve_slot_growth`) is address space no slot has used, so the
+    /// table is charged at [`Self::doubling_slot_capacity`]. Arming a ceiling
+    /// gives the reservation back to that capacity
+    /// (`give_back_slot_reservation`), so the figure a host reads before it
+    /// sets its limit is the one the limit is enforced against.
+    fn charged_slot_bytes<T>(&self, v: &Vec<T>) -> usize {
+        let mut cap = v.capacity();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.resident_ceiling == usize::MAX {
+            cap = cap.min(self.doubling_slot_capacity());
+        }
+        cap.saturating_mul(std::mem::size_of::<T>())
+    }
+
     /// The slot tables and pools at their capacity: every resident byte but
     /// the objects' payloads.
     fn resident_table_bytes(&self) -> usize {
-        vec_capacity_bytes(&self.objs)
-            .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
+        self.charged_slot_bytes(&self.objs)
+            .saturating_add(self.charged_slot_bytes(&self.resident_payload_charged))
             .saturating_add({
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
@@ -10093,14 +10154,14 @@ impl Heap {
                     0
                 }
             })
-            .saturating_add(vec_capacity_bytes(&self.versions))
-            .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror))
+            .saturating_add(self.charged_slot_bytes(&self.versions))
+            .saturating_add(self.charged_slot_bytes(&self.cell_vals_mirror))
             .saturating_add({
                 #[cfg(feature = "jit")]
                 {
-                    vec_capacity_bytes(&self.hot_mirror)
-                        + vec_capacity_bytes(&self.this_mirror)
-                        + vec_capacity_bytes(&self.upvals_mirror)
+                    self.charged_slot_bytes(&self.hot_mirror)
+                        + self.charged_slot_bytes(&self.this_mirror)
+                        + self.charged_slot_bytes(&self.upvals_mirror)
                 }
                 #[cfg(not(feature = "jit"))]
                 {
@@ -10108,9 +10169,9 @@ impl Heap {
                 }
             })
             .saturating_add(vec_capacity_bytes(&self.free))
-            .saturating_add(vec_capacity_bytes(&self.born))
+            .saturating_add(self.charged_slot_bytes(&self.born))
             .saturating_add(vec_capacity_bytes(&self.young))
-            .saturating_add(vec_capacity_bytes(&self.gen))
+            .saturating_add(self.charged_slot_bytes(&self.gen))
             .saturating_add(vec_capacity_bytes(&self.remset))
             .saturating_add(vec_capacity_bytes(&self.scan_roots))
             .saturating_add(self.nonyoung_cache.capacity().div_ceil(8))
