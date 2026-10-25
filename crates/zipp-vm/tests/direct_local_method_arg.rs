@@ -129,12 +129,13 @@ fn bytecode_shape_uses_the_local_directly_only_when_safe() {
         }
         resultOverlap();
     "#;
-    // The staging copy is the one this guards. A build with the JIT also
-    // copies the statement's discarded value out of `index`; a build without
-    // it does not emit that second copy.
+    // The staging copy is the one this guards. No build emits a second copy
+    // of the statement's discarded value out of `index` any more, unless
+    // `ZIPP_KEEP_COPIES` restores it in a build with the JIT.
+    let keeps_copies = cfg!(feature = "jit") && std::env::var_os("ZIPP_KEEP_COPIES").is_some();
     assert_eq!(
         move_count(result_overlap),
-        if cfg!(feature = "jit") { 2 } else { 1 },
+        if keeps_copies { 2 } else { 1 },
         "a result-overlapping local must remain staged:\n{}",
         text_of(result_overlap)
     );

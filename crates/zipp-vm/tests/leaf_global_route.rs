@@ -152,8 +152,12 @@ fn generic_mem_leaf_route_guard_is_non_vacuous() {
         stderr.contains("[leaf] fn2@5 callee fn1 INLINE-ELIGIBLE"),
         "writer leaf was not admitted:\n{stderr}"
     );
+    // The region's end moves with the loop body's length (two discarded
+    // copies fewer unless `ZIPP_KEEP_COPIES`), so match the region, not it.
     assert!(
-        stderr.contains("[jit] MEM region fn2 [2,9] compiled"),
+        stderr
+            .lines()
+            .any(|line| line.starts_with("[jit] MEM region fn2 [2,") && line.contains("] compiled")),
         "writer did not reach the generic MEM region:\n{stderr}"
     );
     assert!(

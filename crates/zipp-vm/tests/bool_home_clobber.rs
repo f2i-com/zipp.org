@@ -735,16 +735,17 @@ fn boolhome_split_spill_bridge_stays_capped_at_one() {
 /// both are BETTER off for it. The counts are exact so a regression in either
 /// direction is caught:
 ///
-///   * denseint-4 still declines its first eight-home attempt, still takes the
-///     shared-home re-plan, and then fits in SIX homes with three lazy
+///   * denseint-4 still declines its first attempt (seven homes; eight with
+///     `ZIPP_KEEP_COPIES`, whose discarded copy is one more live value), still
+///     takes the shared-home re-plan, and then fits in SIX homes with three lazy
 ///     sign-extensions and ZERO spill slots — the `GPR homes engaged` line
 ///     ending in `lazy-sx)` rather than `spilled)` is the whole claim. It
 ///     therefore installs INT-GPR even under `ZIPP_NO_GPR_SPILL_SLOTS=1`, the
 ///     mode that used to send it to DOUBLE: the spill bridge has stopped being
 ///     a correctness-adjacent dependency for this shape.
-///   * the two-spill fixture still overflows (eight homes, then seven after the
-///     share) and still refuses a GPR home plan, but now lands on the XMM INT
-///     tier instead of DOUBLE.
+///   * the two-spill fixture still overflows (nine homes, eight with
+///     `ZIPP_KEEP_COPIES`, then seven after the share) and still refuses a GPR
+///     home plan, but now lands on the XMM INT tier instead of DOUBLE.
 #[test]
 fn boolhome_default_alloc_needs_no_split_spill_bridge() {
     let op = INT_OPS
@@ -752,6 +753,11 @@ fn boolhome_default_alloc_needs_no_split_spill_bridge() {
         .find(|op| op.tag == "denseint")
         .expect("denseint row");
     let src = int_case(op, 4);
+    let first_attempt = if std::env::var_os("ZIPP_KEEP_COPIES").is_some() {
+        "8 homes > 4 gprs"
+    } else {
+        "7 homes > 4 gprs"
+    };
     // The bridge is irrelevant to this shape now, so its kill switch must make
     // no difference at all — that is the strongest form of "not a dependency".
     let modes: [&[(&str, &str)]; 2] = [&[], &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")]];
@@ -776,7 +782,7 @@ fn boolhome_default_alloc_needs_no_split_spill_bridge() {
         assert!(
             log.lines()
                 .any(|line| line.contains("INT-GPR decline [")
-                    && line.contains("8 homes > 4 gprs")),
+                    && line.contains(first_attempt)),
             "denseint-4 no longer overflows its first attempt, so the \
              shared-home re-plan below is not what is being measured:\n{log}"
         );
@@ -794,8 +800,15 @@ fn boolhome_default_alloc_needs_no_split_spill_bridge() {
         );
     }
 
+    // Without the discarded copies the first attempt plans one home more
+    // (nine; eight with `ZIPP_KEEP_COPIES`) and the share still leaves seven.
     let two = jitlog_of(TWO_SPILL_SPLIT);
-    for homes in ["8 homes > 4 gprs", "7 homes > 4 gprs"] {
+    let two_first = if std::env::var_os("ZIPP_KEEP_COPIES").is_some() {
+        "8 homes > 4 gprs"
+    } else {
+        "9 homes > 4 gprs"
+    };
+    for homes in [two_first, "7 homes > 4 gprs"] {
         assert!(
             two.lines()
                 .any(|line| line.contains("INT-GPR decline [") && line.contains(homes)),
