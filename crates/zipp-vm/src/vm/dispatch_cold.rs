@@ -1761,20 +1761,22 @@ impl<'p> Vm<'p> {
                 this_v,
                 arg_base,
                 argc,
-                args_array,
-                new_target_ok,
                 this_reg,
                 home_class,
-                super_static,
-                derived_ctor,
-                class_name_ok,
-                ban_arguments,
-                strict_caller,
-                super_home_obj,
-                var_env_is_global,
                 site,
-                tail,
+                flags,
             } => {
+                use crate::bytecode::EvalFlags as F;
+                let args_array = flags.has(F::ARGS_ARRAY);
+                let new_target_ok = flags.has(F::NEW_TARGET_OK);
+                let super_static = flags.has(F::SUPER_STATIC);
+                let derived_ctor = flags.has(F::DERIVED_CTOR);
+                let class_name_ok = flags.has(F::CLASS_NAME_OK);
+                let ban_arguments = flags.has(F::BAN_ARGUMENTS);
+                let strict_caller = flags.has(F::STRICT_CALLER);
+                let super_home_obj = flags.has(F::SUPER_HOME_OBJ);
+                let var_env_is_global = flags.has(F::VAR_ENV_IS_GLOBAL);
+                let tail = flags.has(F::TAIL);
                 // Both the reference and every argument were evaluated
                 // before this op. Never re-resolve `eval` here: argument
                 // code is allowed to rebind it without redirecting the
@@ -3460,6 +3462,7 @@ impl<'p> Vm<'p> {
                 ip += 1;
             }
             Instr::LoadBigInt { dst, value } => {
+                let value = value.get();
                 // A small literal is an immediate (value.rs).
                 let v = self.make_bigint(value);
                 self.set(base, dst, v);

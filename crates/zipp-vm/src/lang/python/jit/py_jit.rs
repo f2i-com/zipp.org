@@ -278,7 +278,7 @@ impl<'p> Vm<'p> {
             return crate::codegen::SELF_CALL_DEOPT;
         };
         vm.maybe_gc();
-        vm.make_bigint(value).bits()
+        vm.make_bigint(value.get()).bits()
     }
 
     /// `PushHandler` in a compiled Python body: the interpreter arm verbatim

@@ -130,6 +130,8 @@ fn codec(ty: &str, context: &str) -> (String, String) {
         "i32" => ("w.i64(*x as i64)".into(), "r.i64()? as i32".into()),
         "i64" => ("w.i64(*x)".into(), "r.i64()?".into()),
         "i128" => ("w.i128(*x)".into(), "r.i128()?".into()),
+        "I128Bits" => ("w.i128(x.get())".into(), "I128Bits::new(r.i128()?)".into()),
+        "EvalFlags" => ("w.u16(x.0)".into(), "EvalFlags(r.u16()?)".into()),
         "f64" => ("w.f64(*x)".into(), "r.f64()?".into()),
         "Option<Reg>" | "Option<u16>" => ("w.opt_u16(*x)".into(), "r.opt_u16()?".into()),
         "Option<u32>" => ("w.opt_u32(*x)".into(), "r.opt_u32()?".into()),

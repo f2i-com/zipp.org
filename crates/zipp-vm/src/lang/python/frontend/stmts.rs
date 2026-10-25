@@ -705,7 +705,7 @@ impl<'a> Emitter<'a> {
         }
         match regs.as_slice() {
             [stop] => {
-                self.emit(Instr::LoadBigInt { dst: cursor, value: 0 })?;
+                self.emit(Instr::LoadBigInt { dst: cursor, value: crate::bytecode::I128Bits::new(0) })?;
                 self.emit(Instr::Move { dst: end, src: *stop })?;
             }
             [start, stop, ..] => {
@@ -716,7 +716,7 @@ impl<'a> Emitter<'a> {
         }
         if let Step::Dynamic { step, positive } = step {
             let zero = self.alloc()?;
-            self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+            self.emit(Instr::LoadBigInt { dst: zero, value: crate::bytecode::I128Bits::new(0) })?;
             let is_zero = self.alloc()?;
             self.emit(Instr::Eq { dst: is_zero, a: regs[2], b: zero })?;
             generic.push(self.jump_if_true(is_zero)?);
@@ -827,7 +827,7 @@ impl<'a> Emitter<'a> {
         let step_v = self.prop(iter, "step")?;
         self.emit(Instr::Move { dst: step, src: step_v })?;
         let zero = self.alloc()?;
-        self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+        self.emit(Instr::LoadBigInt { dst: zero, value: crate::bytecode::I128Bits::new(0) })?;
         self.emit(Instr::Lt { dst: positive, a: zero, b: step })?;
         let here = self.here();
         self.patch(not_range, here)?;

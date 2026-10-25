@@ -1396,7 +1396,7 @@ pub enum Instr {
     /// `dst = <BigInt literal>` (`123n`) — allocate a BigInt with the given value.
     LoadBigInt {
         dst: Reg,
-        value: i128,
+        value: I128Bits,
     },
     /// `dst = <BigInt literal beyond i128>` — allocate an arbitrary-precision
     /// BigInt from the function's `bigint_consts[idx]` (parsed at compile time).
@@ -1793,25 +1793,19 @@ pub enum Instr {
     /// binding, so the eval'd code sees it too. Decided by the compiler because
     /// only it knows the caller's scope chain — a method-body `let C` shadows
     /// the class name, an enclosing function's `C` does not.
+    ///
+    /// The site's booleans travel packed in `flags` ([`EvalFlags`]): ten
+    /// `bool` fields made this the variant that set every instruction's size.
     DirectEval {
         dst: Reg,
         callee: Reg,
         this_v: Reg,
         arg_base: Reg,
         argc: u16,
-        args_array: bool,
-        new_target_ok: bool,
         this_reg: Reg,
         home_class: u32,
-        super_static: bool,
-        derived_ctor: bool,
-        class_name_ok: bool,
-        ban_arguments: bool,
-        strict_caller: bool,
-        super_home_obj: bool,
-        var_env_is_global: bool,
         site: u16,
-        tail: bool,
+        flags: EvalFlags,
     },
 
     /// ResolveBinding for a strict `name = …` on a global the program does not
@@ -2737,6 +2731,101 @@ pub enum Instr {
     },
 }
 
+/// [`Instr::LoadBigInt`]'s value as four `u32` words, lowest first. A bare
+/// `i128` aligned the whole `Instr` enum to 16 bytes and, with
+/// `DirectEval`'s booleans, made every instruction 32 bytes; the code arrays
+/// every dispatch reads are a quarter smaller without it. Prints as the
+/// number it holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct I128Bits([u32; 4]);
+
+impl I128Bits {
+    #[inline]
+    pub const fn new(v: i128) -> Self {
+        let u = v as u128;
+        I128Bits([u as u32, (u >> 32) as u32, (u >> 64) as u32, (u >> 96) as u32])
+    }
+
+    #[inline]
+    pub const fn get(self) -> i128 {
+        let [a, b, c, d] = self.0;
+        ((a as u128) | (b as u128) << 32 | (c as u128) << 64 | (d as u128) << 96) as i128
+    }
+}
+
+impl From<i128> for I128Bits {
+    #[inline]
+    fn from(v: i128) -> Self {
+        I128Bits::new(v)
+    }
+}
+
+impl std::fmt::Debug for I128Bits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// [`Instr::DirectEval`]'s booleans, one bit each. Prints as the named
+/// fields they replaced.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvalFlags(pub(crate) u16);
+
+impl EvalFlags {
+    /// `arg_base` names a materialized spread-argument array and `argc` is 0.
+    pub const ARGS_ARRAY: u16 = 1 << 0;
+    pub const NEW_TARGET_OK: u16 = 1 << 1;
+    pub const SUPER_STATIC: u16 = 1 << 2;
+    /// Inside a DERIVED-class constructor: `super(...)` in the eval is legal.
+    pub const DERIVED_CTOR: u16 = 1 << 3;
+    /// Nothing at the site shadows `home_class`'s inner NAME binding.
+    pub const CLASS_NAME_OK: u16 = 1 << 4;
+    pub const BAN_ARGUMENTS: u16 = 1 << 5;
+    pub const STRICT_CALLER: u16 = 1 << 6;
+    pub const SUPER_HOME_OBJ: u16 = 1 << 7;
+    pub const VAR_ENV_IS_GLOBAL: u16 = 1 << 8;
+    /// A proper-tail-call RETURN position (see `DirectEval`).
+    pub const TAIL: u16 = 1 << 9;
+
+    const NAMES: [(u16, &'static str); 10] = [
+        (Self::ARGS_ARRAY, "args_array"),
+        (Self::NEW_TARGET_OK, "new_target_ok"),
+        (Self::SUPER_STATIC, "super_static"),
+        (Self::DERIVED_CTOR, "derived_ctor"),
+        (Self::CLASS_NAME_OK, "class_name_ok"),
+        (Self::BAN_ARGUMENTS, "ban_arguments"),
+        (Self::STRICT_CALLER, "strict_caller"),
+        (Self::SUPER_HOME_OBJ, "super_home_obj"),
+        (Self::VAR_ENV_IS_GLOBAL, "var_env_is_global"),
+        (Self::TAIL, "tail"),
+    ];
+
+    #[inline]
+    #[must_use]
+    pub const fn set(self, bit: u16, on: bool) -> Self {
+        if on {
+            EvalFlags(self.0 | bit)
+        } else {
+            EvalFlags(self.0 & !bit)
+        }
+    }
+
+    #[inline]
+    pub const fn has(self, bit: u16) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+impl std::fmt::Debug for EvalFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("EvalFlags");
+        for (bit, name) in Self::NAMES {
+            s.field(name, &self.has(bit));
+        }
+        s.finish()
+    }
+}
+
 /// The operators of [`Instr::PyArith`]. `Add`, `Sub` and `Mul` take every
 /// listed pair; `TrueDiv` takes them all but divides only by a nonzero
 /// divisor (two ints only below 2^53 in magnitude, as Python's exact
@@ -3603,12 +3692,24 @@ mod fused_code_tests {
 
     /// The spill instructions (a 32-bit slot index beside two registers) fit
     /// in the size the other variants already give `Instr`: wide access is
-    /// paid for by the functions that use it, not by every dispatch.
+    /// paid for by the functions that use it, not by every dispatch. 24 bytes
+    /// since `LoadBigInt` keeps its value as `I128Bits` and `DirectEval` its
+    /// booleans as `EvalFlags`; a wider field belongs out of line too.
     #[test]
     fn spill_instructions_keep_instr_size() {
         let size = std::mem::size_of::<Instr>();
         println!("size_of::<Instr>() = {size}");
-        assert!(size <= 32, "Instr grew to {size} bytes");
+        assert!(size <= 24, "Instr grew to {size} bytes");
+        assert_eq!(std::mem::align_of::<Instr>(), 4);
+    }
+
+    /// `I128Bits` round-trips every `i128` and prints as the number.
+    #[test]
+    fn i128_bits_round_trip() {
+        for v in [0i128, 1, -1, i128::MIN, i128::MAX, 1 << 64, -(1 << 100) + 7] {
+            assert_eq!(I128Bits::new(v).get(), v);
+            assert_eq!(format!("{:?}", I128Bits::new(v)), format!("{v:?}"));
+        }
     }
 
     /// The copy keeps the original's length, each superinstruction sits

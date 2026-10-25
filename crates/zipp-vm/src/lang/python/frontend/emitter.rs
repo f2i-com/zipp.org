@@ -910,7 +910,7 @@ impl<'a> Emitter<'a> {
         }
         let dst = self.alloc()?;
         if let Ok(value) = text.parse::<i128>() {
-            self.emit(Instr::LoadBigInt { dst, value })?;
+            self.emit(Instr::LoadBigInt { dst, value: value.into() })?;
         } else {
             let value = num_bigint::BigInt::parse_bytes(text.as_bytes(), 10)
                 .ok_or("Python: invalid integer literal")?;
@@ -949,7 +949,7 @@ impl<'a> Emitter<'a> {
                 break;
             }
             let dst = self.alloc()?;
-            self.emit(Instr::LoadBigInt { dst, value })?;
+            self.emit(Instr::LoadBigInt { dst, value: value.into() })?;
             self.hoisted.insert(value, dst);
         }
         Ok(())

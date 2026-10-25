@@ -412,7 +412,7 @@ impl<'a> FnCompiler<'a> {
                 // construction, so only an out-of-range value reaches the pool —
                 // the canonical-form invariant holds).
                 match b.parse::<i128>() {
-                    Ok(v) => self.emit(Instr::LoadBigInt { dst, value: v }),
+                    Ok(v) => self.emit(Instr::LoadBigInt { dst, value: v.into() }),
                     Err(_) => {
                         let big = b
                             .parse::<num_bigint::BigInt>()

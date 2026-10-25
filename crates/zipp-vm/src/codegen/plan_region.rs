@@ -5594,11 +5594,11 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             this_v,
             arg_base,
             argc,
-            args_array,
             this_reg,
+            flags,
             ..
         } => {
-            if args_array {
+            if flags.has(crate::bytecode::EvalFlags::ARGS_ARRAY) {
                 vec![callee, this_v, arg_base, this_reg]
             } else {
                 win(&[callee, this_v, this_reg], arg_base, argc)

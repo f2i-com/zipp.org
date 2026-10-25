@@ -783,11 +783,9 @@ impl<'p> Vm<'p> {
                 let has = self.func(func_id).code.iter().any(|i| {
                     matches!(
                         i,
-                        crate::bytecode::Instr::DirectEval {
-                            var_env_is_global: false,
-                            strict_caller: false,
-                            ..
-                        }
+                        crate::bytecode::Instr::DirectEval { flags, .. }
+                            if !flags.has(crate::bytecode::EvalFlags::VAR_ENV_IS_GLOBAL)
+                                && !flags.has(crate::bytecode::EvalFlags::STRICT_CALLER)
                     )
                 });
                 self.sloppy_eval_memo[func_id] = if has { 2 } else { 1 };

@@ -4810,6 +4810,7 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LoadBigInt { dst, value } => {
+                let value = value.get();
                 if let Some(bits) = small_bigint_bits(value) {
                     dynasm!(ops
                         ; mov rax, QWORD bits as i64

@@ -825,7 +825,7 @@ impl<'a> Emitter<'a> {
             self.emit(Instr::Add { dst, a: r, b })?;
         } else {
             let one = self.alloc()?;
-            self.emit(Instr::LoadBigInt { dst: one, value: 1 })?;
+            self.emit(Instr::LoadBigInt { dst: one, value: crate::bytecode::I128Bits::new(1) })?;
             self.emit(Instr::Sub { dst, a: dst, b: one })?;
         }
         end_jumps.push(self.jump()?);

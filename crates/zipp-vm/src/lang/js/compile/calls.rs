@@ -1970,28 +1970,22 @@ impl<'a> FnCompiler<'a> {
         // The effective `this` to inherit: a static field initializer holds
         // it in `this_override`, otherwise it is reg 0.
         let this_reg = self.this_override.unwrap_or(0);
-        self.emit(Instr::DirectEval {
-            dst,
-            callee,
-            this_v,
-            arg_base,
-            argc,
-            args_array,
-            new_target_ok: self.cx.new_target_ok,
-            this_reg,
-            home_class: self.super_class.unwrap_or(u32::MAX),
-            super_static: self.super_static,
+        use crate::bytecode::EvalFlags as F;
+        let flags = F::default()
+            .set(F::ARGS_ARRAY, args_array)
+            .set(F::NEW_TARGET_OK, self.cx.new_target_ok)
+            .set(F::SUPER_STATIC, self.super_static)
             // `super()` in a direct eval needs the CONSTRUCTOR of a derived
             // class (`in_derived_ctor`, which arrows inherit) — `derived_class`
             // is also true in that class's methods, where the eval rules "as
             // outside a constructor" apply. A field INITIALIZER runs inside the
             // ctor's compiler but is likewise "outside a constructor" for these
             // early errors (derived-cls-direct-eval-err-contains-supercall).
-            derived_ctor: self.in_derived_ctor && !self.cx.in_field_init,
-            class_name_ok: self.class_inner_name_visible(),
-            ban_arguments: self.cx.in_field_init,
-            strict_caller: self.cx.in_strict,
-            super_home_obj: self.super_home_obj,
+            .set(F::DERIVED_CTOR, self.in_derived_ctor && !self.cx.in_field_init)
+            .set(F::CLASS_NAME_OK, self.class_inner_name_visible())
+            .set(F::BAN_ARGUMENTS, self.cx.in_field_init)
+            .set(F::STRICT_CALLER, self.cx.in_strict)
+            .set(F::SUPER_HOME_OBJ, self.super_home_obj)
             // The eval's variable environment: GLOBAL only when the
             // call site is the script top level (a function/arrow/param
             // context keeps the old slot behavior until the dynamic
@@ -2000,9 +1994,18 @@ impl<'a> FnCompiler<'a> {
             // EvalScope, so a direct eval nested inside it declares there
             // too — `eval("eval('var x=1')")` in a function must not leak
             // `x` to the realm global.
-            var_env_is_global: self.is_script && !self.cx.eval_fn_context,
+            .set(F::VAR_ENV_IS_GLOBAL, self.is_script && !self.cx.eval_fn_context)
+            .set(F::TAIL, tail);
+        self.emit(Instr::DirectEval {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            this_reg,
+            home_class: self.super_class.unwrap_or(u32::MAX),
             site,
-            tail,
+            flags,
         });
         Ok(())
     }
