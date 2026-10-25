@@ -7354,6 +7354,12 @@ pub struct Heap {
     /// refuse to DOUBLE past it. `usize::MAX` (the native default) leaves
     /// `Vec` growth alone. See [`Heap::reserve_slot_growth`].
     resident_ceiling: usize,
+    /// The part of the ceiling's figure that is not this heap's: the VM's
+    /// side tables and, in a JIT VM, its pinned register file, as the latest
+    /// audit found it (`Vm::audit_heap_bytes`). The ceiling is enforced on
+    /// that whole figure, so [`Heap::reserve_slot_growth`] weighs a doubling
+    /// against it too, not against the heap alone.
+    pub(crate) non_heap_resident: Cell<usize>,
     /// Live-count at which the next collection is requested (grown adaptively after
     /// each GC to amortise; never below `GC_MIN_THRESHOLD`).
     gc_threshold: usize,
@@ -8063,6 +8069,7 @@ impl Heap {
             live,
             gc_requested: false,
             resident_ceiling: usize::MAX,
+            non_heap_resident: Cell::new(0),
             // Keep the historical number of collectable allocations before
             // the first GC: the 100 new pad2 prefix slots are permanent OLD
             // objects, not young allocation pressure.
@@ -9558,7 +9565,13 @@ impl Heap {
         }
         let cap = self.objs.capacity();
         let doubled = cap.max(4).saturating_mul(self.slot_table_bytes_per_entry());
-        if self.resident_bytes().saturating_add(doubled) <= ceiling - ceiling / 4 {
+        // Against the figure the ceiling convicts on. The heap alone left a JIT
+        // VM's 1.6 MB register file out, so under the same ceiling a JIT VM
+        // doubled unguarded where an interpreter-only one asked for its major
+        // first, and the two stopped 8,653 steps and 121 KB apart
+        // (tests/str_append_index.rs, tiny-heap boundary).
+        let resident = self.resident_bytes().saturating_add(self.non_heap_resident.get());
+        if resident.saturating_add(doubled) <= ceiling - ceiling / 4 {
             return;
         }
         self.major_due = true;

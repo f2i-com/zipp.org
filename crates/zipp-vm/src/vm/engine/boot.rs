@@ -1080,6 +1080,8 @@ impl<'p> Vm<'p> {
             // part of `Heap::resident_bytes()`.
             rec.heap_audit_non_heap
                 .set(n.saturating_sub(self.heap.resident_bytes()));
+            // The slot table's doubling guard weighs the same figure.
+            self.heap.non_heap_resident.set(rec.heap_audit_non_heap.get());
             // This total holds every program retained by now. One admitted
             // just before it, and retained just after, waits a walk longer.
             let [since, before] = &rec.external_bytes_admitted;
