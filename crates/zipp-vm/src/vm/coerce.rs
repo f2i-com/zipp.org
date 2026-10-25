@@ -2538,8 +2538,30 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn strict_eq(&self, base: usize, a: u16, b: u16) -> bool {
-        let va = self.get(base, a);
-        let vb = self.get(base, b);
+        self.strict_eq_vals(self.get(base, a), self.get(base, b))
+    }
+
+    /// `===` for the comparisons the bits decide, inline: equal bits (but
+    /// NaN), two integers (one bit pattern per value), and a side that is
+    /// neither a heap value nor a number (undefined, null, a boolean),
+    /// which only its own bits equal. Two heap values or two numbers go to
+    /// [`Self::strict_eq_vals`]. A compare with `undefined` or `null` called
+    /// that out of line before: three times QuickJS's cost for `o !== null`.
+    #[inline(always)]
+    pub(crate) fn strict_eq_fast(&self, va: Value, vb: Value) -> bool {
+        if va.bits() == vb.bits() {
+            return !(va.is_double() && va.as_f64().is_nan());
+        }
+        if va.is_int() && vb.is_int() {
+            return false;
+        }
+        if (va.is_heap() && vb.is_heap()) || (va.is_number() && vb.is_number()) {
+            return self.strict_eq_vals(va, vb);
+        }
+        false
+    }
+
+    pub(crate) fn strict_eq_vals(&self, va: Value, vb: Value) -> bool {
         // Same bits → equal (covers int, bool, null, undefined, same heap idx).
         if va.bits() == vb.bits() {
             // NaN !== NaN even with identical bits.

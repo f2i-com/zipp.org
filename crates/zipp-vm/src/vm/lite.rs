@@ -823,31 +823,19 @@ impl<'p> Vm<'p> {
                 }
                 Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
-                    let r = if va.is_int() && vb.is_int() {
-                        va.bits() == vb.bits()
-                    } else {
-                        self.strict_eq(base, a, b)
-                    };
+                    let r = self.strict_eq_fast(va, vb);
                     self.set(base, dst, Value::bool(r));
                     ip += 1;
                 }
                 Instr::Ne { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
-                    let r = if va.is_int() && vb.is_int() {
-                        va.bits() == vb.bits()
-                    } else {
-                        self.strict_eq(base, a, b)
-                    };
+                    let r = self.strict_eq_fast(va, vb);
                     self.set(base, dst, Value::bool(!r));
                     ip += 1;
                 }
                 Instr::FuseEqJump { dst, a, b, ne, when, target } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
-                    let eq = if va.is_int() && vb.is_int() {
-                        va.bits() == vb.bits()
-                    } else {
-                        self.strict_eq(base, a, b)
-                    };
+                    let eq = self.strict_eq_fast(va, vb);
                     let r = eq != ne;
                     self.set(base, dst, Value::bool(r));
                     // Forward only (see the variant).

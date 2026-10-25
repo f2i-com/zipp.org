@@ -1763,11 +1763,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::FuseEqJump { dst, a, b, ne, when, target } => {
                         let (va, vb) = (self.get(base, a), self.get(base, b));
-                        let eq = if va.is_int() && vb.is_int() {
-                            va.bits() == vb.bits()
-                        } else {
-                            self.strict_eq(base, a, b)
-                        };
+                        let eq = self.strict_eq_fast(va, vb);
                         let r = eq != ne;
                         self.set(base, dst, Value::bool(r));
                         // Forward only (see the variant): no back-edge here.
@@ -1884,23 +1880,15 @@ impl<'p> Vm<'p> {
                     Instr::Eq { dst, a, b } => {
                         // Two small integers (one bit pattern per value) are
                         // the loop counters and indices this compares most:
-                        // decided here instead of in `strict_eq`'s call.
+                        // decided here (`strict_eq_fast`) instead of in a call.
                         let (va, vb) = (self.get(base, a), self.get(base, b));
-                        let r = if va.is_int() && vb.is_int() {
-                            va.bits() == vb.bits()
-                        } else {
-                            self.strict_eq(base, a, b)
-                        };
+                        let r = self.strict_eq_fast(va, vb);
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Ne { dst, a, b } => {
                         let (va, vb) = (self.get(base, a), self.get(base, b));
-                        let r = if va.is_int() && vb.is_int() {
-                            va.bits() == vb.bits()
-                        } else {
-                            self.strict_eq(base, a, b)
-                        };
+                        let r = self.strict_eq_fast(va, vb);
                         self.set(base, dst, Value::bool(!r));
                         ip += 1;
                     }
