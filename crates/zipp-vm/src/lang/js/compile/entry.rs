@@ -75,8 +75,48 @@ fn compile_program_with(
     script_completion: bool,
     origin: Option<SourceOrigin>,
 ) -> R<Program> {
+    // `ZIPP_LAZY=verify`: compile with every body where it is met (seeded) and
+    // with bodies deferred, and report how the two differ.
+    if super::lazy::lazy_mode() == super::lazy::LazyMode::Verify {
+        use super::lazy::LazyMode;
+        let (a, _) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin.clone(), LazyMode::Seeded)?;
+        let (b, misses) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, LazyMode::End)?;
+        eprintln!("[lazy-stat] deferred {} of {} functions", LAZY_DEFERRED.with(|d| d.get()), b.functions.len());
+        for d in super::lazy::diff_programs(&a, &b, &misses) {
+            eprintln!("[lazy] {d}");
+        }
+        return Ok(b);
+    }
+    let mode = super::lazy::lazy_mode();
+    compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, mode).map(|(p, _)| p)
+}
+
+thread_local! {
+    /// The bodies the latest compile on this thread deferred (verify mode's count).
+    static LAZY_DEFERRED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many bodies the latest compile on this thread deferred.
+#[cfg(test)]
+pub(super) fn last_deferred() -> usize {
+    LAZY_DEFERRED.with(|d| d.get())
+}
+
+/// [`compile_program_with`] in deferred-compile mode `mode`, with the names a
+/// deferred body resolved only after it was deferred (`Compiler::lazy_misses`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compile_program_mode(
+    prog: &ast::Program,
+    source: &str,
+    module_mode: bool,
+    main_goal: bool,
+    script_completion: bool,
+    origin: Option<SourceOrigin>,
+    mode: super::lazy::LazyMode,
+) -> R<(Program, Vec<String>)> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
     let mut c = Compiler::new(source);
+    c.lazy_mode = mode;
     c.origin = origin;
     c.module_mode = module_mode;
     c.main_goal = main_goal;
@@ -89,13 +129,16 @@ fn compile_program_with(
     // precedes a guest whose own prologue said `"use strict"`).
     c.force_strict = prog.strict;
     c.compile(prog)?;
+    c.drain_lazy(prog)?;
+    let misses = std::mem::take(&mut c.lazy_misses);
+    LAZY_DEFERRED.with(|d| d.set(c.lazy_deferred));
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
         rewrite_local_accumulators(f);
         rewrite_append_indexes(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
-    Ok(Program {
+    Ok((Program {
         functions: c.functions.into(),
         global_count: c.globals.len() as u32,
         classes: c.classes,
@@ -120,7 +163,7 @@ fn compile_program_with(
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
-    })
+    }, misses))
 }
 
 /// Compile an `eval` code string. Identical to [`compile_program`] except the

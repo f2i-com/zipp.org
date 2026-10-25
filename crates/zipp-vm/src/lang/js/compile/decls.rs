@@ -665,7 +665,7 @@ impl<'a> FnCompiler<'a> {
                             // function declaration — `f()` before this statement works
                             // through an `import f from './self'` alias.
                             let (id, has_up) =
-                                self.compile_func_expr(Some("default".to_string()), f)?;
+                                self.compile_func_expr(Some("default".to_string()), f, false)?;
                             if self.is_script && self.cx.script_binds_globals && !has_up {
                                 self.cx.functions[id as usize].name_global = Some(slot);
                                 self.cx.decl_globals.insert(slot);
@@ -756,7 +756,7 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             ast::Expr::Function(f) if f.name.is_none() => {
-                let (id, has_up) = self.compile_func_expr(Some(name.to_string()), f)?;
+                let (id, has_up) = self.compile_func_expr(Some(name.to_string()), f, true)?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }

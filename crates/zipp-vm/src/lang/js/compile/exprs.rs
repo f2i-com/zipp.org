@@ -723,7 +723,7 @@ impl<'a> FnCompiler<'a> {
             }
             E::Function(f) => {
                 let (id, has_up) =
-                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f)?;
+                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f, true)?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
@@ -1708,7 +1708,7 @@ impl<'a> FnCompiler<'a> {
                     Some(own) => own.to_string(),
                     None => key.clone(),
                 };
-                let (id, has_up) = self.compile_func_expr(Some(n), f)?;
+                let (id, has_up) = self.compile_func_expr(Some(n), f, false)?;
                 self.emit_make_callable(slot, id, has_up);
                 slot
             }
@@ -1732,7 +1732,7 @@ impl<'a> FnCompiler<'a> {
             PropVal::Func(f) => {
                 let dst = self.temp();
                 let (id, has_up) =
-                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f)?;
+                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f, false)?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
@@ -1950,7 +1950,7 @@ impl<'a> FnCompiler<'a> {
                     Some(own) => own.to_string(),
                     None => key.clone(),
                 };
-                let (id, has_up) = self.compile_func_expr(Some(n), f)?;
+                let (id, has_up) = self.compile_func_expr(Some(n), f, false)?;
                 self.emit_make_callable(vtmp, id, has_up);
                 vtmp
             }

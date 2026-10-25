@@ -111,20 +111,38 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
-        let mut proto = self.cx.compile_function_body(
-            name.as_deref(),
-            None, // a declaration's name lives in the enclosing scope, not self-bound
-            &params,
-            rest.as_deref(),
-            Some(&f.params),
-            body,
-            fn_directives(f), // body prologue: drives `"use strict"` strictness
-            false,
-            f.is_generator,
-            f.is_async,
-            captured,
-            enclosing,
-        )?;
+        let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
+            None
+        } else {
+            let deferrable = lazy::fn_subtree_ok(f);
+            self.lazy_prepare(
+                lazy::LazyKind::FuncDecl { name: name.clone() },
+                capture::function_free_names(f),
+                deferrable,
+                (f.span.start, f.span.end),
+                name.as_deref().unwrap_or("<script>"),
+                false,
+                &captured,
+                &enclosing,
+            )
+        };
+        let mut proto = match stub {
+            Some(stub) => stub,
+            None => self.cx.compile_function_body(
+                name.as_deref(),
+                None, // a declaration's name lives in the enclosing scope, not self-bound
+                &params,
+                rest.as_deref(),
+                Some(&f.params),
+                body,
+                fn_directives(f), // body prologue: drives `"use strict"` strictness
+                false,
+                f.is_generator,
+                f.is_async,
+                captured,
+                enclosing,
+            )?,
+        };
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let id = self.cx.functions.len() as u32;
@@ -1990,6 +2008,7 @@ impl<'a> FnCompiler<'a> {
         &mut self,
         name: Option<String>,
         f: &ast::Function,
+        lazy_ok: bool,
     ) -> R<(u32, bool)> {
         // Strict mode: a named function expression may not be named `eval`/`arguments`.
         // Use the SYNTACTIC name (`f.name`), not the inferred NamedEvaluation name.
@@ -2011,20 +2030,38 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
-        let mut proto = self.cx.compile_function_body(
-            name.as_deref(),
-            self_name.as_deref(),
-            &params,
-            rest.as_deref(),
-            Some(&f.params),
-            body,
-            fn_directives(f), // body prologue: drives `"use strict"` strictness
-            false,
-            f.is_generator,
-            f.is_async,
-            captured,
-            enclosing,
-        )?;
+        let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
+            None
+        } else {
+            let deferrable = lazy_ok && lazy::fn_subtree_ok(f);
+            self.lazy_prepare(
+                lazy::LazyKind::FuncExpr { name: name.clone(), self_name: self_name.clone() },
+                capture::function_free_names(f),
+                deferrable,
+                (f.span.start, f.span.end),
+                name.as_deref().unwrap_or("<script>"),
+                false,
+                &captured,
+                &enclosing,
+            )
+        };
+        let mut proto = match stub {
+            Some(stub) => stub,
+            None => self.cx.compile_function_body(
+                name.as_deref(),
+                self_name.as_deref(),
+                &params,
+                rest.as_deref(),
+                Some(&f.params),
+                body,
+                fn_directives(f), // body prologue: drives `"use strict"` strictness
+                false,
+                f.is_generator,
+                f.is_async,
+                captured,
+                enclosing,
+            )?,
+        };
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
@@ -2049,18 +2086,36 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
         self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
-        let mut proto = self.cx.compile_arrow_body(
-            &params,
-            rest.as_deref(),
-            a,
-            captured,
-            enclosing,
-            self.super_class,
-            self.super_static,
-            self.super_home_obj,
-            self.derived_class,
-            self.in_derived_ctor,
-        )?;
+        let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
+            None
+        } else {
+            let deferrable = lazy::arrow_subtree_ok(a);
+            self.lazy_prepare(
+                lazy::LazyKind::Arrow,
+                capture::arrow_free_names(a),
+                deferrable,
+                (a.span.start, a.span.end),
+                name,
+                true,
+                &captured,
+                &enclosing,
+            )
+        };
+        let mut proto = match stub {
+            Some(stub) => stub,
+            None => self.cx.compile_arrow_body(
+                &params,
+                rest.as_deref(),
+                a,
+                captured,
+                enclosing,
+                self.super_class,
+                self.super_static,
+                self.super_home_obj,
+                self.derived_class,
+                self.in_derived_ctor,
+            )?,
+        };
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         self.cx.mark_preamble_fn(&mut proto, a.span.start);

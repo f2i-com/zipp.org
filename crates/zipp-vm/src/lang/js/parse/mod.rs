@@ -34,6 +34,7 @@ pub(crate) mod limits;
 pub mod parser;
 pub mod stmt;
 pub mod token;
+pub(crate) mod visit;
 
 #[cfg(test)]
 mod tests {

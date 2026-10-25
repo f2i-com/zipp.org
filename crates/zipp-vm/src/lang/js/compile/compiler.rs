@@ -111,6 +111,12 @@ impl Compiler {
             with_name_counter: 0,
             pending_with_shadows: rustc_hash::FxHashMap::default(),
             obj_method_super: false,
+            lazy_mode: super::lazy::lazy_mode(),
+            lazy_jobs: std::collections::VecDeque::new(),
+            lazy_seed: None,
+            lazy_freeze: false,
+            lazy_misses: Vec::new(),
+            lazy_deferred: 0,
         }
     }
 

@@ -147,6 +147,10 @@ impl<'a> FnCompiler<'a> {
         enclosing: Vec<EnclosingFn>,
     ) -> FnCompiler<'a> {
         let inherited_with_shadows = std::mem::take(&mut cx.pending_with_shadows);
+        // A function whose free names were resolved ahead (`compile::lazy`)
+        // starts with those upvalues; a deferred body may only look them up.
+        let lazy_seed = cx.lazy_seed.take().unwrap_or_default();
+        let upvals_frozen = std::mem::replace(&mut cx.lazy_freeze, false);
         let mut fc = FnCompiler {
             cx,
             code: Vec::new(),
@@ -215,7 +219,7 @@ impl<'a> FnCompiler<'a> {
             lexical_regs: HashSet::default(),
             const_regs: HashSet::default(),
             param_tdz: HashSet::default(),
-            upvalues: Rc::new(RefCell::new(Vec::new())),
+            upvalues: Rc::new(RefCell::new(lazy_seed)),
             enclosing,
             with_stack: Vec::new(),
             inherited_with_shadows,
@@ -226,6 +230,7 @@ impl<'a> FnCompiler<'a> {
             typeof_alias: Vec::new(),
             typeof_alias_depth: 0,
             typeof_alias_defs: Vec::new(),
+            upvals_frozen,
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -351,6 +356,11 @@ impl<'a> FnCompiler<'a> {
             return Some(i as u16);
         }
         let src = capture_source(&self.enclosing, name)?;
+        if self.upvals_frozen {
+            // A deferred body's ancestors were finished when it was deferred:
+            // an upvalue resolved only now is one they never forwarded.
+            self.cx.lazy_misses.push(name.to_string());
+        }
         let mut ups = self.upvalues.borrow_mut();
         let idx = ups.len() as u16;
         ups.push((name.to_string(), src));

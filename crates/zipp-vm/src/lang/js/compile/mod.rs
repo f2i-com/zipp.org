@@ -371,6 +371,21 @@ struct Compiler {
     /// `super_home_obj = true` (object-method super). Consumed (taken) when the
     /// function body starts compiling.
     obj_method_super: bool,
+    /// Deferred compilation (`lazy`): the mode this compile runs in and the
+    /// bodies deferred so far, compiled at the end of the compile.
+    lazy_mode: lazy::LazyMode,
+    lazy_jobs: std::collections::VecDeque<lazy::LazyJob>,
+    /// Transient (consumed by `FnCompiler::new`): the upvalue list the function
+    /// about to be compiled starts with, its free names resolved in name order.
+    lazy_seed: Option<Vec<(String, UpvalSource)>>,
+    /// Transient, with `lazy_seed`: the compile is a deferred body's, whose
+    /// ancestors have finished, so it may only look its upvalues up.
+    lazy_freeze: bool,
+    /// Names a frozen compile had to resolve anyway: each would make the
+    /// deferral unsound. Verify mode reports them.
+    lazy_misses: Vec<String>,
+    /// Bodies deferred so far (and compiled by `drain_lazy`).
+    lazy_deferred: usize,
 }
 
 /// Resolve `name` to an `UpvalSource` for the INNERMOST function whose enclosing
@@ -782,6 +797,9 @@ struct FnCompiler<'a> {
     /// `using` declaration's `RegisterDisposable` knows which scope to push onto.
     /// `None` outside any `using` block; saved/restored across block nesting.
     using_scope_reg: Option<Reg>,
+    /// A deferred body's compile (`Compiler::lazy_freeze`): every upvalue it
+    /// needs was resolved when it was deferred, so a new one is a miss.
+    upvals_frozen: bool,
 }
 
 /// Pending `break`/`continue` jumps for one enclosing breakable construct. A
@@ -944,6 +962,7 @@ mod entry;
 mod exprs;
 mod funcs;
 mod helpers;
+mod lazy;
 mod positions;
 pub(crate) mod remap;
 mod scopes;

@@ -1475,6 +1475,27 @@ fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
     out.extend(own);
 }
 
+/// The names function `f` takes from outside itself: what its body and its
+/// parameter defaults reference (nested functions' free names included) and
+/// it does not bind, sorted. What a deferred compile of `f` must find among
+/// its upvalues (`compile::lazy`).
+pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
+    let mut out = Names::default();
+    fn_node_free(f, &mut out);
+    let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    v.sort_unstable();
+    v
+}
+
+/// [`function_free_names`] for an arrow.
+pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
+    let mut out = Names::default();
+    arrow_free(a, &mut out);
+    let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    v.sort_unstable();
+    v
+}
+
 fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
     if memo_get(a, (a.span.start, a.span.end), 1, out) {
         return;
