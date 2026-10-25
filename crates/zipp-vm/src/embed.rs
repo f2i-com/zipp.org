@@ -994,15 +994,17 @@ impl ScriptState {
     pub fn set_heap_limit(&mut self, bytes: usize) {
         self.with_vm(|vm| {
             vm.meter_fold();
-            let reached = match vm.instr_rec.as_mut() {
+            let (reached, carried) = match vm.instr_rec.as_mut() {
                 Some(rec) => {
                     let reached = rec.heap_ceiling_reached();
+                    let carried = rec.heap_ceiling_carried;
                     rec.heap_limit = bytes;
                     rec.ceiling_gc_pending = false;
                     rec.heap_ceiling_reached = false;
-                    reached
+                    rec.heap_ceiling_carried = false;
+                    (reached, carried)
                 }
-                None => false,
+                None => (false, false),
             };
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
@@ -1021,8 +1023,34 @@ impl ScriptState {
             // the ceiling is the collector's schedule's to find, and a poll
             // that finds the heap over the ceiling asks for a collection
             // before it convicts.
-            if reached && bytes != usize::MAX && vm.heap_bytes_live_estimate() > bytes / 2 {
+            //
+            // A heap that already stands over the new ceiling is collected
+            // too, whatever the last budget found. A preflight (the register
+            // file's growth at a call, a string builder's) convicts on the
+            // estimate before any poll could ask for that collection: after
+            // `keep = null` the next entry's first call failed with "Maximum
+            // call stack size exceeded" when the fill had stopped 0.9 MB over
+            // the ceiling (tests/heap_ceiling_recovery.rs). The poll would
+            // have collected before convicting such a heap anyway, so no
+            // host pays a collection it was not already paying.
+            let live = vm.heap_bytes_live_estimate();
+            let collect = bytes != usize::MAX && (live > bytes || reached && live > bytes / 2);
+            if collect {
                 vm.collect_major_now();
+            }
+            // A conviction's collection that still finds the heap past half
+            // the ceiling ran while the script held what filled it, and the
+            // entry armed now may be the one that drops it (`keep = null` in
+            // tests/heap_ceiling_recovery.rs). Carry the conviction through
+            // this re-arm, so the next one collects too and the entry after
+            // it reuses the dead objects' slots instead of growing the slot
+            // tables past them. Once: after a conviction, a host whose live
+            // heap stays past half pays one more collection, not one an entry.
+            if collect && reached && !carried && vm.heap_bytes_live_estimate() > bytes / 2 {
+                if let Some(rec) = vm.instr_rec.as_mut() {
+                    rec.heap_ceiling_reached = true;
+                    rec.heap_ceiling_carried = true;
+                }
             }
         });
     }

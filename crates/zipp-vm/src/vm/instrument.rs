@@ -468,6 +468,10 @@ pub(crate) struct Recorder {
     /// it. `ScriptState::set_heap_limit` collects a heap the last budget left
     /// at its ceiling, and only that one.
     pub(crate) heap_ceiling_reached: bool,
+    /// `heap_ceiling_reached` was carried through one re-arm already: the
+    /// collection it asked for still found the heap past half the ceiling,
+    /// so the next re-arm collects too, and only that one more.
+    pub(crate) heap_ceiling_carried: bool,
     /// What the first heap walk after the latest major found (`growth_major`
     /// names that major): the level in-place growth is measured from. The
     /// collector schedules on what it allocates, and an Array filled by
@@ -593,6 +597,7 @@ impl Recorder {
             regex_began_on_full_heap: std::cell::Cell::new(false),
             ceiling_gc_pending: false,
             heap_ceiling_reached: false,
+            heap_ceiling_carried: false,
             growth_level: 0,
             growth_major: u64::MAX,
             growth_gc_pending: false,

@@ -1155,6 +1155,7 @@ impl<'p> Vm<'p> {
         // the next `set_heap_limit` collects it (f2i-com/zipp.org#73).
         if let Some(old) = self.instr_rec.as_ref() {
             rec.heap_ceiling_reached |= old.heap_ceiling_reached();
+            rec.heap_ceiling_carried |= old.heap_ceiling_carried;
         }
         self.instr_rec = Some(Box::new(rec));
         // The new recorder's own countdown is the whole of it: the next step
