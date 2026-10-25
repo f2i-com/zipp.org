@@ -1418,7 +1418,12 @@ impl<'p> Vm<'p> {
         handler: Value,
         name: &str,
     ) -> Result<Option<Value>, Thrown> {
-        let t = self.get_prop(handler, name)?;
+        // A plain handler object's own (or inherited) data property, read
+        // where it lies (`plain_handler_trap`); anything else is the Get.
+        let t = match self.plain_handler_trap(handler, name) {
+            Some(t) => t,
+            None => self.get_prop(handler, name)?,
+        };
         if t.is_undefined() || t.is_null() {
             Ok(None)
         } else if self.is_callable(t) {

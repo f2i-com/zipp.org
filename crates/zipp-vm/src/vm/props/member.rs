@@ -831,6 +831,24 @@ impl<'p> Vm<'p> {
         self.plain_chain_data(start, key)
     }
 
+    /// A Proxy handler's trap `name` when the handler is an ordinary object
+    /// whose chain answers the read without running code (`plain_chain_data`
+    /// from the handler itself): every trap of a proxy looked it up with the
+    /// generic Get on every operation. `None` for any other handler (a Proxy,
+    /// a class instance, an accessor), and while a realm or deferred
+    /// namespace exists: the Get answers those.
+    #[inline]
+    pub(crate) fn plain_handler_trap(&self, handler: Value, name: &str) -> Option<Value> {
+        if !handler.is_heap()
+            || self.active_realm.is_some()
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        self.plain_chain_data(handler.heap_index(), name)
+    }
+
     /// `key` read along a prototype chain of ordinary maps from `start`: the
     /// first level's own data value, or `undefined` past the chain's end.
     /// `None` at an accessor, an uninitialised slot, a class's map, the
