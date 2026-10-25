@@ -298,6 +298,28 @@ fn renumber_above(slots: &mut [u32], slot: u32) {
     }
 }
 
+/// The slot tables' capacity at their first growth past the boot tables when
+/// no resident ceiling governs growth (`Heap::reserve_slot_growth`); later
+/// growths quadruple.
+#[cfg(not(target_arch = "wasm32"))]
+const SLOT_TABLE_FIRST_GROWTH: usize = 1 << 17;
+
+/// `ZIPP_NO_SLOT_JUMP=1` grows the slot tables by `Vec`'s doubling.
+#[cfg(not(target_arch = "wasm32"))]
+fn slot_jump_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SLOT_JUMP").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// A hint that the cache line at `p` is about to be read. A prefetch reads
 /// nothing architecturally and cannot fault, so any address will do. Written
 /// with SSE on x86_64 (baseline; not in the safe-sandbox profile, which has
@@ -9443,6 +9465,31 @@ impl Heap {
     fn reserve_slot_growth(&mut self) {
         let ceiling = self.resident_ceiling;
         if ceiling == usize::MAX {
+            // With no ceiling to respect, grow in few large steps. Each
+            // doubling of the seven parallel tables copied all of them into
+            // fresh memory, and the fresh pages were faulted in again: a
+            // server-side render that ends at 100,000 slots copied 13 MB
+            // and touched 12 MB more than it keeps (Preact SSR: 9,444 page
+            // faults, 6,435 with the tables reserved). The reservation is
+            // address space; only the slots in use are ever touched. The
+            // WebAssembly build's linear memory is committed as it grows,
+            // so it keeps the doubling.
+            #[cfg(not(target_arch = "wasm32"))]
+            if slot_jump_enabled() {
+                let cap = self.objs.capacity();
+                let want = if cap < SLOT_TABLE_FIRST_GROWTH {
+                    SLOT_TABLE_FIRST_GROWTH
+                } else {
+                    cap.saturating_mul(4)
+                };
+                self.objs.reserve_exact(want.saturating_sub(self.objs.len()));
+                self.align_slot_table_capacities();
+                if self.nursery {
+                    self.recache_gen_raw();
+                }
+                // The reservation is not growth a collection could answer.
+                self.rebase_footprint();
+            }
             return;
         }
         let cap = self.objs.capacity();
