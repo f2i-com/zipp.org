@@ -615,19 +615,27 @@ impl<'p> Vm<'p> {
     /// generic `length` Get and an index Get per argument, then a nested run
     /// loop for the call. `None` for anything else.
     pub(crate) fn interp_apply_list(&mut self, list: Value) -> Option<Vec<Value>> {
+        let mut out = Vec::new();
+        self.interp_apply_list_into(list, &mut out).then_some(out)
+    }
+
+    /// [`Vm::interp_apply_list`] into `out` (cleared first): false, with
+    /// `out` in no particular state, for a list it does not read.
+    pub(crate) fn interp_apply_list_into(&mut self, list: Value, out: &mut Vec<Value>) -> bool {
+        out.clear();
         if list.is_nullish() {
-            return Some(Vec::new());
+            return true;
         }
         if !list.is_heap() {
-            return None;
+            return false;
         }
         let idx = list.heap_index();
         let HeapObj::Array(items) = self.heap.get(idx) else {
-            return None;
+            return false;
         };
         let n = items.len();
         if items.iter().any(|v| v.is_hole()) {
-            return None;
+            return false;
         }
         if !self.arguments_objs.contains_key(&idx) {
             // A redefined index (an accessor above all) overrides its dense
@@ -636,41 +644,74 @@ impl<'p> Vm<'p> {
                 || self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
                 || self.preflight_native_iteration_work(n as u64).is_err()
             {
-                return None;
+                return false;
             }
             let HeapObj::Array(items) = self.heap.get(idx) else {
-                return None;
+                return false;
             };
-            return Some(items.to_vec());
+            out.extend_from_slice(items);
+            return true;
         }
         // An arguments object: `length` is an ordinary own data property in
         // its side table, beside `callee` and @@iterator, and no other key
         // (a redefined index above all) may be there.
-        let props = self.arr_props.get(&idx)?;
+        let Some(props) = self.arr_props.get(&idx) else {
+            return false;
+        };
         if !props.is_pristine_arguments_table() {
-            return None;
+            return false;
         }
-        let lp = props.pos("length")?;
+        let Some(lp) = props.pos("length") else {
+            return false;
+        };
         let lv = props.val_at(lp);
         // (Made as `Value::num(argc)`, which may be a double.)
         if props.attr_at(lp).accessor || !lv.is_number() || lv.as_f64() != n as f64 {
-            return None;
+            return false;
         }
         if self.preflight_native_iteration_work(n as u64).is_err() {
-            return None;
+            return false;
         }
-        let mut out = Vec::with_capacity(n);
+        out.reserve(n);
         for i in 0..n {
             let v = match self.args_mapped_get(idx, i) {
                 Some(v) => v,
                 None => match self.heap.get(idx) {
                     HeapObj::Array(items) => items[i],
-                    _ => return None,
+                    _ => return false,
                 },
             };
             out.push(v);
         }
-        Some(out)
+        true
+    }
+
+    /// `f.apply(t, list)` entered as `f`'s frame on this loop
+    /// (`setup_call_slice`) when [`Vm::interp_apply_list`] reads the list:
+    /// false when it does not. The list goes through `apply_scratch`: a
+    /// fresh `Vec` per call, allocated and freed around the push, was two
+    /// fifths of the lane's samples in Prettier's bundle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn setup_apply_frame(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this_v: Value,
+        list: Value,
+        dst: u16,
+        caller_ip_next: usize,
+        callee: Value,
+    ) -> Result<bool, Thrown> {
+        let mut args = std::mem::take(&mut self.apply_scratch);
+        let r = if self.interp_apply_list_into(list, &mut args) {
+            self.setup_call_slice(fid, closure, this_v, &args, dst, caller_ip_next, callee)
+                .map(|()| true)
+        } else {
+            Ok(false)
+        };
+        args.clear();
+        self.apply_scratch = args;
+        r
     }
 
     /// `Array.prototype.values.call(arr)` (`arr[Symbol.iterator].call(arr)`,

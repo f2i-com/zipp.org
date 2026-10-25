@@ -1805,6 +1805,10 @@ pub struct Vm<'p> {
     /// invoking the body; the frame-setup path consumes it into `Frame::new_target`
     /// and resets it to `undefined`, so ordinary calls observe `new.target` undefined.
     pending_new_target: Value,
+    /// The list an interpreted `f.apply(t, list)` enters `f` with
+    /// (`Vm::setup_apply_frame`), kept between calls so a call allocates
+    /// none. Empty outside one.
+    apply_scratch: Vec<Value>,
     /// One-shot "the NEXT frame entered runs an eval program" flag, set right
     /// before `execute_eval_program` invokes the compiled eval script and
     /// consumed into `Frame::is_eval` at frame setup (same one-shot idiom as

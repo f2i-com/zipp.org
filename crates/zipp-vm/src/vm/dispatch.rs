@@ -4183,8 +4183,7 @@ impl<'p> Vm<'p> {
                                 if self.realm_global_objs.is_empty() || self.get_function_realm(this_val) == 0 {
                                     let t = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
                                     let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                    if let Some(args) = self.interp_apply_list(list) {
-                                        self.setup_call_slice(fid, closure, t, &args, dst, ip + 1, this_val)?;
+                                    if self.setup_apply_frame(fid, closure, t, list, dst, ip + 1, this_val)? {
                                         break;
                                     }
                                 }
@@ -4794,8 +4793,7 @@ impl<'p> Vm<'p> {
                             if let Some((fid, closure)) = self.fn_apply_plain_target(recv) {
                                 let this_v = if argc == 0 { Value::UNDEFINED } else { self.get(base, arg_base) };
                                 let list = if argc < 2 { Value::UNDEFINED } else { self.get(base, arg_base + 1) };
-                                if let Some(args) = self.interp_apply_list(list) {
-                                    self.setup_call_slice(fid, closure, this_v, &args, dst, ip + 1, recv)?;
+                                if self.setup_apply_frame(fid, closure, this_v, list, dst, ip + 1, recv)? {
                                     break;
                                 }
                             } else if let Some(id) = self.fn_apply_native_target(recv) {

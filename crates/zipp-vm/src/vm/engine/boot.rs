@@ -355,6 +355,7 @@ impl<'p> Vm<'p> {
             start_mono_ms: crate::vm::clock::now_mono_ms(),
             pending_throw: None,
             pending_new_target: Value::UNDEFINED,
+            apply_scratch: Vec::new(),
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
             fn_ctor_cache: rustc_hash::FxHashMap::default(),
