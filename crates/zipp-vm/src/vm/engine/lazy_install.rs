@@ -69,12 +69,15 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("internal: function {fid} is a stub but nothing compiles it")));
         };
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
+        let footprint = crate::heap::footprint_bytes();
         let result = match session.compile(fid, self.funcs.len() as u32) {
             Ok(body) => self.lazy_place(&session, fid, body),
             Err(e) if e.starts_with("SyntaxError") || e.starts_with("RangeError") => Err(Thrown(e)),
             Err(e) => Err(Thrown(format!("SyntaxError: {e}"))),
         };
         self.lazy = Some(session);
+        // What the compile kept is code, not objects (`Heap::discount_footprint`).
+        self.heap.discount_footprint(crate::heap::footprint_bytes().saturating_sub(footprint));
         result
     }
 

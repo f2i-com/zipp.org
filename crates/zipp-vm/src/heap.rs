@@ -7827,7 +7827,7 @@ fn note_block(old_size: usize, new_size: usize) {
 /// what was freed, garbage fills that before the memory grows again, and
 /// each cycle ends a step higher than the last, up to the ceiling.
 #[inline(always)]
-fn footprint_bytes() -> usize {
+pub(crate) fn footprint_bytes() -> usize {
     ALLOCATOR_NET_BYTES.load(Ordering::Relaxed)
 }
 
@@ -9091,6 +9091,32 @@ impl Heap {
             {
                 self.major_due = true;
             }
+        }
+    }
+
+    /// `bytes` the VM has just allocated that are not its objects' (a
+    /// deferred function body compiled at its first call,
+    /// `vm::engine::lazy_install`): the footprint schedule measures from past
+    /// them, as it does for the program compiled before the heap was made.
+    /// Counted as growth, the megabytes a large body's compile retains asked
+    /// for a minor in the middle of a program's startup, which found every
+    /// young object alive, and the nursery's survival control then doubled
+    /// its budget to the cap (Babel's bundle: 4% slower on the core without
+    /// the larger cache).
+    pub(crate) fn discount_footprint(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.footprint_at_major = self.footprint_at_major.saturating_add(bytes);
+        }
+        // A settling level is read afresh at the next look, compile included.
+        if !self.footprint_settling {
+            self.footprint_at_look = self.footprint_at_look.saturating_add(bytes);
+            self.footprint_gc_at = self.footprint_gc_at.saturating_add(bytes);
+            #[cfg(feature = "safe-sandbox")]
+            FOOTPRINT_TRIP_AT.store(self.footprint_gc_at, Ordering::Relaxed);
         }
     }
 
