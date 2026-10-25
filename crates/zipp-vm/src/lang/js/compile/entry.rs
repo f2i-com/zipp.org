@@ -142,7 +142,7 @@ impl Compiler {
 /// The top-level var + function declared names of a parsed eval body —
 /// EvalDeclarationInstantiation's varNames/functionNames for collision checks.
 pub fn eval_var_and_fn_names(prog: &ast::Program) -> Vec<String> {
-    let mut vars = std::collections::HashSet::new();
+    let mut vars = rustc_hash::FxHashSet::default();
     for s in &prog.body {
         collect_hoisted_vars(s, &mut vars);
     }
@@ -164,7 +164,7 @@ pub fn compile_eval(
     force_new_target_ok: bool,
     inherit_super: Option<EvalClassCtx>,
     ban_arguments: bool,
-    visible_privates: std::collections::HashSet<String>,
+    visible_privates: rustc_hash::FxHashSet<String>,
     is_module: bool,
     inherit_super_obj: bool,
     caller_scope: Vec<String>,
@@ -193,13 +193,13 @@ pub fn compile_eval(
     // top-level functions are LEXICAL), or a lexical name colliding with any
     // VarDeclaredName (deep), is a SyntaxError before any evaluation.
     if is_module {
-        let mut vars = std::collections::HashSet::new();
+        let mut vars = rustc_hash::FxHashSet::default();
         for s in &prog.body {
             collect_hoisted_vars(s, &mut vars);
         }
-        let mut lexical: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lexical: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         let add_lexical =
-            |n: String, lexical: &mut std::collections::HashSet<String>| -> Result<(), String> {
+            |n: String, lexical: &mut rustc_hash::FxHashSet<String>| -> Result<(), String> {
                 if !lexical.insert(n.clone()) || vars.contains(&n) {
                     return Err(format!("duplicate declaration of '{n}' in module code"));
                 }
@@ -208,11 +208,11 @@ pub fn compile_eval(
         // `export <decl>` keeps the declaration it wraps, so the exported form
         // goes through the same three cases as a bare one.
         let check_decl = |d: &ast::Stmt,
-                          lexical: &mut std::collections::HashSet<String>|
+                          lexical: &mut rustc_hash::FxHashSet<String>|
          -> Result<(), String> {
             match d {
                 ast::Stmt::VarDecl(vd) if vd.kind.is_lexical() => {
-                    let mut names = std::collections::HashSet::new();
+                    let mut names = rustc_hash::FxHashSet::default();
                     for decl in &vd.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
@@ -238,7 +238,7 @@ pub fn compile_eval(
         for s in &prog.body {
             match s {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                    let mut names = std::collections::HashSet::new();
+                    let mut names = rustc_hash::FxHashSet::default();
                     for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
@@ -308,7 +308,7 @@ pub fn compile_eval(
         // Annex B.3.3: a BLOCK-level function declaration in this sloppy eval
         // also creates a function-scoped binding — in the CALLER's EvalScope,
         // exactly like the eval's top-level vars (never a realm global).
-        let mut blockers = std::collections::HashSet::new();
+        let mut blockers = rustc_hash::FxHashSet::default();
         for s in &prog.body {
             match s {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
@@ -324,7 +324,7 @@ pub fn compile_eval(
                 _ => {}
             }
         }
-        let mut b33 = std::collections::HashSet::new();
+        let mut b33 = rustc_hash::FxHashSet::default();
         for s in &prog.body {
             collect_b33_block_fns(s, false, &blockers, &mut b33);
         }
@@ -362,7 +362,7 @@ pub fn compile_eval(
             for n in eval_var_and_fn_names(prog) {
                 names.insert(n);
             }
-            let mut map = std::collections::HashMap::new();
+            let mut map = rustc_hash::FxHashMap::default();
             for name in names {
                 if name.starts_with(" with-object-") {
                     continue;
@@ -441,7 +441,7 @@ pub fn compile_eval(
 /// Global slots as a sorted `Vec`, so a `HashSet`'s per-process iteration order
 /// never reaches the emitted `Program`. Slots are assigned in order of first
 /// mention, so slot order is a deterministic, source-derived order.
-fn sorted_slots(set: &std::collections::HashSet<u32>) -> Vec<u32> {
+fn sorted_slots(set: &rustc_hash::FxHashSet<u32>) -> Vec<u32> {
     let mut v: Vec<u32> = set.iter().copied().collect();
     v.sort_unstable();
     v
@@ -449,7 +449,7 @@ fn sorted_slots(set: &std::collections::HashSet<u32>) -> Vec<u32> {
 
 /// As `sorted_slots`, for the name-keyed set. These are looked up, never
 /// replayed in order, so alphabetical is only about determinism.
-fn sorted_names(set: &std::collections::HashSet<String>) -> Vec<String> {
+fn sorted_names(set: &rustc_hash::FxHashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = set.iter().cloned().collect();
     v.sort_unstable();
     v

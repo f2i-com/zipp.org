@@ -156,7 +156,7 @@ pub(crate) fn private_key(name: &str) -> String {
 /// loops/if/try/switch but not nested functions). These bind in FUNCTION scope, so a
 /// nested closure over one must be in the capture set to box the right register.
 pub(crate) fn hoisted_var_names(body: &[Stmt]) -> Vec<String> {
-    let mut set = std::collections::HashSet::new();
+    let mut set = rustc_hash::FxHashSet::default();
     for s in body {
         collect_hoisted_vars(s, &mut set);
     }
@@ -179,7 +179,7 @@ pub(crate) fn hoisted_var_names(body: &[Stmt]) -> Vec<String> {
 /// order already differs from V8's for an unrelated reason — hoisted function
 /// declarations take slots before top-level vars — so this does not trade away
 /// a conformance property it currently has.)
-pub(crate) fn sorted_name_vec(set: &std::collections::HashSet<String>) -> Vec<String> {
+pub(crate) fn sorted_name_vec(set: &rustc_hash::FxHashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = set.iter().cloned().collect();
     v.sort_unstable();
     v
@@ -188,7 +188,7 @@ pub(crate) fn sorted_name_vec(set: &std::collections::HashSet<String>) -> Vec<St
 /// Add a block's DIRECT lexical declaration names (top-level `let`/`const`/
 /// `class` of the block) to `out` — the names that block Annex B B.3.3 for a
 /// same-block function declaration.
-pub(crate) fn add_block_lexicals(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn add_block_lexicals(s: &Stmt, out: &mut rustc_hash::FxHashSet<String>) {
     use crate::parse::ast::Stmt as S;
     match s {
         S::VarDecl(d) if d.kind.is_lexical() => {
@@ -230,11 +230,11 @@ pub(crate) fn labelled_fn_decl(s: &Stmt) -> Option<&crate::parse::ast::Function>
 pub(crate) fn collect_b33_block_fns(
     s: &Stmt,
     nested: bool,
-    blockers: &std::collections::HashSet<String>,
-    out: &mut std::collections::HashSet<String>,
+    blockers: &rustc_hash::FxHashSet<String>,
+    out: &mut rustc_hash::FxHashSet<String>,
 ) {
     use crate::parse::ast::Stmt as S;
-    let for_left_lex = |d: &VarDecl, bk: &mut std::collections::HashSet<String>| {
+    let for_left_lex = |d: &VarDecl, bk: &mut rustc_hash::FxHashSet<String>| {
         if d.kind.is_lexical() {
             for decl in &d.decls {
                 capture::collect_pattern_names(&decl.id, bk);
@@ -493,7 +493,7 @@ pub(crate) fn declared_binding_count(body: &[Stmt]) -> (usize, bool) {
         d.decls
             .iter()
             .map(|decl| {
-                let mut names = std::collections::HashSet::new();
+                let mut names = rustc_hash::FxHashSet::default();
                 capture::collect_pattern_names(&decl.id, &mut names);
                 names.len()
             })
@@ -561,7 +561,7 @@ pub(crate) fn declared_binding_count(body: &[Stmt]) -> (usize, bool) {
     (count, has_with)
 }
 
-pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut rustc_hash::FxHashSet<String>) {
     use crate::parse::ast::Stmt as S;
     match s {
         S::VarDecl(d) if d.kind == VarKind::Var => {
@@ -925,7 +925,7 @@ pub(crate) fn is_strict_reserved_word(name: &str) -> bool {
 /// Leaf binding names introduced by destructuring parameters (for capture
 /// analysis — a closure may capture a destructured parameter's leaf).
 pub(crate) fn param_pattern_leaves(params: &Params) -> Vec<String> {
-    let mut set = HashSet::new();
+    let mut set = HashSet::default();
     for item in &params.items {
         // A defaulted parameter wraps its pattern now (`{a} = {}` is
         // `Pattern::Assign`), where oxc kept `item.pattern` as the bare

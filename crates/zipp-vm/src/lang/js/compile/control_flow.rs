@@ -39,12 +39,12 @@ use super::*;
 /// clause, or earlier code of its own clause references it. Without one it
 /// was a plain register that nothing initialized on the jump, and the read
 /// returned whatever temporary last used it.
-fn switch_tdz_names(cases: &[ast::SwitchCase]) -> std::collections::HashSet<String> {
-    let mut early = std::collections::HashSet::new();
-    let declared: Vec<std::collections::HashSet<String>> = cases
+fn switch_tdz_names(cases: &[ast::SwitchCase]) -> rustc_hash::FxHashSet<String> {
+    let mut early = rustc_hash::FxHashSet::default();
+    let declared: Vec<rustc_hash::FxHashSet<String>> = cases
         .iter()
         .map(|c| {
-            let mut names = std::collections::HashSet::new();
+            let mut names = rustc_hash::FxHashSet::default();
             for st in &c.body {
                 match st {
                     ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
@@ -66,7 +66,7 @@ fn switch_tdz_names(cases: &[ast::SwitchCase]) -> std::collections::HashSet<Stri
     if declared.iter().all(|d| d.is_empty()) {
         return early;
     }
-    let mut selector_refs = std::collections::HashSet::new();
+    let mut selector_refs = rustc_hash::FxHashSet::default();
     for c in cases {
         if let Some(t) = &c.test {
             selector_refs.extend(capture::expr_refs_all(t));
@@ -483,7 +483,7 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn predeclare_lexical_tdz_with(
         &mut self,
         stmts: &[ast::Stmt],
-        early: &std::collections::HashSet<String>,
+        early: &rustc_hash::FxHashSet<String>,
     ) {
         // Every block-like scope funnels through here right after `push_scope`,
         // so this is also where the scope's lexical NAMES are recorded for the
@@ -521,7 +521,7 @@ impl<'a> FnCompiler<'a> {
                             // `let {p} = o` must capture the block's `p`, not
                             // resolve past it. `declare_pattern` reuses the
                             // cell. Sorted, as `pre` allocates registers.
-                            let mut leaves = std::collections::HashSet::new();
+                            let mut leaves = rustc_hash::FxHashSet::default();
                             capture::collect_pattern_names(&decl.id, &mut leaves);
                             for name in crate::compile::helpers::sorted_name_vec(&leaves) {
                                 pre(self, &name);
@@ -1103,7 +1103,7 @@ impl<'a> FnCompiler<'a> {
         // ForIn/OfHeadEvaluation. Mark the names as TDZ for the duration of `right`.
         let tdz_added: Vec<String> = match left {
             ast::ForTarget::Var(d) if d.kind.is_lexical() => {
-                let mut names = std::collections::HashSet::new();
+                let mut names = rustc_hash::FxHashSet::default();
                 capture::collect_pattern_names(&d.decls[0].id, &mut names);
                 // Sorted: each name gets a TDZ cell register below, in this order.
                 crate::compile::helpers::sorted_name_vec(&names)
@@ -1599,7 +1599,7 @@ impl<'a> FnCompiler<'a> {
         // TDZ (`for (let x in x) {}` throws a ReferenceError), per ForIn/OfHeadEvaluation.
         let tdz_added: Vec<String> = match left {
             ast::ForTarget::Var(d) if d.kind.is_lexical() => {
-                let mut names = std::collections::HashSet::new();
+                let mut names = rustc_hash::FxHashSet::default();
                 capture::collect_pattern_names(&d.decls[0].id, &mut names);
                 // Sorted: each name gets a TDZ cell register below, in this order.
                 crate::compile::helpers::sorted_name_vec(&names)

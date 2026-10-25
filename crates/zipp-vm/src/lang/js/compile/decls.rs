@@ -219,8 +219,8 @@ impl<'a> FnCompiler<'a> {
                 // at script top level, `func_decl` binds block functions to globals
                 // (Annex B hoisting), so a local here would shadow that with an
                 // uninitialized slot.
-                let mut entry_fns: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut entry_fns: rustc_hash::FxHashSet<String> =
+                    rustc_hash::FxHashSet::default();
                 for st in body {
                     // A LABELLED function declaration (`{ L: function f(){} }`) is
                     // still a FunctionDeclaration of this block: BlockDeclaration-
@@ -610,7 +610,7 @@ impl<'a> FnCompiler<'a> {
                 ast::ExportDecl::Decl(decl) => match &**decl {
                     S::VarDecl(d) => {
                         self.var_decl(d)?;
-                        let mut names = std::collections::HashSet::new();
+                        let mut names = rustc_hash::FxHashSet::default();
                         for dd in &d.decls {
                             capture::collect_pattern_names(&dd.id, &mut names);
                         }
@@ -829,7 +829,7 @@ impl<'a> FnCompiler<'a> {
                 // like their simple-identifier siblings (const immutability,
                 // module per-module slots, script-GDI bookkeeping).
                 if self.is_script && self.cx.script_binds_globals && !block_local {
-                    let mut leaves = std::collections::HashSet::new();
+                    let mut leaves = rustc_hash::FxHashSet::default();
                     capture::collect_pattern_names(&decl.id, &mut leaves);
                     let undef = if d.kind.is_lexical() {
                         None
@@ -861,7 +861,7 @@ impl<'a> FnCompiler<'a> {
                 // evaluates (`let {a} = a` throws); they leave it before the
                 // extraction (a sibling default may read an earlier leaf).
                 let tdz_leaves: Vec<String> = if d.kind.is_lexical() {
-                    let mut names = std::collections::HashSet::new();
+                    let mut names = rustc_hash::FxHashSet::default();
                     capture::collect_pattern_names(&decl.id, &mut names);
                     names
                         .into_iter()
@@ -888,7 +888,7 @@ impl<'a> FnCompiler<'a> {
                 // write throws (see the simple-identifier path below).
                 if is_const {
                     if self.is_script && self.cx.script_binds_globals && !block_local {
-                        let mut leaves = std::collections::HashSet::new();
+                        let mut leaves = rustc_hash::FxHashSet::default();
                         capture::collect_pattern_names(&decl.id, &mut leaves);
                         for n in sorted_name_vec(&leaves) {
                             let slot = self.cx.global_slot(&n) as u32;
@@ -1440,7 +1440,7 @@ impl<'a> FnCompiler<'a> {
     /// pattern's leaves are declared in registers (`declare_local`), never
     /// spilled.
     pub(crate) fn pattern_leaf_regs(&self, pat: &ast::Pattern) -> Vec<Reg> {
-        let mut names = std::collections::HashSet::new();
+        let mut names = rustc_hash::FxHashSet::default();
         capture::collect_pattern_names(pat, &mut names);
         // Sorted: callers EMIT per register, so raw HashSet order would permute
         // the instruction stream between compiles of the same source.

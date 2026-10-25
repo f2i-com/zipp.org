@@ -1434,7 +1434,7 @@ impl<'a> FnCompiler<'a> {
         // make a later key collide or reorder — a spread, a computed key, an
         // accessor, a `__proto__:` colon form, or a repeated static key. After
         // that everything falls back to `InitDataProp`, which is what runs today.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         let mut appendable = true;
         let mut static_keys = 0usize;
         for prop in props {
@@ -1814,7 +1814,7 @@ impl<'a> FnCompiler<'a> {
             return true; // latch off: always wire, the pre-B209 behaviour
         }
         let mut stack = vec![fid];
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         while let Some(f) = stack.pop() {
             if !seen.insert(f) {
                 continue;

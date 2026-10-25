@@ -24,7 +24,7 @@
 //! hides only the references inside its own block. Over-inclusion is the safe
 //! direction — it at most boxes a local that did not need a cell.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use rustc_hash::FxHashSet;
 
@@ -383,7 +383,7 @@ pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
 /// outer or global binding. References hidden by a nested block's own binding
 /// of the name do not count.
 pub fn lexical_forward_refs(stmts: &[Stmt]) -> HashSet<String> {
-    let mut found = HashSet::new();
+    let mut found = HashSet::default();
     // The common shapes — no lexical declaration after the first statement,
     // and no multi-declarator or destructuring one — need no walk at all. A
     // destructuring declarator can reach its own names: `let [a = b, b] = []`.
@@ -627,7 +627,7 @@ pub fn late_box_names(
     captured: &HashSet<String>,
 ) -> HashSet<String> {
     if captured.is_empty() || body.iter().any(late_box_blocked) {
-        return HashSet::new();
+        return HashSet::default();
     }
     let mut kept = Names::default();
     params_nested_free(params_ast, &mut kept);

@@ -84,7 +84,7 @@ impl Compiler {
             eval_caller_scope: Vec::new(),
             eval_outer_scope: Vec::new(),
             eval_catch_params: Vec::new(),
-            eval_dynamic_names: std::collections::HashSet::new(),
+            eval_dynamic_names: rustc_hash::FxHashSet::default(),
             eval_fn_context: false,
             dyn_global_zone: false,
             force_strict: false,
@@ -97,19 +97,19 @@ impl Compiler {
             compiling_ctor: false,
             private_names_stack: Vec::new(),
             heritage_classes: Vec::new(),
-            eval_visible_privates: std::collections::HashSet::new(),
+            eval_visible_privates: rustc_hash::FxHashSet::default(),
             in_derived_ctor: false,
             fn_ctor_no_self_name: false,
-            const_globals: HashSet::new(),
-            lexical_globals: HashSet::new(),
-            decl_globals: HashSet::new(),
+            const_globals: HashSet::default(),
+            lexical_globals: HashSet::default(),
+            decl_globals: HashSet::default(),
             module_exports: Vec::new(),
             module_reexports: Vec::new(),
             module_star_reexports: Vec::new(),
             module_ns_reexports: Vec::new(),
             module_imports: Vec::new(),
             with_name_counter: 0,
-            pending_with_shadows: std::collections::HashMap::new(),
+            pending_with_shadows: rustc_hash::FxHashMap::default(),
             obj_method_super: false,
         }
     }
@@ -283,7 +283,7 @@ impl Compiler {
         // `undefined` at startup so `x; var x;` reads `undefined` rather than
         // throwing the never-declared ReferenceError.
         if self.script_binds_globals {
-            let mut vars = std::collections::HashSet::new();
+            let mut vars = rustc_hash::FxHashSet::default();
             for s in &prog.body {
                 collect_hoisted_vars(s, &mut vars);
             }
@@ -375,7 +375,7 @@ impl Compiler {
             if let Some(pa) = params_ast {
                 let mut ordered = Vec::new();
                 collect_param_names_ordered(pa, &mut ordered);
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 for nm in &ordered {
                     strict_name_err(true, nm)?;
                     if !seen.insert(nm.as_str()) {
@@ -470,7 +470,7 @@ impl Compiler {
             || capture::stmts_refs_all(body).contains("arguments")
             || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
         {
-            HashSet::new()
+            HashSet::default()
         } else {
             capture::late_box_names(params_ast, body, &captured)
         };
@@ -654,11 +654,11 @@ impl Compiler {
         // top-level OR an enclosing block/for-head/catch param) are skipped, as is
         // a top-level function name (already var-scoped).
         if !fc.cx.in_strict && (!is_script || fc.cx.script_binds_globals) {
-            let mut blockers = std::collections::HashSet::new();
+            let mut blockers = rustc_hash::FxHashSet::default();
             // `protect`: params + lexical/class names a same-named block function
             // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no
             // NEW b33 var) but are NOT protected — a block function updates them.
-            let mut protect = std::collections::HashSet::new();
+            let mut protect = rustc_hash::FxHashSet::default();
             let mut parameter_bindings = fc.param_names.clone();
             if let Some(pa) = params_ast {
                 parameter_bindings.extend(param_pattern_leaves(pa));
@@ -713,14 +713,14 @@ impl Compiler {
                 }
             }
             fc.protect_names = protect;
-            let mut b33 = std::collections::HashSet::new();
+            let mut b33 = rustc_hash::FxHashSet::default();
             if is_script {
                 // SCRIPT level: an existing top-level FUNCTION name is NOT a
                 // blocker — the block function UPDATES its global binding at
                 // declaration evaluation (B.3.3.3 SetMutableBinding; the
                 // binding already exists via name_global materialization).
                 let mut script_blockers = blockers.clone();
-                let mut fn_names = std::collections::HashSet::new();
+                let mut fn_names = rustc_hash::FxHashSet::default();
                 for s in body {
                     if let Some(f) = labelled_fn_decl(s) {
                         if let Some(id) = &f.name {
@@ -979,7 +979,7 @@ impl Compiler {
         // `typeof x; let x;` throws ReferenceError. The textual declaration
         // reuses the cell (entry_lexicals), ending the TDZ.
         if is_script && fc.cx.eval_locals {
-            let mut lex = std::collections::HashSet::new();
+            let mut lex = rustc_hash::FxHashSet::default();
             for s in body {
                 match s {
                     ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
@@ -1015,7 +1015,7 @@ impl Compiler {
         // (Lexical `let`/`const` are NOT pre-created — they have a TDZ and are bound
         // at their textual declaration.)
         if !is_script || !fc.cx.script_binds_globals {
-            let mut hv = std::collections::HashSet::new();
+            let mut hv = rustc_hash::FxHashSet::default();
             for s in body {
                 collect_hoisted_vars(s, &mut hv);
             }
@@ -1656,7 +1656,7 @@ impl Compiler {
                             blockers.insert(id.to_string());
                         }
                     }
-                    let mut b33 = HashSet::new();
+                    let mut b33 = HashSet::default();
                     for s in &b.stmts {
                         collect_b33_block_fns(s, false, &blockers, &mut b33);
                     }
@@ -1685,7 +1685,7 @@ impl Compiler {
                 // function-body pass — register accounting + with-fallback +
                 // for-head resolution; see that pass's comment).
                 {
-                    let mut hv = std::collections::HashSet::new();
+                    let mut hv = rustc_hash::FxHashSet::default();
                     for s in &b.stmts {
                         collect_hoisted_vars(s, &mut hv);
                     }
@@ -1708,13 +1708,13 @@ impl Compiler {
                 // every `function f(){ …G… } … const G = …` pair in a bundle hit
                 // this — it is why react-router could not resolve its own helpers.
                 {
-                    let mut lex = std::collections::HashSet::new();
-                    let mut early_cell = std::collections::HashSet::new();
-                    let mut prior_refs = std::collections::HashSet::new();
+                    let mut lex = rustc_hash::FxHashSet::default();
+                    let mut early_cell = rustc_hash::FxHashSet::default();
+                    let mut prior_refs = rustc_hash::FxHashSet::default();
                     for s in &b.stmts {
                         match s {
                             ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                                let mut declared_here = std::collections::HashSet::new();
+                                let mut declared_here = rustc_hash::FxHashSet::default();
                                 for decl in &d.decls {
                                     capture::collect_pattern_names(&decl.id, &mut declared_here);
                                 }
@@ -1962,7 +1962,7 @@ impl<'a> FnCompiler<'a> {
         if seen.is_empty() {
             return;
         }
-        let mut names = std::collections::HashSet::new();
+        let mut names = rustc_hash::FxHashSet::default();
         for s in body {
             collect_hoisted_vars(s, &mut names);
             if let ast::Stmt::FnDecl(f) = s {
@@ -2011,7 +2011,7 @@ impl<'a> FnCompiler<'a> {
 
     /// Allocate function-body lexical cells before hoisted closures capture them.
     fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
-        let mut lex = std::collections::HashSet::new();
+        let mut lex = rustc_hash::FxHashSet::default();
         for s in body {
             match s {
                 ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {

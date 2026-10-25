@@ -2381,7 +2381,7 @@ impl<'p> Vm<'p> {
         let (visible, caller_chain) = if direct {
             match self.current_private_brands() {
                 Some(ch) => {
-                    let mut s = std::collections::HashSet::new();
+                    let mut s = rustc_hash::FxHashSet::default();
                     for b in ch {
                         if let Some(names) = self.brand_private_names.get(b) {
                             for (n, _) in names {
@@ -2391,10 +2391,10 @@ impl<'p> Vm<'p> {
                     }
                     (s, Some(ch.clone()))
                 }
-                None => (std::collections::HashSet::new(), None),
+                None => (rustc_hash::FxHashSet::default(), None),
             }
         } else {
-            (std::collections::HashSet::new(), None)
+            (rustc_hash::FxHashSet::default(), None)
         };
         // 2. Compile in eval mode (top-level returns its completion value).
         let eval_prog = match crate::compile::compile_eval(

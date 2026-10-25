@@ -1966,7 +1966,7 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn stash_child_free_names(&mut self, free_names: HashSet<String>) {
-        let mut map = std::collections::HashMap::new();
+        let mut map = rustc_hash::FxHashMap::default();
         for name in free_names {
             let mut chain = self.with_names_for(&name);
             if !self.scopes.iter().any(|s| s.binds(&name))

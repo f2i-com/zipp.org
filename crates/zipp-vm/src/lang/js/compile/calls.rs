@@ -1847,7 +1847,7 @@ impl<'a> FnCompiler<'a> {
         let eval_root = self.is_script && self.cx.eval_locals;
         let site = if self.box_all_locals || eval_root || self.script_eval_lexicals {
             let mut map: Vec<(String, u8, u16)> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = rustc_hash::FxHashSet::default();
             for scope in self.scopes.iter().rev() {
                 for (n, slot) in scope.iter().rev() {
                     // A function that may direct-eval never spills (its locals

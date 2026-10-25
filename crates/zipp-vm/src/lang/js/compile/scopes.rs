@@ -160,10 +160,10 @@ impl<'a> FnCompiler<'a> {
             spill_reg: None,
             spill_count: 0,
             spill_new_at: None,
-            const_spills: HashSet::new(),
+            const_spills: HashSet::default(),
             scope_pops: 0,
             snapshot_cache: std::cell::RefCell::new(None),
-            scope_lex_names: vec![HashSet::new()],
+            scope_lex_names: vec![HashSet::default()],
             next_reg: 0,
             max_reg: 0,
             bool_regs: 0,
@@ -194,35 +194,35 @@ impl<'a> FnCompiler<'a> {
             },
             this_override: None,
             pattern_block_local: false,
-            pattern_init_globals: std::collections::HashSet::new(),
+            pattern_init_globals: rustc_hash::FxHashSet::default(),
             plain_add_spines: rustc_hash::FxHashSet::default(),
             in_generator: false,
             in_async: false,
             pending_label: None,
             is_script: false,
             completion_reg: None,
-            block_tdz_cells: HashSet::new(),
-            entry_tdz_cells: HashSet::new(),
-            catch_param_regs: HashSet::new(),
+            block_tdz_cells: HashSet::default(),
+            entry_tdz_cells: HashSet::default(),
+            catch_param_regs: HashSet::default(),
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
             handler_depth: 0,
             using_scope_reg: None,
             self_name: None,
             captured,
-            late_boxed: HashSet::new(),
-            cell_regs: HashSet::new(),
-            lexical_regs: HashSet::new(),
-            const_regs: HashSet::new(),
-            param_tdz: HashSet::new(),
+            late_boxed: HashSet::default(),
+            cell_regs: HashSet::default(),
+            lexical_regs: HashSet::default(),
+            const_regs: HashSet::default(),
+            param_tdz: HashSet::default(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
             with_stack: Vec::new(),
             inherited_with_shadows,
-            b33_names: std::collections::HashSet::new(),
+            b33_names: rustc_hash::FxHashSet::default(),
             template_site_count: 0,
-            protect_names: std::collections::HashSet::new(),
-            entry_lexicals: std::collections::HashSet::new(),
+            protect_names: rustc_hash::FxHashSet::default(),
+            entry_lexicals: rustc_hash::FxHashSet::default(),
             typeof_alias: Vec::new(),
             typeof_alias_depth: 0,
             typeof_alias_defs: Vec::new(),
@@ -660,14 +660,14 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn push_scope(&mut self) {
         self.scopes.push(ScopeBindings::default());
-        self.scope_lex_names.push(HashSet::new());
+        self.scope_lex_names.push(HashSet::default());
     }
 
     /// Record the lexically-declared names of the block scope just opened, for
     /// the position-sensitive Annex B B.3.3 blocker test (`block_fn_conflicts`).
     /// Call right after `push_scope`, before compiling the block's contents.
     pub(crate) fn note_block_lexicals(&mut self, stmts: &[ast::Stmt]) {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         for st in stmts {
             super::helpers::add_block_lexicals(st, &mut names);
         }

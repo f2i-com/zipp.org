@@ -17,7 +17,7 @@
 //! time, the same way the old engine did.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 use std::rc::Rc;
 
 // The AST, under both spellings: `ast::Expr` for code that wants the prefix and
@@ -262,7 +262,7 @@ struct Compiler {
     eval_catch_params: Vec<String>,
     /// FUNCTION-context sloppy eval: the eval's own var/function names that
     /// live in the caller's dynamic EvalScope (the Dyn global ops find them).
-    eval_dynamic_names: std::collections::HashSet<String>,
+    eval_dynamic_names: rustc_hash::FxHashSet<String>,
     /// True for a sloppy FUNCTION-context eval program: its global accesses
     /// must be dynamic-first (the caller activation may carry an EvalScope).
     eval_fn_context: bool,
@@ -315,7 +315,7 @@ struct Compiler {
     heritage_classes: Vec<(String, u32)>,
     /// For DIRECT eval programs: private names lexically visible at the eval
     /// call site (the caller's brand-chain names). Empty otherwise.
-    eval_visible_privates: std::collections::HashSet<String>,
+    eval_visible_privates: rustc_hash::FxHashSet<String>,
     /// True while compiling a derived class's constructor BODY (and read by
     /// arrows lexically inside it). Gates `ThisCheck` emission on `this` reads
     /// and super-property references.
@@ -365,7 +365,7 @@ struct Compiler {
     /// function about to be compiled, the ordered (innermost-first) chain of
     /// enclosing with-object binding names that may shadow it at runtime.
     /// Stashed by `stash_child_with_shadows` right before the nested compile.
-    pending_with_shadows: std::collections::HashMap<String, Vec<String>>,
+    pending_with_shadows: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Transient: set by the object-literal compiler right before compiling a concise
     /// method / get-set accessor value, so that function's body compiles with
     /// `super_home_obj = true` (object-method super). Consumed (taken) when the
@@ -639,7 +639,7 @@ struct FnCompiler<'a> {
     /// leaves, set around its extraction: each leaf's store is the binding's
     /// initialization (`StoreGlobal`, as `const x = 1` emits), not an
     /// assignment, and leaves the set once made. Empty everywhere else.
-    pattern_init_globals: std::collections::HashSet<u32>,
+    pattern_init_globals: rustc_hash::FxHashSet<u32>,
     /// The `+` nodes (keyed by their left operand's address) that lie on a
     /// spine `binary` already searched and found to hold no string producer,
     /// so its concat-chain fusion test is not repeated down the spine.
@@ -712,12 +712,12 @@ struct FnCompiler<'a> {
     /// (`stash_child_with_shadows`) with its floor-vs-depth logic, so a name
     /// bound INSIDE a with body never appears. Empty for code not nested in a
     /// `with` (zero cost on the common path).
-    inherited_with_shadows: std::collections::HashMap<String, Vec<String>>,
+    inherited_with_shadows: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Annex B B.3.3: names of functions declared inside BLOCKS of this (sloppy,
     /// non-script) function body that also get a function-scoped `var` binding,
     /// synced to the function value when the block declaration executes. Excludes
     /// names with a lexical conflict (which would be an early error → B.3.3 skipped).
-    b33_names: std::collections::HashSet<String>,
+    b33_names: rustc_hash::FxHashSet<String>,
     /// Per-function counter assigning a stable site index to each tagged-template
     /// literal, so the VM can memoize one canonical template object per (func, site).
     template_site_count: u32,
@@ -726,13 +726,13 @@ struct FnCompiler<'a> {
     /// and class declarations. A block function with one of these names stays
     /// purely block-local (the "skip" cases), unlike a name matching an existing
     /// `var`/function (which gets the function-scoped update via `b33_names`).
-    protect_names: std::collections::HashSet<String>,
+    protect_names: rustc_hash::FxHashSet<String>,
     /// Function-body-level lexical (`let`/`const`/`class`) names that were
     /// pre-created as cells at entry because a nested function captures them, so a
     /// function materialised at entry (forward reference) can bind their cell. The
     /// textual declaration REUSES this cell instead of allocating a fresh binding.
     /// Empty unless a body has a captured forward-referenced lexical.
-    entry_lexicals: std::collections::HashSet<String>,
+    entry_lexicals: rustc_hash::FxHashSet<String>,
     /// Registers of BLOCK-level lexical (`let`/`const`/`class`) bindings
     /// pre-created as TDZ cells at block entry (because a nested function
     /// captures them), whose textual declaration has not yet been compiled.
