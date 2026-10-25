@@ -45,10 +45,10 @@ pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
 ));
 
 mod bytecode;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
 mod bytecode_codec;
 mod capture;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
 mod code_cache;
 mod cold_sort;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -722,7 +722,7 @@ pub fn run_file_then_exit(
     base_dir: Option<std::path::PathBuf>,
     script_name: &str,
 ) -> Result<Outcome, String> {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
     if let Some(entry) = code_cache::script(src) {
         return run_cached(src, base_dir, script_name, entry);
     }
@@ -735,17 +735,17 @@ pub fn run_file_then_exit(
 /// the same folder). For a host that runs one program per process, such as
 /// the `zipp` command. Entries belong to the executable and settings that
 /// wrote them, see `code_cache.rs`. Takes effect if called before the first
-/// compile that would use it; ignored on `wasm32`.
+/// compile that would use it; ignored on `wasm32` and in Lite.
 pub fn set_code_cache(dir: Option<std::path::PathBuf>) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
     code_cache::set_dir(dir);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "wasm-lite"))]
     let _ = dir;
 }
 
 /// [`run_file_then_exit`] with a code-cache entry for `src`: its program
 /// loaded from there, or else compiled and, while it runs, stored there.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
 fn run_cached(
     src: &str,
     base_dir: Option<std::path::PathBuf>,

@@ -24,8 +24,8 @@ fn strip_comments(body: &str) -> String {
             None => line,
         };
         let t = line.trim();
-        // This codec is compiled only by native Python builds, which cannot
-        // enable wasm-lite. Retain Lite-excluded variants in the full schema
+        // This codec is compiled only by native builds without wasm-lite
+        // (lib.rs gates it off there). Retain Lite-excluded variants in the full schema
         // and its tag numbering; never generate a compact/renumbered schema.
         // Other conditional variants still require explicit codec support.
         if t.starts_with("#[cfg") && t != "#[cfg(not(feature = \"wasm-lite\"))]" {
