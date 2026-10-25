@@ -10100,7 +10100,9 @@ impl Heap {
     }
 
     /// The slot tables' capacity had they grown by `Vec`'s doubling from the
-    /// boot tables: the power of two at or above the slots ever used.
+    /// boot tables: the power of two at or above the slots ever used. (The
+    /// WebAssembly build never reserves past it, so it has no use for this.)
+    #[cfg(not(target_arch = "wasm32"))]
     fn doubling_slot_capacity(&self) -> usize {
         self.objs.len().next_power_of_two().max(256)
     }
@@ -10113,11 +10115,14 @@ impl Heap {
     /// (`give_back_slot_reservation`), so the figure a host reads before it
     /// sets its limit is the one the limit is enforced against.
     fn charged_slot_bytes<T>(&self, v: &Vec<T>) -> usize {
-        let mut cap = v.capacity();
         #[cfg(not(target_arch = "wasm32"))]
-        if self.resident_ceiling == usize::MAX {
-            cap = cap.min(self.doubling_slot_capacity());
-        }
+        let cap = if self.resident_ceiling == usize::MAX {
+            v.capacity().min(self.doubling_slot_capacity())
+        } else {
+            v.capacity()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let cap = v.capacity();
         cap.saturating_mul(std::mem::size_of::<T>())
     }
 
