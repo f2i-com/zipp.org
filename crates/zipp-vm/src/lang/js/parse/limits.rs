@@ -144,7 +144,7 @@ fn nesting_within(program: &Program, limit: usize) -> bool {
                     update,
                     body,
                 } => {
-                    if let Some(init) = init {
+                    if let Some(init) = init.as_deref() {
                         match init {
                             ForInit::Var(var) => push_var(&mut work, var, child),
                             ForInit::Expr(expr) => work.push(Work::Expr(expr, child)),

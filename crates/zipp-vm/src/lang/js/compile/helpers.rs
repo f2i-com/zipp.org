@@ -265,7 +265,7 @@ pub(crate) fn collect_b33_block_fns(
         }
         S::For { init, body, .. } => {
             let mut bk = blockers.clone();
-            if let Some(ForInit::Var(d)) = init {
+            if let Some(ForInit::Var(d)) = init.as_deref() {
                 for_left_lex(d, &mut bk);
             }
             collect_b33_block_fns(body, true, &bk, out);
@@ -515,7 +515,7 @@ pub(crate) fn declared_binding_count(body: &[Stmt]) -> (usize, bool) {
                 walk(body, count, has_with)
             }
             S::For { init, body, .. } => {
-                if let Some(ForInit::Var(d)) = init {
+                if let Some(ForInit::Var(d)) = init.as_deref() {
                     *count += decl_names(d);
                 }
                 walk(body, count, has_with);
@@ -596,7 +596,7 @@ pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut rustc_hash::FxHashSet<Str
         S::While { body, .. } => collect_hoisted_vars(body, out),
         S::DoWhile { body, .. } => collect_hoisted_vars(body, out),
         S::For { init, body, .. } => {
-            if let Some(ForInit::Var(d)) = init {
+            if let Some(ForInit::Var(d)) = init.as_deref() {
                 if d.kind == VarKind::Var {
                     for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, out);

@@ -65,7 +65,7 @@ pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> Flow) -> boo
         }
         Stmt::While { test, body } | Stmt::DoWhile { body, test } => expr(test, f) && stmt(body, f),
         Stmt::For { init, test, update, body } => {
-            init.as_ref().is_none_or(|i| match i {
+            init.as_deref().is_none_or(|i| match i {
                 ForInit::Var(d) => var_decl(d, f),
                 ForInit::Expr(e) => expr(e, f),
             }) && test.as_ref().is_none_or(|e| expr(e, f))

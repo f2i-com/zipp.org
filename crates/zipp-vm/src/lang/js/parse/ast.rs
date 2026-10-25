@@ -103,33 +103,37 @@ pub enum Stmt {
         body: Box<Stmt>,
         test: Expr,
     },
+    // The loops' heads, a switch's discriminant and a `try`'s handler are
+    // boxed: inline they made every statement 176 bytes, and these forms are
+    // a few in a hundred of a program's statements (`Stmt` is 80 bytes, the
+    // size of an `if`).
     For {
-        init: Option<ForInit>,
-        test: Option<Expr>,
-        update: Option<Expr>,
+        init: Option<Box<ForInit>>,
+        test: Option<Box<Expr>>,
+        update: Option<Box<Expr>>,
         body: Box<Stmt>,
     },
     ForIn {
         left: ForTarget,
-        right: Expr,
+        right: Box<Expr>,
         body: Box<Stmt>,
     },
     /// `await` is set for `for await (… of …)`.
     ForOf {
         left: ForTarget,
-        right: Expr,
+        right: Box<Expr>,
         body: Box<Stmt>,
         is_await: bool,
     },
     Switch {
-        disc: Expr,
+        disc: Box<Expr>,
         cases: Vec<SwitchCase>,
     },
     Return(Option<Expr>),
     Throw(Expr),
     Try {
         block: Vec<Stmt>,
-        handler: Option<CatchClause>,
+        handler: Option<Box<CatchClause>>,
         finalizer: Option<Vec<Stmt>>,
     },
     Break(Option<Name>),
@@ -149,6 +153,10 @@ pub enum Stmt {
     Import(Box<ImportDecl>),
     Export(Box<ExportDecl>),
 }
+
+// Every statement list is this size per statement: a variant wider than an
+// `if` boxes its fields (see the loops above).
+const _: () = assert!(std::mem::size_of::<Stmt>() <= 80, "Stmt grew past an `if` statement's size");
 
 #[derive(Debug, Clone)]
 pub struct SwitchCase {

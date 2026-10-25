@@ -1266,12 +1266,12 @@ impl<'s> Parser<'s> {
                 if of {
                     Stmt::ForOf {
                         left,
-                        right,
+                        right: Box::new(right),
                         body,
                         is_await,
                     }
                 } else {
-                    Stmt::ForIn { left, right, body }
+                    Stmt::ForIn { left, right: Box::new(right), body }
                 }
             } else {
                 // A classic head that began with a declaration. Its
@@ -1311,7 +1311,7 @@ impl<'s> Parser<'s> {
                         kind,
                         decls: vec![Declarator { id: pat, init }],
                     });
-                    Stmt::ForIn { left, right, body }
+                    Stmt::ForIn { left, right: Box::new(right), body }
                 } else {
                     let mut decls = vec![Declarator { id: pat, init }];
                     while self.eat(Punct::Comma, true)? {
@@ -1406,12 +1406,12 @@ impl<'s> Parser<'s> {
                 if of {
                     Stmt::ForOf {
                         left,
-                        right,
+                        right: Box::new(right),
                         body,
                         is_await,
                     }
                 } else {
-                    Stmt::ForIn { left, right, body }
+                    Stmt::ForIn { left, right: Box::new(right), body }
                 }
             } else {
                 // Not a for-in/of after all: the head was an ordinary
@@ -1454,9 +1454,9 @@ impl<'s> Parser<'s> {
         self.expect(Punct::RParen, true)?;
         let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
         Ok(Stmt::For {
-            init,
-            test,
-            update,
+            init: init.map(Box::new),
+            test: test.map(Box::new),
+            update: update.map(Box::new),
             body,
         })
     }
@@ -1500,7 +1500,7 @@ impl<'s> Parser<'s> {
         self.ctx.in_switch = saved;
         self.scopes.pop()?;
         self.expect(Punct::RBrace, false)?;
-        Ok(Stmt::Switch { disc, cases })
+        Ok(Stmt::Switch { disc: Box::new(disc), cases })
     }
 
     fn parse_try(&mut self) -> PResult<Stmt> {
@@ -1561,7 +1561,7 @@ impl<'s> Parser<'s> {
         }
         Ok(Stmt::Try {
             block,
-            handler,
+            handler: handler.map(Box::new),
             finalizer,
         })
     }

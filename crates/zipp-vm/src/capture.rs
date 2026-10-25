@@ -257,7 +257,7 @@ fn collect_var_names_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_var_names_stmt(body, out),
         Stmt::For { init, body, .. } => {
-            if let Some(ForInit::Var(d)) = init {
+            if let Some(ForInit::Var(d)) = init.as_deref() {
                 var_decl(d, out);
             }
             collect_var_names_stmt(body, out);
@@ -682,7 +682,7 @@ fn late_box_blocked(s: &Stmt) -> bool {
             late_box_blocked(body)
         }
         Stmt::For { init, body, .. } => {
-            matches!(init, Some(ForInit::Var(d)) if using(d)) || late_box_blocked(body)
+            matches!(init.as_deref(), Some(ForInit::Var(d)) if using(d)) || late_box_blocked(body)
         }
         Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
             matches!(left, ForTarget::Var(d) if using(d)) || late_box_blocked(body)
@@ -735,7 +735,7 @@ fn collect_lexical_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
             collect_lexical_stmt(body, out)
         }
         Stmt::For { init, body, .. } => {
-            if let Some(ForInit::Var(d)) = init {
+            if let Some(ForInit::Var(d)) = init.as_deref() {
                 if d.kind.is_lexical() {
                     for decl in &d.decls {
                         pattern_names(&decl.id, out);
@@ -865,7 +865,7 @@ fn collect_bound_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         Stmt::While { body, .. } => collect_bound_stmt(body, out),
         Stmt::DoWhile { body, .. } => collect_bound_stmt(body, out),
         Stmt::For { init, body, .. } => {
-            if let Some(ForInit::Var(d)) = init {
+            if let Some(ForInit::Var(d)) = init.as_deref() {
                 for decl in &d.decls {
                     pattern_names(&decl.id, out);
                 }
@@ -1012,7 +1012,7 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
         } => {
             // A `let`/`const` head scopes the whole loop.
             let lex = hidden(&|n| {
-                if let Some(ForInit::Var(d)) = init {
+                if let Some(ForInit::Var(d)) = init.as_deref() {
                     if d.kind.is_lexical() {
                         for decl in &d.decls {
                             pattern_names(&decl.id, n);
@@ -1021,7 +1021,7 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
                 }
             });
             in_scope(&lex, out, |out| {
-                if let Some(init) = init {
+                if let Some(init) = init.as_deref() {
                     match init {
                         // The declarator PATTERN's defaults read names as well
                         // (`for (let {a = x} = o; …)`), as for any declaration.
@@ -1620,7 +1620,7 @@ fn collect_nested_free_in<'a>(s: &'a Stmt, out: &mut Names<'a>, skip_returns: bo
         } => {
             // A closure in the INIT (`for (let i = 0, f = () => i; …)`)
             // captures head bindings too — scan declarator initializers.
-            if let Some(init) = init {
+            if let Some(init) = init.as_deref() {
                 match init {
                     ForInit::Var(d) => {
                         for decl in &d.decls {

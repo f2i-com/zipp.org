@@ -305,7 +305,7 @@ impl<'a> FnCompiler<'a> {
                 body,
             } => {
                 self.reset_loop_completion();
-                self.for_stmt(init.as_ref(), test.as_ref(), update.as_ref(), body)?
+                self.for_stmt(init.as_deref(), test.as_deref(), update.as_deref(), body)?
             }
             S::ForOf {
                 left,
@@ -524,7 +524,7 @@ impl<'a> FnCompiler<'a> {
                 block,
                 handler,
                 finalizer,
-            } => self.try_statement(block, handler.as_ref(), finalizer.as_deref())?,
+            } => self.try_statement(block, handler.as_deref(), finalizer.as_deref())?,
             S::ClassDecl(c) => self.class_decl(c)?,
             S::Empty => {}
             S::Debugger => {} // `debugger;` is a no-op (no attached debugger)
