@@ -774,59 +774,64 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn parse_var_decl(&mut self, kind: VarKind) -> PResult<VarDecl> {
-        let mut decls = Vec::new();
-        loop {
-            let pos = self.cur().span.start;
-            let id = self.parse_binding_pattern()?;
-            // `using` binds resources by NAME so it can dispose them in reverse
-            // declaration order; a pattern has no single name to record, so the
-            // grammar takes a BindingIdentifier and nothing else. The FIRST
-            // declarator is settled by the contextual-keyword lookahead
-            // (`using [` is an element access, not a declaration) — it is the
-            // second and later ones that reach here.
-            if matches!(kind, VarKind::Using | VarKind::AwaitUsing)
-                && !matches!(id, Pattern::Ident(_))
-            {
-                return Err(SyntaxError::new(
-                    "SyntaxError: a 'using' declaration binds a plain identifier, \
-                     not a destructuring pattern",
-                    pos,
-                ));
-            }
-            self.declare_pattern(&id, kind, pos)?;
-            let init = if self.eat(Punct::Eq, true)? {
-                Some(self.parse_assign_full()?)
-            } else {
-                None
-            };
-            // `using` requires an initializer wherever it appears.
-            if init.is_none() && matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
-                return Err(SyntaxError::new(
-                    "SyntaxError: missing initializer in using declaration",
-                    pos,
-                ));
-            }
-            // `const` without an initializer is an early error — except in a
-            // for-in/of head, which parses through a different path.
-            if init.is_none() && kind == VarKind::Const {
-                return Err(SyntaxError::new(
-                    "SyntaxError: missing initializer in const declaration",
-                    pos,
-                ));
-            }
-            // A destructuring declaration must be initialized.
-            if init.is_none() && !matches!(id, Pattern::Ident(_)) {
-                return Err(SyntaxError::new(
-                    "SyntaxError: missing initializer in destructuring declaration",
-                    pos,
-                ));
-            }
-            decls.push(Declarator { id, init });
-            if !self.eat(Punct::Comma, true)? {
-                break;
-            }
+        // Most declarations bind one name: a list grown by `push` reserved
+        // four 88-byte declarators for it.
+        let first = self.parse_declarator(kind)?;
+        let mut decls = vec![first];
+        while self.eat(Punct::Comma, true)? {
+            decls.push(self.parse_declarator(kind)?);
         }
         Ok(VarDecl { kind, decls })
+    }
+
+    /// One declarator of `parse_var_decl`.
+    fn parse_declarator(&mut self, kind: VarKind) -> PResult<Declarator> {
+        let pos = self.cur().span.start;
+        let id = self.parse_binding_pattern()?;
+        // `using` binds resources by NAME so it can dispose them in reverse
+        // declaration order; a pattern has no single name to record, so the
+        // grammar takes a BindingIdentifier and nothing else. The FIRST
+        // declarator is settled by the contextual-keyword lookahead
+        // (`using [` is an element access, not a declaration) — it is the
+        // second and later ones that reach here.
+        if matches!(kind, VarKind::Using | VarKind::AwaitUsing)
+            && !matches!(id, Pattern::Ident(_))
+        {
+            return Err(SyntaxError::new(
+                "SyntaxError: a 'using' declaration binds a plain identifier, \
+                 not a destructuring pattern",
+                pos,
+            ));
+        }
+        self.declare_pattern(&id, kind, pos)?;
+        let init = if self.eat(Punct::Eq, true)? {
+            Some(self.parse_assign_full()?)
+        } else {
+            None
+        };
+        // `using` requires an initializer wherever it appears.
+        if init.is_none() && matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
+            return Err(SyntaxError::new(
+                "SyntaxError: missing initializer in using declaration",
+                pos,
+            ));
+        }
+        // `const` without an initializer is an early error — except in a
+        // for-in/of head, which parses through a different path.
+        if init.is_none() && kind == VarKind::Const {
+            return Err(SyntaxError::new(
+                "SyntaxError: missing initializer in const declaration",
+                pos,
+            ));
+        }
+        // A destructuring declaration must be initialized.
+        if init.is_none() && !matches!(id, Pattern::Ident(_)) {
+            return Err(SyntaxError::new(
+                "SyntaxError: missing initializer in destructuring declaration",
+                pos,
+            ));
+        }
+        Ok(Declarator { id, init })
     }
 
     /// Declare every name a pattern binds.
