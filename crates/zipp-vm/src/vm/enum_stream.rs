@@ -1250,7 +1250,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let proto = self.main_func(func_id as usize)?;
         let plan = recognize_sparse_forin_fold(proto, ip)?;
         let globals = [
             plan.source_global,
@@ -1387,7 +1387,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let proto = self.main_func(func_id as usize)?;
         let plan = recognize_array_copy_len(proto, ip)?;
         if plan.captured_call != captured_callee.is_some() {
             return None;
@@ -1468,7 +1468,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let f = func_id as usize;
-        let proto = self.program.functions.get(f)?;
+        let proto = self.main_func(f)?;
         if self.in_probe_sites.get(f).is_none_or(Option::is_none) {
             if self.in_probe_sites.len() <= f {
                 self.in_probe_sites.resize(f + 1, None);
@@ -1588,7 +1588,7 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let proto = self.main_func(func_id as usize)?;
         let plan = recognize_forin_count(proto, ip)?;
         let globals = [
             plan.source_global,
@@ -1681,7 +1681,7 @@ impl<'p> Vm<'p> {
         if !enum_loop_reduce_enabled() || !self.enum_loop_observation_free() {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let proto = self.main_func(func_id as usize)?;
         let i_global = match proto.code.get(ip.checked_sub(4)?)? {
             Instr::LoadGlobal { idx, .. } => *idx,
             _ => return None,
@@ -1769,7 +1769,7 @@ impl<'p> Vm<'p> {
         if !enum_loop_reduce_enabled() || !self.enum_loop_observation_free() {
             return None;
         }
-        let proto = self.program.functions.get(func_id as usize)?;
+        let proto = self.main_func(func_id as usize)?;
         let i_global = match proto.code.get(ip.checked_sub(7)?)? {
             Instr::LoadGlobal { idx, .. } => *idx,
             _ => return None,

@@ -771,7 +771,7 @@ fn run_cached(
                 .name("zipp-code-cache".into())
                 .spawn_scoped(scope, move || entry.store(src, program));
         }
-        run_program(&program, base_dir, false, true, Some(script_name))
+        run_program(&program, None, base_dir, false, true, Some(script_name))
     });
     // See `run_then_exit`: the process's exit reclaims both.
     std::mem::forget(program);
@@ -804,8 +804,8 @@ fn run_with_policy(
     // directly and the compiler emits the runtime ReferenceError. A syntax
     // error is reported where it is, as a frame of the script.
     let ast = front::parse_auto_located(src).map_err(|f| f.located(src, script_name))?;
-    let program = compile::compile_main_program(&ast, src)?;
-    let outcome = run_program(&program, base_dir, disable_external_code, leave_heap, script_name);
+    let (program, lazy) = compile_main_for_run(&ast, src)?;
+    let outcome = run_program(&program, lazy, base_dir, disable_external_code, leave_heap, script_name);
     if leave_heap {
         // See `run_then_exit`: the process's exit reclaims all three.
         std::mem::forget(program);
@@ -814,10 +814,36 @@ fn run_with_policy(
     Ok(outcome)
 }
 
+/// Compile main program `ast` for a run: a large one, which the interpreter
+/// runs alone, with its deferred bodies left to their first calls
+/// (`compile::LazySession`; `ZIPP_LAZY=off` compiles every program whole and
+/// `ZIPP_LAZY=run-all` defers in every one, its JIT off), else whole.
+fn compile_main_for_run<'a>(
+    ast: &'a parse::ast::Program,
+    src: &str,
+) -> Result<(bytecode::Program, Option<compile::LazySession<'a>>), String> {
+    // A metered build counts every instruction a program runs, so a stub's
+    // `LazyCompile` would be a step the whole program does not take; the
+    // hardened build compiles whole, as it always has.
+    if cfg!(any(feature = "meter-only", feature = "safe-sandbox")) {
+        return Ok((compile::compile_main_program(ast, src)?, None));
+    }
+    let min_functions = match compile::run_lazy() {
+        compile::RunLazy::Off => return Ok((compile::compile_main_program(ast, src)?, None)),
+        compile::RunLazy::Large if vm::large_programs_run_jit() => {
+            return Ok((compile::compile_main_program(ast, src)?, None))
+        }
+        compile::RunLazy::Large => compile::LAZY_MIN_FUNCTIONS,
+        compile::RunLazy::All => 0,
+    };
+    compile::compile_main_program_lazy(ast, src, min_functions)
+}
+
 /// Run a compiled main program (see [`run_with_policy`]); with `leave_heap`,
 /// its VM is left for the process's exit.
-fn run_program(
-    program: &bytecode::Program,
+fn run_program<'a>(
+    program: &'a bytecode::Program,
+    lazy: Option<compile::LazySession<'a>>,
     base_dir: Option<std::path::PathBuf>,
     disable_external_code: bool,
     leave_heap: bool,
@@ -839,6 +865,9 @@ fn run_program(
         }
     }
     let mut vm = vm::Vm::new(program);
+    if let Some(session) = lazy {
+        vm.set_lazy_session(session);
+    }
     vm.set_module_base_dir(base_dir);
     vm.script_name = script_name.map(std::sync::Arc::from);
     if disable_external_code {
@@ -848,6 +877,12 @@ fn run_program(
     vm.report_unhandled_errors();
     #[cfg(feature = "census")]
     vm.record_census();
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if std::env::var_os("ZIPP_LAZY_STATS").is_some() {
+        if let Some((compiled, waiting)) = vm.lazy_counts() {
+            eprintln!("[lazy-stat] first calls compiled {compiled} bodies; {waiting} never ran");
+        }
+    }
     let outcome = Outcome {
         output: std::mem::take(&mut vm.output),
         errput: std::mem::take(&mut vm.errput),
@@ -886,8 +921,11 @@ pub fn run_with_harness(
     // script semantics in full; the harness is the prelude. See
     // `Vm::run_with_prelude` for why it is this way round and not the other.
     let ast = front::parse_auto(src)?;
-    let program = compile::compile_main_program(&ast, src)?;
+    let (program, lazy) = compile_main_for_run(&ast, src)?;
     let mut vm = vm::Vm::new(&program);
+    if let Some(session) = lazy {
+        vm.set_lazy_session(session);
+    }
     vm.set_module_base_dir(base_dir);
     let result = vm.run_with_prelude(Some(harness));
     vm.report_unhandled_errors();

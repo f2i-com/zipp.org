@@ -5765,6 +5765,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::PushFinally { .. }
         | Instr::PopFinally
         | Instr::GenStart
+        | Instr::LazyCompile
         | Instr::ReturnUndefined => vec![],
     }
 }

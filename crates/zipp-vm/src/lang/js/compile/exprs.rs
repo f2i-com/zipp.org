@@ -16,6 +16,19 @@ use crate::parse::token::StrVal;
 const STATIC_KEY_PLAN_MAX_FIELDS: usize = 256;
 const STATIC_KEY_PLAN_MAX_BYTES: usize = 64 * 1024;
 
+/// The early error of regular expression literal `/text/flags`: it must
+/// parse under the `Pattern` goal (see the `Expr::Regex` arm). Through the
+/// iterator type the VM compiles with (a slice of code points): the regex
+/// parser is generic over it, and a `&str` here was a second copy of the
+/// whole parser, 31 KB of a module.
+pub(crate) fn check_regex_literal(text: &str, flags: &str) -> R<()> {
+    let code_points: Vec<u32> = text.chars().map(u32::from).collect();
+    match regress::Regex::from_unicode(code_points.iter().copied(), flags) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(format!("SyntaxError: invalid regular expression /{text}/{flags}: {err}")),
+    }
+}
+
 /// Field cap for the one-step `FinalizeObject` lowering. Its staged value block
 /// holds this many registers live at once, so the cap bounds literal register
 /// pressure; wider literals keep the per-field append sequence.
@@ -451,20 +464,10 @@ impl<'a> FnCompiler<'a> {
                 // spec-invalid patterns probed and accepting all eighteen
                 // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
                 // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
-                // `[\q{abc}]` under `v`).
-                //
-                // Through the iterator type the VM compiles with (a slice of
-                // code points): the regex parser is generic over it, and a
-                // `&str` here was a second copy of the whole parser, 31 KB of
-                // a module.
-                let code_points: Vec<u32> = text.chars().map(u32::from).collect();
-                if let Err(err) =
-                    regress::Regex::from_unicode(code_points.iter().copied(), &**flags)
-                {
-                    return Err(format!(
-                        "SyntaxError: invalid regular expression /{text}/{flags}: {err}"
-                    ));
-                }
+                // `[\q{abc}]` under `v`). A program whose bodies may wait for
+                // their first call checks every literal before it compiles
+                // (`compile_main_program_lazy`).
+                check_regex_literal(&text, flags)?;
                 let flg = self.add_string_const(flags);
                 let pt = self.temp();
                 self.emit(Instr::LoadConst { dst: pt, idx: pat });

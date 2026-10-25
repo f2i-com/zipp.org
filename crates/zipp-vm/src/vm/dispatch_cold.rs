@@ -93,6 +93,12 @@ impl<'p> Vm<'p> {
         stop_depth: usize,
     ) -> Result<ColdFlow, Thrown> {
         match *instr {
+            // The stub of a function whose body has not compiled yet: compile
+            // it, and run it from its start in this frame.
+            Instr::LazyCompile => {
+                self.lazy_compile_frame(func_id)?;
+                return Ok(ColdFlow::Frame);
+            }
             // A function with more locals than the register file addresses
             // keeps the rest in a spill vector (see `Instr::NewSpill`). It is
             // an ordinary heap value held in a register, so the collector

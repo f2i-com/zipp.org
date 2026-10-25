@@ -298,6 +298,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::PopHandler
         | Instr::PopFinally
         | Instr::JumpFinally { .. }
+        | Instr::LazyCompile
         | Instr::ReturnUndefined => {
         }
         #[cfg(all())]

@@ -7187,7 +7187,7 @@ pub(crate) extern "win64" fn jit_leaf_same_func_proto(
     // loader/eval fids can live outside this table; they deliberately miss here
     // (the normal call remains authoritative) instead of using a panicking
     // convenience lookup across generated-code FFI.
-    let Some(proto) = vm.program.functions.get(fid as usize) else {
+    let Some(proto) = vm.main_func(fid as usize) else {
         return 0;
     };
     if proto.lexical_this || !proto.upvalues.is_empty() || proto.is_generator || proto.is_async {

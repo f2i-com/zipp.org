@@ -117,6 +117,7 @@ impl Compiler {
             lazy_freeze: false,
             lazy_misses: Vec::new(),
             lazy_deferred: 0,
+            lazy_scan: rustc_hash::FxHashMap::default(),
         }
     }
 

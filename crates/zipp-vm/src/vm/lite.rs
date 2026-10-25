@@ -342,6 +342,14 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Decide function `fid` again at its next frame: its code has changed
+    /// (a deferred body replaced its stub, `engine::lazy_install`).
+    pub(crate) fn lite_forget(&mut self, fid: u32) {
+        if let Some(ok) = self.lite.ok.get_mut(fid as usize) {
+            *ok = LITE_UNDECIDED;
+        }
+    }
+
     /// Whether `fid` (which the lite loop runs) runs in the full copy.
     #[inline(always)]
     fn lite_is_full(&self, fid: u32) -> bool {

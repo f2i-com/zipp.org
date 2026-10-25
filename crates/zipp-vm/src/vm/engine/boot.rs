@@ -65,6 +65,16 @@ fn jit_wanted(program: &Program) -> bool {
         || std::env::var_os("ZIPP_JIT_LARGE").is_some()
 }
 
+/// Whether a VM over a JavaScript program of [`JIT_LARGE_PROGRAM_FUNCS`] or
+/// more functions starts with its JIT on (`ZIPP_JIT_LARGE`, see
+/// [`jit_wanted`]).
+pub(crate) fn large_programs_run_jit() -> bool {
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    return std::env::var_os("ZIPP_NOJIT").is_none() && std::env::var_os("ZIPP_JIT_LARGE").is_some();
+    #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    false
+}
+
 #[inline]
 fn module_func_range_contains(ranges: &[(u32, u32, u32)], func_id: u32) -> bool {
     ranges
@@ -93,6 +103,19 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn func(&self, id: usize) -> &'p crate::bytecode::FuncProto {
         self.funcs[id]
+    }
+
+    /// [`Self::func`] for a main-program function id, `None` for any other.
+    /// What reads a main-program function's code reads it here rather than
+    /// in `program`, where a deferred body's stub stays after the body
+    /// replaces it (`engine::lazy_install`).
+    #[inline]
+    pub(crate) fn main_func(&self, id: usize) -> Option<&'p crate::bytecode::FuncProto> {
+        if id < self.main_func_count {
+            Some(self.funcs[id])
+        } else {
+            None
+        }
     }
 
     /// Functions installed at run time (`eval`, `new Function`, modules).
@@ -255,6 +278,8 @@ impl<'p> Vm<'p> {
             program,
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
+            lazy: None,
+            lazy_gmap: Vec::new(),
             static_key_plan_sites,
             static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),

@@ -801,7 +801,7 @@ impl<'p> Vm<'p> {
             HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func as usize,
             _ => return None,
         };
-        let getter_proto = self.program.functions.get(fid)?;
+        let getter_proto = self.main_func(fid)?;
         if getter_proto.param_count != 0
             || getter_proto.lexical_this
             || getter_proto.is_generator
@@ -913,8 +913,8 @@ impl<'p> Vm<'p> {
         };
         let getter_id = self.plain_empty_closure_func(getter)?;
         let setter_id = self.plain_empty_closure_func(setter)?;
-        let getter_proto = self.program.functions.get(getter_id)?;
-        let setter_proto = self.program.functions.get(setter_id)?;
+        let getter_proto = self.main_func(getter_id)?;
+        let setter_proto = self.main_func(setter_id)?;
         if getter_proto.param_count != 0
             || setter_proto.param_count != 1
             || getter_proto.lexical_this
@@ -982,7 +982,7 @@ impl<'p> Vm<'p> {
         start: usize,
         end: usize,
     ) -> bool {
-        let Some(proto) = self.program.functions.get(func_id) else {
+        let Some(proto) = self.main_func(func_id) else {
             return false;
         };
         let Some(p) = recognize(proto, start, end) else {
@@ -1076,7 +1076,7 @@ impl<'p> Vm<'p> {
     }
 
     fn field_mask_read_loop(&mut self, func_id: usize, start: usize, end: usize) -> bool {
-        let Some(proto) = self.program.functions.get(func_id) else {
+        let Some(proto) = self.main_func(func_id) else {
             return false;
         };
         let Some(p) = recognize_mask_read(proto, start, end) else {
@@ -1157,7 +1157,7 @@ impl<'p> Vm<'p> {
     }
 
     fn global_field_sum_loop(&mut self, func_id: usize, start: usize, end: usize) -> bool {
-        let Some(proto) = self.program.functions.get(func_id) else {
+        let Some(proto) = self.main_func(func_id) else {
             return false;
         };
         let Some(p) = recognize_global_field_sum(proto, start, end) else {
@@ -1211,7 +1211,7 @@ impl<'p> Vm<'p> {
     }
 
     fn mixed_field_loop(&mut self, func_id: usize, start: usize, end: usize) -> bool {
-        let Some(proto) = self.program.functions.get(func_id) else {
+        let Some(proto) = self.main_func(func_id) else {
             return false;
         };
         let Some(p) = recognize_mixed(proto, start, end) else {
@@ -1337,7 +1337,7 @@ impl<'p> Vm<'p> {
         start: usize,
         end: usize,
     ) -> bool {
-        let Some(proto) = self.program.functions.get(func_id) else {
+        let Some(proto) = self.main_func(func_id) else {
             return false;
         };
         if std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()

@@ -2,12 +2,34 @@
 //! need to see each expression, statement, pattern and function once (the
 //! deferred-compile eligibility scan and its function index, `compile::lazy`).
 //!
-//! The callback sees a node before its children and returns whether the walk
-//! goes on: `false` stops it at once, and the walk reports `false` back up.
-//! Function, arrow and class nodes are offered as themselves and then walked
-//! into like any other node.
+//! The callback sees a node before its children and returns how the walk goes
+//! on ([`Flow`]): into the node's children, past them, or not at all, in which
+//! case the walk reports `false` back up. Function, arrow and class nodes are
+//! offered as themselves and then walked into like any other node.
 
 use super::ast::*;
+
+/// How the walk goes on after offering a node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// Into the node's children.
+    Go,
+    /// On past the node, its children unseen.
+    Skip,
+    /// Nowhere: the walk ends, reporting `false`.
+    Stop,
+}
+
+impl From<bool> for Flow {
+    /// `true` goes on into the node, `false` stops.
+    fn from(go: bool) -> Flow {
+        if go {
+            Flow::Go
+        } else {
+            Flow::Stop
+        }
+    }
+}
 
 /// A node the walk offers to its callback.
 #[derive(Clone, Copy)]
@@ -24,13 +46,15 @@ pub(crate) enum Node<'a> {
 }
 
 /// Walk `stmts` and everything under them.
-pub(crate) fn stmts<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+pub(crate) fn stmts<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     stmts.iter().all(|s| stmt(s, f))
 }
 
-pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    if !f(Node::Stmt(s)) {
-        return false;
+pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Stmt(s)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
     }
     match s {
         Stmt::Block(b) => stmts(b, f),
@@ -85,15 +109,17 @@ pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> bool) -> boo
     }
 }
 
-fn var_decl<'a>(d: &'a VarDecl, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+fn var_decl<'a>(d: &'a VarDecl, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     d.decls
         .iter()
         .all(|x| pattern(&x.id, f) && x.init.as_ref().is_none_or(|e| expr(e, f)))
 }
 
-pub(crate) fn expr<'a>(e: &'a Expr, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    if !f(Node::Expr(e)) {
-        return false;
+pub(crate) fn expr<'a>(e: &'a Expr, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Expr(e)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
     }
     match e {
         Expr::Ident(_)
@@ -144,17 +170,17 @@ pub(crate) fn expr<'a>(e: &'a Expr, f: &mut impl FnMut(Node<'a>) -> bool) -> boo
     }
 }
 
-fn call<'a>(c: &'a CallExpr, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+fn call<'a>(c: &'a CallExpr, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     expr(&c.callee, f) && args_(&c.args, f)
 }
 
-fn args_<'a>(args: &'a [Arg], f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+fn args_<'a>(args: &'a [Arg], f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     args.iter().all(|a| match a {
         Arg::Expr(e) | Arg::Spread(e) => expr(e, f),
     })
 }
 
-fn member<'a>(m: &'a Member, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+fn member<'a>(m: &'a Member, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     expr(&m.object, f)
         && match &m.prop {
             MemberProp::Computed(e) => expr(e, f),
@@ -162,9 +188,11 @@ fn member<'a>(m: &'a Member, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
         }
 }
 
-pub(crate) fn pattern<'a>(p: &'a Pattern, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    if !f(Node::Pattern(p)) {
-        return false;
+pub(crate) fn pattern<'a>(p: &'a Pattern, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Pattern(p)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
     }
     match p {
         Pattern::Ident(_) => true,
@@ -178,9 +206,11 @@ pub(crate) fn pattern<'a>(p: &'a Pattern, f: &mut impl FnMut(Node<'a>) -> bool) 
     }
 }
 
-pub(crate) fn target<'a>(t: &'a Target, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    if !f(Node::Target(t)) {
-        return false;
+pub(crate) fn target<'a>(t: &'a Target, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Target(t)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
     }
     match t {
         Target::Ident { .. } => true,
@@ -200,9 +230,11 @@ pub(crate) fn target<'a>(t: &'a Target, f: &mut impl FnMut(Node<'a>) -> bool) ->
     }
 }
 
-fn prop_key<'a>(k: &'a PropKey, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    if !f(Node::PropKey(k)) {
-        return false;
+fn prop_key<'a>(k: &'a PropKey, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::PropKey(k)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
     }
     match k {
         PropKey::Computed(e) => expr(e, f),
@@ -210,26 +242,38 @@ fn prop_key<'a>(k: &'a PropKey, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
     }
 }
 
-pub(crate) fn params<'a>(p: &'a Params, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
+pub(crate) fn params<'a>(p: &'a Params, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     p.items.iter().all(|p| pattern(p, f))
 }
 
-pub(crate) fn function<'a>(func: &'a Function, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    f(Node::Function(func)) && params(&func.params, f) && stmts(&func.body.stmts, f)
+pub(crate) fn function<'a>(func: &'a Function, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Function(func)) {
+        Flow::Go => params(&func.params, f) && stmts(&func.body.stmts, f),
+        Flow::Skip => true,
+        Flow::Stop => false,
+    }
 }
 
-pub(crate) fn arrow<'a>(a: &'a Arrow, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    f(Node::Arrow(a))
-        && params(&a.params, f)
+pub(crate) fn arrow<'a>(a: &'a Arrow, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Arrow(a)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
+    }
+    params(&a.params, f)
         && match &a.body {
             ArrowBody::Expr(e) => expr(e, f),
             ArrowBody::Block(b) => stmts(&b.stmts, f),
         }
 }
 
-pub(crate) fn class<'a>(c: &'a Class, f: &mut impl FnMut(Node<'a>) -> bool) -> bool {
-    f(Node::Class(c))
-        && c.decorators.iter().all(|d| expr(d, f))
+pub(crate) fn class<'a>(c: &'a Class, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+    match f(Node::Class(c)) {
+        Flow::Go => {}
+        Flow::Skip => return true,
+        Flow::Stop => return false,
+    }
+    c.decorators.iter().all(|d| expr(d, f))
         && c.superclass.as_deref().is_none_or(|e| expr(e, f))
         && c.body.iter().all(|m| match m {
             ClassMember::Method(m) => {
@@ -252,10 +296,10 @@ pub(crate) fn class<'a>(c: &'a Class, f: &mut impl FnMut(Node<'a>) -> bool) -> b
 mod visit_tests {
     use super::*;
 
-    /// Every function and arrow is offered once, nested ones included, and a
-    /// `false` from the callback stops the walk.
+    /// Every function and arrow is offered once, nested ones included; a
+    /// skipped node's children are not offered, and a stop ends the walk.
     #[test]
-    fn offers_every_function_and_stops_on_false() {
+    fn offers_every_function_skips_and_stops() {
         let prog = crate::front::parse_script(
             "function a(x = () => 1) { return function b() { var o = { m() {} }; class C { n() {} } }; }",
         )
@@ -265,13 +309,26 @@ mod visit_tests {
             if matches!(n, Node::Function(_) | Node::Arrow(_)) {
                 fns += 1;
             }
-            true
+            Flow::Go
         }));
         assert_eq!(fns, 5, "a, the default arrow, b, m and n");
+        let mut names = Vec::new();
+        assert!(stmts(&prog.body, &mut |n| match n {
+            Node::Function(f) => {
+                names.push(f.name.as_deref().unwrap_or("").to_string());
+                if f.name.as_deref() == Some("b") {
+                    Flow::Skip
+                } else {
+                    Flow::Go
+                }
+            }
+            _ => Flow::Go,
+        }));
+        assert_eq!(names, ["a", "b"], "nothing inside b is offered");
         let mut seen = 0;
         assert!(!stmts(&prog.body, &mut |_| {
             seen += 1;
-            seen < 3
+            (seen < 3).into()
         }));
         assert_eq!(seen, 3);
     }

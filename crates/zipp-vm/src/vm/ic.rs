@@ -3858,7 +3858,7 @@ impl<'p> Vm<'p> {
         if closure != NO_CLOSURE || fid as usize >= self.program.functions.len() {
             return None;
         }
-        let p = &self.program.functions[fid as usize];
+        let p = self.func(fid as usize);
         if p.param_count != 1
             || p.reg_count != 9
             || p.is_generator

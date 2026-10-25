@@ -79,11 +79,33 @@ fn compile_program_with(
     // with bodies deferred, and report how the two differ.
     if super::lazy::lazy_mode() == super::lazy::LazyMode::Verify {
         use super::lazy::LazyMode;
+        let origin_is_none = origin.is_none();
         let (a, _) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin.clone(), LazyMode::Seeded)?;
         let (b, misses) = compile_program_mode(prog, source, module_mode, main_goal, script_completion, origin, LazyMode::End)?;
         eprintln!("[lazy-stat] deferred {} of {} functions", LAZY_DEFERRED.with(|d| d.get()), b.functions.len());
         for d in super::lazy::diff_programs(&a, &b, &misses) {
             eprintln!("[lazy] {d}");
+        }
+        // A main script also compiles as a run would (stubs, reserved ids),
+        // then every stub's body as its first call would.
+        if !module_mode && main_goal && !script_completion && origin_is_none {
+            super::lazy::take_eager_census();
+            let (c, session) = compile_main_program_lazy(prog, source, 0)?;
+            for (why, n, bytes) in super::lazy::take_eager_census() {
+                eprintln!("[lazy-stat] eager: {why}: {n} bodies, {bytes} source bytes");
+            }
+            let stubs = session.as_ref().map_or(0, |s| s.pending_ids().len());
+            let (c, notes) = match session {
+                Some(mut s) => super::lazy::compile_every_stub(c, &mut s)?,
+                None => (c, Vec::new()),
+            };
+            eprintln!("[lazy-stat] run: {stubs} stubs of {} functions", c.functions.len());
+            for d in notes.iter().cloned().chain(super::lazy::diff_programs(&a, &c, &[])) {
+                match d.strip_prefix("stat: ") {
+                    Some(stat) => eprintln!("[lazy-stat] run: {stat}"),
+                    None => eprintln!("[lazy] run: {d}"),
+                }
+            }
         }
         return Ok(b);
     }
@@ -132,18 +154,64 @@ pub(super) fn compile_program_mode(
     c.drain_lazy(prog)?;
     let misses = std::mem::take(&mut c.lazy_misses);
     LAZY_DEFERRED.with(|d| d.set(c.lazy_deferred));
+    Ok((finish_program(&mut c), misses))
+}
+
+/// A main program whose deferred bodies compile at their first call: the
+/// program, its stubs in their place, and the session that compiles them
+/// (`None` when nothing was deferred). A program with fewer than
+/// `min_functions` functions compiles whole instead, exactly as
+/// [`compile_main_program`] compiles it. `prog` must outlive the session.
+pub(crate) fn compile_main_program_lazy<'a>(
+    prog: &'a ast::Program,
+    source: &str,
+    min_functions: usize,
+) -> R<(Program, Option<super::lazy::LazySession<'a>>)> {
+    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
+    let mut functions = 0usize;
+    let mut regexes = Vec::new();
+    crate::parse::visit::stmts(&prog.body, &mut |n| {
+        match n {
+            crate::parse::visit::Node::Expr(ast::Expr::Regex { pattern, flags }) => regexes.push((pattern, flags)),
+            crate::parse::visit::Node::Function(_) | crate::parse::visit::Node::Arrow(_) => functions += 1,
+            _ => {}
+        }
+        crate::parse::visit::Flow::Go
+    });
+    if functions < min_functions {
+        return compile_main_program(prog, source).map(|p| (p, None));
+    }
+    // A regular expression literal's early error is the program's however
+    // long its function waits to compile, so every one is checked now.
+    for (pattern, flags) in regexes {
+        super::exprs::check_regex_literal(&pattern.to_lossy_string(), flags)?;
+    }
+    let mut c = Compiler::new(source);
+    c.lazy_mode = super::lazy::LazyMode::Run;
+    c.main_goal = true;
+    c.force_strict = prog.strict;
+    c.compile(prog)?;
+    let program = finish_program(&mut c);
+    // The session's compiler resolves globals as the main compile did.
+    c.globals = program.global_names.clone();
+    let main_globals = program.global_count;
+    Ok((program, c.into_lazy_session(prog, main_globals)))
+}
+
+/// The program compiler `c` has compiled, its tables moved out of it.
+fn finish_program(c: &mut Compiler) -> Program {
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
         rewrite_local_accumulators(f);
         rewrite_append_indexes(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
-    Ok((Program {
-        functions: c.functions.into(),
+    Program {
+        functions: std::mem::take(&mut c.functions).into(),
         global_count: c.globals.len() as u32,
-        classes: c.classes,
-        global_names: c.globals,
-        hoisted_globals: c.hoisted_globals,
+        classes: std::mem::take(&mut c.classes),
+        global_names: std::mem::take(&mut c.globals),
+        hoisted_globals: std::mem::take(&mut c.hoisted_globals),
         // SORTED, not raw HashSet iteration order. std's HashSet reseeds its
         // hasher per process, so these came out in a different order on every
         // run — and the VM creates global-object properties by walking them, so
@@ -163,7 +231,7 @@ pub(super) fn compile_program_mode(
         module_decl_globals,
         python_natives: false,
         python_lazy: None,
-    }, misses))
+    }
 }
 
 /// Compile an `eval` code string. Identical to [`compile_program`] except the

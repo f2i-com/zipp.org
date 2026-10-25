@@ -386,6 +386,9 @@ struct Compiler {
     lazy_misses: Vec<String>,
     /// Bodies deferred so far (and compiled by `drain_lazy`).
     lazy_deferred: usize,
+    /// The eligibility scan's findings by function node (`lazy::ScanFacts`),
+    /// keyed by the node's address and kind in the tree this compiles.
+    lazy_scan: rustc_hash::FxHashMap<(usize, u8), lazy::ScanFacts>,
 }
 
 /// Resolve `name` to an `UpvalSource` for the INNERMOST function whose enclosing
@@ -971,6 +974,7 @@ mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;
+pub(crate) use lazy::{run_lazy, stub_mismatch, LazyBody, LazySession, RunLazy, LAZY_MIN_FUNCTIONS};
 pub(crate) use positions::{locate_message, SourceOrigin};
 pub(crate) use scopes::Slot;
 pub(crate) use helpers::*;

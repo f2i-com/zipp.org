@@ -1535,8 +1535,17 @@ pub struct Vm<'p> {
     /// shared pointers (`FuncTable`), which would cost a second load on every
     /// lookup, and the two-table form cost a compare before that.
     /// `main_func_count` and `eval_funcs` remain the boundary other code asks
-    /// about. Appended to only by `install_func`.
+    /// about. Appended to only by `install_func`; an entry changes only when
+    /// a deferred body replaces its stub (`engine::lazy_install`), so code
+    /// that asks about a function's code reads it here, not in `program`.
     funcs: Vec<&'p crate::bytecode::FuncProto>,
+    /// The compiler of the program's deferred function bodies, each compiled
+    /// at its function's first call (`compile::LazySession`); `None` when
+    /// every body compiled with the program.
+    lazy: Option<Box<crate::compile::LazySession<'p>>>,
+    /// The live slot of each global slot `lazy`'s compiles numbered past the
+    /// program's (`u32::MAX` until one asks).
+    lazy_gmap: Vec<u32>,
     /// Aggregate retained static-key plans across the main Program and every
     /// successfully/partially prepared eval/module Program. Incoming programs
     /// beyond either ceiling are rewritten to legacy NewObject before leaking.
@@ -3468,6 +3477,7 @@ mod dispatch_cold;
 mod engine;
 #[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) use engine::file_url;
+pub(crate) use engine::large_programs_run_jit;
 pub(crate) mod host_api;
 mod indexing_date;
 /// Step budget, cooperative abort, and the optional execution trace. Off by

@@ -1317,7 +1317,7 @@ impl<'p> Vm<'p> {
                 // Dynamic/foreign program ids can share an integer fid with a
                 // root function. Keep this first lane root-realm only.
                 if self.get_function_realm(callee_value) != 0
-                    || self.program.functions.get(fid as usize).is_none()
+                    || self.main_func(fid as usize).is_none()
                 {
                     failed = true;
                     break;
@@ -2726,7 +2726,7 @@ impl<'p> Vm<'p> {
             let callee = self.func(fid as usize);
             if same_proto
                 && (self.get_function_realm(Value::from_bits(callee_bits)) != 0
-                    || self.program.functions.get(fid as usize).is_none())
+                    || self.main_func(fid as usize).is_none())
             {
                 // A sloppy ordinary call substitutes the CALLEE realm's global
                 // object for undefined `this`. The splice bakes main-realm

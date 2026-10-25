@@ -852,7 +852,7 @@ impl<'p> Vm<'p> {
     ) -> Option<(u64, u64, u64)> {
         let func_id = (packed_fip >> 32) as u32;
         let ip = packed_fip as u32 as usize;
-        let proto = self.program.functions.get(func_id as usize).or_else(|| {
+        let proto = self.main_func(func_id as usize).or_else(|| {
             self.loader_module_func(func_id)
                 .then(|| self.func(func_id as usize))
         })?;

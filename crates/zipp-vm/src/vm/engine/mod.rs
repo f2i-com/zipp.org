@@ -82,8 +82,10 @@ mod eval_prog;
 mod jit_calls;
 mod jit_frame;
 mod jit_plans;
+mod lazy_install;
 mod method_inline;
 mod modules;
+pub(crate) use boot::large_programs_run_jit;
 #[cfg(not(feature = "wasm-no-fs-loader"))]
 pub(crate) use modules::file_url;
 // Python's native-tier entry points (see `lang/python/jit/`).

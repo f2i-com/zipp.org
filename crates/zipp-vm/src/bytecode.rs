@@ -2729,6 +2729,12 @@ pub enum Instr {
         b: Reg,
         src: Reg,
     },
+    /// The whole body of a function whose body has not been compiled yet
+    /// (`compile::lazy`): compile it, put it in this function's place, and
+    /// run it from its first instruction in the frame this call pushed. The
+    /// stub it stands in carries the function's real call interface, so the
+    /// frame was set up as the body expects.
+    LazyCompile,
 }
 
 /// [`Instr::LoadBigInt`]'s value as four `u32` words, lowest first. A bare
@@ -4785,7 +4791,7 @@ pub enum BitwiseOp {
     Ushr,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpvalSource {
     /// Capture the cell currently in the defining frame's register `reg`.
     ParentLocal(Reg),

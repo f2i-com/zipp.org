@@ -88,6 +88,22 @@ mod memo {
             STACK.with(|s| s.borrow_mut().push((id, Default::default())));
             Session(id)
         }
+
+        /// Make this session's memo the innermost again: a compiler kept
+        /// for later compiles (`compile::LazySession`) outlives the sessions
+        /// of compiles that ran in between.
+        pub fn activate(&self) {
+            STACK.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.last().is_some_and(|(id, _)| *id == self.0) {
+                    return;
+                }
+                if let Some(i) = s.iter().position(|(id, _)| *id == self.0) {
+                    let entry = s.remove(i);
+                    s.push(entry);
+                }
+            });
+        }
     }
 
     impl Drop for Session {

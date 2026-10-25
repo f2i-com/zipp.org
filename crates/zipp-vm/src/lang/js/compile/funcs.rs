@@ -114,14 +114,16 @@ impl<'a> FnCompiler<'a> {
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
-            let deferrable = lazy::fn_subtree_ok(f);
+            let nested = self.cx.lazy_scan_fn(f);
             self.lazy_prepare(
                 lazy::LazyKind::FuncDecl { name: name.clone() },
                 capture::function_free_names(f),
-                deferrable,
+                nested,
                 (f.span.start, f.span.end),
                 name.as_deref().unwrap_or("<script>"),
                 false,
+                &f.params,
+                has_use_strict(fn_directives(f)),
                 &captured,
                 &enclosing,
             )
@@ -2033,14 +2035,16 @@ impl<'a> FnCompiler<'a> {
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
-            let deferrable = lazy_ok && lazy::fn_subtree_ok(f);
+            let nested = if lazy_ok { self.cx.lazy_scan_fn(f) } else { None };
             self.lazy_prepare(
                 lazy::LazyKind::FuncExpr { name: name.clone(), self_name: self_name.clone() },
                 capture::function_free_names(f),
-                deferrable,
+                nested,
                 (f.span.start, f.span.end),
                 name.as_deref().unwrap_or("<script>"),
                 false,
+                &f.params,
+                has_use_strict(fn_directives(f)),
                 &captured,
                 &enclosing,
             )
@@ -2089,14 +2093,17 @@ impl<'a> FnCompiler<'a> {
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
         } else {
-            let deferrable = lazy::arrow_subtree_ok(a);
+            let nested = self.cx.lazy_scan_arrow(a);
+            let own_strict = matches!(&a.body, ast::ArrowBody::Block(b) if has_use_strict(&b.directives));
             self.lazy_prepare(
                 lazy::LazyKind::Arrow,
                 capture::arrow_free_names(a),
-                deferrable,
+                nested,
                 (a.span.start, a.span.end),
                 name,
                 true,
+                &a.params,
+                own_strict,
                 &captured,
                 &enclosing,
             )
