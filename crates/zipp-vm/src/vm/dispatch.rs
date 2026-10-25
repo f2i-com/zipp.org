@@ -1796,7 +1796,7 @@ impl<'p> Vm<'p> {
                     Instr::FuseConstEqJump { ldst, idx, a, dst, when, target } => {
                         let c = self.resolve_const_slot(func_id, idx);
                         self.set(base, ldst, c);
-                        let r = self.strict_eq(base, a, ldst);
+                        let r = self.strict_eq_fast(self.get(base, a), c);
                         self.set(base, dst, Value::bool(r));
                         ip = if r == when { target as usize } else { ip + 3 };
                     }
