@@ -381,6 +381,9 @@ pub enum Arg {
     Spread(Expr),
 }
 
+// A member expression's object is inline; its key is a name or boxed.
+const _: () = assert!(std::mem::size_of::<Member>() <= 80, "Member grew");
+
 #[derive(Debug, Clone)]
 pub struct Member {
     pub object: Expr,
@@ -393,8 +396,9 @@ pub struct Member {
 pub enum MemberProp {
     /// `a.b`
     Ident(Name),
-    /// `a[b]`
-    Computed(Expr),
+    /// `a[b]`, boxed: inline it made every member expression 104 bytes for
+    /// the fewer reads that compute their key.
+    Computed(Box<Expr>),
     /// `a.#b` — a private name, which is not a string key.
     Private(Name),
 }
@@ -541,8 +545,10 @@ pub enum ObjectMember {
         ///
         /// So it parses, and is an error unless converted: the parser records
         /// the position when it sets this, and raises that error when the
-        /// literal resolves as an expression rather than a target.
-        init: Option<Expr>,
+        /// literal resolves as an expression rather than a target. Boxed: it
+        /// is all but always `None`, and inline it was a third of every
+        /// object literal's property.
+        init: Option<Box<Expr>>,
     },
     /// `m() {}`
     Method {
@@ -931,15 +937,15 @@ mod tests {
             key: PropKey::Ident("a".into()),
             value: Expr::Ident("a".into()),
             shorthand: true,
-            init: Some(Expr::Num(1.0)),
+            init: Some(Box::new(Expr::Num(1.0))),
         };
         match &member {
             ObjectMember::Prop {
-                init: Some(Expr::Num(n)),
+                init: Some(d),
                 shorthand: true,
                 ..
             } => {
-                assert_eq!(*n, 1.0)
+                assert!(matches!(**d, Expr::Num(n) if n == 1.0))
             }
             other => panic!("initializer had nowhere to go: {other:?}"),
         }

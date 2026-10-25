@@ -855,7 +855,7 @@ impl<'s> Parser<'s> {
                     self.expect(Punct::RBracket, false)?;
                     e = Expr::Member(Box::new(Member {
                         object: e,
-                        prop: MemberProp::Computed(idx),
+                        prop: MemberProp::Computed(Box::new(idx)),
                         optional: true,
                     }));
                 } else {
@@ -879,7 +879,7 @@ impl<'s> Parser<'s> {
                 self.expect(Punct::RBracket, false)?;
                 e = Expr::Member(Box::new(Member {
                     object: e,
-                    prop: MemberProp::Computed(idx),
+                    prop: MemberProp::Computed(Box::new(idx)),
                     optional: false,
                 }));
             } else if self.at(Punct::LParen) {
@@ -1031,7 +1031,7 @@ impl<'s> Parser<'s> {
                 self.expect(Punct::RBracket, false)?;
                 callee = Expr::Member(Box::new(Member {
                     object: callee,
-                    prop: MemberProp::Computed(idx),
+                    prop: MemberProp::Computed(Box::new(idx)),
                     optional: false,
                 }));
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
@@ -1596,47 +1596,18 @@ impl<'s> Parser<'s> {
         // `[In]` restores inside the braces — see `parse_args`.
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
-        let mut members = Vec::new();
-        let mut rest_comma = false;
-        let mut proto_count = 0usize;
-        let mut proto_pos = 0u32;
-        let mut paren_name = false;
-        while !self.at(Punct::RBrace) {
-            if self.at(Punct::DotDotDot) {
-                self.bump_before_operand()?;
-                let e = self.parse_assign()?;
-                // See `parse_array_literal`.
-                paren_name |= matches!(e, Expr::Ident(_)) && self.parenthesized;
-                members.push(ObjectMember::Spread(e));
-            } else {
-                let (m, is_proto, pos) = self.parse_object_member()?;
-                if is_proto {
-                    proto_count += 1;
-                    if proto_count == 2 {
-                        proto_pos = pos;
-                    }
-                }
-                // Only a `k: v` value was just parsed as an expression; a
-                // shorthand name is re-read from the key and never clears the
-                // flag, so it must not consult it.
-                if let ObjectMember::Prop {
-                    value: Expr::Ident(_),
-                    shorthand: false,
-                    ..
-                } = &m
-                {
-                    paren_name |= self.parenthesized;
-                }
-                members.push(m);
+        // On `member_scratch`, as `parse_stmt_items` gathers statements: a
+        // list grown by `push` reserved four members for the one to three
+        // most literals hold.
+        let mark = self.member_scratch.len();
+        let (rest_comma, proto_count, proto_pos, paren_name) = match self.parse_object_members(mark) {
+            Ok(r) => r,
+            Err(e) => {
+                self.member_scratch.truncate(mark);
+                return Err(e);
             }
-            if !self.eat(Punct::Comma, true)? {
-                break;
-            }
-            // `{...x,}` — see the Array case; legal only as a literal.
-            if self.at(Punct::RBrace) && matches!(members.last(), Some(ObjectMember::Spread(_))) {
-                rest_comma = true;
-            }
-        }
+        };
+        let members: Vec<ObjectMember> = self.member_scratch.drain(mark..).collect();
         self.ctx.in_ = saved_in;
         self.expect(Punct::RBrace, false)?;
         // Duplicate `__proto__` is an early error — but only for PLAIN
@@ -1659,6 +1630,54 @@ impl<'s> Parser<'s> {
                 paren_name,
             },
         ))
+    }
+
+    /// The members of `parse_object_literal`, pushed to `member_scratch`
+    /// above `mark`: whether the literal ends in a spread and a comma, how
+    /// many plain `__proto__: v` it has and where the second is, and whether
+    /// a value was a parenthesized name.
+    fn parse_object_members(&mut self, mark: usize) -> PResult<(bool, usize, u32, bool)> {
+        let mut rest_comma = false;
+        let mut proto_count = 0usize;
+        let mut proto_pos = 0u32;
+        let mut paren_name = false;
+        while !self.at(Punct::RBrace) {
+            if self.at(Punct::DotDotDot) {
+                self.bump_before_operand()?;
+                let e = self.parse_assign()?;
+                // See `parse_array_literal`.
+                paren_name |= matches!(e, Expr::Ident(_)) && self.parenthesized;
+                self.member_scratch.push(ObjectMember::Spread(e));
+            } else {
+                let (m, is_proto, pos) = self.parse_object_member()?;
+                if is_proto {
+                    proto_count += 1;
+                    if proto_count == 2 {
+                        proto_pos = pos;
+                    }
+                }
+                // Only a `k: v` value was just parsed as an expression; a
+                // shorthand name is re-read from the key and never clears the
+                // flag, so it must not consult it.
+                if let ObjectMember::Prop {
+                    value: Expr::Ident(_),
+                    shorthand: false,
+                    ..
+                } = &m
+                {
+                    paren_name |= self.parenthesized;
+                }
+                self.member_scratch.push(m);
+            }
+            if !self.eat(Punct::Comma, true)? {
+                break;
+            }
+            // `{...x,}` — see the Array case; legal only as a literal.
+            if self.at(Punct::RBrace) && matches!(self.member_scratch[mark..].last(), Some(ObjectMember::Spread(_))) {
+                rest_comma = true;
+            }
+        }
+        Ok((rest_comma, proto_count, proto_pos, paren_name))
     }
 
     /// Returns the member, whether it is a plain `__proto__: v`, and its position.
@@ -1804,7 +1823,7 @@ impl<'s> Parser<'s> {
                 key,
                 value: Expr::Ident(name),
                 shorthand: true,
-                init,
+                init: init.map(Box::new),
             },
             false,
             start,

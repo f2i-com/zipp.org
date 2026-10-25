@@ -118,7 +118,7 @@ pub(crate) fn expr_may_assign_name(e: &Expr, name: &str) -> bool {
         Expr::Object(members, _) => members.iter().any(|mbr| match mbr {
             ObjectMember::Prop {
                 key, value, init, ..
-            } => key_rec(key) || rec(value) || init.as_ref().is_some_and(rec),
+            } => key_rec(key) || rec(value) || init.as_deref().is_some_and(rec),
             ObjectMember::Method { key, .. }
             | ObjectMember::Get { key, .. }
             | ObjectMember::Set { key, .. } => key_rec(key),

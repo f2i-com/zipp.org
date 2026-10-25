@@ -698,6 +698,8 @@ pub struct Parser<'s> {
     pub(crate) stmt_scratch: Vec<Stmt>,
     /// The same for call arguments (`parse_args`).
     pub(crate) arg_scratch: Vec<Arg>,
+    /// The same for object literal members (`parse_object_literal`).
+    pub(crate) member_scratch: Vec<ObjectMember>,
 }
 
 /// How many validator levels one recursive activation may add above the
@@ -758,6 +760,7 @@ impl<'s> Parser<'s> {
             tree_depth: 0,
             stmt_scratch: Vec::new(),
             arg_scratch: Vec::new(),
+            member_scratch: Vec::new(),
         })
     }
 

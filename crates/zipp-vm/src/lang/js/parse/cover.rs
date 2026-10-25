@@ -389,7 +389,7 @@ impl<'s> Parser<'s> {
                             // `({a = 1} = {})` work.
                             let (target, default) = match init {
                                 Some(d) => {
-                                    (self.expr_to_target_at(value, true, true, pos)?, Some(d))
+                                    (self.expr_to_target_at(value, true, true, pos)?, Some(*d))
                                 }
                                 None => self.split_default(value, pos)?,
                             };
@@ -586,7 +586,7 @@ impl<'s> Parser<'s> {
                             let value = match init {
                                 Some(d) => Pattern::Assign {
                                     left: Box::new(inner),
-                                    right: Box::new(d),
+                                    right: d,
                                 },
                                 None => inner,
                             };
