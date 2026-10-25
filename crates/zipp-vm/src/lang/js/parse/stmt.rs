@@ -91,10 +91,7 @@ impl<'s> Parser<'s> {
         } else {
             ScopeKind::Script
         });
-        let mut body = Vec::new();
-        while !self.at_eof() {
-            body.push(self.parse_stmt_list_item()?);
-        }
+        let body = self.parse_stmt_items(|p| !p.at_eof())?;
         for (name, pos) in std::mem::take(&mut self.pending_export_locals) {
             if !self.scopes.module_binds(&name) {
                 return Err(SyntaxError::new(
@@ -879,10 +876,7 @@ impl<'s> Parser<'s> {
             TokenKind::Punct(Punct::LBrace) => {
                 self.bump_before_operand()?;
                 self.scopes.push(ScopeKind::Block);
-                let mut body = Vec::new();
-                while !self.at(Punct::RBrace) && !self.at_eof() {
-                    body.push(self.parse_stmt_list_item()?);
-                }
+                let body = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
                 self.scopes.pop()?;
                 self.expect(Punct::RBrace, false)?;
                 Ok(Stmt::Block(body))
@@ -1498,14 +1492,9 @@ impl<'s> Parser<'s> {
                 return Err(self.err_here("SyntaxError: expected 'case' or 'default'"));
             };
             self.expect(Punct::Colon, true)?;
-            let mut body = Vec::new();
-            while !self.at(Punct::RBrace)
-                && !self.at_kw(Keyword::Case)
-                && !self.at_kw(Keyword::Default)
-                && !self.at_eof()
-            {
-                body.push(self.parse_stmt_list_item()?);
-            }
+            let body = self.parse_stmt_items(|p| {
+                !p.at(Punct::RBrace) && !p.at_kw(Keyword::Case) && !p.at_kw(Keyword::Default) && !p.at_eof()
+            })?;
             cases.push(SwitchCase { test, body });
         }
         self.ctx.in_switch = saved;
@@ -1555,10 +1544,7 @@ impl<'s> Parser<'s> {
             // `simple_catch_param` lives on this scope so Annex B B.3.5
             // (`catch (e) { var e }`) is untouched.
             self.expect(Punct::LBrace, true)?;
-            let mut body = Vec::new();
-            while !self.at(Punct::RBrace) && !self.at_eof() {
-                body.push(self.parse_stmt_list_item()?);
-            }
+            let body = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
             self.expect(Punct::RBrace, false)?;
             self.scopes.pop()?;
             Some(CatchClause { param, body })
@@ -1583,13 +1569,29 @@ impl<'s> Parser<'s> {
     fn parse_block_body(&mut self) -> PResult<Vec<Stmt>> {
         self.expect(Punct::LBrace, true)?;
         self.scopes.push(ScopeKind::Block);
-        let mut out = Vec::new();
-        while !self.at(Punct::RBrace) && !self.at_eof() {
-            out.push(self.parse_stmt_list_item()?);
-        }
+        let out = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
         self.scopes.pop()?;
         self.expect(Punct::RBrace, false)?;
         Ok(out)
+    }
+
+    /// The statement list items parsed while `more` holds, in a `Vec` of
+    /// exactly their number. They gather on `stmt_scratch`, which the lists
+    /// nested in them share as a stack, and leave it in one allocation: a
+    /// list grown by `push` reserved four 176-byte statements for the one or
+    /// two most bodies hold, a fifth of a bundle's syntax tree.
+    pub(crate) fn parse_stmt_items(&mut self, more: impl Fn(&Self) -> bool) -> PResult<Vec<Stmt>> {
+        let mark = self.stmt_scratch.len();
+        while more(self) {
+            match self.parse_stmt_list_item() {
+                Ok(s) => self.stmt_scratch.push(s),
+                Err(e) => {
+                    self.stmt_scratch.truncate(mark);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(self.stmt_scratch.drain(mark..).collect())
     }
 
     /// Run `f` with `in_loop` set, so `break`/`continue` validate.

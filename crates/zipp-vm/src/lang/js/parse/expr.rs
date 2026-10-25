@@ -1115,21 +1115,35 @@ impl<'s> Parser<'s> {
         // {});;)` is legal.
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
-        let mut out = Vec::new();
+        // On `arg_scratch`, as `parse_stmt_items` gathers statements: a list
+        // grown by `push` reserved four 64-byte arguments for a call's one
+        // or two.
+        let mark = self.arg_scratch.len();
+        if let Err(e) = self.parse_arg_items() {
+            self.arg_scratch.truncate(mark);
+            return Err(e);
+        }
+        let out: Vec<Arg> = self.arg_scratch.drain(mark..).collect();
+        self.ctx.in_ = saved_in;
+        self.expect(Punct::RParen, false)?;
+        Ok(out)
+    }
+
+    /// The arguments of `parse_args`, pushed to `arg_scratch`.
+    fn parse_arg_items(&mut self) -> PResult<()> {
         while !self.at(Punct::RParen) {
-            if self.at(Punct::DotDotDot) {
+            let arg = if self.at(Punct::DotDotDot) {
                 self.bump_before_operand()?;
-                out.push(Arg::Spread(self.parse_assign_full()?));
+                Arg::Spread(self.parse_assign_full()?)
             } else {
-                out.push(Arg::Expr(self.parse_assign_full()?));
-            }
+                Arg::Expr(self.parse_assign_full()?)
+            };
+            self.arg_scratch.push(arg);
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
         }
-        self.ctx.in_ = saved_in;
-        self.expect(Punct::RParen, false)?;
-        Ok(out)
+        Ok(())
     }
 
     // ---- primary -----------------------------------------------------------

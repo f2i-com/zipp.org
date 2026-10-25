@@ -287,10 +287,7 @@ impl<'s> Parser<'s> {
                 self.scopes.declare_param(&n);
             }
         }
-        let mut stmts = Vec::new();
-        while !self.at(Punct::RBrace) && !self.at_eof() {
-            stmts.push(self.parse_stmt_list_item()?);
-        }
+        let stmts = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
         self.scopes.pop()?;
         self.expect(Punct::RBrace, false)?;
         let out = FnBody { directives, stmts };
@@ -812,10 +809,7 @@ impl<'s> Parser<'s> {
             // identifier there unless the enclosing code is strict.
             self.ctx.yield_ = false;
             self.scopes.push(ScopeKind::ClassStaticBlock);
-            let mut stmts = Vec::new();
-            while !self.at(Punct::RBrace) && !self.at_eof() {
-                stmts.push(self.parse_stmt_list_item()?);
-            }
+            let stmts = self.parse_stmt_items(|p| !p.at(Punct::RBrace) && !p.at_eof())?;
             self.scopes.pop()?;
             self.expect(Punct::RBrace, false)?;
             self.ctx = saved;

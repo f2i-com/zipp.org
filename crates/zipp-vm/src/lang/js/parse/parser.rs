@@ -692,6 +692,12 @@ pub struct Parser<'s> {
     /// lets the default profile skip that walk for ordinary code — it cost
     /// 3-5% of parse+compile on a 6 MB source.
     tree_depth: usize,
+    /// The statements of the lists being parsed, innermost last
+    /// (`parse_stmt_items`): each list gathers here and leaves in a `Vec`
+    /// of exactly its length.
+    pub(crate) stmt_scratch: Vec<Stmt>,
+    /// The same for call arguments (`parse_args`).
+    pub(crate) arg_scratch: Vec<Arg>,
 }
 
 /// How many validator levels one recursive activation may add above the
@@ -750,6 +756,8 @@ impl<'s> Parser<'s> {
             pending_class_decorators: None,
             syntax_recursion: 0,
             tree_depth: 0,
+            stmt_scratch: Vec::new(),
+            arg_scratch: Vec::new(),
         })
     }
 
