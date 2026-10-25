@@ -157,6 +157,9 @@ pub enum Stmt {
 // Every statement list is this size per statement: a variant wider than an
 // `if` boxes its fields (see the loops above).
 const _: () = assert!(std::mem::size_of::<Stmt>() <= 80, "Stmt grew past an `if` statement's size");
+// An expression is held inline in most nodes; the widest variant is an
+// assignment (Expr::Regex boxes its pattern).
+const _: () = assert!(std::mem::size_of::<Expr>() <= 48, "Expr grew past an assignment's size");
 
 #[derive(Debug, Clone)]
 pub struct SwitchCase {
@@ -258,8 +261,10 @@ pub enum Expr {
     Num(f64),
     BigInt(Box<str>),
     Str(StrVal),
+    /// The pattern is boxed: inline it made every expression 56 bytes for a
+    /// literal a bundle holds a few hundred of.
     Regex {
-        pattern: StrVal,
+        pattern: Box<StrVal>,
         flags: Box<str>,
     },
     /// A hole in `[1, , 3]` is `None`; a spread element is `Spread`.

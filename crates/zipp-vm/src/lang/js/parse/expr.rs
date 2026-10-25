@@ -1243,7 +1243,7 @@ impl<'s> Parser<'s> {
                 // stores what it reports.
                 let canon: String = "dgimsuvy".chars().filter(|c| seen.contains(*c)).collect();
                 Ok(Expr::Regex {
-                    pattern,
+                    pattern: Box::new(pattern),
                     flags: canon.into(),
                 })
             }
