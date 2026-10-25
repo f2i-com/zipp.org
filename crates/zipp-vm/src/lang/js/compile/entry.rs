@@ -168,24 +168,13 @@ pub(crate) fn compile_main_program_lazy<'a>(
     min_functions: usize,
 ) -> R<(Program, Option<super::lazy::LazySession<'a>>)> {
     let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Compile);
-    let mut functions = 0usize;
-    let mut regexes = Vec::new();
-    crate::parse::visit::stmts(&prog.body, &mut |n| {
-        match n {
-            crate::parse::visit::Node::Expr(ast::Expr::Regex { pattern, flags }) => regexes.push((pattern, flags)),
-            crate::parse::visit::Node::Function(_) | crate::parse::visit::Node::Arrow(_) => functions += 1,
-            _ => {}
-        }
-        crate::parse::visit::Flow::Go
-    });
-    if functions < min_functions {
+    let index = super::lazy::ProgramIndex::of(prog);
+    if index.functions() < min_functions {
         return compile_main_program(prog, source).map(|p| (p, None));
     }
     // A regular expression literal's early error is the program's however
     // long its function waits to compile, so every one is checked now.
-    for (pattern, flags) in regexes {
-        super::exprs::check_regex_literal(&pattern.to_lossy_string(), flags)?;
-    }
+    index.check_regexes()?;
     let mut c = Compiler::new(source);
     c.lazy_mode = super::lazy::LazyMode::Run;
     c.main_goal = true;
@@ -195,7 +184,7 @@ pub(crate) fn compile_main_program_lazy<'a>(
     // The session's compiler resolves globals as the main compile did.
     c.globals = program.global_names.clone();
     let main_globals = program.global_count;
-    Ok((program, c.into_lazy_session(prog, main_globals)))
+    Ok((program, c.into_lazy_session(index, main_globals)))
 }
 
 /// The program compiler `c` has compiled, its tables moved out of it.

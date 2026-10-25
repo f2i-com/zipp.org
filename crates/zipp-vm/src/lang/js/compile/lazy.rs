@@ -584,23 +584,48 @@ impl FnNode<'_> {
     }
 }
 
-/// Every function and arrow of `prog` by source range: how a deferred body's
-/// node is found again.
-fn function_nodes(prog: &ast::Program) -> rustc_hash::FxHashMap<(u32, u32), FnNode<'_>> {
-    let mut nodes: rustc_hash::FxHashMap<(u32, u32), FnNode<'_>> = rustc_hash::FxHashMap::default();
-    visit::stmts(&prog.body, &mut |n| {
-        match n {
-            Node::Function(f) => {
-                nodes.insert((f.span.start, f.span.end), FnNode::Function(f));
+/// What one walk of a program finds for a compile that defers: every
+/// function and arrow by source range (how a deferred body's node is found
+/// again) and every regular expression literal (whose early errors are
+/// checked before anything waits).
+pub(super) struct ProgramIndex<'a> {
+    nodes: rustc_hash::FxHashMap<(u32, u32), FnNode<'a>>,
+    regexes: Vec<&'a ast::Expr>,
+}
+
+impl<'a> ProgramIndex<'a> {
+    pub(super) fn of(prog: &'a ast::Program) -> ProgramIndex<'a> {
+        let mut index = ProgramIndex { nodes: rustc_hash::FxHashMap::default(), regexes: Vec::new() };
+        visit::stmts(&prog.body, &mut |n| {
+            match n {
+                Node::Function(f) => {
+                    index.nodes.insert((f.span.start, f.span.end), FnNode::Function(f));
+                }
+                Node::Arrow(a) => {
+                    index.nodes.insert((a.span.start, a.span.end), FnNode::Arrow(a));
+                }
+                Node::Expr(e @ ast::Expr::Regex { .. }) => index.regexes.push(e),
+                _ => {}
             }
-            Node::Arrow(a) => {
-                nodes.insert((a.span.start, a.span.end), FnNode::Arrow(a));
+            visit::Flow::Go
+        });
+        index
+    }
+
+    /// How many functions and arrows the program has.
+    pub(super) fn functions(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The first early error among the program's regular expression literals.
+    pub(super) fn check_regexes(&self) -> R<()> {
+        for e in &self.regexes {
+            if let ast::Expr::Regex { pattern, flags } = e {
+                super::exprs::check_regex_literal(&pattern.to_lossy_string(), flags)?;
             }
-            _ => {}
         }
-        visit::Flow::Go
-    });
-    nodes
+        Ok(())
+    }
 }
 
 impl Compiler {
@@ -610,7 +635,7 @@ impl Compiler {
         if self.lazy_jobs.is_empty() {
             return Ok(());
         }
-        let nodes = function_nodes(prog);
+        let nodes = ProgramIndex::of(prog).nodes;
         while let Some(job) = self.lazy_jobs.pop_front() {
             self.lazy_deferred += 1;
             let node = *nodes
@@ -928,13 +953,13 @@ pub(super) fn compile_every_stub(mut program: Program, session: &mut LazySession
 impl Compiler {
     /// This main compile's deferred bodies, with the compiler and syntax tree
     /// that will compile them (see [`LazySession`]). `None` when nothing waits.
-    pub(super) fn into_lazy_session(mut self, prog: &ast::Program, main_globals: u32) -> Option<LazySession<'_>> {
+    pub(super) fn into_lazy_session(mut self, index: ProgramIndex<'_>, main_globals: u32) -> Option<LazySession<'_>> {
         if self.lazy_jobs.is_empty() {
             return None;
         }
         let jobs = self.lazy_jobs.drain(..).map(|j| (j.func_id, j)).collect();
         self.lazy_deferred = 0;
-        Some(LazySession { cx: self, nodes: function_nodes(prog), jobs, main_globals })
+        Some(LazySession { cx: self, nodes: index.nodes, jobs, main_globals })
     }
 }
 
