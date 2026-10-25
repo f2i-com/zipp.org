@@ -40,7 +40,7 @@ use super::token::{Span, StrVal};
 
 /// An identifier. `Box<str>` rather than `String`: an AST holds a great many of
 /// these and never grows one.
-pub type Name = Box<str>;
+pub type Name = std::sync::Arc<str>;
 
 // ============================================================================
 // Program

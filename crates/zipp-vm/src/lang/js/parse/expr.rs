@@ -327,7 +327,7 @@ impl<'s> Parser<'s> {
                 unreachable!()
             };
             if self.at(Punct::Arrow) && !self.cur().newline_before {
-                if self.ctx.strict && (name == "eval" || name == "arguments") {
+                if self.ctx.strict && (&*name == "eval" || &*name == "arguments") {
                     return Err(SyntaxError::new(
                         format!("SyntaxError: '{name}' cannot be a parameter name in strict mode"),
                         start,
@@ -337,7 +337,7 @@ impl<'s> Parser<'s> {
                 // [?Yield, +Await]` — `await` is reserved there whatever the
                 // enclosing context, and by STRING VALUE, so the escaped
                 // spelling `async await => 1` is the same error.
-                if name == "await" {
+                if &*name == "await" {
                     return Err(SyntaxError::new(
                         "SyntaxError: 'await' is not a valid name in async function parameters",
                         start,
@@ -345,7 +345,7 @@ impl<'s> Parser<'s> {
                 }
                 self.bump_before_operand()?;
                 let params = Params {
-                    items: vec![Pattern::Ident(name.into_boxed_str())],
+                    items: vec![Pattern::Ident(name.into())],
                     simple: true,
                 };
                 return Ok(Some(self.finish_arrow(params, true, start)?));
@@ -595,7 +595,7 @@ impl<'s> Parser<'s> {
             }
         }
         Ok(Some(Expr::PrivateIn {
-            name: name.into_boxed_str(),
+            name: name.into(),
             object: Box::new(object),
         }))
     }
@@ -936,7 +936,7 @@ impl<'s> Parser<'s> {
             let TokenKind::Ident { name, .. } = tok.kind else {
                 unreachable!()
             };
-            return Ok(MemberProp::Private(name.into_boxed_str()));
+            return Ok(MemberProp::Private(name.into()));
         }
         Ok(MemberProp::Ident(self.ident_name()?))
     }
@@ -1179,7 +1179,7 @@ impl<'s> Parser<'s> {
                 let TokenKind::BigInt(d) = tok.kind else {
                     unreachable!()
                 };
-                Ok(Expr::BigInt(d.into_boxed_str()))
+                Ok(Expr::BigInt(d.into()))
             }
             TokenKind::Str(_) => {
                 self.check_legacy_escape()?;
@@ -1230,7 +1230,7 @@ impl<'s> Parser<'s> {
                 let canon: String = "dgimsuvy".chars().filter(|c| seen.contains(*c)).collect();
                 Ok(Expr::Regex {
                     pattern,
-                    flags: canon.into_boxed_str(),
+                    flags: canon.into(),
                 })
             }
             TokenKind::Template { .. } => {
@@ -1347,7 +1347,7 @@ impl<'s> Parser<'s> {
                                     had_escape: false,
                                     private: false,
                                     ..
-                                } => match name.as_str() {
+                                } => match &**name {
                                     "meta" => None,
                                     "defer" => Some(ImportPhase::Defer),
                                     "source" => Some(ImportPhase::Source),
@@ -1442,7 +1442,7 @@ impl<'s> Parser<'s> {
         // and inherited by arrows (which do not), which is exactly the spec's
         // split. The compiler has the same check, but loses the flag on the
         // static-field, static-block and computed-key paths.
-        if self.ctx.in_field_init && name == "arguments" {
+        if self.ctx.in_field_init && &**name == "arguments" {
             return Err(self.err_here(
                 "SyntaxError: 'arguments' is not allowed in a class field initializer \
                  or static block",
@@ -1473,7 +1473,7 @@ impl<'s> Parser<'s> {
         let TokenKind::Ident { name, .. } = tok.kind else {
             unreachable!()
         };
-        Ok((name.into_boxed_str(), pos))
+        Ok((name.into(), pos))
     }
 
     // ---- literals ----------------------------------------------------------
@@ -1856,7 +1856,7 @@ impl<'s> Parser<'s> {
                 ..
             } => {
                 self.bump_after_operand()?;
-                Ok(PropKey::Private(name.into_boxed_str()))
+                Ok(PropKey::Private(name.into()))
             }
             TokenKind::Punct(Punct::LBracket) => {
                 self.bump_before_operand()?;

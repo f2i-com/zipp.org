@@ -972,7 +972,7 @@ impl<'s> Parser<'s> {
         // declare `accessor x` — gets two slots on the instance rather than one
         // shared one.
         self.accessor_seq += 1;
-        let storage: Name = format!("#accessor@{}", self.accessor_seq).into_boxed_str();
+        let storage: Name = format!("#accessor@{}", self.accessor_seq).into();
         let slot = |p: &Name| -> Expr {
             Expr::Member(Box::new(Member {
                 object: Expr::This,

@@ -58,7 +58,7 @@ mod tests {
         lex_all(src)
             .into_iter()
             .filter_map(|k| match k {
-                TokenKind::Ident { name, .. } => Some(name),
+                TokenKind::Ident { name, .. } => Some(name.to_string()),
                 _ => None,
             })
             .collect()
@@ -151,7 +151,7 @@ mod tests {
                 had_escape,
                 ..
             } => {
-                assert_eq!(name, "await", "the escape resolves into the name");
+                assert_eq!(&**name, "await", "the escape resolves into the name");
                 assert_eq!(*kw, Keyword::None, "but it is NOT the keyword");
                 assert!(had_escape);
             }
@@ -395,7 +395,7 @@ mod tests {
     fn private_names_and_identifiers() {
         match &lex_all("#count")[0] {
             TokenKind::Ident { name, private, .. } => {
-                assert_eq!(name, "count");
+                assert_eq!(&**name, "count");
                 assert!(*private);
             }
             other => panic!("got {other:?}"),

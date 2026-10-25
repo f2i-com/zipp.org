@@ -65,6 +65,10 @@ pub struct Lexer<'s> {
     /// still sits at the start of the input — see the `-->` arm of
     /// `skip_trivia`.
     input_start: usize,
+    /// Every identifier spelling this lexer has produced, once: a name the
+    /// source repeats is the same allocation each time, and the AST, the
+    /// parser's scopes and the compiler share it instead of copying it.
+    names: rustc_hash::FxHashSet<super::ast::Name>,
 }
 
 impl<'s> Lexer<'s> {
@@ -97,6 +101,7 @@ impl<'s> Lexer<'s> {
             html_comments: true,
             exact: None,
             input_start: 0,
+            names: rustc_hash::FxHashSet::default(),
         };
         // A leading BOM is whitespace, not part of the first token.
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -489,7 +494,25 @@ impl<'s> Lexer<'s> {
     /// The escaped form is a different token for keyword purposes — `await`
     /// spells the identifier `await`, not the keyword — so the flag has to
     /// survive to the parser.
-    fn read_ident_name(&mut self) -> LResult<(String, bool)> {
+    fn read_ident_name(&mut self) -> LResult<(super::ast::Name, bool)> {
+        // The common spelling, ASCII with no escape, is its own source bytes:
+        // look it up without building it a char at a time. An escape or a
+        // non-ASCII character takes the general loop below from the start.
+        let start = self.pos;
+        let mut end = start;
+        while let Some(&b) = self.src.get(end) {
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let plain_end = self.src.get(end).is_none_or(|&b| b < 0x80 && b != b'\\');
+        if end > start && plain_end && !self.src[start].is_ascii_digit() {
+            self.pos = end;
+            let s = std::str::from_utf8(&self.src[start..end]).expect("ASCII is UTF-8");
+            return Ok((self.intern(s), false));
+        }
         let mut out = String::new();
         let mut had_escape = false;
         let mut first = true;
@@ -541,7 +564,17 @@ impl<'s> Lexer<'s> {
             self.pos += w;
             first = false;
         }
-        Ok((out, had_escape))
+        Ok((self.intern(&out), had_escape))
+    }
+
+    /// This lexer's one allocation of the identifier `s`.
+    fn intern(&mut self, s: &str) -> super::ast::Name {
+        if let Some(n) = self.names.get(s) {
+            return n.clone();
+        }
+        let n = super::ast::Name::from(s);
+        self.names.insert(n.clone());
+        n
     }
 
     /// The value of a `uXXXX` or `u{...}` escape body (the `u` already consumed).

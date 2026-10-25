@@ -318,7 +318,7 @@ pub enum TokenKind {
     Eof,
     /// An identifier, private name, or keyword-shaped word.
     Ident {
-        name: String,
+        name: super::ast::Name,
         kw: Keyword,
         /// The spelling used a `\uXXXX` escape, so it cannot act as a keyword
         /// even when it reads like one (`await` is not `await`).

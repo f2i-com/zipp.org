@@ -230,9 +230,9 @@ impl<'s> Parser<'s> {
     /// ExportedNames must be unique — `export {x}; export {x};` is an error even
     /// though both name the same binding.
     fn record_export_name(&mut self, name: &ModuleExportName, pos: u32) -> PResult<()> {
-        let text: Box<str> = match name {
+        let text: Name = match name {
             ModuleExportName::Ident(n) => n.clone(),
-            ModuleExportName::Str(s) => s.to_lossy_string().into_boxed_str(),
+            ModuleExportName::Str(s) => s.to_lossy_string().into(),
         };
         if self.exported_names.iter().any(|n| *n == text) {
             return Err(SyntaxError::new(
@@ -247,7 +247,7 @@ impl<'s> Parser<'s> {
     /// The current token is the UNESCAPED contextual keyword `want`.
     fn at_contextual(&self, want: &str) -> bool {
         matches!(&self.cur().kind,
-            TokenKind::Ident { name, had_escape: false, private: false, .. } if name == want)
+            TokenKind::Ident { name, had_escape: false, private: false, .. } if &**name == want)
     }
 
     /// Consume a `defer` / `source` phase modifier if that is really what it is;
@@ -346,7 +346,7 @@ impl<'s> Parser<'s> {
     fn parse_import_attributes(&mut self) -> PResult<Vec<ImportAttribute>> {
         let is_with = self.at_kw(Keyword::With);
         let is_assert =
-            matches!(&self.cur().kind, TokenKind::Ident { name, .. } if name == "assert");
+            matches!(&self.cur().kind, TokenKind::Ident { name, .. } if &**name == "assert");
         if !is_with && !is_assert {
             return Ok(Vec::new());
         }
@@ -716,7 +716,7 @@ impl<'s> Parser<'s> {
         // it is a declaration only when followed, on the SAME line, by a plain
         // binding identifier (patterns are not allowed in using declarations),
         // so `using = 5` and a line-broken `using x` stay ordinary expressions.
-        if matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using")
+        if matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if &**name == "using")
         {
             let save = self.save();
             let at = self.cur().span.start;
@@ -747,7 +747,7 @@ impl<'s> Parser<'s> {
             let save = self.save();
             self.bump_after_operand()?;
             let is_using = !self.cur().newline_before
-                && matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using");
+                && matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if &**name == "using");
             if is_using {
                 let at = self.cur().span.start;
                 self.bump_after_operand()?;
@@ -1098,7 +1098,7 @@ impl<'s> Parser<'s> {
             let TokenKind::Ident { name, .. } = tok.kind else {
                 unreachable!()
             };
-            let name = name.into_boxed_str();
+            let name: Name = name.into();
             if self.at(Punct::Colon) {
                 self.bump_before_operand()?;
                 if self.labels.iter().any(|l| **l == *name) {

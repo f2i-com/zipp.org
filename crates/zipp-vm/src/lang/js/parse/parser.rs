@@ -349,19 +349,19 @@ pub(crate) enum ScopeKind {
 #[derive(Debug)]
 pub(crate) struct Scope {
     pub kind: ScopeKind,
-    lex: Vec<(Box<str>, BindKind, u32)>,
-    var: Vec<(Box<str>, u32)>,
+    lex: Vec<(Name, BindKind, u32)>,
+    var: Vec<(Name, u32)>,
     /// `lex`'s names once it holds `NAME_INDEX_MIN` of them, each with
     /// whether every entry of it is a plain FunctionDeclaration (the Annex B
     /// duplicate carve-out, `declare_lexical`).
-    lex_index: Option<rustc_hash::FxHashMap<Box<str>, bool>>,
+    lex_index: Option<rustc_hash::FxHashMap<Name, bool>>,
     /// `var`'s names once it holds `NAME_INDEX_MIN` of them.
-    var_index: Option<rustc_hash::FxHashSet<Box<str>>>,
+    var_index: Option<rustc_hash::FxHashSet<Name>>,
     /// `var` stops here: Script, Module, Function, ClassStaticBlock.
     pub var_boundary: bool,
     /// Annex B B.3.5: `catch (e) { var e; }` is legal for a SIMPLE catch
     /// parameter only, so the exception has to know the parameter's shape.
-    pub simple_catch_param: Option<Box<str>>,
+    pub simple_catch_param: Option<Name>,
 }
 
 /// Entries a scope's name list holds before it is indexed. Each declaration
@@ -652,7 +652,7 @@ pub struct Parser<'s> {
     pub(crate) cover: Cover,
     /// Labels in scope, for duplicate-label and `break`/`continue` target
     /// checks. Reset at every function boundary.
-    pub(crate) labels: Vec<Box<str>>,
+    pub(crate) labels: Vec<Name>,
     /// The expression just parsed was parenthesized. A one-slot flag rather
     /// than a wrapper node: parenthesization is observable in exactly two
     /// places, and both consume it immediately.
@@ -665,12 +665,12 @@ pub struct Parser<'s> {
     /// automatically and only the unbraced single-statement forms have to set it.
     pub(crate) stmt_pos: StmtPos,
     /// Every name this module exports, for the duplicate-`ExportedNames` rule.
-    pub(crate) exported_names: Vec<Box<str>>,
+    pub(crate) exported_names: Vec<Name>,
     /// Local names an `export { … }` (with no `from`) referred to, and where.
     /// A module must declare every one of them, but the declaration may come
     /// LATER in the file, so the check waits until the module's top level is
     /// complete.
-    pub(crate) pending_export_locals: Vec<(Box<str>, u32)>,
+    pub(crate) pending_export_locals: Vec<(Name, u32)>,
     /// Counter for the private backing slot an auto-accessor (`accessor x`)
     /// desugars to. Unique across the whole parse, so a base class and a
     /// derived class that both declare `accessor x` get DISTINCT slots on the
@@ -1131,13 +1131,13 @@ impl<'s> Parser<'s> {
         let TokenKind::Ident { name, .. } = tok.kind else {
             unreachable!()
         };
-        if self.ctx.strict && (name == "eval" || name == "arguments") {
+        if self.ctx.strict && (&*name == "eval" || &*name == "arguments") {
             return Err(SyntaxError::new(
                 format!("SyntaxError: '{name}' cannot be used as a binding in strict mode"),
                 pos,
             ));
         }
-        Ok((name.into_boxed_str(), pos))
+        Ok((name.into(), pos))
     }
 
     /// Consume any identifier-shaped token as a PROPERTY name, where reserved
@@ -1150,7 +1150,7 @@ impl<'s> Parser<'s> {
         let TokenKind::Ident { name, .. } = tok.kind else {
             unreachable!()
         };
-        Ok(name.into_boxed_str())
+        Ok(name.into())
     }
 
     /// Can the current token continue an ExpressionStatement whose expression
