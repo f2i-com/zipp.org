@@ -416,7 +416,20 @@ pub(crate) struct ProtoTable {
     /// that is not a heap object: `null`), or the heap index plus
     /// [`ProtoTable::HEAP_BASE`].
     link: Vec<u32>,
+    /// The heap prototypes stored since the last collection's root walk
+    /// ([`Self::clear_fresh`]), in store order, duplicates kept: the only
+    /// values a minor collection has to root. Every value stored before that
+    /// walk was rooted by it, survived and was promoted, and `insert` is the
+    /// one way a value changes.
+    fresh: Vec<u32>,
+    /// The log stopped at [`FRESH_MAX`] (a loop re-prototyping old objects
+    /// without allocating): the next minor walks the whole table instead.
+    fresh_overflow: bool,
 }
+
+/// Longest [`ProtoTable::fresh`] log kept (4 MB) before a minor walks the
+/// whole table instead.
+const FRESH_MAX: usize = 1 << 20;
 
 impl ProtoTable {
     pub(crate) const NONE: u32 = 0;
@@ -442,6 +455,7 @@ impl ProtoTable {
         self.table.resident_bytes().saturating_add(
             self.link
                 .capacity()
+                .saturating_add(self.fresh.capacity())
                 .saturating_mul(std::mem::size_of::<u32>()),
         )
     }
@@ -486,7 +500,29 @@ impl ProtoTable {
             self.link.resize(at + 1, Self::NONE);
         }
         self.link[at] = Self::encode(v);
+        if v.is_heap() && !self.fresh_overflow {
+            if self.fresh.len() < FRESH_MAX {
+                self.fresh.push(v.heap_index());
+            } else {
+                self.fresh_overflow = true;
+                self.fresh = Vec::new();
+            }
+        }
         self.table.insert(k, v)
+    }
+
+    /// The heap prototypes stored since [`Self::clear_fresh`], or `None` when
+    /// that log overflowed and the whole table must be walked.
+    #[inline]
+    pub(crate) fn fresh(&self) -> Option<&[u32]> {
+        (!self.fresh_overflow).then_some(self.fresh.as_slice())
+    }
+
+    /// Start a new log: a collection's root walk has just rooted every value.
+    #[inline]
+    pub(crate) fn clear_fresh(&mut self) {
+        self.fresh.clear();
+        self.fresh_overflow = false;
     }
 
     /// Dense walk of the live values. Order is unspecified.
@@ -527,6 +563,24 @@ impl ProtoTable {
 mod proto_table_tests {
     use super::ProtoTable;
     use crate::value::Value;
+
+    #[test]
+    fn the_fresh_log_holds_the_heap_values_stored_since_it_was_cleared() {
+        let mut t = ProtoTable::default();
+        assert_eq!(t.fresh(), Some(&[][..]));
+        t.insert(5, Value::heap(9));
+        t.insert(6, Value::NULL);
+        t.insert(5, Value::heap(11));
+        assert_eq!(t.fresh(), Some(&[9, 11][..]), "heap values only, in store order");
+        t.clear_fresh();
+        assert_eq!(t.fresh(), Some(&[][..]));
+        t.insert(7, Value::heap(3));
+        assert_eq!(t.fresh(), Some(&[3][..]));
+        t.fresh_overflow = true;
+        assert_eq!(t.fresh(), None, "an overflowed log asks for the whole table");
+        t.clear_fresh();
+        assert_eq!(t.fresh(), Some(&[][..]));
+    }
 
     #[test]
     fn the_link_copy_follows_every_change() {

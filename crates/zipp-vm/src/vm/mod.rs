@@ -1676,6 +1676,11 @@ pub struct Vm<'p> {
     /// are explicit GC roots because the map is VM-internal. See
     /// `const_cache.rs` for the mutation exclusion and resource bounds.
     const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// The heap strings `const_string_cache` gained since the last
+    /// collection's root walk: all a minor has to root of it, since every
+    /// earlier value was rooted by that walk and is old now (an entry is
+    /// only ever added). At most the map's own size.
+    const_string_fresh: Vec<u32>,
     /// The same entries by function and slot (every source-bounded function,
     /// `const_cache::CONST_DENSE_FUNCS` runtime ones), `UNDEFINED` where none:
     /// a loaded literal is two indexed reads instead of a hash probe, which

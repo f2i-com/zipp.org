@@ -218,6 +218,9 @@ impl<'p> Vm<'p> {
             }
         };
         self.const_string_cache.insert(key, resolved);
+        if resolved.is_heap() {
+            self.const_string_fresh.push(resolved.heap_index());
+        }
         let f = func_id as usize;
         // Only `eval` / `new Function` code takes the cap. A bundle is one
         // program of thousands of functions, and every string load past the

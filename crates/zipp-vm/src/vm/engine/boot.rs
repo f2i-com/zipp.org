@@ -323,6 +323,7 @@ impl<'p> Vm<'p> {
             py_rt: None,
             dynamic_ic_bytes: 0,
             const_string_cache: rustc_hash::FxHashMap::default(),
+            const_string_fresh: Vec::new(),
             const_string_dense: Vec::new(),
             const_string_texts: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),

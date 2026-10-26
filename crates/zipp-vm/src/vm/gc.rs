@@ -558,9 +558,18 @@ impl Vm<'_> {
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
         // roots just like the region-embedded constant strings below.
-        for &v in self.const_string_cache.values() {
-            root_val!(v);
+        // A minor roots only what the cache gained since the last root walk
+        // (as `proto_of` below): Babel's holds 24k strings.
+        if minor {
+            for &i in &self.const_string_fresh {
+                root_idx!(i);
+            }
+        } else {
+            for &v in self.const_string_cache.values() {
+                root_val!(v);
+            }
         }
+        self.const_string_fresh.clear();
         // Enumeration's key strings: one per distinct key text, bounded.
         for &v in self.key_str_cache.values() {
             root_val!(v);
@@ -810,9 +819,25 @@ impl Vm<'_> {
         // Side tables: their VALUES are roots (an entry keyed by a live object
         // must keep its payload alive). Over-approximate by rooting all values;
         // entries whose KEY is dead are pruned after the sweep.
-        for v in self.proto_of.values() {
-            root_val!(*v);
+        //
+        // A minor roots only the prototypes stored since the last root walk:
+        // every earlier one was rooted by that walk and is old now, and old
+        // slots arrive pre-marked. The table holds an entry for every
+        // `new F()` and `Object.create` object, so walking it was O(heap) per
+        // minor: Babel's reached 170k entries, walked at each of 370 minors.
+        match self.proto_of.fresh() {
+            Some(fresh) if minor => {
+                for &i in fresh {
+                    root_idx!(i);
+                }
+            }
+            _ => {
+                for v in self.proto_of.values() {
+                    root_val!(*v);
+                }
+            }
         }
+        self.proto_of.clear_fresh();
         // In-flight super() return-override instances (held across the rest of
         // the derived ctor body until construct() consumes them).
         for v in self.super_this.values() {
