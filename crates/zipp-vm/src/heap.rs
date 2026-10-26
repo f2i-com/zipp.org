@@ -7670,7 +7670,7 @@ const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 /// accepted: zero would suppress minors entirely, while an unbounded value
 /// could defer hygiene for an effectively unlimited allocation span. W10 note:
 /// at the adaptive cap (`NURSERY_BUDGET_MAX`) the default defers the hygiene
-/// major to at most 256×128k allocations; `major_at` still bounds floats
+/// major to at most 256×64k allocations; `major_at` still bounds floats
 /// within one (now larger) budget of the pre-nursery schedule.
 ///
 /// 256, not 64: a major traces the whole old heap, and below `major_at` the
@@ -7892,12 +7892,20 @@ fn parse_nursery_max_minors(raw: &str) -> Option<u32> {
 }
 
 /// W10: the survival-adaptive budget's ceiling (the floor is
-/// [`NURSERY_YOUNG_BUDGET`]). 128k: the B122 sweep measured 131072 at +1.31%
+/// [`NURSERY_YOUNG_BUDGET`]). The B122 sweep measured 131072 at +1.31%
 /// SUITE-wide — but that was as a fixed budget for every row; the controller
-/// reaches it only while young survival stays above ~25%, which on the
-/// measured rows happens exactly where fewer minors pay
+/// reaches the ceiling only while young survival stays above ~25%, which on
+/// the measured rows happens exactly where fewer minors pay
 /// (async-promise-chain's chain-build phases: −3.3% at 64k in B121's trial).
-const NURSERY_BUDGET_MAX: usize = 1 << 17;
+///
+/// 64k, not 128k: a nursery that size is roughly 30 MB of slots, mirrors
+/// and payloads, more than a 32 MB L3 holds beside everything else, so on
+/// that die a high-survival phase at 128k ran its young objects out of
+/// cache. Prettier's start-up climbs to the ceiling: at 64k it is -6.2% on
+/// the 32 MB-L3 die (unchanged on the 96 MB one), Preact SSR -2.3%,
+/// `survival.js` -3.1% (+0.5% on the large die), the other GC rows and
+/// the bundles unchanged. 32k cost `survival.js` 2-4%.
+const NURSERY_BUDGET_MAX: usize = 1 << 16;
 
 /// Minors the survival-adaptive controller waits, after a doubling that did
 /// not cut survival, before it may double again (see
