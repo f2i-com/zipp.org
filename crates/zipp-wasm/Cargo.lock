@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-numparse"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-pyparse"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "bumpalo",
  "rustc-hash",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "memchr",
  "num-bigint",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-wasm"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
