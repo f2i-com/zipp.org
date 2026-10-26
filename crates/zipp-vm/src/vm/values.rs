@@ -780,13 +780,9 @@ impl<'p> Vm<'p> {
             1 => false,
             2 => true,
             _ => {
-                let has = self.func(func_id).code.iter().any(|i| {
-                    matches!(
-                        i,
-                        crate::bytecode::Instr::DirectEval { flags, .. }
-                            if !flags.has(crate::bytecode::EvalFlags::VAR_ENV_IS_GLOBAL)
-                                && !flags.has(crate::bytecode::EvalFlags::STRICT_CALLER)
-                    )
+                let has = self.func(func_id).eval_calls.iter().any(|c| {
+                    !c.flags.has(crate::bytecode::EvalFlags::VAR_ENV_IS_GLOBAL)
+                        && !c.flags.has(crate::bytecode::EvalFlags::STRICT_CALLER)
                 });
                 self.sloppy_eval_memo[func_id] = if has { 2 } else { 1 };
                 has

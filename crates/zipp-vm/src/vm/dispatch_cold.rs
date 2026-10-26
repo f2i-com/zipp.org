@@ -1249,7 +1249,7 @@ impl<'p> Vm<'p> {
                 // error kind: a Symbol message throws TypeError and a throwing
                 // coercion propagates — before the error is allocated (and, for
                 // AggregateError, before the errors are iterated).
-                let msg = match arg {
+                let msg = match arg.get() {
                     Some(r) => {
                         let m = self.get(base, r);
                         if m == Value::UNDEFINED {
@@ -1266,7 +1266,7 @@ impl<'p> Vm<'p> {
                 // HasProperty walks the proto chain AND fires a Proxy
                 // `has` trap (observable; its throw propagates). The
                 // error is rooted across that guest code.
-                if let Some(or) = opts {
+                if let Some(or) = opts.get() {
                     let options = self.get(base, or);
                     self.install_error_cause(v, options)?;
                 }
@@ -1276,6 +1276,7 @@ impl<'p> Vm<'p> {
                 // IterableToList(undefined) throws the required TypeError.
                 if kind == 7 {
                     let errors_arg = errors
+                        .get()
                         .map(|er| self.get(base, er))
                         .unwrap_or(Value::UNDEFINED);
                     self.with_host_roots(&[v], |vm| vm.install_agg_errors(v, errors_arg))?;
@@ -1768,11 +1769,11 @@ impl<'p> Vm<'p> {
                 arg_base,
                 argc,
                 this_reg,
-                home_class,
-                site,
-                flags,
+                call,
             } => {
                 use crate::bytecode::EvalFlags as F;
+                let crate::bytecode::EvalCall { home_class, flags, site } =
+                    self.func(func_id as usize).eval_calls[call as usize];
                 let args_array = flags.has(F::ARGS_ARRAY);
                 let new_target_ok = flags.has(F::NEW_TARGET_OK);
                 let super_static = flags.has(F::SUPER_STATIC);
@@ -3475,11 +3476,11 @@ impl<'p> Vm<'p> {
                 ip += 1;
             }
             Instr::LoadBigIntBig { dst, idx } => {
-                // A literal beyond i128: clone the compile-time-parsed
-                // constant (canonical: the pool only holds out-of-range
-                // values, so this always allocates the Big tier).
+                // A literal beyond i64 (`load_bigint_instr`): the
+                // compile-time-parsed constant, demoted to the small form
+                // when it is within i128, as the canonical form requires.
                 let b = self.func(func_id as usize).bigint_consts[idx as usize].clone();
-                let v = Value::heap(self.heap.alloc(HeapObj::BigIntBig(Box::new(b))));
+                let v = self.make_bigint_num(b);
                 self.set(base, dst, v);
                 ip += 1;
             }

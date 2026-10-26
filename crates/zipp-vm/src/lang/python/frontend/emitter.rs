@@ -740,6 +740,9 @@ impl<'a> Emitter<'a> {
         self.proto.code.len() as u32
     }
     pub fn patch(&mut self, at: usize, target: u32) -> R<()> {
+        if self.patch_narrow_slow(at, target) {
+            return Ok(());
+        }
         match self.proto.code.get_mut(at) {
             Some(Instr::Jump { target: dst })
             | Some(Instr::JumpIfFalse { target: dst, .. })
@@ -759,7 +762,6 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyDictGet { slow: dst, .. })
             | Some(Instr::PyDictSet { slow: dst, .. })
             | Some(Instr::PyCallEntry { slow: dst, .. })
-            | Some(Instr::PyGetItem { slow: dst, .. })
             | Some(Instr::PySetItem { slow: dst, .. })
             | Some(Instr::PyGlobal { slow: dst, .. })
             | Some(Instr::PyStrItem { slow: dst, .. })
@@ -776,11 +778,9 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyRaise { slow: dst, .. })
             | Some(Instr::PyCaught { slow: dst, .. })
             | Some(Instr::PyClassAttr { slow: dst, .. })
-            | Some(Instr::PyDictLookup { slow: dst, .. })
             | Some(Instr::PyUnpack { slow: dst, .. })
             | Some(Instr::PyMakeExc { slow: dst, .. })
             | Some(Instr::PyExcPop { slow: dst, .. })
-            | Some(Instr::PyNew { slow: dst, .. })
             | Some(Instr::PyCall { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
@@ -788,20 +788,73 @@ impl<'a> Emitter<'a> {
             _ => Err("Python emitter: invalid jump patch".into()),
         }
     }
-    /// Patch the `absent` edge of a [`Instr::PyDictLookup`].
-    pub fn patch_absent(&mut self, at: usize, target: u32) -> R<()> {
-        match self.proto.code.get_mut(at) {
-            Some(Instr::PyDictLookup { absent, .. }) | Some(Instr::PyGetItem { absent, .. }) => {
-                *absent = target;
-                Ok(())
+    /// The slow edge of the fast paths whose targets are 16 bits (an
+    /// instruction is 16 bytes): `PyGetItem`, `PyDictLookup` and `PyNew`.
+    /// A target past them skips the fast path, which becomes a jump to its
+    /// slow path: that path handles every case the fast one does. False
+    /// for any other instruction.
+    fn patch_narrow_slow(&mut self, at: usize, target: u32) -> bool {
+        if !matches!(
+            self.proto.code.get(at),
+            Some(Instr::PyGetItem { .. } | Instr::PyDictLookup { .. } | Instr::PyNew { .. })
+        ) {
+            return false;
+        }
+        match u16::try_from(target) {
+            Ok(t) => {
+                if let Some(
+                    Instr::PyGetItem { slow, .. } | Instr::PyDictLookup { slow, .. } | Instr::PyNew { slow, .. },
+                ) = self.proto.code.get_mut(at)
+                {
+                    *slow = t;
+                }
             }
-            _ => Err("Python emitter: invalid absent-edge patch".into()),
+            Err(_) => self.proto.code[at] = Instr::Jump { target },
+        }
+        true
+    }
+    /// Patch the `absent` edge of a [`Instr::PyDictLookup`] or a
+    /// [`Instr::PyGetItem`]. A target past 16 bits skips the fast path as
+    /// [`Emitter::patch_narrow_slow`] does (a jump to the slow edge, which a
+    /// later patch of that edge still sets); a fast path already skipped
+    /// has no edge left to patch.
+    pub fn patch_absent(&mut self, at: usize, target: u32) -> R<()> {
+        let slow = match self.proto.code.get(at) {
+            Some(Instr::PyDictLookup { slow, .. }) | Some(Instr::PyGetItem { slow, .. }) => *slow,
+            Some(Instr::Jump { .. }) => return Ok(()),
+            _ => return Err("Python emitter: invalid absent-edge patch".into()),
+        };
+        match u16::try_from(target) {
+            Ok(t) => {
+                if let Some(Instr::PyDictLookup { absent, .. } | Instr::PyGetItem { absent, .. }) =
+                    self.proto.code.get_mut(at)
+                {
+                    *absent = t;
+                }
+            }
+            Err(_) => self.proto.code[at] = Instr::Jump { target: u32::from(slow) },
+        }
+        Ok(())
+    }
+    /// `PyMethod` for string constant `key` and string-table entry `gb`, or,
+    /// when either index is past 16 bits (an instruction is 16 bytes), a
+    /// jump that the caller patches as the method's slow edge: the slow path
+    /// resolves every method the fast one finds.
+    pub(super) fn emit_py_method(&mut self, dst: Reg, obj: Reg, rt: Reg, key: u32, gb: u32) -> R<usize> {
+        match (u16::try_from(key), u16::try_from(gb)) {
+            (Ok(key), Ok(gb)) => self.emit(Instr::PyMethod { dst, obj, rt, key, gb, slow: 0 }),
+            _ => self.jump(),
         }
     }
-    /// Patch the slow-path target of a fused Python fast-path instruction.
+    /// Patch the slow-path target of a fused Python fast-path instruction
+    /// (or of the jump that stands for a skipped one).
     pub fn patch_slow(&mut self, at: usize, target: u32) -> R<()> {
+        if self.patch_narrow_slow(at, target) {
+            return Ok(());
+        }
         match self.proto.code.get_mut(at) {
-            Some(Instr::PyJumpCompare { slow: dst, .. })
+            Some(Instr::Jump { target: dst })
+            | Some(Instr::PyJumpCompare { slow: dst, .. })
             | Some(Instr::PyArith { slow: dst, .. })
             | Some(Instr::PyAddImm { slow: dst, .. })
             | Some(Instr::PyCompare { slow: dst, .. })
@@ -809,7 +862,6 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyDictGet { slow: dst, .. })
             | Some(Instr::PyDictSet { slow: dst, .. })
             | Some(Instr::PyCallEntry { slow: dst, .. })
-            | Some(Instr::PyGetItem { slow: dst, .. })
             | Some(Instr::PySetItem { slow: dst, .. })
             | Some(Instr::PyGlobal { slow: dst, .. })
             | Some(Instr::PyStrItem { slow: dst, .. })
@@ -826,11 +878,9 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyRaise { slow: dst, .. })
             | Some(Instr::PyCaught { slow: dst, .. })
             | Some(Instr::PyClassAttr { slow: dst, .. })
-            | Some(Instr::PyDictLookup { slow: dst, .. })
             | Some(Instr::PyUnpack { slow: dst, .. })
             | Some(Instr::PyMakeExc { slow: dst, .. })
             | Some(Instr::PyExcPop { slow: dst, .. })
-            | Some(Instr::PyNew { slow: dst, .. })
             | Some(Instr::PyCall { slow: dst, .. }) => {
                 *dst = target;
                 Ok(())
@@ -910,7 +960,8 @@ impl<'a> Emitter<'a> {
         }
         let dst = self.alloc()?;
         if let Ok(value) = text.parse::<i128>() {
-            self.emit(Instr::LoadBigInt { dst, value: value.into() })?;
+            let i = crate::bytecode::load_bigint_instr(dst, value, &mut self.proto.bigint_consts);
+            self.emit(i)?;
         } else {
             let value = num_bigint::BigInt::parse_bytes(text.as_bytes(), 10)
                 .ok_or("Python: invalid integer literal")?;
@@ -949,7 +1000,8 @@ impl<'a> Emitter<'a> {
                 break;
             }
             let dst = self.alloc()?;
-            self.emit(Instr::LoadBigInt { dst, value: value.into() })?;
+            let i = crate::bytecode::load_bigint_instr(dst, value, &mut self.proto.bigint_consts);
+            self.emit(i)?;
             self.hoisted.insert(value, dst);
         }
         Ok(())

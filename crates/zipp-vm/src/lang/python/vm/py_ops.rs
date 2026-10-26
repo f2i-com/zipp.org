@@ -350,7 +350,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyMethod { dst, obj, rt, key, gb, slow } => {
                 let (o, r) = (self.get(base, obj), self.get(base, rt));
-                match self.py_method(func_id, ip, o, r, key, gb) {
+                match self.py_method(func_id, ip, o, r, key.into(), gb.into()) {
                     Some(f) => {
                         self.set(base, dst, f);
                         ip + 1

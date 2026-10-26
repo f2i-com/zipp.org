@@ -311,9 +311,9 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         #[cfg(all())]
         Instr::NewError { dst: r0, arg: r1, opts: r2, errors: r3, .. } => {
             *r0 = m(*r0);
-            if let Some(r) = r1.as_mut() { *r = m(*r); }
-            if let Some(r) = r2.as_mut() { *r = m(*r); }
-            if let Some(r) = r3.as_mut() { *r = m(*r); }
+            for r in [r1, r2, r3] {
+                *r = crate::bytecode::OptReg::new(r.get().map(|x| m(x)));
+            }
         }
         #[cfg(not(feature = "wasm-lite"))]
         Instr::PyArith { dst: r0, a: r1, b: r2, .. }

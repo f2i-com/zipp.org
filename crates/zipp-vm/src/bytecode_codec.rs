@@ -14,7 +14,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 3;
+pub(crate) const FORMAT: u32 = 4;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,
@@ -23,14 +23,6 @@ pub(crate) struct Writer {
 impl Writer {
     #[inline]
     fn u64(&mut self, mut v: u64) {
-        while v >= 0x80 {
-            self.out.push(v as u8 | 0x80);
-            v >>= 7;
-        }
-        self.out.push(v as u8);
-    }
-    #[inline]
-    fn u128(&mut self, mut v: u128) {
         while v >= 0x80 {
             self.out.push(v as u8 | 0x80);
             v >>= 7;
@@ -56,10 +48,6 @@ impl Writer {
     #[inline]
     fn i64(&mut self, v: i64) {
         self.u64(((v << 1) ^ (v >> 63)) as u64)
-    }
-    #[inline]
-    fn i128(&mut self, v: i128) {
-        self.u128(((v << 1) ^ (v >> 127)) as u128)
     }
     #[allow(dead_code)]
     #[inline]
@@ -156,22 +144,6 @@ impl<'a> Reader<'a> {
         }
     }
     #[inline]
-    fn u128(&mut self) -> R<u128> {
-        let mut v = 0u128;
-        let mut shift = 0;
-        loop {
-            let b = self.byte()?;
-            if shift >= 128 {
-                return Err("bad varint".into());
-            }
-            v |= ((b & 0x7F) as u128) << shift;
-            if b & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift += 7;
-        }
-    }
-    #[inline]
     fn u32(&mut self) -> R<u32> {
         u32::try_from(self.u64()?).map_err(|_| "u32 out of range".into())
     }
@@ -195,11 +167,6 @@ impl<'a> Reader<'a> {
     fn i64(&mut self) -> R<i64> {
         let v = self.u64()?;
         Ok(((v >> 1) as i64) ^ -((v & 1) as i64))
-    }
-    #[inline]
-    fn i128(&mut self) -> R<i128> {
-        let v = self.u128()?;
-        Ok(((v >> 1) as i128) ^ -((v & 1) as i128))
     }
     #[allow(dead_code)]
     #[inline]
@@ -388,6 +355,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         name_global,
         upvalues,
         eval_sites,
+        eval_calls,
         source,
         // The interpreter's superinstruction copy is rebuilt at run time.
         fused: _,
@@ -443,6 +411,12 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
                 w.u16(*i);
             }
         }
+    }
+    w.len(eval_calls.len());
+    for c in eval_calls {
+        w.u32(c.home_class);
+        w.u16(c.flags.0);
+        w.u16(c.site);
     }
     w.len(eval_sites.len());
     for (bindings, collisions, lexical) in eval_sites {
@@ -520,6 +494,11 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         });
     }
     let n = r.len()?;
+    let mut eval_calls = Vec::with_capacity(n);
+    for _ in 0..n {
+        eval_calls.push(EvalCall { home_class: r.u32()?, flags: EvalFlags(r.u16()?), site: r.u16()? });
+    }
+    let n = r.len()?;
     let mut eval_sites = Vec::with_capacity(n);
     for _ in 0..n {
         let m = r.len()?;
@@ -568,6 +547,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         name_global,
         upvalues,
         eval_sites,
+        eval_calls,
         source,
         fused: Default::default(),
         call_sites: call_sites.into_boxed_slice(),

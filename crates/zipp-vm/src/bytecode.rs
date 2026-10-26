@@ -15,6 +15,38 @@ use crate::value::Value;
 /// A register index within a function's frame.
 pub type Reg = u16;
 
+/// An optional register in two bytes: a [`Reg`] below `u16::MAX`, or
+/// `u16::MAX` for none. `Option<Reg>` takes four, which made an instruction
+/// with three of them (`NewError`) wider than all but a few. Prints as the
+/// `Option` it stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct OptReg(u16);
+
+// Four instructions to a cache line: every dispatch reads the code arrays
+// (see `spill_instructions_keep_instr_size`).
+const _: () = assert!(std::mem::size_of::<Instr>() <= 16, "Instr grew past 16 bytes");
+
+impl OptReg {
+    pub const NONE: OptReg = OptReg(u16::MAX);
+
+    #[inline]
+    pub fn new(r: Option<Reg>) -> OptReg {
+        debug_assert!(r != Some(u16::MAX), "register u16::MAX is OptReg's none");
+        OptReg(r.unwrap_or(u16::MAX))
+    }
+
+    #[inline]
+    pub fn get(self) -> Option<Reg> {
+        (self.0 != u16::MAX).then_some(self.0)
+    }
+}
+
+impl std::fmt::Debug for OptReg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
 /// `CallWithThis::name` when the call is not a named member call.
 pub const NO_NAME: u32 = u32::MAX;
 
@@ -782,7 +814,7 @@ pub enum Instr {
         dst: Reg,
         base: Reg,
         home_class_id: u32,
-        name: u32,
+        name: u16,
         arg_base: Reg,
         argc: u16,
     },
@@ -1382,9 +1414,9 @@ pub enum Instr {
     NewError {
         dst: Reg,
         kind: u8,
-        arg: Option<Reg>,
-        opts: Option<Reg>,
-        errors: Option<Reg>,
+        arg: OptReg,
+        opts: OptReg,
+        errors: OptReg,
     },
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
@@ -1396,7 +1428,7 @@ pub enum Instr {
     /// `dst = <BigInt literal>` (`123n`) — allocate a BigInt with the given value.
     LoadBigInt {
         dst: Reg,
-        value: I128Bits,
+        value: BigLit,
     },
     /// `dst = <BigInt literal beyond i128>` — allocate an arbitrary-precision
     /// BigInt from the function's `bigint_consts[idx]` (parsed at compile time).
@@ -1803,9 +1835,10 @@ pub enum Instr {
         arg_base: Reg,
         argc: u16,
         this_reg: Reg,
-        home_class: u32,
-        site: u16,
-        flags: EvalFlags,
+        /// The call's entry in the function's `eval_calls` ([`EvalCall`]):
+        /// its home class, booleans and scope map, out of line so the
+        /// instruction is 16 bytes.
+        call: u16,
     },
 
     /// ResolveBinding for a strict `name = …` on a global the program does not
@@ -2188,8 +2221,10 @@ pub enum Instr {
         k: Reg,
         seq: Reg,
         dict: Reg,
-        slow: u32,
-        absent: u32,
+        /// 16-bit targets, so the instruction is 16 bytes; the emitter
+        /// skips the fast path (a `Jump` to `slow`) past them.
+        slow: u16,
+        absent: u16,
     },
     /// `o[k] = v` for the same records: an in-range element of the `seq`
     /// type's items, or a str key of a str-keyed `dict` record (whose own
@@ -2336,8 +2371,10 @@ pub enum Instr {
         dst: Reg,
         obj: Reg,
         rt: Reg,
-        key: u32,
-        gb: u32,
+        /// 16-bit indices, so the instruction is 16 bytes; past them the
+        /// emitter goes straight to the slow path (`emit_py_method`).
+        key: u16,
+        gb: u16,
         slow: u32,
     },
     /// A module's global for a call `module.<key>(...)`: for a plain object
@@ -2465,8 +2502,9 @@ pub enum Instr {
         d: Reg,
         k: Reg,
         rt: Reg,
-        absent: u32,
-        slow: u32,
+        /// 16-bit targets, as `PyGetItem`'s.
+        absent: u16,
+        slow: u16,
     },
     /// The items to unpack `v` into `n` targets: for a plain object whose
     /// own data `cls` is `rt.TTUPLE` or `rt.TLIST` and whose own data
@@ -2532,7 +2570,8 @@ pub enum Instr {
         cls: Reg,
         rt: Reg,
         n: u16,
-        slow: u32,
+        /// A 16-bit target, as `PyGetItem`'s.
+        slow: u16,
     },
     /// Python frontend: `f(args...)` with `argc` positional values in
     /// `arg_base..`, for `f` a plain object whose own data `c<argc>` (the
@@ -2637,7 +2676,9 @@ pub enum Instr {
     /// literal.
     FuseConstEqJump {
         ldst: Reg,
-        idx: u32,
+        /// The constant's index, fused only below 65536 (an instruction is
+        /// 16 bytes).
+        idx: u16,
         a: Reg,
         dst: Reg,
         when: bool,
@@ -2719,7 +2760,9 @@ pub enum Instr {
         idx: u32,
         dst: Reg,
         a: Reg,
-        imm: i32,
+        /// The step, fused only when it fits 16 bits (an instruction is 16
+        /// bytes).
+        imm: i16,
         upd: bool,
     },
     /// `Add { dst, a, b }` then `Return { src }`.
@@ -2737,39 +2780,60 @@ pub enum Instr {
     LazyCompile,
 }
 
-/// [`Instr::LoadBigInt`]'s value as four `u32` words, lowest first. A bare
-/// `i128` aligned the whole `Instr` enum to 16 bytes and, with
-/// `DirectEval`'s booleans, made every instruction 32 bytes; the code arrays
-/// every dispatch reads are a quarter smaller without it. Prints as the
-/// number it holds.
+/// [`Instr::LoadBigInt`]'s value: an `i64` as two `u32` words, lowest first.
+/// A bare `i128` aligned the whole `Instr` enum to 16 bytes (every
+/// instruction 32), and an `i128` as four words made `LoadBigInt` one of the
+/// few variants that kept every instruction 24 bytes; a literal beyond
+/// `i64` is `LoadBigIntBig`'s ([`load_bigint_instr`]). Prints as the number
+/// it holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct I128Bits([u32; 4]);
+pub struct BigLit([u32; 2]);
 
-impl I128Bits {
+impl BigLit {
     #[inline]
-    pub const fn new(v: i128) -> Self {
-        let u = v as u128;
-        I128Bits([u as u32, (u >> 32) as u32, (u >> 64) as u32, (u >> 96) as u32])
+    pub const fn new(v: i64) -> Self {
+        let u = v as u64;
+        BigLit([u as u32, (u >> 32) as u32])
     }
 
     #[inline]
     pub const fn get(self) -> i128 {
-        let [a, b, c, d] = self.0;
-        ((a as u128) | (b as u128) << 32 | (c as u128) << 64 | (d as u128) << 96) as i128
+        let [a, b] = self.0;
+        ((a as u64) | (b as u64) << 32) as i64 as i128
     }
 }
 
-impl From<i128> for I128Bits {
-    #[inline]
-    fn from(v: i128) -> Self {
-        I128Bits::new(v)
-    }
-}
-
-impl std::fmt::Debug for I128Bits {
+impl std::fmt::Debug for BigLit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.get(), f)
     }
+}
+
+/// The instruction that loads integer literal `value` into `dst`:
+/// `LoadBigInt` for one within `i64`, else `LoadBigIntBig` of a constant
+/// added to `consts` (whose load demotes a value within `i128` to the small
+/// form, so either way the result is canonical).
+pub(crate) fn load_bigint_instr(dst: Reg, value: i128, consts: &mut Vec<num_bigint::BigInt>) -> Instr {
+    match i64::try_from(value) {
+        Ok(v) => Instr::LoadBigInt { dst, value: BigLit::new(v) },
+        Err(_) => {
+            let idx = consts.len() as u32;
+            consts.push(num_bigint::BigInt::from(value));
+            Instr::LoadBigIntBig { dst, idx }
+        }
+    }
+}
+
+/// What a [`Instr::DirectEval`] call knows of its site, kept beside the code
+/// (`FuncProto::eval_calls`, indexed by the instruction's `call`):
+/// `home_class`, the class whose `super` the eval sees (`u32::MAX`: none,
+/// or the eval caller's in an eval program), the site's booleans, and its
+/// scope map in `eval_sites` (`u16::MAX`: no map).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvalCall {
+    pub home_class: u32,
+    pub flags: EvalFlags,
+    pub site: u16,
 }
 
 /// [`Instr::DirectEval`]'s booleans, one bit each. Prints as the named
@@ -2999,6 +3063,8 @@ pub struct FuncProto {
     /// names visible at the call site — a sloppy eval's var/function name
     /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
     pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
+    /// One entry per `DirectEval` instruction, by its `call`.
+    pub eval_calls: Vec<EvalCall>,
     /// Exact source text of this function (the function node's span of the
     /// program source, which the program's functions share), used by
     /// `Function.prototype.toString`. Empty for the synthetic top-level script
@@ -3603,11 +3669,13 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
                                 && str_case_at(code, i - 3, ldst, a, dst)
                                 && !(i >= 6 && str_case_at(code, i - 6, ldst, a, dst));
                             let run = if second { str_switch_run(code, i, ldst, a, dst) } else { 0 };
-                            Some(if run >= STR_SWITCH_MIN_CASES {
-                                Instr::FuseStrSwitch { ldst, a, dst, n: run as u16 }
+                            if run >= STR_SWITCH_MIN_CASES {
+                                Some(Instr::FuseStrSwitch { ldst, a, dst, n: run as u16 })
                             } else {
-                                Instr::FuseConstEqJump { ldst, idx, a, dst, when, target }
-                            })
+                                u16::try_from(idx)
+                                    .ok()
+                                    .map(|idx| Instr::FuseConstEqJump { ldst, idx, a, dst, when, target })
+                            }
                         }
                         _ => None,
                     };
@@ -3656,9 +3724,9 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
             (Instr::AddInt { dst, a, imm, upd }, Instr::Jump { target }) if target as usize <= i => {
                 Some(Instr::FuseAddIntJump { dst, a, imm, upd, target })
             }
-            (Instr::LoadGlobal { dst: gdst, idx }, Instr::AddInt { dst, a, imm, upd }) => {
-                Some(Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd })
-            }
+            (Instr::LoadGlobal { dst: gdst, idx }, Instr::AddInt { dst, a, imm, upd }) => i16::try_from(imm)
+                .ok()
+                .map(|imm| Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd }),
             (Instr::Add { dst, a, b }, Instr::Return { src }) => Some(Instr::FuseAddReturn { dst, a, b, src }),
             // A compare and the branch on its result, forward only.
             (first, Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target })
@@ -3698,23 +3766,25 @@ mod fused_code_tests {
 
     /// The spill instructions (a 32-bit slot index beside two registers) fit
     /// in the size the other variants already give `Instr`: wide access is
-    /// paid for by the functions that use it, not by every dispatch. 24 bytes
-    /// since `LoadBigInt` keeps its value as `I128Bits` and `DirectEval` its
-    /// booleans as `EvalFlags`; a wider field belongs out of line too.
+    /// paid for by the functions that use it, not by every dispatch. 16
+    /// bytes, four to a cache line, since the few wider variants moved their
+    /// rest out of line (`DirectEval`'s `EvalCall`, `LoadBigInt`'s `BigLit`)
+    /// or narrowed it with a fallback where it does not fit (the fused and
+    /// Python fast paths); a wider field belongs out of line too.
     #[test]
     fn spill_instructions_keep_instr_size() {
         let size = std::mem::size_of::<Instr>();
         println!("size_of::<Instr>() = {size}");
-        assert!(size <= 24, "Instr grew to {size} bytes");
+        assert!(size <= 16, "Instr grew to {size} bytes");
         assert_eq!(std::mem::align_of::<Instr>(), 4);
     }
 
-    /// `I128Bits` round-trips every `i128` and prints as the number.
+    /// `BigLit` round-trips every `i64` and prints as the number.
     #[test]
-    fn i128_bits_round_trip() {
-        for v in [0i128, 1, -1, i128::MIN, i128::MAX, 1 << 64, -(1 << 100) + 7] {
-            assert_eq!(I128Bits::new(v).get(), v);
-            assert_eq!(format!("{:?}", I128Bits::new(v)), format!("{v:?}"));
+    fn big_lit_round_trip() {
+        for v in [0i64, 1, -1, i64::MIN, i64::MAX, 1 << 40, -(1 << 50) + 7] {
+            assert_eq!(BigLit::new(v).get(), v as i128);
+            assert_eq!(format!("{:?}", BigLit::new(v)), format!("{v:?}"));
         }
     }
 

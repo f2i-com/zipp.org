@@ -131,9 +131,9 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::NewError {
             dst: e,
             kind: 4,
-            arg: None,
-            opts: None,
-            errors: None,
+            arg: crate::bytecode::OptReg::new(None),
+            opts: crate::bytecode::OptReg::new(None),
+            errors: crate::bytecode::OptReg::new(None),
         });
         self.emit(Instr::Throw { src: e });
         true
@@ -160,9 +160,9 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::NewError {
                         dst: e,
                         kind: 1,
-                        arg: None,
-                        opts: None,
-                        errors: None,
+                        arg: crate::bytecode::OptReg::new(None),
+                        opts: crate::bytecode::OptReg::new(None),
+                        errors: crate::bytecode::OptReg::new(None),
                     });
                     self.emit(Instr::Throw { src: e });
                     self.dec_next_reg(1);
@@ -200,9 +200,9 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::NewError {
                 dst: e,
                 kind: 1,
-                arg: None,
-                opts: None,
-                errors: None,
+                arg: crate::bytecode::OptReg::new(None),
+                opts: crate::bytecode::OptReg::new(None),
+                errors: crate::bytecode::OptReg::new(None),
             });
             self.emit(Instr::Throw { src: e });
             self.dec_next_reg(1);

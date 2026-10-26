@@ -168,6 +168,17 @@ impl<'p> Vm<'p> {
         //    FuncProto (stable address — raw pointers live into it), append.
         let mut new_funcs: Vec<&'p FuncProto> = Vec::with_capacity(eval_prog.functions.len());
         for mut f in eval_prog.functions {
+            // A direct eval's home class is a class-id operand too, kept
+            // beside the code (`FuncProto::eval_calls`).
+            for call in f.eval_calls.iter_mut() {
+                if call.home_class == u32::MAX {
+                    if let Some(h) = caller_home {
+                        call.home_class = h;
+                    }
+                } else {
+                    call.home_class += base_class;
+                }
+            }
             for ins in f.code.iter_mut() {
                 match ins {
                     Instr::MakeFunc { func_id, .. }
@@ -257,15 +268,7 @@ impl<'p> Vm<'p> {
                             *home_class_id += base_class;
                         }
                     }
-                    Instr::DirectEval { home_class, .. } => {
-                        if *home_class == u32::MAX {
-                            if let Some(h) = caller_home {
-                                *home_class = h;
-                            }
-                        } else {
-                            *home_class += base_class;
-                        }
-                    }
+
                     Instr::FieldInit { class_id, .. } => {
                         if *class_id != u32::MAX {
                             *class_id += base_class;

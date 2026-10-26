@@ -5589,16 +5589,18 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         // lexical `this`, and its COMPLETE argument source. A spread site uses
         // one materialized Array register; an ordinary site uses a contiguous
         // argument window.
+        // (`argc` is 0 at a spread site, whose flag is out of line in
+        // `eval_calls`: `arg_base` counts as read whenever the window is
+        // empty, which only over-reports for `eval()`.)
         Instr::DirectEval {
             callee,
             this_v,
             arg_base,
             argc,
             this_reg,
-            flags,
             ..
         } => {
-            if flags.has(crate::bytecode::EvalFlags::ARGS_ARRAY) {
+            if argc == 0 {
                 vec![callee, this_v, arg_base, this_reg]
             } else {
                 win(&[callee, this_v, this_reg], arg_base, argc)
@@ -5711,7 +5713,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             arg.into_iter().collect()
         }
         Instr::NewError { arg, opts, errors, .. } => {
-            arg.into_iter().chain(opts).chain(errors).collect()
+            arg.get().into_iter().chain(opts.get()).chain(errors.get()).collect()
         }
         Instr::NewWeakRef { target, .. } => vec![target],
         Instr::NewFinalizationRegistry { cleanup, .. } => vec![cleanup],

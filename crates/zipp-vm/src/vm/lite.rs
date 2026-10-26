@@ -642,7 +642,7 @@ impl<'p> Vm<'p> {
                     let g = global!(idx);
                     self.set(base, gdst, g);
                     let va = self.get(base, a);
-                    let r = self.add_int_value(va, imm, upd)?;
+                    let r = self.add_int_value(va, imm.into(), upd)?;
                     self.set(base, dst, r);
                     ip += 2;
                 }

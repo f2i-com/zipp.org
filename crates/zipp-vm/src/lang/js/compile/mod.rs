@@ -485,6 +485,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         name_global: None,
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
+        eval_calls: Vec::new(),
         source: crate::bytecode::SourceText::default(),
         fused: Default::default(),
         call_sites: Box::default(),
@@ -636,6 +637,8 @@ struct FnCompiler<'a> {
     /// Scope maps for this function's DirectEval call sites (see
     /// FuncProto::eval_sites).
     eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
+    /// The function's direct eval calls (FuncProto::eval_calls).
+    eval_calls: Vec<crate::bytecode::EvalCall>,
     /// True while this function's parameter defaults compile: a direct eval
     /// there sits in the PARAM scope (its sloppy var/function declarations
     /// collide with parameter names / the implicit `arguments`).

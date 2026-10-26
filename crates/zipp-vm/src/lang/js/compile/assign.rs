@@ -276,9 +276,9 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::NewError {
             dst: e,
             kind: 4,
-            arg: None,
-            opts: None,
-            errors: None,
+            arg: crate::bytecode::OptReg::new(None),
+            opts: crate::bytecode::OptReg::new(None),
+            errors: crate::bytecode::OptReg::new(None),
         });
         self.emit(Instr::Throw { src: e });
         self.set_next_reg(save);

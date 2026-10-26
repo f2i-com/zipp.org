@@ -188,6 +188,7 @@ impl<'a> FnCompiler<'a> {
             box_all_locals: false,
             script_eval_lexicals: false,
             eval_sites: Vec::new(),
+            eval_calls: Vec::new(),
             in_param_init: false,
             param_names: {
                 let mut v: Vec<String> = params.to_vec();

@@ -4702,7 +4702,9 @@ impl<'p> Vm<'p> {
                 }),
             ) = (body[ip].clone(), body.get(ip + 1))
             {
-                if callee == *call_callee {
+                // (`SuperMethod`'s name is 16 bits: a later string constant
+                // keeps the pair as it is.)
+                if let (true, Ok(name)) = (callee == *call_callee, u16::try_from(name)) {
                     let normalized_ip = out.len();
                     out.push(Instr::SuperMethod {
                         dst: *dst,

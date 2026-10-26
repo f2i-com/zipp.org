@@ -825,7 +825,7 @@ impl<'a> Emitter<'a> {
             self.emit(Instr::Add { dst, a: r, b })?;
         } else {
             let one = self.alloc()?;
-            self.emit(Instr::LoadBigInt { dst: one, value: crate::bytecode::I128Bits::new(1) })?;
+            self.emit(Instr::LoadBigInt { dst: one, value: crate::bytecode::BigLit::new(1) })?;
             self.emit(Instr::Sub { dst, a: dst, b: one })?;
         }
         end_jumps.push(self.jump()?);
@@ -1850,7 +1850,7 @@ impl<'a> Emitter<'a> {
             let at = if as_module {
                 self.emit(Instr::PyModGet { dst: f, obj, rt, key, slow: 0 })?
             } else {
-                self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?
+                self.emit_py_method(f, obj, rt, key, gb)?
             };
             self.emit(Instr::LoadBool { dst: prepend, val: !as_module })?;
             fused.push(self.jump()?);
@@ -2000,7 +2000,7 @@ impl<'a> Emitter<'a> {
         let rt = self.r_rt;
         let key = self.string_const(name);
         let gb = self.string_index(&format!("{name}#{n}"));
-        let at_m = self.emit(Instr::PyMethod { dst: f, obj, rt, key, gb, slow: 0 })?;
+        let at_m = self.emit_py_method(f, obj, rt, key, gb)?;
         let mut done = Vec::new();
         match (name, n) {
             ("append", 1) => self.list_append_intrinsic(obj, f, regs[0], dst, &mut done)?,

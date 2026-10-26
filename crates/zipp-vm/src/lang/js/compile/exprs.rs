@@ -425,7 +425,10 @@ impl<'a> FnCompiler<'a> {
                 // construction, so only an out-of-range value reaches the pool —
                 // the canonical-form invariant holds).
                 match b.parse::<i128>() {
-                    Ok(v) => self.emit(Instr::LoadBigInt { dst, value: v.into() }),
+                    Ok(v) => {
+                        let i = crate::bytecode::load_bigint_instr(dst, v, &mut self.bigint_consts);
+                        self.emit(i)
+                    }
                     Err(_) => {
                         let big = b
                             .parse::<num_bigint::BigInt>()
@@ -619,9 +622,9 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::NewError {
                         dst: e,
                         kind: 4,
-                        arg: None,
-                        opts: None,
-                        errors: None,
+                        arg: crate::bytecode::OptReg::new(None),
+                        opts: crate::bytecode::OptReg::new(None),
+                        errors: crate::bytecode::OptReg::new(None),
                     });
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
@@ -2568,9 +2571,9 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::NewError {
                             dst: e,
                             kind: 4,
-                            arg: None,
-                            opts: None,
-                            errors: None,
+                            arg: crate::bytecode::OptReg::new(None),
+                            opts: crate::bytecode::OptReg::new(None),
+                            errors: crate::bytecode::OptReg::new(None),
                         });
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
@@ -2600,9 +2603,9 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::NewError {
                             dst: e,
                             kind: 4,
-                            arg: None,
-                            opts: None,
-                            errors: None,
+                            arg: crate::bytecode::OptReg::new(None),
+                            opts: crate::bytecode::OptReg::new(None),
+                            errors: crate::bytecode::OptReg::new(None),
                         });
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
@@ -3019,9 +3022,9 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::NewError {
                     dst: e,
                     kind: 4,
-                    arg: None,
-                    opts: None,
-                    errors: None,
+                    arg: crate::bytecode::OptReg::new(None),
+                    opts: crate::bytecode::OptReg::new(None),
+                    errors: crate::bytecode::OptReg::new(None),
                 });
                 self.emit(Instr::Throw { src: e });
                 return Ok(dst);

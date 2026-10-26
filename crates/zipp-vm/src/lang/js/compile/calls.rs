@@ -1996,6 +1996,13 @@ impl<'a> FnCompiler<'a> {
             // `x` to the realm global.
             .set(F::VAR_ENV_IS_GLOBAL, self.is_script && !self.cx.eval_fn_context)
             .set(F::TAIL, tail);
+        let call = u16::try_from(self.eval_calls.len())
+            .map_err(|_| "function has too many direct eval calls for bytecode metadata".to_string())?;
+        self.eval_calls.push(crate::bytecode::EvalCall {
+            home_class: self.super_class.unwrap_or(u32::MAX),
+            flags,
+            site,
+        });
         self.emit(Instr::DirectEval {
             dst,
             callee,
@@ -2003,9 +2010,7 @@ impl<'a> FnCompiler<'a> {
             arg_base,
             argc,
             this_reg,
-            home_class: self.super_class.unwrap_or(u32::MAX),
-            site,
-            flags,
+            call,
         });
         Ok(())
     }

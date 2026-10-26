@@ -1490,7 +1490,7 @@ impl<'p> Vm<'p> {
                             let (o, r) = (self.get(base, obj), self.get(base, rt));
                             let f = match self.py_method_hit(func_id, ip, o, r) {
                                 Some(f) => Some(f),
-                                None => self.py_method(func_id, ip, o, r, key, gb),
+                                None => self.py_method(func_id, ip, o, r, key.into(), gb.into()),
                             };
                             match f {
                                 Some(f) => {
@@ -1714,7 +1714,7 @@ impl<'p> Vm<'p> {
                         };
                         self.set(base, gdst, g);
                         let va = self.get(base, a);
-                        let r = self.add_int_value(va, imm, upd)?;
+                        let r = self.add_int_value(va, imm.into(), upd)?;
                         self.set(base, dst, r);
                         ip += 2;
                     }
@@ -1794,7 +1794,7 @@ impl<'p> Vm<'p> {
                         ip = if r { ip + 3 } else { target as usize };
                     }
                     Instr::FuseConstEqJump { ldst, idx, a, dst, when, target } => {
-                        let c = self.resolve_const_slot(func_id, idx);
+                        let c = self.resolve_const_slot(func_id, idx.into());
                         self.set(base, ldst, c);
                         let r = self.strict_eq_fast(self.get(base, a), c);
                         self.set(base, dst, Value::bool(r));

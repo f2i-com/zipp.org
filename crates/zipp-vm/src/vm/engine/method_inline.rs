@@ -415,7 +415,7 @@ impl<'p> Vm<'p> {
                         return None;
                     }
                     let bits =
-                        self.mi_super_call(fid, body_ip, home_class_id, name, sargc, recv, depth)?;
+                        self.mi_super_call(fid, body_ip, home_class_id, name.into(), sargc, recv, depth)?;
                     // A nested super target threw — propagate (the region exits;
                     // never re-executed). `CALL_THREW`/`SELF_CALL_DEOPT` are NaN-
                     // tagged sentinels never produced as a real result.
