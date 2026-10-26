@@ -73,6 +73,38 @@ impl<'p> Vm<'p> {
             return false;
         }
         self.store_barrier_v(crate::heap::gcoracle::SET_PROP, target, value);
+        // Through the shape tree, as the property cache's adds go
+        // (`ic_apply_set`): the instance takes the next shape's shared key
+        // list instead of a new `String` per field, and every instance of a
+        // class with fields allocated one for each of them.
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let shape = match self.heap.get(oi) {
+                HeapObj::Object(m) => m.shape(),
+                _ => crate::shape::DICT,
+            };
+            let after = crate::shape::add(shape, key, crate::shape::attr_bits(true, true, true, false));
+            if after != crate::shape::DICT {
+                if !self.shape_key_plans.get(after as usize).is_some_and(Option::is_some) {
+                    crate::vm::helpers_misc::shape_key_plan(self, after);
+                }
+                let borrow = crate::bytecode::plan_borrow_enabled();
+                let plan = self.shape_key_plans.get(after as usize).and_then(Option::as_ref);
+                if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                    match plan {
+                        // SAFETY: the VM's shape plans are never removed or
+                        // replaced, and its heap's maps die with it.
+                        Some(p) if p.len() == m.slot_len() + 1 => unsafe {
+                            m.append_data_planned(key, value, after, p, borrow)
+                        },
+                        _ => m.append_data_shaped(key, value, after, None),
+                    }
+                }
+                self.heap.bump_version(oi);
+                self.heap.refresh_mirror(oi);
+                return true;
+            }
+        }
         if let HeapObj::Object(m) = self.heap.get_mut(oi) {
             m.set(key, value);
         }
