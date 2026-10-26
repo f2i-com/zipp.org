@@ -10352,7 +10352,8 @@ impl Heap {
         // owned variants (the sweep's mass); everything else drops inline
         // here exactly as before. The bookkeeping around it never leaves the
         // mutator.
-        let dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
+        #[cfg_attr(feature = "safe-sandbox", allow(unused_mut))]
+        let mut dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
         // B244 ABA boundary: a snapshot carries only the heap-index bits. A
         // collected Array must dirty the global epoch before this slot can be
         // handed to a different occupant with the same bits.
@@ -10381,9 +10382,15 @@ impl Heap {
         // still carries its keys-plan Arc decrement and Box free off-thread
         // (dropping shells inline measured survival +5.8% — exactly B185's
         // win handed back).
+        //
+        // By reference, and the payload moved out only where it is taken:
+        // re-wrapping a shell that did not pool as `HeapObj::Object` and
+        // passing the 64-byte enum through the pool match below copied it
+        // twice per death (2.5% of an SSR render, a store-forwarding stall
+        // on the rebuilt tag), only to ship the same box at the end.
         #[cfg(not(feature = "safe-sandbox"))]
-        let dead = match dead {
-            HeapObj::Object(mut m) => {
+        let shell = match &mut dead {
+            HeapObj::Object(m) => {
                 // B258: settle the pool question BEFORE the cell goes home.
                 // `strip_slab` turns a `Slab` store into exactly the empty
                 // `Vec` the pre-B258 test accepted, so this predicate is the
@@ -10432,62 +10439,66 @@ impl Heap {
                 // still pool: their contents drop at the overwrite, which is
                 // rare and bounded, and checking for them here would read
                 // the far cache line this arm exists to avoid.
-                if pooled {
-                    if self.oracle {
-                        self.obj_pool_stats[0] += 1;
-                    }
-                    self.obj_pool.push(m);
-                    // Nothing is left to ship or drop: finish here rather
-                    // than carry a tombstone through the courier test and
-                    // the enum's out-of-line drop glue at the end.
-                    self.free_slot_tail(idx);
-                    return;
-                }
-                HeapObj::Object(m)
+                Some(pooled)
             }
-            other => other,
+            _ => None,
         };
         #[cfg(not(feature = "safe-sandbox"))]
-        let dead = match dead {
-            HeapObj::Array(v)
-                if self.obj_pool_refill
-                    && obj_pool_enabled()
-                    && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()) =>
-            {
-                self.arr_pool.push(v);
+        if let Some(pooled) = shell {
+            let HeapObj::Object(m) = dead else {
+                unreachable!("the shell arm matched an object")
+            };
+            if pooled {
+                if self.oracle {
+                    self.obj_pool_stats[0] += 1;
+                }
+                self.obj_pool.push(m);
+            } else if gc_courier::active() {
+                // The courier's object arm below, which ships every shell.
+                if self.oracle {
+                    self.courier_stats[1] += 1;
+                    self.courier_stats[2] += std::mem::size_of::<ObjMap>() as u64;
+                }
+                self.courier_batch.push(gc_courier::Item::Obj(m));
+            } else {
+                drop(m);
+            }
+            self.free_slot_tail(idx);
+            return;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let pool = self.obj_pool_refill && obj_pool_enabled();
+            let take = match &dead {
+                HeapObj::Array(v) => pool && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()),
+                // A Python instance's layout-mode attribute values are the
+                // same small `Value` buffer (`take_arr_buf` hands one back to
+                // `py_attrs_new`): every instance of a class with attributes
+                // allocated one and the sweep freed it. Compiled code reads
+                // the buffer through the slot's hot mirror, cleared above and
+                // rewritten for the next owner at its allocation.
+                #[cfg(feature = "python")]
+                HeapObj::PyAttrs { vals, .. } => pool && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()),
+                // A small string's bytes, for the next string a producer
+                // builds (`take_byte_buf`). Nothing else in a `JsStr` owns
+                // memory.
+                HeapObj::Str(js) => {
+                    self.byte_pool_want && pool && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity())
+                }
+                _ => false,
+            };
+            if take {
+                match dead {
+                    HeapObj::Array(v) => self.arr_pool.push(v),
+                    #[cfg(feature = "python")]
+                    HeapObj::PyAttrs { vals, .. } => self.arr_pool.push(vals),
+                    HeapObj::Str(js) => self.byte_pool.push(js.into_byte_buf()),
+                    _ => unreachable!("the pool test matched one of these"),
+                }
                 self.free_slot_tail(idx);
                 return;
             }
-            // A Python instance's layout-mode attribute values are the same
-            // small `Value` buffer (`take_arr_buf` hands one back to
-            // `py_attrs_new`): every instance of a class with attributes
-            // allocated one and the sweep freed it. Compiled code reads the
-            // buffer through the slot's hot mirror, cleared above and
-            // rewritten for the next owner at its allocation.
-            #[cfg(feature = "python")]
-            HeapObj::PyAttrs { vals, .. }
-                if self.obj_pool_refill
-                    && obj_pool_enabled()
-                    && (1..=ARR_POOL_MAX_CAP).contains(&vals.capacity()) =>
-            {
-                self.arr_pool.push(vals);
-                self.free_slot_tail(idx);
-                return;
-            }
-            // A small string's bytes, for the next string a producer builds
-            // (`take_byte_buf`). Nothing else in a `JsStr` owns memory.
-            HeapObj::Str(js)
-                if self.byte_pool_want
-                    && self.obj_pool_refill
-                    && obj_pool_enabled()
-                    && (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity()) =>
-            {
-                self.byte_pool.push(js.into_byte_buf());
-                self.free_slot_tail(idx);
-                return;
-            }
-            other => other,
-        };
+        }
         // B210: check the discriminant BY REFERENCE before the courier match —
         // moving the fat `HeapObj` enum through a second match costs ~3.5ns
         // per death, which a sweep of millions of NON-shippable payloads
