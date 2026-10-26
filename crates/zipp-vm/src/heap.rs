@@ -1746,17 +1746,56 @@ impl ExactSizeIterator for Slots<'_> {}
 
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Default)]
+#[repr(C)]
 pub struct ObjMap {
-    /// PRIVATE since dictionary holes (see [`ObjMap::delete_at`]): a slot of
-    /// the list can hold no property, so every read of it goes through the
-    /// accessors that know which slots do.
-    keys: PropKeys,
+    // `#[repr(C)]`, hot fields first: an inline-cache hit reads `shape`,
+    // `class` and `is_ctor` and then `vals`, which in the compiler's order
+    // were spread over 80 bytes of the box (two cache lines, sometimes
+    // three); here they are its first 40. The size stays 112.
+    /// This object's hidden class — see [`crate::shape`]. A redundant summary of
+    /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
+    /// inline cache can ask "same layout?" with one integer compare instead of
+    /// pinning an object IDENTITY (which is what makes the current caches fall
+    /// off a cliff past a handful of instances).
+    ///
+    /// [`shape::DICT`] means "not describable as a sequence of appends" — a key
+    /// was deleted, or an existing property's attributes were redefined. Nothing
+    /// depends on a shape being present, only on it being correct when it is.
+    shape: u32,
+    /// Heap index of the class this object is an instance of (`new C()`), used
+    /// for prototype-style method lookup and `instanceof`. `None` for a plain
+    /// object literal. Own properties (the fields) live in `keys`/`vals`;
+    /// methods are resolved through the class, so they stay non-enumerable.
+    pub class: Option<u32>,
+    /// True for the built-in constructor globals (Object/Array/Map/…), which are
+    /// modelled as objects but are callable constructors: `typeof` reports
+    /// "function" and they satisfy IsConstructor. False for ordinary objects and
+    /// the namespace globals (Reflect/Math/JSON).
+    pub is_ctor: bool,
+    /// This map is a class's materialized `C.prototype` (`Vm::prototype_of`).
+    /// Instances resolve declared members through the `ClassData` member
+    /// tables for as long as those tables still describe this object, so every
+    /// mutation of it must reach a slow path that can record the divergence
+    /// (`Vm::note_class_proto_mutation`): the in-place data-store fast paths
+    /// decline such a map, and `mark_class_proto` pins its shape to DICT so no
+    /// shape-keyed way can serve it. Fits existing bool padding.
+    pub class_proto: bool,
+    /// `[[Extensible]]`: whether new own properties may be added. Cleared by
+    /// `Object.preventExtensions`/`seal`/`freeze`. Default `true`.
+    pub extensible: bool,
+    /// `Object.freeze` on an object whose elements live outside this map;
+    /// see `sealed`.
+    pub frozen: bool,
     /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
     /// access goes through the `val_*`/`vals_*` methods so the storage can
     /// change underneath — the planned literal-born representation keeps the
     /// contiguity the JIT's scale-8 loads require while dropping the per-
     /// object `Vec` header round-trip.
     vals: ValStore,
+    /// PRIVATE since dictionary holes (see [`ObjMap::delete_at`]): a slot of
+    /// the list can hold no property, so every read of it goes through the
+    /// accessors that know which slots do.
+    keys: PropKeys,
     /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
     /// writable/enumerable/configurable + accessor get/set). For a DATA property
     /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
@@ -1764,29 +1803,6 @@ pub struct ObjMap {
     /// through the `attr_*`/`attrs_*` methods below, which is what lets the
     /// common all-default case store nothing — see [`PropAttrs`].
     attrs: PropAttrs,
-    /// Heap index of the class this object is an instance of (`new C()`), used
-    /// for prototype-style method lookup and `instanceof`. `None` for a plain
-    /// object literal. Own properties (the fields) live in `keys`/`vals`;
-    /// methods are resolved through the class, so they stay non-enumerable.
-    pub class: Option<u32>,
-    /// `[[Extensible]]`: whether new own properties may be added. Cleared by
-    /// `Object.preventExtensions`/`seal`/`freeze`. Default `true`.
-    pub extensible: bool,
-    /// True for the built-in constructor globals (Object/Array/Map/…), which are
-    /// modelled as objects but are callable constructors: `typeof` reports
-    /// "function" and they satisfy IsConstructor. False for ordinary objects and
-    /// the namespace globals (Reflect/Math/JSON).
-    pub is_ctor: bool,
-    /// `[[IsRawJSON]]`: set only on the frozen objects returned by
-    /// `JSON.rawJSON`. `JSON.isRawJSON` reports it, and `JSON.stringify` emits
-    /// the object's `"rawJSON"` string property verbatim instead of serialising.
-    pub is_raw_json: bool,
-    /// Explicit Object.seal / Object.freeze markers. For a PLAIN object the
-    /// per-property `attrs` already encode sealed/frozen, but an exotic object
-    /// whose elements live OUTSIDE this map (a dense Array's Vec, a TypedArray's
-    /// buffer) has no per-element attrs, so seal/freeze on it is recorded here.
-    pub sealed: bool,
-    pub frozen: bool,
     /// Lazy hash index over `keys` (see [`PropIndex`]): `None` (linear scan)
     /// until the map reaches [`PROP_INDEX_THRESHOLD`] keys, maintained by
     /// `set`/`define` on append and rebuilt/dropped by `remove`. PRIVATE so
@@ -1802,6 +1818,23 @@ pub struct ObjMap {
     /// ordinary named-property object pays one nullable pointer and no heap
     /// allocation. Slots point into the authoritative parallel vectors.
     numeric_index: Option<Box<NumIndex>>,
+    /// The capacity of the key strings `keys` owns, kept in step by every
+    /// change to the list, so a heap audit sizes the map without visiting
+    /// each key. That visit was most of an audit: a sandbox embedding with
+    /// a heap ceiling spent a quarter of a dictionary-heavy run summing the
+    /// keys of 60-property objects. `u32::MAX` means at least that much,
+    /// and is counted afresh when asked. Fits existing padding.
+    key_bytes: u32,
+    /// `[[IsRawJSON]]`: set only on the frozen objects returned by
+    /// `JSON.rawJSON`. `JSON.isRawJSON` reports it, and `JSON.stringify` emits
+    /// the object's `"rawJSON"` string property verbatim instead of serialising.
+    pub is_raw_json: bool,
+    /// Explicit Object.seal / Object.freeze markers. For a PLAIN object the
+    /// per-property `attrs` already encode sealed/frozen, but an exotic object
+    /// whose elements live OUTSIDE this map (a dense Array's Vec, a TypedArray's
+    /// buffer) has no per-element attrs, so seal/freeze on it is recorded here
+    /// (`frozen` sits with the hot fields above).
+    pub sealed: bool,
     /// Does any key in this map name an ELEMENT of the exotic object it hangs
     /// off — a canonical decimal index, or `"length"`? Maintained by the same
     /// three appends and one removal that maintain `shape`, and read only
@@ -1820,31 +1853,6 @@ pub struct ObjMap {
     /// rather than the compiler-proof-only unchecked push. Fits existing bool
     /// padding, preserving ObjMap's pinned size.
     planned_append_failed: bool,
-    /// This map is a class's materialized `C.prototype` (`Vm::prototype_of`).
-    /// Instances resolve declared members through the `ClassData` member
-    /// tables for as long as those tables still describe this object, so every
-    /// mutation of it must reach a slow path that can record the divergence
-    /// (`Vm::note_class_proto_mutation`): the in-place data-store fast paths
-    /// decline such a map, and `mark_class_proto` pins its shape to DICT so no
-    /// shape-keyed way can serve it. Fits existing bool padding.
-    pub class_proto: bool,
-    /// This object's hidden class — see [`crate::shape`]. A redundant summary of
-    /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
-    /// inline cache can ask "same layout?" with one integer compare instead of
-    /// pinning an object IDENTITY (which is what makes the current caches fall
-    /// off a cliff past a handful of instances).
-    ///
-    /// [`shape::DICT`] means "not describable as a sequence of appends" — a key
-    /// was deleted, or an existing property's attributes were redefined. Nothing
-    /// depends on a shape being present, only on it being correct when it is.
-    shape: u32,
-    /// The capacity of the key strings `keys` owns, kept in step by every
-    /// change to the list, so a heap audit sizes the map without visiting
-    /// each key. That visit was most of an audit: a sandbox embedding with
-    /// a heap ceiling spent a quarter of a dictionary-heavy run summing the
-    /// keys of 60-property objects. `u32::MAX` means at least that much,
-    /// and is counted afresh when asked. Fits existing padding.
-    key_bytes: u32,
 }
 
 impl Clone for ObjMap {
