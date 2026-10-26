@@ -113,8 +113,11 @@ performance measurements or claims that full PyTorch runs in browser WASM.
 
 ## Develop and check
 
-`package.json` overrides Miniflare's `undici` dependency to 7.29.1 to fix
-[GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v).
+`package.json` overrides Miniflare's `undici` dependency to 7.30.1 to fix
+[GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v),
+[GHSA-4qv8-2p9j-2685](https://github.com/advisories/GHSA-4qv8-2p9j-2685),
+[GHSA-f72v-6w45-q472](https://github.com/advisories/GHSA-f72v-6w45-q472) and
+[GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c).
 Remove the override once the Cloudflare tooling resolves a patched version
 without it; verify with `npm audit` after updating the lockfile.
 
