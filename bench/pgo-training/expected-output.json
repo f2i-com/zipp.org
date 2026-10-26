@@ -8,6 +8,7 @@
     {"path": "bench/pgo-training/async-dag-mix.js", "stdout": "async-dag=192:92:2743580189\n", "stderr": ""},
     {"path": "bench/pgo-training/memory-shapes-mix.js", "stdout": "1125858648\n", "stderr": ""},
     {"path": "bench/pgo-training/dictionary-mix.js", "stdout": "80951254\n", "stderr": ""},
-    {"path": "bench/pgo-training/tree-walk-mix.js", "stdout": "tree-walk=70606:3162:3312:6898190\n", "stderr": ""}
+    {"path": "bench/pgo-training/tree-walk-mix.js", "stdout": "tree-walk=70606:3162:3312:6898190\n", "stderr": ""},
+    {"path": "bench/pgo-training/app-scale-mix.js", "stdout": "app-scale=44:2816:3331854087\n", "stderr": ""}
   ]
 }

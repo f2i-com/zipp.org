@@ -2319,7 +2319,7 @@ class ProvenanceTests(unittest.TestCase):
 
         declared = shell_array("PGO_INPUTS")
         self.assertEqual(declared, bench.PGO_TRAINING_INPUTS)
-        self.assertEqual(len(declared), 8)
+        self.assertEqual(len(declared), 9)
         self.assertEqual(len(declared), len(set(declared)))
         self.assertEqual(
             declared.count("bench/pgo-training/dictionary-mix.js"), 1
@@ -2329,6 +2329,7 @@ class ProvenanceTests(unittest.TestCase):
             "bench/pgo-training/template-uri-mix.js",
             "bench/pgo-training/async-dag-mix.js",
             "bench/pgo-training/tree-walk-mix.js",
+            "bench/pgo-training/app-scale-mix.js",
         ):
             self.assertEqual(declared.count(relative), 1)
         self.assertNotIn("bench/pgo-training/text-pipelines-mix.js", declared)

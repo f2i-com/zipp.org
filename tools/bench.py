@@ -194,6 +194,7 @@ PGO_TRAINING_INPUTS = (
     "bench/pgo-training/memory-shapes-mix.js",
     "bench/pgo-training/dictionary-mix.js",
     "bench/pgo-training/tree-walk-mix.js",
+    "bench/pgo-training/app-scale-mix.js",
 )
 PGO_CORPUS_VALIDATOR = "tools/pgo_corpus.py"
 PGO_TRAINING_RUNNER = "tools/pgo_training.py"
