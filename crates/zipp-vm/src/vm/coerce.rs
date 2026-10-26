@@ -2603,6 +2603,24 @@ impl<'p> Vm<'p> {
         if let Some(t) = v.truthy_primitive() {
             return t;
         }
+        // An object with a settled shape, or a function, from its hot mirror:
+        // the JIT's probes rely on a mirror with a shape or a callee naming a
+        // live object or function, and no string or BigInt ever has one
+        // (`Heap::refresh_mirror`; `free_slot` clears it). The heap slot's
+        // read below is a second cache line per object, and on a 32 MB L3 a
+        // miss to memory; the property reads that usually come next go
+        // through the mirror's line. `document.all`, the one falsy object,
+        // is asked for by index.
+        #[cfg(feature = "jit")]
+        {
+            let idx = v.heap_index();
+            let mir = self.heap.hot_mirror_of(idx);
+            if (mir.shape != crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE)
+                && !self.is_htmldda_index(idx)
+            {
+                return true;
+            }
+        }
         // Heap: empty string is falsy; 0n is falsy; everything else truthy.
         if let Some(empty) = self.heap.str_is_empty(v.heap_index()) {
             return !empty;
