@@ -547,7 +547,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         name_global,
         upvalues,
         eval_sites,
-        eval_calls,
+        eval_calls: eval_calls.into_boxed_slice(),
         source,
         fused: Default::default(),
         call_sites: call_sites.into_boxed_slice(),

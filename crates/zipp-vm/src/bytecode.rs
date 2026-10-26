@@ -3063,8 +3063,9 @@ pub struct FuncProto {
     /// names visible at the call site — a sloppy eval's var/function name
     /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
     pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
-    /// One entry per `DirectEval` instruction, by its `call`.
-    pub eval_calls: Vec<EvalCall>,
+    /// One entry per `DirectEval` instruction, by its `call` (boxed: 16
+    /// bytes, and no allocation for the functions with none).
+    pub eval_calls: Box<[EvalCall]>,
     /// Exact source text of this function (the function node's span of the
     /// program source, which the program's functions share), used by
     /// `Function.prototype.toString`. Empty for the synthetic top-level script
@@ -4606,7 +4607,7 @@ mod static_key_plan_layout_tests {
         assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
         assert_eq!(std::mem::size_of::<FusedCode>(), 64);
         assert_eq!(std::mem::size_of::<CallSite>(), 16);
-        assert_eq!(std::mem::size_of::<FuncProto>(), 352);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 368);
     }
 }
 

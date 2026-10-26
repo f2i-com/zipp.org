@@ -485,7 +485,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         name_global: None,
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
-        eval_calls: Vec::new(),
+        eval_calls: Box::default(),
         source: crate::bytecode::SourceText::default(),
         fused: Default::default(),
         call_sites: Box::default(),

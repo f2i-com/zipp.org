@@ -1198,7 +1198,7 @@ impl Compiler {
             name_global: None, // set by the caller for top-level declarations
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            eval_calls: std::mem::take(&mut fc.eval_calls),
+            eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by the caller from the function node's span
             fused: Default::default(),
             call_sites,
@@ -1552,7 +1552,7 @@ impl Compiler {
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            eval_calls: std::mem::take(&mut fc.eval_calls),
+            eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // class methods: caller may override from span
             fused: Default::default(),
             call_sites,
@@ -1843,7 +1843,7 @@ impl Compiler {
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
-            eval_calls: std::mem::take(&mut fc.eval_calls),
+            eval_calls: std::mem::take(&mut fc.eval_calls).into_boxed_slice(),
             source: SourceText::default(), // set by compile_arrow from the arrow's span
             fused: Default::default(),
             call_sites,

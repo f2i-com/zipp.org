@@ -418,7 +418,7 @@ impl FnCompiler<'_> {
             name_global: None,
             upvalues: seed.iter().map(|(_, s)| *s).collect(),
             eval_sites: Vec::new(),
-            eval_calls: Vec::new(),
+            eval_calls: Box::default(),
             source: SourceText::default(),
             fused: Default::default(),
             call_sites: Box::new([]),
