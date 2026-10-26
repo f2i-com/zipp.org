@@ -810,10 +810,11 @@ pub enum Instr {
     /// captured super base (`base`, a SuperBase register) up its chain, with
     /// `this` = the current frame's `this` (reg 0).
     #[allow(dead_code)] // sealed legacy op: source calls now capture GetValue before arguments
+    // (Field order: see `SuperMethodComputed`.)
     SuperMethod {
         dst: Reg,
-        base: Reg,
         home_class_id: u32,
+        base: Reg,
         name: u16,
         arg_base: Reg,
         argc: u16,
@@ -854,10 +855,12 @@ pub enum Instr {
     /// `dst = super[key](args…)`: computed form of SuperMethod.
     #[allow(dead_code)]
     // retained only while its interpreter/codegen support is retired safely
+    // (Field order is the wasm-lite build's layout, `repr(u16)`: a 32-bit
+    // field at offset 4 keeps the variant within 16 bytes.)
     SuperMethodComputed {
         dst: Reg,
-        base: Reg,
         home_class_id: u32,
+        base: Reg,
         key: Reg,
         arg_base: Reg,
         argc: u16,
@@ -2599,13 +2602,14 @@ pub enum Instr {
     // planners and recognizers, the cold paths) reads the original code.
     // Each runs both instructions in one dispatch and continues at `ip + 2`.
     /// `AddInt { dst, a, imm, upd }` then `Move { dst: mdst, src: msrc }`.
+    // (Field order: see `SuperMethodComputed`.)
     FuseAddIntMove {
         dst: Reg,
-        a: Reg,
         imm: i32,
-        upd: bool,
+        a: Reg,
         mdst: Reg,
         msrc: Reg,
+        upd: bool,
     },
     /// `LoadGlobal { dst, idx }` then `LoadGlobal { dst: dst2, idx: idx2 }`.
     FuseLoadGlobal2 {
@@ -2745,12 +2749,13 @@ pub enum Instr {
     },
     /// `AddInt { dst, a, imm, upd }` then a backward `Jump { target }`: a
     /// loop's counter step and its back-edge.
+    // (Field order: see `SuperMethodComputed`.)
     FuseAddIntJump {
         dst: Reg,
-        a: Reg,
         imm: i32,
-        upd: bool,
         target: u32,
+        a: Reg,
+        upd: bool,
     },
     /// `LoadGlobal { dst: gdst, idx }` then `AddInt { dst, a, imm, upd }`
     /// (independent operands as often as not: a global callee, then its
