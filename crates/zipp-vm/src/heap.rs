@@ -7654,7 +7654,7 @@ const GC_GROWTH: usize = 3;
 /// the schedule off garbage they merely failed to sweep).
 const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 
-/// Default backstop: run a major after 64 consecutive minors even if the
+/// Default backstop: run a major after 256 consecutive minors even if the
 /// occupied count never crosses `major_at`, so major-only hygiene (the
 /// `brand_private_names` recompute, reclaiming table capacity) is never
 /// deferred forever. `ZIPP_NURSERY_MAX_MINORS=<n>` is latched by each Heap so
@@ -7662,8 +7662,18 @@ const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 /// accepted: zero would suppress minors entirely, while an unbounded value
 /// could defer hygiene for an effectively unlimited allocation span. W10 note:
 /// at the adaptive cap (`NURSERY_BUDGET_MAX`) the default defers the hygiene
-/// major to at most 64×128k allocations; `major_at` still bounds floats within
-/// one (now larger) budget of the pre-nursery schedule.
+/// major to at most 256×128k allocations; `major_at` still bounds floats
+/// within one (now larger) budget of the pre-nursery schedule.
+///
+/// 256, not 64: a major traces the whole old heap, and below `major_at` the
+/// streak alone decided when one ran. Babel's bundle ran six at 64, each
+/// floor-forced; at 256 it runs three: -2.7% on the 96 MB-L3 die and
+/// -1.7..-2.7% on the 32 MB one, where a major's trace misses to memory
+/// (46 ms of majors on the first were 136 ms there). TypeScript -1.7%,
+/// the GC-bound bench rows -1..-5% (large-heap-churn, strings-build-slice,
+/// async-promise-chain, map-set-heavy, await-sustained, ephemeral). The
+/// cost is floats held longer: Babel's peak slots 384k -> 493k, peak
+/// working set 210 -> 245 MB.
 /// Payload size at which an allocation is counted against the byte-based
 /// collection trigger. Below this the count-based schedule demonstrably keeps
 /// up: 2 KiB objects churn through 512 MB without the ceiling being reached.
@@ -7863,7 +7873,7 @@ const FOOTPRINT_BYTES_PER_ALLOC: usize = 1024;
 /// walk; what grew in place is in no figure until one runs.
 const FOOTPRINT_WALK_BYTES_PER_ALLOC: usize = 256;
 
-const NURSERY_MAX_MINORS_DEFAULT: u32 = 64;
+const NURSERY_MAX_MINORS_DEFAULT: u32 = 256;
 const NURSERY_MAX_MINORS_LIMIT: u32 = 4096;
 
 #[inline]
@@ -9229,8 +9239,8 @@ impl Heap {
         //
         // Which collection it is, and when a major follows, is
         // `big_payload_due`'s: the count schedule alone reaches a major only
-        // after 64 minors, which never arrived in time for buffers that were
-        // promoted and then dropped.
+        // after the backstop's streak of minors, which never arrived in time
+        // for buffers that were promoted and then dropped.
         let big = obj.birth_payload_bytes();
         debug_assert_eq!(big, obj.resident_payload_bytes());
         // With no allocator reporting, weigh every payload: a minor once a
@@ -13606,8 +13616,8 @@ mod tests {
         h.young_budget = 16_384;
         h.live_at_major = 100_000;
         assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_DEFAULT, "a small heap keeps the default");
-        h.live_at_major = 2_000_000;
-        assert_eq!(h.backstop_minors(), 244, "twice the live heap, in young budgets");
+        h.live_at_major = 4_000_000;
+        assert_eq!(h.backstop_minors(), 488, "twice the live heap, in young budgets");
         h.live_at_major = usize::MAX / 2;
         assert_eq!(h.backstop_minors(), NURSERY_MAX_MINORS_LIMIT);
         h.nursery_max_minors = 2;
