@@ -80,8 +80,14 @@
   const fs = {
     constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1, O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024 },
     readFileSync(path, options) {
-      path = toPath(path);
       const enc = encodingOf(options);
+      // Standard input, all of it: `readFileSync(0)`, as scripts read their
+      // input (and "/dev/stdin", which Windows has no file for).
+      if (path === 0 || path === "/dev/stdin") {
+        const text = host.readStdin(-1);
+        return enc === "utf8" || enc === "utf-8" ? text : enc ? Buffer.from(text).toString(enc) : Buffer.from(text);
+      }
+      path = toPath(path);
       let data;
       try {
         data = host.readFile(path, false);

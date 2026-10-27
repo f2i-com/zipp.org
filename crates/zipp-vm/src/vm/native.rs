@@ -178,6 +178,7 @@ pub const NODE_HOST_FORMAT: u16 = 2115;
 pub const NODE_HOST_FS: u16 = 2116;
 pub const NODE_HOST_CJS: u16 = 2117;
 pub const NODE_HOST_INSPECT: u16 = 2118;
+pub const NODE_HOST_READ_STDIN: u16 = 2119;
 pub const FR_REGISTER: u16 = 298;
 pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
@@ -1769,6 +1770,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         NODE_HOST_FS => ("fs", 4),
         NODE_HOST_CJS => ("cjs", 0),
         NODE_HOST_INSPECT => ("inspect", 1),
+        NODE_HOST_READ_STDIN => ("readStdin", 1),
         FR_REGISTER => ("register", 2),
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),

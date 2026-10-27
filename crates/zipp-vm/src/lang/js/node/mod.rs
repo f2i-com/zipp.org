@@ -53,6 +53,7 @@ const PARTS: &[(&str, &str)] = &[
 ];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static LIVE: AtomicBool = AtomicBool::new(false);
 static ARGV: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// `process.exitCode` at the end of the run, for the command's exit status.
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -64,6 +65,14 @@ pub(crate) fn set_enabled(on: bool, argv: Vec<String>) {
     if let Ok(mut a) = ARGV.lock() {
         *a = argv;
     }
+}
+
+/// Write what programs print as they print it, as `node` does, instead of
+/// collecting it for the caller (the command's runs: a long-running
+/// program's progress and a prompt before reading input must appear when
+/// written; an embedder or a test reads the run's output afterwards).
+pub(crate) fn set_live_output(on: bool) {
+    LIVE.store(on, Ordering::Relaxed);
 }
 
 /// Whether programs this process runs get Node's globals.
@@ -86,6 +95,16 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         self.node_installed = true;
+        if LIVE.load(Ordering::Relaxed) && self.console_sink.is_none() {
+            self.console_sink = Some(Box::new(|stream, line| {
+                use std::io::Write;
+                // A closed pipe (`zipp app.ts | head`) ends output, not the run.
+                let _ = match stream {
+                    crate::vm::ConsoleStream::Stdout => writeln!(std::io::stdout().lock(), "{line}"),
+                    crate::vm::ConsoleStream::Stderr => writeln!(std::io::stderr().lock(), "{line}"),
+                };
+            }));
+        }
         let install = self.eval_script(BOOTSTRAP)?;
         let host = self.node_host_object();
         self.node_host = host;
@@ -323,6 +342,7 @@ impl<'p> Vm<'p> {
             ("fs", NODE_HOST_FS),
             ("cjs", NODE_HOST_CJS),
             ("inspect", NODE_HOST_INSPECT),
+            ("readStdin", NODE_HOST_READ_STDIN),
         ] {
             let f = Value::heap(self.heap.alloc(HeapObj::Native(id)));
             m.define(name, f, attr);
@@ -446,6 +466,34 @@ impl<'p> Vm<'p> {
                 // and the module loader's imports of CommonJS files.
                 self.node_cjs_fn("self")?
             }
+            NODE_HOST_READ_STDIN => {
+                // `readStdin(max)`: up to `max` bytes as they arrive (a
+                // terminal hands over a line at a time), or all of it when
+                // `max` is negative; null at the end of input.
+                use std::io::Read;
+                let max = self.to_number_coerce(arg(0))?;
+                let mut stdin = std::io::stdin().lock();
+                let mut bytes = Vec::new();
+                if max < 0.0 {
+                    stdin
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| io_error(&e, "read", "<stdin>"))?;
+                    let text = String::from_utf8(bytes)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                    return Ok(self.alloc_str(text));
+                }
+                bytes.resize((max as usize).clamp(1, 1 << 20), 0);
+                let n = stdin
+                    .read(&mut bytes)
+                    .map_err(|e| io_error(&e, "read", "<stdin>"))?;
+                if n == 0 {
+                    return Ok(Value::NULL);
+                }
+                bytes.truncate(n);
+                let text = String::from_utf8(bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                self.alloc_str(text)
+            }
             NODE_HOST_READ_FILE => {
                 let path = self.to_js_string(arg(0))?;
                 let bytes = std::fs::read(&path).map_err(|e| io_error(&e, "open", &path))?;
@@ -541,6 +589,19 @@ impl<'p> Vm<'p> {
     /// Text written to a stream: complete lines become console lines, a
     /// trailing partial one is kept for what follows.
     fn node_write(&mut self, text: &str, to_stderr: bool) {
+        // Written as it is, partial line and all: a prompt is on screen
+        // before the read that waits for its answer.
+        if LIVE.load(Ordering::Relaxed) && self.console_sink.is_some() {
+            use std::io::Write;
+            let _ = if to_stderr {
+                let mut e = std::io::stderr().lock();
+                e.write_all(text.as_bytes()).and_then(|_| e.flush())
+            } else {
+                let mut o = std::io::stdout().lock();
+                o.write_all(text.as_bytes()).and_then(|_| o.flush())
+            };
+            return;
+        }
         let i = to_stderr as usize;
         let mut buf = std::mem::take(&mut self.node_partial[i]);
         buf.push_str(text);

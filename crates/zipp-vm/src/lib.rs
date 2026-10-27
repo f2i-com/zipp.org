@@ -738,6 +738,13 @@ pub fn set_node_runtime(on: bool, argv: Vec<String>) {
     vm::node::set_enabled(on, argv);
 }
 
+/// Write what a program run with Node's globals prints as it prints it, to
+/// this process's stdout and stderr, instead of into its `Outcome` (the
+/// command's runs; see `set_node_runtime`).
+pub fn set_node_live_output(on: bool) {
+    vm::node::set_live_output(on);
+}
+
 /// The exit status a program run with Node's globals asked for
 /// (`process.exitCode`), 0 when it set none.
 pub fn node_exit_code() -> i32 {

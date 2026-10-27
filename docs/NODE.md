@@ -11,6 +11,12 @@ It is the command's. An embedder, the WebAssembly engines, the sandboxed
 runner and a run with a harness prelude (the test262 runner) get the plain
 ECMAScript global object. `ZIPP_NO_NODE=1` turns it off for a run.
 
+The command's runs print as the program prints, as `node` does: each line
+of `console.log` and each `process.stdout.write`, partial line and all, is
+written when it happens (an embedder, which reads the run's output
+afterwards, still gets it collected). `fs.readFileSync(0)` (or
+`"/dev/stdin"`) reads standard input to its end.
+
 ## Globals
 
 `process` (`argv`, `env`, `platform`, `arch`, `cwd()`, `exit()`,

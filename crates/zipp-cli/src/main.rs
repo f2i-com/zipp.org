@@ -414,6 +414,7 @@ pub(crate) fn enable_node_runtime(path: &str, program_args: &[String]) {
     let mut argv = vec![exe, script];
     argv.extend(program_args.iter().cloned());
     zipp_vm::set_node_runtime(true, argv);
+    zipp_vm::set_node_live_output(true);
 }
 
 /// Print an engine outcome the way `node` does — `console.log` to stdout,
