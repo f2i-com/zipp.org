@@ -244,14 +244,17 @@ rab.resize(8);
 console.log("zero|" + tracking.byteLength + "|" + tracking.byteOffset + "|" +
             caught(function () { return tracking.getUint8(0); }));
 
-// Once the live buffer is shorter than byteOffset, both accessors and methods
-// report an out-of-bounds view (TypeError).
+// Once the live buffer is shorter than byteOffset, the view is out of bounds:
+// its methods throw a TypeError and its byteLength and byteOffset read 0
+// (tc39/ecma262#3972). Node still throws from the two getters, so their line
+// is checked apart from the comparison (OOB_ACCESSORS).
 rab.resize(7);
 console.log("shrink-invalid|" +
-            caught(function () { return tracking.byteLength; }) + "|" +
-            caught(function () { return tracking.byteOffset; }) + "|" +
             caught(function () { return hotTracking(0, 1); }) + "|" +
             caught(function () { tracking.setUint8(0, 1); return "ok"; }));
+console.log("oob-accessors|" +
+            caught(function () { return tracking.byteLength; }) + "|" +
+            caught(function () { return tracking.byteOffset; }));
 
 // Regrowth revives both views. The auto-length view can address bytes beyond
 // its construction-time 16-byte length; the fixed view stays eight bytes.
@@ -506,10 +509,21 @@ fn dataview_tracking_live_length_worker() {
     let expected: Vec<String> = String::from_utf8(node.stdout)
         .expect("node output is UTF-8")
         .lines()
+        .filter(|line| !line.starts_with(OOB_ACCESSORS))
         .map(str::to_owned)
         .collect();
-    assert_eq!(out.output, expected);
+    let (oob, rest): (Vec<String>, Vec<String>) = out
+        .output
+        .iter()
+        .cloned()
+        .partition(|line| line.starts_with(OOB_ACCESSORS));
+    assert_eq!(oob, ["oob-accessors|v:0|v:0"]);
+    assert_eq!(rest, expected);
 }
+
+/// The out-of-bounds getters' line of `TRACKING_SOURCE`, which reads 0 under
+/// tc39/ecma262#3972 where Node still throws.
+const OOB_ACCESSORS: &str = "oob-accessors|";
 
 #[test]
 fn dataview_tracking_live_length_matches_node_in_all_tiers() {

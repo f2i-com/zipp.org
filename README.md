@@ -29,7 +29,7 @@ and Bun.
 
 **Languages today: JavaScript and Python.**
 
-- **JavaScript** is complete and modern: ES2025, passing **99.999% of test262**: 96,229 / 96,230 executions of the official conformance suite,
+- **JavaScript** is complete and modern: ES2025, passing **99.999% of test262**: 96,227 / 96,228 executions of the official conformance suite,
   unmodified.
 - **Python** is an experimental subset, compiled straight to ZIPP bytecode (no
   CPython inside), with a bundled `torch` subset for tensors, autograd and

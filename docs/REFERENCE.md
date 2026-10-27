@@ -74,7 +74,7 @@ compile-time JIT/unsafe exclusion, or the full resource policy, matters.
 ## Conformance and language coverage
 
 The core Test262 corpus is pinned to
-`d53ebc8b1931d9f1541e43d59650776e4b766248`, including staging and excluding the
+`0b4e0812022b18236b5276d2804948fdd9f71603`, including staging and excluding the
 separate `intl402` suite. See the README for measured counts and build identity.
 CI runs the unmodified corpus once against the
 [expected-failure manifest](../tools/test262-expected-failures.txt), whose single

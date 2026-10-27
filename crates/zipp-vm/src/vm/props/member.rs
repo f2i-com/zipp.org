@@ -1948,10 +1948,11 @@ impl<'p> Vm<'p> {
         } = self.heap.get(obj.heap_index())
         {
             let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
-            // IsViewOutOfBounds: byteLength / byteOffset throw a TypeError when the
-            // viewed buffer is detached, or when a resizable buffer has shrunk so the
-            // view no longer fits (fixed-length: offset+length > current size;
-            // length-tracking: offset > current size). `buffer` stays readable.
+            // IsViewOutOfBounds: byteLength / byteOffset answer +0 when the viewed
+            // buffer is detached, or when a resizable buffer has shrunk so the view
+            // no longer fits (fixed-length: offset+length > current size;
+            // length-tracking: offset > current size), as the TypedArray getters
+            // do (tc39/ecma262#3972; they threw a TypeError before it).
             let detached = matches!(
                 self.heap.get(buffer),
                 HeapObj::ArrayBuffer { detached: true, .. }
@@ -1975,11 +1976,7 @@ impl<'p> Vm<'p> {
                 return Err(self.realm_thrown_from_proto(obj.heap_index(), msg));
             }
             return Ok(match key {
-                "byteLength" | "byteOffset" if oob => {
-                    return Err(Thrown(format!(
-                    "TypeError: get DataView.prototype.{key}: the viewed buffer is out of bounds"
-                )))
-                }
+                "byteLength" | "byteOffset" if oob => Value::num(0.0),
                 // A length-tracking view reports the buffer's current remaining size.
                 "byteLength" if tracking => Value::num((cur - byte_offset) as f64),
                 "byteLength" => Value::num(byte_length as f64),

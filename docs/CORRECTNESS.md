@@ -1,15 +1,15 @@
 # Correctness and language coverage
 
 The unmodified pinned core Test262 corpus passes
-**99.999% of test262**: 96,229 / 96,230 executions, with one documented expected
+**99.999% of test262**: 96,227 / 96,228 executions, with one documented expected
 failure and zero skips. The original DateTimeFormat ECMA-402 shard also passes
 **490 / 490**, without changes or skips. The corpus is pinned to
-`d53ebc8b1931d9f1541e43d59650776e4b766248` (13 October 2026), including staging
+`0b4e0812022b18236b5276d2804948fdd9f71603` (26 October 2026), including staging
 and excluding the separate ECMA-402 suite; hosted CI runs it once, unmodified.
 
 | Validation profile | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
-| Original pinned core Test262 | 96,229 | 1 | 0 |
+| Original pinned core Test262 | 96,227 | 1 | 0 |
 | Original DateTimeFormat ECMA-402 tests | 490 | 0 | 0 |
 
 The one failure, `annexB/language/function-code/block-decl-func-skip-arguments.js`
@@ -30,6 +30,13 @@ Moving the pin found 236 executions the engine failed: the new stage 4
 bound, `Promise.try`'s unwrapped result and the test host's module-source
 prototype. All are fixed; the iterator and Promise.try regression tests run in
 every tier and under GC stress.
+
+The 26 October 2026 pin (`0b4e0812`, one commit later) expects a DataView's
+`byteLength` and `byteOffset` to read 0 once its buffer is detached or shrinks
+beneath it, as a typed array's do (tc39/ecma262#3972, which has consensus).
+The engine threw a `TypeError` there, failing 12 executions; it now answers
+0, and the old pin's two detached-buffer tests, merged into one, leave the
+corpus two executions smaller.
 
 The [12 September 2026 correctness audit](archive/audits/2026-09-12-correctness.md)
 recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.

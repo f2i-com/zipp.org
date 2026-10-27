@@ -1,5 +1,5 @@
 # Expected failures of the pinned Test262 corpus (tc39/test262
-# d53ebc8b1931d9f1541e43d59650776e4b766248, test/ including staging, without
+# 0b4e0812022b18236b5276d2804948fdd9f71603, test/ including staging, without
 # intl402). Each entry still RUNS; `run_test262.py --expected-failures` fails on
 # any other failure, on an entry that passes, and on a skip.
 #
