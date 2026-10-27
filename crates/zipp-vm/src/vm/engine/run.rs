@@ -1170,11 +1170,16 @@ impl<'p> Vm<'p> {
                 "RangeError: Maximum call stack size exceeded".into(),
             ));
         }
+        // Both native entries below want a compiled body, which a VM with its
+        // JIT off has none of: the two calls were a twentieth of a Proxy trap
+        // made from interpreted code.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some(r) =
-            self.call_compiled_windowed(callee, this, WinArgs::Slice(args), func_id, closure)
-        {
-            return r;
+        if self.jit_enabled {
+            if let Some(r) =
+                self.call_compiled_windowed(callee, this, WinArgs::Slice(args), func_id, closure)
+            {
+                return r;
+            }
         }
         // Copy the scalar layout fields out so the FuncProto borrow (which now
         // spans the whole `&self` via `func()`) ends before the `self.regs` /
@@ -1256,8 +1261,10 @@ impl<'p> Vm<'p> {
             callee,
         });
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some(r) = self.frame_run_compiled(func_id, stop_depth) {
-            return r;
+        if self.jit_enabled {
+            if let Some(r) = self.frame_run_compiled(func_id, stop_depth) {
+                return r;
+            }
         }
         self.run_loop(stop_depth)
     }
