@@ -936,7 +936,13 @@ impl<'p> Vm<'p> {
                     obj
                 };
                 // A return-override result receives this class's private brand.
-                self.brand_instance(result, cval);
+                // `obj` itself has it already: a base class's from the entry
+                // above, a derived one's from its `super()`'s completion
+                // (`super_ctor_complete`), which brands what that call
+                // produced, the `super_this` result included.
+                if result != obj {
+                    self.brand_instance(result, cval);
+                }
                 return Ok(result);
             }
             Ok(obj)

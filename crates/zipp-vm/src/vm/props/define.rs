@@ -45,16 +45,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         let oi = target.heap_index();
-        let b0 = match key.as_bytes().first() {
-            Some(&b) => b,
-            None => return false,
-        };
-        if b0 == b'#'
-            || b0 == b'@'
-            || b0 == b'-'
-            || b0.is_ascii_digit()
-            || key == "__proto__"
-            || key == "length"
+        if !Self::field_key_appends(key)
             || oi == self.global_this
             || oi == self.arr_proto
             || oi == self.obj_proto
@@ -111,6 +102,20 @@ impl<'p> Vm<'p> {
         // A key add can move `vals` (inline caches address it).
         self.heap.bump_version(oi);
         true
+    }
+
+    /// Whether a field definition of `key` may be an append
+    /// (`define_field_append`, `Vm::ic_define_field`): not a private, symbol
+    /// or index-like key, nor `__proto__` or `length`.
+    pub(crate) fn field_key_appends(key: &str) -> bool {
+        match key.as_bytes().first() {
+            Some(&b) => {
+                !(b == b'#' || b == b'@' || b == b'-' || b.is_ascii_digit())
+                    && key != "__proto__"
+                    && key != "length"
+            }
+            None => false,
+        }
     }
 
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own

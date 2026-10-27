@@ -5592,6 +5592,11 @@ pub struct ClassData {
     /// Shapes are never reissued, so while `statics` keeps that shape the
     /// proof stands (`Vm::instanceof_fast`).
     pub no_has_instance_shape: std::cell::Cell<u32>,
+    /// How many private entries (brands and fields) an instance of this
+    /// class gets from its construction along `parent`, counted at its first
+    /// (`Vm::private_slots_hint`); 0 before. Only a capacity: a chain
+    /// re-prototyped since costs a regrowth, nothing more.
+    pub private_slots: std::cell::Cell<u32>,
 }
 
 /// The per-EVALUATION decoration state of a decorated class: what the decorator

@@ -406,6 +406,8 @@ pub(crate) enum IcEntry {
     /// here. Only the way-0 own hits read it (`ic_private_get_tail`,
     /// `ic_private_set_tail`): a private name fills no other way. Last, like
     /// `NsExport`. The safe profile has no own hits and never fills one.
+    /// A field initializer's site holds one with `pos` [`PRIVATE_ADD`]: the
+    /// field's add (`Vm::ic_private_add_fill`).
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     Private {
         head: u64,
@@ -414,6 +416,10 @@ pub(crate) enum IcEntry {
         pos: u32,
     },
 }
+
+/// The `pos` of an `IcEntry::Private` way that adds its field.
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+pub(crate) const PRIVATE_ADD: u32 = u32::MAX;
 
 // `SuperData` already established this interpreter-cache entry budget. Keep
 // additional guards in the existing padding/variant envelope so every
@@ -1441,6 +1447,9 @@ impl<'p> Vm<'p> {
         if self.private_memo_key(ctx) != Some(head) {
             return false;
         }
+        if pos == PRIVATE_ADD {
+            return self.private_field_add_hit(idx, brand, id, val);
+        }
         let Some((at, _)) = self.private_field_at(idx, brand, id, pos) else {
             return false;
         };
@@ -1474,6 +1483,33 @@ impl<'p> Vm<'p> {
             site.n = site.n.max(1);
         }
         // The own hit reads the receiver through its mirror.
+        self.heap.refresh_mirror(recv.heap_index());
+    }
+
+    /// Fill a field initializer's private-name site, a `SetProp` that ran as
+    /// `ctx` and added the field `(brand, id)` to `recv`: way 0 becomes an
+    /// `IcEntry::Private` whose `pos` is [`PRIVATE_ADD`], which the set's own
+    /// hit hands to `private_field_add_hit`. Such a site only ever adds (an
+    /// assignment to a private field is a `SetPrivate`), and every instance
+    /// it initializes took `private_set_slow`'s resolution, its failed write
+    /// and its checks, for each of its private fields.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ic_private_add_fill(&mut self, func_id: u32, ip: usize, ctx: Value, brand: u64, id: u32, recv: Value) {
+        if !recv.is_heap() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_)) {
+            return;
+        }
+        let Some(head) = self.private_memo_key(ctx) else {
+            return;
+        };
+        if let Some(site) = self.ic_site_mut(func_id, ip) {
+            site.entries[0] = IcEntry::Private {
+                head,
+                brand,
+                id,
+                pos: PRIVATE_ADD,
+            };
+            site.n = site.n.max(1);
+        }
         self.heap.refresh_mirror(recv.heap_index());
     }
 
@@ -2983,6 +3019,73 @@ impl<'p> Vm<'p> {
                 setter,
             },
         }
+    }
+
+    // ── DefineField sites ──
+
+    /// A class field's definition (`DefineField`, CreateDataPropertyOrThrow)
+    /// as an append through the site's ways: an `AddData` entry whose
+    /// `before` is the receiver's shape takes the key to `after`, as
+    /// `define_field_append` would, without its key tests, own lookup and
+    /// transition search. A definition consults no prototype, so the entries
+    /// a `DefineField` site holds have empty chains, and nothing reads them
+    /// as a `SetProp`'s. `false`, with nothing done, sends the definition the
+    /// full way; a miss that is an append fills a way.
+    ///
+    /// Every instance of a class with public fields took that search for
+    /// each of them: two fields were an eighth of constructing an instance of
+    /// class-features' hierarchy.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ic_define_field(&mut self, func_id: u32, ip: usize, recv: Value, key: &str, val: Value) -> bool {
+        if !recv.is_heap() || !self.deferred_ns_state.is_empty() {
+            return false;
+        }
+        let idx = recv.heap_index();
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return false;
+        };
+        if !m.extensible
+            || m.is_ctor
+            || m.class_proto
+            || !m.shape_guardable()
+            || idx == self.obj_proto
+            || !self.ic_obj_ok_map(idx, m)
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+        {
+            return false;
+        }
+        let shape = m.shape();
+        let hit = self.ic_site(func_id, ip).and_then(|site| {
+            site.entries[..site.n as usize].iter().find_map(|e| match *e {
+                IcEntry::AddData { before, after, .. } if before == shape => Some(after),
+                _ => None,
+            })
+        });
+        let after = match hit {
+            Some(after) => after,
+            None => {
+                if !Self::field_key_appends(key) || m.pos(key).is_some() {
+                    return false;
+                }
+                let after = crate::shape::add(shape, key, crate::shape::attr_bits(true, true, true, false));
+                if after == crate::shape::DICT {
+                    return false;
+                }
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::AddData {
+                        before: shape,
+                        after,
+                        first: 0,
+                        hops: ([(0, 0); IC_MAX_HOPS], 0),
+                    },
+                );
+                after
+            }
+        };
+        self.ic_apply_set(SetPlan::Append { idx, after }, key, val);
+        true
     }
 
     /// Validate an OWN data slot for a write (still a writable data property

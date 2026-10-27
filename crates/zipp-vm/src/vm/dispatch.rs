@@ -101,6 +101,9 @@ pub(crate) const LEAN_DESC_SLOPPY: u32 = 1 << 25;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
 
+/// How many arguments `Vm::arg_window` copies out on the stack.
+const ARGS_ON_STACK: usize = 8;
+
 #[inline(always)]
 fn lean_calls_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
@@ -7419,11 +7422,39 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Result<(), Thrown> {
-        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+        let mut big = Vec::new();
+        let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
         self.sync_top_ip(ip);
-        let result = self.construct(cv, &args)?;
+        let result = self.construct(cv, args)?;
         self.set(base, dst, result);
         Ok(())
+    }
+
+    /// The `argc` argument registers at `arg_base` of the frame at `base`,
+    /// copied out for a callee that takes a slice: into `small` when they
+    /// fit, else into `big`. (The registers stay the roots of the values.)
+    /// Every `new C(a, b)` and `super(a, b)` allocated and freed a `Vec` for
+    /// them, a fortieth of constructing a class hierarchy's instance.
+    #[inline(always)]
+    fn arg_window<'s>(
+        &self,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        small: &'s mut [Value; ARGS_ON_STACK],
+        big: &'s mut Vec<Value>,
+    ) -> &'s [Value] {
+        let n = argc as usize;
+        if n <= ARGS_ON_STACK {
+            for (i, slot) in small[..n].iter_mut().enumerate() {
+                *slot = self.get(base, arg_base + i as u16);
+            }
+            &small[..n]
+        } else {
+            *big = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+            big
+        }
     }
 
     /// `SuperCtor` at `ip` (`super(...)`), out of `dispatch_body` as
@@ -7446,7 +7477,9 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: superclass is not a constructor".into()));
         }
         let this = self.get(base, 0);
-        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
+        let mut big = Vec::new();
+        let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
         // `super(...)` keeps the derived activation's new.target.
         let nt = self
             .frames
@@ -7456,7 +7489,7 @@ impl<'p> Vm<'p> {
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.
-        let produced = self.run_class_ctor(parent, this, &args, nt)?;
+        let produced = self.run_class_ctor(parent, this, args, nt)?;
         self.super_ctor_complete(base, this, produced, home_class_id)
     }
 

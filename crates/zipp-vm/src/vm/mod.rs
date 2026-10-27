@@ -2181,11 +2181,6 @@ pub struct Vm<'p> {
     /// finds through `method_brand` and `brand_owner`, in one load. Pruned
     /// when either the callable or the class dies.
     pub(crate) ctor_owner: crate::slot_table::SlotTable<u32>,
-    /// Extra private brands installed on a specific INSTANCE that its `map.class`
-    /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
-    /// receives a class's private fields/brand without becoming an instanceof that
-    /// class. Checked by `instance_has_brand` alongside the class chain. Pruned by GC.
-    instance_brand: crate::slot_table::SlotTable<Vec<u64>>,
     /// Private NAMES (with the "#" prefix) declared by the class owning each brand.
     /// Lets a private access resolve "#x" to the innermost brand in the lexical
     /// chain whose class actually declares it (precise + shadow-aware) instead of
@@ -2433,6 +2428,12 @@ pub struct Vm<'p> {
     /// sibling classes or other evaluations never collide; invisible to
     /// reflection, proxy traps and property enumeration by construction.
     /// Values are GC roots; entries pruned when the instance dies.
+    ///
+    /// The list also holds the object's private brands, each as
+    /// `(brand, values::BRAND_ENTRY, undefined)` where its class installed it
+    /// (`instance_has_brand`): an instance's, at each class's
+    /// InitializeInstanceElements, and a return-override object's, which
+    /// receives a class's brand without becoming an instance of it.
     ///
     /// It was a SipHash map per instance from `(brand, String)`: every
     /// construction of a class with a private field allocated a map and a

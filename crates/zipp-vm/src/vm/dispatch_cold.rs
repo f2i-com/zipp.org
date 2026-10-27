@@ -768,6 +768,7 @@ impl<'p> Vm<'p> {
                     proto_dirty: false,
                     reproto_instances: false,
                     no_has_instance_shape: std::cell::Cell::new(crate::shape::DICT),
+                    private_slots: std::cell::Cell::new(0),
                 }))));
                 self.brand_owner.insert(private_brand, v.heap_index());
                 // Remember it so `super` in a derived class can reach it, and
@@ -3514,7 +3515,13 @@ impl<'p> Vm<'p> {
                 let o = self.get(base, obj);
                 let v = self.get(base, val);
                 let key = strs[name as usize].as_str();
-                self.define_field(o, &key, v)?;
+                #[cfg(not(feature = "safe-sandbox"))]
+                let done = self.ic_define_field(func_id, ip, o, key, v);
+                #[cfg(feature = "safe-sandbox")]
+                let done = false;
+                if !done {
+                    self.define_field(o, &key, v)?;
+                }
                 ip += 1;
             }
             Instr::InitDataPropDyn { obj, key, val } => {

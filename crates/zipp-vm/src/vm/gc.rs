@@ -1111,7 +1111,6 @@ impl Vm<'_> {
         self.method_brand.retain_marked(&marks);
         // A kept constructor's class (see `Vm::ctor_owner`): gone with either.
         self.ctor_owner.retain(|&k, &mut c| marks[k as usize] && marks[c as usize]);
-        self.instance_brand.retain_marked(&marks);
         let owners = self.brand_owner.len();
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
         if self.brand_owner.len() != owners {
@@ -1128,9 +1127,7 @@ impl Vm<'_> {
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
-            for bs in self.instance_brand.values() {
-                live_brands.extend(bs.iter().copied());
-            }
+            self.extend_installed_brands(&mut live_brands);
             self.brand_private_names
                 .retain(|b, _| live_brands.contains(b));
         }
@@ -1441,7 +1438,6 @@ impl Vm<'_> {
         if !self.ctor_owner.is_empty() {
             self.ctor_owner.retain(|&k, &mut c| live_bits[k as usize] && live_bits[c as usize]);
         }
-        prune_map!(self.instance_brand);
         // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
             let owners = self.brand_owner.len();
@@ -1488,9 +1484,7 @@ impl Vm<'_> {
             for bs in self.method_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
-            for bs in self.instance_brand.values() {
-                live_brands.extend(bs.iter().copied());
-            }
+            self.extend_installed_brands(&mut live_brands);
             self.brand_private_names
                 .retain(|b, _| live_brands.contains(b));
             self.brand_names_pruned_len = self.brand_private_names.len();

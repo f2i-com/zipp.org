@@ -74,6 +74,11 @@ fn private_memo_index(head: u64, site: u64) -> usize {
     (h >> 22) as usize & (PRIVATE_MEMO_SLOTS - 1)
 }
 
+/// The name id of a brand's entry in an object's private list
+/// (`Vm::private_fields`): `(brand, BRAND_ENTRY, undefined)` marks the brand
+/// installed (PrivateBrandAdd). No private name is interned with it.
+pub(crate) const BRAND_ENTRY: u32 = u32::MAX;
+
 /// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
 /// See [`Vm::regexp_pattern_snapshot`].
 pub(crate) struct RegExpPre {
@@ -653,9 +658,25 @@ impl<'p> Vm<'p> {
         // super() completion). Before that point the class's privates are NOT
         // yet on the instance (prod-private-*-before-super-return), even
         // though map.class already links to the class.
-        self.instance_brand
-            .get(&receiver.heap_index())
-            .is_some_and(|bs| bs.contains(&brand))
+        self.has_brand_entry(receiver.heap_index(), brand)
+    }
+
+    /// Whether heap `idx`'s private list holds the brand entry of `brand`
+    /// (`BRAND_ENTRY`), which `install_brand` adds.
+    #[inline]
+    pub(crate) fn has_brand_entry(&self, idx: u32, brand: u64) -> bool {
+        self.private_fields
+            .get(&idx)
+            .is_some_and(|es| es.iter().any(|e| e.0 == brand && e.1 == BRAND_ENTRY))
+    }
+
+    /// Every brand installed on an object the private lists still hold, into
+    /// `set`: with the lexical chains' brands, the ones whose declared names
+    /// the collector keeps.
+    pub(crate) fn extend_installed_brands(&self, set: &mut rustc_hash::FxHashSet<u64>) {
+        for es in self.private_fields.values() {
+            set.extend(es.iter().filter(|e| e.1 == BRAND_ENTRY).map(|e| e.0));
+        }
     }
 
     /// PrivateBrandAdd: install a class's own private brand on an instance at
@@ -674,13 +695,65 @@ impl<'p> Vm<'p> {
             if !self.brand_private_names.contains_key(&own) {
                 return;
             }
-            let e = self.instance_brand.entry(inst.heap_index()).or_default();
-            if !e.contains(&own) {
-                e.push(own);
-                #[cfg(feature = "instrument")]
-                self.instrument_mark_external_heap_growth();
-            }
+            self.install_brand(inst.heap_index(), own);
         }
+    }
+
+    /// The brand entry of `brand` on heap `idx`, unless it is there: the
+    /// first of an instance's private entries, which makes its list with
+    /// room for all of them (`private_slots_hint`).
+    ///
+    /// The brands were a list of their own per instance, so constructing an
+    /// instance of a class with private fields allocated two, and grew the
+    /// field list once or twice on the way: a twentieth of constructing a
+    /// three-level hierarchy's instance.
+    fn install_brand(&mut self, idx: u32, brand: u64) {
+        let cap = if self.private_fields.has(idx) {
+            0
+        } else {
+            self.private_slots_hint(idx)
+        };
+        let es = self.private_fields.entry(idx).or_insert_with(|| Vec::with_capacity(cap));
+        if !es.iter().any(|e| e.0 == brand && e.1 == BRAND_ENTRY) {
+            es.push((brand, BRAND_ENTRY, Value::UNDEFINED));
+            #[cfg(feature = "instrument")]
+            self.instrument_mark_external_heap_growth();
+        }
+    }
+
+    /// How many private entries a class instance at heap `idx` gets from its
+    /// construction: for each class along its class's `parent` chain that
+    /// declares private names, its brand and its instance fields. Counted
+    /// once per class (`ClassData::private_slots`); 0 for anything else.
+    fn private_slots_hint(&self, idx: u32) -> usize {
+        let Some(class) = (match self.heap.get(idx) {
+            HeapObj::Object(m) => m.class,
+            _ => None,
+        }) else {
+            return 0;
+        };
+        let HeapObj::Class(c) = self.heap.get(class) else {
+            return 0;
+        };
+        let known = c.private_slots.get();
+        if known != 0 {
+            return known as usize;
+        }
+        let mut n = 0u32;
+        let mut cur = Some(class);
+        for _ in 0..64 {
+            let Some(ci) = cur else { break };
+            let HeapObj::Class(level) = self.heap.get(ci) else {
+                break;
+            };
+            let own = self.method_brand.get(&ci).and_then(|b| b.first());
+            if let Some(names) = own.and_then(|b| self.brand_private_names.get(b)) {
+                n += 1 + names.iter().filter(|(_, k)| *k == 0).count() as u32;
+            }
+            cur = level.parent;
+        }
+        c.private_slots.set(n.max(1));
+        n as usize
     }
 
     /// Infallible extensibility of a plain heap target (no proxy traps): an
@@ -731,10 +804,12 @@ impl<'p> Vm<'p> {
             Some(&b) => b,
             None => return Ok(()),
         };
-        let has_instance_privates = self
-            .brand_private_names
-            .get(&own)
-            .is_some_and(|ns| ns.iter().any(|(_, k)| k & 8 == 0));
+        // A brand without declared names is one `brand_instance` installs
+        // nothing for.
+        let Some(names) = self.brand_private_names.get(&own) else {
+            return Ok(());
+        };
+        let has_instance_privates = names.iter().any(|(_, k)| k & 8 == 0);
         if has_instance_privates {
             if is_override && self.instance_has_brand(inst, own) {
                 return Err(Thrown::from_static(
@@ -749,7 +824,8 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.brand_instance(inst, classval);
+        // `brand_instance`, with the brand and its names already looked up.
+        self.install_brand(inst.heap_index(), own);
         Ok(())
     }
 
@@ -982,6 +1058,45 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// PrivateFieldAdd at a field initializer's cached site
+    /// (`Vm::ic_private_add_fill`), the name resolved: what
+    /// `private_set_slow` makes of the add for an extensible ordinary object
+    /// that carries the brand and lacks the field. `false`, with nothing
+    /// done, for any other receiver, which takes that path.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn private_field_add_hit(&mut self, idx: u32, brand: u64, id: u32, v: Value) -> bool {
+        if !matches!(self.heap.get(idx), HeapObj::Object(m) if m.extensible) {
+            return false;
+        }
+        // The brand's entry and the field's absence, in one pass from the
+        // end: a class's fields follow its brand's entry (`install_brand`
+        // runs before its initializers), so the entries past that one are
+        // all a duplicate could be, and an instance's latest class is the
+        // one initializing it.
+        let Some(m) = self.private_fields.get_mut(&idx) else {
+            return false;
+        };
+        let mut branded = false;
+        for e in m.iter().rev() {
+            if e.0 == brand {
+                if e.1 == id {
+                    return false;
+                }
+                if e.1 == BRAND_ENTRY {
+                    branded = true;
+                    break;
+                }
+            }
+        }
+        if !branded {
+            return false;
+        }
+        m.push((brand, id, v));
+        #[cfg(feature = "instrument")]
+        self.instrument_mark_external_heap_growth();
+        true
+    }
+
     /// Lenient any-brand lookup for the textual-fallback paths (the accessing
     /// chain was unresolvable — e.g. a class defined in a static initializer).
     pub(crate) fn private_field_scan(&self, inst: Value, key: &str) -> Option<Value> {
@@ -1203,6 +1318,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 self.private_field_set_id(o, b2, pid, v, true);
+                #[cfg(not(feature = "safe-sandbox"))]
+                if kind & 8 == 0 {
+                    self.ic_private_add_fill(func_id, ip, ctx, b2, pid, o);
+                }
             } else if kind & 4 != 0 {
                 let s = self
                     .private_member_from_owner(owner, key, (kind & 8) | 4)
@@ -1422,10 +1541,7 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
             // A class value reads an INSTANCE private only if it was itself
             // branded as a return-override instance.
-            return self
-                .instance_brand
-                .get(&recv.heap_index())
-                .is_some_and(|bs| bs.contains(&b));
+            return self.has_brand_entry(recv.heap_index(), b);
         }
         self.instance_has_brand(recv, b)
     }
