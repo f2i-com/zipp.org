@@ -20,7 +20,7 @@ crates/zipp-vm/src/
     mod.rs                  the `Language` trait and the table of languages
     js/                     JavaScript: parse/, compile/, front.rs, mod.rs
     ts/                     TypeScript: types.rs, expr.rs, decl.rs, class.rs,
-                            lower.rs, elide.rs, config.rs, mod.rs
+                            lower.rs, legacy.rs, elide.rs, config.rs, mod.rs
     python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
                             vm/, jit/, mod.rs
 ```
@@ -123,6 +123,13 @@ JavaScript.
   `useDefineForClassFields` (or a target of ES2022 or later) fields are
   defined on the instance; otherwise, and with no config, they are assigned
   in the constructor, which is tsc's default.
+- **`experimentalDecorators` are tsc's legacy decorators** (`legacy.rs`):
+  with the option on, a decorated class lowers to the calls tsc emits
+  (`__decorate`, `__param`, a decorated class's references inside its body
+  read the decorated class), and with `emitDecoratorMetadata` the
+  `design:type`, `design:paramtypes` and `design:returntype` entries follow,
+  types serialized as tsc serializes them. Without the option decorators are
+  the standard ones.
 - **Modules resolve the way TypeScript names them**: `./x` finds `./x.ts`
   or `./x/index.ts`, and `./x.js` finds `./x.ts`.
 
@@ -130,6 +137,4 @@ The ambiguous prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against
 `f < T > (x)`, `<T>x` against `<T>(x) => …`) are settled as tsc settles
 them, with the parser's snapshot as the fallback point. `zipp ts file.ts`
 (or `zipp file.ts`) runs a file; `zipp ts-sweep <paths>` parses a corpus
-and groups the failures. Not supported: `.tsx` (the engine has no JSX) and
-`experimentalDecorators`' legacy decorator semantics (decorators are the
-standard ones).
+and groups the failures. Not supported: `.tsx` (the engine has no JSX).

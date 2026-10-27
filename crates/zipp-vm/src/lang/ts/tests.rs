@@ -10,6 +10,7 @@ fn run(src: &str) -> Vec<String> {
         src,
         super::TsConfig {
             define_fields: true,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|f| panic!("{}", f.message));
@@ -34,11 +35,41 @@ fn out(src: &str) -> String {
     run(src).join("\n")
 }
 
+/// [`out`] under `experimentalDecorators` (with `emitDecoratorMetadata` when
+/// `metadata`), target ES2022.
+fn legacy_out(src: &str, metadata: bool) -> String {
+    let ast = super::parse_auto(
+        src,
+        super::TsConfig {
+            define_fields: true,
+            legacy_decorators: true,
+            decorator_metadata: metadata,
+        },
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
+    let program = if ast.goal == Goal::Module {
+        crate::compile::compile_main_module(&ast, src).expect("compiles")
+    } else {
+        crate::compile::compile_main_program(&ast, src).expect("compiles")
+    };
+    let mut vm = crate::vm::Vm::new(&program);
+    let r = if ast.goal == Goal::Module {
+        vm.run_module()
+    } else {
+        vm.run()
+    };
+    if let Err(e) = r {
+        panic!("threw: {}\noutput so far: {:?}", e.0, vm.output);
+    }
+    vm.output.join("\n")
+}
+
 fn parse_err(src: &str) -> String {
     match super::parse_auto(
         src,
         super::TsConfig {
             define_fields: true,
+            ..Default::default()
         },
     ) {
         Ok(_) => panic!("expected a syntax error in {src:?}"),
@@ -160,6 +191,7 @@ fn modules_elide_type_imports() {
         src,
         super::TsConfig {
             define_fields: true,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|f| panic!("{}", f.message));
@@ -280,4 +312,86 @@ fn a_type_argument_list_may_open_with_a_generic_function_type() {
 #[test]
 fn a_call_may_take_a_generic_function_type_argument() {
     assert_eq!(out("const fn = <F,>(f: F): F => f; const id = fn<<T>(x: T) => T>((x) => x); console.log(id(5), 1 << 3)"), "5 8");
+}
+
+#[test]
+fn legacy_decorators_run_as_tsc_emits_them() {
+    // Members after the class (instance members, then static ones, each in
+    // source order), parameter decorators among their method's, the
+    // constructor's with the class's, which run last and replace the class;
+    // references inside the body read the decorated class. The expected
+    // lines are tsc's output's, run by Node, as for the next test.
+    let src = r#"
+const log: string[] = [];
+function tag(n: string) {
+  log.push("eval " + n);
+  return (t: any, k?: any, d?: any) => { log.push(n + " " + (typeof t === "function" ? t.name : "proto") + " " + String(k) + " " + (d === undefined ? "-" : Object.keys(d).sort().join("|"))); };
+}
+function p(n: string) { return (t: any, k: any, i: number) => { log.push("param " + n + " " + String(k) + " " + i); }; }
+function sub<T extends new (...a: any[]) => any>(C: T) { return class Sub extends C { extra = 1; }; }
+function ro(_t: any, _k: string, d: PropertyDescriptor) { d.writable = false; }
+@tag("class") @sub
+class K {
+  static first = K.name;
+  @tag("field") x = 1;
+  constructor(@p("a") a?: number) {}
+  @tag("m") m(@p("b") b?: string) { return K === (this.constructor as any); }
+  @ro fixed() {}
+  @tag("s") static make() { return new K(); }
+}
+const k = K.make();
+console.log(log.join("; "));
+console.log(k.m(), (k as any).extra, K.name, K.first, Object.getOwnPropertyDescriptor(Object.getPrototypeOf(K.prototype), "fixed")!.writable);
+"#;
+    assert_eq!(
+        legacy_out(src, false),
+        "eval field; field proto x -; eval m; param b m 0; m proto m configurable|enumerable|value|writable; eval s; s K make configurable|enumerable|value|writable; eval class; param a undefined 0; class Sub undefined -\ntrue 1 Sub K false"
+    );
+}
+
+#[test]
+fn legacy_decorator_metadata_serializes_types() {
+    let src = r#"
+const meta = new Map<string, unknown>();
+(Reflect as any).metadata = (k: string, v: unknown) => (t: any, key?: string) => { meta.set((typeof t === "function" ? t.name : "proto") + "." + String(key) + " " + k, v); };
+const show = (v: any): string => Array.isArray(v) ? "[" + v.map(show).join(",") + "]" : typeof v === "function" ? v.name : String(v);
+const d = (..._a: any[]) => {};
+interface I { x: number }
+enum E { A, B }
+type Alias = string | undefined;
+class Dep {}
+@d class C {
+  constructor(a: Dep, b: I, c: E, e: Alias, f: Date, g?: number, ...r: boolean[]) {}
+  @d p1: string | null = "";
+  @d p2: 1 | 2 = 1;
+  @d p3: string | number = 1;
+  @d p4: () => void = () => {};
+  @d p5: Dep[] = [];
+  @d m(x: Dep): Promise<void> { return null!; }
+  @d get g(): never { return null!; }
+}
+console.log([...meta].map(([k, v]) => k + "=" + show(v)).join("; "));
+"#;
+    assert_eq!(
+        legacy_out(src, true),
+        "proto.p1 design:type=String; proto.p2 design:type=Number; proto.p3 design:type=Object; proto.p4 design:type=Function; proto.p5 design:type=Array; proto.m design:returntype=Promise; proto.m design:paramtypes=[Dep]; proto.m design:type=Function; proto.g design:paramtypes=[]; proto.g design:type=undefined; C.undefined design:paramtypes=[Dep,Object,Number,String,Date,Number,Boolean]"
+    );
+}
+
+#[test]
+fn legacy_decorators_are_not_valid_on_class_expressions() {
+    for src in [
+        "const d = (x: any) => x; const X = @d class {};",
+        "const d: any = 0; const X = class { @d m() {} };",
+    ] {
+        let r = super::parse_auto(
+            src,
+            super::TsConfig {
+                define_fields: true,
+                legacy_decorators: true,
+                decorator_metadata: false,
+            },
+        );
+        assert!(r.is_err(), "{src}");
+    }
 }

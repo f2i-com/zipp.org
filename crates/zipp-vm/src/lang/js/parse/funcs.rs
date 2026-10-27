@@ -577,6 +577,10 @@ impl<'s> Parser<'s> {
         if self.ts {
             self.ts_class_heritage_tail()?;
         }
+        let legacy = self.ts && self.ts_state.legacy_decorators;
+        if legacy {
+            self.ts_legacy_enter(name.as_ref(), !decorators.is_empty());
+        }
 
         self.expect(Punct::LBrace, true)?;
         // `[In]` restores inside the braces — see `parse_args`. Nothing a
@@ -619,7 +623,13 @@ impl<'s> Parser<'s> {
         let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
         if self.ts {
+            if legacy {
+                self.ts_legacy_strip(&mut body)?;
+            }
             self.ts_finish_class(&mut body, ts_fields, derived, start);
+        }
+        if legacy {
+            self.ts_legacy_exit();
         }
         self.ctx.in_ = saved_in;
         self.ctx.strict = saved_strict;

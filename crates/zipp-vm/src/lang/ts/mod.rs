@@ -22,10 +22,12 @@
 //!
 //! Semantics follow tsc with `target: ES2022` and its defaults: class fields
 //! are defined (`useDefineForClassFields`), standard decorators, and enums
-//! and namespaces as tsc emits them. Not supported: `.tsx` (the engine has no
-//! JSX), and legacy `experimentalDecorators` semantics.
+//! and namespaces as tsc emits them. A project's `tsconfig.json` can ask for
+//! assigned fields and for legacy `experimentalDecorators` (with
+//! `emitDecoratorMetadata`), lowered as tsc lowers them ([`legacy`]). Not
+//! supported: `.tsx` (the engine has no JSX).
 
-use crate::parse::ast::{Goal, Name, Program};
+use crate::parse::ast::{Expr, Goal, Name, Program};
 use crate::parse::parser::{PResult, ParseOptions, Parser};
 use crate::parse::token::{Keyword, Punct, TokenKind};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -36,6 +38,7 @@ pub(crate) mod config;
 mod decl;
 mod elide;
 mod expr;
+pub(crate) mod legacy;
 mod lower;
 mod types;
 
@@ -125,6 +128,36 @@ pub(crate) struct TsState {
     /// Where a `(` or `<` was tried as an arrow function and was not one, so
     /// it is not tried again (see `Parser::ts_arrow`).
     pub(crate) not_arrow: FxHashSet<u32>,
+    /// `experimentalDecorators` and `emitDecoratorMetadata` (see
+    /// `legacy.rs`); everything below is theirs.
+    pub(crate) legacy_decorators: bool,
+    pub(crate) decorator_metadata: bool,
+    /// The parameter list just read: its parameters' decorators, `(index,
+    /// decorators)`, and with metadata their types. As with `param_props`,
+    /// the function body takes them, and leaves them as `fn_param_decs` and
+    /// `fn_sig` (with its return type) for the class member reading it.
+    pub(crate) param_decs: Vec<(u32, Vec<Expr>)>,
+    pub(crate) param_types: Vec<legacy::Ser>,
+    pub(crate) fn_param_decs: Vec<(u32, Vec<Expr>)>,
+    pub(crate) fn_sig: Option<(Vec<legacy::Ser>, Option<legacy::Ser>)>,
+    /// The type of the class field just read, with metadata.
+    pub(crate) field_type: Option<legacy::Ser>,
+    /// The class declarations being read, innermost last, and the one just
+    /// finished, for its declaration to lower.
+    pub(crate) legacy_classes: Vec<legacy::LegacyClass>,
+    pub(crate) legacy_last: Option<legacy::LegacyClass>,
+    /// The statement about to be read is an `export`'s declaration.
+    pub(crate) legacy_export: bool,
+    /// A class was lowered: the file needs the helpers.
+    pub(crate) legacy_used: bool,
+    /// Temporaries named so far (computed member names).
+    pub(crate) legacy_temps: u32,
+    /// The type aliases read so far, by the source range of their type.
+    pub(crate) type_aliases: FxHashMap<Name, (u32, u32)>,
+    /// Each import binding's module and the name it imports.
+    pub(crate) import_from: FxHashMap<Name, (crate::parse::token::StrVal, String)>,
+    /// The namespace imports metadata reads imported types through.
+    pub(crate) meta_ns: Vec<(crate::parse::token::StrVal, Name)>,
 }
 
 /// The address an interned identifier is known by: the lexer gives every
@@ -259,6 +292,8 @@ fn parse_goal(
         allow_return,
         typescript: true,
         ts_define_fields: config.define_fields,
+        ts_legacy_decorators: config.legacy_decorators,
+        ts_decorator_metadata: config.decorator_metadata,
         ..if goal == Goal::Module {
             ParseOptions::module()
         } else {

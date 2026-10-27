@@ -1,7 +1,9 @@
 //! The `tsconfig.json` settings that change what a TypeScript program does at
-//! run time — today one: whether class fields are *defined* on the instance
+//! run time: whether class fields are *defined* on the instance
 //! (`useDefineForClassFields`, the ES2022 semantics) or *assigned* in the
-//! constructor (tsc's output for older targets, and its default).
+//! constructor (tsc's output for older targets, and its default), and
+//! whether decorators are the legacy ones (`experimentalDecorators`, with
+//! `emitDecoratorMetadata`).
 //!
 //! A file's settings come from the nearest `tsconfig.json` above it, with its
 //! `extends` chain applied, as tsc finds them. The file is JSON with comments
@@ -17,14 +19,20 @@ pub(crate) struct TsConfig {
     /// as the class is constructed (ES2022) rather than assigned at the head
     /// of the constructor.
     pub(crate) define_fields: bool,
+    /// `experimentalDecorators`: decorators are TypeScript's legacy ones.
+    pub(crate) legacy_decorators: bool,
+    /// `emitDecoratorMetadata`: legacy decorators also record types.
+    pub(crate) decorator_metadata: bool,
 }
 
 impl Default for TsConfig {
     /// tsc's defaults with no `tsconfig.json`: target ES5, so fields are
-    /// assigned.
+    /// assigned; standard decorators.
     fn default() -> TsConfig {
         TsConfig {
             define_fields: false,
+            legacy_decorators: false,
+            decorator_metadata: false,
         }
     }
 }
@@ -71,6 +79,8 @@ fn find_config(dir: &Path) -> Option<PathBuf> {
 struct Options {
     target: Option<String>,
     use_define: Option<bool>,
+    experimental_decorators: Option<bool>,
+    decorator_metadata: Option<bool>,
 }
 
 fn resolve(o: &Options) -> TsConfig {
@@ -83,7 +93,12 @@ fn resolve(o: &Options) -> TsConfig {
             None => false,
         }
     });
-    TsConfig { define_fields }
+    let legacy_decorators = o.experimental_decorators.unwrap_or(false);
+    TsConfig {
+        define_fields,
+        legacy_decorators,
+        decorator_metadata: legacy_decorators && o.decorator_metadata.unwrap_or(false),
+    }
 }
 
 /// The options of the config file at `path`, its bases' first.
@@ -105,6 +120,9 @@ fn options_of(path: &Path, depth: u32) -> Option<Options> {
                 if let Some(o) = options_of(&file, depth + 1) {
                     out.target = o.target.or(out.target);
                     out.use_define = o.use_define.or(out.use_define);
+                    out.experimental_decorators =
+                        o.experimental_decorators.or(out.experimental_decorators);
+                    out.decorator_metadata = o.decorator_metadata.or(out.decorator_metadata);
                 }
             }
         }
@@ -115,6 +133,12 @@ fn options_of(path: &Path, depth: u32) -> Option<Options> {
         }
         if let Some(Value::Bool(b)) = opts.get("useDefineForClassFields") {
             out.use_define = Some(*b);
+        }
+        if let Some(Value::Bool(b)) = opts.get("experimentalDecorators") {
+            out.experimental_decorators = Some(*b);
+        }
+        if let Some(Value::Bool(b)) = opts.get("emitDecoratorMetadata") {
+            out.decorator_metadata = Some(*b);
         }
     }
     Some(out)
@@ -342,7 +366,7 @@ mod tests {
         let at = |t: &str| {
             resolve(&Options {
                 target: Some(t.into()),
-                use_define: None,
+                ..Options::default()
             })
             .define_fields
         };
@@ -352,7 +376,8 @@ mod tests {
         assert!(
             resolve(&Options {
                 target: Some("es5".into()),
-                use_define: Some(true)
+                use_define: Some(true),
+                ..Options::default()
             })
             .define_fields
         );

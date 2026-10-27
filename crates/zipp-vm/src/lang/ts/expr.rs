@@ -150,6 +150,8 @@ impl<'s> Parser<'s> {
         let inner = std::mem::replace(&mut self.cover, outer);
         let params = params?;
         self.ts_state.param_props.clear();
+        self.ts_state.param_decs.clear();
+        self.ts_state.param_types.clear();
         if let Some(e) = inner.yield_await.into_iter().next() {
             return Err(e);
         }
@@ -185,10 +187,17 @@ impl<'s> Parser<'s> {
         self.expect(Punct::LParen, true)?;
         let mut items = Vec::new();
         let mut props: Vec<Name> = Vec::new();
+        let mut decs: Vec<(u32, Vec<Expr>)> = Vec::new();
+        let mut types: Vec<super::legacy::Ser> = Vec::new();
+        let legacy = self.ts_state.legacy_decorators;
+        let metadata = self.ts_state.decorator_metadata;
         let mut first = true;
         while !self.at(Punct::RParen) {
             if self.at(Punct::At) {
-                self.parse_decorators()?;
+                let d = self.parse_decorators()?;
+                if legacy {
+                    decs.push((items.len() as u32, d));
+                }
             }
             let mut prop = false;
             while matches!(
@@ -223,7 +232,18 @@ impl<'s> Parser<'s> {
                 self.bump_before_operand()?;
                 let pat = self.parse_binding_pattern()?;
                 let _ = self.eat(Punct::Question, false)?;
-                self.ts_annotation_opt()?;
+                let ann = self.ts_annotation_span()?;
+                if metadata {
+                    // A rest parameter's metadata is its element type.
+                    let t = ann.map_or(super::legacy::Ser::Ctor("Object"), |(s, e)| {
+                        let text = self.src_text(s, e).trim_end();
+                        match text.strip_suffix("[]") {
+                            Some(elem) => super::legacy::classify(elem),
+                            None => super::legacy::Ser::Ctor("Object"),
+                        }
+                    });
+                    types.push(t);
+                }
                 items.push(Pattern::Rest(Box::new(pat)));
                 if self.at(Punct::Comma) {
                     return Err(SyntaxError::new(
@@ -235,7 +255,12 @@ impl<'s> Parser<'s> {
             }
             let pat = self.parse_binding_pattern()?;
             let _ = self.eat(Punct::Question, false)?;
-            self.ts_annotation_opt()?;
+            let ann = self.ts_annotation_span()?;
+            if metadata {
+                types.push(ann.map_or(super::legacy::Ser::Ctor("Object"), |(s, e)| {
+                    self.ts_classify(s, e)
+                }));
+            }
             if prop {
                 if let Pattern::Ident(n) = &pat {
                     props.push(n.clone());
@@ -256,6 +281,10 @@ impl<'s> Parser<'s> {
         self.expect(Punct::RParen, false)?;
         let simple = items.iter().all(|p| matches!(p, Pattern::Ident(_)));
         self.ts_state.param_props = props;
+        if legacy {
+            self.ts_state.param_decs = decs;
+            self.ts_state.param_types = types;
+        }
         Ok(Params { items, simple })
     }
 
@@ -264,9 +293,16 @@ impl<'s> Parser<'s> {
     /// one and sets `TsState::bodiless` for the declaration to drop itself.
     pub(crate) fn ts_fn_body(&mut self, params: &Params) -> PResult<FnBody> {
         let props = std::mem::take(&mut self.ts_state.param_props);
+        let decs = std::mem::take(&mut self.ts_state.param_decs);
+        let types = std::mem::take(&mut self.ts_state.param_types);
+        let mut ret = None;
         if self.at(Punct::Colon) {
             self.bump(false)?;
+            let start = self.cur().span.start;
             self.ts_return_type()?;
+            if self.ts_state.decorator_metadata {
+                ret = Some(self.ts_classify(start, self.prev_end()));
+            }
         }
         if !self.at(Punct::LBrace) {
             self.semicolon()?;
@@ -282,6 +318,10 @@ impl<'s> Parser<'s> {
         }
         // Last, so it is this function's own for the class member reading it.
         self.ts_state.ctor_props = props;
+        if self.ts_state.legacy_decorators {
+            self.ts_state.fn_param_decs = decs;
+            self.ts_state.fn_sig = self.ts_state.decorator_metadata.then_some((types, ret));
+        }
         self.ts_state.bodiless = false;
         Ok(body)
     }

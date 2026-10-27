@@ -1212,6 +1212,9 @@ impl<'s> Parser<'s> {
             }
             self.bump_after_operand()?;
             let c = self.parse_class_rest_dec(start, decorators)?;
+            if self.ts && self.ts_state.legacy_decorators {
+                self.ts_legacy_expr_class(&c)?;
+            }
             return Ok(Expr::Class(Box::new(c)));
         }
         // Dispatch on a BORROW of the token; the taking arms consume it through
@@ -1373,6 +1376,9 @@ impl<'s> Parser<'s> {
                     Keyword::Class => {
                         self.bump_after_operand()?;
                         let c = self.parse_class_rest(start)?;
+                        if self.ts && self.ts_state.legacy_decorators {
+                            self.ts_legacy_expr_class(&c)?;
+                        }
                         Ok(Expr::Class(Box::new(c)))
                     }
                     Keyword::Super => {
@@ -1536,6 +1542,12 @@ impl<'s> Parser<'s> {
         };
         if self.ts {
             self.ts_note_ref(&name);
+            // A decorated class's name inside its body (legacy decorators).
+            if !self.ts_state.legacy_classes.is_empty() {
+                if let Some(alias) = self.ts_class_alias(&name) {
+                    return Ok((alias, pos));
+                }
+            }
         }
         Ok((name.into(), pos))
     }

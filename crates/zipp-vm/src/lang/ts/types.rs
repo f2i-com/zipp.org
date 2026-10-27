@@ -43,6 +43,17 @@ impl<'s> Parser<'s> {
         Ok(false)
     }
 
+    /// [`Self::ts_annotation_opt`], giving the type's source range.
+    pub(crate) fn ts_annotation_span(&mut self) -> PResult<Option<(u32, u32)>> {
+        if self.at(Punct::Colon) {
+            self.bump(false)?;
+            let start = self.cur().span.start;
+            self.ts_type()?;
+            return Ok(Some((start, self.prev_end())));
+        }
+        Ok(None)
+    }
+
     /// A return type: a type, or a type predicate (`x is T`, `this is T`,
     /// `asserts x`, `asserts x is T`).
     pub(crate) fn ts_return_type(&mut self) -> PResult<()> {

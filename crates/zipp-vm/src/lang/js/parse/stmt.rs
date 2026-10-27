@@ -94,6 +94,7 @@ impl<'s> Parser<'s> {
         let mut body = self.parse_stmt_items(|p| !p.at_eof())?;
         if self.ts {
             self.ts_finish_program(&mut body);
+            self.ts_legacy_helpers(&mut body);
         }
         for (name, pos) in std::mem::take(&mut self.pending_export_locals) {
             if !self.scopes.module_binds(&name) {
@@ -486,6 +487,15 @@ impl<'s> Parser<'s> {
                     if let Some(n) = &c.name {
                         self.declare(&n.clone(), BindKind::Class, cstart)?;
                     }
+                    if self.ts && self.ts_state.legacy_decorators {
+                        let mut stmts = self
+                            .ts_legacy_lower(c, crate::lang::ts::legacy::LegacyExport::Default)?;
+                        let Some(Stmt::Export(last)) = stmts.pop() else {
+                            unreachable!("a lowered default export ends with it")
+                        };
+                        self.stmt_scratch.extend(stmts);
+                        return Ok(*last);
+                    }
                     return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
                 }
                 return Err(self.err_here("SyntaxError: decorators must precede a class"));
@@ -559,7 +569,22 @@ impl<'s> Parser<'s> {
         }
         // `export var/let/const/function/class …` — the declaration binds
         // exactly as it would without the `export`.
+        if self.ts && self.ts_state.legacy_decorators {
+            self.ts_state.legacy_export = true;
+        }
         let decl = self.parse_stmt_list_item()?;
+        if self.ts {
+            self.ts_state.legacy_export = false;
+            // A class lowered for its legacy decorators ends with its export.
+            if let Stmt::Export(e) = decl {
+                if let ExportDecl::Named { specifiers, .. } = &*e {
+                    for sp in specifiers {
+                        self.record_export_name(&sp.exported, pos)?;
+                    }
+                }
+                return Ok(*e);
+            }
+        }
         // …and its ExportedNames are its BoundNames, which 16.2.3.1 requires to
         // be unique across the whole ModuleItemList. Nothing was recording them,
         // so `export var a, a;` — one declaration naming `a` twice — parsed.
@@ -604,6 +629,7 @@ impl<'s> Parser<'s> {
         // here through the Block, and the brace is what makes it a declaration
         // again rather than an Annex B clause.
         self.stmt_pos = StmtPos::ListItem;
+        let ts_export = self.ts && std::mem::take(&mut self.ts_state.legacy_export);
         if self.ts {
             if let Some(s) = self.ts_stmt()? {
                 return Ok(s);
@@ -627,6 +653,9 @@ impl<'s> Parser<'s> {
             let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
+            }
+            if self.ts && self.ts_state.legacy_decorators {
+                return self.ts_legacy_decl(c, ts_export);
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
         }
@@ -675,6 +704,9 @@ impl<'s> Parser<'s> {
             let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
+            }
+            if self.ts && self.ts_state.legacy_decorators {
+                return self.ts_legacy_decl(c, ts_export);
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
         }

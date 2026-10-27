@@ -215,6 +215,8 @@ pub(crate) fn parse_eval(
             allow_yield_expr: false,
             typescript: false,
             ts_define_fields: false,
+            ts_legacy_decorators: false,
+            ts_decorator_metadata: false,
         },
     )
     .map_err(err_str)

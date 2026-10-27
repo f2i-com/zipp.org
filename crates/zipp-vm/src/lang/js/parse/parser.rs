@@ -557,6 +557,19 @@ impl ScopeStack {
             .any(|s| s.has_lex(name) || s.has_var(name))
     }
 
+    /// How many scopes are open.
+    pub(crate) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Is `name` declared in a scope opened after the first `depth`?
+    pub(crate) fn binds_from(&self, depth: usize, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(depth)
+            .any(|s| s.has_lex(name) || s.has_var(name))
+    }
+
     /// Is `name` declared in the innermost scope (lexically or by a `var`)?
     pub(crate) fn declared_here(&self, name: &str) -> bool {
         self.scopes
@@ -670,6 +683,11 @@ pub struct ParseOptions {
     /// (defined on the instance) rather than becoming assignments at the head
     /// of the constructor (see `lang/ts/config.rs`).
     pub ts_define_fields: bool,
+    /// TypeScript's `experimentalDecorators` and `emitDecoratorMetadata`:
+    /// decorators are the legacy ones, lowered to tsc's helper calls (see
+    /// `lang/ts/legacy.rs`).
+    pub ts_legacy_decorators: bool,
+    pub ts_decorator_metadata: bool,
 }
 
 impl Default for ParseOptions {
@@ -685,6 +703,8 @@ impl Default for ParseOptions {
             allow_yield_expr: false,
             typescript: false,
             ts_define_fields: false,
+            ts_legacy_decorators: false,
+            ts_decorator_metadata: false,
         }
     }
 }
@@ -788,6 +808,8 @@ pub(crate) struct Snapshot {
     stmt_pos: StmtPos,
     scope_depth: usize,
     tree_depth: usize,
+    /// TypeScript's legacy-decorator classes open (`TsState::legacy_classes`).
+    legacy_depth: usize,
 }
 
 /// How many validator levels one recursive activation may add above the
@@ -855,6 +877,8 @@ impl<'s> Parser<'s> {
             ts: opts.typescript,
             ts_state: crate::lang::ts::TsState {
                 define_fields: opts.ts_define_fields,
+                legacy_decorators: opts.ts_legacy_decorators,
+                decorator_metadata: opts.ts_decorator_metadata,
                 ..Default::default()
             },
         })
@@ -873,6 +897,7 @@ impl<'s> Parser<'s> {
             stmt_pos: self.stmt_pos,
             scope_depth: self.scopes.scopes.len(),
             tree_depth: self.tree_depth,
+            legacy_depth: self.ts_state.legacy_classes.len(),
         }
     }
 
@@ -889,6 +914,17 @@ impl<'s> Parser<'s> {
         self.stmt_pos = s.stmt_pos;
         self.scopes.scopes.truncate(s.scope_depth);
         self.tree_depth = s.tree_depth;
+        self.ts_state.legacy_classes.truncate(s.legacy_depth);
+    }
+
+    /// The source text `start..end`.
+    pub(crate) fn src_text(&self, start: u32, end: u32) -> &'s str {
+        self.src.get(start as usize..end as usize).unwrap_or("")
+    }
+
+    /// The source text's length.
+    pub(crate) fn src_len(&self) -> u32 {
+        self.src.len() as u32
     }
 
     /// A one-token lookahead's rewind point: [`Self::save`] plus `prev_end`.

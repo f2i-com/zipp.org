@@ -22,7 +22,7 @@ impl<'s> Parser<'s> {
         fields: &mut Vec<ClassMember>,
     ) -> PResult<Option<ClassMember>> {
         let dec_start = self.cur().span.start;
-        let decorators = self.parse_decorators()?;
+        let mut decorators = self.parse_decorators()?;
         let mut erase = false;
         while let Some(word) = self.ts_word() {
             let is_static = word == "static";
@@ -77,7 +77,15 @@ impl<'s> Parser<'s> {
             }));
         }
         if std::mem::take(&mut self.ts_state.bodiless) || erase {
+            if self.ts_state.legacy_decorators {
+                self.ts_state.fn_param_decs.clear();
+                self.ts_state.fn_sig = None;
+                self.ts_state.field_type = None;
+            }
             return Ok(None);
+        }
+        if self.ts_state.legacy_decorators {
+            self.ts_legacy_member(&m, &mut decorators);
         }
         self.attach_member_decorators(&mut m, decorators, dec_start)?;
         Ok(Some(m))
@@ -91,6 +99,10 @@ impl<'s> Parser<'s> {
         }
         if self.at(Punct::Lt) {
             self.ts_type_params()?;
+        } else if self.ts_state.decorator_metadata {
+            if let Some((s, e)) = self.ts_annotation_span()? {
+                self.ts_state.field_type = Some(self.ts_classify(s, e));
+            }
         } else {
             self.ts_annotation_opt()?;
         }

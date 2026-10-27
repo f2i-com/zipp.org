@@ -139,12 +139,17 @@ impl<'s> Parser<'s> {
     /// `type T<P> = Type;`, the `type` current.
     fn ts_type_alias(&mut self) -> PResult<()> {
         self.bump(false)?;
-        self.ident_name()?;
+        let name = self.ident_name()?;
         if self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
         self.expect(Punct::Eq, false)?;
+        let start = self.cur().span.start;
         self.ts_type()?;
+        if self.ts_state.decorator_metadata {
+            let end = self.prev_end();
+            self.ts_state.type_aliases.insert(name, (start, end));
+        }
         self.semicolon()
     }
 
@@ -713,6 +718,21 @@ impl<'s> Parser<'s> {
         // `import { type A } from "m"` imports nothing at run time.
         if specifiers.is_empty() && had_types {
             return Ok(Stmt::Empty);
+        }
+        if self.ts_state.decorator_metadata {
+            for sp in &specifiers {
+                let (local, imported) = match sp {
+                    ImportSpecifier::Default(n) => (n, "default".to_string()),
+                    ImportSpecifier::Named { imported, local } => match imported {
+                        ModuleExportName::Ident(n) => (local, n.to_string()),
+                        ModuleExportName::Str(s) => (local, s.to_lossy_string()),
+                    },
+                    ImportSpecifier::Namespace(_) => continue,
+                };
+                self.ts_state
+                    .import_from
+                    .insert(local.clone(), (source.clone(), imported));
+            }
         }
         // tsc's `resolveJsonModule`: `import data from "./data.json"` is the
         // JSON module `with { type: "json" }` asks for.
