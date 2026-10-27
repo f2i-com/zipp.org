@@ -18,6 +18,7 @@ pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
         && first != "--lang"
         && !first.starts_with("--lang=")
         && !is_typescript_file(first)
+        && !is_javascript_file(first)
     {
         return None;
     }
@@ -44,6 +45,16 @@ pub(crate) fn code_cache_dir() -> Option<PathBuf> {
         env("XDG_CACHE_HOME").or_else(|| Some(env("HOME")?.join(".cache")))?.join("zipp")
     })
 }
+/// `zipp app.js` (`.mjs`, `.cjs`): a JavaScript file named as the command
+/// runs as `node app.js` would, its arguments after it.
+fn is_javascript_file(arg: &str) -> bool {
+    let path = Path::new(arg);
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "js" | "mjs" | "cjs"))
+        && path.is_file()
+}
+
 /// `zipp app.ts`: a TypeScript file named as the command runs as `zipp ts`.
 fn is_typescript_file(arg: &str) -> bool {
     let path = Path::new(arg);
@@ -181,6 +192,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("mjs"));
         if !bytecode {
+            super::enable_node_runtime(&filename, &program_args);
             return super::run(&[if module { "mjs" } else { "js" }.to_owned(), filename]);
         }
         // `--bc` inspects and never runs: a script falls through to the
@@ -193,6 +205,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // A TypeScript file runs by its path, so the `.ts` files it imports load
     // from beside it; a module goes through the module loader.
     if detected.language == LanguageId::TypeScript && !stdin && !bytecode {
+        super::enable_node_runtime(&filename, &program_args);
         let path = Path::new(&filename);
         return super::emit(zipp_vm::frontend::run_typescript_file(path)?);
     }

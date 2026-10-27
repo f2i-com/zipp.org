@@ -4467,6 +4467,21 @@ impl<'p> Vm<'p> {
     /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
     /// run in the same drain). The whole event loop.
     pub fn drain_microtasks(&mut self) {
+        // `process.nextTick`'s callbacks run first at a checkpoint, and again
+        // after the microtasks while those queued more (Node's order).
+        loop {
+            if self.node_tick_pending {
+                self.node_run_ticks();
+            }
+            self.drain_microtasks_queue();
+            if !self.node_tick_pending {
+                break;
+            }
+        }
+    }
+
+    /// [`Self::drain_microtasks`]'s promise jobs.
+    fn drain_microtasks_queue(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
         // The embedding/main-script call that reached this checkpoint was one
         // job. WeakRef targets kept during it may now be cleared before the

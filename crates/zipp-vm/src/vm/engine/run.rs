@@ -210,6 +210,11 @@ impl<'p> Vm<'p> {
         // declaration of the same name shadows the builtin.
         self.setup_globals();
         let has_prelude = prelude.is_some();
+        // Node's globals, for a program the command runs from a file (a
+        // harness run never has them).
+        if !has_prelude {
+            self.install_node_runtime(true)?;
+        }
         if has_prelude {
             // Pin only the intrinsic boot graph before running a separate
             // harness Script. Harness-created values remain ordinary traced
@@ -289,6 +294,7 @@ impl<'p> Vm<'p> {
         // before the embedding caller has a chance to marshal it.
         let root = main.as_ref().copied().unwrap_or(Value::UNDEFINED);
         self.with_host_roots(&[root], Self::run_event_loop);
+        self.with_host_roots(&[root], Self::node_run_ended);
         if main.is_ok() {
             if let Some(t) = self.take_uncaught_timer_throw() {
                 return Err(t);
@@ -461,6 +467,7 @@ impl<'p> Vm<'p> {
     pub fn run_module(&mut self) -> Result<Value, Thrown> {
         use crate::heap::PromiseState;
         self.setup_globals();
+        self.install_node_runtime(false)?;
         self.hoist_functions();
         self.set_gc_floor();
         // Unlike `run_with_prelude`, this direct async module entry has no
@@ -474,6 +481,7 @@ impl<'p> Vm<'p> {
         // Its rejection is the program's error below, never an unhandled one.
         self.mark_promise_handled(p);
         self.run_event_loop();
+        self.with_host_roots(&[p], Self::node_run_ended);
         if p.is_heap() {
             if let HeapObj::Promise {
                 state: PromiseState::Rejected,

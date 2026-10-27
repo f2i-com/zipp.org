@@ -175,8 +175,14 @@ fn locate_base(from: &Path, spec: &str) -> Option<PathBuf> {
     }
 }
 
+/// JSON with comments and trailing commas (a `tsconfig.json`, a
+/// `package.json`), or `None` when it is not that.
+pub(crate) fn parse_json(text: &str) -> Option<Value> {
+    Jsonc::new(text).parse().ok()
+}
+
 /// A JSON value, as much as a config needs.
-enum Value {
+pub(crate) enum Value {
     Null,
     Bool(bool),
     Num,
@@ -186,14 +192,14 @@ enum Value {
 }
 
 impl Value {
-    fn get(&self, key: &str) -> Option<&Value> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Obj(members) => members.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
             _ => None,

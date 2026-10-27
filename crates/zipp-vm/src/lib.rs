@@ -729,6 +729,21 @@ pub fn run_file_then_exit(
     run_with_policy(src, base_dir, false, true, Some(script_name))
 }
 
+/// Give the programs this process runs from files Node's globals
+/// (`process`, `global`, `structuredClone`, `queueMicrotask`, timers that
+/// can be cleared), with `argv` as `process.argv`: for a host that runs a
+/// program as `node` would, such as the `zipp` command. A run with a harness
+/// prelude never has them.
+pub fn set_node_runtime(on: bool, argv: Vec<String>) {
+    vm::node::set_enabled(on, argv);
+}
+
+/// The exit status a program run with Node's globals asked for
+/// (`process.exitCode`), 0 when it set none.
+pub fn node_exit_code() -> i32 {
+    vm::node::exit_code()
+}
+
 /// Keep compiled code in `dir` between processes, or not at all (`None`, the
 /// default): large scripts run with [`run_file_then_exit`], and Python's
 /// runtime and library modules ([`frontend::set_python_runtime_cache`] names

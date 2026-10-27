@@ -244,6 +244,10 @@ impl<'p> Vm<'p> {
         &mut self,
         raw_path: &std::path::Path,
     ) -> Result<std::path::PathBuf, Thrown> {
+        // Node's builtins (`node:fs`) are no files.
+        if raw_path.to_str().is_some_and(|s| s.starts_with("node:")) {
+            return Ok(raw_path.to_path_buf());
+        }
         // Once per requested path: a module importing fifty names from one
         // specifier resolved it fifty times, each a filesystem call.
         if let Some(c) = self.module_canon_memo.get(raw_path) {
@@ -601,6 +605,13 @@ impl<'p> Vm<'p> {
                 .insert((path.clone(), t.to_string()), Value::heap(ns_idx));
             return Ok(Value::heap(ns_idx));
         }
+        // Node's builtins and CommonJS files, for a program run with Node's
+        // globals: a namespace over what they export.
+        if self.node_installed {
+            if let Some(ns) = self.node_import_special(&path)? {
+                return Ok(ns);
+            }
+        }
         let code = self.read_module_text(&path)?;
         let ast = crate::lang::ts::parse_module_file(&path, &code).map_err(Thrown)?;
         let prog = match crate::compile::compile_eval(
@@ -668,10 +679,7 @@ impl<'p> Vm<'p> {
         // ancestors throughout it.
         let module_root = self.module_root.clone();
         let canon_of = |dir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
-            let raw = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let raw = crate::vm::node::resolve::specifier_path(dir, spec);
             canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw)
         };
         use crate::bytecode::ImportName as IN;
@@ -872,10 +880,7 @@ impl<'p> Vm<'p> {
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
                     continue;
                 }
-                let dep_raw = match dir.as_deref() {
-                    Some(d) => d.join(&e.specifier),
-                    None => std::path::PathBuf::from(&e.specifier),
-                };
+                let dep_raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
                 let confined = self.module_root.is_some();
                 let dep_canon = self.resolve_module_path(&dep_raw).map_err(|err| {
                     if confined {
@@ -902,10 +907,7 @@ impl<'p> Vm<'p> {
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
                     continue;
                 }
-                let dep_raw = match dir.as_deref() {
-                    Some(d) => d.join(&e.specifier),
-                    None => std::path::PathBuf::from(&e.specifier),
-                };
+                let dep_raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
                 let dep_canon = self.resolve_module_path(&dep_raw)?;
                 // A TYPED import (json/text) is a DISTINCT module record even
                 // for the importing file itself — never self/in-flight.
@@ -1347,10 +1349,7 @@ impl<'p> Vm<'p> {
         // matches the spec's (module, ~namespace~) ResolvedBinding. Cycles
         // resolve through the loader's pre-registered cache entry.
         for (exported, spec) in ns_reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
             let canon = self.resolve_module_path(&dep)?;
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
@@ -1360,10 +1359,7 @@ impl<'p> Vm<'p> {
             full.push((exported.clone(), slot));
         }
         for (exported, imported, spec) in reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
             if let Some(slot) = self.resolve_export(&dep, imported, None)? {
                 full.push((exported.clone(), slot));
             } else if !typescript {
@@ -1381,10 +1377,7 @@ impl<'p> Vm<'p> {
             std::collections::HashMap::new();
         let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
         for spec in star_reexports {
-            let dep = match dir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
-            };
+            let dep = crate::vm::node::resolve::specifier_path(dir, spec);
             for (name, slot) in self.all_exports(&dep)? {
                 if own.contains(&name) {
                     continue; // a local/indirect export shadows star names
@@ -1842,10 +1835,7 @@ impl<'p> Vm<'p> {
                 if spec == "<module source>" {
                     continue;
                 }
-                let raw = match dir.as_deref() {
-                    Some(d) => d.join(&spec),
-                    None => std::path::PathBuf::from(&spec),
-                };
+                let raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &spec);
                 let canon = self.resolve_module_path(&raw).map_err(|err| {
                     if confined {
                         err
@@ -2254,10 +2244,7 @@ impl<'p> Vm<'p> {
         pdir: Option<&std::path::Path>,
         spec: &str,
     ) -> Result<std::path::PathBuf, Thrown> {
-        let raw = match pdir {
-            Some(d) => d.join(spec),
-            None => std::path::PathBuf::from(spec),
-        };
+        let raw = crate::vm::node::resolve::specifier_path(pdir, spec);
         if let Some(c) = self.module_canon_memo.get(&raw) {
             return Ok(c.clone());
         }

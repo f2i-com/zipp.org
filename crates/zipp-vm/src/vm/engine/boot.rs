@@ -763,6 +763,13 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            node_installed: false,
+            node_partial: [String::new(), String::new()],
+            node_exit_hook: Value::UNDEFINED,
+            node_tick_hook: Value::UNDEFINED,
+            node_tick_pending: false,
+            node_host: Value::UNDEFINED,
+            node_cjs: Value::UNDEFINED,
             uncaught_timer_throw: None,
         }
     }

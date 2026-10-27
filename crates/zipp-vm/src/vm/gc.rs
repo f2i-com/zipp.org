@@ -555,6 +555,10 @@ impl Vm<'_> {
         for &v in &self.host_result_roots {
             root_val!(v);
         }
+        root_val!(self.node_exit_hook);
+        root_val!(self.node_tick_hook);
+        root_val!(self.node_host);
+        root_val!(self.node_cjs);
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
         // roots just like the region-embedded constant strings below.

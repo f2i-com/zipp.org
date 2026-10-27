@@ -3406,6 +3406,19 @@ pub struct Vm<'p> {
     /// results collected across later guest re-entry — spread, rest,
     /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
     host_result_roots: Vec<Value>,
+    /// Node's globals (`lang/js/node`): installed for this run, the partial
+    /// lines `process.stdout`/`stderr.write` left, and the function the
+    /// run's end calls (a root).
+    pub(crate) node_installed: bool,
+    pub(crate) node_partial: [String; 2],
+    pub(crate) node_exit_hook: Value,
+    /// `process.nextTick`'s queue runner (a root), and whether it has work:
+    /// ticks run before the microtasks at each checkpoint.
+    pub(crate) node_tick_hook: Value,
+    pub(crate) node_tick_pending: bool,
+    /// The host object, and the CommonJS loader (both roots).
+    pub(crate) node_host: Value,
+    pub(crate) node_cjs: Value,
     /// The first exception a `setTimeout` callback let escape. It ends the
     /// event loop and becomes the program's error when the main job itself
     /// completed normally (Node's uncaught-exception exit). Rooted.
@@ -3621,6 +3634,11 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 mod handler_pool;
 pub(crate) mod prof;
+// ── Node's globals ── for a program the command runs from a file
+// (`lang/js/node/`): a module of `vm` for the same reason as Python's below.
+#[path = "../lang/js/node/mod.rs"]
+pub(crate) mod node;
+
 // ── Python's half of the VM ── its instructions' semantics, runtime
 // tables and library natives. The files live with the rest of the language
 // in `lang/python/vm/`; they are modules of `vm` because they implement the
@@ -3691,6 +3709,19 @@ impl<'p> Vm<'p> {
     /// Every console emission goes through here.
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        // A partial line `process.stdout.write` left begins this one.
+        let partial = &mut self.node_partial[to_stderr as usize];
+        if !partial.is_empty() {
+            let mut joined = std::mem::take(partial);
+            joined.push_str(&line);
+            return self.push_console_line_raw(joined, to_stderr);
+        }
+        self.push_console_line_raw(line, to_stderr)
+    }
+
+    /// [`Self::push_console_line`] without a partial line to join.
+    #[inline]
+    pub(crate) fn push_console_line_raw(&mut self, line: String, to_stderr: bool) {
         if let Some(sink) = self.console_sink.as_mut() {
             let stream = if to_stderr {
                 ConsoleStream::Stderr

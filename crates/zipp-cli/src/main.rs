@@ -369,9 +369,14 @@ fn main() -> ExitCode {
         }
     }
     match r {
-        Ok(()) => REQUESTED_EXIT
-            .get()
-            .map_or(ExitCode::SUCCESS, |&status| ExitCode::from(status)),
+        Ok(()) => REQUESTED_EXIT.get().map_or_else(
+            // `process.exitCode`, for a program run with Node's globals.
+            || match zipp_vm::node_exit_code() {
+                0 => ExitCode::SUCCESS,
+                code => ExitCode::from(code as u8),
+            },
+            |&status| ExitCode::from(status),
+        ),
         Err(e) => {
             eprintln!("zipp: {e}");
             ExitCode::FAILURE
@@ -385,6 +390,30 @@ static REQUESTED_EXIT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 fn request_exit(status: u8) {
     let _ = REQUESTED_EXIT.set(status);
+}
+
+/// Whether Node's globals were switched on for this run already (by the
+/// frontend, which knows the program's arguments).
+static NODE_RUNTIME_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run the program in `path` with Node's globals, `program_args` as the rest
+/// of its `process.argv`, as `node path args…` would. `ZIPP_NO_NODE=1` runs
+/// it with ECMAScript's global object alone.
+pub(crate) fn enable_node_runtime(path: &str, program_args: &[String]) {
+    if NODE_RUNTIME_SET.swap(true, std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("ZIPP_NO_NODE").is_some_and(|v| v != "0")
+    {
+        return;
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "zipp".into());
+    let script = std::path::absolute(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let mut argv = vec![exe, script];
+    argv.extend(program_args.iter().cloned());
+    zipp_vm::set_node_runtime(true, argv);
 }
 
 /// Print an engine outcome the way `node` does — `console.log` to stdout,
@@ -465,6 +494,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 // is left for that exit instead of being freed first. Error
                 // stacks name the script by its absolute path, as Node does.
                 None => {
+                    enable_node_runtime(path, &[]);
                     let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
                     let name = name.to_string_lossy();
                     // A large script's compiled code is kept between runs, as
@@ -494,6 +524,9 @@ fn run(args: &[String]) -> Result<(), String> {
             // `flags:[module]` test262 tests and `.mjs` entry points.
             let path = it.next().ok_or("usage: zipp mjs <file.mjs>")?;
             let harness = it.next();
+            if harness.is_none() {
+                enable_node_runtime(path, &[]);
+            }
             emit(zipp_vm::run_module_file(
                 std::path::Path::new(&path),
                 harness.map(|s| s.as_str()),

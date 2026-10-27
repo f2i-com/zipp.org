@@ -173,7 +173,7 @@ impl<'p> Vm<'p> {
 
     /// The bytes of a BufferSource: an ArrayBuffer, a TypedArray's or a
     /// DataView's view of one (a detached or out-of-bounds view has none).
-    fn buffer_source_bytes(&self, v: Value) -> Result<Vec<u8>, Thrown> {
+    pub(crate) fn buffer_source_bytes(&self, v: Value) -> Result<Vec<u8>, Thrown> {
         let bad = || Thrown::from_static(
             "TypeError: The provided value is not of type '(ArrayBuffer or ArrayBufferView)'",
         );

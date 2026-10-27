@@ -1411,7 +1411,7 @@ impl<'p> Vm<'p> {
                             // promise waiting on them.
                             match self
                                 .dynamic_import_base_dir(func_id)
-                                .map(|d| d.join(&spec_str))
+                                .map(|d| crate::vm::node::resolve::specifier_path(Some(&d), &spec_str))
                             {
                                 None => Err(self.make_error(1, None)),
                                 // A fresh Evaluate() for the eager
@@ -1473,7 +1473,7 @@ impl<'p> Vm<'p> {
                             // the joined path.
                             match self
                                 .dynamic_import_base_dir(func_id)
-                                .map(|d| d.join(&spec_str))
+                                .map(|d| crate::vm::node::resolve::specifier_path(Some(&d), &spec_str))
                             {
                                 None => Err(self.make_error(1, None)),
                                 Some(path) => {
