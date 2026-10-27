@@ -7875,6 +7875,24 @@ pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed
     0
 }
 
+/// Win64 helper for a Tier C `PushHandler` (a JavaScript `try`): the
+/// interpreter's arm verbatim on the activation's own frame (bodies with
+/// handler ops take only frame-backed entries). `packed` is
+/// `catch_target << 16 | catch_reg`. Total, never deopts.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` with at least one live frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_push_catch(vm: *mut core::ffi::c_void, packed: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let top = vm.frames.len() - 1;
+    vm.frames[top].handlers.push(Handler::Catch {
+        target: (packed >> 16) as u32,
+        reg: packed as u16,
+    });
+    0
+}
+
 /// Win64 helper for a region `PopFinally` — the pop half of `jit_push_finally`
 /// (the interpreter arm verbatim). Total, never deopts.
 ///

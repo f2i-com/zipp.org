@@ -47,6 +47,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_TIERC_TRY=1` leaves every function holding a `try`/`catch`
+    /// (or a BigInt literal) interpreted, as before Tier C admitted them.
+    fn tierc_try_enabled() = "ZIPP_NO_TIERC_TRY"
+);
+
+env_off_switch!(
     /// Defer flat-ASCII builder metadata across a compiler-proved call-free
     /// Tier-C loop. `ZIPP_NO_STR_APPEND_CURSOR=1` restores one
     /// `jit_str_append_index_ascii` boundary crossing per appended character.
@@ -1355,6 +1361,22 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             Instr::Throw { .. } => {
                 if !tierc_throw_enabled() {
                     reject!("[tierC-reject] op Throw (disabled)");
+                }
+            }
+            // `try`/`catch`: the interpreter's handler push and pop, on the
+            // activation's own frame (a body with handler ops takes only
+            // frame-backed entries, as the `finally` bracket's do above). A
+            // throw inside unwinds to the handler through the interpreter,
+            // which runs the `catch`. A BigInt literal (`0n`): its immediate,
+            // or the interpreter's constant for a large one.
+            Instr::PushHandler { .. } | Instr::PopHandler => {
+                if !tierc_try_enabled() {
+                    reject!("[tierC-reject] try/catch (disabled)");
+                }
+            }
+            Instr::LoadBigInt { value, .. } => {
+                if !tierc_try_enabled() || Value::small_bigint(value.get()).is_none() {
+                    reject!("[tierC-reject] BigInt literal (disabled or not an immediate)");
                 }
             }
             // Captured accesses use Tier-C-specific helpers. A frame-free native
@@ -4096,6 +4118,30 @@ pub(crate) fn compile_proto_mem(
                     }
                 });
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            // A JavaScript body's BigInt literal: admission took only the
+            // immediates.
+            Instr::LoadBigInt { dst, value } if !py => {
+                let bits = Value::small_bigint(value.get()).map_or(0, Value::bits);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            // A JavaScript `try`: the interpreter's handler push, on this
+            // activation's own frame (handler-op bodies take only
+            // frame-backed entries).
+            Instr::PushHandler {
+                catch_target,
+                catch_reg,
+            } if !py => {
+                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD crate::vm::jit_push_catch as *const () as i64
+                    ; call rax
+                );
             }
             Instr::LoadBigInt { dst, value } => {
                 let value = value.get();
