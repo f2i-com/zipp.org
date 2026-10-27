@@ -3244,9 +3244,11 @@ pub struct Vm<'p> {
     /// re-checks every version and the live `next` bits (an in-place
     /// overwrite bumps no version), so nothing has to invalidate it.
     iter_proto_memo: [std::cell::Cell<construct::IterProtoProof>; 4],
-    /// The last proof that a generator's `next` is the intrinsic
-    /// (`Vm::gen_method_pristine`), rechecked on every use.
-    gen_next_memo: std::cell::Cell<construct::GenNextProof>,
+    /// The last proofs that a generator's `next` is the intrinsic
+    /// (`Vm::gen_method_pristine`), by the generator's first prototype,
+    /// rechecked on every use. A pipeline of generators steps several
+    /// generator functions in turn, and one proof was the other's each time.
+    gen_next_memo: [std::cell::Cell<construct::GenNextProof>; 4],
     /// The same kind of memo for `builtin_iter_fast`'s holder half: per
     /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
     /// the own `@@iterator` data property last proven to be the default.

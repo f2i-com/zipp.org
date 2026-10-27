@@ -1206,7 +1206,8 @@ impl<'p> Vm<'p> {
         // the first prototype and the holder unchanged (versions) and the
         // holder's `next` still the same value (an in-place overwrite moves
         // no version).
-        let memo = self.gen_next_memo.get();
+        let memo_cell = &self.gen_next_memo[first as usize & 3];
+        let memo = memo_cell.get();
         if id == GEN_NEXT
             && memo.first_ver != 0
             && memo.first == first
@@ -1235,7 +1236,7 @@ impl<'p> Vm<'p> {
                     && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id);
                 // A proof made within two levels names everything it read.
                 if ok && id == GEN_NEXT && depth < 2 {
-                    self.gen_next_memo.set(GenNextProof {
+                    memo_cell.set(GenNextProof {
                         first,
                         first_ver: self.heap.version_of(first).wrapping_add(1),
                         holder: cur,
