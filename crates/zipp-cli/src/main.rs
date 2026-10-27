@@ -655,7 +655,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  zipp py  <file.py>              run a Python program (--bc prints the bytecode)");
             #[cfg(feature = "gpu")]
             println!("                                  torch.compile graphs run on a GPU when one is present (--no-gpu or ZIPP_GPU=0: CPU)");
-            println!("  zipp run [--lang=L] <file>      run; L = javascript|python, else by extension/shebang");
+            println!("  zipp ts  <file.ts>              run TypeScript directly (also `zipp <file.ts>`)");
+            println!("  zipp run [--lang=L] <file>      run; L = javascript|typescript|python, else by extension/shebang");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
             println!(

@@ -156,6 +156,9 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_assign_inner(&mut self) -> PResult<Expr> {
+        // TypeScript: whether this is a conditional's true branch, read once
+        // here so it reaches no nested expression (`TsState::no_ret_arrow`).
+        let ts_no_ret = self.ts && std::mem::take(&mut self.ts_state.no_ret_arrow);
         // `yield` is an AssignmentExpression of its own, not an operand.
         if self.ctx.yield_ && self.at_kw(Keyword::Yield) {
             return self.parse_yield();
@@ -167,6 +170,13 @@ impl<'s> Parser<'s> {
         }
 
         let start = self.cur().span.start;
+        // TypeScript arrows (`(a: T): R => …`, `<T>(a: T) => …`) are read by
+        // `lang::ts`, which leaves anything else to the cover grammar below.
+        if self.ts && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
+            if let Some(e) = self.ts_arrow(false, start, ts_no_ret)? {
+                return Ok(e);
+            }
+        }
         // Stash the enclosing region's pattern-only error so an inner one
         // cannot be mistaken for it, and vice versa.
         let outer_po = self.cover.pattern_only.take();
@@ -353,6 +363,15 @@ impl<'s> Parser<'s> {
             self.restore(save);
             return Ok(None);
         }
+        if self.ts && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
+            if let Some(e) = self.ts_arrow(true, start, false)? {
+                return Ok(Some(e));
+            }
+            if self.at(Punct::Lt) {
+                self.restore(save);
+                return Ok(None);
+            }
+        }
         // `async ( … )` — either an async arrow or a CALL to something named
         // `async`. The cover machinery decides, from what follows the `)`.
         if self.at(Punct::LParen) {
@@ -383,6 +402,9 @@ impl<'s> Parser<'s> {
         // b in c : d;;)` parses the `in`.
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
+        if self.ts {
+            self.ts_state.no_ret_arrow = true;
+        }
         let cons = self.parse_assign()?;
         self.ctx.in_ = saved_in;
         self.expect(Punct::Colon, true)?;
@@ -519,6 +541,11 @@ impl<'s> Parser<'s> {
         }
         let mut links = 0usize;
         loop {
+            // TypeScript's `as T` / `satisfies T`, at relational precedence.
+            if self.ts && min <= 9 && self.ts_at_as() {
+                self.ts_as_suffix()?;
+                continue;
+            }
             // `in` and `instanceof` are keywords at binary precedence, and `in`
             // is suppressed inside a `for` head.
             let (prec, op) = if self.at_kw(Keyword::In) && self.ctx.in_ {
@@ -608,6 +635,11 @@ impl<'s> Parser<'s> {
 
     fn parse_unary_inner(&mut self) -> PResult<Expr> {
         use Punct as P;
+        // TypeScript's type assertion `<T>expr`.
+        if self.ts && self.at(P::Lt) {
+            self.ts_type_assertion_head()?;
+            return self.parse_unary();
+        }
         let op = match self.cur().kind.as_punct() {
             Some(P::Minus) => Some(UnaryOp::Minus),
             Some(P::Plus) => Some(UnaryOp::Plus),
@@ -893,6 +925,11 @@ impl<'s> Parser<'s> {
                     optional: false,
                     pos,
                 }));
+            } else if self.ts && self.at(Punct::Bang) && !self.cur().newline_before {
+                // TypeScript's non-null assertion `e!`.
+                self.bump_after_operand()?;
+            } else if self.ts && self.at(Punct::Lt) && self.ts_type_args_in_expr()? {
+                // `f<T>(…)`: the type arguments are gone; the call follows.
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
                 self.check_syntax_chain(links)?;
                 links += 1;
@@ -1061,6 +1098,9 @@ impl<'s> Parser<'s> {
         // constructor.
         if self.at(Punct::QuestionDot) {
             return Err(self.err_here("SyntaxError: 'new' cannot be applied to an optional chain"));
+        }
+        if self.ts && self.at(Punct::Lt) {
+            self.ts_type_args_in_expr()?;
         }
         let args = if self.at(Punct::LParen) {
             self.parse_args()?
@@ -1487,6 +1527,9 @@ impl<'s> Parser<'s> {
         let TokenKind::Ident { name, .. } = tok.kind else {
             unreachable!()
         };
+        if self.ts {
+            self.ts_note_ref(&name);
+        }
         Ok((name.into(), pos))
     }
 
@@ -1754,8 +1797,8 @@ impl<'s> Parser<'s> {
         let key_is_ident_ref = self.is_binding_ident();
         let key_pos = self.cur().span.start;
         let key = self.parse_public_prop_key()?;
-        // `m() {}`
-        if self.at(Punct::LParen) {
+        // `m() {}` (and TypeScript's `m<T>() {}`)
+        if self.at(Punct::LParen) || (self.ts && self.at(Punct::Lt)) {
             let func = self.parse_method_rest(false, false, start)?;
             return Ok((
                 ObjectMember::Method {
@@ -1793,6 +1836,9 @@ impl<'s> Parser<'s> {
             ));
         }
         let name = name.clone();
+        if self.ts {
+            self.ts_note_ref(&name);
+        }
         // Shorthand re-reads the key as an IdentifierReference without going
         // through `binding_ident_or_reference`, so record `{await}` here too —
         // `async({await}) => {}` is the same early error as `async(await) =>

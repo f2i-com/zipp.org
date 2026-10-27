@@ -46,7 +46,7 @@ impl ParseFailure {
     }
 }
 
-fn failure(e: crate::parse::parser::SyntaxError) -> ParseFailure {
+pub(crate) fn failure(e: crate::parse::parser::SyntaxError) -> ParseFailure {
     // The default profile reports source nesting past its budget as the
     // resource limit it is, the way node does — see
     // `parse::parser::MAX_NATIVE_SYNTAX_RECURSION`.
@@ -213,6 +213,7 @@ pub(crate) fn parse_eval(
             allow_super_call: flags.allow_super,
             allow_await_expr: false,
             allow_yield_expr: false,
+            typescript: false,
         },
     )
     .map_err(err_str)

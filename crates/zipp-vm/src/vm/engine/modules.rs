@@ -132,7 +132,16 @@ fn canonical_module_path(
     }
     #[cfg(test)]
     CANONICALIZE_CALLS.with(|c| c.set(c.get() + 1));
-    let path = std::fs::canonicalize(raw_path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+    // A missing file may be one TypeScript names another way: `./x` for
+    // `./x.ts`, `./x.js` for `./x.ts` (`lang::ts::resolve_candidates`).
+    let path = match std::fs::canonicalize(raw_path) {
+        Ok(path) => path,
+        Err(_) => crate::lang::ts::resolve_candidates(raw_path)
+            .into_iter()
+            .filter(|p| root.is_none_or(|root| lexically_confined(root, p)))
+            .find_map(|p| std::fs::canonicalize(p).ok().filter(|p| p.is_file()))
+            .ok_or_else(|| Thrown(MODULE_NOT_FOUND.into()))?,
+    };
     if root.is_some_and(|root| !path.starts_with(root)) {
         return Err(Thrown(MODULE_NOT_FOUND.into()));
     }
@@ -533,7 +542,7 @@ impl<'p> Vm<'p> {
             return Ok(Value::heap(ns_idx));
         }
         let code = self.read_module_text(&path)?;
-        let ast = crate::front::parse_module(&code).map_err(Thrown)?;
+        let ast = crate::lang::ts::parse_module_file(&path, &code).map_err(Thrown)?;
         let prog = match crate::compile::compile_eval(
             &ast,
             &code,
@@ -1586,7 +1595,7 @@ impl<'p> Vm<'p> {
         let Ok(code) = self.read_module_text(&path) else {
             return false;
         };
-        let Ok(ast) = crate::front::parse_module(&code) else {
+        let Ok(ast) = crate::lang::ts::parse_module_file(&path, &code) else {
             return false;
         };
         let Ok(prog) = crate::compile::compile_eval(
@@ -1706,7 +1715,7 @@ impl<'p> Vm<'p> {
                 ))
             }
         })?;
-        let ast = crate::front::parse_module(&code).map_err(Thrown)?;
+        let ast = crate::lang::ts::parse_module_file(&path, &code).map_err(Thrown)?;
         let dir = path.parent().map(|p| p.to_path_buf());
         let mut out = Vec::new();
         for s in &ast.body {

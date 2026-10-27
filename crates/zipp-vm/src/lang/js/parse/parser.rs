@@ -520,6 +520,13 @@ impl ScopeStack {
         self.scopes.len() == 1 && self.scopes[0].kind == ScopeKind::Module
     }
 
+    /// Is `name` declared in the innermost scope (lexically or by a `var`)?
+    pub(crate) fn declared_here(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|s| s.has_lex(name) || s.has_var(name))
+    }
+
     /// Is `name` bound anywhere at the module's top level (lexically or by a
     /// `var`)? An `export { x }` must resolve to such a binding.
     pub(crate) fn module_binds(&self, name: &str) -> bool {
@@ -607,6 +614,10 @@ pub struct ParseOptions {
     pub allow_super_call: bool,
     pub allow_await_expr: bool,
     pub allow_yield_expr: bool,
+    /// Read TypeScript: the grammar of `crate::lang::ts`, whose types are
+    /// checked and dropped as they are read, so the tree is the one the same
+    /// program written in JavaScript would give.
+    pub typescript: bool,
 }
 
 impl Default for ParseOptions {
@@ -620,6 +631,7 @@ impl Default for ParseOptions {
             allow_super_call: false,
             allow_await_expr: false,
             allow_yield_expr: false,
+            typescript: false,
         }
     }
 }
@@ -700,6 +712,29 @@ pub struct Parser<'s> {
     pub(crate) arg_scratch: Vec<Arg>,
     /// The same for object literal members (`parse_object_literal`).
     pub(crate) member_scratch: Vec<ObjectMember>,
+    /// The source is TypeScript (`ParseOptions::typescript`): the hooks into
+    /// `crate::lang::ts` are taken.
+    pub(crate) ts: bool,
+    /// What the TypeScript grammar keeps while it reads (see `lang/ts`).
+    pub(crate) ts_state: crate::lang::ts::TsState,
+}
+
+/// Where a speculative parse started, to go back to: TypeScript decides some
+/// prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against `f < T > (x)`)
+/// only by trying one reading. Everything a failed attempt may have changed
+/// is here; the scratch lists and the recursion count restore themselves on
+/// the error path.
+pub(crate) struct Snapshot {
+    pos: u32,
+    tok: Token,
+    prev_end: u32,
+    ctx: Ctx,
+    cover: Cover,
+    labels: Vec<Name>,
+    parenthesized: bool,
+    stmt_pos: StmtPos,
+    scope_depth: usize,
+    tree_depth: usize,
 }
 
 /// How many validator levels one recursive activation may add above the
@@ -761,7 +796,68 @@ impl<'s> Parser<'s> {
             stmt_scratch: Vec::new(),
             arg_scratch: Vec::new(),
             member_scratch: Vec::new(),
+            ts: opts.typescript,
+            ts_state: Default::default(),
         })
+    }
+
+    /// The parser's position and state, for [`Self::rewind`].
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            pos: self.lx.pos(),
+            tok: self.tok.clone(),
+            prev_end: self.prev_end,
+            ctx: self.ctx,
+            cover: self.cover.clone(),
+            labels: self.labels.clone(),
+            parenthesized: self.parenthesized,
+            stmt_pos: self.stmt_pos,
+            scope_depth: self.scopes.scopes.len(),
+            tree_depth: self.tree_depth,
+        }
+    }
+
+    /// Go back to `s`, undoing a speculative parse that failed or was not
+    /// wanted.
+    pub(crate) fn rewind(&mut self, s: Snapshot) {
+        self.lx.seek(s.pos);
+        self.tok = s.tok;
+        self.prev_end = s.prev_end;
+        self.ctx = s.ctx;
+        self.cover = s.cover;
+        self.labels = s.labels;
+        self.parenthesized = s.parenthesized;
+        self.stmt_pos = s.stmt_pos;
+        self.scopes.scopes.truncate(s.scope_depth);
+        self.tree_depth = s.tree_depth;
+    }
+
+    /// A one-token lookahead's rewind point: [`Self::save`] plus `prev_end`.
+    pub(crate) fn peek_state(&self) -> (u32, Token, u32) {
+        (self.lx.pos(), self.tok.clone(), self.prev_end)
+    }
+
+    pub(crate) fn peek_restore(&mut self, s: (u32, Token, u32)) {
+        self.lx.seek(s.0);
+        self.tok = s.1;
+        self.prev_end = s.2;
+    }
+
+    /// The current token is `>>`, `>>>`, `>=`, `>>=` or `>>>=` where only its
+    /// first `>` belongs to the production (the end of a TypeScript type
+    /// argument list, `Array<Array<T>>`): take that `>` and lex the rest again
+    /// as the token that follows it.
+    pub(crate) fn split_gt(&mut self) -> PResult<()> {
+        let at = self.tok.span.start + 1;
+        self.prev_end = at;
+        self.lx.seek(at);
+        self.tok = self.lx.next_token(false)?;
+        Ok(())
+    }
+
+    /// The source text from byte `pos` on.
+    pub(crate) fn rest_from(&self, pos: u32) -> &'s str {
+        self.src.get(pos as usize..).unwrap_or("")
     }
 
     /// The upper bound on the finished program's tree height — see the

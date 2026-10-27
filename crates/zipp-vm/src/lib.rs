@@ -963,7 +963,12 @@ pub fn run_module_file(
     };
     // A syntax error is reported where it is, in the entry's file URL, as
     // its frames and its `import.meta.url` name it.
-    let entry_ast = front::parse_module_located(&src).map_err(|f| {
+    let entry_ast = if lang::ts::is_ts_path(path) {
+        lang::ts::parse_module(&src)
+    } else {
+        front::parse_module_located(&src)
+    }
+    .map_err(|f| {
         let url = std::path::absolute(path).map(|p| vm::file_url(&p));
         f.located(&src, url.as_deref().ok())
     })?;

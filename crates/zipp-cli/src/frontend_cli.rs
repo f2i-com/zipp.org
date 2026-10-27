@@ -12,7 +12,13 @@ use zipp_vm::frontend::{
 
 pub(super) fn try_run(args: &[String]) -> Option<Result<(), String>> {
     let first = args.first()?.as_str();
-    if first != "py" && first != "run" && first != "--lang" && !first.starts_with("--lang=") {
+    if first != "py"
+        && first != "ts"
+        && first != "run"
+        && first != "--lang"
+        && !first.starts_with("--lang=")
+        && !is_typescript_file(first)
+    {
         return None;
     }
     // One program per process: its compiled runtime is never reused in the
@@ -38,16 +44,27 @@ pub(crate) fn code_cache_dir() -> Option<PathBuf> {
         env("XDG_CACHE_HOME").or_else(|| Some(env("HOME")?.join(".cache")))?.join("zipp")
     })
 }
+/// `zipp app.ts`: a TypeScript file named as the command runs as `zipp ts`.
+fn is_typescript_file(arg: &str) -> bool {
+    let path = Path::new(arg);
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ts" | "mts" | "cts"))
+        && path.is_file()
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let first = args[0].as_str();
     let python_command = first == "py";
     let mut explicit = if python_command {
         Some(LanguageId::Python)
+    } else if first == "ts" {
+        Some(LanguageId::TypeScript)
     } else {
         None
     };
     let mut filename: Option<String> = None;
-    let mut index = if first == "py" || first == "run" {
+    let mut index = if first == "py" || first == "ts" || first == "run" {
         1
     } else {
         0
@@ -79,7 +96,7 @@ fn run(args: &[String]) -> Result<(), String> {
             index += 1;
             Some(
                 args.get(index)
-                    .ok_or("--lang requires javascript or python")?
+                    .ok_or("--lang requires javascript, typescript or python")?
                     .as_str(),
             )
         } else if options {
@@ -104,7 +121,7 @@ fn run(args: &[String]) -> Result<(), String> {
         index += 1;
     }
     let filename = filename.ok_or(
-        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp run [--lang=python|javascript] [--no-gpu] FILE [ARGS...] | zipp --lang=python -",
+        "usage: zipp py [--bc] [--no-gpu] FILE|DIR [ARGS...] | zipp ts [--bc] FILE | zipp run [--lang=python|javascript|typescript] [--no-gpu] FILE [ARGS...] | zipp --lang=python -",
     )?;
     let stdin = filename == "-";
     // A directory is a Python project rooted there with `main.py` as the
@@ -173,6 +190,12 @@ fn run(args: &[String]) -> Result<(), String> {
             return Err("--bc takes a script; a .mjs module cannot be inspected this way".into());
         }
     }
+    // A TypeScript file runs by its path, so the `.ts` files it imports load
+    // from beside it; a module goes through the module loader.
+    if detected.language == LanguageId::TypeScript && !stdin && !bytecode {
+        let path = Path::new(&filename);
+        return super::emit(zipp_vm::frontend::run_typescript_file(path)?);
+    }
     // Any other Python file run by name (a shebang script, `zipp py tool`)
     // is the entry of its project exactly like a `.py` file.
     if detected.language == LanguageId::Python && !stdin && !bytecode {
@@ -186,6 +209,7 @@ fn run(args: &[String]) -> Result<(), String> {
         LanguageId::Python => Frontend::Python {
             mode: PythonMode::Module,
         },
+        LanguageId::TypeScript => Frontend::TypeScript,
     };
     if bytecode {
         // Developer inspection: the compiled program, no execution.

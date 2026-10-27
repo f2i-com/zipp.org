@@ -9,6 +9,8 @@
 //! `docs/LANGUAGES.md` for the extension points and for adding a language.
 //!
 //! Python is an experimental, feature-gated subset, not CPython compatibility.
+//! TypeScript is read by the JavaScript parser with its types dropped as they
+//! are read (`lang/ts`), so it runs exactly as the same JavaScript would.
 //! Detection is a caller-side policy and never a compiler fallback.
 use crate::embed::{ScriptGoal, ScriptState};
 use std::path::Path;
@@ -16,6 +18,9 @@ use std::str::FromStr;
 
 mod js;
 mod python;
+pub(crate) mod ts;
+
+pub use ts::run_file as run_typescript_file;
 
 /// A language the runtime runs: its names, how a file is recognised as its,
 /// and its frontend. Every language implements it once, in `lang/<name>/`,
@@ -43,7 +48,7 @@ pub trait Language: Sync {
 
 /// Every language, the base language first.
 pub fn languages() -> &'static [&'static dyn Language] {
-    &[&js::JavaScript, &python::Python]
+    &[&js::JavaScript, &python::Python, &ts::TypeScript]
 }
 
 /// The language `id` names.
@@ -59,6 +64,7 @@ pub fn language(id: LanguageId) -> &'static dyn Language {
 pub enum LanguageId {
     JavaScript,
     Python,
+    TypeScript,
 }
 impl FromStr for LanguageId {
     type Err = String;
@@ -67,7 +73,7 @@ impl FromStr for LanguageId {
         match languages().iter().find(|l| l.names().contains(&key.as_str())) {
             Some(l) => Ok(l.id()),
             None => Err(format!(
-                "unknown language {value:?}; expected javascript or python"
+                "unknown language {value:?}; expected javascript, typescript or python"
             )),
         }
     }
@@ -80,12 +86,15 @@ pub enum PythonMode {
 pub enum Frontend {
     JavaScript { goal: ScriptGoal },
     Python { mode: PythonMode },
+    /// A TypeScript script (types read and dropped; see `lang/ts`).
+    TypeScript,
 }
 impl Frontend {
     pub fn language(self) -> LanguageId {
         match self {
             Self::JavaScript { .. } => LanguageId::JavaScript,
             Self::Python { .. } => LanguageId::Python,
+            Self::TypeScript => LanguageId::TypeScript,
         }
     }
 }
@@ -112,7 +121,8 @@ pub fn compile_source(source: &str, frontend: Frontend) -> Result<CompiledSource
         Frontend::JavaScript { goal } => js::compile(source, goal)?,
         Frontend::Python {
             mode: PythonMode::Module,
-        } => self::language(language).compile(source)?,
+        }
+        | Frontend::TypeScript => self::language(language).compile(source)?,
     };
     Ok(CompiledSource { language, state })
 }
@@ -297,6 +307,7 @@ pub fn compile_source_to_text(source: &str, frontend: Frontend) -> Result<String
     match frontend {
         Frontend::JavaScript { goal } => js::compile_to_text(source, goal),
         Frontend::Python { .. } => language(LanguageId::Python).compile_to_text(source),
+        Frontend::TypeScript => language(LanguageId::TypeScript).compile_to_text(source),
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,7 +374,7 @@ pub fn detect_language(
             return found(value.parse()?, DetectionReason::Directive);
         }
     }
-    Err("ambiguous source language; specify --lang=javascript or --lang=python".into())
+    Err("ambiguous source language; specify --lang=javascript, --lang=typescript or --lang=python".into())
 }
 
 #[cfg(test)]
@@ -408,7 +419,7 @@ mod tests {
     }
     #[test]
     fn the_table_lists_each_language_once() {
-        for id in [LanguageId::JavaScript, LanguageId::Python] {
+        for id in [LanguageId::JavaScript, LanguageId::Python, LanguageId::TypeScript] {
             assert_eq!(languages().iter().filter(|l| l.id() == id).count(), 1);
             for name in language(id).names() {
                 assert_eq!(name.parse::<LanguageId>().unwrap(), id, "{name}");
