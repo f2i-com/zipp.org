@@ -666,7 +666,10 @@ impl Compiler {
         // error (a formal parameter, or a lexical `let`/`const`/`class` in scope —
         // top-level OR an enclosing block/for-head/catch param) are skipped, as is
         // a top-level function name (already var-scoped).
-        if !fc.cx.in_strict && (!is_script || fc.cx.script_binds_globals) {
+        if !fc.cx.in_strict
+            && (!is_script || fc.cx.script_binds_globals)
+            && body.iter().any(|s| has_b33_block_fn(s, false))
+        {
             let mut blockers = rustc_hash::FxHashSet::default();
             // `protect`: params + lexical/class names a same-named block function
             // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no

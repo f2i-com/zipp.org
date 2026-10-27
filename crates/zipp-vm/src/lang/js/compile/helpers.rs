@@ -221,6 +221,36 @@ pub(crate) fn labelled_fn_decl(s: &Stmt) -> Option<&crate::parse::ast::Function>
     }
 }
 
+/// Whether [`collect_b33_block_fns`] can find anything in `s`, whatever the
+/// blockers: a plain function declaration inside a block, a loop, a branch,
+/// a `switch`, a `try` or a `with`. A sloppy body with none skips the B.3.3
+/// pass, which cloned every parameter name into two sets and cloned its
+/// blocker set again at every nested block, and whose sets only a block
+/// function's declaration reads.
+pub(crate) fn has_b33_block_fn(s: &Stmt, nested: bool) -> bool {
+    use crate::parse::ast::Stmt as S;
+    let any = |list: &[Stmt]| list.iter().any(|st| has_b33_block_fn(st, true));
+    match s {
+        S::FnDecl(f) => nested && !f.is_generator && !f.is_async && f.name.is_some(),
+        S::Block(body) => any(body),
+        S::For { body, .. }
+        | S::ForOf { body, .. }
+        | S::ForIn { body, .. }
+        | S::While { body, .. }
+        | S::DoWhile { body, .. }
+        | S::With { body, .. } => has_b33_block_fn(body, true),
+        S::If { cons, alt, .. } => has_b33_block_fn(cons, true) || alt.as_ref().is_some_and(|a| has_b33_block_fn(a, true)),
+        S::Switch { cases, .. } => cases.iter().any(|c| any(&c.body)),
+        S::Try {
+            block,
+            handler,
+            finalizer,
+        } => any(block) || handler.as_ref().is_some_and(|h| any(&h.body)) || finalizer.as_ref().is_some_and(|f| any(f)),
+        S::Labeled { body, .. } => has_b33_block_fn(body, nested),
+        _ => false,
+    }
+}
+
 /// Annex B B.3.3: collect names of `function` declarations inside BLOCKS (not at
 /// the top level of the function body) that are eligible for a function-scoped
 /// `var` binding. `blockers` is the set of lexical names in scope (params,
