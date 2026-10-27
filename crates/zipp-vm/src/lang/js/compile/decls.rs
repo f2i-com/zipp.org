@@ -1666,9 +1666,12 @@ impl<'a> FnCompiler<'a> {
                 // per element), so draining up front is observable on a generator
                 // or a custom iterator: it ran ahead of the default, and a
                 // throwing default found later elements already pulled.
-                if fixed
-                    .iter()
-                    .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
+                // (A pattern of `ITER_PROBE` elements or more would spell a
+                // probe in `IterToArray`'s count.)
+                if fixed.len() >= crate::bytecode::ITER_PROBE as usize
+                    || fixed
+                        .iter()
+                        .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
                 {
                     return self.extract_array_pattern_stepwise(fixed, rest, src);
                 }

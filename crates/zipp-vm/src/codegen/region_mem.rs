@@ -2424,6 +2424,10 @@ pub(crate) fn compile_region_mem(
                         dynasm!(ops ; jmp => ta_done ; => ta_slow);
                     } // end TA-kind branch
                 }
+                // An unpinned receiver: a present dense element through the
+                // array mirror, else the helper.
+                let mirror_done = ops.new_dynamic_label();
+                emit_arr_mirror_get(&mut ops, dst, obj, key, mirror_done);
                 // Generic element read `a[i]` via a win64 helper (dense arrays,
                 // flat-ASCII strings, and unpinned TypedArrays). Returns the
                 // element bits, `undefined` for out-of-range, or the deopt
@@ -2438,6 +2442,7 @@ pub(crate) fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
+                    ; => mirror_done
                 );
                 if pinned.is_some() {
                     dynasm!(ops ; => ta_done);
@@ -3680,7 +3685,33 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::IterToArray { dst, count, .. }
+                if !py && count & !0x7FFF == crate::bytecode::ITER_PROBE =>
+            {
+                // `[a, b] = [b, a]`'s probe: a pure read, no call protocol.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::IterToArray { dst, src, count } if !py => {
+                // A plain Array first: itself, with no call protocol.
+                let general = ops.new_dynamic_label();
+                let plain_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_iter_to_array_plain as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => general
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => plain_done
+                    ; => general
+                );
                 // `[a, b] = v`: `jit_iter_to_array_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
@@ -3696,6 +3727,7 @@ pub(crate) fn compile_region_mem(
                     refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                     ta_refetch,
                 );
+                dynasm!(ops ; => plain_done);
             }
             Instr::ArrayAppend { arr, val, spread: false } if !py => {
                 // `[...v, x]`'s `x`: a plain push (`jit_array_append_plain`).

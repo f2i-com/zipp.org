@@ -1350,10 +1350,9 @@ impl<'p> Vm<'p> {
         // int-tier body, which needs neither a frame nor an activation and
         // only its self-binding rechecked (`try_run_jit`).
         let (entry, activate) = match self.jit.cross_entry(fid) {
-            Some(_) if frameless => return None,
-            Some((entry, _, _, _)) => (entry, true),
-            None => {
-                let body = self.jit.get(fid).filter(|body| body.int_tier())?;
+            Some((entry, _, _, _)) if !frameless => (entry, true),
+            _ => {
+                let body = self.jit.int_body(fid)?;
                 let rebound = body.self_binding().is_some_and(|(slot, expect)| {
                     self.globals.get(slot as usize).map(|v| v.bits()) != Some(expect)
                 });

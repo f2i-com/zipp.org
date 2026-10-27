@@ -5280,6 +5280,9 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::GetIndex { dst, obj, key } => {
+                // A present dense element first, through the array mirror.
+                let done = ops.new_dynamic_label();
+                emit_arr_mirror_get(&mut ops, dst, obj, key, done);
                 // Generic element read `a[i]` via the win64 helper (dense arrays,
                 // flat-ASCII strings, unpinned TypedArrays); `undefined` for
                 // out-of-range, deopt sentinel for receivers/keys needing
@@ -5296,6 +5299,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
             }
             Instr::TypeOf { dst, a } => {
                 // `typeof v` → a heap string (jit_typeof). Total (no deopt). The
@@ -5859,6 +5863,26 @@ pub(crate) fn compile_proto_mem(
                     );
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else {
+                    // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
+                    // the region arm, which declines before any effect; the
+                    // route below then serves the call as it always has.
+                    let pop_done = (key == "pop" && argc == 0).then(|| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; mov rax, QWORD crate::vm::jit_array_pop as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     // Every remaining name/arity: the same live-IC route as
                     // `random` — a USER function/closure runs to completion
                     // through the method cross-call or generic helper; natives
@@ -5884,6 +5908,9 @@ pub(crate) fn compile_proto_mem(
                         refetch,
                         method_own_slot_direct,
                     );
+                    if let Some(done) = pop_done {
+                        dynasm!(ops ; => done);
+                    }
                 }
             }
             Instr::Call {
@@ -6079,7 +6106,33 @@ pub(crate) fn compile_proto_mem(
                     None,
                 );
             }
+            Instr::IterToArray { dst, count, .. }
+                if !py && count & !0x7FFF == crate::bytecode::ITER_PROBE =>
+            {
+                // `[a, b] = [b, a]`'s probe: a pure read, no call protocol.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::IterToArray { dst, src, count } if !py => {
+                // A plain Array first: itself, with no call protocol.
+                let general = ops.new_dynamic_label();
+                let plain_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_iter_to_array_plain as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => general
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => plain_done
+                    ; => general
+                );
                 // `[a, b] = v`: `jit_iter_to_array_ic`, as the region arm.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
@@ -6095,6 +6148,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => plain_done);
             }
             Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if !py => {
                 // `jit_iter_op_ic` op 2 (close) or 3 (quiet close), as the

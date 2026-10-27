@@ -4578,7 +4578,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
                     _ => return false,
                 };
-                if !self.jit.get(fid).is_some_and(|body| body.int_tier()) {
+                if self.jit.int_body(fid).is_none() {
                     return false;
                 }
                 self.close_job_window(window);

@@ -1139,6 +1139,9 @@ pub(crate) fn emit_inline_leaf_call(
             // the region GetIndex generic tail). Deopt sentinel → re-run the call.
             Instr::GetIndex { dst: d, obj, key } => {
                 let bail = ops.new_dynamic_label();
+                // A present dense element first, through the array mirror.
+                let done = ops.new_dynamic_label();
+                emit_arr_mirror_get(ops, rg(d), rg(obj), rg(key), done);
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(rg(obj))]
@@ -1149,6 +1152,7 @@ pub(crate) fn emit_inline_leaf_call(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(rg(d))], rax
+                    ; => done
                 );
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }

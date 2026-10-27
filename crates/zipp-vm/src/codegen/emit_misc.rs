@@ -1201,6 +1201,69 @@ pub(crate) fn djump_if_not_cmp(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+/// `dst = obj[key]` for a present element of a dense Array at an int key,
+/// read through the array mirror (`Heap::arr_mirror`) with no call: heap- and
+/// int-tag checks, the mirror's bounds, the element's hole tag. Jumps to
+/// `done` with `dst` written; anything else (a cleared entry has length 0)
+/// falls through to the caller's helper path, which repairs the entry when
+/// the store answers alone. An integral double key (`dist[to]` where `to`
+/// came from `%`) is an index too. Clobbers rax, rcx, rdx, r9, r10, xmm0 and
+/// xmm1, all of which the helper call clobbers anyway.
+pub(crate) fn emit_arr_mirror_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    obj: u16,
+    key: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    let slow = ops.new_dynamic_label();
+    let have_key = ops.new_dynamic_label();
+    let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+    let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => slow
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, 0x7FF9                    // Value TAG_INT >> 48
+        ; je >int_key
+        // A double with the sign clear (high word below the tags) whose
+        // value is a whole number; NaN fails the compare, a negative or a
+        // tagged value the range test.
+        ; ja => slow
+        ; movq xmm0, rdx
+        ; cvttsd2si rdx, xmm0
+        ; cvtsi2sd xmm1, rdx
+        ; ucomisd xmm0, xmm1
+        ; jne => slow
+        ; jp => slow
+        ; jmp => have_key
+        ; int_key:
+        ; mov edx, edx                        // a negative int is huge
+        ; => have_key
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + arr_len]
+        ; jae => slow
+        ; mov r9, [rdi + arr_raw]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; cmp rdx, [r9 + 8]
+        ; jae => slow
+        ; mov r9, [r9]
+        ; mov rax, [r9 + rdx*8]
+        ; mov r10, QWORD ARR_HOLE_BITS as i64
+        ; cmp rax, r10
+        ; je => slow
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => slow
+    );
+}
+
 /// Emit a region op's bail block: the success path skips it; the block records
 /// the resume ip into `[rsi]` and jumps to the shared epilogue (which restores
 /// the 4-push/40-byte frame). Unlike the function JIT no result is set — a

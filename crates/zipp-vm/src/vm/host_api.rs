@@ -231,6 +231,16 @@ pub(crate) const JIT_THIS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'s
 pub(crate) const JIT_UPVALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, upvals_mirror_raw);
 
+/// VM-relative offsets of the heap's array mirror base and entry count (see
+/// `Heap::arr_mirror`): loaded through the VM on every access, as the shape
+/// mirror's are, since a helper's allocation can move the mirror.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, arr_mirror_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARR_MIRROR_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, arr_mirror_len);
+
 /// B244: VM-relative offset of the saturating dense-Array snapshot epoch.
 /// Emitted code reads this scalar after a native cross call; equality with its
 /// stack-cached copy licenses reuse of Array raw bases only when the value is

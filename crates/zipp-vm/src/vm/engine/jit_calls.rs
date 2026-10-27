@@ -420,7 +420,12 @@ impl<'p> Vm<'p> {
                 crate::vm::helpers_misc::crossstats::decline(
                     crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY,
                 );
-                if std::env::var_os("ZIPP_DECLLOG").is_some() {
+                // Read once: this is the decline every call to a callee
+                // without an entry takes, and an environment read per call
+                // (a UTF-16 conversion and a system call on Windows) was a
+                // tenth of such a call's time.
+                static DECLLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DECLLOG.get_or_init(|| std::env::var_os("ZIPP_DECLLOG").is_some()) {
                     eprintln!(
                         "[decl] no-entry fid={fid} compiled={} sp2={}",
                         self.jit.get(fid).is_some(),

@@ -1281,6 +1281,50 @@ pub(crate) extern "win64" fn jit_iter_to_array_ic(
     })
 }
 
+/// Win64 helper for `IterToArray`'s probe (`bytecode::ITER_PROBE`): whether
+/// Array iteration is the built-in one, as a boolean Value. Reads memoized
+/// prototype slots only; no allocation and no user code, so no call protocol.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_probe(vm: *mut core::ffi::c_void) -> u64 {
+    // SAFETY: read-only view; the running code holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    Value::bool(vm.array_iter_pristine()).bits()
+}
+
+/// Win64 helper for `IterToArray` of a plain Array whose iteration is the
+/// built-in one: the array itself, as `iter_to_array`'s positional arm
+/// answers, with none of the call protocol (no allocation, no user code).
+/// `SELF_CALL_DEOPT`, having done nothing, for anything else, which then
+/// takes `jit_iter_to_array_ic`.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_to_array_plain(
+    vm: *mut core::ffi::c_void,
+    src_bits: u64,
+) -> u64 {
+    let src = Value::from_bits(src_bits);
+    if !src.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the running code holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let idx = src.heap_index();
+    // A mapped `arguments` object's dense slots are refreshed by the general
+    // route before they are read; it takes that route.
+    if matches!(vm.heap.get(idx), HeapObj::Array(_))
+        && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&idx))
+        && vm.builtin_iter_fast(src, true)
+    {
+        return src_bits;
+    }
+    crate::codegen::SELF_CALL_DEOPT
+}
+
 /// Win64 helper for a non-spread `ArrayAppend` (`[a, ...b, x]`'s `x`): push
 /// onto the literal under construction, as the interpreter's arm does. No
 /// user code and no heap allocation, so no call protocol: returns the
@@ -1922,8 +1966,9 @@ pub(crate) extern "win64" fn jit_get_index(
     // own data property and shadows the chain: the Array arm below answers
     // the same after its lookups.
     if key.is_int() {
+        let raw = vm;
         // SAFETY: read-only view; the running code holds no conflicting borrow.
-        let vm = unsafe { &*(vm as *const Vm) };
+        let vm = unsafe { &*(raw as *const Vm) };
         let aidx = arr.heap_index();
         if let HeapObj::Array(items) = vm.heap.get(aidx) {
             if let Some(&v) = usize::try_from(key.as_int()).ok().and_then(|i| items.get(i)) {
@@ -1931,6 +1976,14 @@ pub(crate) extern "win64" fn jit_get_index(
                     && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
                     && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
                 {
+                    // The store answered alone: let emitted reads of this
+                    // array answer from it too (`Heap::arr_mirror`).
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    {
+                        // SAFETY: the shared view above is not used again.
+                        let vm = unsafe { &mut *(raw as *mut Vm) };
+                        vm.heap.repair_arr_mirror(aidx);
+                    }
                     return v.bits();
                 }
             }

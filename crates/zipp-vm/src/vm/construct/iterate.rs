@@ -1270,6 +1270,17 @@ impl<'p> Vm<'p> {
     /// walk may stand in for the iterator; false only that the caller must
     /// read `@@iterator` and ask `builtin_iter_pristine` (always correct).
     #[inline]
+    /// Whether iterating a fresh Array is unobservable: `[@@iterator]` on
+    /// %Array.prototype% is the built-in data method, `next` on
+    /// %ArrayIteratorPrototype% is pristine and there is no `return` for a
+    /// close to call. [`Self::builtin_iter_fast`]'s answer for an Array with
+    /// no own properties and the default prototype; it reads nothing a
+    /// program can observe (no getter runs).
+    pub(crate) fn array_iter_pristine(&self) -> bool {
+        self.realm_global_objs.is_empty()
+            && self.iter_holder_pristine(0, self.arr_proto, self.default_array_iter, true)
+    }
+
     pub(crate) fn builtin_iter_fast(&self, v: Value, closes: bool) -> bool {
         if !v.is_heap() || !self.realm_global_objs.is_empty() {
             return false;
@@ -1291,6 +1302,13 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
+        self.iter_holder_pristine(slot, holder, default, closes)
+    }
+
+    /// The prototype-level half of [`Self::builtin_iter_fast`]: `holder`'s own
+    /// `@@iterator` is the default data method (memoized by its version) and
+    /// the kind's iterator prototype is pristine.
+    fn iter_holder_pristine(&self, slot: usize, holder: u32, default: Value, closes: bool) -> bool {
         let (ver, at) = self.iter_method_memo[slot].get();
         let hit = ver != 0
             && ver == self.heap.version_of(holder).wrapping_add(1)
@@ -1300,9 +1318,9 @@ impl<'p> Vm<'p> {
             // Prove the holder's own `@@iterator` is the default DATA method;
             // its slot then stays valid for as long as its version does.
             let at = match self.heap.get(holder) {
-                HeapObj::Object(p) => p.pos("@@iterator").filter(|&i| {
-                    !p.attr_at(i).accessor && p.val_at(i).bits() == default.bits()
-                }),
+                HeapObj::Object(p) => p
+                    .pos("@@iterator")
+                    .filter(|&i| !p.attr_at(i).accessor && p.val_at(i).bits() == default.bits()),
                 _ => None,
             };
             let Some(at) = at else {
@@ -1531,6 +1549,9 @@ impl<'p> Vm<'p> {
     /// unobservable passes through unchanged. A value with no callable
     /// `@@iterator` is a TypeError.
     pub(crate) fn iter_to_array(&mut self, v: Value, max: u32) -> Result<Value, Thrown> {
+        if (crate::bytecode::ITER_PROBE..=crate::bytecode::ITER_PROBE | 0x7FFF).contains(&max) {
+            return Ok(Value::bool(self.array_iter_pristine()));
+        }
         // Array destructuring uses GetIterator(value), which first does
         // RequireObjectCoercible — so null/undefined throw a TypeError even for an
         // empty pattern (`[] = null`), before any element is read.
