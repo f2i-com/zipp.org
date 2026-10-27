@@ -1727,10 +1727,11 @@ impl<'p> Vm<'p> {
             let HeapObj::Object(m) = self.heap.get(cur) else {
                 return None;
             };
-            let at = if m.is_indexed() {
+            // A shaped level answers from the (shape, key) memo.
+            let at = if m.is_indexed() && m.shape() == crate::shape::DICT {
                 m.pos_tagged(key, *tag.get_or_insert_with(|| crate::heap::prop_tag_of(key)))
             } else {
-                m.pos(key)
+                self.own_pos(m, key)
             };
             if at.is_some() {
                 return Some(true);
@@ -1789,10 +1790,10 @@ impl<'p> Vm<'p> {
                 _ if depth == 0 => return self.plain_array_own_data_get(cur, key).map(PlainGet::Data),
                 _ => return None,
             };
-            let at = if m.is_indexed() {
+            let at = if m.is_indexed() && m.shape() == crate::shape::DICT {
                 m.pos_tagged(key, *tag.get_or_insert_with(|| crate::heap::prop_tag_of(key)))
             } else {
-                m.pos(key)
+                self.own_pos(m, key)
             };
             if let Some(slot) = at {
                 let v = m.val_at(slot);
@@ -1866,7 +1867,7 @@ impl<'p> Vm<'p> {
         if m.is_ctor {
             return false;
         }
-        match m.pos(js.as_str_wf()) {
+        match self.own_pos(m, js.as_str_wf()) {
             None => true,
             Some(i) => m.attr_at(i).configurable && m.extensible,
         }

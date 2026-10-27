@@ -1418,11 +1418,18 @@ impl<'p> Vm<'p> {
         handler: Value,
         name: &str,
     ) -> Result<Option<Value>, Thrown> {
-        // A plain handler object's own (or inherited) data property, read
+        // Where the memo says the handler keeps it (`trap_front_get`); else a
+        // plain handler object's own (or inherited) data property, read
         // where it lies (`plain_handler_trap`); anything else is the Get.
-        let t = match self.plain_handler_trap(handler, name) {
-            Some(t) => t,
-            None => self.get_prop(handler, name)?,
+        let t = match self.trap_front_get(handler, name) {
+            Some(t) => t.unwrap_or(Value::UNDEFINED),
+            None => match self.plain_handler_trap(handler, name) {
+                Some(t) => {
+                    self.trap_front_fill(handler, name);
+                    t
+                }
+                None => self.get_prop(handler, name)?,
+            },
         };
         if t.is_undefined() || t.is_null() {
             Ok(None)

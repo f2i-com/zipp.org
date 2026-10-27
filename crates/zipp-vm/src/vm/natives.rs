@@ -239,7 +239,7 @@ impl<'p> Vm<'p> {
             if m.is_ctor || m.class.is_some() || m.class_proto {
                 return None;
             }
-            let i = m.pos(key)?;
+            let i = self.own_pos(m, key)?;
             let a = m.attr_at(i);
             if a.accessor || !a.writable || m.val_at(i).is_uninitialized() {
                 return None;

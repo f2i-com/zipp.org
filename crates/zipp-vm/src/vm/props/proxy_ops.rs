@@ -5,6 +5,54 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `Vm::proxy_trap_front`'s size: a direct-mapped memo of where Proxy
+/// handlers keep their traps (`Vm::trap_front_get`).
+pub(crate) const TRAP_FRONT_SLOTS: usize = 64;
+
+/// One entry of `Vm::proxy_trap_front`: a handler of `shape` keeps trap
+/// `trap` (`trap_id`) in own slot `slot`, or (`ABSENT`) neither it nor
+/// %Object.prototype% at version `obj_proto_ver` has it. `EMPTY`'s shape is
+/// `DICT`, which no described handler has.
+#[derive(Clone, Copy)]
+pub(crate) struct TrapFront {
+    shape: u32,
+    trap: u32,
+    slot: u32,
+    obj_proto_ver: u32,
+}
+
+impl TrapFront {
+    pub(crate) const EMPTY: TrapFront =
+        TrapFront { shape: crate::shape::DICT, trap: u32::MAX, slot: 0, obj_proto_ver: 0 };
+    const ABSENT: u32 = u32::MAX;
+}
+
+/// A Proxy trap's name as a small number, `None` for any other name.
+#[inline(always)]
+fn trap_id(name: &str) -> Option<u32> {
+    Some(match name {
+        "get" => 0,
+        "set" => 1,
+        "has" => 2,
+        "deleteProperty" => 3,
+        "defineProperty" => 4,
+        "getOwnPropertyDescriptor" => 5,
+        "ownKeys" => 6,
+        "apply" => 7,
+        "construct" => 8,
+        "getPrototypeOf" => 9,
+        "setPrototypeOf" => 10,
+        "isExtensible" => 11,
+        "preventExtensions" => 12,
+        _ => return None,
+    })
+}
+
+#[inline(always)]
+fn trap_front_index(shape: u32, trap: u32) -> usize {
+    (shape.wrapping_mul(13).wrapping_add(trap) as usize) & (TRAP_FRONT_SLOTS - 1)
+}
+
 impl<'p> Vm<'p> {
     /// Own ENUMERABLE keys / values / [k,v] entries of `obj` as an array (the
     /// shared core of `Object.keys`/`values`/`entries`).
@@ -137,6 +185,10 @@ impl<'p> Vm<'p> {
         if !self.deferred_ns_state.is_empty() {
             return false;
         }
+        if let Some(t) = self.trap_front_get(handler, name) {
+            return t.is_none();
+        }
+        self.trap_front_fill(handler, name);
         let mut cur = handler;
         for _ in 0..64 {
             if !cur.is_heap() {
@@ -161,6 +213,109 @@ impl<'p> Vm<'p> {
             };
         }
         false
+    }
+
+    /// Where a Proxy handler keeps its `name` trap, from `proxy_trap_front`:
+    /// `Some(Some(v))` for an own data property, `Some(None)` when neither
+    /// the handler nor %Object.prototype% has the name, `None` (look it up)
+    /// for a memo miss and every handler the memo does not describe. Every
+    /// operation on a proxy found its trap by name: the handler's own keys,
+    /// then %Object.prototype%'s hashed ones when the handler leaves the trap
+    /// out (a forwarding `{}` handler on every access).
+    ///
+    /// The handler's shape fixes its key sequence and attributes, and shapes
+    /// are never reissued, so a (shape, trap) answer about the handler holds
+    /// for any object of that shape. An absent answer also needs the chain
+    /// past it: the default link to %Object.prototype% (whose own
+    /// [[Prototype]] is null for good) at the version the memo recorded,
+    /// which every key add, delete or redefinition there moves.
+    #[inline]
+    pub(crate) fn trap_front_get(&self, handler: Value, name: &str) -> Option<Option<Value>> {
+        let id = trap_id(name)?;
+        if !handler.is_heap() {
+            return None;
+        }
+        let idx = handler.heap_index();
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return None;
+        };
+        let sh = m.shape();
+        let e = self.proxy_trap_front[trap_front_index(sh, id)].get();
+        if e.shape != sh
+            || e.trap != id
+            || sh == crate::shape::DICT
+            || m.is_ctor
+            || m.class.is_some()
+            || self.active_realm.is_some()
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        if e.slot == TrapFront::ABSENT {
+            return (self.proto_of.link(idx) == crate::slot_table::ProtoTable::NONE
+                && self.obj_proto != 0
+                && self.heap.version_of(self.obj_proto) == e.obj_proto_ver)
+                .then_some(None);
+        }
+        let v = m.val_at(e.slot as usize);
+        (!v.is_uninitialized()).then_some(Some(v))
+    }
+
+    /// Record in `proxy_trap_front` where `handler` keeps its `name` trap,
+    /// when [`Self::trap_front_get`] can answer it: an own data property of a
+    /// shaped ordinary handler, or a name that neither such a handler (with
+    /// the default prototype) nor %Object.prototype% holds.
+    #[inline(never)]
+    pub(crate) fn trap_front_fill(&self, handler: Value, name: &str) {
+        let Some(id) = trap_id(name) else {
+            return;
+        };
+        if !handler.is_heap()
+            || self.active_realm.is_some()
+            || !self.realm_global_objs.is_empty()
+            || !self.deferred_ns_state.is_empty()
+            || self.obj_proto == 0
+        {
+            return;
+        }
+        let idx = handler.heap_index();
+        if idx == self.global_this && self.global_this != 0 {
+            return;
+        }
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return;
+        };
+        let sh = m.shape();
+        if sh == crate::shape::DICT || m.is_ctor || m.class.is_some() {
+            return;
+        }
+        let slot = match m.pos(name) {
+            Some(i) => {
+                if m.attr_at(i).accessor || m.val_at(i).is_uninitialized() {
+                    return;
+                }
+                i as u32
+            }
+            None => {
+                if self.proto_of.link(idx) != crate::slot_table::ProtoTable::NONE {
+                    return;
+                }
+                let HeapObj::Object(op) = self.heap.get(self.obj_proto) else {
+                    return;
+                };
+                if op.is_ctor || op.class.is_some() || op.pos(name).is_some() {
+                    return;
+                }
+                TrapFront::ABSENT
+            }
+        };
+        self.proxy_trap_front[trap_front_index(sh, id)].set(TrapFront {
+            shape: sh,
+            trap: id,
+            slot,
+            obj_proto_ver: self.heap.version_of(self.obj_proto),
+        });
     }
 
     /// boolean, or the target update when no trap); `None` for a non-proxy.
