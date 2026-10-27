@@ -449,6 +449,7 @@ impl<'p> Vm<'p> {
                 crate::vm::values::PRIVATE_MEMO_SLOTS
             ]
             .into_boxed_slice(),
+            private_epoch: 0,
             prototypes: crate::slot_table::SlotTable::default(),
             class_proto_owner: rustc_hash::FxHashMap::default(),
             ctor_initial_name: rustc_hash::FxHashMap::default(),

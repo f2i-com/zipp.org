@@ -415,6 +415,24 @@ pub(crate) enum IcEntry {
         id: u32,
         pos: u32,
     },
+    /// `obj.#m` for an instance's private METHOD, at a site whose code,
+    /// running as the callee `head`, resolved the name to `method` of the
+    /// class whose brand is `brand`; the receiver it filled from held that
+    /// brand's entry at `pos` of its private list. A hit is the running
+    /// callee's key, no declaring class collected since the fill (`epoch`,
+    /// `Vm::private_epoch`: a class keeps its methods alive) and the
+    /// receiver's brand entry. A method's every call (`this.#step(dt)`) read
+    /// it through `private_get_slow`: the name's resolution, the brand scan
+    /// and the class's method list by name. Last, after `Private`, as the
+    /// own hit tests both at once.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    PrivateMethod {
+        head: u64,
+        brand: u64,
+        method: Value,
+        epoch: u32,
+        pos: u32,
+    },
 }
 
 /// The `pos` of an `IcEntry::Private` way that adds its field.
@@ -1387,7 +1405,7 @@ impl<'p> Vm<'p> {
                 // of this shape, which has that many slots).
                 Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
             }
-            IcEntry::ProtoData { .. } | IcEntry::Private { .. } => {
+            IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
                 self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape)
             }
             _ => None,
@@ -1409,8 +1427,41 @@ impl<'p> Vm<'p> {
                 slot,
             } if recv_shape == shape => self.ic_proto_hit_tail(idx, first, hops, slot),
             IcEntry::Private { head, brand, id, pos } => self.ic_private_get_tail(idx, head, brand, id, pos),
+            IcEntry::PrivateMethod {
+                head,
+                brand,
+                method,
+                epoch,
+                pos,
+            } => self.ic_private_method_tail(idx, head, brand, method, epoch, pos),
             _ => None,
         }
+    }
+
+    /// A private-name site's way-0 method hit (`IcEntry::PrivateMethod`):
+    /// the method, when no declaring class died since the fill, the running
+    /// callee is the one the way was filled under, and the receiver, which
+    /// is not a class value (a class's own statics are another way), carries
+    /// the brand: what `private_get_slow` checks before it reads the method.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn ic_private_method_tail(
+        &self,
+        idx: u32,
+        head: u64,
+        brand: u64,
+        method: Value,
+        epoch: u32,
+        pos: u32,
+    ) -> Option<Value> {
+        if epoch != self.private_epoch {
+            return None;
+        }
+        let ctx = self.frames.last()?.callee;
+        if self.private_memo_key(ctx) != Some(head) || matches!(self.heap.get(idx), HeapObj::Class(_)) {
+            return None;
+        }
+        self.brand_entry_at(idx, brand, pos).is_some().then_some(method)
     }
 
     /// A private-name site's way-0 field hit (`IcEntry::Private`): the field
@@ -1478,6 +1529,43 @@ impl<'p> Vm<'p> {
                 head,
                 brand,
                 id,
+                pos: pos as u32,
+            };
+            site.n = site.n.max(1);
+        }
+        // The own hit reads the receiver through its mirror.
+        self.heap.refresh_mirror(recv.heap_index());
+    }
+
+    /// Fill a private-name site's way 0 after its code, running as `ctx`,
+    /// read the instance private method `method` of the class whose brand
+    /// is `brand` from `recv` (`IcEntry::PrivateMethod`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ic_private_method_fill(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        ctx: Value,
+        brand: u64,
+        method: Value,
+        recv: Value,
+    ) {
+        if !recv.is_heap() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_)) {
+            return;
+        }
+        let Some(head) = self.private_memo_key(ctx) else {
+            return;
+        };
+        let Some(pos) = self.brand_entry_at(recv.heap_index(), brand, 0) else {
+            return;
+        };
+        let epoch = self.private_epoch;
+        if let Some(site) = self.ic_site_mut(func_id, ip) {
+            site.entries[0] = IcEntry::PrivateMethod {
+                head,
+                brand,
+                method,
+                epoch,
                 pos: pos as u32,
             };
             site.n = site.n.max(1);
@@ -1605,7 +1693,9 @@ impl<'p> Vm<'p> {
             IcEntry::OwnData { shape, slot } => {
                 (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
             }
-            IcEntry::Private { .. } => self.ic_get_way0_tail(idx, &site.entries[0], crate::shape::DICT),
+            IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+                self.ic_get_way0_tail(idx, &site.entries[0], crate::shape::DICT)
+            }
             _ => None,
         }
     }

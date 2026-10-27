@@ -2200,6 +2200,11 @@ pub struct Vm<'p> {
     /// brand of the accessing chain and the private name's id (see
     /// `Vm::resolve_private_memo`).
     private_memo: Box<[values::PrivateMemo]>,
+    /// Bumped whenever the collector drops a `brand_owner` entry (a class
+    /// with private names died), as it clears `private_memo`: the private
+    /// method ways (`IcEntry::PrivateMethod`) filled before hold methods such
+    /// a class kept alive, and miss from then on.
+    private_epoch: u32,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

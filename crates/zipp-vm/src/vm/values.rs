@@ -670,6 +670,20 @@ impl<'p> Vm<'p> {
             .is_some_and(|es| es.iter().any(|e| e.0 == brand && e.1 == BRAND_ENTRY))
     }
 
+    /// Where heap `idx`'s private list holds the brand entry of `brand`:
+    /// `pos` when it is there, which every instance of one class hierarchy
+    /// shares (its classes install their brands in one order), else found
+    /// by a scan. `None` when the brand is not installed.
+    #[inline]
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    pub(crate) fn brand_entry_at(&self, idx: u32, brand: u64, pos: u32) -> Option<usize> {
+        let es = self.private_fields.get(&idx)?;
+        if es.get(pos as usize).is_some_and(|e| e.0 == brand && e.1 == BRAND_ENTRY) {
+            return Some(pos as usize);
+        }
+        es.iter().position(|e| e.0 == brand && e.1 == BRAND_ENTRY)
+    }
+
     /// Every brand installed on an object the private lists still hold, into
     /// `set`: with the lexical chains' brands, the ones whose declared names
     /// the collector keeps.
@@ -1231,8 +1245,15 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 let r = if kind & 1 != 0 {
-                    self.private_member_from_owner(owner, key, (kind & 8) | 1)
-                        .unwrap_or(Value::UNDEFINED)
+                    let m = self
+                        .private_member_from_owner(owner, key, (kind & 8) | 1)
+                        .unwrap_or(Value::UNDEFINED);
+                    // An instance method: the site's way 0 remembers it.
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    if kind & 8 == 0 && m.is_heap() {
+                        self.ic_private_method_fill(func_id, ip, ctx, b, m, o);
+                    }
+                    m
                 } else if kind & 2 != 0 {
                     let g = self
                         .private_member_from_owner(owner, key, (kind & 8) | 2)
@@ -1468,6 +1489,7 @@ impl<'p> Vm<'p> {
     /// `resolve_private_site`): a class's `brand_owner` entry was dropped.
     pub(crate) fn clear_private_memo(&mut self) {
         self.private_memo.fill(PrivateMemo::EMPTY);
+        self.private_epoch = self.private_epoch.wrapping_add(1);
     }
 
     /// Declaring-class private resolution (kind-aware): walk the brand chain

@@ -1445,7 +1445,10 @@ impl Vm<'_> {
             // A remembered private resolution may name a class just freed
             // (see `Vm::resolve_private_site`).
             if self.brand_owner.len() != owners {
+                // `clear_private_memo`, field by field (`live_bits` borrows
+                // the heap).
                 self.private_memo.fill(super::values::PrivateMemo::EMPTY);
+                self.private_epoch = self.private_epoch.wrapping_add(1);
             }
         }
         // A guarded wrapper with its own `retain` and `remove`, not a std
