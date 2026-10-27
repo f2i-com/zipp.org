@@ -100,6 +100,10 @@ pub(crate) const LEAN_DESC_SLOPPY: u32 = 1 << 25;
 /// Set in every descriptor, so 0 means none.
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
+/// In place of [`LEAN_DESC_OK`]: the callee is an arrow that takes the
+/// lean push with the `this` its closure captured (`Vm::setup_call_arrow`).
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 
 /// How many arguments `Vm::arg_window` copies out on the stack.
 const ARGS_ON_STACK: usize = 8;
@@ -8007,7 +8011,6 @@ impl<'p> Vm<'p> {
         callee_val: Value,
     ) -> Result<(), Thrown> {
         let callee_regs = (desc & 0xFFFF) as usize;
-        let params = ((desc >> 16) & 0xFF) as usize;
         let new_base = self.regs.len();
         let lean = desc & LEAN_DESC_OK != 0
             && self.frames.len() < MAX_FRAMES
@@ -8016,6 +8019,19 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "python")]
         let lean = lean && !super::prof_py::on();
         if !lean {
+            if desc & LEAN_DESC_ARROW != 0 {
+                return self.setup_call_arrow(
+                    func_id,
+                    closure,
+                    desc,
+                    caller_base,
+                    arg_base,
+                    argc,
+                    dst,
+                    caller_ip_next,
+                    callee_val,
+                );
+            }
             return self.setup_call_lean(
                 func_id,
                 closure,
@@ -8033,6 +8049,79 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
+        self.lean_desc_push(func_id, closure, desc, this_val, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        Ok(())
+    }
+
+    /// [`Self::setup_call_lean_desc`] for an arrow ([`LEAN_DESC_ARROW`]): the
+    /// same push, with the `this` its closure captured. An arrow took the
+    /// whole of `setup_call`, which reads the callee's prototype for every
+    /// flag again: a plain call to an arrow cost a quarter more than one to
+    /// a declared function. Out of line, so the plain push compiles as it
+    /// did (inline, the arrow's test spilled the loop's registers on every
+    /// call).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn setup_call_arrow(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let new_base = self.regs.len();
+        let lean = closure != NO_CLOSURE
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + callee_regs)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call(
+                func_id,
+                closure,
+                Value::UNDEFINED,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        let this_val = self.arrow_closure_this(closure, Value::UNDEFINED);
+        self.lean_desc_push(func_id, closure, desc, this_val, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        Ok(())
+    }
+
+    /// The push [`Self::setup_call_lean_desc`] and
+    /// [`Self::setup_call_arrow`] make once they have decided it is lean.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn lean_desc_push(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        this_val: Value,
+        new_base: usize,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) {
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let params = ((desc >> 16) & 0xFF) as usize;
         self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
         self.regs[new_base] = this_val;
         let n = (argc as usize).min(params);
@@ -8061,15 +8150,15 @@ impl<'p> Vm<'p> {
             new_target,
             callee: callee_val,
         });
-        Ok(())
     }
 
     /// The frame facts [`Self::setup_call_lean_desc`] needs of `func_id`,
     /// packed: its register count (bits 0-15), its parameter count (16-23),
     /// [`LEAN_DESC_OK`] when a plain call to it takes the lean push (no rest
-    /// parameter, no `arguments` object, not an arrow), [`LEAN_DESC_SLOPPY`]
-    /// when its `this` is then the global object. 0 when the counts do not
-    /// fit, which sends every call to `setup_call_lean`.
+    /// parameter, no `arguments` object, not an arrow), [`LEAN_DESC_ARROW`]
+    /// for such an arrow, [`LEAN_DESC_SLOPPY`] when its `this` is then the
+    /// global object. 0 when the counts do not fit, which sends every call to
+    /// `setup_call_lean`.
     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
     pub(crate) fn lean_call_desc(&self, func_id: u32) -> u32 {
         let p = self.func(func_id as usize);
@@ -8078,10 +8167,10 @@ impl<'p> Vm<'p> {
             return 0;
         }
         let mut d = regs as u32 | ((p.param_count as u32) << 16);
-        if p.rest_reg.is_none() && p.arguments_reg.is_none() && !p.lexical_this {
-            d |= LEAN_DESC_OK;
+        if p.rest_reg.is_none() && p.arguments_reg.is_none() {
+            d |= if p.lexical_this { LEAN_DESC_ARROW } else { LEAN_DESC_OK };
         }
-        if !p.is_strict {
+        if !p.is_strict && !p.lexical_this {
             d |= LEAN_DESC_SLOPPY;
         }
         d | LEAN_DESC_KNOWN

@@ -515,11 +515,19 @@ impl<'p> Vm<'p> {
     /// `NO_CLOSURE`.
     pub(crate) fn rebind_arrow_this(&self, func_id: u32, closure: u32, this: Value) -> Value {
         if closure != NO_CLOSURE && self.func(func_id as usize).lexical_this {
-            if let HeapObj::Closure { this_val, .. } = self.heap.get(closure) {
-                return *this_val;
-            }
+            return self.arrow_closure_this(closure, this);
         }
         this
+    }
+
+    /// [`Self::rebind_arrow_this`] for a caller that knows the callee is an
+    /// arrow and `closure` its closure.
+    #[inline(always)]
+    pub(crate) fn arrow_closure_this(&self, closure: u32, this: Value) -> Value {
+        match self.heap.get(closure) {
+            HeapObj::Closure { this_val, .. } => *this_val,
+            _ => this,
+        }
     }
 
     /// If `callee` is an arrow function value, its lexically-captured `this`; else
