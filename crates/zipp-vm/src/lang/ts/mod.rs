@@ -24,8 +24,12 @@
 //! are defined (`useDefineForClassFields`), standard decorators, and enums
 //! and namespaces as tsc emits them. A project's `tsconfig.json` can ask for
 //! assigned fields and for legacy `experimentalDecorators` (with
-//! `emitDecoratorMetadata`), lowered as tsc lowers them ([`legacy`]). Not
-//! supported: `.tsx` (the engine has no JSX).
+//! `emitDecoratorMetadata`), lowered as tsc lowers them ([`legacy`]).
+//!
+//! A `.tsx` file has JSX, which the JavaScript parser reads (its `jsx`
+//! module, shared with `.jsx`) and lowers as tsc does for the project's
+//! `jsx` setting: React's automatic runtime unless the config asks for the
+//! classic `React.createElement` (see `config.rs`).
 
 use crate::parse::ast::{Expr, Goal, Name, Program};
 use crate::parse::parser::{PResult, ParseOptions, Parser};
@@ -62,7 +66,8 @@ impl Language for TypeScript {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["ts", "mts", "cts"]
+        // `.jsx` too: this front end reads it, without TypeScript's grammar.
+        &["ts", "mts", "cts", "tsx", "jsx"]
     }
 
     fn shebang(&self, command: &str) -> bool {
@@ -290,10 +295,11 @@ fn parse_goal(
     let opts = ParseOptions {
         goal,
         allow_return,
-        typescript: true,
+        typescript: !config.javascript,
         ts_define_fields: config.define_fields,
         ts_legacy_decorators: config.legacy_decorators,
         ts_decorator_metadata: config.decorator_metadata,
+        jsx: config.jsx,
         ..if goal == Goal::Module {
             ParseOptions::module()
         } else {
@@ -345,7 +351,7 @@ pub(crate) fn parse_auto(
     src: &str,
     config: TsConfig,
 ) -> Result<Program, crate::front::ParseFailure> {
-    let first = if looks_like_module(src) {
+    let first = if looks_like_module(src) || jsx_needs_module(&config) {
         Goal::Module
     } else {
         Goal::Script
@@ -401,17 +407,24 @@ pub(crate) fn looks_like_module(src: &str) -> bool {
     false
 }
 
+/// JSX lowered for the automatic runtime imports it, so the file is a
+/// module (tsc's `moduleDetection: "auto"` decides the same).
+fn jsx_needs_module(config: &TsConfig) -> bool {
+    config.jsx.is_some_and(|j| j.automatic)
+}
+
 /// Whether `path` names a TypeScript file.
 pub(crate) fn is_ts_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e, "ts" | "mts" | "cts"))
+        .is_some_and(|e| matches!(e, "ts" | "mts" | "cts" | "tsx"))
 }
 
-/// The module at `path`, read as TypeScript or JavaScript by its extension.
+/// The module at `path`, read as TypeScript or JavaScript by its extension
+/// (`.jsx` is JavaScript with JSX, read here for its config's JSX settings).
 /// A TypeScript module's syntax error names the file, as an entry's does.
 pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, String> {
-    if is_ts_path(path) {
+    if is_ts_path(path) || config::is_jsx_path(path) {
         parse_module(code, config::config_for(path)).map_err(|f| {
             #[cfg(not(feature = "wasm-no-fs-loader"))]
             let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p)).ok();
@@ -425,25 +438,29 @@ pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, Stri
 }
 
 /// A file a TypeScript import may mean when `raw` itself does not exist:
-/// `./x` is `./x.ts` or `./x/index.ts`, and `./x.js` is `./x.ts` (tsc's
-/// module resolution, which lets ESM TypeScript name its imports by the
-/// JavaScript file they become).
+/// `./x` is `./x.ts`, `./x.tsx` or `./x/index.ts`, and `./x.js` is
+/// `./x.ts` or `./x.tsx` (tsc's module resolution, which lets ESM
+/// TypeScript name its imports by the JavaScript file they become).
 pub(crate) fn resolve_candidates(raw: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let ext = raw.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "js" | "jsx" => out.push(raw.with_extension("ts")),
+        "js" => {
+            out.push(raw.with_extension("ts"));
+            out.push(raw.with_extension("tsx"));
+        }
+        "jsx" => out.push(raw.with_extension("tsx")),
         "mjs" => out.push(raw.with_extension("mts")),
         "cjs" => out.push(raw.with_extension("cts")),
-        "ts" | "mts" | "cts" => {}
+        "ts" | "mts" | "cts" | "tsx" => {}
         _ => {
             let s = raw.as_os_str();
-            for add in [".ts", ".mts", ".js", ".mjs"] {
+            for add in [".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs"] {
                 let mut p = s.to_owned();
                 p.push(add);
                 out.push(p.into());
             }
-            for index in ["index.ts", "index.js"] {
+            for index in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
                 out.push(raw.join(index));
             }
         }
@@ -458,14 +475,14 @@ pub fn run_file(path: &Path) -> Result<crate::Outcome, String> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let config = config::config_for(path);
     let module = match ext {
         "mts" => true,
         "cts" => false,
-        _ => looks_like_module(&src),
+        _ => looks_like_module(&src) || jsx_needs_module(&config),
     };
     let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
     let name = name.to_string_lossy();
-    let config = config::config_for(path);
     if !module {
         match parse_script(&src, true, config) {
             Ok(ast) => return run_script(&src, ast, path, &name),

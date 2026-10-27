@@ -18,7 +18,8 @@ crates/zipp-vm/src/
   codegen/                  the native tiers (x86-64; codegen_aarch64.rs)
   lang/
     mod.rs                  the `Language` trait and the table of languages
-    js/                     JavaScript: parse/, compile/, front.rs, mod.rs
+    js/                     JavaScript: parse/ (jsx.rs: JSX), compile/, node/,
+                            front.rs, mod.rs
     ts/                     TypeScript: types.rs, expr.rs, decl.rs, class.rs,
                             lower.rs, legacy.rs, elide.rs, config.rs, mod.rs
     python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
@@ -130,11 +131,23 @@ JavaScript.
   `design:type`, `design:paramtypes` and `design:returntype` entries follow,
   types serialized as tsc serializes them. Without the option decorators are
   the standard ones.
-- **Modules resolve the way TypeScript names them**: `./x` finds `./x.ts`
-  or `./x/index.ts`, and `./x.js` finds `./x.ts`.
+- **Modules resolve the way TypeScript names them**: `./x` finds `./x.ts`,
+  `./x.tsx` or `./x/index.ts`, and `./x.js` finds `./x.ts` or `./x.tsx`.
+- **JSX** (`.tsx`, and `.jsx` read the same way without types) is read by
+  the JavaScript parser (`lang/js/parse/jsx.rs`) and lowered as it is read,
+  to the calls tsc emits for the project's `jsx` setting: React's automatic
+  runtime (`_jsx`/`_jsxs` imported from `<jsxImportSource>/jsx-runtime`,
+  `react-jsxdev`'s `jsxDEV`) or the classic `React.createElement` through
+  `jsxFactory` and `jsxFragmentFactory`, with a file's `@jsx`, `@jsxFrag`,
+  `@jsxImportSource` and `@jsxRuntime` pragmas over the config. With no
+  `jsx` set, or `preserve` (which leaves lowering to a bundler, Next.js's
+  with the automatic runtime), it is the automatic runtime. Text is trimmed
+  and character references decoded as tsc does; a tag's type arguments
+  (`<Select<Opt> />`) are dropped, and in a `.tsx` file `<T>` starts an
+  element, so a generic arrow is written `<T,>(x) => x` as tsc requires.
 
 The ambiguous prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against
 `f < T > (x)`, `<T>x` against `<T>(x) => …`) are settled as tsc settles
 them, with the parser's snapshot as the fallback point. `zipp ts file.ts`
-(or `zipp file.ts`) runs a file; `zipp ts-sweep <paths>` parses a corpus
-and groups the failures. Not supported: `.tsx` (the engine has no JSX).
+(or `zipp file.ts`, `zipp app.tsx`, `zipp app.jsx`) runs a file; `zipp
+ts-sweep <paths>` parses a corpus and groups the failures.

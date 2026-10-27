@@ -96,6 +96,9 @@ impl<'s> Parser<'s> {
             self.ts_finish_program(&mut body);
             self.ts_legacy_helpers(&mut body);
         }
+        if self.jsx.is_some() {
+            self.jsx_finish_program(&mut body)?;
+        }
         for (name, pos) in std::mem::take(&mut self.pending_export_locals) {
             if !self.scopes.module_binds(&name) {
                 return Err(SyntaxError::new(

@@ -3,12 +3,14 @@
 //! (`useDefineForClassFields`, the ES2022 semantics) or *assigned* in the
 //! constructor (tsc's output for older targets, and its default), and
 //! whether decorators are the legacy ones (`experimentalDecorators`, with
-//! `emitDecoratorMetadata`).
+//! `emitDecoratorMetadata`), and how JSX is lowered (`jsx`, `jsxFactory`,
+//! `jsxFragmentFactory`, `jsxImportSource`).
 //!
 //! A file's settings come from the nearest `tsconfig.json` above it, with its
 //! `extends` chain applied, as tsc finds them. The file is JSON with comments
 //! and trailing commas.
 
+use crate::parse::jsx::JsxOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -23,6 +25,12 @@ pub(crate) struct TsConfig {
     pub(crate) legacy_decorators: bool,
     /// `emitDecoratorMetadata`: legacy decorators also record types.
     pub(crate) decorator_metadata: bool,
+    /// How JSX is lowered, for a file that has JSX (`.tsx`, `.jsx`); `None`
+    /// for one that has not.
+    pub(crate) jsx: Option<JsxOptions>,
+    /// The file is JavaScript with JSX (`.jsx`), read without TypeScript's
+    /// grammar: tsc's `allowJs`.
+    pub(crate) javascript: bool,
 }
 
 impl Default for TsConfig {
@@ -33,8 +41,17 @@ impl Default for TsConfig {
             define_fields: false,
             legacy_decorators: false,
             decorator_metadata: false,
+            jsx: None,
+            javascript: false,
         }
     }
+}
+
+/// Whether `file` is one with JSX in it.
+pub(crate) fn is_jsx_path(file: &Path) -> bool {
+    file.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("tsx") || e.eq_ignore_ascii_case("jsx"))
 }
 
 /// The settings for the TypeScript file at `file`.
@@ -44,19 +61,33 @@ pub(crate) fn config_for(file: &Path) -> TsConfig {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    let jsx = is_jsx_path(file);
+    let javascript = file
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("jsx"));
+    let for_file = |mut c: TsConfig| {
+        if !jsx {
+            c.jsx = None;
+        }
+        c.javascript = javascript;
+        c
+    };
     if let Ok(cache) = CACHE.lock() {
         if let Some((_, c)) = cache.iter().find(|(d, _)| *d == dir) {
-            return *c;
+            return for_file(*c);
         }
     }
     let config = find_config(&dir)
         .and_then(|path| options_of(&path, 0))
         .map(|o| resolve(&o))
-        .unwrap_or_default();
+        .unwrap_or_else(|| TsConfig {
+            jsx: Some(JsxOptions::default()),
+            ..TsConfig::default()
+        });
     if let Ok(mut cache) = CACHE.lock() {
         cache.push((dir, config));
     }
-    config
+    for_file(config)
 }
 
 /// The nearest `tsconfig.json` in `dir` or above it.
@@ -81,6 +112,10 @@ struct Options {
     use_define: Option<bool>,
     experimental_decorators: Option<bool>,
     decorator_metadata: Option<bool>,
+    jsx: Option<String>,
+    jsx_factory: Option<String>,
+    jsx_fragment: Option<String>,
+    jsx_import_source: Option<String>,
 }
 
 fn resolve(o: &Options) -> TsConfig {
@@ -98,7 +133,46 @@ fn resolve(o: &Options) -> TsConfig {
         define_fields,
         legacy_decorators,
         decorator_metadata: legacy_decorators && o.decorator_metadata.unwrap_or(false),
+        jsx: Some(jsx_options(o)),
+        javascript: false,
     }
+}
+
+/// tsc's `getJSXImplicitImportBase`: `react-jsx`, `react-jsxdev` or a
+/// `jsxImportSource` is the automatic runtime, `react` the classic one. tsc
+/// lowers nothing for `preserve` (a bundler does, Next.js's with the
+/// automatic runtime) and refuses a `.tsx` file with no `jsx`; both get the
+/// automatic runtime here, unless a factory is named.
+fn jsx_options(o: &Options) -> JsxOptions {
+    let d = JsxOptions::default();
+    let mode = o.jsx.as_deref().unwrap_or("").to_ascii_lowercase();
+    let automatic = match mode.as_str() {
+        "react" => o.jsx_import_source.is_some(),
+        "react-jsx" | "react-jsxdev" => true,
+        _ => o.jsx_import_source.is_some() || (o.jsx_factory.is_none() && o.jsx_fragment.is_none()),
+    };
+    JsxOptions {
+        automatic,
+        dev: mode == "react-jsxdev",
+        factory: o.jsx_factory.as_deref().map_or(d.factory, leak),
+        fragment: o.jsx_fragment.as_deref().map_or(d.fragment, leak),
+        import_source: o.jsx_import_source.as_deref().map_or(d.import_source, leak),
+    }
+}
+
+/// A config's string for the rest of the run: there is one per distinct
+/// setting, and configs are read once per directory.
+fn leak(s: &str) -> &'static str {
+    static KEPT: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let Ok(mut kept) = KEPT.lock() else {
+        return "";
+    };
+    if let Some(k) = kept.iter().find(|k| **k == s) {
+        return k;
+    }
+    let k: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    kept.push(k);
+    k
 }
 
 /// The options of the config file at `path`, its bases' first.
@@ -123,6 +197,10 @@ fn options_of(path: &Path, depth: u32) -> Option<Options> {
                     out.experimental_decorators =
                         o.experimental_decorators.or(out.experimental_decorators);
                     out.decorator_metadata = o.decorator_metadata.or(out.decorator_metadata);
+                    out.jsx = o.jsx.or(out.jsx);
+                    out.jsx_factory = o.jsx_factory.or(out.jsx_factory);
+                    out.jsx_fragment = o.jsx_fragment.or(out.jsx_fragment);
+                    out.jsx_import_source = o.jsx_import_source.or(out.jsx_import_source);
                 }
             }
         }
@@ -140,6 +218,15 @@ fn options_of(path: &Path, depth: u32) -> Option<Options> {
         if let Some(Value::Bool(b)) = opts.get("emitDecoratorMetadata") {
             out.decorator_metadata = Some(*b);
         }
+        let text = |key: &str, slot: &mut Option<String>| {
+            if let Some(s) = opts.get(key).and_then(Value::as_str) {
+                *slot = Some(s.to_owned());
+            }
+        };
+        text("jsx", &mut out.jsx);
+        text("jsxFactory", &mut out.jsx_factory);
+        text("jsxFragmentFactory", &mut out.jsx_fragment);
+        text("jsxImportSource", &mut out.jsx_import_source);
     }
     Some(out)
 }

@@ -1,7 +1,7 @@
 # Running Node programs
 
-`zipp app.js`, `zipp app.mjs` and `zipp app.ts` run a program the way
-`node` runs it: with Node's globals, npm packages from `node_modules`,
+`zipp app.js`, `zipp app.mjs`, `zipp app.ts` and `zipp app.tsx` run a
+program the way `node` runs it: with Node's globals, npm packages from `node_modules`,
 CommonJS and the core modules most packages reach for. The layer lives in
 `crates/zipp-vm/src/lang/js/node/`: JavaScript (as Python's runtime is) over
 a few host functions, each part compiled the first time a program uses it,

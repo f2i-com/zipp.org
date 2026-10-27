@@ -74,8 +74,43 @@ impl<'s> Parser<'s> {
     /// At `<`: a generic arrow (`<T>(x: T) => x`) may start here only if a
     /// type parameter's name (or `const`) follows.
     fn ts_generic_arrow_tri(&mut self) -> PResult<Tri> {
+        if self.jsx.is_some() {
+            return Ok(self.ts_tsx_generic_arrow_tri());
+        }
         let r = self.ts_peek(|p| p.ts_at_name() || p.at_kw(Keyword::Const))?;
         Ok(if r { Tri::Unknown } else { Tri::False })
+    }
+
+    /// In a `.tsx` file `<T>` starts an element, so tsc takes `<` for a
+    /// generic arrow only when the parameter list cannot be a tag: `<T,>`,
+    /// `<T = D>`, or `<T extends U>` with no `=`, `>` or `/` straight after
+    /// `extends` (an attribute named `extends`). Anything else is JSX.
+    fn ts_tsx_generic_arrow_tri(&mut self) -> Tri {
+        let saved = self.peek_state();
+        let r = (|| -> PResult<bool> {
+            self.bump(false)?; // `<`
+            if self.at_kw(Keyword::Const) {
+                self.bump(false)?;
+            }
+            if !self.ts_at_name() {
+                return Ok(false);
+            }
+            self.bump(false)?;
+            if self.at_kw(Keyword::Extends) {
+                self.bump(false)?;
+                return Ok(!matches!(
+                    self.cur().kind.as_punct(),
+                    Some(Punct::Eq | Punct::Gt | Punct::Slash)
+                ));
+            }
+            Ok(self.at(Punct::Comma) || self.at(Punct::Eq))
+        })();
+        self.peek_restore(saved);
+        if r.unwrap_or(false) {
+            Tri::True
+        } else {
+            Tri::False
+        }
     }
 
     /// tsc's `isParenthesizedArrowFunctionExpressionWorker`, at `(`.

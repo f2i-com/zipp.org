@@ -44,6 +44,7 @@ fn legacy_out(src: &str, metadata: bool) -> String {
             define_fields: true,
             legacy_decorators: true,
             decorator_metadata: metadata,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|f| panic!("{}", f.message));
@@ -390,6 +391,7 @@ fn legacy_decorators_are_not_valid_on_class_expressions() {
                 define_fields: true,
                 legacy_decorators: true,
                 decorator_metadata: false,
+                ..Default::default()
             },
         );
         assert!(r.is_err(), "{src}");

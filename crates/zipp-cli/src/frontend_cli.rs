@@ -55,13 +55,16 @@ fn is_javascript_file(arg: &str) -> bool {
         && path.is_file()
 }
 
-/// `zipp app.ts`: a TypeScript file named as the command runs as `zipp ts`.
+/// `zipp app.ts`: a TypeScript file named as the command runs as `zipp ts`,
+/// and so does a `.tsx` or `.jsx` one (JSX is read by the same front end).
 fn is_typescript_file(arg: &str) -> bool {
     let path = Path::new(arg);
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ts" | "mts" | "cts"))
-        && path.is_file()
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "ts" | "mts" | "cts" | "tsx" | "jsx"
+        )
+    }) && path.is_file()
 }
 
 fn run(args: &[String]) -> Result<(), String> {

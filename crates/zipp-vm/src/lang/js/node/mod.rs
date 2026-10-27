@@ -625,7 +625,7 @@ pub(crate) fn node_format(path: &std::path::Path) -> &'static str {
         .to_ascii_lowercase();
     match ext.as_str() {
         "cjs" => "commonjs",
-        "mjs" | "ts" | "mts" | "cts" | "tsx" => "module",
+        "mjs" | "ts" | "mts" | "cts" | "tsx" | "jsx" => "module",
         "json" => "json",
         _ => {
             let dir = path.parent().unwrap_or(std::path::Path::new("."));

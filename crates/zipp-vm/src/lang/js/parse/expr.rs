@@ -635,8 +635,9 @@ impl<'s> Parser<'s> {
 
     fn parse_unary_inner(&mut self) -> PResult<Expr> {
         use Punct as P;
-        // TypeScript's type assertion `<T>expr`.
-        if self.ts && self.at(P::Lt) {
+        // TypeScript's type assertion `<T>expr` (in a `.tsx` file, `<T>`
+        // starts an element).
+        if self.ts && self.jsx.is_none() && self.at(P::Lt) {
             self.ts_type_assertion_head()?;
             return self.parse_unary();
         }
@@ -1202,6 +1203,9 @@ impl<'s> Parser<'s> {
         // The `(` branch re-sets it after its contents are parsed.
         self.parenthesized = false;
         let start = self.cur().span.start;
+        if self.jsx.is_some() && self.at(Punct::Lt) {
+            return self.parse_jsx();
+        }
         // `ClassExpression : DecoratorList_opt class …` — a decorated class
         // EXPRESSION (`x = @dec class {}`, `f(@dec class C {})`). Nothing else in
         // PrimaryExpression starts with `@`, so this is unambiguous.

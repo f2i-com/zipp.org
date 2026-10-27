@@ -688,6 +688,9 @@ pub struct ParseOptions {
     /// `lang/ts/legacy.rs`).
     pub ts_legacy_decorators: bool,
     pub ts_decorator_metadata: bool,
+    /// Read JSX (a `.jsx` or `.tsx` file), lowered as these options say
+    /// (see `jsx.rs`).
+    pub jsx: Option<super::jsx::JsxOptions>,
 }
 
 impl Default for ParseOptions {
@@ -705,6 +708,7 @@ impl Default for ParseOptions {
             ts_define_fields: false,
             ts_legacy_decorators: false,
             ts_decorator_metadata: false,
+            jsx: None,
         }
     }
 }
@@ -790,6 +794,8 @@ pub struct Parser<'s> {
     pub(crate) ts: bool,
     /// What the TypeScript grammar keeps while it reads (see `lang/ts`).
     pub(crate) ts_state: crate::lang::ts::TsState,
+    /// JSX's settings and what its lowering has used, when the file has JSX.
+    pub(crate) jsx: Option<Box<super::jsx::JsxState>>,
 }
 
 /// Where a speculative parse started, to go back to: TypeScript decides some
@@ -881,6 +887,9 @@ impl<'s> Parser<'s> {
                 decorator_metadata: opts.ts_decorator_metadata,
                 ..Default::default()
             },
+            jsx: opts
+                .jsx
+                .map(|o| Box::new(super::jsx::JsxState::new(o, src))),
         })
     }
 
@@ -918,6 +927,11 @@ impl<'s> Parser<'s> {
     }
 
     /// The source text `start..end`.
+    /// The whole source text.
+    pub(crate) fn source(&self) -> &'s str {
+        self.src
+    }
+
     pub(crate) fn src_text(&self, start: u32, end: u32) -> &'s str {
         self.src.get(start as usize..end as usize).unwrap_or("")
     }
@@ -949,6 +963,30 @@ impl<'s> Parser<'s> {
         self.lx.seek(at);
         self.tok = self.lx.next_token(false)?;
         Ok(())
+    }
+
+    /// Lex on from byte `pos`, whose token becomes the current one. JSX reads
+    /// its own text and hands the lexer back its position this way; the
+    /// trivia before the token is skipped, so `newline_before` is right.
+    pub(crate) fn resume_at(&mut self, pos: u32, regex_allowed: bool) -> PResult<()> {
+        self.prev_end = pos;
+        self.lx.seek(pos);
+        self.tok = self.lx.next_token(regex_allowed)?;
+        Ok(())
+    }
+
+    /// The first byte at or after `pos` that is not whitespace or part of a
+    /// comment. Moves the lexer, so a [`Self::resume_at`] must follow before
+    /// tokens are read again.
+    pub(crate) fn skip_trivia_from(&mut self, pos: u32) -> PResult<u32> {
+        self.lx.seek(pos);
+        self.lx.skip_trivia()?;
+        Ok(self.lx.pos())
+    }
+
+    /// This parse's one allocation of the name `s` (see `Lexer::intern`).
+    pub(crate) fn intern_name(&mut self, s: &str) -> Name {
+        self.lx.intern(s)
     }
 
     /// The source text from byte `pos` on.

@@ -31,6 +31,14 @@ pub fn check_typescript(source: &str) -> Result<(), String> {
         .map_err(|f| f.located(source, None))
 }
 
+/// [`check_typescript`] for the file at `path`, read as it would be run: a
+/// `.tsx` or `.jsx` file has JSX, lowered as its `tsconfig.json` says.
+pub fn check_typescript_file(path: &Path, source: &str) -> Result<(), String> {
+    ts::parse_auto(source, ts::config::config_for(path))
+        .map(drop)
+        .map_err(|f| f.located(source, None))
+}
+
 /// A language the runtime runs: its names, how a file is recognised as its,
 /// and its frontend. Every language implements it once, in `lang/<name>/`,
 /// and is listed in [`languages`]; language detection, the `--lang` names

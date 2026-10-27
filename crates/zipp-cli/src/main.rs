@@ -687,7 +687,7 @@ fn run(args: &[String]) -> Result<(), String> {
             for f in &files {
                 let Ok(src) = std::fs::read_to_string(f) else { continue };
                 bytes += src.len();
-                match zipp_vm::frontend::check_typescript(&src) {
+                match zipp_vm::frontend::check_typescript_file(f, &src) {
                     Ok(()) => ok += 1,
                     Err(e) => {
                         failed += 1;
@@ -1021,8 +1021,8 @@ fn build_identity(json: bool) -> String {
     s
 }
 
-/// Every `.ts`/`.mts`/`.cts` file under `p` (or `p` itself if it is a file),
-/// `.d.ts` included. A `node_modules` folder below `p` is skipped (name one
+/// Every `.ts`/`.mts`/`.cts`/`.tsx` file under `p` (or `p` itself if it is a
+/// file), `.d.ts` included. A `node_modules` folder below `p` is skipped (name one
 /// to sweep it).
 fn collect_ts(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     if p.is_file() {
@@ -1039,7 +1039,7 @@ fn collect_ts(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             collect_ts(&path, out);
         } else if path
             .extension()
-            .is_some_and(|x| x == "ts" || x == "mts" || x == "cts")
+            .is_some_and(|x| x == "ts" || x == "mts" || x == "cts" || x == "tsx")
         {
             out.push(path);
         }
