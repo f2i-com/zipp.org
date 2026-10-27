@@ -3600,8 +3600,38 @@ impl<'p> Vm<'p> {
                         // never serves (a private name fills no way, and a
                         // string, array or typed array has no shape), and they
                         // read the key's text first. Anything else is the full
-                        // `ic_get_prop` call further down.
-                        #[cfg(not(feature = "safe-sandbox"))]
+                        // `ic_get_prop` call further down. A getter way 0
+                        // names is called from here as that call's would be.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        match self.ic_get_prop_way0(func_id, ip, o) {
+                            GetAct::Value(v) => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                            GetAct::Accessor {
+                                fid,
+                                closure,
+                                getter,
+                            } => {
+                                // A shaped receiver is an object: no boxing.
+                                self.setup_call_this_outlined(
+                                    fid,
+                                    closure,
+                                    o,
+                                    true,
+                                    base,
+                                    0,
+                                    0,
+                                    dst,
+                                    ip + 1,
+                                    getter,
+                                )?;
+                                break;
+                            }
+                            GetAct::None => {}
+                        }
+                        #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
                         if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
                             self.set(base, dst, v);
                             ip += 1;

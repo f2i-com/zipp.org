@@ -264,11 +264,16 @@ pub(crate) enum IcEntry {
         closure: u32,
         recv_shape: u32,
     },
+    /// `recv_shape` as for `ClassMethod`: a live match proves the receiver
+    /// has no own property of the key (`ic_get_acc_tail`, which only the
+    /// mirrored profiles have).
     ClassGetter {
         class: u32,
         ver: u32,
         epoch: u32,
         getter: Value,
+        #[cfg_attr(not(all(feature = "jit", not(feature = "safe-sandbox"))), allow(dead_code))]
+        recv_shape: u32,
     },
     /// `set key(v)` resolved on the receiver's class chain (SetProp sites).
     ClassSetter {
@@ -1454,6 +1459,137 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::ic_get_prop_own_hit`] for the main dispatch loop, which also
+    /// takes a getter to call, or a class method to read, from way 0
+    /// (`ic_get_acc_tail`). Each went to the full `ic_get_prop` call once
+    /// this hit and the prototype probe had missed: an object literal's
+    /// getter took 31 ns a read against QuickJS's 22.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_way0(&self, func_id: u32, ip: usize, recv: Value) -> GetAct {
+        if !recv.is_heap() {
+            return GetAct::None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT
+            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !self.deferred_ns_state.is_empty()
+            || !self.ic_func_eligible(func_id)
+        {
+            return GetAct::None;
+        }
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return GetAct::None;
+        };
+        if let Some(slot) = cell.own_read(mir.shape) {
+            // SAFETY: as in `ic_get_prop_own_hit`.
+            return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
+        }
+        let Some(site) = cell.site.as_deref() else {
+            return GetAct::None;
+        };
+        if site.n == 0 {
+            return GetAct::None;
+        }
+        match site.entries[0] {
+            IcEntry::OwnData { shape, slot } if shape == mir.shape => {
+                // SAFETY: as in `ic_get_prop_own_hit`.
+                GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) })
+            }
+            IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+                match self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape) {
+                    Some(v) => GetAct::Value(v),
+                    None => GetAct::None,
+                }
+            }
+            IcEntry::OwnAcc { .. } | IcEntry::ProtoAcc { .. } | IcEntry::ClassGetter { .. } | IcEntry::ClassMethod { .. } => {
+                self.ic_get_acc_tail(recv.heap_index(), &site.entries[0], mir.shape, mir.vals)
+            }
+            _ => GetAct::None,
+        }
+    }
+
+    /// [`Self::ic_get_prop_way0`]'s accessor and class-member ways, out of
+    /// line, under the guards `ic_get_prop`'s shape-keyed hits apply: the
+    /// receiver's shape (its mirror's, `shape`, whose value column is `vals`)
+    /// is the one the way was filled with, which proves an own accessor's
+    /// slot and, for an inherited accessor or a class member, that the
+    /// receiver still has no own property of the key.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_get_acc_tail(&self, idx: u32, e: &IcEntry, shape: u32, vals: u64) -> GetAct {
+        match *e {
+            IcEntry::OwnAcc { shape: s, slot } if s == shape => {
+                // SAFETY: as the own-data read: the matching shape proves
+                // `vals` is the map's live value column and holds `slot`.
+                let g = unsafe { *(vals as *const Value).add(slot as usize) };
+                if g == Value::UNDEFINED {
+                    return GetAct::Value(Value::UNDEFINED);
+                }
+                match self.ic_plain_fn(g) {
+                    Some((fid, closure)) => GetAct::Accessor {
+                        fid,
+                        closure,
+                        getter: g,
+                    },
+                    None => GetAct::None,
+                }
+            }
+            IcEntry::ProtoAcc {
+                recv_shape,
+                first,
+                hops,
+                slot,
+            } if recv_shape == shape => {
+                let HeapObj::Object(m) = self.heap.get(idx) else {
+                    return GetAct::None;
+                };
+                if m.class.is_some()
+                    || !self.interp_own_resolve_vm_is_interpreter()
+                    || self.ic_chain_ok(idx, first, &hops).is_none()
+                {
+                    return GetAct::None;
+                }
+                self.ic_chain_acc_get(hops, slot)
+            }
+            IcEntry::ClassGetter {
+                class,
+                ver,
+                epoch,
+                getter,
+                recv_shape,
+            } if recv_shape == shape => {
+                let HeapObj::Object(m) = self.heap.get(idx) else {
+                    return GetAct::None;
+                };
+                if m.class != Some(class) || self.heap.version_of(class) != ver || self.class_proto_epoch != epoch {
+                    return GetAct::None;
+                }
+                match self.ic_plain_fn(getter) {
+                    Some((fid, closure)) => GetAct::Accessor { fid, closure, getter },
+                    None => GetAct::None,
+                }
+            }
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                epoch,
+                callee,
+                recv_shape,
+                ..
+            } if recv_shape == shape => {
+                let HeapObj::Object(m) = self.heap.get(idx) else {
+                    return GetAct::None;
+                };
+                if m.class != Some(class) || self.heap.version_of(class) != ver || self.class_proto_epoch != epoch {
+                    return GetAct::None;
+                }
+                GetAct::Value(callee)
+            }
+            _ => GetAct::None,
+        }
+    }
+
     /// `ic_get_prop_own_hit`'s other way-0 hits, out of line: one call with
     /// the entry by reference keeps the inline arm small.
     #[cfg(not(feature = "safe-sandbox"))]
@@ -1950,7 +2086,12 @@ impl<'p> Vm<'p> {
                                 return GetAct::Value(v);
                             }
                             IcEntry::OwnAcc { shape, slot } if shape == sh => {
-                                return self.ic_acc_get_from(m, slot as usize);
+                                let act = self.ic_acc_get_from(m, slot as usize);
+                                // Settled as the data hit settles it, so the
+                                // next read is `ic_get_prop_way0`'s (an object
+                                // literal's accessor leaves its mirror unset).
+                                self.heap.refresh_mirror(idx);
+                                return act;
                             }
                             // A class instance's method (`o.m` before a
                             // `CallWithThis`): the matching shape proves the
@@ -2216,6 +2357,7 @@ impl<'p> Vm<'p> {
                 let ver = self.heap.version_of(class);
                 let epoch = self.class_proto_epoch;
                 self.mi_record_recv(func_id, ip, recv);
+                let recv_shape = self.ic_recv_shape(recv);
                 self.ic_install(
                     func_id,
                     ip,
@@ -2224,6 +2366,7 @@ impl<'p> Vm<'p> {
                         ver,
                         epoch,
                         getter,
+                        recv_shape,
                     },
                 );
                 match self.ic_plain_fn(getter) {
@@ -2362,6 +2505,7 @@ impl<'p> Vm<'p> {
                 ver,
                 epoch,
                 getter,
+                ..
             } => {
                 if own.is_none()
                     && m.class == Some(class)
@@ -4051,6 +4195,7 @@ impl<'p> Vm<'p> {
                 ver,
                 epoch,
                 getter,
+                ..
             } = *e
             {
                 if c == class && self.ic_class_way_live(c, ver, epoch) {
