@@ -115,7 +115,14 @@ point. See the [`bench` guide](../bench/README.md),
 
 ### The release build as downloaded
 
-The published binaries are ordinary release builds, not profile-guided ones.
+The published binaries up to 0.0.30 are ordinary release builds, not
+profile-guided ones. From the next release, `release-build.yml` builds the
+Windows x86-64, Linux x86-64 and Linux arm64 CLIs with profile-guided
+optimization (`tools/release/pgo-build.sh`): the training corpus of the
+canonical build, run on the runner by an instrumented build of the release
+feature set (Python and GPU included), so the download keeps its features and
+gains the profile. The armv7 CLI and the WebAssembly modules stay plain
+builds. The figures below describe the plain 0.0.28 download.
 The 0.0.28 Windows CLI as downloaded ([`release_real13_da0fe6b1_2026-10-21.json`](../bench/comparison/release_real13_da0fe6b1_2026-10-21.json),
 the same four engines, 15 repetitions) runs the 13 normal rows at **0.608× Node**
 [0.605, 0.617] and the headline ten at 0.856× [0.850, 0.869], faster than Node on
