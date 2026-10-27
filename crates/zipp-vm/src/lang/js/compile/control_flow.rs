@@ -558,6 +558,99 @@ impl<'a> FnCompiler<'a> {
             .any(|st| matches!(st, ast::Stmt::VarDecl(d) if d.kind == ast::VarKind::AwaitUsing))
     }
 
+    /// IteratorClose for a loop's iterator on a `break` or a `continue` leaving
+    /// it: `IterClose`, or for a `for await` loop the awaited close.
+    pub(crate) fn emit_iter_close(&mut self, iter: Reg, is_await: bool) {
+        if is_await {
+            self.emit_async_iter_close(iter, false);
+        } else {
+            self.emit(Instr::IterClose { iter });
+        }
+    }
+
+    /// AsyncIteratorClose (7.4.13) of a `for await` loop's iterator: call its
+    /// `return()` with no argument and await what it gives back, which must
+    /// be an object. `quiet` (a throw leaving the loop) swallows whatever the
+    /// close throws and skips the check, so the original error wins.
+    pub(crate) fn emit_async_iter_close(&mut self, iter: Reg, quiet: bool) {
+        let save = self.next_reg;
+        let res = self.alloc_reg();
+        let has = self.alloc_reg();
+        let push_at = self.here();
+        if quiet {
+            self.emit(Instr::PushHandler {
+                catch_target: 0,
+                catch_reg: res,
+            });
+        }
+        // `ret == dst`: the bare call.
+        self.emit(Instr::AsyncIterReturnStep {
+            dst: res,
+            has_dst: has,
+            iter,
+            ret: res,
+        });
+        let jnone = self.here();
+        self.emit(Instr::JumpIfFalse {
+            cond: has,
+            target: 0,
+        });
+        self.emit(Instr::Await { dst: res, val: res });
+        if !quiet {
+            self.emit(Instr::RequireObject { val: res });
+        }
+        let none = self.here();
+        self.patch_jump(jnone, none);
+        if quiet {
+            self.emit(Instr::PopHandler);
+            let jover = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let cat = self.here();
+            if let Instr::PushHandler { catch_target, .. } = &mut self.code[push_at as usize] {
+                *catch_target = cat;
+            }
+            let over = self.here();
+            self.patch_jump(jover, over);
+        }
+        self.set_next_reg(save);
+    }
+
+    /// The close handler's body for a `for await` loop, keyed on the
+    /// completion (as `IterCloseFinally` is for a sync loop): a return (1)
+    /// closes for real, a throw (2) closes quietly, a break/continue (3,
+    /// with the unwind floor in its upper bits) closes nothing here.
+    fn emit_async_close_finally(&mut self, iter: Reg, kind_reg: Reg) {
+        let save = self.next_reg;
+        let k = self.alloc_reg();
+        let c = self.alloc_reg();
+        self.emit(Instr::LoadInt { dst: k, val: 1 });
+        self.emit(Instr::Eq {
+            dst: c,
+            a: kind_reg,
+            b: k,
+        });
+        let jnot_ret = self.here();
+        self.emit(Instr::JumpIfFalse { cond: c, target: 0 });
+        self.emit_async_iter_close(iter, false);
+        let jend = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let not_ret = self.here();
+        self.patch_jump(jnot_ret, not_ret);
+        self.emit(Instr::LoadInt { dst: k, val: 2 });
+        self.emit(Instr::Eq {
+            dst: c,
+            a: kind_reg,
+            b: k,
+        });
+        let jnot_throw = self.here();
+        self.emit(Instr::JumpIfFalse { cond: c, target: 0 });
+        self.emit_async_iter_close(iter, true);
+        let end = self.here();
+        self.patch_jump(jend, end);
+        self.patch_jump(jnot_throw, end);
+        self.set_next_reg(save);
+    }
+
     /// Emit the async-disposal epilogue (the finally body for an `await using`
     /// scope): a loop that pops the disposers LIFO and AWAITs each value
     /// `AsyncDisposeNext` hands back, catching a sync throw or an awaited
@@ -1186,15 +1279,12 @@ impl<'a> FnCompiler<'a> {
         // handlers (7.4.11 is part of the for-of statement, not of its body) and a
         // `gen.return()` resumed at a `yield` in the body reaches it too. The
         // completion record lands in (`kind_reg`, `val_reg`).
-        // (for-await iterates asynchronously — left on the inline-close path.)
-        let (kind_reg, exc_reg) = if is_await {
-            (None, None)
-        } else {
-            (
-                Some(self.declare_local("<forof.kind>")),
-                Some(self.declare_local("<forof.cval>")),
-            )
-        };
+        // A `for await` loop's handler awaits the close instead
+        // (`emit_async_iter_close`).
+        let (kind_reg, exc_reg) = (
+            Some(self.declare_local("<forof.kind>")),
+            Some(self.declare_local("<forof.cval>")),
+        );
 
         // The loop binding: a destructuring pattern's leaves, an assignment to an
         // existing target, or a single (possibly cell-boxed) declared variable.
@@ -1355,13 +1445,12 @@ impl<'a> FnCompiler<'a> {
             self.handler_depth,
         ));
         // Record the iterator so a `break`/`continue` LEAVING this loop from inside a
-        // nested one closes it, and (for-await only, which has no close handler) so
-        // does a `return`.
+        // nested one closes it.
         self.loop_ctx.last_mut().unwrap().iter_close = Some(iter_reg);
+        self.loop_ctx.last_mut().unwrap().iter_async = is_await;
         let close_push = if let (Some(kr), Some(er)) = (kind_reg, exc_reg) {
-            // The close handler subsumes the `return` case, so `return` must NOT
-            // also emit an inline IterClose for this frame — that would close twice.
-            self.loop_ctx.last_mut().unwrap().close_via_finally = true;
+            // The close handler subsumes the `return` case: `return` emits no
+            // close of its own.
             let at = self.here();
             self.emit(Instr::PushFinally {
                 target: 0,
@@ -1514,10 +1603,14 @@ impl<'a> FnCompiler<'a> {
         // of those actually closes; `EndFinally` then resumes the completion.
         if let (Some(at), Some(kr), Some(er)) = (close_push, kind_reg, exc_reg) {
             let fin_start = self.here();
-            self.emit(Instr::IterCloseFinally {
-                iter: iter_reg,
-                kind_reg: kr,
-            });
+            if is_await {
+                self.emit_async_close_finally(iter_reg, kr);
+            } else {
+                self.emit(Instr::IterCloseFinally {
+                    iter: iter_reg,
+                    kind_reg: kr,
+                });
+            }
             self.emit(Instr::EndFinally {
                 kind_reg: kr,
                 val_reg: er,
@@ -1535,7 +1628,7 @@ impl<'a> FnCompiler<'a> {
             e
         } else {
             let brk_target = self.here();
-            self.emit(Instr::IterClose { iter: iter_reg });
+            self.emit_iter_close(iter_reg, is_await);
             let e = self.here();
             self.patch_jump(jdone, e);
             for b in ctx.break_jumps {

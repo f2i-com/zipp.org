@@ -3634,11 +3634,18 @@ impl<'p> Vm<'p> {
                 let it = self.get(base, iter);
                 let r = self.get(base, ret);
                 let m = self.get_member(it, "return", it)?;
-                if m.is_nullish() || !self.is_callable(m) {
+                if m.is_nullish() {
                     // No `return` method â†’ the outer generator just returns `ret`.
                     self.set(base, has_dst, Value::bool(false));
+                } else if !self.is_callable(m) {
+                    // GetMethod: present but not callable.
+                    return Err(Thrown(
+                        "TypeError: the iterator's 'return' is not a function".into(),
+                    ));
                 } else {
-                    let res = self.call_value(m, it, &[r])?;
+                    // `ret == dst`: AsyncIteratorClose's bare call.
+                    let args: &[Value] = if ret == dst { &[] } else { &[r] };
+                    let res = self.call_value(m, it, args)?;
                     self.set(base, dst, res);
                     self.set(base, has_dst, Value::bool(true));
                 }

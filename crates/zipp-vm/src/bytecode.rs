@@ -668,6 +668,8 @@ pub enum Instr {
     /// `return`: if absent (undefined/null), sets `has_dst` to false (the yield* loop
     /// then makes the OUTER generator return `ret`); otherwise calls it with `ret`,
     /// sets `has_dst` true and writes the (to-be-awaited) result into `dst`.
+    /// With `ret == dst` the call passes no argument: a `for await` loop's
+    /// AsyncIteratorClose (7.4.13), which calls `return()` bare.
     AsyncIterReturnStep {
         dst: Reg,
         has_dst: Reg,
