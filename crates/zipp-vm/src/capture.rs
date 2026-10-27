@@ -390,6 +390,18 @@ pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
     owned(refs)
 }
 
+/// Whether [`stmts_refs_all`]'s set holds each of `names`, asked of the
+/// walk's borrowed names: one walk for every question, and no owned copy.
+/// Compiling a function walked its body twice for two such questions and
+/// allocated a `String` per name it references each time.
+pub fn stmts_refs_each<const N: usize>(body: &[Stmt], names: [&str; N]) -> [bool; N] {
+    let mut refs = Names::default();
+    for s in body {
+        stmt_refs(s, &mut refs, false);
+    }
+    names.map(|n| refs.contains(n))
+}
+
 /// The lexical names a statement list declares at its own level (`let`,
 /// `const`, `using`, classes) that some EARLIER code of the same list — an
 /// earlier statement, or an earlier declarator of the same declaration —

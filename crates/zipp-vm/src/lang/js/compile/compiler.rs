@@ -434,8 +434,14 @@ impl Compiler {
         // that only mentions `eval` cannot direct-eval (`capture::
         // DIRECT_EVAL_CALL`).
         let mut captured = captured;
+        // What a function's body references, asked once (a script's is not).
+        let [body_calls_eval, body_refs_arguments] = if is_script {
+            [false, false]
+        } else {
+            capture::stmts_refs_each(body, [capture::DIRECT_EVAL_CALL, "arguments"])
+        };
         let body_refs_eval = !is_script
-            && (capture::stmts_refs_all(body).contains(capture::DIRECT_EVAL_CALL)
+            && (body_calls_eval
                 || params_ast
                     .is_some_and(|pa| capture::params_reference(capture::DIRECT_EVAL_CALL, pa)));
         let saved_dyn_zone = self.dyn_global_zone;
@@ -474,7 +480,7 @@ impl Compiler {
             || is_generator
             || is_async
             || body_refs_eval
-            || capture::stmts_refs_all(body).contains("arguments")
+            || body_refs_arguments
             || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
         {
             HashSet::default()

@@ -463,7 +463,7 @@ impl Compiler {
         // is this frame's object, which a stub does not make.
         let own = facts.ok
             && facts.reads_arguments
-            && (capture::stmts_refs_all(&f.body.stmts).contains("arguments")
+            && (capture::stmts_refs_each(&f.body.stmts, ["arguments"])[0]
                 || capture::params_reference("arguments", &f.params));
         note_eager(if own { Some("arguments") } else { facts.why }, f.span.end - f.span.start);
         (facts.ok && !own).then_some(facts.nested)
