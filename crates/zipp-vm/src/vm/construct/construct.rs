@@ -138,12 +138,6 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        // `brand_instance` would stamp nothing.
-        if let Some(own) = self.method_brand.get(&ci).and_then(|b| b.first()) {
-            if self.brand_private_names.contains_key(own) {
-                return None;
-            }
-        }
         let Some(f) = self.class_body_fn(cv, false) else {
             return None;
         };
@@ -164,7 +158,9 @@ impl<'p> Vm<'p> {
         let ci = cv.heap_index();
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
         let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(ci)));
-        // The base class's InitializeInstanceElements, before its body.
+        // The base class's InitializeInstanceElements, before its body: its
+        // private brand, then its fields, as `construct_class` runs it.
+        self.brand_instance(obj, cv);
         let rooted = self.host_result_roots.len();
         self.host_result_roots.push(obj);
         let thunk = self.run_field_thunk(obj, cv);
@@ -1383,10 +1379,12 @@ impl<'p> Vm<'p> {
                 // must resolve through this mapping on every later `this` read
                 // (ThisCheck). The GC prunes the entry once the placeholder dies.
                 let super_this = self.super_this.get(&obj.heap_index()).copied();
-                // Any object return replaces the new instance.
+                // Any object return replaces the new instance, as it stands:
+                // [[Construct]] step 10.a returns it without this class's
+                // InitializeInstanceElements, which ran on `this` (a base
+                // class's at entry, a derived one's on what its `super()`
+                // produced, `super_ctor_complete`).
                 if self.is_object_value(ret) {
-                    // A return-override result receives this class's private brand.
-                    self.brand_instance(ret, cv);
                     return Ok(ret);
                 }
                 if parent.is_some() || extends_null {

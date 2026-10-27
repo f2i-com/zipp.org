@@ -935,14 +935,12 @@ impl<'p> Vm<'p> {
                 } else {
                     obj
                 };
-                // A return-override result receives this class's private brand.
-                // `obj` itself has it already: a base class's from the entry
-                // above, a derived one's from its `super()`'s completion
-                // (`super_ctor_complete`), which brands what that call
-                // produced, the `super_this` result included.
-                if result != obj {
-                    self.brand_instance(result, cval);
-                }
+                // No brand of this class for a return-override result: its
+                // InitializeInstanceElements ran on `this` (a base class's at
+                // entry above, a derived one's on what its own `super()`
+                // produced, `super_ctor_complete`, the `super_this` result
+                // included), and an object its body returns is handed back
+                // as it stands ([[Construct]] step 10.a).
                 return Ok(result);
             }
             Ok(obj)
