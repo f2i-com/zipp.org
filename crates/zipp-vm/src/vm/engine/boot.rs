@@ -431,6 +431,7 @@ impl<'p> Vm<'p> {
             array_stringify_active: Vec::new(),
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regexp_literal_sites: rustc_hash::FxHashMap::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),
             handler_pool: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),

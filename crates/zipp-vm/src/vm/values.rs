@@ -3008,6 +3008,78 @@ impl<'p> Vm<'p> {
         if let Some(b) = exact_bytes {
             self.regexp_exact_source.insert(idx, b);
         }
+        self.install_regexp_proto(idx);
+        Ok(Value::heap(idx))
+    }
+
+    /// The object a regex literal's evaluation makes (`NewRegExp`, whose
+    /// pattern and flags are the site's string constants). Each evaluation
+    /// is a new object, as the spec requires, but everything about it but
+    /// `lastIndex` is the same every time: the first builds it through the
+    /// constructor's path and keeps its program, source and flags for the
+    /// site, and the rest share them (three reference counts, no parse of
+    /// the flags, no string copies, no cache lookup). After a few evaluations
+    /// the site builds the byte-optimized twin once, which a fresh object
+    /// per evaluation would never live long enough to earn.
+    pub(crate) fn new_regexp_literal(
+        &mut self,
+        site: u64,
+        p: Value,
+        f: Value,
+    ) -> Result<Value, Thrown> {
+        const TWIN_AFTER: u32 = 8;
+        if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
+            if t.pattern_bits == p.bits() && t.flags_bits == f.bits() {
+                t.uses = t.uses.saturating_add(1);
+                let want_twin = t.twin.is_none() && t.uses >= TWIN_AFTER;
+                let data = crate::heap::RegExpData {
+                    regex: t.regex.clone(),
+                    source: t.source.clone(),
+                    flags: t.flags.clone(),
+                    last_index: Value::int(0),
+                    ascii_twin: t.twin.clone(),
+                };
+                let idx = self.heap.alloc(HeapObj::RegExp(Box::new(data)));
+                self.install_regexp_proto(idx);
+                if want_twin {
+                    self.ensure_regexp_ascii_twin(idx);
+                    let twin = match self.heap.get(idx) {
+                        HeapObj::RegExp(re) => re.ascii_twin.clone(),
+                        _ => None,
+                    };
+                    if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
+                        t.twin = twin;
+                    }
+                }
+                return Ok(Value::heap(idx));
+            }
+        }
+        let v = self.new_regexp_value(p, f, true)?;
+        let idx = v.heap_index();
+        // A lone-surrogate pattern keeps its exact source in a side table
+        // per object; such a site builds every object in full.
+        if self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&idx) {
+            if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                let site_data = RegExpLiteralSite {
+                    pattern_bits: p.bits(),
+                    flags_bits: f.bits(),
+                    regex: re.regex.clone(),
+                    source: re.source.clone(),
+                    flags: re.flags.clone(),
+                    twin: None,
+                    uses: 1,
+                };
+                if self.regexp_literal_sites.len() >= 4096 {
+                    self.regexp_literal_sites.clear();
+                }
+                self.regexp_literal_sites.insert(site, site_data);
+            }
+        }
+        Ok(v)
+    }
+
+    /// A new RegExp's [[Prototype]], as RegExpAlloc gives it.
+    fn install_regexp_proto(&mut self, idx: u32) {
         // RegExpAlloc is OrdinaryCreateFromConstructor(%RegExp%, "%RegExp.prototype%"),
         // and %RegExp% is the CURRENT Realm Record's — so a literal evaluated by
         // createRealm-child code (`other.eval("/foo/")`) inherits the CHILD's
@@ -3024,7 +3096,6 @@ impl<'p> Vm<'p> {
             };
             self.proto_of.insert(idx, Value::heap(proto));
         }
-        Ok(Value::heap(idx))
     }
 
     // ── Temporal.Duration ──

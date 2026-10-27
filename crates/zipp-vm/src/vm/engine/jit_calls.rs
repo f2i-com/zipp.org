@@ -1535,7 +1535,11 @@ impl<'p> Vm<'p> {
         let p = self.get(base, (packed_args & 0xFFFF) as u16);
         let f = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
         self.jit_call_depth += 1;
-        let r = self.new_regexp_value(p, f, (packed_args >> 32) & 1 == 1);
+        let r = if (packed_args >> 32) & 1 == 1 {
+            self.new_regexp_literal(packed_fip, p, f)
+        } else {
+            self.new_regexp_value(p, f, false)
+        };
         self.jit_call_depth -= 1;
         match r {
             Ok(v) => v.bits(),

@@ -1521,6 +1521,19 @@ pub enum ConsoleStream {
     Stderr,
 }
 
+/// What every object a regex literal makes shares: its compiled program,
+/// source and flags (all `Arc`s), and its byte-optimized twin once one is
+/// built. Keyed by the constants the site loads, compared by their bits.
+pub(crate) struct RegExpLiteralSite {
+    pattern_bits: u64,
+    flags_bits: u64,
+    regex: std::sync::Arc<regress::Regex>,
+    source: std::sync::Arc<str>,
+    flags: std::sync::Arc<str>,
+    twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+    uses: u32,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -2141,6 +2154,9 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
+    /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
+    pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,
     /// Short-subject ASCII execs each RegExp without a byte-optimized twin
     /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
     /// keyed by heap index; an entry leaves when its twin is built. A reused

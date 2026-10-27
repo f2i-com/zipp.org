@@ -1292,7 +1292,12 @@ impl<'p> Vm<'p> {
             } => {
                 let p = self.get(base, pattern);
                 let f = self.get(base, flags);
-                let v = self.new_regexp_value(p, f, is_construct)?;
+                // Every `NewRegExp` the compiler emits is a literal's.
+                let v = if is_construct {
+                    self.new_regexp_literal((u64::from(func_id) << 32) | ip as u64, p, f)?
+                } else {
+                    self.new_regexp_value(p, f, is_construct)?
+                };
                 self.set(base, dst, v);
                 ip += 1;
             }
