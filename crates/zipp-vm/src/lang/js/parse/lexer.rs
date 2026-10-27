@@ -67,9 +67,18 @@ pub struct Lexer<'s> {
     input_start: usize,
     /// Every identifier spelling this lexer has produced, once: a name the
     /// source repeats is the same allocation each time, and the AST, the
-    /// parser's scopes and the compiler share it instead of copying it.
+    /// parser's scopes and the compiler share it instead of copying it. The
+    /// first [`FEW_NAMES`] live in `few`, scanned in place; `names` takes
+    /// them all over past that.
+    few: Vec<super::ast::Name>,
     names: rustc_hash::FxHashSet<super::ast::Name>,
 }
+
+/// How many identifiers a lexer keeps in its scanned list before it hashes
+/// them. An `eval` or `Function` body names a handful; the set hashed every
+/// spelling twice and grew its table from empty for each of them, a tenth of
+/// compiling one.
+const FEW_NAMES: usize = 16;
 
 impl<'s> Lexer<'s> {
     /// Turn Annex B HTML-like comments off — the Module goal has none.
@@ -101,6 +110,7 @@ impl<'s> Lexer<'s> {
             html_comments: true,
             exact: None,
             input_start: 0,
+            few: Vec::new(),
             names: rustc_hash::FxHashSet::default(),
         };
         // A leading BOM is whitespace, not part of the first token.
@@ -569,6 +579,19 @@ impl<'s> Lexer<'s> {
 
     /// This lexer's one allocation of the identifier `s`.
     fn intern(&mut self, s: &str) -> super::ast::Name {
+        if self.names.is_empty() {
+            if let Some(n) = self.few.iter().find(|n| &***n == s) {
+                return n.clone();
+            }
+            let n = super::ast::Name::from(s);
+            if self.few.len() < FEW_NAMES {
+                self.few.push(n.clone());
+            } else {
+                self.names.extend(self.few.drain(..));
+                self.names.insert(n.clone());
+            }
+            return n;
+        }
         if let Some(n) = self.names.get(s) {
             return n.clone();
         }
