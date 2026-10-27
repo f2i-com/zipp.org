@@ -4625,11 +4625,48 @@ impl<'p> Vm<'p> {
     /// IC for a `Call` site: callee identity (+ slot version) → a resolved
     /// plain user function, skipping the Proxy/native/bound/ctor probes and
     /// flag loads. `None` ⇒ slow path.
-    #[inline]
+    ///
+    /// The first way's hit is inlined into the call arms; the rest (the
+    /// other ways, the fill) is `ic_call_ways`. The whole was too large to
+    /// inline, and every call of the main loop paid the call to it and its
+    /// result through memory: a twentieth of a call-heavy loop.
+    #[inline(always)]
     pub(crate) fn ic_call(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<CallIcHit> {
         if !callee.is_heap() {
             return None;
         }
+        if let Some(site) = self.ic_site(func_id, ip) {
+            if site.n > 0 {
+                if let IcEntry::Callee {
+                    bits,
+                    ver,
+                    fid,
+                    closure,
+                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                    desc,
+                    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                    fib_global,
+                } = site.entries[0]
+                {
+                    if callee.bits() == bits && self.heap.version_of(callee.heap_index()) == ver {
+                        return Some(CallIcHit {
+                            fid,
+                            closure,
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            desc,
+                            #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            fib_global,
+                        });
+                    }
+                }
+            }
+        }
+        self.ic_call_ways(func_id, ip, callee)
+    }
+
+    /// [`Self::ic_call`] past its first way: every way, then the fill.
+    #[inline(never)]
+    fn ic_call_ways(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<CallIcHit> {
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
                 if let IcEntry::Callee {
