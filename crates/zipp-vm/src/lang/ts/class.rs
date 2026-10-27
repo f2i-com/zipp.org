@@ -10,7 +10,7 @@
 
 use crate::parse::ast::*;
 use crate::parse::parser::{PResult, Parser};
-use crate::parse::token::Punct;
+use crate::parse::token::{Punct, Span};
 
 impl<'s> Parser<'s> {
     /// A class member, or `None` for one that is only a type. A constructor's
@@ -114,4 +114,139 @@ impl<'s> Parser<'s> {
         }
         Ok(())
     }
+
+    /// Settle a class's fields once its body is read. With
+    /// `useDefineForClassFields` they stay fields, and the parameter
+    /// properties' own (`prop_fields`) go first, as tsc declares them.
+    /// Without it they are tsc's assignments: an instance field with an
+    /// initializer becomes `this.x = init` at the head of the constructor
+    /// (after its `super(…)` and its parameter properties, in that order; a
+    /// constructor is made for a class without one), and one without is
+    /// dropped. Private, computed, decorated and `accessor` fields, and
+    /// static ones, stay fields under either.
+    pub(crate) fn ts_finish_class(
+        &mut self,
+        body: &mut Vec<ClassMember>,
+        prop_fields: Vec<ClassMember>,
+        derived: bool,
+        start: u32,
+    ) {
+        if self.ts_state.define_fields {
+            if !prop_fields.is_empty() {
+                body.splice(0..0, prop_fields);
+            }
+            return;
+        }
+        let assigned = |f: &ClassField| {
+            !f.is_static
+                && f.accessor.is_none()
+                && f.decorators.is_empty()
+                && matches!(f.key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
+        };
+        if !body
+            .iter()
+            .any(|m| matches!(m, ClassMember::Field(f) if assigned(f)))
+        {
+            return;
+        }
+        let mut inits = Vec::new();
+        let mut kept = Vec::with_capacity(body.len());
+        for m in body.drain(..) {
+            match m {
+                ClassMember::Field(f) if assigned(&f) => {
+                    if let Some(value) = f.value {
+                        inits.push(this_assign(f.key, value));
+                    }
+                }
+                other => kept.push(other),
+            }
+        }
+        *body = kept;
+        if inits.is_empty() {
+            return;
+        }
+        let ctor = body.iter_mut().find_map(|m| match m {
+            ClassMember::Method(cm) if cm.kind == MethodKind::Constructor => Some(cm),
+            _ => None,
+        });
+        match ctor {
+            Some(cm) => {
+                let stmts = &mut cm.func.body.stmts;
+                let at = super::lower::after_super(stmts) + prop_fields.len();
+                stmts.splice(at..at, inits);
+            }
+            None => {
+                // `constructor(...args) { super(...args); … }` / `constructor() { … }`.
+                // The rest parameter's name cannot be spelled, so no initializer
+                // can mean it; the span (one byte at the class) is no real
+                // function's.
+                let args: Name = "%args".into();
+                let (params, mut stmts) = if derived {
+                    (
+                        Params {
+                            items: vec![Pattern::Rest(Box::new(Pattern::Ident(args.clone())))],
+                            simple: false,
+                        },
+                        vec![Stmt::Expr(Expr::Call(Box::new(CallExpr {
+                            callee: Expr::Super,
+                            args: vec![Arg::Spread(Expr::Ident(args))],
+                            optional: false,
+                            pos: start,
+                        })))],
+                    )
+                } else {
+                    (
+                        Params {
+                            items: Vec::new(),
+                            simple: true,
+                        },
+                        Vec::new(),
+                    )
+                };
+                stmts.extend(inits);
+                body.insert(
+                    0,
+                    ClassMember::Method(ClassMethod {
+                        key: PropKey::Ident("constructor".into()),
+                        kind: MethodKind::Constructor,
+                        func: Box::new(Function {
+                            name: None,
+                            params,
+                            body: FnBody {
+                                directives: Vec::new(),
+                                stmts,
+                            },
+                            is_async: false,
+                            is_generator: false,
+                            span: Span::new(start, start + 1),
+                        }),
+                        is_static: false,
+                        decorators: Vec::new(),
+                    }),
+                );
+            }
+        }
+    }
+}
+
+/// `this.key = value;` for a field's key.
+fn this_assign(key: PropKey, value: Expr) -> Stmt {
+    let prop = match key {
+        PropKey::Ident(n) => MemberProp::Ident(n),
+        PropKey::Str(s) => MemberProp::Computed(Box::new(Expr::Str(s))),
+        PropKey::Num(n) => MemberProp::Computed(Box::new(Expr::Num(n))),
+        PropKey::Computed(_) | PropKey::Private(_) => {
+            unreachable!("only named fields are assigned")
+        }
+    };
+    Stmt::Expr(Expr::Assign {
+        op: AssignOp::Assign,
+        target: Target::Member(Box::new(Member {
+            object: Expr::This,
+            prop,
+            optional: false,
+        })),
+        value: Box::new(value),
+        covered: false,
+    })
 }

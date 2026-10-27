@@ -618,8 +618,8 @@ impl<'s> Parser<'s> {
         }
         let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
-        if !ts_fields.is_empty() {
-            body.splice(0..0, ts_fields);
+        if self.ts {
+            self.ts_finish_class(&mut body, ts_fields, derived, start);
         }
         self.ctx.in_ = saved_in;
         self.ctx.strict = saved_strict;

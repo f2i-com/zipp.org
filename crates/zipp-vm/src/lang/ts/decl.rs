@@ -46,7 +46,7 @@ impl<'s> Parser<'s> {
             }
             "const" if self.ts_followed_by_word("enum") => {
                 self.bump(false)?;
-                let stmts = self.ts_enum(None)?;
+                let stmts = self.ts_const_enum(None)?;
                 Ok(Some(self.ts_emit(stmts)))
             }
             "declare" if self.ts_next_is_ident_on_line()? => {
@@ -281,6 +281,19 @@ impl<'s> Parser<'s> {
         Ok(Some(lower::var_stmt(kind, name, None)))
     }
 
+    /// `const enum E { … }`, the `enum` current: lowered like any enum (so
+    /// `E[0]` and a use before the declaration still work), and its constant
+    /// members inlined from here on.
+    fn ts_const_enum(&mut self, exported_in: Option<&Name>) -> PResult<Vec<Stmt>> {
+        let name = match self.ts_peek(|p| p.ts_word_name())? {
+            Some(n) => n,
+            None => return self.ts_enum(exported_in),
+        };
+        let stmts = self.ts_enum(exported_in)?;
+        self.ts_state.const_enums.insert(name);
+        Ok(stmts)
+    }
+
     /// `enum E { A, B = 2, C = "c" }`, the `enum` current, lowered.
     /// `exported_in` names the namespace it is exported from, if it is.
     pub(crate) fn ts_enum(&mut self, exported_in: Option<&Name>) -> PResult<Vec<Stmt>> {
@@ -454,7 +467,7 @@ impl<'s> Parser<'s> {
                 }
                 "const" if self.ts_followed_by_word("enum") => {
                     self.bump(false)?;
-                    let stmts = self.ts_enum(Some(ns))?;
+                    let stmts = self.ts_const_enum(Some(ns))?;
                     return Ok(self.ts_emit(stmts));
                 }
                 "namespace" | "module" => {
@@ -890,7 +903,7 @@ impl<'s> Parser<'s> {
                 }
                 "const" if self.ts_followed_by_word("enum") => {
                     self.bump(false)?;
-                    let stmts = self.ts_enum(None)?;
+                    let stmts = self.ts_const_enum(None)?;
                     return Ok(self.ts_export_lowered(stmts, pos)?);
                 }
                 "namespace" | "module" if self.ts_namespace_ahead()? => {

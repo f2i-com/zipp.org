@@ -82,11 +82,7 @@ pub(crate) fn var_stmt(kind: VarKind, name: &Name, init: Option<Expr>) -> Stmt {
 /// constructor's `super(…)` call when it has one at its top level (as tsc
 /// places them), else first.
 pub(crate) fn param_props(body: &mut FnBody, props: Vec<Name>) {
-    let at = body
-        .stmts
-        .iter()
-        .position(|s| matches!(s, Stmt::Expr(Expr::Call(c)) if matches!(c.callee, Expr::Super)))
-        .map_or(0, |i| i + 1);
+    let at = after_super(&body.stmts);
     let assigns = props.into_iter().map(|n| {
         Stmt::Expr(assign(
             Target::Member(Box::new(Member {
@@ -98,6 +94,16 @@ pub(crate) fn param_props(body: &mut FnBody, props: Vec<Name>) {
         ))
     });
     body.stmts.splice(at..at, assigns);
+}
+
+/// Where a constructor's instance setup goes: after its top-level `super(…)`
+/// statement when it has one (a derived class's `this` exists only then),
+/// else first.
+pub(crate) fn after_super(stmts: &[Stmt]) -> usize {
+    stmts
+        .iter()
+        .position(|s| matches!(s, Stmt::Expr(Expr::Call(c)) if matches!(c.callee, Expr::Super)))
+        .map_or(0, |i| i + 1)
 }
 
 /// `(function (param) { body })(arg);` — the IIFE an enum or namespace

@@ -6,7 +6,13 @@ use crate::parse::ast::Goal;
 /// Run TypeScript `src` (a script, or a module without imports) and return
 /// its console output, one line per entry.
 fn run(src: &str) -> Vec<String> {
-    let ast = super::parse_auto(src).unwrap_or_else(|f| panic!("{}", f.message));
+    let ast = super::parse_auto(
+        src,
+        super::TsConfig {
+            define_fields: true,
+        },
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
     let program = if ast.goal == Goal::Module {
         crate::compile::compile_main_module(&ast, src).expect("compiles")
     } else {
@@ -29,7 +35,12 @@ fn out(src: &str) -> String {
 }
 
 fn parse_err(src: &str) -> String {
-    match super::parse_auto(src) {
+    match super::parse_auto(
+        src,
+        super::TsConfig {
+            define_fields: true,
+        },
+    ) {
         Ok(_) => panic!("expected a syntax error in {src:?}"),
         Err(f) => f.message,
     }
@@ -137,7 +148,7 @@ fn this_parameter_and_predicates() {
 #[test]
 fn complex_types() {
     assert_eq!(
-        out("type M<T> = { readonly [K in keyof T as `get${Capitalize<string & K>}`]-?: () => T[K] }; type Tup = [a: string, b?: number, ...rest: boolean[]]; type F = new (...args: any[]) => object; type R<T> = T extends (...args: any) => infer U extends string ? U : never; type L = typeof import('./x'); let q: { a: 1 | -1; b: `x${number}`; c(): void; new (): F } | null = null; let r: unique symbol; console.log(q)"),
+        out("type M<T> = { readonly [K in keyof T as `get${Capitalize<string & K>}`]-?: () => T[K] }; type Tup = [a: string, b?: number, ...rest: boolean[]]; type F = new (...args: any[]) => object; type R<T> = T extends (...args: any) => infer U ? U : never; type S<T> = T extends [infer H extends string, ...infer R] ? H : never; type E<X, Y> = (<V>() => V extends X ? 1 : 2) extends <V>() => V extends Y ? 1 : 2 ? true : false; type L = typeof import('./x'); let q: { a: 1 | -1; b: `x${number}`; c(): void; new (): F } | null = null; let r: unique symbol; console.log(q)"),
         "null"
     );
 }
@@ -145,7 +156,13 @@ fn complex_types() {
 #[test]
 fn modules_elide_type_imports() {
     let src = "import { A, type B } from './a'; import type { C } from './c'; import D from './d'; export interface E {} export type F = number; export { E, F }; const x: A = 1 as any; export { x }; console.log('ok')";
-    let ast = super::parse_auto(src).unwrap_or_else(|f| panic!("{}", f.message));
+    let ast = super::parse_auto(
+        src,
+        super::TsConfig {
+            define_fields: true,
+        },
+    )
+    .unwrap_or_else(|f| panic!("{}", f.message));
     assert_eq!(ast.goal, Goal::Module);
     // Only the run-time statements remain: the import of `A` is gone (used
     // only as a type), so is `D`, and the export of the types.
@@ -188,4 +205,40 @@ fn module_detection() {
         "const s = 'x'; important(); reexport = 1;"
     ));
     assert!(!super::looks_like_module("import('x')"));
+}
+
+/// [`run`] under tsc's default settings (no `tsconfig.json`): class fields
+/// assigned in the constructor, not defined.
+fn out_assigned(src: &str) -> String {
+    let ast = super::parse_auto(src, super::TsConfig::default())
+        .unwrap_or_else(|f| panic!("{}", f.message));
+    let program = crate::compile::compile_main_program(&ast, src).expect("compiles");
+    let mut vm = crate::vm::Vm::new(&program);
+    if let Err(e) = vm.run() {
+        panic!("threw: {}", e.0);
+    }
+    std::mem::take(&mut vm.output).join("\n")
+}
+
+#[test]
+fn class_fields_follow_use_define_for_class_fields() {
+    let src = "class A { x = 1; y?: number; #z = 2; static s = 3; constructor(public p: number) { console.log(Object.keys(this).join(), 'y' in this, this.#z) } } class B extends A { w = this.x + 10; } const b = new B(7); console.log(b.w, A.s)";
+    // Defined (ES2022): every declared field exists, the parameter
+    // property's first.
+    assert_eq!(out(src), "p,x,y true 2\n11 3");
+    // Assigned (tsc's default): parameter properties, then initializers, in
+    // the constructor; `y` never exists; `B` gets a constructor.
+    assert_eq!(out_assigned(src), "p,x false 2\n11 3");
+}
+
+#[test]
+fn const_enums_are_inlined() {
+    let src = "const enum K { A = 1, B = A * 4, S = 'x' } function f(K: any) { return K.A } const r = [K.A, K.B, K.S, f({ A: 9 })]; console.log(r.join())";
+    assert_eq!(out(src), "1,4,x,9");
+    let ast = super::parse_auto(src, super::TsConfig::default())
+        .unwrap_or_else(|f| panic!("{}", f.message));
+    // `K.A` in the array is the literal 1; the parameter `K` inside `f`
+    // hides the enum, so `K.A` there stays a member read.
+    let text = format!("{:?}", ast.body);
+    assert!(text.contains("Num(4.0)"), "{text}");
 }

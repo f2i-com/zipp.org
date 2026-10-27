@@ -32,6 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
 mod class;
+pub(crate) mod config;
 mod decl;
 mod elide;
 mod expr;
@@ -43,6 +44,7 @@ mod tests;
 
 use super::{Language, LanguageId};
 use crate::embed::ScriptState;
+pub(crate) use config::TsConfig;
 
 /// The TypeScript entry of the language table.
 pub(super) struct TypeScript;
@@ -65,13 +67,14 @@ impl Language for TypeScript {
     }
 
     fn compile(&self, source: &str) -> Result<ScriptState, String> {
-        let ast = parse_script(source, true).map_err(|f| f.located(source, None))?;
+        let ast =
+            parse_script(source, true, TsConfig::default()).map_err(|f| f.located(source, None))?;
         let program = crate::compile::compile_main_program(&ast, source)?;
         Ok(ScriptState::from_program(program))
     }
 
     fn compile_to_text(&self, source: &str) -> Result<String, String> {
-        let ast = parse_auto(source).map_err(|f| f.located(source, None))?;
+        let ast = parse_auto(source, TsConfig::default()).map_err(|f| f.located(source, None))?;
         let program = if ast.goal == Goal::Module {
             crate::compile::compile_main_module(&ast, source)?
         } else {
@@ -85,6 +88,8 @@ impl Language for TypeScript {
 /// ([`Parser::ts_state`]). Empty and unused for JavaScript.
 #[derive(Default)]
 pub(crate) struct TsState {
+    /// `useDefineForClassFields` (see `config.rs`).
+    pub(crate) define_fields: bool,
     /// The function body most recently read was a signature with none: an
     /// overload, an abstract method or an ambient function. Read by the
     /// declaration that asked for it, straight after, which then drops it.
@@ -114,6 +119,9 @@ pub(crate) struct TsState {
     /// Constant members of the enums read so far, for the initializers of
     /// later members and enums (`B = A << 1`, `X = Other.Y`).
     pub(crate) enums: FxHashMap<Name, Vec<(Name, lower::Const)>>,
+    /// The `const enum`s among them, whose constant members are inlined
+    /// where they are read (`Kind.A` is `0`), as tsc inlines them.
+    pub(crate) const_enums: FxHashSet<Name>,
     /// Where a `(` or `<` was tried as an arrow function and was not one, so
     /// it is not tried again (see `Parser::ts_arrow`).
     pub(crate) not_arrow: FxHashSet<u32>,
@@ -244,11 +252,13 @@ fn parse_goal(
     src: &str,
     goal: Goal,
     allow_return: bool,
+    config: TsConfig,
 ) -> Result<Program, crate::front::ParseFailure> {
     let opts = ParseOptions {
         goal,
         allow_return,
         typescript: true,
+        ts_define_fields: config.define_fields,
         ..if goal == Goal::Module {
             ParseOptions::module()
         } else {
@@ -263,25 +273,32 @@ fn parse_goal(
 pub(crate) fn parse_script(
     src: &str,
     allow_return: bool,
+    config: TsConfig,
 ) -> Result<Program, crate::front::ParseFailure> {
-    parse_goal(src, Goal::Script, allow_return)
+    parse_goal(src, Goal::Script, allow_return, config)
 }
 
 /// A TypeScript module.
-pub(crate) fn parse_module(src: &str) -> Result<Program, crate::front::ParseFailure> {
-    parse_goal(src, Goal::Module, false)
+pub(crate) fn parse_module(
+    src: &str,
+    config: TsConfig,
+) -> Result<Program, crate::front::ParseFailure> {
+    parse_goal(src, Goal::Module, false, config)
 }
 
 /// A TypeScript file whose goal is decided by what it holds: a module when
 /// it imports or exports ([`looks_like_module`]), else a script, and the
 /// other goal when the first does not parse.
-pub(crate) fn parse_auto(src: &str) -> Result<Program, crate::front::ParseFailure> {
+pub(crate) fn parse_auto(
+    src: &str,
+    config: TsConfig,
+) -> Result<Program, crate::front::ParseFailure> {
     let first = if looks_like_module(src) {
         Goal::Module
     } else {
         Goal::Script
     };
-    match parse_goal(src, first, true) {
+    match parse_goal(src, first, true, config) {
         Ok(p) => Ok(p),
         Err(e) => {
             let other = if first == Goal::Module {
@@ -289,7 +306,7 @@ pub(crate) fn parse_auto(src: &str) -> Result<Program, crate::front::ParseFailur
             } else {
                 Goal::Module
             };
-            parse_goal(src, other, true).map_err(|_| e)
+            parse_goal(src, other, true, config).map_err(|_| e)
         }
     }
 }
@@ -340,9 +357,13 @@ pub(crate) fn is_ts_path(path: &Path) -> bool {
 }
 
 /// The module at `path`, read as TypeScript or JavaScript by its extension.
+/// A TypeScript module's syntax error names the file, as an entry's does.
 pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, String> {
     if is_ts_path(path) {
-        parse_module(code).map_err(|f| f.located(code, None))
+        parse_module(code, config::config_for(path)).map_err(|f| {
+            let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p));
+            f.located(code, url.as_deref().ok())
+        })
     } else {
         crate::front::parse_module(code)
     }
@@ -389,18 +410,50 @@ pub fn run_file(path: &Path) -> Result<crate::Outcome, String> {
     };
     let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
     let name = name.to_string_lossy();
+    let config = config::config_for(path);
     if !module {
-        match parse_script(&src, true) {
+        match parse_script(&src, true, config) {
             Ok(ast) => return run_script(&src, ast, path, &name),
             // A script that does not parse may be a module the scan missed.
             Err(e) => {
-                if parse_module(&src).is_err() {
+                if parse_module(&src, config).is_err() {
                     return Err(e.located(&src, Some(&name)));
                 }
             }
         }
     }
-    crate::run_module_file(path, None)
+    run_module(path)
+}
+
+/// Run the TypeScript module at `path` through the module loader, which
+/// parses and compiles it (and each `.ts` file it imports) once. Unlike
+/// `crate::run_module_file` there is no separate pass over the entry first
+/// to report its syntax errors: the loader's report names the file and
+/// position the same way, and the pass cost a second parse and compile of
+/// every entry.
+#[cfg(not(feature = "wasm-no-fs-loader"))]
+fn run_module(path: &Path) -> Result<crate::Outcome, String> {
+    let host = crate::compile::compile_main_program(&crate::front::parse_auto("")?, "")?;
+    let mut vm = crate::vm::Vm::new(&host);
+    vm.set_module_base_dir(path.parent().map(|p| p.to_path_buf()));
+    let result = vm.run().and_then(|_| vm.run_module_entry(path));
+    if !matches!(&result, Err(thrown) if thrown.0.contains("top-level await is not supported")) {
+        vm.report_unhandled_errors();
+    }
+    let outcome = crate::Outcome {
+        output: std::mem::take(&mut vm.output),
+        errput: std::mem::take(&mut vm.errput),
+        error: result.err().map(|thrown| thrown.0),
+    };
+    // The process exits next; see `crate::run_then_exit`.
+    std::mem::forget(vm);
+    std::mem::forget(host);
+    Ok(outcome)
+}
+
+#[cfg(feature = "wasm-no-fs-loader")]
+fn run_module(_path: &Path) -> Result<crate::Outcome, String> {
+    Err("filesystem module loader is disabled in this build".into())
 }
 
 fn run_script(src: &str, ast: Program, path: &Path, name: &str) -> Result<crate::Outcome, String> {

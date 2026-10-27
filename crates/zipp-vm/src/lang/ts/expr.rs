@@ -426,4 +426,29 @@ impl<'s> Parser<'s> {
             TokenKind::Eof => false,
         }
     }
+
+    /// `e`, just read as `E.A`: the constant value of member `A` when `E` is a
+    /// `const enum` this file declared (and no nearer binding named `E`
+    /// hides it).
+    pub(crate) fn ts_inline_const_enum(&mut self, e: &mut Expr) {
+        let Expr::Member(m) = &*e else { return };
+        let (Expr::Ident(enum_name), MemberProp::Ident(member)) = (&m.object, &m.prop) else {
+            return;
+        };
+        if !self.ts_state.const_enums.contains(enum_name) || self.scopes.shadowed(enum_name) {
+            return;
+        }
+        let value = self.ts_state.enums.get(enum_name).and_then(|members| {
+            members
+                .iter()
+                .rev()
+                .find(|(k, _)| k == member)
+                .map(|(_, v)| v.clone())
+        });
+        *e = match value {
+            Some(lower::Const::Num(n)) => Expr::Num(n),
+            Some(lower::Const::Str(s)) => Expr::Str(crate::parse::token::StrVal::Utf8(s)),
+            None => return,
+        };
+    }
 }

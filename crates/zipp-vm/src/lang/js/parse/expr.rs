@@ -856,6 +856,10 @@ impl<'s> Parser<'s> {
                     prop,
                     optional: false,
                 }));
+                // TypeScript: `E.A` of a `const enum` is its value.
+                if self.ts && !self.ts_state.const_enums.is_empty() {
+                    self.ts_inline_const_enum(&mut e);
+                }
             } else if self.at(Punct::QuestionDot) {
                 self.check_syntax_chain(links)?;
                 links += 1;

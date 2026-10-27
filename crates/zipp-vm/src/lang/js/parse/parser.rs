@@ -627,6 +627,10 @@ pub struct ParseOptions {
     /// checked and dropped as they are read, so the tree is the one the same
     /// program written in JavaScript would give.
     pub typescript: bool,
+    /// TypeScript's `useDefineForClassFields`: class fields stay fields
+    /// (defined on the instance) rather than becoming assignments at the head
+    /// of the constructor (see `lang/ts/config.rs`).
+    pub ts_define_fields: bool,
 }
 
 impl Default for ParseOptions {
@@ -641,6 +645,7 @@ impl Default for ParseOptions {
             allow_await_expr: false,
             allow_yield_expr: false,
             typescript: false,
+            ts_define_fields: false,
         }
     }
 }
@@ -806,7 +811,10 @@ impl<'s> Parser<'s> {
             arg_scratch: Vec::new(),
             member_scratch: Vec::new(),
             ts: opts.typescript,
-            ts_state: Default::default(),
+            ts_state: crate::lang::ts::TsState {
+                define_fields: opts.ts_define_fields,
+                ..Default::default()
+            },
         })
     }
 
