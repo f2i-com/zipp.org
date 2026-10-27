@@ -238,7 +238,7 @@ impl<'s> Parser<'s> {
 
     /// Type arguments after a type's name, which must be on its line.
     fn ts_type_args_on_line(&mut self) -> PResult<()> {
-        if self.at(Punct::Lt) && !self.cur().newline_before {
+        if (self.at(Punct::Lt) || self.at(Punct::Shl)) && !self.cur().newline_before {
             self.ts_type_args()?;
         }
         Ok(())
@@ -685,9 +685,13 @@ impl<'s> Parser<'s> {
         )
     }
 
-    /// `<A, B>` in a type.
+    /// `<A, B>` in a type (the `<` may be the first of a `<<`).
     pub(crate) fn ts_type_args(&mut self) -> PResult<()> {
-        self.bump(false)?; // `<`
+        if self.at(Punct::Shl) {
+            self.split_first()?;
+        } else {
+            self.bump(false)?; // `<`
+        }
         self.ts_with_cond(true, |p| {
             while !p.ts_at_gt() {
                 p.ts_type()?;

@@ -213,7 +213,7 @@ impl<'s> Parser<'s> {
                 Ok(())
             }
             Some(Punct::Shr | Punct::UShr | Punct::GtEq | Punct::ShrEq | Punct::UShrEq) => {
-                self.split_gt()
+                self.split_first()
             }
             _ => Err(self.err_here("SyntaxError: expected '>'")),
         }

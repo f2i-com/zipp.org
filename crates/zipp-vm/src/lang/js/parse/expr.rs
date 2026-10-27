@@ -932,7 +932,10 @@ impl<'s> Parser<'s> {
             } else if self.ts && self.at(Punct::Bang) && !self.cur().newline_before {
                 // TypeScript's non-null assertion `e!`.
                 self.bump_after_operand()?;
-            } else if self.ts && self.at(Punct::Lt) && self.ts_type_args_in_expr()? {
+            } else if self.ts
+                && (self.at(Punct::Lt) || self.at(Punct::Shl))
+                && self.ts_type_args_in_expr()?
+            {
                 // `f<T>(…)`: the type arguments are gone; the call follows.
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
                 self.check_syntax_chain(links)?;

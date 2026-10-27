@@ -334,7 +334,13 @@ impl<'s> Parser<'s> {
     }
 
     fn ts_expr_type_args(&mut self) -> PResult<bool> {
-        self.bump(false)?; // `<`
+        // `<`, or the first of `<<` when the first type argument is a generic
+        // function type (`f<<T>(x: T) => T>(g)`).
+        if self.at(Punct::Shl) {
+            self.split_first()?;
+        } else {
+            self.bump(false)?;
+        }
         self.ts_with_cond(true, |p| {
             loop {
                 p.ts_type()?;

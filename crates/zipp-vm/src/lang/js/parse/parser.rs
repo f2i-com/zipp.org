@@ -902,11 +902,12 @@ impl<'s> Parser<'s> {
         self.prev_end = s.2;
     }
 
-    /// The current token is `>>`, `>>>`, `>=`, `>>=` or `>>>=` where only its
-    /// first `>` belongs to the production (the end of a TypeScript type
-    /// argument list, `Array<Array<T>>`): take that `>` and lex the rest again
-    /// as the token that follows it.
-    pub(crate) fn split_gt(&mut self) -> PResult<()> {
+    /// The current token is a compound punctuator of which only the first
+    /// character belongs to the production: `>>`, `>=` and the like ending a
+    /// TypeScript type argument list (`Array<Array<T>>`), or `<<` opening one
+    /// whose first type is generic (`Mock<<T>(x: T) => T>`). Take that
+    /// character and lex the rest again as the token that follows it.
+    pub(crate) fn split_first(&mut self) -> PResult<()> {
         let at = self.tok.span.start + 1;
         self.prev_end = at;
         self.lx.seek(at);

@@ -271,3 +271,13 @@ fn json_imports_are_json_modules() {
         }
     }
 }
+
+#[test]
+fn a_type_argument_list_may_open_with_a_generic_function_type() {
+    assert_eq!(out("type Mock<F> = { f: F }; let m: Mock<<T>(x: T) => T> | null = null; const a: Array<<U>() => U> = []; console.log(m, a.length)"), "null 0");
+}
+
+#[test]
+fn a_call_may_take_a_generic_function_type_argument() {
+    assert_eq!(out("const fn = <F,>(f: F): F => f; const id = fn<<T>(x: T) => T>((x) => x); console.log(id(5), 1 << 3)"), "5 8");
+}

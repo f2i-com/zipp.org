@@ -989,7 +989,8 @@ fn build_identity(json: bool) -> String {
 }
 
 /// Every `.ts`/`.mts`/`.cts` file under `p` (or `p` itself if it is a file),
-/// `.d.ts` included.
+/// `.d.ts` included. A `node_modules` folder below `p` is skipped (name one
+/// to sweep it).
 fn collect_ts(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     if p.is_file() {
         out.push(p.to_path_buf());
@@ -999,7 +1000,7 @@ fn collect_ts(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for e in rd.flatten() {
         let path = e.path();
         if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == ".git") {
+            if path.file_name().is_some_and(|n| n == ".git" || n == "node_modules") {
                 continue;
             }
             collect_ts(&path, out);
