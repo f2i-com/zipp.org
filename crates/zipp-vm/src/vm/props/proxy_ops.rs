@@ -61,7 +61,45 @@ impl<'p> Vm<'p> {
     /// reduced to `(is_data, value, writable, has_getter, has_setter)`. Returns
     /// `None` when the target has no own property OR the property is configurable
     /// (in which case no invariant applies and the trap result stands).
+    ///
+    /// Inlined with its first answer: an ordinary target whose every own
+    /// property is a configurable data property (`plain_target_desc`'s
+    /// all-default case) constrains no trap. The call built its whole
+    /// `Result` in memory to say so, after every trap: a tenth of a minimal
+    /// `get` trap.
+    #[inline(always)]
     pub(crate) fn proxy_target_desc(
+        &mut self,
+        target: Value,
+        key: &str,
+    ) -> Result<Option<(bool, Value, bool, bool, bool)>, Thrown> {
+        if self.target_props_all_configurable(target) {
+            return Ok(None);
+        }
+        self.proxy_target_desc_full(target, key)
+    }
+
+    /// Whether `target` is an ordinary object whose own properties all live
+    /// in its map as default (configurable) data properties: the targets
+    /// `plain_target_desc` answers `Some(None)` for without a lookup.
+    #[inline(always)]
+    fn target_props_all_configurable(&self, target: Value) -> bool {
+        if !target.is_heap() {
+            return false;
+        }
+        let idx = target.heap_index();
+        if (idx == self.global_this && self.global_this != 0)
+            || (idx == self.arr_proto && self.arr_proto != 0)
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+        {
+            return false;
+        }
+        matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor && !m.may_deviate_attrs())
+    }
+
+    /// [`Self::proxy_target_desc`]'s every other case, out of line.
+    #[inline(never)]
+    fn proxy_target_desc_full(
         &mut self,
         target: Value,
         key: &str,
