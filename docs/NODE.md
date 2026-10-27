@@ -15,8 +15,11 @@ ECMAScript global object. `ZIPP_NO_NODE=1` turns it off for a run.
 
 `process` (`argv`, `env`, `platform`, `arch`, `cwd()`, `exit()`,
 `exitCode`, `nextTick`, `hrtime`, `stdout.write`, `stderr.write`, `on('exit')`,
-`versions`), `global`, `Buffer`, `atob`, `btoa`, `structuredClone`,
-`queueMicrotask`, and timers with ids, arguments and cancellation:
+`versions`), `global`, `Buffer`, `atob`, `btoa`, `structuredClone`, the
+WHATWG `URL` and `URLSearchParams` (`url_whatwg.js`: the URL Standard's
+parser, serializer and setters, passing every case of the web-platform
+tests' `urltestdata.json` and `setters_tests.json`), `queueMicrotask`, and
+timers with ids, arguments and cancellation:
 `setTimeout`/`clearTimeout`, `setInterval`/`clearInterval`,
 `setImmediate`/`clearImmediate`. `process.nextTick` callbacks run before
 promise jobs, as Node orders them. A script also has CommonJS's `require`,
@@ -67,5 +70,4 @@ their members read and their classes extended (`react-dom/server` extends
 `stream.Readable` as it loads); calling or constructing one throws
 `ERR_ZIPP_UNSUPPORTED` naming it.
 
-Not there yet: the WHATWG `URL` and `URLSearchParams` globals, `fetch`,
-streams, and `fs` streams and watchers.
+Not there yet: `fetch`, streams, and `fs` streams and watchers.

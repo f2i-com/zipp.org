@@ -32,6 +32,7 @@ const BOOTSTRAP: &str = include_str!("bootstrap.js");
 const PARTS: &[(&str, &str)] = &[
     ("timers", include_str!("timers.js")),
     ("clone", include_str!("clone.js")),
+    ("url_whatwg", include_str!("url_whatwg.js")),
     ("process", include_str!("process.js")),
     ("cjs", include_str!("cjs.js")),
     ("builtin/path", include_str!("builtins/path.js")),

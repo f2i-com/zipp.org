@@ -4,7 +4,8 @@
 //! library is asked directly. The program writes partial lines, orders
 //! `process.nextTick`, `queueMicrotask`, promise jobs, cleared timeouts and
 //! intervals, clones a cyclic graph of every kind `structuredClone` copies,
-//! and sets `process.exitCode` with an `exit` listener. The expected lines
+//! reads and edits a URL and its search parameters, and sets
+//! `process.exitCode` with an `exit` listener. The expected lines
 //! are Node 24's (`node app.js a b`).
 
 #[test]
@@ -28,6 +29,7 @@ fn node_globals_behave_as_node() {
             r#"true true 0 gi 2 true false 10 3 true boom"#,
             r#"DataCloneError: () => 1 could not be cloned."#,
             r#"DataCloneError: Symbol(s) could not be cloned."#,
+            r#"https://example.com/a/c?x=42&z=%C3%A9+%26%3D https://example.com x,42|z,é &= false TypeError ERR_INVALID_URL true"#,
             r#"exit 3"#,
         ]
     );
@@ -55,6 +57,14 @@ setTimeout(() => {
   const c = structuredClone(src);
   out.push([c !== src, c.self === c, c.d.getTime(), c.r.flags, c.m.get(1).z, c.s.has(2), 1 in c.arr, c.big, c.u8[2], c.err instanceof RangeError, c.err.message].join(" "));
   for (const bad of [() => 1, Symbol("s")]) { try { structuredClone(bad); } catch (e) { out.push(e.name + ": " + e.message); } }
+  const u = new URL("https://EXAMPLE.com:443/a/b/../c?x=1&y=2#f");
+  u.searchParams.append("z", "é &=");
+  u.searchParams.set("x", "42");
+  u.searchParams.delete("y");
+  u.hash = "";
+  let bad = null;
+  try { new URL("nope"); } catch (e) { bad = e; }
+  out.push([u.href, u.origin, [...u.searchParams].join("|"), Object.keys(globalThis).includes("URL"), bad.name, bad.code, URL.canParse("/x", u)].join(" "));
   process.exitCode = 3;
   process.on("exit", (code) => console.log("exit", code));
   console.log(out.join("\n"));

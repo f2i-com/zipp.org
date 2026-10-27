@@ -12,7 +12,9 @@
   function part(name) {
     return (parts[name] ||= host.load(name)(host, nativeSetTimeout));
   }
-  const hidden = (name) => name === "process" || name === "Buffer";
+  // Node's non-enumerable globals among these.
+  const hidden = (name) =>
+    name === "process" || name === "Buffer" || name === "URL" || name === "URLSearchParams";
   function settle(name, value) {
     defineProperty(G, name, { value, writable: true, configurable: true, enumerable: !hidden(name) });
     return value;
@@ -29,6 +31,8 @@
     lazy(name, "timers");
   }
   lazy("structuredClone", "clone");
+  lazy("URL", "url_whatwg");
+  lazy("URLSearchParams", "url_whatwg");
   lazy("process", "process");
   for (const name of ["Buffer", "atob", "btoa"]) {
     lazy(name, null, () => host.cjs().builtin("buffer")[name]);
