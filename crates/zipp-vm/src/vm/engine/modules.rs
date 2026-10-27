@@ -118,6 +118,49 @@ thread_local! {
     static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A top-level statement whose evaluation is unobservable whenever it runs:
+/// a declaration of functions or of literal bindings, which reads no other
+/// module and calls nothing (see `ModuleStaticExports::inert`).
+fn inert_stmt(s: &crate::parse::ast::Stmt) -> bool {
+    use crate::parse::ast::{ExportDecl, ExportDefault, Stmt};
+    let decl = |d: &crate::parse::ast::VarDecl| d.decls.iter().all(|x| x.init.as_ref().is_none_or(inert_expr));
+    match s {
+        Stmt::Empty | Stmt::FnDecl(_) => true,
+        Stmt::VarDecl(d) => decl(d),
+        Stmt::Export(e) => match &**e {
+            ExportDecl::Decl(d) => match &**d {
+                Stmt::FnDecl(_) => true,
+                Stmt::VarDecl(v) => decl(v),
+                _ => false,
+            },
+            ExportDecl::Named { source: None, .. } => true,
+            ExportDecl::Default(ExportDefault::Function(_)) => true,
+            ExportDecl::Default(ExportDefault::Expr(x)) => inert_expr(x),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A literal, or a function, which evaluating reads and calls nothing.
+fn inert_expr(e: &crate::parse::ast::Expr) -> bool {
+    use crate::parse::ast::{ArrayElem, Expr, ObjectMember, PropKey};
+    match e {
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::BigInt(_) => true,
+        Expr::Function(_) | Expr::Arrow(_) => true,
+        Expr::Template(t) => t.exprs.is_empty(),
+        Expr::Array(items, _) => items.iter().flatten().all(|i| matches!(i, ArrayElem::Expr(x) if inert_expr(x))),
+        Expr::Object(members, _) => members.iter().all(|m| match m {
+            ObjectMember::Prop { key, value, .. } => !matches!(key, PropKey::Computed(_)) && inert_expr(value),
+            ObjectMember::Method { key, .. } | ObjectMember::Get { key, .. } | ObjectMember::Set { key, .. } => {
+                !matches!(key, PropKey::Computed(_))
+            }
+            ObjectMember::Spread(_) => false,
+        }),
+        _ => false,
+    }
+}
+
 /// What a module's source says about one export name (`Vm::static_export`).
 enum StaticExport {
     /// The module binds it itself (a `var` or another declaration).
@@ -2254,6 +2297,16 @@ impl<'p> Vm<'p> {
         let t = &self.module_static_exports[dep];
         Ok(if t.unknown {
             StaticExport::Indirect
+        } else if t.functions.contains(name) {
+            // A function exists from link time on, so a cycle member may call
+            // it before its module runs. Loading an inert module to get it is
+            // unobservable; any other keeps its turn, the binding forwarded
+            // (and callable once the module has loaded).
+            if t.inert {
+                StaticExport::Indirect
+            } else {
+                StaticExport::Own { is_var: false }
+            }
         } else if let Some(&is_var) = t.own.get(name) {
             StaticExport::Own { is_var }
         } else if t.indirect.contains(name) || (t.star && name != "default") {
@@ -2264,7 +2317,7 @@ impl<'p> Vm<'p> {
     }
 
     fn read_static_exports(&mut self, dep: &std::path::Path) -> crate::vm::ModuleStaticExports {
-        use crate::parse::ast::{ExportDecl, ModuleExportName, Stmt, VarKind};
+        use crate::parse::ast::{ExportDecl, ExportDefault, ModuleExportName, Stmt, VarKind};
         let mut t = crate::vm::ModuleStaticExports::default();
         let Ok(code) = self.read_module_text(dep) else {
             t.unknown = true;
@@ -2282,6 +2335,8 @@ impl<'p> Vm<'p> {
         // Import bindings: re-exporting one (`import { x } …; export { x }`)
         // is indirect.
         let mut imported: std::collections::HashSet<String> = Default::default();
+        // Top-level function declarations, exported by name or not.
+        let mut functions: std::collections::HashSet<String> = Default::default();
         // (exported, local) of `export { local as exported }`, judged once
         // every top-level `var` is known.
         let mut locals: Vec<(String, String)> = Vec::new();
@@ -2295,6 +2350,11 @@ impl<'p> Vm<'p> {
                             crate::parse::ast::ImportSpecifier::Named { local, .. } => local,
                         };
                         imported.insert(local.to_string());
+                    }
+                }
+                Stmt::FnDecl(f) => {
+                    if let Some(n) = &f.name {
+                        functions.insert(n.to_string());
                     }
                 }
                 Stmt::VarDecl(d) if d.kind == VarKind::Var => {
@@ -2318,9 +2378,14 @@ impl<'p> Vm<'p> {
                                 t.own.insert(n.to_string(), v.kind == VarKind::Var);
                             }
                         }
+                        // A function is instantiated at link time, so a
+                        // cycle member may call it before its module runs:
+                        // no forward slot (which holds nothing until then)
+                        // stands in for it — it resolves by loading.
                         Stmt::FnDecl(f) => {
                             if let Some(n) = &f.name {
-                                t.own.insert(n.to_string(), false);
+                                functions.insert(n.to_string());
+                                t.functions.insert(n.to_string());
                             }
                         }
                         Stmt::ClassDecl(c) => {
@@ -2340,6 +2405,9 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
+                    ExportDecl::Default(ExportDefault::Function(_)) => {
+                        t.functions.insert("default".into());
+                    }
                     ExportDecl::Default(_) => {
                         t.own.insert("default".into(), false);
                     }
@@ -2354,6 +2422,8 @@ impl<'p> Vm<'p> {
         for (exported, local) in locals {
             if imported.contains(&local) {
                 t.indirect.insert(exported);
+            } else if functions.contains(&local) {
+                t.functions.insert(exported);
             } else {
                 let is_var = vars.contains(&local);
                 t.own.insert(exported, is_var);
@@ -2363,7 +2433,9 @@ impl<'p> Vm<'p> {
         let indirect: Vec<String> = t.indirect.iter().cloned().collect();
         for n in indirect {
             t.own.remove(&n);
+            t.functions.remove(&n);
         }
+        t.inert = ast.body.iter().all(inert_stmt);
         t
     }
 
@@ -2647,6 +2719,23 @@ mod confined_budget_tests {
             let entry = std::fs::canonicalize(root.join("main.mjs")).expect("canonical entry");
             vm.import_module(&entry, None).expect("the barrel runs");
             assert_eq!(vm.output, ["a", "b", "1"]);
+        });
+    }
+
+    #[test]
+    fn a_hoisted_function_is_callable_through_a_barrel_before_its_module_runs() {
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            std::fs::write(root.join("barrel.mjs"), "export * from './a.mjs'; export * from './c.mjs';")
+                .expect("write barrel");
+            std::fs::write(root.join("a.mjs"), "import { f } from './barrel.mjs'; export const y = f();")
+                .expect("write a");
+            std::fs::write(root.join("c.mjs"), "export function f() { return 1 }").expect("write c");
+            std::fs::write(root.join("main.mjs"), "import { y } from './barrel.mjs'; console.log(String(y));")
+                .expect("write main");
+            let entry = std::fs::canonicalize(root.join("main.mjs")).expect("canonical entry");
+            vm.import_module(&entry, None).expect("the barrel runs");
+            assert_eq!(vm.output, ["1"]);
         });
     }
 }

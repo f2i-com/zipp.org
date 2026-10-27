@@ -3721,4 +3721,10 @@ pub(crate) struct ModuleStaticExports {
     pub(crate) star: bool,
     /// The source could not be read or parsed: nothing is known.
     pub(crate) unknown: bool,
+    /// Exported names whose binding is a function declaration.
+    pub(crate) functions: std::collections::HashSet<String>,
+    /// The module's top level only declares (functions, and bindings of
+    /// literals and function expressions) and imports nothing, so running it
+    /// ahead of its turn is unobservable.
+    pub(crate) inert: bool,
 }
