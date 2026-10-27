@@ -1710,7 +1710,17 @@ impl<'a> FnCompiler<'a> {
         // class scope, never the ctor's.
         // Implicit (fields-only) ctors keep the entry layout: there are no
         // parameters and no body for the fields to race with.
-        let defer_fields = has_explicit_ctor;
+        //
+        // A BASE class whose initializers cannot tell the difference keeps them
+        // inline at the head of its constructor instead: there they run where
+        // the thunk would (before the body, with no parameter defaults to race
+        // with), and each `new` saves the host re-entry that calls the thunk —
+        // most of the cost of constructing such a class (every TypeScript
+        // class that declares its fields or has parameter properties).
+        let defer_fields = has_explicit_ctor
+            && !(class.superclass.is_none()
+                && plan.elements.is_empty()
+                && ctor_fn.is_some_and(|f| fields_inline_ok(f, &fields, &instance_computed_inits)));
         let empty_fields = Vec::new();
         let empty_cinits = Vec::new();
         let empty_order: Vec<(u8, usize)> = Vec::new();
@@ -2179,4 +2189,66 @@ impl<'a> FnCompiler<'a> {
             this_reg,
         });
     }
+}
+
+/// Whether a base class's instance-field initializers may run inline at the
+/// head of its explicit constructor `ctor` rather than in a thunk of their own
+/// (see `defer_fields`): the constructor's parameters are plain names (no
+/// default or pattern evaluates before the body), and no initializer can see
+/// a difference — none names anything the constructor binds (which the inline
+/// form would resolve to the constructor's binding instead of the class
+/// scope's), reads `new.target` (undefined in an initializer, the class in a
+/// constructor), or may call a direct `eval` (which would see the
+/// constructor's scope).
+fn fields_inline_ok(
+    ctor: &ast::Function,
+    fields: &[(String, Option<&ast::Expr>)],
+    computed: &[Option<&ast::Expr>],
+) -> bool {
+    use crate::parse::visit::{self, Flow, Node};
+    if !ctor.params.simple {
+        return false;
+    }
+    let inits: Vec<&ast::Expr> = fields
+        .iter()
+        .filter_map(|(_, e)| *e)
+        .chain(computed.iter().filter_map(|e| *e))
+        .collect();
+    if inits.is_empty() {
+        return true;
+    }
+    let mut bound: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    bound.insert("arguments".into());
+    for p in &ctor.params.items {
+        crate::capture::collect_pattern_names(p, &mut bound);
+    }
+    visit::stmts(&ctor.body.stmts, &mut |n| {
+        match n {
+            Node::Pattern(ast::Pattern::Ident(name)) => {
+                bound.insert(name.to_string());
+            }
+            Node::Stmt(ast::Stmt::FnDecl(f)) => {
+                if let Some(name) = &f.name {
+                    bound.insert(name.to_string());
+                }
+            }
+            Node::Stmt(ast::Stmt::ClassDecl(c)) => {
+                if let Some(name) = &c.name {
+                    bound.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        Flow::Go
+    });
+    inits.iter().all(|e| {
+        let refs = crate::capture::expr_refs_all(e);
+        if refs.iter().any(|n| bound.contains(n) || n == "eval") {
+            return false;
+        }
+        visit::expr(e, &mut |n| match n {
+            Node::Expr(ast::Expr::NewTarget) => Flow::Stop,
+            _ => Flow::Go,
+        })
+    })
 }

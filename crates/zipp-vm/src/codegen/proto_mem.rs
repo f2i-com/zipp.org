@@ -1190,6 +1190,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] object literal op (disabled)");
                 }
             }
+            // A class field's definition: `jit_define_field`'s append, or a
+            // decline that replays the full definition in the interpreter.
+            Instr::DefineField { .. } => {}
             Instr::NewArray { .. } => {
                 if !crate::vm::tierc_new_array_enabled() {
                     reject!("[tierC-reject] op NewArray (disabled)");
@@ -1682,6 +1685,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::GetProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
             Instr::AppendDataProp { obj, val, .. } => (u2(obj, val), None),
+            Instr::DefineField { obj, val, .. } => (u2(obj, val), None),
             Instr::SetHomeObject { method, home } => (u2(method, home), None),
             Instr::DeleteProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::NewArray {
@@ -4244,6 +4248,30 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::DefineField { obj, name, val } => {
+                // As AppendDataProp's packing; the helper appends or declines
+                // with nothing done (the interpreter then replays the full
+                // CreateDataPropertyOrThrow). An append can move the
+                // receiver's property storage and bumps its version, so
+                // pinned bases are refreshed after it.
+                let helper = crate::vm::jit_define_field as *const () as usize;
+                let packed_name = ((func_id as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, QWORD packed_name as i64
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
                 );
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));

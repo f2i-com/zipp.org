@@ -40,7 +40,7 @@ impl<'p> Vm<'p> {
     /// the full definition built a four-property descriptor object and read
     /// it back through `Object.defineProperty`'s machinery: a class with two
     /// fields constructed at 1.9 microseconds an instance, 47 times Node.
-    fn define_field_append(&mut self, target: Value, key: &str, value: Value) -> bool {
+    pub(crate) fn define_field_append(&mut self, target: Value, key: &str, value: Value) -> bool {
         if !target.is_heap() {
             return false;
         }
@@ -73,11 +73,58 @@ impl<'p> Vm<'p> {
             return false;
         }
         self.store_barrier_v(crate::heap::gcoracle::SET_PROP, target, value);
-        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
-            m.set(key, value);
+        // The append `set_prop`'s inline cache makes (`ic.rs`, its `Append`
+        // plan): the shared shape transition, and the shape's shared key list
+        // rather than a new `String` for the key on every instance.
+        let shape = match self.heap.get(oi) {
+            HeapObj::Object(m) => m.shape(),
+            _ => crate::shape::DICT,
+        };
+        let after = if shape == crate::shape::DICT {
+            crate::shape::DICT
+        } else {
+            crate::shape::add(shape, key, crate::shape::attr_bits(true, true, true, false))
+        };
+        if after == crate::shape::DICT {
+            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                m.set(key, value);
+            }
+        } else {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                if !self.shape_key_plans.get(after as usize).is_some_and(Option::is_some) {
+                    crate::vm::helpers_misc::shape_key_plan(self, after);
+                }
+                let borrow = crate::bytecode::plan_borrow_enabled();
+                let plan = self.shape_key_plans.get(after as usize).and_then(Option::as_ref);
+                if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                    match plan {
+                        // SAFETY: as `ic.rs`'s append — the VM's shape plans
+                        // are never removed or replaced, and its heap's maps
+                        // die with it.
+                        Some(p) if p.len() == m.slot_len() + 1 => unsafe {
+                            m.append_data_planned(key, value, after, p, borrow)
+                        },
+                        _ => m.append_data_shaped(key, value, after, None),
+                    }
+                }
+            }
+            #[cfg(feature = "safe-sandbox")]
+            {
+                let plan = crate::vm::helpers_misc::shape_key_plan(self, after);
+                if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                    m.append_data_shaped(key, value, after, plan);
+                }
+            }
         }
         // A key add can move `vals` (inline caches address it).
         self.heap.bump_version(oi);
+        // The map is settled: refresh the mirror the inline caches read, as
+        // their own add path does, rather than leave it invalidated. Every
+        // instance of a class with fields comes through here, and an
+        // invalidated mirror made the first access to each one miss — enough
+        // misses that the JIT evicted the code reading them.
+        self.heap.refresh_mirror(oi);
         true
     }
 

@@ -381,7 +381,7 @@ impl<'p> Vm<'p> {
             // Callback compilation happens outside a live caller bytecode
             // frame/site, so there is no receiver exemplar to bake.
             let method_plan = rustc_hash::FxHashMap::default();
-            let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None);
+            let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None, true);
             self.jit.note_cross_pending(fid, &cross_pending);
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             self.jit.compile(

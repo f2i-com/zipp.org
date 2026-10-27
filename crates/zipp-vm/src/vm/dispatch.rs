@@ -2973,7 +2973,7 @@ impl<'p> Vm<'p> {
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
                                 let (cross_plan, cross_pending, cross_baked) =
-                                    self.build_cross_call_plan(func_id, Some(base));
+                                    self.build_cross_call_plan(func_id, Some(base), false);
                                 self.jit.note_cross_baked(func_id, &cross_baked);
                                 // B199: a "no entry yet" decline at a REGION is
                                 // deferred (capped) instead of baked — the callee

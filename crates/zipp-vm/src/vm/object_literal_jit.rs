@@ -669,6 +669,63 @@ pub(crate) extern "win64" fn jit_append_data_prop(
     }
 }
 
+/// Tier C's `DefineField` — a class field defined on an instance being
+/// constructed (`x = init`, and TypeScript's `x;`): the common case,
+/// CreateDataPropertyOrThrow appending a writable, enumerable, configurable
+/// data property to an ordinary extensible object that lacks the key, done
+/// here (`Vm::define_field_append`, the interpreter's own fast path). Every
+/// other case — an existing key, a Proxy, a non-extensible or exotic
+/// receiver — is the full definition, so the helper declines before any
+/// effect and the interpreter replays the instruction.
+///
+/// Without it a constructor or field initializer holding a `DefineField`
+/// was never compiled, so constructing a class that declares its fields ran
+/// several times slower than one assigning them in its constructor.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_define_field(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed_name: u64,
+    val_bits: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let obj = Value::from_bits(obj_bits);
+        if !obj.is_heap() || obj.heap_index() as usize >= vm.heap.len() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let func_id = (packed_name >> 32) as u32;
+        let name = packed_name as u32 as usize;
+        let func_count = vm.main_func_count.saturating_add(vm.eval_funcs.len());
+        if func_id as usize >= func_count {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let func: &crate::bytecode::FuncProto = vm.func(func_id as usize);
+        let Some(key) = func.string_constants.get(name) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        let key: &str = key.as_str();
+        let val = Value::from_bits(val_bits);
+        if val.is_heap() && val.heap_index() as usize >= vm.heap.len() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        // The interpreter's fast path: a pure decline (nothing done) or a
+        // complete append.
+        if vm.define_field_append(obj, key, val) {
+            0
+        } else {
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    })) {
+        Ok(bits) => bits,
+        // As `jit_append_data_prop`: never replay after the commit point.
+        Err(_) => std::process::abort(),
+    }
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tests {
     use super::*;

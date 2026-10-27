@@ -1928,6 +1928,7 @@ impl<'p> Vm<'p> {
         call_ip: usize,
         fid: u32,
         argc: u16,
+        whole_body: bool,
         pending: &mut Vec<u32>,
         baked: &mut Vec<u32>,
     ) -> Option<crate::codegen::SameProtoCross3Plan> {
@@ -1969,6 +1970,7 @@ impl<'p> Vm<'p> {
         // reach themselves through their own global name are left out: those
         // are Tier A's and the reducers' shapes.
         let self_arm = fid == caller_fid
+            && whole_body
             && crate::codegen::cross3_self_enabled()
             && reg_count <= 64
             && crate::codegen::markdown_inline_plan(callee).is_none()
@@ -2100,10 +2102,18 @@ impl<'p> Vm<'p> {
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// `whole_body`: the plan is for a whole-function (Tier C) compile, the
+    /// one that installs the function's own cross entry. Only such a compile
+    /// may bake a CROSS3 arm against itself (B270): a loop region's compile
+    /// installs no entry, and a region that called its own function through
+    /// that lane crashed once the function's body was later compiled (a
+    /// recursive arrow concatenating arrays in a loop, `ZIPP_NO_CROSS3_SELF=1`
+    /// avoided it). A region's self call keeps the helper.
     pub(crate) fn build_cross_call_plan(
         &self,
         func_id: u32,
         exemplar_base: Option<usize>,
+        whole_body: bool,
     ) -> (crate::codegen::CrossCallPlan, Vec<u32>, Vec<u32>) {
         // A Python program's own bodies take none of these plans (see
         // `Vm::py_plans_skipped`).
@@ -2256,7 +2266,7 @@ impl<'p> Vm<'p> {
             let mut cross3 = crate::codegen::Cross3CallPlan::default();
             if (same_proto || mono_ok) && crate::codegen::cross3_enabled() && cross3_unmetered {
                 if let Some(arm) =
-                    self.build_cross3_call_arm(func_id, ip, fid, argc, &mut pending, &mut baked)
+                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
                 {
                     let inserted = cross3.push(arm);
                     debug_assert!(inserted);
@@ -2283,6 +2293,7 @@ impl<'p> Vm<'p> {
                         ip,
                         poly_arm_fid,
                         argc,
+                        whole_body,
                         &mut pending,
                         &mut baked,
                     ) {
