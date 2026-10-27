@@ -5688,6 +5688,14 @@ pub(crate) fn compile_proto_mem(
                 // re-fetches the versions pointer explicitly below.
                 let key = proto.string_constants[name as usize].as_str();
                 let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
+                // A dedicated lane is chosen by the method's NAME, and a user
+                // method may share it (a queue's `push`, a cache's `get`): its
+                // helper declines before any effect and the call takes the
+                // general route below (`general`), as the final arm's does,
+                // rather than bailing the whole body to the interpreter on
+                // every such call.
+                let general = ops.new_dynamic_label();
+                let mut lane = false;
                 if key == "random" && argc == 0 && tierc_random_method_enabled() {
                     // Unlike arithmetic Math intrinsics, `Math.random()` must
                     // observe an own-property replacement. Route through the
@@ -5743,7 +5751,7 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail                          // live prototype/realm mismatch
+                        ; je => general                          // live prototype/realm mismatch
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // Case mapping allocates the result and can grow the heap's
@@ -5752,7 +5760,7 @@ pub(crate) fn compile_proto_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if tierc_coll_mutate_enabled()
                     && matches!((key, argc), ("set", 2) | ("clear", 0))
                 {
@@ -5776,10 +5784,10 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail                          // own/proto/realm override
+                        ; je => general                          // own/proto/realm override
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if substring_arity_ok && matches!(key, "substring" | "slice") {
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
@@ -5793,7 +5801,7 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // The result allocation can move the heap versions Vec.
@@ -5802,7 +5810,7 @@ pub(crate) fn compile_proto_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if matches!(key, "get" | "has") {
                     // Map.get / Map.has / Set.has — the region arm verbatim:
                     // `has` retries as Set (op 2) before deopting; a wrong
@@ -5833,16 +5841,16 @@ pub(crate) fn compile_proto_mem(
                             ; call rax
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
-                            ; je => bail
+                            ; je => general
                         );
                     } else {
-                        dynasm!(ops ; => set_try ; jmp => bail);
+                        dynasm!(ops ; => set_try ; jmp => general);
                     }
                     dynasm!(ops
                         ; => coll_done
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if matches!(key, "charCodeAt" | "indexOf" | "push") && argc == 1 {
                     // charCodeAt / indexOf / push — one-arg dedicated helpers.
                     let helper = match key {
@@ -5858,10 +5866,10 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else {
                     // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
                     // the region arm, which declines before any effect; the
@@ -5911,6 +5919,28 @@ pub(crate) fn compile_proto_mem(
                     if let Some(done) = pop_done {
                         dynasm!(ops ; => done);
                     }
+                }
+                if lane {
+                    let lane_done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => lane_done ; => general);
+                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    emit_tierc_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_method_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        arg_base,
+                        refetch,
+                        method_own_slot_direct,
+                    );
+                    dynasm!(ops ; => lane_done);
                 }
             }
             Instr::Call {
