@@ -129,6 +129,35 @@ linker. The ratio compares the release product with the canonical benchmark
 product; it is not the effect of profile guidance alone, which would take a
 feature- and flag-matched pair to measure.
 
+### Release 0.0.30, as published
+
+The 0.0.30 release notes measure the published 0.0.30 and 0.0.29 Windows
+binaries against Bellard's QuickJS 2026-06-04 on 27 October 2026: an
+otherwise idle Ryzen 9 9950X3D, address-space randomization off, each run
+pinned to one core, medians of interleaved runs. This is a release
+comparison taken with scratch scripts, not a stamped capture like the ones
+above. Ratios are 0.0.30 / the other engine.
+
+| Bundled application, cache off (7 runs) | / 0.0.29 | / QuickJS, 96 MB-L3 die | / QuickJS, 32 MB-L3 die |
+|---|---:|---:|---:|
+| Babel | 0.77× | 0.94× | 1.03× |
+| TypeScript | 0.81× | 0.87× | 0.90× |
+| Prettier | 0.83× | 1.02× | 1.04× |
+| marked, lodash, acorn, terser, three.js, immer, RxJS, date-fns | 0.86× | 0.36× | 0.38× |
+| Vue server rendering | 0.87× | 0.97× | 0.98× |
+| Preact server rendering | 0.95× | 0.98× | 1.01× |
+| React server rendering | 0.90× | QuickJS fails | QuickJS fails |
+
+A profile-guided build of the same engine (`tools/pgo.sh`), which the
+release does not ship, takes 0.82× to 0.94× QuickJS's time on Babel,
+TypeScript, Prettier, Vue and Preact on the 96 MB-L3 die and 0.85× to 0.95×
+on the other. Over the 78 benchmark programs of the release notes
+(3 runs each, outputs identical), the interpreter (`ZIPP_NOJIT=1`, regex JIT
+on) takes 0.917× 0.0.29's time and 0.818× QuickJS's, faster than QuickJS on
+54; the JIT lane takes 0.971× 0.0.29's time. The full tables, with peak
+working sets, are in
+[docs/releases/0.0.30.md](releases/0.0.30.md#performance).
+
 ### Interpreter versus interpreter
 
 The tables above compare production JITs. This one asks the other question:
