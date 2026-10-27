@@ -1651,6 +1651,12 @@ impl<'p> Vm<'p> {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
     pub(crate) fn ic_proto_hit_settle(&mut self, recv: Value) {
+        // A module namespace's or a dictionary-mode object's map has no shape
+        // to settle (the export and dictionary-hint answers): the refresh
+        // found nothing to keep, on every read of `ns.key` in a loop.
+        if matches!(self.heap.get(recv.heap_index()), HeapObj::Object(m) if m.shape() == crate::shape::DICT) {
+            return;
+        }
         self.heap.refresh_mirror(recv.heap_index());
     }
 
@@ -1782,19 +1788,25 @@ impl<'p> Vm<'p> {
             return None;
         }
         #[cfg(feature = "jit")]
-        if self.heap.hot_mirror_of(recv.heap_index()).shape == crate::shape::DICT {
-            if !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
-                return None;
-            }
-            if let Some(v) = self.ic_dict_hint_hit(func_id, ip, recv, key) {
-                return Some(v);
-            }
+        let dict_mirror = self.heap.hot_mirror_of(recv.heap_index()).shape == crate::shape::DICT;
+        #[cfg(feature = "jit")]
+        if dict_mirror && !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
+            return None;
         }
         #[cfg(not(feature = "jit"))]
         if !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
             return None;
         }
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let cell = self.ic_cell(func_id, ip)?;
+        // A dictionary-mode receiver at a site that remembers where it found
+        // its key in one (a namespace's site never does).
+        #[cfg(feature = "jit")]
+        if dict_mirror && cell.dict_hint().is_some() {
+            if let Some(v) = self.ic_dict_hint_hit(func_id, ip, recv, key) {
+                return Some(v);
+            }
+        }
+        let site = cell.site.as_deref()?;
         if site.n == 0 {
             return None;
         }
