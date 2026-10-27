@@ -1,11 +1,14 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import data from './benchmark-data.json'
+import releaseData from './release-comparison.json'
 
 /*
  * The measured-performance section. Every figure comes from
  * benchmark-data.json, which scripts/import-benchmarks.py writes from the
  * capture artifacts under bench/; the prose below states only what those
- * numbers say (counts and directions are computed, not typed).
+ * numbers say (counts and directions are computed, not typed). The one
+ * exception is the release tab: release-comparison.json holds the latest
+ * release notes' comparison of the published binaries, labelled as such.
  */
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
@@ -13,8 +16,9 @@ const blob = (path: string) => `${GITHUB_URL}/blob/main/${path}`
 const PERFORMANCE_URL = blob('docs/PERFORMANCE.md')
 const ROADMAP_URL = blob('docs/PERF_ROADMAP.md')
 
-type Mode = 'jit' | 'interp' | 'python'
+type Mode = 'jit' | 'interp' | 'python' | 'release'
 type Suite = 'normal' | 'hostile'
+type Die = 'large' | 'small'
 type Filter = 'all' | 'headline' | 'diagnostic'
 type PyGroup = 'all' | 'micro' | 'macro'
 type Interval = number[] | null | undefined
@@ -33,6 +37,17 @@ const range = (ci: Interval) => (ci && ci.length === 2 ? `${ci[0].toFixed(3)}–
 const longDate = (iso: string) =>
   new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' })
 const below = (rows: { ratio: number }[]) => rows.filter((row) => row.ratio < 1).length
+const geomean = (values: number[]) => Math.exp(values.reduce((sum, value) => sum + Math.log(value), 0) / values.length)
+
+// The release tab: the published binaries of the latest release, its
+// predecessor and QuickJS, per bundled application and per L3 die.
+const rel = releaseData
+type Timing = { previous: number; current: number; warm: number; pgo: number; quickjs: number | null }
+const relRows = (die: Die) => rel.bundles.map((bundle) => ({ ...bundle, t: bundle[die] as Timing }))
+const relVsQuickjs = (die: Die, engine: 'current' | 'pgo') =>
+  geomean(relRows(die).filter((row) => row.t.quickjs !== null).map((row) => row.t[engine] / row.t.quickjs!))
+const relVsPrevious = geomean(relRows('large').map((row) => row.t.current / row.t.previous))
+const relFaster = relRows('large').filter((row) => row.t.current < row.t.previous).length
 
 /** The home page's proof band reads these: the JIT capture's own headline facts. */
 export const benchmarkFacts = {
@@ -128,6 +143,11 @@ const READING: Record<Mode, { title: string; copy: string }[]> = {
     { title: 'Work time, and the whole process', copy: 'Each program times its own workload in-process (the ratio in the table), and the harness records wall time too. Wall time adds process start and compile, where ZIPP’s lighter start counts in its favour.' },
     { title: 'Same answers', copy: `Every run’s output must equal CPython’s. ${python.zippOnlyPrograms} more programs (the torch ones) have no CPython counterpart and are left out of every figure here.` },
   ],
+  release: [
+    { title: `What ${rel.version} changed`, copy: `The published ${rel.version} and ${rel.previous} Windows binaries, as downloaded, on bundled applications: one script per library, a fixed workload, the bundle’s compile included. These are plain release builds, not the profile-guided build the other tabs measure.` },
+    { title: 'Two dies, one processor', copy: `The Ryzen 9 9950X3D has one die with ${rel.dies.large} and one with ${rel.dies.small}. Large programs feel the difference, so every figure is given for both: runs are pinned to one core of the chosen die.` },
+    { title: 'A release comparison', copy: 'Measured for the release notes with scratch scripts on an otherwise idle machine, not one of the stamped, provenance-checked captures behind the other tabs. The notes carry the full method, the memory figures and the slower rows.' },
+  ],
 }
 
 export function BenchmarkSection() {
@@ -135,6 +155,7 @@ export function BenchmarkSection() {
   const [suite, setSuite] = useState<Suite>('normal')
   const [filter, setFilter] = useState<Filter>('all')
   const [pyGroup, setPyGroup] = useState<PyGroup>('all')
+  const [die, setDie] = useState<Die>('large')
 
   const jitRows = suite === 'normal' ? jit.normal.rows.filter((row) => filter === 'all' || row.group === filter) : jit.hostile.rows
   const interpSuite = suite === 'normal' ? interp.normal : interp.hostile
@@ -153,6 +174,8 @@ export function BenchmarkSection() {
   const pyWorkInterp = python.geomean.work.interp
   const pyWallJit = python.geomean.wall.jit
   const pyFaster = below(python.rows)
+  const releaseRows = relRows(die)
+  const releaseGaps = releaseRows.filter((row) => row.t.quickjs !== null && row.t.current >= row.t.quickjs)
 
   return (
     <section className="benchmark-section section-wrap" id="benchmarks">
@@ -167,18 +190,25 @@ export function BenchmarkSection() {
         </div>
       </div>
 
-      <p className="benchmark-capture-note">
-        Measured {longDate(jit.capturedAt)} on native Windows x86-64 · ZIPP {benchmarkFacts.version}, canonical PGO build (source <code>{jit.zipp.source}</code>)
-        {' '}· Node {jit.engines.node} · Bun {jit.engines.bun} · Deno {jit.engines.deno}
-        {' '}· QuickJS {interp.normal.engines.quickjs} · QuickJS-NG {interp.normal.engines['quickjs-ng']} · CPython {python.cpython}. Native CLI results, not the browser build.
-      </p>
+      {mode === 'release' ? (
+        <p className="benchmark-capture-note">
+          Measured {longDate(rel.measuredAt)} on native Windows x86-64 · the published ZIPP {rel.version} and {rel.previous} Windows binaries, plain release builds
+          {' '}· Bellard’s QuickJS {rel.quickjs}. A release comparison from the {rel.version} notes, not a stamped capture. Native CLI results, not the browser build.
+        </p>
+      ) : (
+        <p className="benchmark-capture-note">
+          Measured {longDate(jit.capturedAt)} on native Windows x86-64 · ZIPP {benchmarkFacts.version}, canonical PGO build (source <code>{jit.zipp.source}</code>)
+          {' '}· Node {jit.engines.node} · Bun {jit.engines.bun} · Deno {jit.engines.deno}
+          {' '}· QuickJS {interp.normal.engines.quickjs} · QuickJS-NG {interp.normal.engines['quickjs-ng']} · CPython {python.cpython}. Native CLI results, not the browser build.
+        </p>
+      )}
 
       <Tabs
         label="Choose a comparison"
         className="mode-tabs"
         value={mode}
         onChange={setMode}
-        options={[['jit', 'JIT vs JIT'], ['interp', 'Interpreter vs interpreter'], ['python', 'Python vs CPython']] as const}
+        options={[['jit', 'JIT vs JIT'], ['interp', 'Interpreter vs interpreter'], ['python', 'Python vs CPython'], ['release', `${rel.version} release`]] as const}
       />
 
       {mode === 'jit' && (
@@ -259,6 +289,40 @@ export function BenchmarkSection() {
         </div>
       )}
 
+      {mode === 'release' && (
+        <div className="benchmark-summary">
+          <article className="headline-result">
+            <div>
+              <span>{rel.version} release · {rel.bundles.length} bundled apps</span>
+              <strong>{x(relVsPrevious)}</strong>
+              <p>ZIPP {rel.version} / {rel.previous} geomean, {rel.dies.large} die · lower is faster</p>
+            </div>
+            <div className="confidence-pill">faster than {rel.previous} on {relFaster} of {rel.bundles.length} apps</div>
+          </article>
+          <article className="ratio-card">
+            <span>Bundled apps, ZIPP / QuickJS</span>
+            <RatioRows rows={[
+              { label: `${rel.version}, ${rel.dies.large}`, value: relVsQuickjs('large', 'current') },
+              { label: `${rel.version}, ${rel.dies.small}`, value: relVsQuickjs('small', 'current') },
+              { label: `PGO build, ${rel.dies.large}`, value: relVsQuickjs('large', 'pgo') },
+            ]} />
+            <small>Geomeans over the {rel.bundles.filter((bundle) => bundle.large.quickjs !== null).length} apps QuickJS runs, cache off. The profile-guided build of the same engine is not shipped.</small>
+          </article>
+          <article className="ratio-card suite-card">
+            <span>The {rel.programs.count} benchmark programs</span>
+            <RatioRows rows={[
+              { label: `Interpreter / ${rel.previous}`, value: rel.programs.interpVsPrevious },
+              { label: `JIT / ${rel.previous}`, value: rel.programs.jitVsPrevious },
+              { label: 'Interpreter / QuickJS', value: rel.programs.interpVsQuickjs },
+            ]} />
+            <small>
+              The interpreter is faster than QuickJS on {rel.programs.interpFasterThanQuickjs} of {rel.programs.count} ({rel.previous}: {rel.programs.previousInterpFasterThanQuickjs},
+              {' '}{x(rel.programs.previousInterpVsQuickjs)}) and faster than {rel.previous} on {rel.programs.interpFasterThanPrevious}.
+            </small>
+          </article>
+        </div>
+      )}
+
       <div className="reading-guide" aria-label="How to read these numbers">
         {READING[mode].map((item, index) => (
           <article key={item.title}>
@@ -276,11 +340,15 @@ export function BenchmarkSection() {
               {mode === 'jit' && <>{suite === 'normal' ? 'Normal 13' : 'Hostile 17'} · JIT vs JIT · cold wall time</>}
               {mode === 'interp' && <>{suite === 'normal' ? 'Normal 13' : 'Hostile 17'} · interpreter vs interpreter · cold wall time</>}
               {mode === 'python' && <>Python programs · in-process work time</>}
+              {mode === 'release' && <>Bundled apps · {rel.version} against {rel.previous} and QuickJS · {rel.dies[die]} die, cold</>}
               <span>milliseconds · lower is better</span>
             </p>
           </div>
           <div className="scoreboard-controls">
-            {mode !== 'python' ? (
+            {mode === 'release' ? (
+              <Tabs label="Choose a die" value={die} onChange={setDie}
+                options={[['large', `${rel.dies.large} die`], ['small', `${rel.dies.small} die`]] as const} />
+            ) : mode !== 'python' ? (
               <Tabs label="Choose a benchmark suite" className="suite-tabs" value={suite} onChange={setSuite}
                 options={[['normal', 'Normal suite'], ['hostile', 'Hostile suite']] as const} />
             ) : (
@@ -382,6 +450,38 @@ export function BenchmarkSection() {
               </tbody>
             </table>
           )}
+
+          {mode === 'release' && (
+            <table className="benchmark-table release-table">
+              <caption>ZIPP {rel.version} against {rel.previous} and QuickJS: bundled-app wall-time medians, {rel.dies[die]} die</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Bundled app</th>
+                  <th scope="col" className="zipp-column">ZIPP <span>{rel.version}</span></th>
+                  <th scope="col">ZIPP {rel.previous}</th>
+                  <th scope="col">{rel.version} <span>cache warm</span></th>
+                  <th scope="col">QuickJS</th>
+                  <th scope="col" className="bar-column">{rel.version} vs QuickJS <span>relative time</span></th>
+                  <th scope="col">{rel.version} / QuickJS</th>
+                  <th scope="col">{rel.version} / {rel.previous}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {releaseRows.map((row) => (
+                  <tr key={row.id}>
+                    <th scope="row"><span>{row.name}</span><small>{row.detail}</small></th>
+                    <td className="zipp-time" data-label={`ZIPP ${rel.version}`}><strong>{ms(row.t.current)}</strong><span className="sr-only"> milliseconds</span></td>
+                    <td data-label={`ZIPP ${rel.previous}`}>{ms(row.t.previous)}</td>
+                    <td data-label="Cache warm">{ms(row.t.warm)}</td>
+                    <td data-label="QuickJS">{row.t.quickjs === null ? 'fails' : ms(row.t.quickjs)}</td>
+                    <td className="bar-cell" data-label={`${rel.version} vs QuickJS`} aria-hidden="true">{row.t.quickjs !== null && <RowBars zipp={row.t.current} other={row.t.quickjs} />}</td>
+                    {row.t.quickjs !== null ? <RatioCell ratio={row.t.current / row.t.quickjs} label={`ZIPP ${rel.version} divided by QuickJS`} versus="QuickJS" /> : <td data-label={`${rel.version} / QuickJS`}>—</td>}
+                    <td data-label={`${rel.version} / ${rel.previous}`}>{x(row.t.current / row.t.previous, 2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 
@@ -438,11 +538,25 @@ export function BenchmarkSection() {
               </p>
             </>
           )}
+          {mode === 'release' && (
+            <>
+              <p>
+                {rel.method} Peak working set, cache off: {rel.memory.map((row, index) => (
+                  <span key={row.id}>{row.name} {Math.round(row.previous)} → {Math.round(row.current)} MiB (QuickJS {Math.round(row.quickjs)}){index < rel.memory.length - 1 ? ', ' : '.'}</span>
+                ))}
+              </p>
+              <p className="gap-list">
+                <strong>Apps where QuickJS is faster on the {rel.dies[die]} die ({releaseGaps.length}):</strong>{' '}
+                {releaseGaps.length === 0 ? 'none.' : releaseGaps.map((row, index) => <span key={row.id}>{row.name} {x(row.t.current / row.t.quickjs!)}{index < releaseGaps.length - 1 ? ', ' : '.'}</span>)}
+              </p>
+            </>
+          )}
         </div>
         <div className="methodology-links">
           {mode === 'jit' && <><Link href={blob(jit.artifacts.normal)}>Normal capture</Link><Link href={blob(jit.artifacts.hostile)}>Hostile capture</Link><Link href={blob(release.artifacts.release)}>Release build</Link></>}
           {mode === 'interp' && <><Link href={blob(interp.artifacts.normal)}>Normal capture</Link><Link href={blob(interp.artifacts.hostile)}>Hostile capture</Link></>}
           {mode === 'python' && <><Link href={blob(python.artifacts.jit)}>With JIT</Link><Link href={blob(python.artifacts.interp)}>Without JIT</Link></>}
+          {mode === 'release' && <Link href={`${blob(rel.notes)}#performance`}>{rel.version} release notes</Link>}
           <Link href={PERFORMANCE_URL}>Method & intervals</Link>
           <Link href={ROADMAP_URL}>What is next</Link>
         </div>

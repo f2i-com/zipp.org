@@ -199,6 +199,28 @@ test('every benchmark capture the page cites is in the repository, and the data 
   assert.equal(data.jit.nodeWins, [...data.jit.normal.rows, ...data.jit.hostile.rows].filter(row => row.ratio < 1).length)
 })
 
+test('the home page release tab is the served release, and its figures are the release notes\' own', () => {
+  // src/release-comparison.json is not a stamped capture: it restates the
+  // comparison in docs/releases/<version>.md, so the two must agree.
+  const rel = JSON.parse(readFileSync(new URL('../src/release-comparison.json', import.meta.url), 'utf8'))
+  const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(rel.version, site.zippEngineRelease, 'the release tab names the release the site serves')
+  const notes = readFileSync(new URL(`../../${rel.notes}`, import.meta.url), 'utf8')
+  assert.equal(rel.notes, `docs/releases/${rel.version}.md`)
+  assert.ok(notes.includes(`Bellard's QuickJS ${rel.quickjs}`), 'the notes name the same QuickJS')
+  // The notes' bundle table: seconds to two places from 400 ms, whole ms below.
+  const cell = msValue => (msValue >= 400 ? `${(msValue / 1000).toFixed(2)} s` : `${Math.round(msValue)} ms`)
+  for (const bundle of rel.bundles) {
+    const { previous, current } = bundle.large
+    assert.ok(notes.includes(`| ${cell(previous)} | ${cell(current)} |`), `${bundle.id}: ${cell(previous)} -> ${cell(current)} in the notes`)
+  }
+  const p = rel.programs
+  for (const ratio of [p.interpVsPrevious, p.jitVsPrevious, p.interpVsQuickjs, p.previousInterpVsQuickjs]) {
+    assert.ok(notes.includes(`${ratio.toFixed(3)}x`), `${ratio} in the notes`)
+  }
+  assert.ok(notes.includes(`faster on ${p.interpFasterThanQuickjs} of the ${p.count}`), 'the QuickJS win count')
+})
+
 test('repository links on the site point at files and headings that exist on main', () => {
   // Links to github.com/f2i-com/zipp.org/blob/main/<path>[#anchor] (and tree/main) in the
   // home page's source and the documentation pages; the README and docs moved on 17

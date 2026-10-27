@@ -1,0 +1,69 @@
+{
+  "about": "The release comparison of docs/releases/0.0.30.md (Performance): the published 0.0.30 and 0.0.29 Windows binaries and Bellard's QuickJS, measured 27 October 2026 with scratch scripts, not a stamped capture. Medians in milliseconds; memory is the mean peak working set of 3 runs in MiB.",
+  "version": "0.0.30",
+  "previous": "0.0.29",
+  "measuredAt": "2026-10-27",
+  "quickjs": "2026-06-04",
+  "notes": "docs/releases/0.0.30.md",
+  "method": "Native Windows x86-64 on an otherwise idle Ryzen 9 9950X3D, address-space randomization off, each run pinned to one core: medians of 7 interleaved runs of each app per engine, ZIPP in its default mode with the code cache off (warm: filled) and the bundle's compile included.",
+  "dies": {
+    "large": "96 MB L3",
+    "small": "32 MB L3"
+  },
+  "bundles": [
+    {
+      "id": "babel", "name": "Babel", "detail": "@babel/standalone transforms about 20 KB of JSX twice",
+      "large": { "previous": 4347.2, "current": 3344.6, "warm": 3260.5, "pgo": 2990.2, "quickjs": 3553.9 },
+      "small": { "previous": 5021.6, "current": 3864.5, "warm": 3786.1, "pgo": 3456.9, "quickjs": 3743.1 }
+    },
+    {
+      "id": "typescript", "name": "TypeScript", "detail": "transpileModule on about 40 KB of classes, generics and enums",
+      "large": { "previous": 1112.1, "current": 898.9, "warm": 715.0, "pgo": 845.2, "quickjs": 1028.6 },
+      "small": { "previous": 1164.7, "current": 951.4, "warm": 734.5, "pgo": 900.5, "quickjs": 1062.3 }
+    },
+    {
+      "id": "prettier", "name": "Prettier", "detail": "formats JavaScript, TypeScript and Markdown",
+      "large": { "previous": 530.0, "current": 437.4, "warm": 368.0, "pgo": 405.8, "quickjs": 430.6 },
+      "small": { "previous": 571.1, "current": 469.2, "warm": 387.4, "pgo": 430.1, "quickjs": 451.1 }
+    },
+    {
+      "id": "misc", "name": "Eight libraries", "detail": "marked, lodash, acorn, terser, three.js, immer, RxJS and date-fns",
+      "large": { "previous": 795.4, "current": 683.5, "warm": 629.6, "pgo": 645.4, "quickjs": 1874.8 },
+      "small": { "previous": 841.2, "current": 707.2, "warm": 658.5, "pgo": 669.3, "quickjs": 1881.3 }
+    },
+    {
+      "id": "vue-ssr", "name": "Vue server rendering", "detail": "renders a component tree to HTML",
+      "large": { "previous": 91.5, "current": 79.9, "warm": 68.8, "pgo": 74.9, "quickjs": 82.1 },
+      "small": { "previous": 94.3, "current": 81.7, "warm": 74.3, "pgo": 78.6, "quickjs": 83.7 }
+    },
+    {
+      "id": "preact-ssr", "name": "Preact server rendering", "detail": "renders a component tree to HTML",
+      "large": { "previous": 74.2, "current": 70.6, "warm": 70.3, "pgo": 63.4, "quickjs": 72.1 },
+      "small": { "previous": 76.8, "current": 72.9, "warm": 71.1, "pgo": 64.5, "quickjs": 71.9 }
+    },
+    {
+      "id": "react-ssr", "name": "React server rendering", "detail": "renders a component tree to HTML; QuickJS has no TextEncoder for it",
+      "large": { "previous": 73.8, "current": 66.3, "warm": 61.2, "pgo": 61.7, "quickjs": null },
+      "small": { "previous": 76.6, "current": 69.4, "warm": 64.3, "pgo": 66.9, "quickjs": null }
+    }
+  ],
+  "memory": [
+    { "id": "typescript", "name": "TypeScript", "previous": 318.5, "current": 225.1, "quickjs": 114.0 },
+    { "id": "babel", "name": "Babel", "previous": 239.7, "current": 245.2, "quickjs": 96.3 },
+    { "id": "misc", "name": "Eight libraries", "previous": 217.6, "current": 209.0, "quickjs": 31.7 },
+    { "id": "prettier", "name": "Prettier", "previous": 159.1, "current": 126.7, "quickjs": 37.5 },
+    { "id": "vue-ssr", "name": "Vue server rendering", "previous": 50.8, "current": 37.3, "quickjs": 20.1 },
+    { "id": "preact-ssr", "name": "Preact server rendering", "previous": 39.2, "current": 32.3, "quickjs": 14.5 }
+  ],
+  "programs": {
+    "count": 78,
+    "interpVsPrevious": 0.917,
+    "interpFasterThanPrevious": 74,
+    "jitVsPrevious": 0.971,
+    "jitFasterThanPrevious": 57,
+    "interpVsQuickjs": 0.818,
+    "interpFasterThanQuickjs": 54,
+    "previousInterpVsQuickjs": 0.892,
+    "previousInterpFasterThanQuickjs": 43
+  }
+}
