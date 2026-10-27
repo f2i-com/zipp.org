@@ -10052,6 +10052,22 @@ impl Heap {
         &self.vremset
     }
 
+    /// Record a young `v` stored where no holder's edge list reaches it (an
+    /// instance's private field list, which the collector roots rather than
+    /// traces through the instance) in `vremset`, whatever the holder's
+    /// generation, so the next minor marks it as `write_barrier_val`'s
+    /// value-grain records are marked.
+    #[inline]
+    pub(crate) fn record_young_value(&mut self, v: Value) {
+        if self.nursery
+            && v.is_heap()
+            && self.gen[v.heap_index() as usize] & (GEN_STATE | GEN_VLOG) == GEN_YOUNG
+        {
+            self.gen[v.heap_index() as usize] |= GEN_VLOG;
+            self.vremset.push(v.heap_index());
+        }
+    }
+
     /// W10 survival-adaptive young budget (B123): called by `gc_minor` after
     /// each sweep with the just-ended epoch's survivor and log counts,
     /// BEFORE `note_minor_done` reads the budget for the next threshold.

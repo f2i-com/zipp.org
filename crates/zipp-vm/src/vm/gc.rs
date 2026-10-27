@@ -849,9 +849,16 @@ impl Vm<'_> {
         }
         // Private field values: an entry keyed by a live instance must keep its
         // payload alive (over-approximate; dead-instance entries pruned below).
-        for m in self.private_fields.values() {
-            for &(_, _, v) in m {
-                root_val!(v);
+        // A minor needs only the young ones, and every private write of a young
+        // value recorded it in the value-grain remembered set the minor marks
+        // (`Heap::record_young_value`); the rest are old and pre-marked. The
+        // walk of every live instance's fields at every minor was 9% of a
+        // class-heavy program.
+        if !minor {
+            for m in self.private_fields.values() {
+                for &(_, _, v) in m {
+                    root_val!(v);
+                }
             }
         }
         for &p in self.prototypes.values() {

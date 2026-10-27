@@ -1061,12 +1061,14 @@ impl<'p> Vm<'p> {
         };
         if let Some(e) = m.iter_mut().find(|e| e.0 == brand && e.1 == id) {
             e.2 = v;
+            self.heap.record_young_value(v);
             return true;
         }
         if !add {
             return false;
         }
         m.push((brand, id, v));
+        self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
         self.instrument_mark_external_heap_growth();
         true
@@ -1106,6 +1108,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         m.push((brand, id, v));
+        self.heap.record_young_value(v);
         #[cfg(feature = "instrument")]
         self.instrument_mark_external_heap_growth();
         true
@@ -1141,6 +1144,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         e.2 = v;
+        self.heap.record_young_value(v);
         true
     }
 

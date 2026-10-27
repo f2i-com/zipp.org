@@ -1682,10 +1682,12 @@ impl<'p> Vm<'p> {
         let Some((at, _)) = self.private_field_at(idx, brand, id, pos) else {
             return false;
         };
-        // No barrier: the collector roots every private field value.
+        // No holder barrier: the collector roots private field values; a
+        // minor takes the young ones from this record (`record_young_value`).
         if let Some(fields) = self.private_fields_mut(idx) {
             fields[at].2 = val;
         }
+        self.heap.record_young_value(val);
         true
     }
 
