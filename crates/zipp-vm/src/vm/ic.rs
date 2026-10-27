@@ -2072,6 +2072,14 @@ impl<'p> Vm<'p> {
                                     self.ic_cell_dict(func_id, ip, slot);
                                 } else {
                                     self.ic_cell_own(func_id, ip, sh, slot, false);
+                                    // Settle the mirror, as the way-0 hit
+                                    // does: a key add leaves it unsettled,
+                                    // and only that hit repaired it, so a
+                                    // receiver read through a site whose way 0
+                                    // holds another layout kept missing the
+                                    // inline hit and the (shape, key) memo on
+                                    // every read.
+                                    self.heap.refresh_mirror(idx);
                                 }
                             }
                             return GetAct::Value(v);
@@ -2717,6 +2725,11 @@ impl<'p> Vm<'p> {
         }
         if let Some((sh, slot)) = own_rec {
             self.ic_cell_own(func_id, ip, sh, slot as usize, true);
+            // Settle the receiver's mirror for the inline hits, as the read
+            // side's own resolve does.
+            if let Some(SetPlan::WriteOwn { idx, .. }) = plan {
+                self.heap.refresh_mirror(idx);
+            }
         }
         if let Some(p) = plan {
             return self.ic_apply_set(p, key, val);
