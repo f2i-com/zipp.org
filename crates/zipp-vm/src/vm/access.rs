@@ -1176,6 +1176,20 @@ impl<'p> Vm<'p> {
         self.proxy_set_kv(obj, target, handler, revoked, k, Some(key), val, strict).map(Some)
     }
 
+    /// [`Self::set_prop`] for a receiver the caller found to be a Proxy: its
+    /// `set` trap, or the target's [[Set]], without the ordinary, primitive,
+    /// realm and global receiver tests `set_prop` makes first (a dozen
+    /// compares and two calls a store), nor the property cache's miss.
+    #[inline(never)]
+    pub(crate) fn set_prop_proxy(&mut self, obj: Value, key: &str, val: Value, strict: bool) -> Result<bool, Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
+        self.store_barrier_v(crate::heap::gcoracle::SET_PROP, obj, val);
+        let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) else {
+            return self.set_prop(obj, key, val, strict);
+        };
+        self.proxy_set_kv(obj, target, handler, revoked, key, None, val, strict)
+    }
+
     /// `set_prop`'s Proxy branch: the `set` trap and its invariants, or the
     /// target's [[Set]] with the proxy as the receiver. `kv`, when given, is
     /// `key` as a value, which the trap takes instead of `key_to_value(key)`'s.

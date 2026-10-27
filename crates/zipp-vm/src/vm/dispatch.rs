@@ -3868,12 +3868,19 @@ impl<'p> Vm<'p> {
                         // cache declines. Neither is ever an ordinary
                         // object's, whose adds (`this.x = x` in a
                         // constructor) paid both lanes' key tests first.
-                        if o.is_heap()
-                            && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_))
-                            && (self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v))
-                        {
-                            ip += 1;
-                            continue;
+                        if o.is_heap() && !matches!(self.heap.get(o.heap_index()), HeapObj::Object(_)) {
+                            // A Proxy's store is its `set` trap's, which no
+                            // cache answers.
+                            if matches!(self.heap.get(o.heap_index()), HeapObj::Proxy { .. }) {
+                                let strict = self.func(func_id as usize).is_strict || site_strict;
+                                self.set_prop_proxy(o, key, v, strict)?;
+                                ip += 1;
+                                continue;
+                            }
+                            if self.class_static_data_write(o, &key, v) || self.fn_own_data_write(o, &key, v) {
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // ── interpreter property IC ── an existing own data
                         // slot writes directly; a cached class/own SETTER
