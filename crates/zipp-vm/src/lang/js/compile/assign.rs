@@ -1294,16 +1294,24 @@ impl<'a> FnCompiler<'a> {
                     // (`a[i] = i++` writes `a[0]`); the read-modify-write forms
                     // snapshot it through ToPropKey first.
                     let key = self.pin_operand(key_expr, key, &[value]);
+                    // A read-modify-write reuses the SAME property key for the
+                    // load and the store: coerce ToPropertyKey ONCE (its
+                    // toString/valueOf must not run twice). A number or string
+                    // literal is its own key and coerces running no code, so
+                    // both take it as it is.
+                    let literal_key = matches!(&**key_expr, ast::Expr::Num(_) | ast::Expr::Str(_));
                     if is_logical {
-                        // A read-modify-write reuses the SAME property key for the load
-                        // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
-                        // must not run twice).
-                        let keyk = self.temp();
-                        self.emit(Instr::ToPropKey {
-                            dst: keyk,
-                            obj,
-                            src: key,
-                        });
+                        let keyk = if literal_key {
+                            key
+                        } else {
+                            let keyk = self.temp();
+                            self.emit(Instr::ToPropKey {
+                                dst: keyk,
+                                obj,
+                                src: key,
+                            });
+                            keyk
+                        };
                         self.emit(Instr::GetIndex {
                             dst,
                             obj,
@@ -1329,12 +1337,17 @@ impl<'a> FnCompiler<'a> {
                         }
                         self.emit(Instr::SetIndex { obj, key, val: dst });
                     } else {
-                        let keyk = self.temp();
-                        self.emit(Instr::ToPropKey {
-                            dst: keyk,
-                            obj,
-                            src: key,
-                        });
+                        let keyk = if literal_key {
+                            key
+                        } else {
+                            let keyk = self.temp();
+                            self.emit(Instr::ToPropKey {
+                                dst: keyk,
+                                obj,
+                                src: key,
+                            });
+                            keyk
+                        };
                         let cur = self.temp();
                         self.emit(Instr::GetIndex {
                             dst: cur,

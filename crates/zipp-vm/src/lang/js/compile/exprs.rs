@@ -331,7 +331,7 @@ impl<'a> FnCompiler<'a> {
             match e {
                 ast::Expr::Update { op, target, .. } => {
                     if let Some(r) = self.discarded_in_place_reg(target) {
-                        return self.update(*op, true, target, r);
+                        return self.update(*op, true, target, r, false);
                     }
                 }
                 ast::Expr::Assign {
@@ -344,14 +344,11 @@ impl<'a> FnCompiler<'a> {
                 _ => {}
             }
         }
-        if let ast::Expr::Update {
-            op,
-            prefix: false,
-            target,
-        } = e
-        {
+        if let ast::Expr::Update { op, target, .. } = e {
+            // A fresh register nobody reads: a member update computes its new
+            // value there (`update`'s `dst_fresh`).
             let dst = self.temp();
-            return self.update(*op, true, target, dst);
+            return self.update(*op, true, target, dst, true);
         }
         self.expr(e)
     }
@@ -713,7 +710,7 @@ impl<'a> FnCompiler<'a> {
             E::Binary { op, left, right } => self.binary(*op, left, right, dst),
             E::Logical { op, left, right } => self.logical(*op, left, right, dst),
             E::Unary { op, arg } => self.unary(*op, arg, dst),
-            E::Update { op, prefix, target } => self.update(*op, *prefix, target, dst),
+            E::Update { op, prefix, target } => self.update(*op, *prefix, target, dst, false),
             E::Assign {
                 op, target, value, ..
             } => self.assign(*op, target, value, dst),
@@ -2750,12 +2747,51 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// A member update's step from `cur`, the property's value: the new value
+    /// to store and the update's result, `(new, result)`. A postfix update
+    /// coerces the old value ToNumeric ONCE (AddInt imm:0), steps that, and
+    /// yields the coerced old value — `x++` returns a number, not the raw
+    /// operand, and an object operand's valueOf runs once. A prefix update
+    /// yields the new value, and its stepping AddInt does that coercion
+    /// itself; with `dst_fresh` it computes in `dst`, which then needs no copy.
+    fn member_update_step(&mut self, cur: Reg, delta: i32, prefix: bool, dst: Reg, dst_fresh: bool) -> (Reg, Reg) {
+        if prefix {
+            let nw = if dst_fresh { dst } else { self.temp() };
+            self.emit(Instr::AddInt {
+                dst: nw,
+                a: cur,
+                imm: delta,
+                upd: true,
+            });
+            return (nw, nw);
+        }
+        let oldnum = self.temp();
+        self.emit(Instr::AddInt {
+            dst: oldnum,
+            a: cur,
+            imm: 0,
+            upd: true,
+        });
+        let nw = self.temp();
+        self.emit(Instr::AddInt {
+            dst: nw,
+            a: oldnum,
+            imm: delta,
+            upd: true,
+        });
+        (nw, oldnum)
+    }
+
+    /// `dst_fresh`: `dst` is a register no operand of the update can be (a
+    /// temp minted for a discarded result), so a member update may compute
+    /// its new value in it before the store.
     pub(crate) fn update(
         &mut self,
         op: ast::UpdateOp,
         prefix: bool,
         target: &ast::Target,
         dst: Reg,
+        dst_fresh: bool,
     ) -> R<Reg> {
         let delta = match op {
             ast::UpdateOp::Inc => 1,
@@ -2897,33 +2933,16 @@ impl<'a> FnCompiler<'a> {
                         obj,
                         name,
                     });
-                    // ToNumeric(old) ONCE (AddInt imm:0), derive the new value from it,
-                    // and yield the COERCED old (postfix) — `x++` returns a number, not
-                    // the raw operand. Single coercion = one valueOf for an object operand.
-                    let oldnum = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: oldnum,
-                        a: cur,
-                        imm: 0,
-                        upd: true,
-                    });
-                    let nw = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: nw,
-                        a: oldnum,
-                        imm: delta,
-                        upd: true,
-                    });
+                    let (nw, result) = self.member_update_step(cur, delta, prefix, dst, dst_fresh);
                     self.emit(Instr::SetProp {
                         obj,
                         name,
                         val: nw,
                         strict: self.cx.strict_expr_region > 0,
                     });
-                    self.emit(Instr::Move {
-                        dst,
-                        src: if prefix { nw } else { oldnum },
-                    });
+                    if result != dst {
+                        self.emit(Instr::Move { dst, src: result });
+                    }
                     return Ok(dst);
                 }
                 (_, ast::MemberProp::Computed(ke)) => {
@@ -2932,41 +2951,35 @@ impl<'a> FnCompiler<'a> {
                     let key = self.expr(ke)?;
                     // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
                     // ONCE and reuse it (its toString/valueOf must not run twice).
-                    let keyk = self.temp();
-                    self.emit(Instr::ToPropKey {
-                        dst: keyk,
-                        obj,
-                        src: key,
-                    });
+                    // A number or string literal is its own property key, and its
+                    // coercion runs no code: the read and the store take it as it
+                    // is (a nullish `o` throws at the read, before anything else).
+                    let keyk = if matches!(&**ke, ast::Expr::Num(_) | ast::Expr::Str(_)) {
+                        key
+                    } else {
+                        let keyk = self.temp();
+                        self.emit(Instr::ToPropKey {
+                            dst: keyk,
+                            obj,
+                            src: key,
+                        });
+                        keyk
+                    };
                     let cur = self.temp();
                     self.emit(Instr::GetIndex {
                         dst: cur,
                         obj,
                         key: keyk,
                     });
-                    let oldnum = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: oldnum,
-                        a: cur,
-                        imm: 0,
-                        upd: true,
-                    });
-                    let nw = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: nw,
-                        a: oldnum,
-                        imm: delta,
-                        upd: true,
-                    });
+                    let (nw, result) = self.member_update_step(cur, delta, prefix, dst, dst_fresh);
                     self.emit(Instr::SetIndex {
                         obj,
                         key: keyk,
                         val: nw,
                     });
-                    self.emit(Instr::Move {
-                        dst,
-                        src: if prefix { nw } else { oldnum },
-                    });
+                    if result != dst {
+                        self.emit(Instr::Move { dst, src: result });
+                    }
                     return Ok(dst);
                 }
                 // `obj.#x++` — like a static member, keyed "#x".
@@ -2980,30 +2993,16 @@ impl<'a> FnCompiler<'a> {
                         obj,
                         name,
                     });
-                    let oldnum = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: oldnum,
-                        a: cur,
-                        imm: 0,
-                        upd: true,
-                    });
-                    let nw = self.temp();
-                    self.emit(Instr::AddInt {
-                        dst: nw,
-                        a: oldnum,
-                        imm: delta,
-                        upd: true,
-                    });
+                    let (nw, result) = self.member_update_step(cur, delta, prefix, dst, dst_fresh);
                     self.emit(Instr::SetProp {
                         obj,
                         name,
                         val: nw,
                         strict: self.cx.strict_expr_region > 0,
                     });
-                    self.emit(Instr::Move {
-                        dst,
-                        src: if prefix { nw } else { oldnum },
-                    });
+                    if result != dst {
+                        self.emit(Instr::Move { dst, src: result });
+                    }
                     return Ok(dst);
                 }
             }
