@@ -1404,7 +1404,7 @@ impl<'p> Vm<'p> {
         // An escaped guest string key reads back as the string it was, one
         // shared heap string per key text (`alloc_key_str`): a Proxy trap
         // receives its key through here on every access.
-        if let Some(v) = self.cached_key_str(key) {
+        if let Some(v) = self.cached_key_str_front(key) {
             return v;
         }
         self.alloc_key_str(key.to_string())

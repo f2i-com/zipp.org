@@ -134,7 +134,7 @@ impl OwnSlot {
 
 /// A key of at most 16 bytes as two little-endian words, zero-padded.
 #[inline(always)]
-fn key_words(b: &[u8]) -> (u64, u64) {
+pub(crate) fn key_words(b: &[u8]) -> (u64, u64) {
     if b.len() > 8 {
         let (lo, hi) = b.split_at(8);
         (u64::from_le_bytes(lo.try_into().expect("8 bytes")), load_le_short(hi))

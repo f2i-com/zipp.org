@@ -34,6 +34,31 @@ fn enum_hoist_enabled() -> bool {
 const KEY_STR_CACHE_MAX_BYTES: usize = 64;
 const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
 
+/// `Vm::key_value_front`'s size: a direct-mapped cache in front of
+/// `key_str_cache` for keys of at most 16 bytes.
+pub(crate) const KEY_VALUE_FRONT_SLOTS: usize = 256;
+
+/// One entry of `Vm::key_value_front`: the key of `len` bytes, held
+/// zero-padded in `w0`/`w1` (`ic::key_words`), and its string from
+/// `key_str_cache`. `len == u32::MAX` matches no key.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyValueFront {
+    len: u32,
+    w0: u64,
+    w1: u64,
+    value: Value,
+}
+
+impl KeyValueFront {
+    pub(crate) const EMPTY: KeyValueFront = KeyValueFront { len: u32::MAX, w0: 0, w1: 0, value: Value::UNDEFINED };
+}
+
+#[inline(always)]
+fn key_value_front_index(w0: u64, w1: u64, len: usize) -> usize {
+    let h = (w0 ^ w1.rotate_left(29) ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> (64 - KEY_VALUE_FRONT_SLOTS.trailing_zeros())) as usize
+}
+
 /// `Vm::enum_key_cache`'s bound: the shape ids it has a slot for. Shapes
 /// themselves are bounded (`shape::SHAPE_MAX`); an id past this would build
 /// its list each time as before.
@@ -1116,6 +1141,28 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn cached_key_str(&self, k: &str) -> Option<Value> {
         self.key_str_cache.get(k).copied()
+    }
+
+    /// [`Self::cached_key_str`] through `key_value_front` for a key of at
+    /// most 16 bytes: a Proxy trap takes its key through here on every
+    /// access, and the table probe hashed and compared the key each time.
+    /// The front holds only `key_str_cache`'s strings, which are never
+    /// removed and are roots, so an entry never names a dead string.
+    #[inline]
+    pub(crate) fn cached_key_str_front(&self, k: &str) -> Option<Value> {
+        let b = k.as_bytes();
+        if b.len() > 16 {
+            return self.cached_key_str(k);
+        }
+        let (w0, w1) = crate::vm::ic::key_words(b);
+        let cell = &self.key_value_front[key_value_front_index(w0, w1, b.len())];
+        let e = cell.get();
+        if e.len == b.len() as u32 && e.w0 == w0 && e.w1 == w1 {
+            return Some(e.value);
+        }
+        let value = self.cached_key_str(k)?;
+        cell.set(KeyValueFront { len: b.len() as u32, w0, w1, value });
+        Some(value)
     }
 
     /// Build a data property descriptor object `{value, writable, enumerable,

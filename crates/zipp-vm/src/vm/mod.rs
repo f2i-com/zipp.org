@@ -1699,6 +1699,9 @@ pub struct Vm<'p> {
     /// values are roots (`Vm::mark_roots`) and frozen, since many holders
     /// name each one.
     pub(crate) key_str_cache: rustc_hash::FxHashMap<Box<str>, Value>,
+    /// `key_str_cache`'s answers for short keys, direct-mapped by the key's
+    /// words (`Vm::cached_key_str_front`).
+    pub(crate) key_value_front: Box<[std::cell::Cell<props::KeyValueFront>]>,
     /// The own enumerable string keys an object of a given shape has, in
     /// spec order, as `key_str_cache`'s strings (which root them): a shape
     /// names a key sequence with its attributes, so every object of the

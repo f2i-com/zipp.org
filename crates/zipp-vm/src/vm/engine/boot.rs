@@ -327,6 +327,9 @@ impl<'p> Vm<'p> {
             const_string_dense: Vec::new(),
             const_string_texts: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),
+            key_value_front: (0..crate::vm::props::KEY_VALUE_FRONT_SLOTS)
+                .map(|_| std::cell::Cell::new(crate::vm::props::KeyValueFront::EMPTY))
+                .collect(),
             enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
             const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
