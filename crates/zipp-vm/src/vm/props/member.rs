@@ -1354,6 +1354,72 @@ impl<'p> Vm<'p> {
         key: &str,
         receiver: Value,
     ) -> Result<Value, Thrown> {
+        self.proxy_get_kv(target, handler, revoked, key, None, receiver)
+    }
+
+    /// The text of `key` when a Proxy trap can take `key` itself as its
+    /// property key: a well-formed string not spelt `@@…` (which `key_of`
+    /// escapes), flattened first. The text is copied into `buf`, or into
+    /// `spill` past 64 bytes, for the invariant checks after the trap.
+    /// `None` for any other key, which keeps the general path.
+    pub(crate) fn proxy_string_key<'b>(
+        &mut self,
+        key: Value,
+        buf: &'b mut [u8; 64],
+        spill: &'b mut String,
+    ) -> Option<&'b str> {
+        if !key.is_heap() {
+            return None;
+        }
+        self.heap.flatten(key.heap_index());
+        let HeapObj::Str(js) = self.heap.get(key.heap_index()) else {
+            return None;
+        };
+        if !js.is_wellformed() {
+            return None;
+        }
+        let s = js.as_str_wf();
+        if s.starts_with("@@") {
+            return None;
+        }
+        if s.len() <= buf.len() {
+            let n = s.len();
+            buf[..n].copy_from_slice(s.as_bytes());
+            // SAFETY: the bytes were copied from a `str`.
+            Some(unsafe { std::str::from_utf8_unchecked(&buf[..n]) })
+        } else {
+            *spill = s.to_owned();
+            Some(spill.as_str())
+        }
+    }
+
+    /// `p[k]` for a Proxy `p` and a string key (`get_index`): the `get` trap
+    /// takes `key` as it stands. The general route spelt it as a `String`
+    /// for `get_prop`, and the trap call spelt it back into a heap string
+    /// through `key_to_value`'s table. `Ok(None)` when `obj` is not a proxy
+    /// or `key` is not such a string.
+    pub(crate) fn proxy_get_value_key(&mut self, obj: Value, key: Value) -> Result<Option<Value>, Thrown> {
+        let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) else {
+            return Ok(None);
+        };
+        let (mut buf, mut spill) = ([0u8; 64], String::new());
+        let Some(k) = self.proxy_string_key(key, &mut buf, &mut spill) else {
+            return Ok(None);
+        };
+        self.proxy_get_kv(target, handler, revoked, k, Some(key), obj).map(Some)
+    }
+
+    /// [`Self::proxy_get`], where `kv`, when given, is `key` as a value,
+    /// which the trap takes instead of `key_to_value(key)`'s.
+    fn proxy_get_kv(
+        &mut self,
+        target: Value,
+        handler: Value,
+        revoked: bool,
+        key: &str,
+        kv: Option<Value>,
+        receiver: Value,
+    ) -> Result<Value, Thrown> {
         if revoked {
             return Err(Thrown::from_static(
                 "TypeError: Cannot perform 'get' on a revoked proxy",
@@ -1361,7 +1427,10 @@ impl<'p> Vm<'p> {
         }
         match self.proxy_trap(handler, "get")? {
             Some(trap) => {
-                let kv = self.key_to_value(key);
+                let kv = match kv {
+                    Some(v) => v,
+                    None => self.key_to_value(key),
+                };
                 // 10.5.8 [[Get]](P, Receiver): the trap's third argument is
                 // the RECEIVER, which is only the proxy itself for a direct
                 // read — reading through a child (`Object.create(p).x`) or

@@ -533,6 +533,14 @@ impl<'p> Vm<'p> {
         // generic, as do accessor hits and misses (proto/class chain).
         if key.is_heap() {
             let oidx = obj.heap_index();
+            // A Proxy's `get` trap takes a string key as it stands
+            // (`proxy_get_value_key`); the route below spelt it as a `String`
+            // and the trap call spelt it back.
+            if matches!(self.heap.get(oidx), HeapObj::Proxy { .. }) {
+                if let Some(v) = self.proxy_get_value_key(obj, key)? {
+                    return Ok(v);
+                }
+            }
             // A key built by concatenation is a rope until read: flattened in
             // place, so the view below sees its bytes (it is read as a key
             // whatever path the read takes).
@@ -951,6 +959,13 @@ impl<'p> Vm<'p> {
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
+        // A Proxy's `set` trap takes a string key as it stands
+        // (`proxy_set_value_key`), as `get_index`'s does.
+        if key.is_heap() && matches!(self.heap.get(idx), HeapObj::Proxy { .. }) {
+            if self.proxy_set_value_key(obj, key, val, strict)?.is_some() {
+                return Ok(());
+            }
+        }
         // FAST PATH: a present element of an ordinary array with nothing in a
         // side table (`counts[0]++`). Every check the general path makes
         // before its own `items[i] = val` passes for it: no defineProperty'd

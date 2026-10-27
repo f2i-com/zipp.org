@@ -1155,6 +1155,91 @@ impl<'p> Vm<'p> {
         Some(false)
     }
 
+    /// `p[k] = v` for a Proxy `p` and a string key (`set_index`): `set_prop`'s
+    /// Proxy branch, with `key` handed to the `set` trap as it stands
+    /// (`proxy_string_key`) rather than spelt as a `String` and back.
+    /// `Ok(None)` when `obj` is not a proxy or `key` is not such a string.
+    pub(crate) fn proxy_set_value_key(
+        &mut self,
+        obj: Value,
+        key: Value,
+        val: Value,
+        strict: bool,
+    ) -> Result<Option<bool>, Thrown> {
+        let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) else {
+            return Ok(None);
+        };
+        let (mut buf, mut spill) = ([0u8; 64], String::new());
+        let Some(k) = self.proxy_string_key(key, &mut buf, &mut spill) else {
+            return Ok(None);
+        };
+        self.proxy_set_kv(obj, target, handler, revoked, k, Some(key), val, strict).map(Some)
+    }
+
+    /// `set_prop`'s Proxy branch: the `set` trap and its invariants, or the
+    /// target's [[Set]] with the proxy as the receiver. `kv`, when given, is
+    /// `key` as a value, which the trap takes instead of `key_to_value(key)`'s.
+    #[allow(clippy::too_many_arguments)]
+    fn proxy_set_kv(
+        &mut self,
+        obj: Value,
+        target: Value,
+        handler: Value,
+        revoked: bool,
+        key: &str,
+        kv: Option<Value>,
+        val: Value,
+        strict: bool,
+    ) -> Result<bool, Thrown> {
+        if revoked {
+            return Err(Thrown(
+                "TypeError: Cannot perform 'set' on a revoked proxy".into(),
+            ));
+        }
+        match self.proxy_trap(handler, "set")? {
+            Some(trap) => {
+                let kv = match kv {
+                    Some(v) => v,
+                    None => self.key_to_value(key),
+                };
+                let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
+                if !self.truthy(r) {
+                    if strict {
+                        return Err(Thrown(format!(
+                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
+                        )));
+                    }
+                    return Ok(false);
+                }
+                // Invariant: a non-configurable, non-writable target data
+                // property can't be reported set to a different value; a
+                // non-configurable accessor with no setter can't be set at all.
+                if let Some((is_data, value, writable, _, has_set)) =
+                    self.proxy_target_desc(target, key)?
+                {
+                    if is_data && !writable && !self.same_value(val, value) {
+                        return Err(Thrown(format!(
+                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                        )));
+                    }
+                    if !is_data && !has_set {
+                        return Err(Thrown(format!(
+                            "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
+                        )));
+                    }
+                }
+                Ok(true)
+            }
+            // No set trap: target.[[Set]](P, V, Receiver = THE PROXY).
+            // OrdinarySetWithOwnDescriptor consults the RECEIVER's own
+            // descriptor and defines through it, so the proxy's
+            // getOwnPropertyDescriptor and defineProperty traps fire.
+            None => self.with_native_recursion_guard(|vm| {
+                vm.ordinary_set_with_proxy_receiver(target, obj, key, val, strict)
+            }),
+        }
+    }
+
     pub(crate) fn set_prop(
         &mut self,
         obj: Value,
@@ -1320,50 +1405,7 @@ impl<'p> Vm<'p> {
         }
         // Proxy `set` trap (or fall through to the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
-            if revoked {
-                return Err(Thrown(
-                    "TypeError: Cannot perform 'set' on a revoked proxy".into(),
-                ));
-            }
-            return match self.proxy_trap(handler, "set")? {
-                Some(trap) => {
-                    let kv = self.key_to_value(key);
-                    let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
-                    if !self.truthy(r) {
-                        if strict {
-                            return Err(Thrown(format!(
-                                "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                            )));
-                        }
-                        return Ok(false);
-                    }
-                    // Invariant: a non-configurable, non-writable target data
-                    // property can't be reported set to a different value; a
-                    // non-configurable accessor with no setter can't be set at all.
-                    if let Some((is_data, value, writable, _, has_set)) =
-                        self.proxy_target_desc(target, key)?
-                    {
-                        if is_data && !writable && !self.same_value(val, value) {
-                            return Err(Thrown(format!(
-                                "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
-                            )));
-                        }
-                        if !is_data && !has_set {
-                            return Err(Thrown(format!(
-                                "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
-                            )));
-                        }
-                    }
-                    Ok(true)
-                }
-                // No set trap: target.[[Set]](P, V, Receiver = THE PROXY).
-                // OrdinarySetWithOwnDescriptor consults the RECEIVER's own
-                // descriptor and defines through it, so the proxy's
-                // getOwnPropertyDescriptor and defineProperty traps fire.
-                None => self.with_native_recursion_guard(|vm| {
-                    vm.ordinary_set_with_proxy_receiver(target, obj, key, val, strict)
-                }),
-            };
+            return self.proxy_set_kv(obj, target, handler, revoked, key, None, val, strict);
         }
         let idx = obj.heap_index();
         self.materialize_regexp_result_prop_for_key(idx, key);
