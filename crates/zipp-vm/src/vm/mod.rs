@@ -2446,7 +2446,7 @@ pub struct Vm<'p> {
     /// It was a SipHash map per instance from `(brand, String)`: every
     /// construction of a class with a private field allocated a map and a
     /// String per field, and every access hashed the name.
-    private_fields: crate::slot_table::SlotTable<Vec<(u64, u32, Value)>>,
+    private_fields: crate::slot_table::SlotTable<Vec<(u64, u32, Value)>, true>,
     /// Private names, interned once (`Vm::private_name_id`): the `u32` the
     /// field lists store.
     private_name_ids: rustc_hash::FxHashMap<Box<str>, u32>,

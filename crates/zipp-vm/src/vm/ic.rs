@@ -4664,10 +4664,15 @@ impl<'p> Vm<'p> {
                                 self.heap.get(hops.0[hops.1 as usize - 1].0)
                             {
                                 let s = slot as usize;
-                                if hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor
-                                {
-                                    return GetAct::Value(hm.val_at(s));
-                                }
+                                // The holder is the last hop, at the version
+                                // the fill saw: the slot still holds the key
+                                // as a data property (`ic_get_prop_proto_hit`
+                                // reads its holder the same way).
+                                debug_assert!(
+                                    hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor,
+                                    "super holder slot {s} changed under a matching version"
+                                );
+                                return GetAct::Value(hm.val_at(s));
                             }
                         }
                     }

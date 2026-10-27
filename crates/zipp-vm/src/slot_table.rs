@@ -71,27 +71,34 @@ struct Page {
     used: u32,
 }
 
-pub(crate) struct SlotTable<V> {
+/// `FLAT` swaps the paged index for a flat one, four bytes for each slot up
+/// to the highest that ever had an entry, as `ProtoTable`'s link copy is:
+/// one dependent load to the dense position instead of two, for a table read
+/// on every access of a hot operation (`Vm::private_fields`, every `this.#x`).
+pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     /// Paged slot→dense-position index. `pages[slot >> PAGE_BITS]` is `None`
-    /// until some slot in that page gets an entry.
+    /// until some slot in that page gets an entry. Unused when `FLAT`.
     pages: Vec<Option<Page>>,
+    /// The flat slot→dense-position index when `FLAT` (`EMPTY` for none).
+    flat: Vec<u32>,
     /// Dense entry values, no holes.
     vals: Vec<V>,
     /// The owning slot of each dense entry, parallel to `vals`.
     keys: Vec<u32>,
 }
 
-impl<V> Default for SlotTable<V> {
+impl<V, const FLAT: bool> Default for SlotTable<V, FLAT> {
     fn default() -> Self {
         SlotTable {
             pages: Vec::new(),
+            flat: Vec::new(),
             vals: Vec::new(),
             keys: Vec::new(),
         }
     }
 }
 
-impl<V> SlotTable<V> {
+impl<V, const FLAT: bool> SlotTable<V, FLAT> {
     /// Reserved bytes owned directly by the table (including allocated index
     /// pages, but excluding allocations owned inside each `V`).
     pub(crate) fn resident_bytes(&self) -> usize {
@@ -113,6 +120,7 @@ impl<V> SlotTable<V> {
             .saturating_add(
                 self.keys
                     .capacity()
+                    .saturating_add(self.flat.capacity())
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(pages)
@@ -120,8 +128,12 @@ impl<V> SlotTable<V> {
 
     #[inline]
     fn pos(&self, k: u32) -> Option<usize> {
-        let page = self.pages.get((k >> PAGE_BITS) as usize)?.as_ref()?;
-        let p = page.pos[(k & PAGE_MASK) as usize];
+        let p = if FLAT {
+            *self.flat.get(k as usize)?
+        } else {
+            let page = self.pages.get((k >> PAGE_BITS) as usize)?.as_ref()?;
+            page.pos[(k & PAGE_MASK) as usize]
+        };
         if p == EMPTY {
             None
         } else {
@@ -133,6 +145,14 @@ impl<V> SlotTable<V> {
     /// not already have an entry — callers either just pushed it or are fixing up
     /// the entry that `swap_remove` moved (whose page slot is already counted).
     fn set_pos(&mut self, k: u32, p: u32) {
+        if FLAT {
+            let at = k as usize;
+            if at >= self.flat.len() {
+                self.flat.resize(at + 1, EMPTY);
+            }
+            self.flat[at] = p;
+            return;
+        }
         let pi = (k >> PAGE_BITS) as usize;
         if pi >= self.pages.len() {
             self.pages.resize_with(pi + 1, || None);
@@ -149,6 +169,12 @@ impl<V> SlotTable<V> {
     }
 
     fn clear_pos(&mut self, k: u32) {
+        if FLAT {
+            if let Some(cell) = self.flat.get_mut(k as usize) {
+                *cell = EMPTY;
+            }
+            return;
+        }
         let pi = (k >> PAGE_BITS) as usize;
         let Some(slot) = self.pages.get_mut(pi) else {
             return;
@@ -203,6 +229,9 @@ impl<V> SlotTable<V> {
     /// loop is in).
     #[inline(always)]
     pub(crate) fn has(&self, k: u32) -> bool {
+        if FLAT {
+            return self.flat.get(k as usize).is_some_and(|&p| p != EMPTY);
+        }
         match self.pages.get((k >> PAGE_BITS) as usize) {
             Some(Some(page)) => page.pos[(k & PAGE_MASK) as usize] != EMPTY,
             _ => false,
@@ -242,7 +271,7 @@ impl<V> SlotTable<V> {
     }
 
     #[inline]
-    pub(crate) fn entry(&mut self, k: u32) -> Entry<'_, V> {
+    pub(crate) fn entry(&mut self, k: u32) -> Entry<'_, V, FLAT> {
         let pos = self.pos(k);
         Entry {
             table: self,
@@ -282,13 +311,13 @@ impl<V> SlotTable<V> {
 
 /// `HashMap::entry`'s shape, restricted to the two forms the VM uses:
 /// `.entry(idx).or_insert_with(ObjMap::new_side_table)` and one `.or_default()`.
-pub(crate) struct Entry<'a, V> {
-    table: &'a mut SlotTable<V>,
+pub(crate) struct Entry<'a, V, const FLAT: bool = false> {
+    table: &'a mut SlotTable<V, FLAT>,
     key: u32,
     pos: Option<usize>,
 }
 
-impl<'a, V> Entry<'a, V> {
+impl<'a, V, const FLAT: bool> Entry<'a, V, FLAT> {
     #[inline]
     pub(crate) fn or_insert_with<F: FnOnce() -> V>(self, f: F) -> &'a mut V {
         let p = match self.pos {
@@ -302,7 +331,7 @@ impl<'a, V> Entry<'a, V> {
     }
 }
 
-impl<'a, V: Default> Entry<'a, V> {
+impl<'a, V: Default, const FLAT: bool> Entry<'a, V, FLAT> {
     #[inline]
     pub(crate) fn or_default(self) -> &'a mut V {
         self.or_insert_with(V::default)
@@ -748,7 +777,17 @@ mod tests {
     /// swap-remove index repair gets wrong shows up here.
     #[test]
     fn differential_against_hashmap() {
-        let mut t: SlotTable<u64> = SlotTable::default();
+        differential::<false>();
+    }
+
+    /// The same op stream over the flat index.
+    #[test]
+    fn differential_against_hashmap_flat() {
+        differential::<true>();
+    }
+
+    fn differential<const FLAT: bool>() {
+        let mut t: SlotTable<u64, FLAT> = SlotTable::default();
         let mut h: HashMap<u32, u64> = HashMap::new();
         let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = || {
@@ -803,5 +842,8 @@ mod tests {
         want.sort_unstable();
         assert_eq!(seen, want);
         assert_eq!(t.values().count(), h.len());
+        for k in 0..100_000u32 {
+            assert_eq!(t.has(k), h.contains_key(&k), "has {k}");
+        }
     }
 }

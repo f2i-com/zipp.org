@@ -190,7 +190,7 @@ impl SlotKeyed for crate::slot_table::SlotSet {
     }
 }
 
-impl<V> SlotKeyed for crate::slot_table::SlotTable<V> {
+impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
         self.retain(|&k, _| marks[k as usize]);
