@@ -21,7 +21,7 @@ const COMMITS_URL = `${GITHUB_URL}/commits/main`
 const DOC_LINKS = [
   { href: '/javascript-engine/', title: 'JavaScript engine', text: 'What Zipp is, the language it implements, and how to run it.' },
   { href: '/architecture/', title: 'JavaScript engine architecture', text: 'NaN-boxed values, the explicit-frame register VM, JIT tiers and the nursery GC.' },
-  { href: '/test262/', title: 'Test262 conformance', text: '96,230 executions of the pinned corpus, the one expected failure, and the CI gate.' },
+  { href: '/test262/', title: 'Test262 conformance', text: '96,228 executions of the pinned corpus, the one expected failure, and the CI gate.' },
   { href: '/benchmarks/', title: 'Zipp benchmarks', text: 'JIT against JIT, interpreter against interpreter, Python against CPython, with the raw data.' },
   { href: '/python/', title: 'Python frontend', text: 'Python 3 compiled to the same register bytecode, natively or in the browser.' },
   { href: '/wasm/', title: 'WebAssembly runtime', text: 'The persistent, interpreter-only browser sandbox and every one of its limits.' },
@@ -549,7 +549,7 @@ function Playground() {
 
   // This scratchpad loads the engine's internal packaging: the wasm-bindgen glue
   // and the module as two files in public/wasm, extracted from the release's
-  // zipp-0.0.29-javascript.wasm (`package.mjs extract`) and driven by
+  // zipp-0.0.30-javascript.wasm (`package.mjs extract`) and driven by
   // playground.worker.ts. Pages that embed ZIPP use the public path instead,
   // zipp.mjs plus that one .wasm, which the Embed section (EmbedSection.tsx)
   // shows and /sandbox/playground/ runs. tests/adventure.test.mjs exercises this
@@ -777,7 +777,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.29`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.29</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.30`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.30</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
       <p className="playground-build-note">This scratchpad loads the engine’s internal two-file packaging. To put ZIPP in your own page, use <code>zipp.mjs</code> and one <code>.wasm</code>: see <a href="#embed">Embed ZIPP on your site</a>.</p>
     </section>
   )
@@ -901,7 +901,7 @@ function App() {
             </div>
             <p className="hero-embed">
               <a href="#embed">Embed it in your page</a>: one <code>.wasm</code> engine and <code>zipp.mjs</code> from
-              the <a href={`${GITHUB_URL}/releases/tag/v0.0.29`} target="_blank" rel="noreferrer">v0.0.29 release</a>, nothing to build.
+              the <a href={`${GITHUB_URL}/releases/tag/v0.0.30`} target="_blank" rel="noreferrer">v0.0.30 release</a>, nothing to build.
             </p>
 
             <div className="hero-trust" aria-label="Zipp highlights">
@@ -1082,7 +1082,7 @@ function App() {
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
               <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
-              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.29`}>Or download the v0.0.29 CLI</ExternalLink>
+              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.30`}>Or download the v0.0.30 CLI</ExternalLink>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>

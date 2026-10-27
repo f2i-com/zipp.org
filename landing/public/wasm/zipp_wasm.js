@@ -925,7 +925,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_f4b386a82fe8d40f: function() { return handleError(function (arg0) {
+        __wbg_isArray_e516792dd4c8182a: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -933,7 +933,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_1e7140a89138576b: function() { return handleError(function (arg0) {
+        __wbg_keys_ba2a6f512910cfa7: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -953,14 +953,14 @@ function __wbg_get_imports() {
             const ret = new Array();
             return ret;
         },
+        __wbg_new_da10631d8662f098: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
         },
-        __wbg_new_f2c6d56274c29f44: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_from_slice_ddf8b82c4d6af38e: function(arg0, arg1) {
             const ret = new Float32Array(getArrayF32FromWasm0(arg0, arg1));
             return ret;
