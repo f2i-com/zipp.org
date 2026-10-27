@@ -4797,9 +4797,25 @@ impl<'p> Vm<'p> {
                         // leading-'#' test; textual fallback when no brand resolvable.
                         let mut private_callee: Option<Value> = None;
                         if is_private_key(key) {
+                            // The instance method the site's way 0 remembers
+                            // (`IcEntry::PrivateMethod`, filled below), under
+                            // a read's guards: the running callee, the
+                            // receiver's brand. The resolution, brand check
+                            // and owner's method search below were two thirds
+                            // of a `this.#m()` call.
+                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv) {
+                                if let Some((fid, closure)) = self.plain_fn_entry(f) {
+                                    self.setup_call_lean_this(
+                                        fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, f,
+                                    )?;
+                                    break;
+                                }
+                            }
                             let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
                             let site = super::values::private_site(func_id as u32, name as u32);
-                            private_callee = self.private_method_callee(ctx, recv, key, Some(site))?;
+                            private_callee =
+                                self.private_method_callee(ctx, recv, key, Some(site), Some((func_id, ip)))?;
                             // `this.#m(x)` resolved to a plain function: the
                             // call the general tail below makes of it (no
                             // lane between here and there serves a private

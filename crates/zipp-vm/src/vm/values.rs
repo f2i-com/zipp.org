@@ -1633,7 +1633,9 @@ impl<'p> Vm<'p> {
     /// value; the caller then takes its ordinary property lookup.
     ///
     /// The interpreter's `CallMethod` passes the running frame's callee, and
-    /// its access site (`private_site`) so the resolution is remembered. The
+    /// its access site (`private_site`) so the resolution is remembered, and
+    /// its own position (`fill_at`), where an instance method is remembered
+    /// in the site's way 0 as a read's is (`ic_private_method_fill`). The
     /// JIT region-call fallback passes the callee of the code that is
     /// actually running: it used to look `#m` up as a plain property, so one
     /// class could call another class's same-named `#m`.
@@ -1643,6 +1645,7 @@ impl<'p> Vm<'p> {
         recv: Value,
         key: &str,
         site: Option<u64>,
+        #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))] fill_at: Option<(u32, usize)>,
     ) -> Result<Option<Value>, Thrown> {
         let resolved = match site {
             Some(site) => self
@@ -1658,8 +1661,16 @@ impl<'p> Vm<'p> {
                 )));
             }
             let f = if kind & 1 != 0 {
-                self.private_member_from_owner(owner, key, (kind & 8) | 1)
-                    .unwrap_or(Value::UNDEFINED)
+                let m = self
+                    .private_member_from_owner(owner, key, (kind & 8) | 1)
+                    .unwrap_or(Value::UNDEFINED);
+                #[cfg(not(feature = "safe-sandbox"))]
+                if let Some((func_id, ip)) = fill_at {
+                    if kind & 8 == 0 && m.is_heap() {
+                        self.ic_private_method_fill(func_id, ip, ctx, b, m, recv);
+                    }
+                }
+                m
             } else if kind & 2 != 0 {
                 let g = self
                     .private_member_from_owner(owner, key, (kind & 8) | 2)

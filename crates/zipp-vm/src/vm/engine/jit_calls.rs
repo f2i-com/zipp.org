@@ -1876,7 +1876,7 @@ impl<'p> Vm<'p> {
                         let Some(ctx) = self.jit_running_callee(func_id, base) else {
                             return SELF_CALL_DEOPT;
                         };
-                        match self.private_method_callee(ctx, recv, key, None) {
+                        match self.private_method_callee(ctx, recv, key, None, None) {
                             Ok(Some(prop)) => {
                                 return self
                                     .jit_call_method_value(recv, key, prop, base, arg_base, argc);
