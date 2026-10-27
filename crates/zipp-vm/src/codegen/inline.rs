@@ -41,6 +41,13 @@ pub(crate) fn span_code_unit_pair_enabled() -> bool {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_CWT_LEAF=1` leaves a `CallWithThis` site (`o.f(x)` whose
+    /// callee was read before its arguments) to the call helper instead of
+    /// inlining a leaf callee that never reads `this`.
+    fn cwt_leaf_enabled() = "ZIPP_NO_CWT_LEAF"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_INLINE_SAME_PROTO_GUARD=1` restores the read-only
     /// `jit_leaf_same_func_proto` helper call at each polymorphic leaf site.
     /// The default emits the same proof from VM-relative mirrors and falls

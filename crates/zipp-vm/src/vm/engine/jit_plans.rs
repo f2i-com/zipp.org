@@ -2695,21 +2695,32 @@ impl<'p> Vm<'p> {
         let reg_window = caller.reg_count;
         let log = crate::jitlog_enabled();
         for ip in start as usize..=end as usize {
-            let Instr::Call {
-                argc,
-                arg_base,
-                callee: callee_reg,
-                ..
-            } = caller.code[ip]
-            else {
-                continue;
+            // A `CallWithThis` site (`o.f(x)` with its callee read before the
+            // arguments, as `this.cmp(h[i], h[p])` is) inlines a callee whose
+            // body never reads `this`, so the receiver it would bind is
+            // unobservable; its callee is guarded by FuncProto whenever it
+            // captures nothing (a callback field is a fresh closure per owner).
+            let (argc, arg_base, callee_reg, with_this) = match caller.code[ip] {
+                Instr::Call {
+                    argc,
+                    arg_base,
+                    callee,
+                    ..
+                } => (argc, arg_base, callee, false),
+                Instr::CallWithThis {
+                    argc,
+                    arg_base,
+                    callee,
+                    ..
+                } if crate::codegen::cwt_leaf_enabled() => (argc, arg_base, callee, true),
+                _ => continue,
             };
             // Prefer the exact monomorphic entry. A bounded extension accepts a
             // polymorphic site only when every filled way names the same
             // FuncProto; later gates require that proto to be capture-free and
             // non-arrow, and emitted code re-checks the LIVE callee's proto.
             let poly_on = std::env::var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
-            let upval_rep = poly_on
+            let upval_rep = (poly_on && !with_this)
                 .then(|| {
                     self.leaf_upval_callee_representative(func_id, start as usize, ip, callee_reg)
                 })
@@ -2735,6 +2746,11 @@ impl<'p> Vm<'p> {
                 continue;
             };
             let callee = self.func(fid as usize);
+            let same_proto = if with_this {
+                poly_on && callee.upvalues.is_empty()
+            } else {
+                same_proto
+            };
             if same_proto
                 && (self.get_function_realm(Value::from_bits(callee_bits)) != 0
                     || self.main_func(fid as usize).is_none())
@@ -2754,7 +2770,7 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
-            if same_proto && (callee.lexical_this || !callee.upvalues.is_empty()) {
+            if same_proto && ((callee.lexical_this && !with_this) || !callee.upvalues.is_empty()) {
                 if log {
                     eprintln!(
                         "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
@@ -2805,7 +2821,10 @@ impl<'p> Vm<'p> {
             // immutable lexical-this Value and the bits+slot-version guard pins
             // that exact closure instance. This is distinct from rotating-proto
             // cross-calls, which load each live closure's this dynamically.
-            let this_bits = if callee.lexical_this {
+            let this_bits = if with_this {
+                // Never read (checked once the body is known).
+                Value::UNDEFINED.bits()
+            } else if callee.lexical_this {
                 if closure == NO_CLOSURE {
                     continue;
                 }
@@ -2847,7 +2866,7 @@ impl<'p> Vm<'p> {
             // plan-local body through that SAME gate, preserving every normal
             // function/register/parameter constraint without admitting any
             // other CallWithThis shape.
-            let captured_span = if same_proto {
+            let captured_span = if same_proto || with_this {
                 None
             } else {
                 captured_span_code_unit_pred_plan(callee, argc).and_then(
@@ -2874,7 +2893,7 @@ impl<'p> Vm<'p> {
                         // Same-proto inlining deliberately stops at a direct leaf:
                         // a wrapper splice adds an independently identity-guarded
                         // inner call and has no rotating-identity evidence yet.
-                        if same_proto {
+                        if same_proto || with_this {
                             if log {
                                 eprintln!(
                                     "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
@@ -2994,6 +3013,16 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
+            if with_this
+                && body
+                    .iter()
+                    .any(|ins| crate::codegen::instr_uses(ins).contains(&0))
+            {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (reads `this`)");
+                }
+                continue;
+            }
             // Pre-resolve the numeric constants the body's `LoadConst` ops read
             // (callee_leaf_ok rejected any non-numeric constant).
             let mut consts = rustc_hash::FxHashMap::default();
@@ -3053,7 +3082,8 @@ impl<'p> Vm<'p> {
             // holds global slot g's value at the call and every write to g
             // bumps the generation (conditions (a)-(g), `slot_guard_key`).
             // `None` keeps today's per-execution bits+version guard.
-            let slot_guard = if same_proto || !crate::codegen::splice_slotgen_enabled() {
+            let slot_guard = if same_proto || with_this || !crate::codegen::splice_slotgen_enabled()
+            {
                 None
             } else {
                 match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver) {

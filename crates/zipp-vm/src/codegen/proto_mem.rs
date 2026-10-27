@@ -6527,19 +6527,48 @@ pub(crate) fn compile_proto_mem(
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    crate::vm::jit_call_with_this_ic as *const () as usize,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    refetch,
-                    None,
-                );
+                let call_with_this = crate::vm::jit_call_with_this_ic as *const () as usize;
+                // A leaf callee that never reads `this`, inlined under its
+                // guard; a miss makes the call through the same helper.
+                match leaf_plan.get(&ip).filter(|_| lane_done.is_none()) {
+                    Some(lp) => emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        heap.math_imul_guard,
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
+                        call_with_this,
+                        packed_fip,
+                        packed_args,
+                        refetch,
+                        None,
+                        None,
+                    ),
+                    None => emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        call_with_this,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch,
+                        None,
+                    ),
+                }
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
                 }

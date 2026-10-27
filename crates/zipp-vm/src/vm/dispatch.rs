@@ -4061,6 +4061,13 @@ impl<'p> Vm<'p> {
                         if let Some((fid, closure)) = plain {
                             let p = self.func(fid as usize);
                             if !p.is_generator && !p.is_async {
+                                // The site's callee, for the leaf inliner's
+                                // choice when this function compiles
+                                // (`build_leaf_inline_plan`).
+                                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                                if crate::codegen::cwt_leaf_enabled() {
+                                    let _ = self.ic_call(func_id, ip, callee_v);
+                                }
                                 self.setup_call(
                                     fid,
                                     closure,
