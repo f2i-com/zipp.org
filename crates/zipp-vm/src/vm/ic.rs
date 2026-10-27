@@ -1742,6 +1742,26 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// [`Self::ic_get_prop_proto_hit`] for a receiver whose mirror holds no
+    /// shape: `ic_get_prop`'s dictionary hint, the slot where this site last
+    /// found its key in a dictionary-mode object, when that object holds the
+    /// key there as a data property. A delete leaves an object in the mode for
+    /// good, and every read of one took the full call to reach the hint, past
+    /// its megamorphic probe, receiver fetch and namespace test.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_dict_hint_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
+        let s = self.ic_cell(func_id, ip)?.dict_hint()?;
+        if is_private_key(key) || !self.interp_own_resolve_vm_is_interpreter() {
+            return None;
+        }
+        let (_, m) = self.ic_recv_map(recv)?;
+        if m.shape() != crate::shape::DICT || m.key_get(s) != Some(key) || m.attr_at(s).accessor {
+            return None;
+        }
+        Some(m.val_at(s))
+    }
+
     /// The way-0 inherited-data hit of [`Self::ic_get_prop`], for the
     /// dispatch loops to take inline after the own-data one misses: the same
     /// guards (the receiver's complete shape, an unchanged chain, the holder's
@@ -1762,10 +1782,13 @@ impl<'p> Vm<'p> {
             return None;
         }
         #[cfg(feature = "jit")]
-        if self.heap.hot_mirror_of(recv.heap_index()).shape == crate::shape::DICT
-            && !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_))
-        {
-            return None;
+        if self.heap.hot_mirror_of(recv.heap_index()).shape == crate::shape::DICT {
+            if !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
+                return None;
+            }
+            if let Some(v) = self.ic_dict_hint_hit(func_id, ip, recv, key) {
+                return Some(v);
+            }
         }
         #[cfg(not(feature = "jit"))]
         if !matches!(self.heap.get_for_ic(recv.heap_index()), HeapObj::Object(_)) {
