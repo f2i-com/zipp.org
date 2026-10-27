@@ -806,9 +806,9 @@ impl<'s> Parser<'s> {
     fn parse_declarator(&mut self, kind: VarKind) -> PResult<Declarator> {
         let pos = self.cur().span.start;
         let id = self.parse_binding_pattern()?;
-        if self.ts {
-            self.ts_binding_suffix()?;
-        }
+        // TypeScript: an annotated `const` may go without an initializer in
+        // an ambient context (a `.d.ts` file's `export const x: T;`).
+        let ts_typed = self.ts && self.ts_binding_suffix()?;
         // `using` binds resources by NAME so it can dispose them in reverse
         // declaration order; a pattern has no single name to record, so the
         // grammar takes a BindingIdentifier and nothing else. The FIRST
@@ -839,7 +839,7 @@ impl<'s> Parser<'s> {
         }
         // `const` without an initializer is an early error — except in a
         // for-in/of head, which parses through a different path.
-        if init.is_none() && kind == VarKind::Const {
+        if init.is_none() && kind == VarKind::Const && !ts_typed {
             return Err(SyntaxError::new(
                 "SyntaxError: missing initializer in const declaration",
                 pos,
@@ -1261,6 +1261,9 @@ impl<'s> Parser<'s> {
         let out = if let Some(kind) = self.at_var_decl_start(true)? {
             let pos = self.cur().span.start;
             let pat = self.parse_binding_pattern()?;
+            if self.ts {
+                self.ts_binding_suffix()?;
+            }
             self.declare_pattern(&pat, kind, pos)?;
             if self.at_kw(Keyword::In) || self.at_kw(Keyword::Of) {
                 let of = self.at_kw(Keyword::Of);
@@ -1343,6 +1346,9 @@ impl<'s> Parser<'s> {
                     while self.eat(Punct::Comma, true)? {
                         let p2 = self.cur().span.start;
                         let id = self.parse_binding_pattern()?;
+                        if self.ts {
+                            self.ts_binding_suffix()?;
+                        }
                         self.declare_pattern(&id, kind, p2)?;
                         let init = if self.eat(Punct::Eq, true)? {
                             Some(self.parse_assign_full()?)

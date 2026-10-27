@@ -18,22 +18,18 @@ use crate::parse::parser::Parser;
 use crate::parse::visit::{self, Node};
 
 impl<'s> Parser<'s> {
-    /// Elide `body`'s type-only imports and exports. Runs before the module's
-    /// `export { x }` names are checked against its bindings, so those of
-    /// type-only names are taken out of that check first.
+    /// Elide `body`'s type-only imports and exports. Runs where the module's
+    /// `export { x }` names would be checked against its bindings, and takes
+    /// that check's place.
     pub(crate) fn ts_finish_program(&mut self, body: &mut [Stmt]) {
         if self.goal != Goal::Module {
             return;
         }
-        // `export { T }` where `T` is only a type here.
-        if !self.ts_state.type_names.is_empty() {
-            let types = std::mem::take(&mut self.ts_state.type_names);
-            let type_only = |p: &Self, n: &Name| types.contains(n) && !p.scopes.module_binds(n);
-            let pending = std::mem::take(&mut self.pending_export_locals);
-            self.pending_export_locals = pending
-                .into_iter()
-                .filter(|(n, _)| !type_only(self, n))
-                .collect();
+        // `export { T }` of a name the module binds nothing to: in TypeScript
+        // that checks, it is a type (an interface, an alias, an `import type`)
+        // or an ambient declaration, none of which exist at run time.
+        let pending = std::mem::take(&mut self.pending_export_locals);
+        if pending.iter().any(|(n, _)| !self.scopes.module_binds(n)) {
             for s in body.iter_mut() {
                 let Stmt::Export(e) = s else { continue };
                 let ExportDecl::Named {
@@ -47,9 +43,10 @@ impl<'s> Parser<'s> {
                 if specifiers.is_empty() {
                     continue;
                 }
-                specifiers.retain(
-                    |sp| !matches!(&sp.local, ModuleExportName::Ident(n) if type_only(self, n)),
-                );
+                specifiers.retain(|sp| match &sp.local {
+                    ModuleExportName::Ident(n) => self.scopes.module_binds(n),
+                    ModuleExportName::Str(_) => true,
+                });
                 if specifiers.is_empty() {
                     *s = Stmt::Empty;
                 }

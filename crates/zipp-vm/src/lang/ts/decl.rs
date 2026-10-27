@@ -113,18 +113,10 @@ impl<'s> Parser<'s> {
         Ok(r)
     }
 
-    /// Record a top-level type-only declaration's name, for `export { T }`.
-    fn ts_note_type_name(&mut self, name: Name) {
-        if self.scopes.scopes.len() == 1 {
-            self.ts_state.type_names.insert(name);
-        }
-    }
-
     /// `interface I<T> extends A, B { … }`, the `interface` current.
     fn ts_interface(&mut self) -> PResult<()> {
         self.bump(false)?;
-        let name = self.ident_name()?;
-        self.ts_note_type_name(name);
+        self.ident_name()?;
         if self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
@@ -144,8 +136,7 @@ impl<'s> Parser<'s> {
     /// `type T<P> = Type;`, the `type` current.
     fn ts_type_alias(&mut self) -> PResult<()> {
         self.bump(false)?;
-        let name = self.ident_name()?;
-        self.ts_note_type_name(name);
+        self.ident_name()?;
         if self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
@@ -204,6 +195,12 @@ impl<'s> Parser<'s> {
                     self.bump(false)?;
                 }
                 self.bump(false)?; // `class`
+                if self.ts_at_name() && !self.ts_at("extends") && !self.ts_at("implements") {
+                    self.ident_name()?;
+                }
+                if self.at(Punct::Lt) {
+                    self.ts_type_params()?;
+                }
                 while !self.at(Punct::LBrace) {
                     if self.at_eof() {
                         return Err(self.err_here("SyntaxError: unexpected end of input"));

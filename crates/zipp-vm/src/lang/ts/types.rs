@@ -646,9 +646,9 @@ impl<'s> Parser<'s> {
         }
         self.ts_skip_params()?;
         self.expect(Punct::Arrow, false)?;
-        // The return type keeps the context: in `T extends (x: A) => infer R ?
-        // R : never` the `?` is the outer conditional's.
-        self.ts_return_type()
+        // tsc's `parseReturnType` allows conditional types again: `A extends
+        // <V>() => V extends B ? 1 : 2 ? X : Y` has one in the return type.
+        self.ts_with_cond(true, |p| p.ts_return_type())
     }
 
     /// `<T extends C = D, const U, in out V>`.

@@ -234,6 +234,20 @@ impl<'s> Parser<'s> {
             // `[In]` is on inside it however the arrow was reached.
             self.ctx.in_ = true;
             ArrowBody::Block(self.parse_fn_body_with_params(Some(&params))?)
+        } else if self.ts {
+            // TypeScript reads which names a reference reaches (import
+            // elision), so the parameters are in scope here as in a block body.
+            self.scopes.push(super::parser::ScopeKind::Function);
+            let mut names = Vec::new();
+            for item in &params.items {
+                super::stmt::collect_pattern_names(item, &mut names);
+            }
+            for n in names {
+                self.scopes.declare_param(&n);
+            }
+            let body = self.parse_assign_full();
+            self.scopes.pop()?;
+            ArrowBody::Expr(Box::new(body?))
         } else {
             // `ConciseBody[In] : ExpressionBody[?In, ~Await]` INHERITS `[In]`, so
             // in a `for` head the `in` of `for (x => 0 in 1;;)` can belong

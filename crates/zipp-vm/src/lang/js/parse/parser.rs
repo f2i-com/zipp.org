@@ -520,6 +520,15 @@ impl ScopeStack {
         self.scopes.len() == 1 && self.scopes[0].kind == ScopeKind::Module
     }
 
+    /// Is `name` declared in a scope inside the outermost one, so a reference
+    /// to it here does not reach a top-level binding of that name?
+    pub(crate) fn shadowed(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(1)
+            .any(|s| s.has_lex(name) || s.has_var(name))
+    }
+
     /// Is `name` declared in the innermost scope (lexically or by a `var`)?
     pub(crate) fn declared_here(&self, name: &str) -> bool {
         self.scopes

@@ -287,13 +287,12 @@ impl<'s> Parser<'s> {
     }
 
     /// After a declarator's name or pattern: `!` (definite assignment) and
-    /// the type.
-    pub(crate) fn ts_binding_suffix(&mut self) -> PResult<()> {
+    /// the type; whether there was a type.
+    pub(crate) fn ts_binding_suffix(&mut self) -> PResult<bool> {
         if self.at(Punct::Bang) && !self.cur().newline_before {
             self.bump(false)?;
         }
-        self.ts_annotation_opt()?;
-        Ok(())
+        self.ts_annotation_opt()
     }
 
     /// `as` or `satisfies`, on the line of the expression it follows.

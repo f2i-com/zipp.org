@@ -111,9 +111,6 @@ pub(crate) struct TsState {
     /// An import came after a statement that may have referred to it, so
     /// references are counted from the finished tree instead.
     pub(crate) late_import: bool,
-    /// Names declared at the top level only as types (`interface`, `type`),
-    /// so `export { Props }` exports nothing.
-    pub(crate) type_names: FxHashSet<Name>,
     /// Constant members of the enums read so far, for the initializers of
     /// later members and enums (`B = A << 1`, `X = Other.Y`).
     pub(crate) enums: FxHashMap<Name, Vec<(Name, lower::Const)>>,
@@ -130,13 +127,16 @@ fn name_key(name: &Name) -> usize {
 }
 
 impl<'s> Parser<'s> {
-    /// A value reference to `name` was read: an import it names is used.
+    /// A value reference to `name` was read: an import it names is used,
+    /// unless a binding of the same name nearer the reference shadows it.
     #[inline]
     pub(crate) fn ts_note_ref(&mut self, name: &Name) {
-        if !self.ts_state.imports.is_empty() {
-            if let Some(used) = self.ts_state.imports.get_mut(&name_key(name)) {
-                *used = true;
-            }
+        if self.ts_state.imports.is_empty() {
+            return;
+        }
+        let key = name_key(name);
+        if self.ts_state.imports.get(&key) == Some(&false) && !self.scopes.shadowed(name) {
+            self.ts_state.imports.insert(key, true);
         }
     }
 

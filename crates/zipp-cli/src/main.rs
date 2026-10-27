@@ -639,6 +639,46 @@ fn run(args: &[String]) -> Result<(), String> {
                 Err(format!("{differ} mismatches"))
             }
         }
+        Some("ts-sweep") => {
+            // Parse every TypeScript file under the given paths and report the
+            // failures grouped by message (a corpus check for `lang/ts`).
+            let mut files = Vec::new();
+            for p in it {
+                collect_ts(std::path::Path::new(p), &mut files);
+            }
+            files.sort();
+            let (mut ok, mut failed) = (0usize, 0usize);
+            let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+            let started = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for f in &files {
+                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                bytes += src.len();
+                match zipp_vm::frontend::check_typescript(&src) {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        failed += 1;
+                        let key: String = e.lines().next().unwrap_or(&e).chars().take(90).collect();
+                        let at = e.lines().nth(1).unwrap_or("").trim().to_string();
+                        let entry = reasons.entry(key).or_insert((0, format!("{} {at}", f.display())));
+                        entry.0 += 1;
+                    }
+                }
+            }
+            println!(
+                "{} files ({:.1} MB): {ok} parsed, {failed} failed, in {:.0} ms",
+                files.len(),
+                bytes as f64 / 1e6,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            let mut by_count: Vec<_> = reasons.into_iter().collect();
+            by_count.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (reason, (n, example)) in by_count.iter().take(60) {
+                println!("  {n:5}  {reason}
+         e.g. {example}");
+            }
+            Ok(())
+        }
         Some("sandbox") => sandbox::run(&it.cloned().collect::<Vec<_>>()),
         // Private half of the process sandbox. It is still fail-closed and
         // validates every argument, but is omitted from help so callers use
@@ -946,6 +986,30 @@ fn build_identity(json: bool) -> String {
         }
     );
     s
+}
+
+/// Every `.ts`/`.mts`/`.cts` file under `p` (or `p` itself if it is a file),
+/// `.d.ts` included.
+fn collect_ts(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if p.is_file() {
+        out.push(p.to_path_buf());
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(p) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            collect_ts(&path, out);
+        } else if path
+            .extension()
+            .is_some_and(|x| x == "ts" || x == "mts" || x == "cts")
+        {
+            out.push(path);
+        }
+    }
 }
 
 /// Every `.js`/`.mjs` file under `p` (or `p` itself if it is a file).

@@ -22,6 +22,13 @@ pub(crate) mod ts;
 
 pub use ts::run_file as run_typescript_file;
 
+/// Parse TypeScript `source` (a script or a module, as [`run_typescript_file`]
+/// would read it) without compiling or running it: the syntax error, located,
+/// if it has one. For tools that check a corpus.
+pub fn check_typescript(source: &str) -> Result<(), String> {
+    ts::parse_auto(source).map(drop).map_err(|f| f.located(source, None))
+}
+
 /// A language the runtime runs: its names, how a file is recognised as its,
 /// and its frontend. Every language implements it once, in `lang/<name>/`,
 /// and is listed in [`languages`]; language detection, the `--lang` names
