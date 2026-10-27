@@ -7,3 +7,21 @@
 # assertion is ES2017 wording that ES2018 deleted; current Node fails it too.
 # Local regression tests cover the current semantics.
 annexB/language/function-code/block-decl-func-skip-arguments.js [sloppy]
+# DataView byteLength/byteOffset of a detached or out-of-bounds view answer
+# +0, as the TypedArray getters do (tc39/ecma262#3972); the pinned corpus
+# predates it and expects the TypeError the getters threw before. See the
+# DataView arm of `Vm::get_member` (vm/props/member.rs).
+built-ins/DataView/prototype/byteLength/detached-buffer.js [sloppy]
+built-ins/DataView/prototype/byteLength/detached-buffer.js [strict]
+built-ins/DataView/prototype/byteLength/instance-has-detached-buffer.js [sloppy]
+built-ins/DataView/prototype/byteLength/instance-has-detached-buffer.js [strict]
+built-ins/DataView/prototype/byteLength/resizable-array-buffer-auto.js [sloppy]
+built-ins/DataView/prototype/byteLength/resizable-array-buffer-auto.js [strict]
+built-ins/DataView/prototype/byteLength/resizable-array-buffer-fixed.js [sloppy]
+built-ins/DataView/prototype/byteLength/resizable-array-buffer-fixed.js [strict]
+built-ins/DataView/prototype/byteOffset/detached-buffer.js [sloppy]
+built-ins/DataView/prototype/byteOffset/detached-buffer.js [strict]
+built-ins/DataView/prototype/byteOffset/resizable-array-buffer-auto.js [sloppy]
+built-ins/DataView/prototype/byteOffset/resizable-array-buffer-auto.js [strict]
+built-ins/DataView/prototype/byteOffset/resizable-array-buffer-fixed.js [sloppy]
+built-ins/DataView/prototype/byteOffset/resizable-array-buffer-fixed.js [strict]
