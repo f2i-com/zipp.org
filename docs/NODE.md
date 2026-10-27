@@ -42,9 +42,9 @@ promise jobs, as Node orders them. A script also has CommonJS's `require`,
 and dispatch order): listener options `once`, `capture`, `passive` and
 `signal`, `handleEvent` objects, and a listener's throw reported on the next
 tick as an uncaught exception while the other listeners still run.
-`structuredClone` throws `DOMException`s, as Node's does. Timers do not yet
-honour `unref()`, so a pending `AbortSignal.timeout` keeps the process
-running until it fires.
+`structuredClone` throws `DOMException`s, as Node's does. As in Node, a
+cleared timer and one that was `unref()`'d (a pending `AbortSignal.timeout`
+among them) do not keep the process running.
 
 ## Packages
 

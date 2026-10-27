@@ -4820,6 +4820,19 @@ impl<'p> Vm<'p> {
                 self.timer_queue.clear();
                 break;
             }
+            // Only unref'd timeouts left (and no waiter): the loop is done,
+            // as Node's is; they never run.
+            if !self.timer_unref.is_empty()
+                && self.async_waiters.is_empty()
+                && self
+                    .timer_queue
+                    .iter()
+                    .all(|(_, cb)| self.timer_unref.contains(&cb.bits()))
+            {
+                self.timer_queue.clear();
+                self.timer_unref.clear();
+                break;
+            }
             let now = crate::vm::clock::Instant::now();
             let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
             let next_wait = self
@@ -4869,11 +4882,15 @@ impl<'p> Vm<'p> {
                 break;
             }
             let mut insertion_index = 0usize;
+            let unref = &mut self.timer_unref;
             self.timer_queue.retain(|&(deadline, callback)| {
                 let index = insertion_index;
                 insertion_index = insertion_index.saturating_add(1);
                 if deadline <= now {
                     fired.push((deadline, index, callback));
+                    if !unref.is_empty() {
+                        unref.remove(&callback.bits());
+                    }
                     false
                 } else {
                     true

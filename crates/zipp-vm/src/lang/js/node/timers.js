@@ -45,9 +45,10 @@
       this._ref = true;
       this._generation = 0;
       this._destroyed = false;
+      this._native = null;
     }
-    ref() { this._ref = true; return this; }
-    unref() { this._ref = false; return this; }
+    ref() { this._ref = true; if (this._native) host.timer(this._native, 1); return this; }
+    unref() { this._ref = false; if (this._native) host.timer(this._native, 2); return this; }
     hasRef() { return this._ref; }
     refresh() { if (!this._destroyed) arm(this); return this; }
     close() { clear(this); return this; }
@@ -56,12 +57,17 @@
   function arm(t) {
     const generation = ++t._generation;
     call(mapSet, active, t._id, t);
-    nativeSetTimeout(() => {
+    if (t._native) host.timer(t._native, 0);
+    const native = () => {
       if (t._destroyed || t._generation !== generation) return;
+      t._native = null;
       if (t._repeat) arm(t);
       else { t._destroyed = true; call(mapDelete, active, t._id); }
       apply(t._onTimeout, undefined, t._args);
-    }, t._idleTimeout);
+    };
+    t._native = native;
+    nativeSetTimeout(native, t._idleTimeout);
+    if (!t._ref) host.timer(native, 2);
   }
   function clear(t) {
     if (t == null) return;
@@ -69,6 +75,11 @@
     if (timer instanceof Timeout || (timer && typeof timer === "object" && "_destroyed" in timer)) {
       timer._destroyed = true;
       call(mapDelete, active, timer._id);
+      // The native timeout goes too: a cleared timer keeps nothing waiting.
+      if (timer._native) {
+        host.timer(timer._native, 0);
+        timer._native = null;
+      }
     }
   }
   function checkCallback(callback) {

@@ -346,6 +346,7 @@ impl<'p> Vm<'p> {
             ("cjs", NODE_HOST_CJS),
             ("inspect", NODE_HOST_INSPECT),
             ("readStdin", NODE_HOST_READ_STDIN),
+            ("timer", NODE_HOST_TIMER),
         ] {
             let f = Value::heap(self.heap.alloc(HeapObj::Native(id)));
             m.define(name, f, attr);
@@ -451,6 +452,28 @@ impl<'p> Vm<'p> {
             }
             NODE_HOST_REQUEST_TICKS => {
                 self.node_tick_pending = true;
+                Value::UNDEFINED
+            }
+            NODE_HOST_TIMER => {
+                // `timer(callback, op)` on the native timeout armed with
+                // `callback`: 0 cancels it (`clearTimeout`), 1 refs it, 2
+                // unrefs it (an unref'd timeout runs if the loop is still
+                // going, but does not keep it going).
+                let cb = arg(0);
+                match self.to_number(arg(1))? as i32 {
+                    0 => {
+                        self.timer_queue.retain(|&(_, c)| c.bits() != cb.bits());
+                        self.timer_unref.remove(&cb.bits());
+                    }
+                    1 => {
+                        self.timer_unref.remove(&cb.bits());
+                    }
+                    _ => {
+                        if self.timer_queue.iter().any(|&(_, c)| c.bits() == cb.bits()) {
+                            self.timer_unref.insert(cb.bits());
+                        }
+                    }
+                }
                 Value::UNDEFINED
             }
             NODE_HOST_LOAD => {

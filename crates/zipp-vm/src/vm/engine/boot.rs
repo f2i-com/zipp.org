@@ -512,6 +512,7 @@ impl<'p> Vm<'p> {
             realm_throw_type_errors: std::collections::HashMap::new(),
             async_waiters: Vec::new(),
             timer_queue: Vec::new(),
+            timer_unref: rustc_hash::FxHashSet::default(),
             vm_start_mono_ms: crate::vm::clock::now_mono_ms(),
             #[cfg(not(feature = "wasm-single-agent"))]
             agent_shared: None,

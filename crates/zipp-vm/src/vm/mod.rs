@@ -2865,6 +2865,9 @@ pub struct Vm<'p> {
     /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
     /// are GC ROOTS.
     timer_queue: Vec<(clock::Instant, Value)>,
+    /// The callbacks (bits) of the queued timeouts Node's `unref()` was
+    /// called on: the loop ends when only these remain.
+    pub(crate) timer_unref: rustc_hash::FxHashSet<u64>,
     /// Monotonic-clock reading at VM construction — the
     /// `$262.agent.monotonicNow()` epoch.
     vm_start_mono_ms: f64,
