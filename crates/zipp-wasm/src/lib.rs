@@ -757,7 +757,8 @@ impl Engine {
     }
 
     /// [`Self::init_script`] with an explicit source language: `"javascript"`
-    /// (identical to `initScript`) or `"python"` (the experimental subset
+    /// (identical to `initScript`), `"typescript"` (a script whose types are
+    /// dropped as it is read) or `"python"` (the experimental subset
     /// frontend; requires the `python` Cargo feature). A Python state has no
     /// preamble, exposes no global slots, and rejects the JS-only
     /// global/call/eval methods.
@@ -781,6 +782,15 @@ impl Engine {
                 },
             )
             .map(|compiled| compiled.into_state()),
+            // A TypeScript script runs as its JavaScript would, preamble and all.
+            zipp_vm::frontend::LanguageId::TypeScript => {
+                zipp_vm::embed::compile_typescript_with_preamble_and_origin(
+                    PREAMBLE,
+                    source,
+                    &GUEST_COMPILE_OPTIONS,
+                    &origin,
+                )
+            }
         })
     }
 

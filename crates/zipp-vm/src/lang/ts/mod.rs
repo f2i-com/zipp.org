@@ -278,6 +278,23 @@ pub(crate) fn parse_script(
     parse_goal(src, Goal::Script, allow_return, config)
 }
 
+/// [`parse_script`] made strict whatever its own prologue says (an
+/// embedder's preamble put before the guest, see `embed`), with tsc's
+/// default settings.
+pub(crate) fn parse_script_strict(
+    src: &str,
+    allow_return: bool,
+    force_strict: bool,
+) -> Result<Program, crate::front::ParseFailure> {
+    let opts = ParseOptions {
+        allow_return,
+        force_strict,
+        typescript: true,
+        ..ParseOptions::script()
+    };
+    crate::parse::stmt::parse(src, opts).map_err(crate::front::failure)
+}
+
 /// A TypeScript module.
 pub(crate) fn parse_module(
     src: &str,
@@ -361,8 +378,11 @@ pub(crate) fn is_ts_path(path: &Path) -> bool {
 pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, String> {
     if is_ts_path(path) {
         parse_module(code, config::config_for(path)).map_err(|f| {
-            let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p));
-            f.located(code, url.as_deref().ok())
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
+            let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p)).ok();
+            #[cfg(feature = "wasm-no-fs-loader")]
+            let url: Option<String> = None;
+            f.located(code, url.as_deref())
         })
     } else {
         crate::front::parse_module(code)

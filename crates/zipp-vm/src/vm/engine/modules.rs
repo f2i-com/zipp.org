@@ -1081,6 +1081,7 @@ impl<'p> Vm<'p> {
             &star_reexports,
             &ns_reexports,
             dir.as_deref(),
+            crate::lang::ts::is_ts_path(&path),
         );
         // The link is over: no further static edge originates here.
         self.module_link_pop(&path);
@@ -1236,6 +1237,11 @@ impl<'p> Vm<'p> {
     /// ResolveExport. `export *` copies the dependency's exports except `default`; a
     /// name supplied by TWO different star sources is AMBIGUOUS — excluded from the
     /// namespace and a SyntaxError to resolve by name (the second tuple element).
+    ///
+    /// `typescript`: the re-exporting module is TypeScript, where `export { T }
+    /// from "./types"` may name a type, which exists only at compile time: a
+    /// name the dependency does not export is left out rather than an error
+    /// (in checked TypeScript it can only be a type).
     pub(crate) fn link_module_reexports(
         &mut self,
         mut full: Vec<(String, u32)>,
@@ -1243,6 +1249,7 @@ impl<'p> Vm<'p> {
         star_reexports: &[String],
         ns_reexports: &[(String, String)],
         dir: Option<&std::path::Path>,
+        typescript: bool,
     ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
         // `export * as name from`: import the dependency and export its
         // NAMESPACE object under `name` through the dependency's CANONICAL
@@ -1270,7 +1277,7 @@ impl<'p> Vm<'p> {
             };
             if let Some(slot) = self.resolve_export(&dep, imported, None)? {
                 full.push((exported.clone(), slot));
-            } else {
+            } else if !typescript {
                 return Err(Thrown(format!(
                     "SyntaxError: The requested module '{spec}' does not provide an export named '{imported}'"
                 )));
