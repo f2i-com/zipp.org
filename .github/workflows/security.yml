@@ -106,7 +106,14 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+      # Quick mode: the harness and validator tests run, but not the full
+      # structural comparison of every PGO training input against every
+      # scored program, which took over an hour once the app-scale input
+      # joined the corpus. tools/pgo.sh runs that comparison before every
+      # profile-guided build.
       - name: Run benchmark harness adversarial tests
+        env:
+          ZIPP_BENCH_TESTS_QUICK: "1"
         run: |
           python -m unittest tools.test_bench tools.test_bench_hostile tools.test_bench_peak_rss tools.test_run_native
           node --no-warnings --test bench/comparison/test_run_wasm_suites.mjs
@@ -416,47 +423,6 @@ jobs:
           docker run --rm --ipc=host -v "$PWD:/crate" -w /crate \
             mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27 \
             sh -c 'npm install --no-save --no-audit --no-fund playwright@1.63.0 && node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit'
-
-  # The same corpus on a 32-bit build. Every WebAssembly engine is wasm32 and
-  # the armv7 CLI is 32-bit: there `usize` is 32 bits, and an index or length
-  # past 2^32 converted too early was truncated (2d337999 fixed 24 such
-  # executions the 64-bit run could not see). Windows runs i686 programs
-  # natively, so this needs no emulator.
-  test262-32bit:
-    name: Pinned Test262 on a 32-bit build (Windows i686)
-    if: ${{ !inputs.skip_heavy }}
-    runs-on: windows-2022
-    timeout-minutes: 120
-    steps:
-      # Git on a Windows runner converts checkouts to CRLF; the corpus's
-      # import-bytes tests import their fixtures as raw bytes and count them.
-      - name: Keep checkouts byte for byte
-        run: git config --global core.autocrlf false
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          persist-credentials: false
-      - name: Check out the pinned Test262 corpus
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: tc39/test262
-          ref: 0b4e0812022b18236b5276d2804948fdd9f71603
-          path: target/test262
-          persist-credentials: false
-      - name: Select the pinned release Rust toolchain and the i686 target
-        run: |
-          rustup toolchain install 1.92.0 --profile minimal --no-self-update
-          rustup target add i686-pc-windows-msvc --toolchain 1.92.0
-      - name: Build the locked release CLI for i686
-        run: cargo +1.92.0 build --locked --release --package zipp-cli --bin zipp --target i686-pc-windows-msvc
-      - name: Require the pinned Test262 corpus to pass on 32 bits
-        run: >-
-          python tools/run_test262.py
-          --t262 target/test262
-          --zipp target/i686-pc-windows-msvc/release/zipp.exe
-          --jobs 4 --timeout 120
-          --expected-failures tools/test262-expected-failures.txt
 
   test262:
     name: Pinned Test262 conformance

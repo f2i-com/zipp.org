@@ -2598,6 +2598,13 @@ class ProvenanceTests(unittest.TestCase):
                     self.assertLessEqual(int(match.group(1)), maximum)
                 self.assertIn(expected, source)
 
+    # Every training input against every scored program: over an hour with
+    # the app-scale input. Security's quick lane leaves it to tools/pgo.sh,
+    # which runs the same validation before every profile-guided build.
+    @unittest.skipIf(
+        os.environ.get("ZIPP_BENCH_TESTS_QUICK") == "1",
+        "ZIPP_BENCH_TESTS_QUICK: the full corpus comparison runs in tools/pgo.sh",
+    )
     def test_current_pgo_corpus_passes_structural_anti_leakage_policy(self):
         scored = bench.pgo_publication_input_paths()
         self.assertIsNotNone(scored)
