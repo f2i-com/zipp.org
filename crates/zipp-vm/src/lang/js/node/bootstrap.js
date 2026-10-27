@@ -12,9 +12,15 @@
   function part(name) {
     return (parts[name] ||= host.load(name)(host, nativeSetTimeout));
   }
+  // The parts as the globals have them, for the parts and builtins that
+  // share one (node:events and node:stream use web_events's classes).
+  host.part = part;
   // Node's non-enumerable globals among these.
-  const hidden = (name) =>
-    name === "process" || name === "Buffer" || name === "URL" || name === "URLSearchParams";
+  const hiddenNames = new Set([
+    "process", "Buffer", "URL", "URLSearchParams",
+    "Event", "EventTarget", "CustomEvent", "AbortController", "AbortSignal", "DOMException",
+  ]);
+  const hidden = (name) => hiddenNames.has(name);
   function settle(name, value) {
     defineProperty(G, name, { value, writable: true, configurable: true, enumerable: !hidden(name) });
     return value;
@@ -33,6 +39,9 @@
   lazy("structuredClone", "clone");
   lazy("URL", "url_whatwg");
   lazy("URLSearchParams", "url_whatwg");
+  for (const name of ["Event", "EventTarget", "CustomEvent", "AbortController", "AbortSignal", "DOMException"]) {
+    lazy(name, "web_events");
+  }
   lazy("process", "process");
   for (const name of ["Buffer", "atob", "btoa"]) {
     lazy(name, null, () => host.cjs().builtin("buffer")[name]);

@@ -15,12 +15,17 @@ The command's runs print as the program prints, as `node` does: each line
 of `console.log` and each `process.stdout.write`, partial line and all, is
 written when it happens (an embedder, which reads the run's output
 afterwards, still gets it collected). `fs.readFileSync(0)` (or
-`"/dev/stdin"`) reads standard input to its end.
+`"/dev/stdin"`) reads standard input to its end. `process.stdin` is a
+Readable over standard input and `process.stdout`/`process.stderr` are
+Writables, so `readline.createInterface({ input: process.stdin })`,
+`for await` over its lines, `rl.question` and `pipeline(process.stdin, …,
+process.stdout)` work as in Node; as Node's stdio, a `pipeline` into
+stdout leaves it open.
 
 ## Globals
 
 `process` (`argv`, `env`, `platform`, `arch`, `cwd()`, `exit()`,
-`exitCode`, `nextTick`, `hrtime`, `stdout.write`, `stderr.write`, `on('exit')`,
+`exitCode`, `nextTick`, `hrtime`, `stdin`, `stdout`, `stderr`, `on('exit')`,
 `versions`), `global`, `Buffer`, `atob`, `btoa`, `structuredClone`, the
 WHATWG `URL` and `URLSearchParams` (`url_whatwg.js`: the URL Standard's
 parser, serializer and setters, passing every case of the web-platform
@@ -30,6 +35,16 @@ timers with ids, arguments and cancellation:
 `setImmediate`/`clearImmediate`. `process.nextTick` callbacks run before
 promise jobs, as Node orders them. A script also has CommonJS's `require`,
 `module`, `exports`, `__filename` and `__dirname`; an ES module does not.
+
+`Event`, `CustomEvent`, `EventTarget`, `AbortController`, `AbortSignal`
+(`abort`, `timeout`, `any`, `throwIfAborted`, `onabort`) and `DOMException`
+(`web_events.js`, derived from Node's own, with its accessors, error codes
+and dispatch order): listener options `once`, `capture`, `passive` and
+`signal`, `handleEvent` objects, and a listener's throw reported on the next
+tick as an uncaught exception while the other listeners still run.
+`structuredClone` throws `DOMException`s, as Node's does. Timers do not yet
+honour `unref()`, so a pending `AbortSignal.timeout` keeps the process
+running until it fires.
 
 ## Packages
 
@@ -59,21 +74,39 @@ be more names than Node's, never fewer of the ones a program can use.
 ## Core modules
 
 Implemented, as `require('x')`, `require('node:x')` and `import`:
-`path` (POSIX and Windows), `events`, `util` (`format`, `inspect`,
-`inherits`, `promisify`, `callbackify`, `deprecate`, `debuglog`,
-`isDeepStrictEqual`, `types`), `fs` (the synchronous API, and its callback
-and promise forms: read, write, append, stat, readdir, mkdir, rm, rename,
-copy, realpath), `os`, `tty`, `url` (file URLs, legacy `parse`/`format`),
-`module` (`createRequire`), `assert` and `assert/strict`, `buffer`,
-`crypto` (`randomUUID`, `randomBytes`, `getRandomValues`, and `createHash`
-and `createHmac` for md5, sha1 and sha256; the randomness is
-`Math.random`'s, not a cryptographic source), `string_decoder`, `timers`,
-`process`.
+`path` (POSIX and Windows), `events` (`EventEmitter`, and `once`, `on`,
+`getEventListeners`, `getMaxListeners`, `setMaxListeners` and
+`addAbortListener`, over emitters and EventTargets alike, with `signal`s),
+`util` (`format`, `inspect`, `inherits`, `promisify`, `callbackify`,
+`deprecate`, `debuglog`, `isDeepStrictEqual`, `types`), `fs` (the
+synchronous API, and its callback and promise forms: read, write, append,
+stat, readdir, mkdir, rm, rename, copy, realpath; and Node's `ReadStream`
+and `WriteStream`, with `createReadStream`/`createWriteStream`, over the
+same file operations: a read stream takes the file whole when it opens and
+hands it out in slices, `start`/`end`/`highWaterMark` as Node's; a write
+stream truncates or appends as its flags say and appends each chunk),
+`os`, `tty`, `url` (file URLs, legacy `parse`/`format`), `module`
+(`createRequire`), `assert` and `assert/strict`, `buffer`, `crypto`
+(`randomUUID`, `randomBytes`, `getRandomValues`, and `createHash` and
+`createHmac` for md5, sha1 and sha256; the randomness is `Math.random`'s,
+not a cryptographic source), `string_decoder` (Node's, ported from its
+C++: a character split between writes, in UTF-8, UTF-16LE or base64, is
+held back whole, with `lastChar`/`lastNeed`/`lastTotal`), `timers`,
+`process`, `stream` and `stream/promises` (`builtins/stream.js`, derived
+from Node's own: Readable, Writable, Duplex, Transform, PassThrough,
+`pipeline`, `finished`, `Readable.from` and the iterator helpers, with
+Node's event order and ticks; not there are `compose`, `duplexPair`, the
+web-stream adapters, and `concurrency` for `map` and the others, which
+take one item at a time), and `readline` and `readline/promises`
+(`createInterface`, `line`/`close` events, `question`, async iteration,
+`emitKeypressEvents`, the cursor helpers; a terminal reads lines as a pipe
+does, leaving editing and echo to the terminal, with no raw-mode editing,
+history or completion).
 
-The other core modules (`http`, `net`, `child_process`, `stream`, `zlib`,
+The other core modules (`http`, `net`, `child_process`, `zlib`,
 `worker_threads`, …) can be required, as many packages do at their top, and
-their members read and their classes extended (`react-dom/server` extends
-`stream.Readable` as it loads); calling or constructing one throws
-`ERR_ZIPP_UNSUPPORTED` naming it.
+their members read and their classes extended; calling or constructing one
+throws `ERR_ZIPP_UNSUPPORTED` naming it.
 
-Not there yet: `fetch`, streams, and `fs` streams and watchers.
+Not there yet: `fetch`, `fs` watchers, and `fs`'s descriptor API (`open`,
+`read`, `close`; a stream's `fd` is a number of its own).

@@ -20,11 +20,10 @@
   const ArrayIsArray = Array.isArray;
   const SymbolToPrimitive = Symbol.toPrimitive;
   // ---- structuredClone ------------------------------------------------------
+  // A DOMException, the web_events part's (the global's own).
+  const webEvents = () => host.part("web_events");
   function DataCloneError(what) {
-    const e = new Error(String(what) + " could not be cloned.");
-    e.name = "DataCloneError";
-    e.code = 25;
-    return e;
+    return new (webEvents().DOMException)(String(what) + " could not be cloned.", "DataCloneError");
   }
   const errorNames = new SetCtor(["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError"]);
   const errorCtors = { Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError };
@@ -98,9 +97,16 @@
             out = new G[kind](buf, v.byteOffset, v.length);
             break;
           }
+          if (tag === "[object DOMException]" && webEvents().isDOMException(v)) {
+            out = new (webEvents().DOMException)(v.message, v.name);
+            defineProperty(out, "stack", { value: v.stack, writable: true, configurable: true, enumerable: false });
+            break;
+          }
           if (typeof v === "object" && !ArrayIsArray(v)) {
             // A Promise, a WeakMap, a Proxy of a function…: not cloneable.
-            if (tag !== "[object Object]") throw DataCloneError(tag === "[object Promise]" ? "#<Promise>" : tag);
+            if (tag !== "[object Object]") {
+              throw DataCloneError(/^\[object (Promise|WeakMap|WeakSet|WeakRef)\]$/.test(tag) ? "#<" + tag.slice(8, -1) + ">" : tag);
+            }
           }
           out = {};
           call(mapSet, memory, v, out);

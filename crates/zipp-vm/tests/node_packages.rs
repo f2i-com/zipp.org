@@ -138,7 +138,7 @@ fn packages_resolve_and_commonjs_interoperates_as_in_node() {
 }
 
 /// A core module zipp does not have loads, as packages require them at
-/// their top (react-dom/server extends `stream.Readable` as it loads);
+/// their top (a server library extends `net.Server` as it loads);
 /// reading its members and extending its classes work, and calling or
 /// constructing one throws ERR_ZIPP_UNSUPPORTED naming it. Not Node's
 /// output: Node has these modules.
@@ -149,10 +149,10 @@ fn core_modules_zipp_lacks_load_and_say_so_when_used() {
     let script = root.join("main.cjs");
     std::fs::write(
         &script,
-        r#"const stream = require("stream");
-class R extends stream.Readable {}
-console.log(typeof R, R.prototype instanceof stream.Readable, stream.Readable === stream.Readable);
-for (const f of [() => new R(), () => require("http").createServer(), () => stream.pipeline()]) {
+        r#"const net = require("net");
+class R extends net.Server {}
+console.log(typeof R, R.prototype instanceof net.Server, net.Server === net.Server);
+for (const f of [() => new R(), () => require("http").createServer(), () => net.connect()]) {
   try { f(); } catch (e) { console.log(e.code, e.message); }
 }
 import("node:zlib").then((z) => console.log("zlib", typeof z.default.gzipSync));
@@ -169,9 +169,9 @@ import("node:zlib").then((z) => console.log("zlib", typeof z.default.gzipSync));
         lines(&out),
         [
             "function true true",
-            "ERR_ZIPP_UNSUPPORTED zipp: node:stream.Readable is not supported",
+            "ERR_ZIPP_UNSUPPORTED zipp: node:net.Server is not supported",
             "ERR_ZIPP_UNSUPPORTED zipp: node:http.createServer is not supported",
-            "ERR_ZIPP_UNSUPPORTED zipp: node:stream.pipeline is not supported",
+            "ERR_ZIPP_UNSUPPORTED zipp: node:net.connect is not supported",
             "zlib function",
         ]
     );

@@ -40,28 +40,55 @@
     }
     return true;
   }
-  function stream(fd) {
-    return {
-      fd,
-      isTTY: host.isatty(fd),
-      columns: 80,
-      rows: 24,
-      writable: true,
+  // The standard streams are node:stream's, made the first time one is
+  // read (a program that never touches them never loads the module), and
+  // handled as Node handles stdio: writes go out in order with console
+  // output, and destroying one (a `pipeline` into stdout does) leaves the
+  // descriptor open, emitting 'close' so `finished` and `pipeline` complete.
+  function stdioDestroy(err, cb) {
+    cb(err);
+    this._undestroy();
+    if (!this._writableState.emitClose) process.nextTick(() => this.emit("close"));
+  }
+  function writableStdio(fd) {
+    const { Writable } = host.cjs().builtin("stream");
+    const s = new Writable({
+      decodeStrings: false,
       write(chunk, encoding, cb) {
         host.write(fd, typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
-        if (typeof encoding === "function") encoding();
-        else if (typeof cb === "function") cb();
-        return true;
+        cb();
       },
-      end(chunk) { if (chunk != null) this.write(chunk); },
-      on() { return this; },
-      once() { return this; },
-      off() { return this; },
-      removeListener() { return this; },
-      emit() { return false; },
-      getColorDepth() { return 1; },
-      hasColors() { return false; },
-    };
+    });
+    s.fd = fd;
+    s._isStdio = true;
+    s.isTTY = host.isatty(fd);
+    s.columns = 80;
+    s.rows = 24;
+    s.destroySoon = s.destroy;
+    s._destroy = stdioDestroy;
+    s.getColorDepth = () => 1;
+    s.hasColors = () => false;
+    s.getWindowSize = () => [80, 24];
+    return s;
+  }
+  function readableStdin() {
+    const { Readable } = host.cjs().builtin("stream");
+    const s = new Readable({
+      highWaterMark: 65536,
+      // A blocking read: a terminal hands over a line at a time, a pipe or
+      // a file what it has. The program waits for input as it asked to.
+      read(size) {
+        const chunk = host.readStdin(Math.max(size, 1), true);
+        this.push(chunk === null ? null : Buffer.from(chunk));
+      },
+    });
+    s.fd = 0;
+    s._isStdio = true;
+    s.isTTY = host.isatty(0);
+    s.isRaw = false;
+    s.setRawMode = function (mode) { this.isRaw = !!mode; return this; };
+    s.ref = s.unref = function () { return this; };
+    return s;
   }
   function hrtime(prev) {
     const [s, ns] = host.hrtime();
@@ -104,9 +131,7 @@
     exitCode: undefined,
     config: { variables: {} },
     features: {},
-    stdout: stream(1),
-    stderr: stream(2),
-    stdin: { fd: 0, isTTY: host.isatty(0), on() { return this; }, once() { return this; }, setEncoding() {}, resume() {}, pause() {} },
+
     cwd: () => host.cwd(),
     chdir() { throw new Error("process.chdir() is not supported"); },
     exit(code) {
@@ -123,6 +148,12 @@
       if (ticks.length === 2) host.requestTicks();
     },
     hrtime,
+    get stdout() { return defineProperty(this, "stdout", { value: writableStdio(1), writable: true, configurable: true, enumerable: true }).stdout; },
+    set stdout(v) { defineProperty(this, "stdout", { value: v, writable: true, configurable: true, enumerable: true }); },
+    get stderr() { return defineProperty(this, "stderr", { value: writableStdio(2), writable: true, configurable: true, enumerable: true }).stderr; },
+    set stderr(v) { defineProperty(this, "stderr", { value: v, writable: true, configurable: true, enumerable: true }); },
+    get stdin() { return defineProperty(this, "stdin", { value: readableStdin(), writable: true, configurable: true, enumerable: true }).stdin; },
+    set stdin(v) { defineProperty(this, "stdin", { value: v, writable: true, configurable: true, enumerable: true }); },
     uptime() {
       const [s, ns] = hrtime(start);
       return s + ns / 1e9;

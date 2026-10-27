@@ -72,7 +72,8 @@
   }
   function stringOf(bytes, enc) {
     switch (normEncoding(enc)) {
-      case "utf8": return new TextDecoder().decode(bytes);
+      // A leading BOM is a character of the text, as Node keeps it.
+      case "utf8": return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
       case "hex": {
         let s = "";
         for (let i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
@@ -172,8 +173,9 @@
       const out = Buffer.alloc(totalLength);
       let at = 0;
       for (const b of list) {
+        if (at >= totalLength) break;
         const take = Math.min(b.length, totalLength - at);
-        if (take <= 0) break;
+        if (take === 0) continue;
         out.set(take === b.length ? b : b.subarray(0, take), at);
         at += take;
       }

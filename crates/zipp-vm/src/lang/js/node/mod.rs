@@ -33,6 +33,7 @@ const PARTS: &[(&str, &str)] = &[
     ("timers", include_str!("timers.js")),
     ("clone", include_str!("clone.js")),
     ("url_whatwg", include_str!("url_whatwg.js")),
+    ("web_events", include_str!("web_events.js")),
     ("process", include_str!("process.js")),
     ("cjs", include_str!("cjs.js")),
     ("builtin/path", include_str!("builtins/path.js")),
@@ -46,6 +47,8 @@ const PARTS: &[(&str, &str)] = &[
     ("builtin/assert", include_str!("builtins/assert.js")),
     ("builtin/buffer", include_str!("builtins/buffer.js")),
     ("builtin/crypto", include_str!("builtins/crypto.js")),
+    ("builtin/stream", include_str!("builtins/stream.js")),
+    ("builtin/readline", include_str!("builtins/readline.js")),
     (
         "builtin/string_decoder",
         include_str!("builtins/string_decoder.js"),
@@ -490,6 +493,11 @@ impl<'p> Vm<'p> {
                     return Ok(Value::NULL);
                 }
                 bytes.truncate(n);
+                // The bytes as read (a stream decodes them, keeping a
+                // character split between two reads whole).
+                if self.truthy(arg(1)) {
+                    return self.node_bytes(bytes);
+                }
                 let text = String::from_utf8(bytes)
                     .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 self.alloc_str(text)

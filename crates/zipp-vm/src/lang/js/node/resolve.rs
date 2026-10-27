@@ -87,6 +87,11 @@ fn file_url_path(spec: &str) -> Option<PathBuf> {
 
 /// The modules Node builds in, by the names `require` and `import` take.
 pub(crate) const BUILTINS: &[&str] = &[
+    "_stream_duplex",
+    "_stream_passthrough",
+    "_stream_readable",
+    "_stream_transform",
+    "_stream_writable",
     "assert",
     "assert/strict",
     "async_hooks",

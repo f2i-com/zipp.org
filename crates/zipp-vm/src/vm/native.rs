@@ -1770,7 +1770,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         NODE_HOST_FS => ("fs", 4),
         NODE_HOST_CJS => ("cjs", 0),
         NODE_HOST_INSPECT => ("inspect", 1),
-        NODE_HOST_READ_STDIN => ("readStdin", 1),
+        NODE_HOST_READ_STDIN => ("readStdin", 2),
         FR_REGISTER => ("register", 2),
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),

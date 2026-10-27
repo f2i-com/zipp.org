@@ -13,7 +13,8 @@
   const cache = ObjectCreate(null);
   const builtinCache = ObjectCreate(null);
   const builtinModules = [
-    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console",
+    "_stream_duplex", "_stream_passthrough", "_stream_readable", "_stream_transform",
+    "_stream_writable", "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console",
     "constants", "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises", "events", "fs",
     "fs/promises", "http", "http2", "https", "inspector", "module", "net", "os", "path",
     "path/posix", "path/win32", "perf_hooks", "process", "punycode", "querystring", "readline",
@@ -123,6 +124,9 @@
     "util/types": "util", sys: "util", fs: "fs", "fs/promises": "fs", os: "os", tty: "tty",
     url: "url", module: "module", assert: "assert", "assert/strict": "assert", buffer: "buffer",
     crypto: "crypto", string_decoder: "string_decoder",
+    stream: "stream", "stream/promises": "stream", _stream_readable: "stream",
+    _stream_writable: "stream", _stream_duplex: "stream", _stream_transform: "stream",
+    _stream_passthrough: "stream", readline: "readline", "readline/promises": "readline",
   };
   function unsupported(name) {
     // A module the layer does not have: requiring it works (packages often
@@ -175,7 +179,10 @@
       else if (name === "path/win32") value = base.win32;
       else if (name === "util/types") value = base.types;
       else if (name === "assert/strict") value = base.strict;
-      else value = base;
+      else if (name === "stream/promises" || name === "readline/promises") value = base.promises;
+      else if (name.startsWith("_stream_")) {
+        value = { _stream_readable: base.Readable, _stream_writable: base.Writable, _stream_duplex: base.Duplex, _stream_transform: base.Transform, _stream_passthrough: base.PassThrough }[name];
+      } else value = base;
     } else if (builtinSet.has(name)) value = unsupported(name);
     else {
       const e = new Error("No such built-in module: node:" + name);
