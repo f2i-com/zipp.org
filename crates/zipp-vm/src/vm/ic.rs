@@ -1349,7 +1349,10 @@ impl<'p> Vm<'p> {
     /// non-async) user function. `None` for natives/bound/generators/… —
     /// the caller falls back to the slow path. (Also used by the JIT prop-miss
     /// helpers to pre-screen a bakeable accessor fn for a B114 ACCESSOR way.)
-    #[inline]
+    /// Always inlined: as a call, its Option came back through memory
+    /// as two 4-byte stores read as one 8-byte load, a stalled store-forward
+    /// at every caller (a twentieth of constructing a class instance).
+    #[inline(always)]
     pub(crate) fn ic_plain_fn(&self, v: Value) -> Option<(u32, u32)> {
         if !v.is_heap() {
             return None;

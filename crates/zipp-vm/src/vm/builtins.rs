@@ -735,7 +735,10 @@ impl<'p> Vm<'p> {
     /// The `(func id, closure)` of `v` when calling it pushes a frame and
     /// runs its body: an ordinary function or closure that is not a
     /// generator or an async function.
-    #[inline]
+    /// Always inlined: as a call, its Option came back through memory
+    /// as two 4-byte stores read as one 8-byte load, a stalled store-forward
+    /// at every caller (a twentieth of constructing a class instance).
+    #[inline(always)]
     pub(crate) fn plain_fn_entry(&self, v: Value) -> Option<(u32, u32)> {
         if !v.is_heap() {
             return None;
