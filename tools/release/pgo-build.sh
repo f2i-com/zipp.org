@@ -7,8 +7,13 @@
 #      JavaScript, Python and the GPU path, as the plain build has);
 #   2. the PGO training corpus, bench/pgo-training, run by that binary through
 #      tools/pgo_training.py: the inputs and the exact output each must print
-#      are bench/pgo-training/expected-output.json's, staged read-only first;
-#   3. the profiles merged by the selected toolchain's llvm-profdata;
+#      are bench/pgo-training/expected-output.json's, staged read-only first.
+#      It runs twice: as the CLI runs it, then interpreted (ZIPP_NOJIT=1), as
+#      a large program, a sandboxed one and any loop the JIT declines runs.
+#      The corpus is small programs whose hot loops the JIT compiles, so the
+#      first pass alone left the interpreter's paths for those loops cold;
+#   3. the profiles of both passes merged by the selected toolchain's
+#      llvm-profdata;
 #   4. the release build with that profile, where
 #      `cargo build --release --target TARGET` leaves the binary.
 #
@@ -41,7 +46,7 @@ python=$(command -v python3 || command -v python)
 work="$PWD/target/pgo-release"
 # A previous run left its stage read-only (tools/pgo_training.py seals it).
 if [[ -e $work ]]; then chmod -R u+w "$work"; rm -rf "$work"; fi
-mkdir -p "$work/profiles" "$work/stage"
+mkdir -p "$work/profiles" "$work/profiles-interp" "$work/stage"
 # The same directory as cargo and Python (native programs) must be told it.
 root_n=$(native_path "$PWD")
 work_n=$(native_path "$work")
@@ -76,28 +81,41 @@ CARGO_TARGET_DIR="$work_n/target" \
   RUSTFLAGS="$base_flags -Cprofile-generate=$work_n/profiles" \
   cargo build --locked --release --package zipp-cli --bin zipp --target "$target"
 
-echo "== stage 2/4: training =="
-run_args=(run --root "$work_n/stage" --binary "$work_n/target/$target/release/$exe"
-  --manifest "$work_n/stage/$manifest" --profile-dir "$work_n/profiles"
-  --profile-list "$work_n/profile-list")
-for input in "${inputs[@]}"; do run_args+=(--input "$input"); done
-"$python" -I tools/pgo_training.py "${run_args[@]}"
+# train DIR LIST: the corpus once, its profiles in DIR and their list in LIST.
+train() {
+  local run_args=(run --root "$work_n/stage" --binary "$work_n/target/$target/release/$exe"
+    --manifest "$work_n/stage/$manifest" --profile-dir "$1" --profile-list "$2")
+  for input in "${inputs[@]}"; do run_args+=(--input "$input"); done
+  "$python" -I tools/pgo_training.py "${run_args[@]}"
+}
+echo "== stage 2/4: training, as the CLI runs it =="
+train "$work_n/profiles" "$work_n/profile-list"
+echo "== stage 2/4: training, interpreted =="
+(export ZIPP_NOJIT=1; train "$work_n/profiles-interp" "$work_n/profile-list-interp")
 
 echo "== stage 3/4: merge =="
-"$python" -I tools/pgo_training.py verify-profiles \
-  --profile-dir "$work_n/profiles" --profile-list "$work_n/profile-list" > "$work/verified"
-mapfile -d '' -t profiles < "$work/verified"
-if [[ ${#profiles[@]} -ne ${#inputs[@]} ]]; then
-  echo "error: ${#profiles[@]} profiles for ${#inputs[@]} training inputs" >&2
-  exit 1
-fi
+profiles=()
+for pass in "" -interp; do
+  "$python" -I tools/pgo_training.py verify-profiles --profile-dir "$work_n/profiles$pass" \
+    --profile-list "$work_n/profile-list$pass" > "$work/verified$pass"
+  mapfile -d '' -t pass_profiles < "$work/verified$pass"
+  if [[ ${#pass_profiles[@]} -ne ${#inputs[@]} ]]; then
+    echo "error: ${#pass_profiles[@]} profiles for ${#inputs[@]} training inputs (pass '$pass')" >&2
+    exit 1
+  fi
+  profiles+=("${pass_profiles[@]}")
+done
 merged="$work/merged.profdata"
 "$profdata" merge -o "$work_n/merged.profdata" "${profiles[@]}"
 profile_sha256=$(sha256sum "$merged" | awk '{ print $1 }')
-# The corpus as trained: the manifest and each input, in order.
-recipe_sha256=$(for f in "$manifest" "${inputs[@]}"; do
-  printf '%s %s\n' "$(sha256sum "$f" | awk '{ print $1 }')" "$f"
-done | sha256sum | awk '{ print $1 }')
+# The corpus as trained: the passes, then the manifest and each input, in
+# order.
+recipe_sha256=$({
+  printf 'passes: default, ZIPP_NOJIT=1\n'
+  for f in "$manifest" "${inputs[@]}"; do
+    printf '%s %s\n' "$(sha256sum "$f" | awk '{ print $1 }')" "$f"
+  done
+} | sha256sum | awk '{ print $1 }')
 echo "merged profile sha256 $profile_sha256, training corpus sha256 $recipe_sha256"
 
 echo "== stage 4/4: profile-guided release build =="

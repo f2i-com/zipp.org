@@ -217,16 +217,17 @@ PGO_RUNNER_POLICY = (
     "one-profraw-per-input;explicit-hashed-profile-merge;atomic-publish"
 )
 PGO_RECIPE_VERSION = (
-    "zipp-pgo-training-recipe-v7-immutable-source-staged-bounded-external-code-off"
+    "zipp-pgo-training-recipe-v8-immutable-source-staged-bounded-external-code-off-two-pass"
 )
 PGO_EXCLUDED_INPUTS_LABEL = "excluded-publication-inputs"
 PGO_RECIPE_COMMAND = (
     "build both Cargo stages from one private read-only clean-HEAD source snapshot; "
     "stage ordered corpus and scored provenance into an exclusive read-only tree; "
-    "validate staged bytes; run each ordered training input once as zipp js "
-    "--pgo-training STAGED_INPUT under zipp-pgo-training-env-allowlist-v1; "
+    "validate staged bytes; run each ordered training input twice as zipp js "
+    "--pgo-training STAGED_INPUT under zipp-pgo-training-env-allowlist-v1, "
+    "the second time with ZIPP_NOJIT=1 added; "
     "enforce timeout, output caps, exact manifest stdout, and one explicitly "
-    "hashed profraw per input; merge only enumerated profiles"
+    "hashed profraw per input per pass; merge only enumerated profiles"
 )
 PGO_BUILD_RECIPE_VERSION = "zipp-pgo-build-recipe-v2"
 PGO_BUILD_CONTRACT = (

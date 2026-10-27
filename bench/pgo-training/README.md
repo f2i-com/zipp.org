@@ -67,10 +67,16 @@ ShadowRealm evaluation and imports, `$262.evalScript`, `$262.agent.start`, and
 filesystem module loading before secondary source is parsed or read. This flag
 is a PGO provenance boundary, not a sandbox for hostile main source.
 
-The instrumented run writes into an exclusive profile directory. The runner
-requires exactly one new regular `.profraw` file per ordered input, records its
-hash, rejects extras or mutations, and the script merges only that enumerated
-set. Profile snapshots and the final binary are copied through exclusive sibling
+The corpus is trained twice: once as the CLI runs it, then interpreted
+(`ZIPP_NOJIT=1`), as a large program, a sandboxed one and any loop the JIT
+declines runs. Every input here but the application-scale one is a small
+program whose hot loops the JIT compiles, so with the first pass alone the
+interpreter's paths for those loops (global and typed-array loops, `try`
+blocks) were among the profile's coldest code, and the profile-guided build ran
+them 10-20% slower than a plain build. Each pass writes into an exclusive
+profile directory. The runner requires exactly one new regular `.profraw` file
+per ordered input, records its hash, rejects extras or mutations, and the script
+merges only the two enumerated sets. Profile snapshots and the final binary are copied through exclusive sibling
 temporaries and atomically published after regular-file/reparse and digest
 checks. The spelling, similarity, runner, staging, manifest, and publication
 policies plus their implementation bytes are bound into the PGO recipe hash.

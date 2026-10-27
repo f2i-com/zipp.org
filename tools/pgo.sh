@@ -189,8 +189,8 @@ TRAINING_RUNNER=tools/pgo_training.py
 EXPECTED_OUTPUT_MANIFEST=bench/pgo-training/expected-output.json
 PGO_SIMILARITY_POLICY='zipp-pgo-structural-similarity-v1;normalized-js-tokens;10gram;ngram-evidence>=16;function-containment<0.78;whole-containment<0.66;window=96/24@0.82;absolute-run<72;short-run<36-or-0.90;training-source=ascii-lf;training-template-literal=deny;training-unicode-escape=deny;training-html-comment=deny;training-hashbang=deny;training-fnv1a=deny;training-distinctive-numbers=disjoint;training-numeric-tuples=disjoint;training-cooked-strings+regex-bodies=disjoint;training-ambiguous-slash=deny;private-id=atomic'
 PGO_RUNNER_POLICY='zipp-pgo-runner-v1;exclusive-readonly-stage;external-code-off;timeout=30s;stdout<=4096;combined-output<=8192;output=manifest;one-profraw-per-input;explicit-hashed-profile-merge;atomic-publish'
-PGO_RECIPE_VERSION='zipp-pgo-training-recipe-v7-immutable-source-staged-bounded-external-code-off'
-PGO_RECIPE_COMMAND='build both Cargo stages from one private read-only clean-HEAD source snapshot; stage ordered corpus and scored provenance into an exclusive read-only tree; validate staged bytes; run each ordered training input once as zipp js --pgo-training STAGED_INPUT under zipp-pgo-training-env-allowlist-v1; enforce timeout, output caps, exact manifest stdout, and one explicitly hashed profraw per input; merge only enumerated profiles'
+PGO_RECIPE_VERSION='zipp-pgo-training-recipe-v8-immutable-source-staged-bounded-external-code-off-two-pass'
+PGO_RECIPE_COMMAND='build both Cargo stages from one private read-only clean-HEAD source snapshot; stage ordered corpus and scored provenance into an exclusive read-only tree; validate staged bytes; run each ordered training input twice as zipp js --pgo-training STAGED_INPUT under zipp-pgo-training-env-allowlist-v1, the second time with ZIPP_NOJIT=1 added; enforce timeout, output caps, exact manifest stdout, and one explicitly hashed profraw per input per pass; merge only enumerated profiles'
 
 # Derive the excluded scored-source set from the same definitions as the two
 # publication harnesses: every tracked bench/**/*.js|mjs|cjs outside the training
@@ -735,11 +735,15 @@ fi
 PGO_WORK_DIR="$(mktemp -d "$CHECKOUT_ROOT/target/pgo-work.XXXXXX")"
 "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" check --path "$PGO_WORK_DIR" --kind directory --empty
 PGODIR="$PGO_WORK_DIR/raw"
+PGODIR_INTERP="$PGO_WORK_DIR/raw-interp"
 PROFDATA="$PGO_WORK_DIR/merged.profdata"
 PROFILE_LIST="$PGO_WORK_DIR/profile-list"
+PROFILE_LIST_INTERP="$PGO_WORK_DIR/profile-list-interp"
 VERIFIED_PROFILE_PATHS="$PGO_WORK_DIR/verified-profile-paths"
-mkdir "$PGODIR"
+VERIFIED_PROFILE_PATHS_INTERP="$PGO_WORK_DIR/verified-profile-paths-interp"
+mkdir "$PGODIR" "$PGODIR_INTERP"
 "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" check --path "$PGODIR" --kind directory --empty
+"$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" check --path "$PGODIR_INTERP" --kind directory --empty
 
 echo "== stage 1/4: instrumented build =="
 PGODIR_RUSTC="$(cargo_path "$PGODIR")"
@@ -748,42 +752,63 @@ run_cargo_build "$GENERATE_RUSTFLAGS" "" ""
 verify_training_recipe_unchanged
 verify_source_and_tools_unchanged
 
-echo "== stage 2/4: training (7 structural-similarity-guarded workloads) =="
+echo "== stage 2/4: training (structural-similarity-guarded workloads, two passes) =="
 # Exact publication inputs are never launched here. The runner invokes only
 # immutable staged programs with runtime compilation/module loading disabled,
-# bounded output/time, and byte-exact expected stdout.
-TRAINING_RUN_ARGS=(
-  run
-  --root "$CORPUS_STAGE"
-  --binary "$BIN"
-  --manifest "$STAGED_EXPECTED_OUTPUT_MANIFEST"
-  --profile-dir "$PGODIR"
-  --profile-list "$PROFILE_LIST"
-)
-for input in "${TRAINING_INPUTS[@]}"; do
-  TRAINING_RUN_ARGS+=(--input "$input")
-done
-env -i \
-  "${BUILD_ENV_ARGS[@]}" \
-  LC_ALL=C LANG=C TZ=UTC \
-  "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" "${TRAINING_RUN_ARGS[@]}"
+# bounded output/time, and byte-exact expected stdout. The corpus runs twice:
+# as the CLI runs it, then interpreted (ZIPP_NOJIT=1), as a large program and
+# any loop the JIT declines runs. Its small programs' hot loops are the JIT's,
+# so the first pass alone left the interpreter's paths for them cold.
+# train_pass PROFILE_DIR PROFILE_LIST [VAR=VALUE...]
+train_pass() {
+  local profile_dir=$1 profile_list=$2
+  shift 2
+  local run_args=(
+    run
+    --root "$CORPUS_STAGE"
+    --binary "$BIN"
+    --manifest "$STAGED_EXPECTED_OUTPUT_MANIFEST"
+    --profile-dir "$profile_dir"
+    --profile-list "$profile_list"
+  )
+  for input in "${TRAINING_INPUTS[@]}"; do
+    run_args+=(--input "$input")
+  done
+  env -i \
+    "${BUILD_ENV_ARGS[@]}" \
+    LC_ALL=C LANG=C TZ=UTC \
+    "$@" \
+    "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" "${run_args[@]}"
+}
+train_pass "$PGODIR" "$PROFILE_LIST"
+train_pass "$PGODIR_INTERP" "$PROFILE_LIST_INTERP" ZIPP_NOJIT=1
 verify_training_recipe_unchanged
 verify_source_and_tools_unchanged
 
 echo "== stage 3/4: merge profiles =="
-if ! "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" verify-profiles \
-  --profile-dir "$PGODIR" --profile-list "$PROFILE_LIST" > "$VERIFIED_PROFILE_PATHS"; then
-  echo "error: generated PGO profile set failed enumeration/hash validation" >&2
-  exit 1
-fi
-mapfile -d '' -t PROFILE_PATHS < "$VERIFIED_PROFILE_PATHS"
-if [[ ${#PROFILE_PATHS[@]} -ne ${#TRAINING_INPUTS[@]} ]]; then
-  echo "error: generated profile count does not match the ordered training corpus" >&2
-  exit 1
-fi
+PROFILE_PATHS=()
+PASS_DIRS=("$PGODIR" "$PGODIR_INTERP")
+PASS_LISTS=("$PROFILE_LIST" "$PROFILE_LIST_INTERP")
+PASS_VERIFIED=("$VERIFIED_PROFILE_PATHS" "$VERIFIED_PROFILE_PATHS_INTERP")
+for pass in 0 1; do
+  pass_verified=${PASS_VERIFIED[$pass]}
+  if ! "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" verify-profiles \
+    --profile-dir "${PASS_DIRS[$pass]}" --profile-list "${PASS_LISTS[$pass]}" > "$pass_verified"; then
+    echo "error: generated PGO profile set failed enumeration/hash validation" >&2
+    exit 1
+  fi
+  mapfile -d '' -t PASS_PROFILE_PATHS < "$pass_verified"
+  if [[ ${#PASS_PROFILE_PATHS[@]} -ne ${#TRAINING_INPUTS[@]} ]]; then
+    echo "error: generated profile count does not match the ordered training corpus" >&2
+    exit 1
+  fi
+  PROFILE_PATHS+=("${PASS_PROFILE_PATHS[@]}")
+done
 "$LLVM_PROFDATA" merge -o "$PROFDATA" "${PROFILE_PATHS[@]}"
 "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" verify-profiles \
   --profile-dir "$PGODIR" --profile-list "$PROFILE_LIST" > /dev/null
+"$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" verify-profiles \
+  --profile-dir "$PGODIR_INTERP" --profile-list "$PROFILE_LIST_INTERP" > /dev/null
 "$PYTHON_BIN" -I "$STAGED_TRAINING_RUNNER" check --path "$PROFDATA" --kind file
 PROFILE_SHA256="$(sha256_file "$PROFDATA")"
 PROFILE_SNAPSHOT_DIR="$CHECKOUT_ROOT/target/pgo-profiles"
