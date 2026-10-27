@@ -82,7 +82,68 @@ impl<'p> Vm<'p> {
                 return Ok(self.alloc_array_current_realm(out));
             }
         }
+        if obj.is_heap() && self.plain_enum_object(obj.heap_index()) {
+            if let Some(v) = self.plain_data_enum(obj.heap_index(), what) {
+                return Ok(v);
+            }
+        }
         self.with_host_roots(&[obj], |vm| vm.object_enum_own_inner(obj, what))
+    }
+
+    /// `Object.keys` / `values` / `entries` of a plain object whose every
+    /// property is a default data property (enumerable, writable,
+    /// configurable, no accessor): its own string keys in spec order, as
+    /// key strings, and their slots' values, in one walk. No getter can run
+    /// between the reads, so the general path's key snapshot and per-key
+    /// descriptor re-read can only agree with it. That path copied every
+    /// key, found each again by its text and read it with [[Get]]: a
+    /// dictionary of 1,800 keys paid three hash lookups and a malloc a key,
+    /// on every call. `None` for any other object.
+    fn plain_data_enum(&mut self, idx: u32, what: EnumWhat) -> Option<Value> {
+        let keys_wanted = !matches!(what, EnumWhat::Values);
+        let mut misses: Vec<(usize, String)> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        let mut vals: Vec<Value> = Vec::new();
+        match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.may_deviate_attrs() && m.class.is_none() => {
+                for i in spec_key_order_map(m) {
+                    let k = m.key_at(i);
+                    if is_hidden_key(k) {
+                        continue;
+                    }
+                    let v = m.val_at(i);
+                    if v.is_uninitialized() {
+                        return None;
+                    }
+                    if keys_wanted {
+                        match self.cached_key_str(k) {
+                            Some(kv) => keys.push(kv),
+                            None => {
+                                misses.push((keys.len(), k.to_owned()));
+                                keys.push(Value::UNDEFINED);
+                            }
+                        }
+                    }
+                    vals.push(v);
+                }
+            }
+            _ => return None,
+        }
+        for (pos, k) in misses {
+            keys[pos] = self.alloc_key_str(k);
+        }
+        let out = match what {
+            EnumWhat::Keys => keys,
+            EnumWhat::Values => vals,
+            EnumWhat::Entries => {
+                let mut pairs = Vec::with_capacity(keys.len());
+                for (k, v) in keys.into_iter().zip(vals) {
+                    pairs.push(self.alloc_array_current_realm(vec![k, v]));
+                }
+                pairs
+            }
+        };
+        Some(self.alloc_array_current_realm(out))
     }
 
     /// Whether `idx` is an ordinary object whose keys live in its `ObjMap`
