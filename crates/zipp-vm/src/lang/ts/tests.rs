@@ -259,3 +259,15 @@ fn a_local_value_displaces_a_type_import() {
         .collect();
     assert_eq!(imports, ["./types:1", "./side-effect:0"]);
 }
+
+#[test]
+fn json_imports_are_json_modules() {
+    let src = "import data from './data.json'; import other from './x.json' with { type: 'json' }; console.log(data, other)";
+    let ast = super::parse_auto(src, super::TsConfig::default()).unwrap_or_else(|f| panic!("{}", f.message));
+    for s in &ast.body {
+        if let crate::parse::ast::Stmt::Import(d) = s {
+            assert_eq!(d.attributes.len(), 1, "{}", d.source);
+            assert_eq!(d.attributes[0].value.to_lossy_string(), "json");
+        }
+    }
+}

@@ -4,8 +4,8 @@ Zipp is one engine for several languages. The core is language-neutral in
 structure and JavaScript's in meaning: one bytecode, one VM, one heap and
 collector, one set of native tiers. A language is a frontend that compiles
 its source to that bytecode, plus whatever it adds where its semantics are
-not JavaScript's. JavaScript and Python are built in; this page is how they
-fit together and how another language would.
+not JavaScript's. JavaScript, TypeScript and Python are built in; this page
+is how they fit together and how another language would.
 
 ## Layout
 
@@ -19,6 +19,8 @@ crates/zipp-vm/src/
   lang/
     mod.rs                  the `Language` trait and the table of languages
     js/                     JavaScript: parse/, compile/, front.rs, mod.rs
+    ts/                     TypeScript: types.rs, expr.rs, decl.rs, class.rs,
+                            lower.rs, elide.rs, config.rs, mod.rs
     python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
                             vm/, jit/, mod.rs
 ```
@@ -94,3 +96,40 @@ need nothing from a language.
   method, a getter) goes to the executor or the runtime, and through the
   VM's ordinary call protocol, which owns re-entrancy, the recursion limit
   and the GC's safe points.
+
+## TypeScript
+
+TypeScript is the one language that needs nothing past the parser. It is a
+dialect of JavaScript's grammar: the JavaScript parser reads a `.ts`, `.mts`
+or `.cts` file with `ParseOptions::typescript` on and calls into `lang/ts`
+at each place the grammars part, and the tree that comes out is the one the
+same program written in JavaScript gives. There is no transpile step and no
+JavaScript text; the compiler, the VM and the JIT run it as they run
+JavaScript.
+
+- **Types are read and dropped** (`types.rs`): a recursive descent over
+  tsc's type grammar that checks what it reads and builds nothing.
+  Annotations, type parameters and arguments, `as`, `satisfies`, `!`,
+  `interface`, `type`, `declare`, overload signatures and abstract members
+  leave no trace.
+- **Constructs with a run-time meaning are lowered** (`lower.rs`) to the
+  tree of the JavaScript tsc emits: `enum` (constant-folded, reverse-mapped;
+  a `const enum`'s members are inlined where read), `namespace`, constructor
+  parameter properties, `import x = …` and `export = …`.
+- **Imports used only as types are elided** (`elide.rs`), as tsc elides
+  them; a `.ts` module's `export { T } from` of a name its dependency does
+  not export (a type) is left out rather than a link error.
+- **`tsconfig.json` decides class fields** (`config.rs`): with
+  `useDefineForClassFields` (or a target of ES2022 or later) fields are
+  defined on the instance; otherwise, and with no config, they are assigned
+  in the constructor, which is tsc's default.
+- **Modules resolve the way TypeScript names them**: `./x` finds `./x.ts`
+  or `./x/index.ts`, and `./x.js` finds `./x.ts`.
+
+The ambiguous prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against
+`f < T > (x)`, `<T>x` against `<T>(x) => …`) are settled as tsc settles
+them, with the parser's snapshot as the fallback point. `zipp ts file.ts`
+(or `zipp file.ts`) runs a file; `zipp ts-sweep <paths>` parses a corpus
+and groups the failures. Not supported: `.tsx` (the engine has no JSX) and
+`experimentalDecorators`' legacy decorator semantics (decorators are the
+standard ones).

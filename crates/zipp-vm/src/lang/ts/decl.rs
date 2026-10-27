@@ -708,11 +708,19 @@ impl<'s> Parser<'s> {
             return Err(self.err_here("SyntaxError: expected a module specifier string"));
         };
         self.bump_after_operand()?;
-        let attributes = self.parse_import_attributes()?;
+        let mut attributes = self.parse_import_attributes()?;
         self.semicolon()?;
         // `import { type A } from "m"` imports nothing at run time.
         if specifiers.is_empty() && had_types {
             return Ok(Stmt::Empty);
+        }
+        // tsc's `resolveJsonModule`: `import data from "./data.json"` is the
+        // JSON module `with { type: "json" }` asks for.
+        if attributes.is_empty() && source.to_lossy_string().ends_with(".json") {
+            attributes.push(ImportAttribute {
+                key: crate::parse::token::StrVal::Utf8("type".into()),
+                value: crate::parse::token::StrVal::Utf8("json".into()),
+            });
         }
         Ok(Stmt::Import(Box::new(ImportDecl {
             specifiers,

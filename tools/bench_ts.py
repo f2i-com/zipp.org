@@ -11,7 +11,9 @@ clock medians of interleaved runs, start-up included, which is what running
 a `.ts` file costs.
 
 A generated `large.ts` (several thousand typed declarations, little run
-time) measures the cost of reading TypeScript itself.
+time) measures the cost of reading TypeScript itself; `large-strip.ts` is
+the same with only erasable syntax, which Node reads in its fast
+type-stripping mode.
 """
 import argparse
 import os
@@ -70,6 +72,52 @@ export const helper{i} = <T,>(xs: readonly T[], f: (x: T, i: number) => boolean)
     path.write_text("".join(out), encoding="utf-8")
 
 
+def generate_large_erasable(path: Path, units: int) -> None:
+    """`generate_large` with only erasable syntax (no enums, parameter
+    properties or overloaded implementations Node's stripping rejects), so
+    Node reads it in its fast type-stripping mode."""
+    out = []
+    for i in range(units):
+        out.append(
+            f"""
+export interface Shape{i}<T extends object = {{}}> {{
+  readonly id: number;
+  name?: string;
+  tags: ReadonlyArray<string>;
+  meta: Record<string, T | null>;
+  transform(input: T, options?: {{ deep: boolean; depth: number }}): Promise<T[]>;
+}}
+export type Union{i} = {{ kind: "a"; value: number }} | {{ kind: "b"; text: string }} | null;
+export const Kind{i} = {{ First: {i}, Second: {i + 1}, Third: {i * 2}, Label: "label{i}" }} as const;
+export class Store{i}<K extends string, V> implements Iterable<[K, V]> {{
+  private readonly items = new Map<K, V>();
+  private readonly label: string;
+  protected limit: number;
+  constructor(label: string, limit: number = {i}) {{ this.label = label; this.limit = limit; }}
+  get(key: K): V | undefined {{ return this.items.get(key); }}
+  set(key: K, value: V): this {{ if (this.items.size < this.limit) this.items.set(key, value); return this; }}
+  *[Symbol.iterator](): Iterator<[K, V]> {{ yield* this.items; }}
+  static of<K extends string, V>(entries: readonly (readonly [K, V])[]): Store{i}<K, V> {{
+    const s = new Store{i}<K, V>("of", entries.length);
+    for (const [k, v] of entries) s.set(k, v);
+    return s;
+  }}
+}}
+export function pick{i}(u: Union{i}, fallback: string = "none"): string {{
+  if (u === null) return fallback;
+  return u.kind === "a" ? String(u.value as number) : u.text!;
+}}
+export const helper{i} = <T,>(xs: readonly T[], f: (x: T, i: number) => boolean): T[] => xs.filter(f);
+"""
+        )
+    out.append(
+        "\nlet acc = 0;\n"
+        + "".join(f"acc += Kind{i}.Third + pick{i}({{ kind: 'a', value: {i} }}).length;\n" for i in range(0, units, max(1, units // 50)))
+        + "console.log(acc);\n"
+    )
+    path.write_text("".join(out), encoding="utf-8")
+
+
 def run(cmd: list, cwd: Path) -> tuple:
     start = time.perf_counter()
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -96,7 +144,9 @@ def main() -> int:
     scratch.mkdir(parents=True, exist_ok=True)
     large = scratch / "large.ts"
     generate_large(large, args.units)
-    files = sorted(BENCH.glob("*.ts")) + [large]
+    large_strip = scratch / "large-strip.ts"
+    generate_large_erasable(large_strip, args.units)
+    files = sorted(BENCH.glob("*.ts")) + [large, large_strip]
     if args.only:
         files = [f for f in files if f.stem in args.only]
 
