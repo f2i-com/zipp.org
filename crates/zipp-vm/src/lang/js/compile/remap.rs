@@ -296,6 +296,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::Jump { .. }
         | Instr::CheckGlobalResolvable { .. }
         | Instr::PopHandler
+        | Instr::FusePopHandlerJump { .. }
         | Instr::PopFinally
         | Instr::JumpFinally { .. }
         | Instr::LazyCompile

@@ -5126,6 +5126,11 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
+                    Instr::FusePopHandlerJump { target } => {
+                        let top = self.frames.len() - 1;
+                        self.frames[top].handlers.pop();
+                        ip = target as usize;
+                    }
                     Instr::PushFinally {
                         target,
                         kind_reg,

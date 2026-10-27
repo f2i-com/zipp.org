@@ -2757,6 +2757,11 @@ pub enum Instr {
         a: Reg,
         upd: bool,
     },
+    /// `PopHandler` then a forward `Jump { target }`: the end of a `try`
+    /// block, which leaves its handler and skips the `catch`.
+    FusePopHandlerJump {
+        target: u32,
+    },
     /// `LoadGlobal { dst: gdst, idx }` then `AddInt { dst, a, imm, upd }`
     /// (independent operands as often as not: a global callee, then its
     /// argument `n - 1`).
@@ -3729,6 +3734,11 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
             // fused arm does what `Jump` does at a back-edge).
             (Instr::AddInt { dst, a, imm, upd }, Instr::Jump { target }) if target as usize <= i => {
                 Some(Instr::FuseAddIntJump { dst, a, imm, upd, target })
+            }
+            // The end of a `try` block, past its `catch` (forward only: a
+            // backward `Jump` is a back-edge, which polls).
+            (Instr::PopHandler, Instr::Jump { target }) if target as usize > i + 1 => {
+                Some(Instr::FusePopHandlerJump { target })
             }
             (Instr::LoadGlobal { dst: gdst, idx }, Instr::AddInt { dst, a, imm, upd }) => i16::try_from(imm)
                 .ok()
