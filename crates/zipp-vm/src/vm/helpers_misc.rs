@@ -1372,6 +1372,73 @@ pub(crate) extern "win64" fn jit_obj_enum_ic(
     })
 }
 
+/// Win64 helper for `GlobalFn` (`Number(x)`, `Boolean(x)`, `parseInt(s, r)`,
+/// `parseFloat(s)`, `isNaN(x)`, `isFinite(x)` and `String(x)`) in a Tier C
+/// body, `packed_args` = `callee | arg_base << 16 | argc << 32 | op << 48`:
+/// the interpreter's value (`Vm::global_fn_value`), with the call protocol
+/// (coercion runs `valueOf`/`toString`). A callee that is no longer the
+/// intrinsic declines with nothing done, for the interpreter's call.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_global_fn_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_global_fn_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
+/// Win64 helper for a private name in compiled code: a read `o.#x`
+/// (`GetProp`, op 0), a write `o.#x = v` (`SetPrivate`, op 1) and a field
+/// initializer's add (`SetProp`, op 2). `packed_args` = `obj | val << 16 |
+/// name << 32 | op << 56`. A read returns the value; a write returns `val`'s
+/// own bits, stored back over its register unchanged.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_private_prop_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_private_prop_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
+/// Win64 helper for `NewRegExp` (a regular expression literal, `RegExp(p,
+/// f)` or `new RegExp(p, f)`) in a Tier C body, `packed_args` = `pattern |
+/// flags << 16 | is_construct << 32`: the interpreter's value
+/// (`Vm::new_regexp_value`), with the call protocol (`@@match`, `source`,
+/// `flags` and a pattern's `toString` are user code).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_new_regexp_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_new_regexp_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
 /// Win64 helper for two object-literal instructions in a compiled region:
 /// `ObjectSpread` (`{ ...src }`, op 0, `packed_args` = `target | src << 16`)
 /// and `InitDataProp` (a literal's named data property after a spread or a
@@ -1848,6 +1915,26 @@ pub(crate) extern "win64" fn jit_get_index(
     let key = Value::from_bits(key_bits);
     if !arr.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // The common read first: a present element of a dense Array at an int
+    // key. With no side table on the array (no element override, no
+    // `defineProperty`'d index) and no arguments mapping, the element is its
+    // own data property and shadows the chain: the Array arm below answers
+    // the same after its lookups.
+    if key.is_int() {
+        // SAFETY: read-only view; the running code holds no conflicting borrow.
+        let vm = unsafe { &*(vm as *const Vm) };
+        let aidx = arr.heap_index();
+        if let HeapObj::Array(items) = vm.heap.get(aidx) {
+            if let Some(&v) = usize::try_from(key.as_int()).ok().and_then(|i| items.get(i)) {
+                if !v.is_hole()
+                    && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
+                    && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
+                {
+                    return v.bits();
+                }
+            }
+        }
     }
     // A key built by concatenation is a rope until something reads it. The
     // arm below wants its bytes in place, and a loop over more than 32 fresh

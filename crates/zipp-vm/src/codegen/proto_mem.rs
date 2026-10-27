@@ -1193,6 +1193,40 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // A class field's definition: `jit_define_field`'s append, or a
             // decline that replays the full definition in the interpreter.
             Instr::DefineField { .. } => {}
+            // An object literal's spread (`{ ...e, left }`, everywhere in
+            // TypeScript) and its named properties after one: the region's
+            // `jit_obj_init_ic`, with the call protocol (a spread's getters
+            // are user code).
+            Instr::InitDataProp { name, .. } if name <= 0xFF_FFFF => {}
+            Instr::ObjectSpread { .. } => {}
+            // Every other intrinsic global call (`Number(x)`, `parseInt`, …)
+            // through `jit_global_fn_ic`, with the call protocol.
+            Instr::GlobalFn { op, argc, .. }
+                if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {}
+            // A JavaScript array literal's element or spread: the region's
+            // `jit_array_append_ic`, with the call protocol (a spread runs
+            // the iterator protocol, user code).
+            Instr::ArrayAppend { .. } if !py => {}
+            // `f(...xs)`: the region's `jit_call_spread_ic`, with the call
+            // protocol (the iterator and the callee are user code).
+            Instr::CallSpread { .. } if !py => {}
+            // A regular expression literal (one object per evaluation) or
+            // `RegExp(p, f)`: `jit_new_regexp_ic`, with the call protocol.
+            Instr::NewRegExp { .. } if !py => {}
+            // `o.#x = v`: `jit_private_prop_ic` (a private setter is user code).
+            Instr::SetPrivate { name, .. } if !py && name <= 0xFF_FFFF => {}
+            // Array destructuring (`const [a, b] = v`, `[x, y] = [y, x]`): the
+            // region's `jit_iter_to_array_ic`, with the call protocol (a
+            // non-array iterator is user code).
+            Instr::IterToArray { count, .. } if !py && count <= 0xFFFF => {}
+            // A destructuring's close of an unexhausted iterator, and its
+            // error-path form: the region's `jit_iter_op_ic` (`return()` is
+            // user code).
+            Instr::IterClose { .. } | Instr::IterCloseQuiet { .. } if !py => {
+                if !crate::vm::tierc_iter_enabled() {
+                    reject!("[tierC-reject] iterator/finally op (disabled)");
+                }
+            }
             Instr::NewArray { .. } => {
                 if !crate::vm::tierc_new_array_enabled() {
                     reject!("[tierC-reject] op NewArray (disabled)");
@@ -1436,6 +1470,16 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
     }
     ok
+}
+
+/// Whether `name` is a private name (`#x`), which Tier C reads and writes
+/// through `jit_private_prop_ic` rather than the inline cache.
+fn tierc_private_name(proto: &FuncProto, name: u32) -> bool {
+    name <= 0xFF_FFFF
+        && proto
+            .string_constants
+            .get(name as usize)
+            .is_some_and(|s| s.starts_with('#'))
 }
 
 fn tierc_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
@@ -1686,6 +1730,19 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
             Instr::AppendDataProp { obj, val, .. } => (u2(obj, val), None),
             Instr::DefineField { obj, val, .. } => (u2(obj, val), None),
+            // The literal's own bits come back into its register.
+            Instr::InitDataProp { obj, val, .. } => (u2(obj, val), Some(obj)),
+            Instr::ObjectSpread { target, src } => (u2(target, src), Some(target)),
+            Instr::ArrayAppend { arr, val, .. } => (u2(arr, val), Some(arr)),
+            Instr::CallSpread { dst, callee, args } => (u2(callee, args), Some(dst)),
+            // A private write: `val`'s own bits come back into its register.
+            Instr::SetPrivate { obj, val, .. } => (u2(obj, val), Some(val)),
+            Instr::IterToArray { dst, src, .. } => (u1(src), Some(dst)),
+            // The iterator's own bits come back into its register.
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => (u1(iter), Some(iter)),
+            Instr::NewRegExp {
+                dst, pattern, flags, ..
+            } => (u2(pattern, flags), Some(dst)),
             Instr::SetHomeObject { method, home } => (u2(method, home), None),
             Instr::DeleteProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::NewArray {
@@ -5347,6 +5404,60 @@ pub(crate) fn compile_proto_mem(
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
             }
+            Instr::GetProp { dst, obj, name } if !py && tierc_private_name(proto, name) => {
+                // `o.#x`: `jit_private_prop_ic` op 0 (no inline-cache way
+                // ever holds a private name). The site stays reserved.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (name as u64) << 32,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+                ic_site += 1;
+            }
+            Instr::SetProp { obj, name, val, .. } if !py && tierc_private_name(proto, name) => {
+                // A private field initializer's add: op 2.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 2u64 << 56,
+                    0,
+                    val,
+                    refetch,
+                    None,
+                );
+                ic_site += 1;
+            }
+            Instr::SetPrivate { obj, name, val } if !py => {
+                // `o.#x = v`: op 1.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    val,
+                    refetch,
+                    None,
+                );
+            }
             Instr::GetProp { dst, obj, name } => {
                 // 8-way inline cache (call-free on hit), then the miss helper,
                 // then the PROP_VIA_IC slow path (accessor / class receiver — may
@@ -5926,6 +6037,160 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::GlobalFn {
+                dst,
+                op,
+                callee,
+                arg_base,
+                argc,
+            } if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_global_fn_ic as *const () as usize,
+                    packed_fip,
+                    callee as u64
+                        | (arg_base as u64) << 16
+                        | (argc as u64) << 32
+                        | (op as u8 as u64) << 48,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ArrayAppend { arr, val, spread } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_append_ic as *const () as usize,
+                    packed_fip,
+                    arr as u64 | (val as u64) << 16 | (spread as u64) << 32,
+                    0,
+                    arr,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::IterToArray { dst, src, count } if !py => {
+                // `[a, b] = v`: `jit_iter_to_array_ic`, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_to_array_ic as *const () as usize,
+                    packed_fip,
+                    src as u64 | (count as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if !py => {
+                // `jit_iter_op_ic` op 2 (close) or 3 (quiet close), as the
+                // region arm.
+                let op: u64 = if matches!(proto.code[ip], Instr::IterClose { .. }) {
+                    2
+                } else {
+                    3
+                };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
+                    packed_fip,
+                    iter as u64 | op << 56,
+                    0,
+                    iter,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::CallSpread { dst, callee, args } if !py => {
+                // `f(...v)`: `jit_call_spread_ic`, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_spread_ic as *const () as usize,
+                    packed_fip,
+                    callee as u64 | (args as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::NewRegExp {
+                dst,
+                pattern,
+                flags,
+                is_construct,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_new_regexp_ic as *const () as usize,
+                    packed_fip,
+                    pattern as u64 | (flags as u64) << 16 | (is_construct as u64) << 32,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ObjectSpread { target, src } => {
+                // `{ ...src }`: `jit_obj_init_ic` op 0, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
+                    packed_fip,
+                    target as u64 | (src as u64) << 16,
+                    0,
+                    target,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::InitDataProp { obj, name, val } => {
+                // A literal's named data property (`jit_obj_init_ic` op 1),
+                // as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    obj,
+                    refetch,
+                    None,
+                );
             }
             Instr::LoadClassValue { dst, class_id } => {
                 // The class binding through `jit_load_class_value_ic`; see

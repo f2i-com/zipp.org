@@ -153,8 +153,13 @@ impl<'p> Vm<'p> {
         // a base class, its field initializers as its body, run as a call
         // (with no arguments, `new.target` undefined). Run as a construction
         // here it is the same, unless something in it can see `new.target`
-        // (the test the frame-free call makes).
+        // (the test the frame-free call makes, which is the JIT's).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if !explicit && !self.ctor_body_framefree(fid) {
+            return None;
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        if !explicit {
             return None;
         }
         Some((fid, closure, f))

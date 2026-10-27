@@ -1421,6 +1421,20 @@ impl<'p> Vm<'p> {
         self.private_field_at(idx, brand, id, pos).map(|(_, v)| v)
     }
 
+    /// The site's way-0 private field `(brand, id, pos)` for code running as
+    /// `ctx` (compiled code, whose running callee is not the top frame's):
+    /// what [`Self::ic_private_get_tail`] checks against the top frame.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn ic_private_way0(&self, func_id: u32, ip: usize, ctx: Value) -> Option<(u64, u32, u32)> {
+        let Some(IcEntry::Private { head, brand, id, pos }) =
+            self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()).map(|s| s.entries[0])
+        else {
+            return None;
+        };
+        (self.private_memo_key(ctx) == Some(head)).then_some((brand, id, pos))
+    }
+
     /// [`Self::ic_private_get_tail`] for a write of the field, which must
     /// already be there (PrivateSet; an add takes the uncached path). The
     /// own hit hands over only the site: its way 0 is read again here, which

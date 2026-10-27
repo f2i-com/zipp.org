@@ -1101,6 +1101,20 @@ impl<'p> Vm<'p> {
         key: &str,
     ) -> Result<Option<Value>, Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_get_slow_in(ctx, func_id, ip, name, o, key)
+    }
+
+    /// [`Self::private_get_slow`] for code running as `ctx`: compiled code,
+    /// whose running callee is not the top frame's (`jit_private_prop_ic`).
+    pub(crate) fn private_get_slow_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+    ) -> Result<Option<Value>, Thrown> {
         let site = private_site(func_id, name);
         if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // Declaring-class-resolved, KIND-aware access (spec PrivateGet):
@@ -1175,6 +1189,21 @@ impl<'p> Vm<'p> {
         v: Value,
     ) -> Result<bool, Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_set_slow_in(ctx, func_id, ip, name, o, key, v)
+    }
+
+    /// [`Self::private_set_slow`] for code running as `ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn private_set_slow_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+        v: Value,
+    ) -> Result<bool, Thrown> {
         let site = private_site(func_id, name);
         if let Some((b2, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // PrivateFieldSet on a field already present: its entry for this
@@ -1269,6 +1298,21 @@ impl<'p> Vm<'p> {
         v: Value,
     ) -> Result<(), Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_set_strict_in(ctx, func_id, ip, name, o, key, v)
+    }
+
+    /// [`Self::private_set_strict`] for code running as `ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn private_set_strict_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+        v: Value,
+    ) -> Result<(), Thrown> {
         let site = private_site(func_id, name);
         if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // Declaring-class-resolved, KIND-aware write (spec PrivateSet). A
@@ -2770,6 +2814,30 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `new RegExp(p, f)` (`is_construct`), `RegExp(p, f)`, and a regular
+    /// expression literal: the `NewRegExp` instruction, shared by the
+    /// interpreter and compiled code (`jit_new_regexp_ic`).
+    pub(crate) fn new_regexp_value(
+        &mut self,
+        p: Value,
+        f: Value,
+        is_construct: bool,
+    ) -> Result<Value, Thrown> {
+        // IsRegExp(pattern) (ctor step 1) reads `@@match` once, for
+        // both the shortcut below and the build.
+        let pattern_is_regexp = self.is_regexp(p)?;
+        // `RegExp(re)` (NOT `new`) with no flags returns `re`
+        // unchanged when re's `constructor` is RegExp (ctor step 2.b).
+        if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && pattern_is_regexp {
+            let c = self.get_prop(p, "constructor")?;
+            if self.same_value(c, Value::heap(self.regexp_ctor)) {
+                return Ok(p);
+            }
+        }
+        let pre = self.regexp_pattern_snapshot_after(p, pattern_is_regexp);
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
     /// RegExpInitialize against an already-taken pattern snapshot.
     pub(crate) fn build_regexp_snapshot(
         &mut self,
@@ -2960,4 +3028,87 @@ impl<'p> Vm<'p> {
     }
 
     // ── Temporal.Duration ──
+}
+
+impl<'p> Vm<'p> {
+    /// The value of a call of the intrinsic global function `op` (`Number`,
+    /// `String`, `Boolean`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`)
+    /// with the `argc` arguments at `arg_base` of the window at `base`: the
+    /// `GlobalFn` instruction once its callee is known to be the intrinsic
+    /// (`global_fn_is_intrinsic`). Shared by the interpreter and compiled
+    /// code (`jit_global_fn_ic`).
+    pub(crate) fn global_fn_value(
+        &mut self,
+        op: crate::bytecode::GlobalFn,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        use crate::bytecode::GlobalFn as G;
+        use super::helpers_numeric::{parse_float, parse_int};
+        let a0 = if argc >= 1 {
+            self.get(base, arg_base)
+        } else {
+            Value::UNDEFINED
+        };
+        let v = match op {
+            G::Number => {
+                if argc == 0 {
+                    Value::num(0.0)
+                } else {
+                    Value::num(self.to_number_coerce(a0)?)
+                }
+            }
+            G::String => {
+                if argc == 0 {
+                    self.alloc_str(String::new())
+                } else if a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Symbol { .. }
+                    )
+                {
+                    // `String(symbol)` is allowed (unlike ToString,
+                    // which throws) and yields "Symbol(desc)".
+                    self.symbol_descriptive_value(a0)?
+                } else {
+                    // Proper ToString: routes objects/functions
+                    // through their `toString` (so a function yields
+                    // its real source via Function.prototype.toString).
+                    // Identity for strings (exact WTF-8 content).
+                    self.to_str_value(a0)?
+                }
+            }
+            G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
+            G::ParseInt => {
+                // ToString(string) FIRST (observable toString, abrupt),
+                // then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity
+                // → 0 = default base).
+                let s = self.to_js_string(a0)?;
+                // ToInt32 WRAPS mod 2^32; Rust's `as i32` on a
+                // float saturates, which turned
+                // `parseInt("0x10", 1e308)` into an
+                // out-of-range radix (NaN) instead of 0.
+                let radix = if argc >= 2 {
+                    let rv = self.get(base, arg_base + 1);
+                    let r = self.to_number_strict(rv)?;
+                    crate::vm::helpers_num2::to_int32(r)
+                } else {
+                    0
+                };
+                Value::num(parse_int(&s, radix))
+            }
+            G::ParseFloat => {
+                let s = self.to_js_string(a0)?;
+                Value::num(parse_float(&s))
+            }
+            // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
+            // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
+            // and propagates abrupt completions (a throwing valueOf or
+            // a Symbol/BigInt argument → TypeError), so use strict ToNumber.
+            G::IsNaN => Value::bool(self.to_number_strict(a0)?.is_nan()),
+            G::IsFinite => Value::bool(self.to_number_strict(a0)?.is_finite()),
+        };
+        Ok(v)
+    }
 }

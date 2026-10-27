@@ -1292,25 +1292,7 @@ impl<'p> Vm<'p> {
             } => {
                 let p = self.get(base, pattern);
                 let f = self.get(base, flags);
-                // IsRegExp(pattern) (ctor step 1) reads `@@match` once, for
-                // both the shortcut below and the build.
-                let pattern_is_regexp = self.is_regexp(p)?;
-                // `RegExp(re)` (NOT `new`) with no flags returns `re`
-                // unchanged when re's `constructor` is RegExp (ctor step 2.b).
-                let mut short = None;
-                if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && pattern_is_regexp {
-                    let c = self.get_prop(p, "constructor")?;
-                    if self.same_value(c, Value::heap(self.regexp_ctor)) {
-                        short = Some(p);
-                    }
-                }
-                let v = match short {
-                    Some(v) => v,
-                    None => {
-                        let pre = self.regexp_pattern_snapshot_after(p, pattern_is_regexp);
-                        self.build_regexp_snapshot(p, f, pre)?
-                    }
-                };
+                let v = self.new_regexp_value(p, f, is_construct)?;
                 self.set(base, dst, v);
                 ip += 1;
             }

@@ -3992,6 +3992,13 @@ impl Jit {
     /// Record an interpreter entry into `func_id`. Returns `true` once it
     /// crosses the threshold and is neither compiled nor blacklisted — the
     /// caller should then attempt `compile`.
+    /// Whether a compile of `func_id` failed for good (the function stays on
+    /// the interpreter).
+    #[inline]
+    pub fn is_blacklisted(&self, func_id: u32) -> bool {
+        self.blacklist.contains(&func_id)
+    }
+
     pub fn record_and_should_compile(&mut self, func_id: u32) -> bool {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return false;

@@ -1054,13 +1054,14 @@ impl<'p> Vm<'p> {
     /// (`callee`) with the receiver `this`, as a frame's call setup binds it:
     /// a strict function takes it as it is; a sloppy one takes the global
     /// object of its realm for `undefined` or `null`, and an object as it is.
-    /// `None` for an arrow (its captured `this` is the setup's to bind) and
-    /// for a sloppy function given a primitive (the setup boxes it).
+    /// An arrow ignores the receiver for the `this` it captured, which is what
+    /// its frame's setup would put in register 0. `None` for a sloppy
+    /// function given a primitive (the setup boxes it).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn frame_free_this(&self, fid: u32, callee: Value, this: Value) -> Option<Value> {
         let proto = self.func(fid as usize);
         if proto.lexical_this {
-            return None;
+            return self.arrow_captured_this(callee);
         }
         if proto.is_strict || self.is_object_value(this) {
             return Some(this);
@@ -1365,6 +1366,174 @@ impl<'p> Vm<'p> {
         self.jit_call_depth -= 1;
         match r {
             Ok(()) => o.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind `jit_global_fn_ic`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_global_fn_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::bytecode::GlobalFn as G;
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as usize;
+        if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let op = match (packed_args >> 48) as u8 {
+            0 => G::Number,
+            1 => G::String,
+            2 => G::Boolean,
+            3 => G::ParseInt,
+            4 => G::ParseFloat,
+            5 => G::IsNaN,
+            6 => G::IsFinite,
+            _ => return SELF_CALL_DEOPT,
+        };
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let callee = (packed_args & 0xFFFF) as u16;
+        let arg_base = ((packed_args >> 16) & 0xFFFF) as u16;
+        let argc = ((packed_args >> 32) & 0xFFFF) as u16;
+        // A replaced global is the interpreter's call: declined before any
+        // effect.
+        let live = self.get(base, callee);
+        if !self.global_fn_is_intrinsic(op, live) {
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let r = self.global_fn_value(op, base, arg_base, argc);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind `jit_private_prop_ic`: the interpreter's
+    /// private-name arms, for the code's own running callee
+    /// (`jit_running_callee`: the frame a region or a frame-backed Tier C
+    /// body runs on, or a frame-free body's activation). A name that does not
+    /// resolve to a declaring class (the interpreter's textual fallback) and
+    /// a callee that cannot be named decline before any effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_private_prop_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let Some(ctx) = self.jit_running_callee(func_id, base) else {
+            return SELF_CALL_DEOPT;
+        };
+        let o = self.get(base, (packed_args & 0xFFFF) as u16);
+        let val_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+        let name = ((packed_args >> 32) & 0xFF_FFFF) as u32;
+        let op = ((packed_args >> 56) & 3) as u8;
+        // The field this site last served, for this callee: the
+        // interpreter's way-0 hit.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if op != 2 && o.is_heap() {
+            if let Some((brand, id, pos)) = self.ic_private_way0(func_id, ip, ctx) {
+                let idx = o.heap_index();
+                if let Some((at, v)) = self.private_field_at(idx, brand, id, pos) {
+                    if op == 0 {
+                        return v.bits();
+                    }
+                    let nv = self.get(base, val_reg);
+                    // No barrier: the collector roots every private field value.
+                    if let Some(fields) = self.private_fields_mut(idx) {
+                        fields[at].2 = nv;
+                    }
+                    return nv.bits();
+                }
+            }
+        }
+        let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
+        let Some(key) = func.string_constants.get(name as usize) else {
+            return SELF_CALL_DEOPT;
+        };
+        let key: &'p str = key.as_str();
+        let site = super::values::private_site(func_id, name);
+        if self.private_memo_hit(ctx, site).is_none()
+            && self.resolve_private_site(ctx, site, key).is_none()
+        {
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let r = match op {
+            0 => self.private_get_slow_in(ctx, func_id, ip, name, o, key).map(|v| v.map(|v| v.bits())),
+            1 => {
+                let v = self.get(base, val_reg);
+                self.private_set_strict_in(ctx, func_id, ip, name, o, key, v).map(|()| Some(v.bits()))
+            }
+            _ => {
+                let v = self.get(base, val_reg);
+                self.private_set_slow_in(ctx, func_id, ip, name, o, key, v)
+                    .map(|took| took.then_some(v.bits()))
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(Some(bits)) => bits,
+            // Resolved names never reach the textual tail that answers this.
+            Ok(None) => SELF_CALL_DEOPT,
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind `jit_new_regexp_ic`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_new_regexp_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as usize;
+        if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        // A literal in a loop allocates every iteration: the window's Values
+        // are roots, so the safe point precedes the operand reads.
+        self.maybe_gc();
+        let p = self.get(base, (packed_args & 0xFFFF) as u16);
+        let f = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        self.jit_call_depth += 1;
+        let r = self.new_regexp_value(p, f, (packed_args >> 32) & 1 == 1);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
     }
@@ -2043,6 +2212,28 @@ impl<'p> Vm<'p> {
                     Ok(v) => v.bits(),
                     Err(t) => self.jit_thrown_to_sentinel(t),
                 };
+            }
+            // A body whose entry needs a frame (B272: a `try`, a `for...of`, a
+            // destructuring's close) takes the cross call's frame-backed
+            // entry: its own frame pushed and the body entered natively,
+            // without `setup_call` and the interpreter's prologue. `this` is
+            // already bound (above), which the cross call keeps as it is; a
+            // pure decline falls through.
+            if self.jit.cross_needs_frame(fid) {
+                let caller_regs = self.func(func_id as usize).reg_count.max(1);
+                let packed = argc as u64 | (u64::from(caller_regs) << 16);
+                // SAFETY: the argument registers lie in the caller's window.
+                let args = unsafe { caller_base_ptr.add(arg_base as usize) };
+                let r = self.jit_cross_call_impl::<false>(
+                    caller_base_ptr,
+                    args,
+                    packed,
+                    callee_v.bits(),
+                    Some(this),
+                );
+                if r != SELF_CALL_DEOPT {
+                    return r;
+                }
             }
         }
         // Push the callee frame exactly like the interpreter's Call/CallMethod

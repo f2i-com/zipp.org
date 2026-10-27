@@ -338,6 +338,12 @@ impl<'p> Vm<'p> {
         } else {
             return None;
         };
+        // A callback whose compile failed for good stays interpreted: trying
+        // again built every plan and declined on each call of the builtin —
+        // `xs.map(f)` with an uncompilable `f`, once per `map`.
+        if self.jit.is_blacklisted(fid) {
+            return None;
+        }
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
