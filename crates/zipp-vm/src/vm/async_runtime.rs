@@ -1852,7 +1852,15 @@ impl<'p> Vm<'p> {
             // `then.call(value, resolveFn, rejectFn)` to a microtask (spec ordering).
             // A throwing `then` GETTER rejects the promise.
             if self.is_object_value(value) && !self.array_then_absent(value) {
-                let then = match self.get_prop(value, "then") {
+                // A `then` getter runs code, which may collect, and `value`
+                // and `p` may be held by nothing but this call (an async
+                // function's return value, its frame already popped): root
+                // both across the Get, as B214 roots a combinator's values.
+                let rooted = self.host_result_roots.len();
+                self.host_result_roots.extend([value, Value::heap(p)]);
+                let got = self.get_prop(value, "then");
+                self.host_result_roots.truncate(rooted);
+                let then = match got {
                     Ok(t) => t,
                     Err(Thrown(msg)) => {
                         let e = match self.pending_throw.take() {

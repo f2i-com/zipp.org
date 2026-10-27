@@ -57,7 +57,11 @@ fn await_in_place_matches_node_in_every_mode() {
         return;
     }
     let exe = std::env::current_exe().expect("test binary path");
-    for mode in ["on", "off", "gc", "nojit"] {
+    // `gcnojit`: an async function returning an object whose `then` getter
+    // starts an async generator (s12) collected inside the getter, while
+    // `[[Resolve]]` held the object in a local only, and the promise
+    // settled with a freed slot; the JIT's timing hid it in `gc`.
+    for mode in ["on", "off", "gc", "nojit", "gcnojit"] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(["--exact", "await_in_place_child", "--nocapture"])
             .env("ZIPP_AWAIT_IN_PLACE_CHILD", mode)
@@ -71,6 +75,9 @@ fn await_in_place_matches_node_in_every_mode() {
             }
             "nojit" => {
                 cmd.env("ZIPP_NOJIT", "1");
+            }
+            "gcnojit" => {
+                cmd.env("ZIPP_GC_STRESS", "1").env("ZIPP_NOJIT", "1");
             }
             _ => {}
         }
