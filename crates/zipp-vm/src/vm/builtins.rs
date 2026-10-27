@@ -2675,7 +2675,12 @@ impl<'p> Vm<'p> {
                 }
             }
             HeapObj::Date(_) => self.date_method(idx, name, args),
-            HeapObj::TypedArray { .. } => self.typed_array_method(idx, name, args),
+            // Receiver-kind dispatch must not hide an own/prototype override:
+            // a subclass's `indexOf` (Node's Buffer has one) is the method.
+            HeapObj::TypedArray { .. } if self.ta_method_is_intrinsic(idx, name) => {
+                self.typed_array_method(idx, name, args)
+            }
+            HeapObj::TypedArray { .. } => Ok(None),
             // Receiver-kind dispatch must not hide an own/prototype override.
             // The JIT's pinned DataView lanes use the same live proof before
             // bypassing ordinary `[[Get]]`; keep the interpreter contract

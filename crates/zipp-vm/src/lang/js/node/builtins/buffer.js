@@ -240,9 +240,20 @@
       return new Buffer(u.buffer, u.byteOffset, u.length);
     }
     indexOf(value, byteOffset = 0, encoding) {
+      if (typeof byteOffset === "string") [encoding, byteOffset] = [byteOffset, 0];
       const needle = typeof value === "number" ? [value & 255] : typeof value === "string" ? bytesOf(value, encoding) : value;
       if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
       outer: for (let i = byteOffset; i <= this.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) if (this[i + j] !== needle[j]) continue outer;
+        return i;
+      }
+      return -1;
+    }
+    lastIndexOf(value, byteOffset = this.length - 1, encoding) {
+      if (typeof byteOffset === "string") [encoding, byteOffset] = [byteOffset, this.length - 1];
+      const needle = typeof value === "number" ? [value & 255] : typeof value === "string" ? bytesOf(value, encoding) : value;
+      if (byteOffset < 0) byteOffset = this.length + byteOffset;
+      outer: for (let i = Math.min(byteOffset, this.length - needle.length); i >= 0; i--) {
         for (let j = 0; j < needle.length; j++) if (this[i + j] !== needle[j]) continue outer;
         return i;
       }

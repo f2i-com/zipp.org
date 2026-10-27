@@ -4,8 +4,9 @@
 //! globals non-enumerable as Node's, `pipeline` handing a generator stage a
 //! signal, `events.once`; with `Buffer.concat` over empty buffers, a
 //! decoded BOM kept, `StringDecoder` holding a base64 group across writes,
-//! and an fs write stream read back through a read stream in 4-byte
-//! slices. The expected lines are Node 24's.
+//! an fs write stream read back through a read stream in 4-byte slices,
+//! and Buffer's `indexOf`/`lastIndexOf`/`includes` with string needles.
+//! The expected lines are Node 24's.
 
 #[test]
 fn node_web_events_and_fs_streams_behave_as_node() {
@@ -16,6 +17,7 @@ fn node_web_events_and_fs_streams_behave_as_node() {
     assert_eq!(
         lines,
         [
+            r#"6 4 1 2 true 2"#,
             r#"abcd abcd 3 "﻿hi""#,
             r#"abort abort true AbortError"#,
             r#"function false 20"#,
@@ -28,7 +30,8 @@ fn node_web_events_and_fs_streams_behave_as_node() {
     );
 }
 
-const PROGRAM: &str = r####"const a = Buffer.concat([Buffer.alloc(0), Buffer.from("ab"), Buffer.alloc(0), Buffer.from("cd")]);
+const PROGRAM: &str = r####"const sb = Buffer.from("abcabc\n"); console.log(sb.indexOf("\n"), sb.lastIndexOf("b"), sb.lastIndexOf("bc", 3), sb.indexOf("c", "utf8"), sb.includes("\n"), Buffer.concat([sb.subarray(0, 2), sb.subarray(2)]).indexOf("ca"));
+const a = Buffer.concat([Buffer.alloc(0), Buffer.from("ab"), Buffer.alloc(0), Buffer.from("cd")]);
 const b = Buffer.concat([Buffer.from("abc"), Buffer.from("def")], 4);
 const c = Buffer.from([0xef, 0xbb, 0xbf, 0x68, 0x69]).toString();
 console.log(a.toString(), b.toString(), c.length, JSON.stringify(c));

@@ -457,6 +457,68 @@ impl<'p> Vm<'p> {
     /// receiver-kind dispatcher and native register lanes bypass ordinary
     /// `[[Get]]`, so an own shadow, custom prototype, accessor, deleted slot,
     /// replacement callable, or child-realm prototype must fail closed.
+    /// Whether `ta.<name>()` on the TypedArray `ta_idx` resolves to the
+    /// intrinsic `%TypedArray%.prototype.<name>`, so the receiver-kind
+    /// dispatch may run it: no own `name`, the instance's [[Prototype]] its
+    /// kind's intrinsic prototype, which neither shadows `name` nor has been
+    /// re-pointed off `%TypedArray%.prototype`, whose own data slot still
+    /// holds the method's native. A subclass instance (`class Buffer extends
+    /// Uint8Array` overriding `indexOf`), a patched prototype or an own
+    /// shadow answers false, and the call takes the ordinary Get. A name
+    /// that is not a `%TypedArray%.prototype` method answers true: its
+    /// dispatch declines on its own.
+    pub(crate) fn ta_method_is_intrinsic(&self, ta_idx: u32, name: &str) -> bool {
+        let Some(method) = crate::vm::native::TA_PROTO_METHODS
+            .iter()
+            .position(|&candidate| candidate == name)
+        else {
+            return true;
+        };
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind as usize,
+            _ => return false,
+        };
+        if self
+            .arr_props
+            .get(&ta_idx)
+            .is_some_and(|m| m.pos(name).is_some())
+        {
+            return false;
+        }
+        let want_proto = match self.ta_protos.get(kind) {
+            Some(&p) if p != 0 => p,
+            _ => return false,
+        };
+        match self.proto_of.get_copied(ta_idx) {
+            Some(v) if v.is_heap() && v.heap_index() == want_proto => {}
+            _ => return false,
+        }
+        match self.heap.get(want_proto) {
+            HeapObj::Object(m) if m.pos(name).is_none() => {}
+            _ => return false,
+        }
+        if self.ta_base_proto == 0 {
+            return false;
+        }
+        match self.proto_of.get_copied(want_proto) {
+            Some(v) if v.is_heap() && v.heap_index() == self.ta_base_proto => {}
+            _ => return false,
+        }
+        let value = match self.heap.get(self.ta_base_proto) {
+            HeapObj::Object(map) => match map.pos(name) {
+                Some(slot) if !map.attr_at(slot).accessor => map.val_at(slot),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        value.is_heap()
+            && matches!(
+                self.heap.get(value.heap_index()),
+                HeapObj::Native(id) if *id == crate::vm::native::TA_METHOD_BASE + method as u16
+            )
+            && (self.obj_realm.is_empty() || self.get_function_realm(value) == 0)
+    }
+
     pub(crate) fn dataview_method_is_intrinsic(&self, view_idx: u32, name: &str) -> Option<Value> {
         let method = crate::vm::native::DV_PROTO_METHODS
             .iter()
