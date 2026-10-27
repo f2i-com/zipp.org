@@ -594,6 +594,7 @@ impl<'p> Vm<'p> {
                 state: GenState::Suspended(genstart_ip),
                 regs: back,
                 handlers,
+                callee: gen_callee,
             })));
             // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
             // the callee's `prototype` object (a replaced g.prototype flows
@@ -607,10 +608,6 @@ impl<'p> Vm<'p> {
                 if let Some(rp) = self.realm_proto_fallback(gen_callee, self.gen_proto) {
                     self.proto_of.insert(g, Value::heap(rp));
                 }
-            }
-            if gen_callee != Value::UNDEFINED {
-                // Resumes re-bind this as Frame.callee (LoadCallee identity).
-                self.gen_callee.insert(g, gen_callee);
             }
             if args_obj != u32::MAX {
                 // Mapped arguments: each resume re-links the [[ParameterMap]]
@@ -635,6 +632,7 @@ impl<'p> Vm<'p> {
                 state: GenState::Completed,
                 regs: Vec::new(),
                 handlers: Vec::new(),
+                callee: gen_callee,
             }))))),
             Err(t) => Err(t),
         }
@@ -768,11 +766,17 @@ impl<'p> Vm<'p> {
         resume_ip: usize,
         input: GenResumeMode,
     ) -> Result<Option<GenStep>, Thrown> {
-        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+        let (saved, saved_handlers, gen_callee) = match self.heap.get_mut(idx) {
             HeapObj::Generator(g) => {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                let crate::heap::GeneratorData {
+                    state,
+                    regs,
+                    handlers,
+                    callee,
+                    ..
+                } = &mut **g;
                 *state = GenState::Running;
-                (std::mem::take(regs), std::mem::take(handlers))
+                (std::mem::take(regs), std::mem::take(handlers), *callee)
             }
             _ => return Ok(None),
         };
@@ -810,11 +814,7 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             // The creating call's function value (named fn-expression
             // self-name identity survives suspension).
-            callee: self
-                .gen_callee
-                .get(&idx)
-                .copied()
-                .unwrap_or(Value::UNDEFINED),
+            callee: gen_callee,
         });
         // Restore the activation's dynamic EvalScope (created by a direct eval
         // in the param prologue or an earlier resume), parked on the generator.
@@ -1019,9 +1019,9 @@ impl<'p> Vm<'p> {
         if self.py_rt.is_some() {
             return false;
         }
-        let (fid, closure, resume_ip, reg_count) = match self.heap.get(idx) {
+        let (fid, closure, resume_ip, reg_count, callee) = match self.heap.get(idx) {
             HeapObj::Generator(g) => match g.state {
-                GenState::Suspended(ip) => (g.func, g.closure, ip, g.regs.len()),
+                GenState::Suspended(ip) => (g.func, g.closure, ip, g.regs.len(), g.callee),
                 _ => return false,
             },
             _ => return false,
@@ -1067,7 +1067,6 @@ impl<'p> Vm<'p> {
         }
         let top = self.frames.len() - 1;
         self.frames[top].ip = caller_ip;
-        let callee = self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED);
         self.frames.push(Frame {
             super_done: delegate,
             args_obj: u32::MAX,

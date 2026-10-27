@@ -1896,6 +1896,7 @@ impl Vm<'_> {
             HeapObj::CombinatorResolver { combinator, .. } => m_idx!(*combinator),
             HeapObj::Generator(g) => {
                 m_idx!(g.closure);
+                m_val!(g.callee);
                 for &v in &g.regs {
                     m_val!(v);
                 }

@@ -6022,6 +6022,11 @@ pub struct GeneratorData {
     pub state: GenState,
     pub regs: Vec<Value>,
     pub handlers: Vec<Handler>,
+    /// The function value whose call made the generator (`undefined` when
+    /// none was recorded): every resumed frame's callee, which a named
+    /// function expression's own name and the private brand chain read.
+    /// Traced with the window. It was a side table, probed on every resume.
+    pub callee: Value,
 }
 
 /// Payload of `HeapObj::RegExp`: a JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);

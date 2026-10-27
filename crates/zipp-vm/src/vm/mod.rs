@@ -2692,10 +2692,11 @@ pub struct Vm<'p> {
     /// flight (set by the call site just before alloc_generator /
     /// alloc_async / alloc_async_generator; consumed at their entry).
     pending_gen_callee: Value,
-    /// Generator / AsyncGenerator heap index → the function
-    /// value that created it. Resumes bind it as Frame.callee so LoadCallee
-    /// (a named function expression's self-name) keeps the caller-visible
-    /// identity across suspensions. Values are GC roots; keys pruned on sweep.
+    /// AsyncGenerator heap index → the function value that created it.
+    /// Resumes bind it as Frame.callee so LoadCallee (a named function
+    /// expression's self-name) keeps the caller-visible identity across
+    /// suspensions. Values are GC roots; keys pruned on sweep. A sync
+    /// generator keeps its own (`GeneratorData::callee`).
     gen_callee: crate::slot_table::SlotTable<Value>,
     /// Heap indices of IMMUTABLE cells — named function expressions' own-name
     /// bindings (MakeCellFnName). UpvalSet/StoreUpvalDyn writes through one
