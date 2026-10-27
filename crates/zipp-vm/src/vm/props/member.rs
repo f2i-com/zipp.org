@@ -1385,8 +1385,9 @@ impl<'p> Vm<'p> {
         if s.len() <= buf.len() {
             let n = s.len();
             buf[..n].copy_from_slice(s.as_bytes());
-            // SAFETY: the bytes were copied from a `str`.
-            Some(unsafe { std::str::from_utf8_unchecked(&buf[..n]) })
+            // Copied from a `str`, so always valid; checked, as the
+            // safe-sandbox profile allows no `unsafe`.
+            std::str::from_utf8(&buf[..n]).ok()
         } else {
             *spill = s.to_owned();
             Some(spill.as_str())
