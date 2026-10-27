@@ -491,6 +491,23 @@ impl<'p> Vm<'p> {
         buf
     }
 
+    /// OrdinaryCreateFromConstructor for generator `g` made by `gen_callee`:
+    /// the instance's [[Prototype]] is the callee's `prototype` object (a
+    /// replaced g.prototype flows through); the HeapObj::Generator fallback
+    /// stays %GeneratorProto%. A REALM-BORN generator function with a
+    /// NON-OBJECT `prototype` falls back to GetFunctionRealm's
+    /// %GeneratorPrototype% image instead (the main realm keeps the dynamic
+    /// fallback).
+    fn gen_link_proto(&mut self, g: u32, gen_callee: Value) {
+        if let Some(p) = self.prototype_of(gen_callee) {
+            self.proto_of.insert(g, p);
+        } else if !self.realm_global_objs.is_empty() {
+            if let Some(rp) = self.realm_proto_fallback(gen_callee, self.gen_proto) {
+                self.proto_of.insert(g, Value::heap(rp));
+            }
+        }
+    }
+
     /// Calling a `function*` does NOT run its body — it allocates a suspended
     /// Generator whose DETACHED register window holds `this` + the bound args
     /// (incl. a rest array). Resumed later by `generator_method`.
@@ -550,6 +567,32 @@ impl<'p> Vm<'p> {
                 args_obj = arr.heap_index();
             }
         }
+        // A body that starts at its `GenStart` has no prologue: the window
+        // built above is the one the marker would park, so it is parked as
+        // it is, without the nested run loop that pushed its frame, entered
+        // the dispatch loop and popped the frame at its first instruction,
+        // on every call of a generator function. Not with a mapped
+        // `arguments` object (re-linked to a live window), nor while a
+        // recorder counts the marker's step.
+        #[cfg(feature = "instrument")]
+        let counted = self.instr_rec.is_some();
+        #[cfg(not(feature = "instrument"))]
+        let counted = false;
+        if args_obj == u32::MAX
+            && !counted
+            && matches!(self.func(func_id as usize).code.first(), Some(Instr::GenStart))
+        {
+            let g = self.heap.alloc(HeapObj::Generator(Box::new(crate::heap::GeneratorData {
+                func: func_id,
+                closure,
+                state: GenState::Suspended(0),
+                regs,
+                handlers: Vec::new(),
+                callee: gen_callee,
+            })));
+            self.gen_link_proto(g, gen_callee);
+            return Ok(Value::heap(g));
+        }
         // FunctionDeclarationInstantiation runs eagerly at CALL time: splice the
         // window onto the live register file and run the parameter prologue
         // (defaults + destructuring) up to the `GenStart` body-entry marker. A
@@ -596,19 +639,7 @@ impl<'p> Vm<'p> {
                 handlers,
                 callee: gen_callee,
             })));
-            // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
-            // the callee's `prototype` object (a replaced g.prototype flows
-            // through); the HeapObj::Generator fallback stays %GeneratorProto%.
-            // A REALM-BORN generator function with a NON-OBJECT `prototype`
-            // falls back to GetFunctionRealm's %GeneratorPrototype% image
-            // instead (the main realm keeps the dynamic fallback).
-            if let Some(p) = self.prototype_of(gen_callee) {
-                self.proto_of.insert(g, p);
-            } else if !self.realm_global_objs.is_empty() {
-                if let Some(rp) = self.realm_proto_fallback(gen_callee, self.gen_proto) {
-                    self.proto_of.insert(g, Value::heap(rp));
-                }
-            }
+            self.gen_link_proto(g, gen_callee);
             if args_obj != u32::MAX {
                 // Mapped arguments: each resume re-links the [[ParameterMap]]
                 // to the freshly spliced window.
