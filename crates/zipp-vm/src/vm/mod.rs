@@ -2960,13 +2960,30 @@ pub struct Vm<'p> {
     /// cycle) instead of failing or re-evaluating.
     module_pending_reexports: std::collections::HashMap<
         std::path::PathBuf,
-        (
+        std::sync::Arc<(
             Vec<(String, String, String)>,
             Vec<String>,
             Vec<(String, String)>,
             Option<std::path::PathBuf>,
-        ),
+        )>,
     >,
+    /// Requested path -> canonical module path, for the re-export walks: a
+    /// barrel file's `export *` list is walked for every name imported through
+    /// it, and each step canonicalized its specifier with a filesystem call.
+    pub(crate) module_canon_memo: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// (in-flight module, export name) -> the live slot its pending re-exports
+    /// resolved it to. A slot never changes once bound.
+    pub(crate) module_pending_resolved: std::collections::HashMap<(std::path::PathBuf, String), u32>,
+    /// A module's exports as its source declares them, read once without
+    /// running it (see `Vm::static_export`).
+    pub(crate) module_static_exports: std::collections::HashMap<std::path::PathBuf, ModuleStaticExports>,
+    /// Forward bindings: an export of a module not loaded yet, which a cycle
+    /// member importing through an in-flight `export *` (a barrel file) bound
+    /// before that module's turn to evaluate came. (canonical path, exported
+    /// name) -> the live slot the module adopts for that export when it loads.
+    /// Resolving the binding by loading the module there instead evaluated it
+    /// out of order — ahead of the modules listed before it in the barrel.
+    pub(crate) module_forward: std::collections::HashMap<(std::path::PathBuf, String), u32>,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
@@ -3691,4 +3708,17 @@ impl<'p> Vm<'p> {
             self.output.push(line);
         }
     }
+}
+
+/// A module's exports as its parsed source declares them (`Vm::static_export`).
+#[derive(Default)]
+pub(crate) struct ModuleStaticExports {
+    /// Exported name -> whether its own local binding is a `var`.
+    pub(crate) own: std::collections::HashMap<String, bool>,
+    /// Names exported through a re-export (`export { x } from`, `export * as x`).
+    pub(crate) indirect: std::collections::HashSet<String>,
+    /// The module has an `export * from`, which may supply any other name.
+    pub(crate) star: bool,
+    /// The source could not be read or parsed: nothing is known.
+    pub(crate) unknown: bool,
 }

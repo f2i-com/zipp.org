@@ -118,6 +118,16 @@ thread_local! {
     static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// What a module's source says about one export name (`Vm::static_export`).
+enum StaticExport {
+    /// The module binds it itself (a `var` or another declaration).
+    Own { is_var: bool },
+    /// Through a re-export or `export *`: only loading the module settles it.
+    Indirect,
+    /// The module does not export it.
+    Absent,
+}
+
 fn canonical_module_path(
     root: Option<&std::path::Path>,
     raw_path: &std::path::Path,
@@ -188,10 +198,17 @@ mod lexical_tests {
 #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 impl<'p> Vm<'p> {
     pub(crate) fn resolve_module_path(
-        &self,
+        &mut self,
         raw_path: &std::path::Path,
     ) -> Result<std::path::PathBuf, Thrown> {
-        canonical_module_path(self.module_root.as_deref(), raw_path)
+        // Once per requested path: a module importing fifty names from one
+        // specifier resolved it fifty times, each a filesystem call.
+        if let Some(c) = self.module_canon_memo.get(raw_path) {
+            return Ok(c.clone());
+        }
+        let c = canonical_module_path(self.module_root.as_deref(), raw_path)?;
+        self.module_canon_memo.insert(raw_path.to_path_buf(), c.clone());
+        Ok(c)
     }
 
     /// Run one recursive loader operation under the confined graph-depth cap.
@@ -693,6 +710,15 @@ impl<'p> Vm<'p> {
             prog.module_decl_globals.iter().copied().collect();
         let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut own_pre = super::super::ExportSlots::default();
+        // A `var` export is `undefined` from instantiation on (InitializeEnvironment
+        // step 21), not in a TDZ: a cycle member that reads it before this
+        // module's body runs sees `undefined`, as `let`/`const`/`class` would
+        // throw. (A TypeScript `namespace` or `enum` is such a `var`.)
+        let var_names: std::collections::HashSet<String> = if early_prepare {
+            Default::default()
+        } else {
+            crate::compile::hoisted_var_names(&ast.body).into_iter().collect()
+        };
         if !early_prepare {
             for (exported, local) in &exports {
                 if let Some(i) = names.iter().position(|n| n == local) {
@@ -704,7 +730,15 @@ impl<'p> Vm<'p> {
                         own_pre.insert(exported.clone(), live);
                         continue;
                     }
-                    let live = self.alloc_global_pool_slot(Value::UNINITIALIZED, "module bindings")?;
+                    let init = if var_names.contains(local) {
+                        Value::UNDEFINED
+                    } else {
+                        Value::UNINITIALIZED
+                    };
+                    let live = match self.module_forward.remove(&(path.clone(), exported.clone())) {
+                        Some(slot) => slot,
+                        None => self.alloc_global_pool_slot(init, "module bindings")?,
+                    };
                     self.pool_slot_names
                         .insert(live, crate::vm::PoolSlotName::Module(local.as_str().into()));
                     prealloc.insert(c, live);
@@ -717,12 +751,12 @@ impl<'p> Vm<'p> {
         self.module_cache.insert(path.clone(), Value::heap(ns_idx));
         self.module_pending_reexports.insert(
             path.clone(),
-            (
+            std::sync::Arc::new((
                 reexports.clone(),
                 star_reexports.clone(),
                 ns_reexports.clone(),
                 dir.clone(),
-            ),
+            )),
         );
         // EARLY mode: instantiate the environment (per-module slots, function/
         // class install, hoisting) NOW — cycle dependencies see the real
@@ -730,6 +764,18 @@ impl<'p> Vm<'p> {
         let mut gmap_base: Option<(Vec<u32>, u32)> = None;
         let mut full: Vec<(String, u32)> = Vec::new();
         if early_prepare {
+            // Exports a cycle member already bound (`module_forward`) keep
+            // those slots.
+            let mut forward: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            if !self.module_forward.is_empty() {
+                for (exported, local) in &exports {
+                    if let Some(slot) = self.module_forward.remove(&(path.clone(), exported.clone())) {
+                        if let Some(i) = names.iter().position(|n| n == local) {
+                            forward.insert(i as u32, slot);
+                        }
+                    }
+                }
+            }
             let prog = prog_opt.take().expect("module program");
             let prepared = self.prepare_eval_program(
                 prog,
@@ -747,7 +793,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Some(&self_aliases)
                 },
-                None,
+                if forward.is_empty() { None } else { Some(&forward) },
             );
             match prepared {
                 Ok((gmap, base_func)) => {
@@ -2108,44 +2154,217 @@ impl<'p> Vm<'p> {
         if let Some(slot) = self.module_own.get(dep).and_then(|m| m.get(name).copied()) {
             return Ok(Some(slot));
         }
-        let Some((reex, stars, nsreex, pdir)) = self.module_pending_reexports.get(dep).cloned()
-        else {
+        let key = (dep.clone(), name.to_string());
+        if let Some(&slot) = self.module_pending_resolved.get(&key) {
+            return Ok(Some(slot));
+        }
+        let Some(pending) = self.module_pending_reexports.get(dep).cloned() else {
+            // Not loaded at all yet: bind its own export without evaluating
+            // it ahead of its turn (see `module_forward`).
+            if !self.module_cache.contains_key(dep) {
+                match self.static_export(dep, name)? {
+                    StaticExport::Own { is_var } => {
+                        return self.module_forward_slot(dep, name, is_var).map(Some);
+                    }
+                    StaticExport::Absent => return Ok(None),
+                    StaticExport::Indirect => {}
+                }
+            }
             // Completed (or never in-flight): normal resolution.
             return self.resolve_export(dep, name, None);
         };
-        let module_root = self.module_root.clone();
-        let join =
-            |pdir: Option<&std::path::Path>, spec: &str| -> Result<std::path::PathBuf, Thrown> {
-                let raw = match pdir {
-                    Some(d) => d.join(spec),
-                    None => std::path::PathBuf::from(spec),
-                };
-                canonical_module_path(module_root.as_deref(), &raw)
-            };
-        for (exported, imported, spec) in &reex {
+        let (reex, stars, nsreex, pdir) = &*pending;
+        for (exported, imported, spec) in reex {
             if exported == name {
-                let target = join(pdir.as_deref(), spec)?;
-                return self.resolve_pending_export(&target, imported, seen);
+                let target = self.canon_join(pdir.as_deref(), spec)?;
+                let r = self.resolve_pending_export(&target, imported, seen)?;
+                if let Some(slot) = r {
+                    self.module_pending_resolved.insert(key, slot);
+                }
+                return Ok(r);
             }
         }
         // `export * as name from spec`: an INDIRECT export whose binding is
         // the dependency's namespace — its canonical shared slot (created on
         // demand; the value fills in when the dependency links).
-        for (exported, spec) in &nsreex {
+        for (exported, spec) in nsreex {
             if exported == name {
-                let target = join(pdir.as_deref(), spec)?;
+                let target = self.canon_join(pdir.as_deref(), spec)?;
                 return Ok(Some(self.module_ns_slot(&target)?));
             }
         }
         if name != "default" {
-            for spec in &stars {
-                let target = join(pdir.as_deref(), spec)?;
+            for spec in stars {
+                let target = self.canon_join(pdir.as_deref(), spec)?;
                 if let Some(slot) = self.resolve_pending_export(&target, name, seen)? {
+                    self.module_pending_resolved.insert(key, slot);
                     return Ok(Some(slot));
                 }
             }
         }
         Ok(None)
+    }
+
+    /// `spec` requested from directory `pdir`, canonicalized once per run.
+    fn canon_join(
+        &mut self,
+        pdir: Option<&std::path::Path>,
+        spec: &str,
+    ) -> Result<std::path::PathBuf, Thrown> {
+        let raw = match pdir {
+            Some(d) => d.join(spec),
+            None => std::path::PathBuf::from(spec),
+        };
+        if let Some(c) = self.module_canon_memo.get(&raw) {
+            return Ok(c.clone());
+        }
+        let c = canonical_module_path(self.module_root.as_deref(), &raw)?;
+        self.module_canon_memo.insert(raw, c.clone());
+        Ok(c)
+    }
+
+    /// The forward slot for export `name` of the not-yet-loaded module `dep`
+    /// (see `module_forward`): `undefined` for a `var`, else uninitialized
+    /// (a TDZ) until the module's own environment takes it over.
+    fn module_forward_slot(
+        &mut self,
+        dep: &std::path::Path,
+        name: &str,
+        is_var: bool,
+    ) -> Result<u32, Thrown> {
+        let key = (dep.to_path_buf(), name.to_string());
+        if let Some(&slot) = self.module_forward.get(&key) {
+            return Ok(slot);
+        }
+        let init = if is_var { Value::UNDEFINED } else { Value::UNINITIALIZED };
+        let slot = self.alloc_global_pool_slot(init, "module bindings")?;
+        self.pool_slot_names
+            .insert(slot, crate::vm::PoolSlotName::Module(name.into()));
+        self.module_forward.insert(key, slot);
+        Ok(slot)
+    }
+
+    /// What the module at canonical `dep` says about export `name` without
+    /// running it, from its parsed top level (read once per module).
+    fn static_export(&mut self, dep: &std::path::Path, name: &str) -> Result<StaticExport, Thrown> {
+        if !self.module_static_exports.contains_key(dep) {
+            let table = self.read_static_exports(dep);
+            self.module_static_exports.insert(dep.to_path_buf(), table);
+        }
+        let t = &self.module_static_exports[dep];
+        Ok(if t.unknown {
+            StaticExport::Indirect
+        } else if let Some(&is_var) = t.own.get(name) {
+            StaticExport::Own { is_var }
+        } else if t.indirect.contains(name) || (t.star && name != "default") {
+            StaticExport::Indirect
+        } else {
+            StaticExport::Absent
+        })
+    }
+
+    fn read_static_exports(&mut self, dep: &std::path::Path) -> crate::vm::ModuleStaticExports {
+        use crate::parse::ast::{ExportDecl, ModuleExportName, Stmt, VarKind};
+        let mut t = crate::vm::ModuleStaticExports::default();
+        let Ok(code) = self.read_module_text(dep) else {
+            t.unknown = true;
+            return t;
+        };
+        let Ok(ast) = crate::lang::ts::parse_module_file(dep, &code) else {
+            t.unknown = true;
+            return t;
+        };
+        let text = |n: &ModuleExportName| match n {
+            ModuleExportName::Ident(n) => n.to_string(),
+            ModuleExportName::Str(s) => s.to_lossy_string(),
+        };
+        let mut vars: std::collections::HashSet<String> = Default::default();
+        // Import bindings: re-exporting one (`import { x } …; export { x }`)
+        // is indirect.
+        let mut imported: std::collections::HashSet<String> = Default::default();
+        // (exported, local) of `export { local as exported }`, judged once
+        // every top-level `var` is known.
+        let mut locals: Vec<(String, String)> = Vec::new();
+        for s in &ast.body {
+            match s {
+                Stmt::Import(d) => {
+                    for sp in &d.specifiers {
+                        let local = match sp {
+                            crate::parse::ast::ImportSpecifier::Default(n)
+                            | crate::parse::ast::ImportSpecifier::Namespace(n) => n,
+                            crate::parse::ast::ImportSpecifier::Named { local, .. } => local,
+                        };
+                        imported.insert(local.to_string());
+                    }
+                }
+                Stmt::VarDecl(d) if d.kind == VarKind::Var => {
+                    let mut names = Vec::new();
+                    for dc in &d.decls {
+                        crate::parse::stmt::collect_pattern_names(&dc.id, &mut names);
+                    }
+                    vars.extend(names.iter().map(|n| n.to_string()));
+                }
+                Stmt::Export(e) => match &**e {
+                    ExportDecl::Decl(d) => match &**d {
+                        Stmt::VarDecl(v) => {
+                            let mut names = Vec::new();
+                            for dc in &v.decls {
+                                crate::parse::stmt::collect_pattern_names(&dc.id, &mut names);
+                            }
+                            for n in names {
+                                if v.kind == VarKind::Var {
+                                    vars.insert(n.to_string());
+                                }
+                                t.own.insert(n.to_string(), v.kind == VarKind::Var);
+                            }
+                        }
+                        Stmt::FnDecl(f) => {
+                            if let Some(n) = &f.name {
+                                t.own.insert(n.to_string(), false);
+                            }
+                        }
+                        Stmt::ClassDecl(c) => {
+                            if let Some(n) = &c.name {
+                                t.own.insert(n.to_string(), false);
+                            }
+                        }
+                        _ => {}
+                    },
+                    ExportDecl::Named { specifiers, source, .. } => {
+                        for sp in specifiers {
+                            match (source, &sp.local) {
+                                (None, ModuleExportName::Ident(l)) => locals.push((text(&sp.exported), l.to_string())),
+                                _ => {
+                                    t.indirect.insert(text(&sp.exported));
+                                }
+                            }
+                        }
+                    }
+                    ExportDecl::Default(_) => {
+                        t.own.insert("default".into(), false);
+                    }
+                    ExportDecl::All { alias: Some(a), .. } => {
+                        t.indirect.insert(text(a));
+                    }
+                    ExportDecl::All { alias: None, .. } => t.star = true,
+                },
+                _ => {}
+            }
+        }
+        for (exported, local) in locals {
+            if imported.contains(&local) {
+                t.indirect.insert(exported);
+            } else {
+                let is_var = vars.contains(&local);
+                t.own.insert(exported, is_var);
+            }
+        }
+        // A name both declared here and re-exported is settled by loading.
+        let indirect: Vec<String> = t.indirect.iter().cloned().collect();
+        for n in indirect {
+            t.own.remove(&n);
+        }
+        t
     }
 
     /// Enumerate all exports of the module at `raw_path` (excluding `default`) as
@@ -2394,6 +2613,40 @@ mod confined_budget_tests {
             let entry = std::fs::canonicalize(root.join("entry.mjs")).expect("canonical entry");
             vm.import_module(&entry, None).expect("the graph runs");
             assert_eq!(vm.output, ["file:///lib/dep.mjs", "file:///entry.mjs"]);
+        });
+    }
+
+    #[test]
+    fn a_var_export_read_through_a_cycle_is_undefined_not_a_tdz() {
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            std::fs::write(root.join("a.mjs"), "import { b } from './b.mjs'; export var A = 1;")
+                .expect("write a");
+            std::fs::write(root.join("b.mjs"), "import { A } from './a.mjs'; export var b = 2; console.log(String(A));")
+                .expect("write b");
+            let entry = std::fs::canonicalize(root.join("a.mjs")).expect("canonical entry");
+            vm.import_module(&entry, None).expect("the cycle runs");
+            assert_eq!(vm.output, ["undefined"]);
+        });
+    }
+
+    #[test]
+    fn a_barrel_evaluates_its_modules_in_order() {
+        // `a` imports `B` back through the barrel while the barrel is linking:
+        // binding it must not run `b` ahead of `a`.
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            std::fs::write(root.join("barrel.mjs"), "export * from './a.mjs'; export * from './b.mjs';")
+                .expect("write barrel");
+            std::fs::write(root.join("a.mjs"), "import { B } from './barrel.mjs'; console.log('a'); export var A = { f() { return 1 } };")
+                .expect("write a");
+            std::fs::write(root.join("b.mjs"), "import { A } from './barrel.mjs'; console.log('b'); export var B = A.f();")
+                .expect("write b");
+            std::fs::write(root.join("main.mjs"), "import { B } from './barrel.mjs'; console.log(String(B));")
+                .expect("write main");
+            let entry = std::fs::canonicalize(root.join("main.mjs")).expect("canonical entry");
+            vm.import_module(&entry, None).expect("the barrel runs");
+            assert_eq!(vm.output, ["a", "b", "1"]);
         });
     }
 }

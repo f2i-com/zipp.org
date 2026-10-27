@@ -242,3 +242,20 @@ fn const_enums_are_inlined() {
     let text = format!("{:?}", ast.body);
     assert!(text.contains("Num(4.0)"), "{text}");
 }
+
+#[test]
+fn a_local_value_displaces_a_type_import() {
+    // `Symbol` and `Point` are imported types; the module's own values of
+    // those names are what the code means, and the imports go.
+    let src = "import { Symbol, Point, used } from './types'; import './side-effect'; function Symbol(this: Symbol, n: number) { (this as any).n = n } let Point: new () => Point; namespace N { import Alias = Inner.V; export namespace Inner { export const V = 3 } export const w = Alias } console.log(used, N.w)";
+    let ast = super::parse_auto(src, super::TsConfig::default()).unwrap_or_else(|f| panic!("{}", f.message));
+    let imports: Vec<String> = ast
+        .body
+        .iter()
+        .filter_map(|s| match s {
+            crate::parse::ast::Stmt::Import(d) => Some(format!("{}:{}", d.source, d.specifiers.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imports, ["./types:1", "./side-effect:0"]);
+}

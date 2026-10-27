@@ -64,9 +64,12 @@ impl<'s> Parser<'s> {
                 self.bump(false)?;
                 Ok(None)
             }
-            // `import x = …` in a script (a module's `import` is read by
-            // `ts_module_decl`).
-            "import" if self.goal != Goal::Module && self.ts_import_equals_ahead()? => {
+            // `import x = …` in a script or a namespace (a module's own
+            // `import` is read by `ts_module_decl`).
+            "import"
+                if (self.goal != Goal::Module || !self.scopes.at_module_top_level())
+                    && self.ts_import_equals_ahead()? =>
+            {
                 let pos = self.cur().span.start;
                 self.bump(false)?;
                 let s = self.ts_import_equals(pos, false)?;
@@ -269,6 +272,7 @@ impl<'s> Parser<'s> {
     /// is a declaration merging with it (`class C {}` + `namespace C {}`, two
     /// `enum E`s). `let` in a block, as tsc writes it; `var` elsewhere.
     fn ts_merge_decl(&mut self, name: &Name, pos: u32) -> PResult<Option<Stmt>> {
+        self.scopes.ts_take_import(name);
         if self.scopes.declared_here(name) {
             return Ok(None);
         }
@@ -301,6 +305,26 @@ impl<'s> Parser<'s> {
         self.bump(false)?; // `enum`
         let (name, pos) = self.binding_ident()?;
         self.expect(Punct::LBrace, false)?;
+        // The members are names in their initializers (`B = A | 2` means
+        // the member `A`), hiding any import of the same name: a scope of
+        // their own holds them while the body is read.
+        self.scopes.push(ScopeKind::Function);
+        let members = self.ts_enum_members();
+        self.scopes.pop()?;
+        let members = members?;
+        self.expect(Punct::RBrace, false)?;
+        let span = Span::new(start, self.prev_end());
+        let (body, consts) = lower::enum_body(&name, members, &self.ts_state.enums);
+        self.ts_state.enums.entry(name.clone()).or_default().extend(consts);
+        let mut out = Vec::with_capacity(2);
+        out.extend(self.ts_merge_decl(&name, pos)?);
+        out.push(lower::iife(&name, body, lower::merge_arg(&name, exported_in), span));
+        self.reinterpret_slash_as_regex()?;
+        Ok(out)
+    }
+
+    /// An enum's members, up to its `}`.
+    fn ts_enum_members(&mut self) -> PResult<Vec<EnumMember>> {
         let mut members = Vec::new();
         while !self.at(Punct::RBrace) {
             let member: Name = match self.cur().kind.clone() {
@@ -327,29 +351,13 @@ impl<'s> Parser<'s> {
             } else {
                 None
             };
+            self.scopes.declare_param(&member);
             members.push(EnumMember { name: member, init });
             if !self.eat(Punct::Comma, false)? {
                 break;
             }
         }
-        self.expect(Punct::RBrace, false)?;
-        let span = Span::new(start, self.prev_end());
-        let (body, consts) = lower::enum_body(&name, members, &self.ts_state.enums);
-        self.ts_state
-            .enums
-            .entry(name.clone())
-            .or_default()
-            .extend(consts);
-        let mut out = Vec::with_capacity(2);
-        out.extend(self.ts_merge_decl(&name, pos)?);
-        out.push(lower::iife(
-            &name,
-            body,
-            lower::merge_arg(&name, exported_in),
-            span,
-        ));
-        self.reinterpret_slash_as_regex()?;
-        Ok(out)
+        Ok(members)
     }
 
     /// `namespace A.B { … }` / `module A { … }`, the keyword current,

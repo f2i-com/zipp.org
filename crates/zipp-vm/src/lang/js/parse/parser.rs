@@ -386,6 +386,24 @@ impl Scope {
         }
     }
 
+    /// Remove an import binding of `name`, if this scope has one.
+    fn take_import(&mut self, name: &str) -> bool {
+        if !self.lex.iter().any(|(n, k, _)| &**n == name && *k == BindKind::Import) {
+            return false;
+        }
+        self.lex.retain(|(n, k, _)| !(&**n == name && *k == BindKind::Import));
+        if let Some(index) = self.lex_index.as_mut() {
+            index.remove(name);
+            for (n, k, _) in &self.lex {
+                if &**n == name {
+                    let all_functions = index.entry(n.clone()).or_insert(true);
+                    *all_functions &= *k == BindKind::Function;
+                }
+            }
+        }
+        true
+    }
+
     fn has_lex(&self, name: &str) -> bool {
         match &self.lex_index {
             Some(index) => index.contains_key(name),
@@ -437,6 +455,13 @@ impl Scope {
 #[derive(Debug, Default)]
 pub(crate) struct ScopeStack {
     pub scopes: Vec<Scope>,
+    /// TypeScript: a value declaration may share its name with an import,
+    /// which TypeScript then knows to be a type (they live in different
+    /// declaration spaces: `import { Symbol }` of an interface beside `function
+    /// Symbol`). The import gives way, and its name is recorded here for the
+    /// import to be dropped (`lang/ts/elide.rs`).
+    pub(crate) ts: bool,
+    pub(crate) import_clashes: Vec<Name>,
 }
 
 impl ScopeStack {
@@ -493,6 +518,9 @@ impl ScopeStack {
         pos: u32,
         annexb_dup_ok: bool,
     ) -> PResult<()> {
+        if self.ts && kind != BindKind::Import {
+            self.ts_take_import(name);
+        }
         let Some(scope) = self.scopes.last_mut() else {
             return Ok(());
         };
@@ -573,9 +601,20 @@ impl ScopeStack {
         }
     }
 
+    /// TypeScript: a value declaration of `name` in the innermost scope takes
+    /// the place of an import binding of it there (see `import_clashes`).
+    pub(crate) fn ts_take_import(&mut self, name: &str) {
+        if self.scopes.len() == 1 && self.scopes[0].take_import(name) {
+            self.import_clashes.push(name.into());
+        }
+    }
+
     /// A `var` conflicts with any lexical binding between here and the nearest
     /// var boundary, inclusive.
     pub(crate) fn declare_var(&mut self, name: &str, pos: u32) -> PResult<()> {
+        if self.ts {
+            self.ts_take_import(name);
+        }
         for scope in self.scopes.iter().rev() {
             if let Some(p) = &scope.simple_catch_param {
                 // Annex B B.3.5 carve-out.
@@ -795,7 +834,10 @@ impl<'s> Parser<'s> {
             tok,
             prev_end: 0,
             ctx,
-            scopes: ScopeStack::default(),
+            scopes: ScopeStack {
+                ts: opts.typescript,
+                ..ScopeStack::default()
+            },
             cover: Cover::default(),
             labels: Vec::new(),
             parenthesized: false,

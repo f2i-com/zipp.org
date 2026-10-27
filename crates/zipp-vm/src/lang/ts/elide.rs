@@ -52,6 +52,23 @@ impl<'s> Parser<'s> {
                 }
             }
         }
+        // An import whose name a local value declaration took is a type.
+        let clashes = std::mem::take(&mut self.scopes.import_clashes);
+        for name in &clashes {
+            for s in body.iter_mut() {
+                let Stmt::Import(d) = s else { continue };
+                if d.specifiers.is_empty() {
+                    continue;
+                }
+                d.specifiers.retain(|sp| match sp {
+                    ImportSpecifier::Default(n) | ImportSpecifier::Namespace(n) => n != name,
+                    ImportSpecifier::Named { local, .. } => local != name,
+                });
+                if d.specifiers.is_empty() {
+                    *s = Stmt::Empty;
+                }
+            }
+        }
         if self.ts_state.imports.is_empty() {
             return;
         }
