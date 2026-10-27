@@ -126,20 +126,34 @@
   };
   function unsupported(name) {
     // A module the layer does not have: requiring it works (packages often
-    // do at their top), using it says what is missing.
-    const fail = (what) => () => {
-      const e = new Error("zipp: node:" + name + (what ? "." + what : "") + " is not supported");
+    // do at their top), and so does reading its members and extending its
+    // classes (`class X extends stream.Readable`); calling or constructing
+    // one says what is missing.
+    const fail = (what) => {
+      const e = new Error("zipp: node:" + what + " is not supported");
       e.code = "ERR_ZIPP_UNSUPPORTED";
       throw e;
     };
-    const stub = new Proxy(fail(""), {
-      get(_, key) {
-        if (key === "__esModule" || typeof key === "symbol") return undefined;
-        if (key === "default") return stub;
-        return fail(String(key));
-      },
-    });
-    return stub;
+    function stub(path) {
+      const members = ObjectCreate(null);
+      const target = function () {};
+      const self = new Proxy(target, {
+        get(t, key) {
+          if (key === "prototype") return t.prototype;
+          if (key === "__esModule" || typeof key === "symbol" || key === "then") return undefined;
+          if (key === "default" && path === name) return self;
+          return (members[key] ||= stub(path + "." + String(key)));
+        },
+        apply() {
+          fail(path);
+        },
+        construct() {
+          fail(path);
+        },
+      });
+      return self;
+    }
+    return stub(name);
   }
   function builtin(name) {
     if (name in builtinCache) return builtinCache[name];

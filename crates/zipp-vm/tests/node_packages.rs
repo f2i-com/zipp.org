@@ -136,3 +136,44 @@ fn packages_resolve_and_commonjs_interoperates_as_in_node() {
     assert_eq!(lines(&out), ["9 B 42 esm extra function 3"]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A core module zipp does not have loads, as packages require them at
+/// their top (react-dom/server extends `stream.Readable` as it loads);
+/// reading its members and extending its classes work, and calling or
+/// constructing one throws ERR_ZIPP_UNSUPPORTED naming it. Not Node's
+/// output: Node has these modules.
+#[test]
+fn core_modules_zipp_lacks_load_and_say_so_when_used() {
+    let root = std::env::temp_dir().join(format!("zipp-npm-stub-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("main.cjs");
+    std::fs::write(
+        &script,
+        r#"const stream = require("stream");
+class R extends stream.Readable {}
+console.log(typeof R, R.prototype instanceof stream.Readable, stream.Readable === stream.Readable);
+for (const f of [() => new R(), () => require("http").createServer(), () => stream.pipeline()]) {
+  try { f(); } catch (e) { console.log(e.code, e.message); }
+}
+import("node:zlib").then((z) => console.log("zlib", typeof z.default.gzipSync));
+"#,
+    )
+    .unwrap();
+    zipp_vm::set_node_runtime(
+        true,
+        vec!["zipp".into(), script.to_string_lossy().into_owned()],
+    );
+    let src = std::fs::read_to_string(&script).unwrap();
+    let out = zipp_vm::run_with_base(&src, Some(root.clone())).expect("compiles");
+    assert_eq!(
+        lines(&out),
+        [
+            "function true true",
+            "ERR_ZIPP_UNSUPPORTED zipp: node:stream.Readable is not supported",
+            "ERR_ZIPP_UNSUPPORTED zipp: node:http.createServer is not supported",
+            "ERR_ZIPP_UNSUPPORTED zipp: node:stream.pipeline is not supported",
+            "zlib function",
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

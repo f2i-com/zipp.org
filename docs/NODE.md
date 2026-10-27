@@ -63,7 +63,9 @@ and `createHmac` for md5, sha1 and sha256; the randomness is
 
 The other core modules (`http`, `net`, `child_process`, `stream`, `zlib`,
 `worker_threads`, …) can be required, as many packages do at their top, and
-throw `ERR_ZIPP_UNSUPPORTED` naming the function when one is called.
+their members read and their classes extended (`react-dom/server` extends
+`stream.Readable` as it loads); calling or constructing one throws
+`ERR_ZIPP_UNSUPPORTED` naming it.
 
 Not there yet: the WHATWG `URL` and `URLSearchParams` globals, `fetch`,
 streams, and `fs` streams and watchers.
