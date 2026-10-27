@@ -1004,9 +1004,7 @@ impl Vm<'_> {
                 }
             }
         } else {
-            while let Some(idx) = stack.pop() {
-                self.trace_edges(idx, &mut marks, &mut stack, n);
-            }
+            self.drain_mark_stack(&mut marks, &mut stack, n);
         }
         self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
         let t_trace = gcstats::now(stats);
@@ -1063,7 +1061,14 @@ impl Vm<'_> {
                 trace_old,
             );
         } else {
+            // The slots come in order, but a dead object's map behind its Box
+            // is a cold line `free_slot` reads: ask for it a few slots ahead,
+            // as the minor's sweep does.
+            const MAP_AHEAD: usize = 8;
             for i in floor..n {
+                if let Some(false) = marks.get(i + MAP_AHEAD) {
+                    self.heap.prefetch_dead_map((i + MAP_AHEAD) as u32);
+                }
                 if !marks[i] {
                     self.heap.free_slot(i as u32);
                     swept += 1;
@@ -1264,9 +1269,7 @@ impl Vm<'_> {
                 stack.push(v);
             }
         }
-        while let Some(idx) = stack.pop() {
-            self.trace_edges(idx, &mut marks, &mut stack, n);
-        }
+        self.drain_mark_stack(&mut marks, &mut stack, n);
         self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
         let t_trace = gcstats::now(stats);
         if nursery_verify::enabled() {
@@ -1789,6 +1792,39 @@ impl Vm<'_> {
     }
 
     /// Push every heap reference held by object `idx` onto the mark stack.
+    /// Trace from everything on `stack` until it is empty. A popped index
+    /// waits in a short ring before it is traced, its heap slot prefetched as
+    /// it enters and its map or elements halfway through, so the trace finds
+    /// them in cache: on a large heap each object's slot, map and values were
+    /// a dependent miss apiece, and the mark ran at 34 ns an object.
+    fn drain_mark_stack(&self, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
+        const DEPTH: usize = 8;
+        const HALF: usize = DEPTH / 2;
+        let mut ring = [0u32; DEPTH];
+        // `ring[(next - len + k) % DEPTH]` for k < len holds the queued
+        // indices, oldest first.
+        let mut next = 0usize;
+        let mut len = 0usize;
+        loop {
+            while len < DEPTH {
+                let Some(i) = stack.pop() else { break };
+                self.heap.prefetch_slot(i);
+                ring[next % DEPTH] = i;
+                next += 1;
+                len += 1;
+                if len > HALF {
+                    self.heap.prefetch_payload(ring[(next - HALF - 1) % DEPTH]);
+                }
+            }
+            if len == 0 {
+                return;
+            }
+            let i = ring[(next - len) % DEPTH];
+            len -= 1;
+            self.trace_edges(i, marks, stack, n);
+        }
+    }
+
     fn trace_edges(&self, idx: u32, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
         macro_rules! m_val {
             ($v:expr) => {{

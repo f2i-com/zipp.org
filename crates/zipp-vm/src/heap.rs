@@ -10052,6 +10052,36 @@ impl Heap {
         &self.vremset
     }
 
+    /// The collector's mark loop is about to trace slot `idx`: ask for its
+    /// line (`Vm::drain_mark_stack`).
+    #[inline(always)]
+    pub(crate) fn prefetch_slot(&self, idx: u32) {
+        if let Some(o) = self.objs.get(idx as usize) {
+            prefetch_line(o);
+        }
+    }
+
+    /// [`Self::prefetch_slot`]'s second stage, once the slot's line has had
+    /// time to arrive: the out-of-line payload the trace reads next, an
+    /// object's map or an array's elements.
+    #[inline(always)]
+    pub(crate) fn prefetch_payload(&self, idx: u32) {
+        match self.objs.get(idx as usize) {
+            Some(HeapObj::Object(m)) => prefetch_line::<ObjMap>(&**m),
+            Some(HeapObj::Array(items)) => prefetch_line(items.as_ptr()),
+            _ => {}
+        }
+    }
+
+    /// A sweep about to free slot `idx`: an ordinary object's map, the line
+    /// behind its Box that `free_slot` reads to pool or ship it.
+    #[inline(always)]
+    pub(crate) fn prefetch_dead_map(&self, idx: u32) {
+        if let Some(HeapObj::Object(m)) = self.objs.get(idx as usize) {
+            prefetch_line::<ObjMap>(&**m);
+        }
+    }
+
     /// Record a young `v` stored where no holder's edge list reaches it (an
     /// instance's private field list, which the collector roots rather than
     /// traces through the instance) in `vremset`, whatever the holder's
