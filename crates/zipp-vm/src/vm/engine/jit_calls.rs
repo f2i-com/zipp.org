@@ -1712,9 +1712,7 @@ impl<'p> Vm<'p> {
             return Some(v.bits());
         }
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
-        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-            crate::heap::ObjMap::with_val_capacity(hint as usize),
-        ))));
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, None));
         if proto.is_heap() {
             self.proto_of.insert(obj.heap_index(), proto);
         }

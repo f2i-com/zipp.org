@@ -2068,16 +2068,34 @@ impl ValStore {
         }
     }
 
-    /// Structural growth: a `Slab` store SPILLS to the `Vec` form first. The
-    /// Vec (including the new value) is fully allocated and published before
-    /// the old cell goes home, so allocation failure cannot leave the object
-    /// pointing at a returned cell. The caller's key-add version bump
-    /// invalidates every cached pointer, per the field doc.
+    /// Structural growth: a `Slab` store fills its cell's free slots in place
+    /// and SPILLS to the `Vec` form once the cell is full. The Vec (including
+    /// the new value) is fully allocated and published before the old cell
+    /// goes home, so allocation failure cannot leave the object pointing at
+    /// a returned cell. The caller's key-add version bump invalidates every
+    /// cached pointer, per the field doc.
     fn push(&mut self, v: Value) {
         match self {
             ValStore::Vec(vec) => vec.push(v),
             #[cfg(not(feature = "safe-sandbox"))]
-            ValStore::Slab { .. } => {
+            ValStore::Slab { base, owner_and_len } => {
+                let len = *owner_and_len & VAL_SLAB_OWNER_LEN_MASK;
+                // SAFETY: the owner address was exposed from the class that
+                // carved this cell, which lives in a Box for the heap's whole
+                // life (see `return_slab_cell`).
+                let cap = unsafe {
+                    (*std::ptr::with_exposed_provenance::<ValSlabClass>(
+                        *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK,
+                    ))
+                    .cap
+                };
+                if len < cap {
+                    // SAFETY: the cell has `cap` slots inside a live chunk and
+                    // belongs to this store alone (the containment invariant).
+                    unsafe { *std::ptr::with_exposed_provenance_mut::<Value>(*base).add(len) = v };
+                    *owner_and_len += 1;
+                    return;
+                }
                 let mut vec = self.as_slice().to_vec();
                 vec.reserve(1);
                 vec.push(v);
@@ -2201,6 +2219,9 @@ struct ValSlabClass {
     free: Vec<usize>,
     /// Next unused offset (in `Value`s) within the LAST chunk.
     cursor: usize,
+    /// The slots of every cell this class carves, which an append fills in
+    /// place before it spills (`ValStore::push`); 0 spills every append.
+    cap: usize,
 }
 
 // The tagged-owner representation above depends on all five low address bits
@@ -2217,10 +2238,15 @@ const VAL_SLAB_CHUNK: usize = 4096;
 #[cfg(not(feature = "safe-sandbox"))]
 impl ValSlabClass {
     const fn new() -> Self {
+        Self::with_cap(0)
+    }
+
+    const fn with_cap(cap: usize) -> Self {
         ValSlabClass {
             chunks: Vec::new(),
             free: Vec::new(),
             cursor: VAL_SLAB_CHUNK, // forces the first chunk on first use
+            cap,
         }
     }
 
@@ -2974,27 +3000,6 @@ impl ObjMap {
         self.sealed = sealed;
         self.frozen = frozen;
         self.extensible = extensible;
-    }
-
-    /// [`ObjMap::with_capacity`] without the key vector: for an instance a
-    /// compiled constructor fills through the JIT's add ways, whose keys come
-    /// from the shape's shared list (`append_data_shaped`), so a reserved key
-    /// vector would be allocated only to be dropped.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn with_val_capacity(n: usize) -> ObjMap {
-        let mut m = ObjMap::new();
-        if n > 0 {
-            {
-                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
-                let ValStore::Vec(v) = &mut m.vals
-                else {
-                    unreachable!("ctor stores are Vec-born")
-                };
-                v.reserve_exact(n);
-            }
-            m.attrs.reserve_exact(n);
-        }
-        m
     }
 
     /// Empty object storage backed by a compiler-prepared immutable key list.
@@ -8034,11 +8039,11 @@ impl Heap {
             courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
             val_slab: Box::new([
-                ValSlabClass::new(),
-                ValSlabClass::new(),
-                ValSlabClass::new(),
-                ValSlabClass::new(),
-                ValSlabClass::new(),
+                ValSlabClass::with_cap(4),
+                ValSlabClass::with_cap(5),
+                ValSlabClass::with_cap(6),
+                ValSlabClass::with_cap(8),
+                ValSlabClass::with_cap(16),
             ]),
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool: Vec::new(),
@@ -8588,6 +8593,76 @@ impl Heap {
             self.thin_stats[0] += 1;
         }
         self.alloc_object_settled_thin(boxed, shape)
+    }
+
+    /// A constructor's new instance: an empty object of class `class` (none
+    /// for a function's) whose values go in a slab cell of the class for
+    /// `hint` properties, what the constructor's last instance ended up
+    /// holding, in a recycled shell when the pool has one. Its appends fill
+    /// the cell in place (`ValStore::push`), and at its death the shell and
+    /// cell go back to the pools a literal's go to. A boxed map and a value
+    /// vector of its own were two allocations and two frees per instance,
+    /// the second freed on the courier thread (`new P(i)` with two fields at
+    /// 1.5 times QuickJS's time). A hint the slab has no class for, or the
+    /// slab off, takes the vector.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {
+        let Some(sc) = val_slab_class(hint).filter(|_| self.thin_alloc) else {
+            let mut m = ObjMap::with_value_capacity(hint);
+            m.class = class;
+            return self.alloc(HeapObj::Object(Box::new(m)));
+        };
+        let mut shell = self.obj_pool.pop();
+        let owner = &mut self.val_slab[sc as usize];
+        let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
+        // A pooled shell may still hold its last occupant's cell (B258): the
+        // instance keeps it when the class matches, as a literal does.
+        let mut reuse_base = None;
+        if let Some(b) = shell.as_deref_mut() {
+            if let ValStore::Slab { base, owner_and_len } = &b.vals {
+                if *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK == owner_addr {
+                    reuse_base = Some(*base);
+                } else {
+                    b.vals.strip_slab();
+                }
+            }
+        }
+        let base = match reuse_base {
+            Some(base) => base,
+            None => self.val_slab[sc as usize].alloc_cell(val_slab_class_cap(sc)),
+        };
+        // Length 0 in the owner's low bits: the appends count it up.
+        let vals = ValStore::Slab {
+            base,
+            owner_and_len: owner_addr,
+        };
+        let boxed = match shell {
+            Some(mut b) => {
+                self.obj_pool_pops += 1;
+                // The old occupant's remains (a plan handle, an index) drop
+                // here; its cell is either `vals` or already home.
+                *b = ObjMap {
+                    vals,
+                    class,
+                    ..ObjMap::new()
+                };
+                b
+            }
+            None => Box::new(ObjMap {
+                vals,
+                class,
+                ..ObjMap::new()
+            }),
+        };
+        self.alloc_object_settled_thin(boxed, crate::shape::EMPTY)
+    }
+
+    /// [`Heap::alloc_ctor_object`] in the checked profile, which has no slab.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {
+        let mut m = ObjMap::with_value_capacity(hint);
+        m.class = class;
+        self.alloc(HeapObj::Object(Box::new(m)))
     }
 
     /// B257: install a finalized object whose mirror is known, writing the

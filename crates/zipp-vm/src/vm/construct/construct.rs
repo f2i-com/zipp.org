@@ -70,9 +70,7 @@ impl<'p> Vm<'p> {
             }
         }
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
-        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-            ObjMap::with_value_capacity(hint as usize),
-        ))));
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, None));
         if proto.is_heap() {
             self.proto_of.insert(obj.heap_index(), proto);
         }
@@ -165,9 +163,7 @@ impl<'p> Vm<'p> {
     ) -> Result<(u32, u32, Value, Value), Thrown> {
         let ci = cv.heap_index();
         let hint = self.ctor_field_hint.get(fid as usize).copied().unwrap_or(0);
-        let mut map = ObjMap::with_value_capacity(hint as usize);
-        map.class = Some(ci);
-        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(ci)));
         // The base class's InitializeInstanceElements, before its body.
         let rooted = self.host_result_roots.len();
         self.host_result_roots.push(obj);
@@ -1220,9 +1216,7 @@ impl<'p> Vm<'p> {
             let hint = fid
                 .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
                 .unwrap_or(0);
-            let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-                ObjMap::with_capacity(hint as usize),
-            ))));
+            let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, None));
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
@@ -1317,9 +1311,11 @@ impl<'p> Vm<'p> {
         }
         // The instance links to its class for method lookup + instanceof; its own
         // keys hold only the fields (so enumeration / JSON stay method-free).
-        let mut map = ObjMap::new();
-        map.class = Some(cv.heap_index());
-        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        // Sized from what the class's last instance held (`ctor_field_hint`).
+        let hint = ctor
+            .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
+            .unwrap_or(0);
+        let obj = Value::heap(self.heap.alloc_ctor_object(hint as usize, Some(cv.heap_index())));
         if let Some(p) = proto_override {
             // A class instance with its own proto entry no longer matches the
             // class-shape inline caches.
@@ -1464,6 +1460,9 @@ impl<'p> Vm<'p> {
                 self.call_value(f, inst, &[])?;
             }
             return Ok(inst);
+        }
+        if let Some(f) = ctor {
+            self.learn_ctor_field_hint(f, obj);
         }
         Ok(obj)
     }
