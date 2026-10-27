@@ -276,11 +276,14 @@ pub(crate) enum IcEntry {
         recv_shape: u32,
     },
     /// `set key(v)` resolved on the receiver's class chain (SetProp sites).
+    /// `recv_shape` as for `ClassGetter` (`ic_set_way0_tail`).
     ClassSetter {
         class: u32,
         ver: u32,
         epoch: u32,
         setter: Value,
+        #[cfg_attr(not(all(feature = "jit", not(feature = "safe-sandbox"))), allow(dead_code))]
+        recv_shape: u32,
     },
     /// Data property / accessor found on the proto_of chain at
     /// `hops[last].slot`, or (`slot == u32::MAX` for `ProtoData`) a full-chain
@@ -2680,6 +2683,126 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// [`Self::ic_set_prop_own_hit`] for the main dispatch loop, which also
+    /// takes from way 0, out of line (`ic_set_way0_tail`), an append (a
+    /// constructor's `this.x = v`) and a setter to call. Each went through
+    /// the site key's text, the private and static-member tests and the full
+    /// `ic_set_prop` call, whose megamorphic probe, site fetch and receiver
+    /// map came before the same first way; an own or a class setter took
+    /// the receiver's key lookup as well.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_set_prop_way0(&mut self, func_id: u32, ip: usize, recv: Value, val: Value, name: u32) -> SetAct {
+        if !recv.is_heap() {
+            return SetAct::None;
+        }
+        let idx = recv.heap_index();
+        let mir = self.heap.hot_mirror_of(idx);
+        if mir.shape == crate::shape::DICT
+            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !self.deferred_ns_state.is_empty()
+            || !self.ic_func_eligible(func_id)
+        {
+            return SetAct::None;
+        }
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return SetAct::None;
+        };
+        let slot = match cell.own_write(mir.shape) {
+            Some(slot) => slot,
+            None => {
+                let Some(site) = cell.site.as_deref() else {
+                    return SetAct::None;
+                };
+                if site.n == 0 {
+                    return SetAct::None;
+                }
+                match site.entries[0] {
+                    IcEntry::OwnData { shape: cached, slot } if cached == mir.shape => slot,
+                    IcEntry::Private { .. } => {
+                        return if self.ic_private_set_tail(func_id, ip, idx, val) {
+                            SetAct::Done
+                        } else {
+                            SetAct::None
+                        };
+                    }
+                    e @ (IcEntry::AddData { .. }
+                    | IcEntry::AddClass { .. }
+                    | IcEntry::OwnAcc { .. }
+                    | IcEntry::ProtoAcc { .. }
+                    | IcEntry::ClassSetter { .. }) => {
+                        return self.ic_set_way0_tail(func_id, idx, e, mir.shape, val, name);
+                    }
+                    _ => return SetAct::None,
+                }
+            }
+        };
+        if val.is_heap() {
+            self.heap.write_barrier_val(idx, val);
+        }
+        // SAFETY: as in `ic_set_prop_own_hit`.
+        unsafe { *(mir.vals as *mut Value).add(slot as usize) = val };
+        SetAct::Done
+    }
+
+    /// [`Self::ic_set_prop_way0`]'s appends and setters, under the guards
+    /// `ic_set_prop`'s shape-keyed first way applies: the receiver's shape
+    /// (its mirror's, `shape`) is the one the way was filled with, which
+    /// proves an append's starting layout, an own accessor's slot, and for
+    /// an inherited or a class setter that the receiver has no own property
+    /// of the key. `name` is the site's key, read only for an append.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_set_way0_tail(&mut self, func_id: u32, idx: u32, e: IcEntry, shape: u32, val: Value, name: u32) -> SetAct {
+        let HeapObj::Object(m) = self.heap.get(idx) else {
+            return SetAct::None;
+        };
+        let plan = match e {
+            IcEntry::AddData { before, .. } | IcEntry::AddClass { before, .. } if before == shape => {
+                self.ic_validate_add(&e, idx, m)
+            }
+            IcEntry::OwnAcc { shape: s, slot } if s == shape => {
+                // A getter-only accessor (no plain setter) is the full path's.
+                let setter = m.attr_at(slot as usize).setter;
+                self.ic_plain_fn(setter)
+                    .map(|(fid, closure)| SetPlan::Setter { fid, closure, setter })
+            }
+            IcEntry::ProtoAcc {
+                recv_shape,
+                first,
+                hops,
+                slot,
+            } if recv_shape == shape && m.class.is_none() && self.ic_chain_ok(idx, first, &hops).is_some() => {
+                match self.ic_chain_acc_set(hops, slot) {
+                    SetAct::Setter { fid, closure, setter } => Some(SetPlan::Setter { fid, closure, setter }),
+                    _ => None,
+                }
+            }
+            IcEntry::ClassSetter {
+                class,
+                ver,
+                epoch,
+                setter,
+                recv_shape,
+            } if recv_shape == shape
+                && m.class == Some(class)
+                && self.heap.version_of(class) == ver
+                && self.class_proto_epoch == epoch =>
+            {
+                self.ic_plain_fn(setter)
+                    .map(|(fid, closure)| SetPlan::Setter { fid, closure, setter })
+            }
+            _ => None,
+        };
+        match plan {
+            Some(p) => {
+                let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+                self.ic_apply_set(p, key, val)
+            }
+            None => SetAct::None,
+        }
+    }
+
     /// [`Self::ic_set_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
     #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
@@ -2963,6 +3086,7 @@ impl<'p> Vm<'p> {
                         let ver = self.heap.version_of(class);
                         let epoch = self.class_proto_epoch;
                         self.mi_record_recv(func_id, ip, recv);
+                        let recv_shape = self.ic_recv_shape(recv);
                         self.ic_install(
                             func_id,
                             ip,
@@ -2971,6 +3095,7 @@ impl<'p> Vm<'p> {
                                 ver,
                                 epoch,
                                 setter,
+                                recv_shape,
                             },
                         );
                         match self.ic_plain_fn(setter) {
@@ -3025,6 +3150,7 @@ impl<'p> Vm<'p> {
                                 let ver = self.heap.version_of(class);
                                 let epoch = self.class_proto_epoch;
                                 self.mi_record_recv(func_id, ip, recv);
+                                let recv_shape = self.ic_recv_shape(recv);
                                 self.ic_install(
                                     func_id,
                                     ip,
@@ -3033,6 +3159,7 @@ impl<'p> Vm<'p> {
                                         ver,
                                         epoch,
                                         setter,
+                                        recv_shape,
                                     },
                                 );
                                 return match self.ic_plain_fn(setter) {
@@ -3352,6 +3479,7 @@ impl<'p> Vm<'p> {
                 ver,
                 epoch,
                 setter,
+                ..
             } => {
                 if own.is_none()
                     && m.class == Some(class)
@@ -4220,6 +4348,7 @@ impl<'p> Vm<'p> {
                 ver,
                 epoch,
                 setter,
+                ..
             } = *e
             {
                 if c == class && self.ic_class_way_live(c, ver, epoch) {

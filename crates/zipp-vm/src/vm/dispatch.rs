@@ -3816,8 +3816,37 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         // The cache's way-0 own-data hit, inline and first (a
                         // private name fills no way: `ic_set_prop`); anything
-                        // else is the full `ic_set_prop` call below.
-                        #[cfg(not(feature = "safe-sandbox"))]
+                        // else is the full `ic_set_prop` call below. An append
+                        // or a setter way 0 names is taken from here too.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        match self.ic_set_prop_way0(func_id, ip, o, v, name) {
+                            SetAct::Done => {
+                                ip += 1;
+                                continue;
+                            }
+                            SetAct::Setter {
+                                fid,
+                                closure,
+                                setter,
+                            } => {
+                                // A shaped receiver is an object: no boxing.
+                                self.setup_call_this_outlined(
+                                    fid,
+                                    closure,
+                                    o,
+                                    true,
+                                    base,
+                                    val,
+                                    1,
+                                    RET_DISCARD,
+                                    ip + 1,
+                                    setter,
+                                )?;
+                                break;
+                            }
+                            SetAct::None => {}
+                        }
+                        #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
                         if self.ic_set_prop_own_hit(func_id, ip, o, v) {
                             ip += 1;
                             continue;
