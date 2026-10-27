@@ -3725,7 +3725,21 @@ impl<'p> Vm<'p> {
                                 closure,
                                 getter,
                             } => {
-                                self.setup_call(fid, closure, o, base, 0, 0, dst, ip + 1, getter)?;
+                                // The lean push: an object receiver needs no
+                                // boxing even for a sloppy getter.
+                                let this_is_object = self.is_object_value(o);
+                                self.setup_call_this_outlined(
+                                    fid,
+                                    closure,
+                                    o,
+                                    this_is_object,
+                                    base,
+                                    0,
+                                    0,
+                                    dst,
+                                    ip + 1,
+                                    getter,
+                                )?;
                                 break;
                             }
                             GetAct::None => {}
@@ -3854,10 +3868,13 @@ impl<'p> Vm<'p> {
                                 closure,
                                 setter,
                             } => {
-                                self.setup_call(
+                                // The lean push, as for a getter.
+                                let this_is_object = self.is_object_value(o);
+                                self.setup_call_this_outlined(
                                     fid,
                                     closure,
                                     o,
+                                    this_is_object,
                                     base,
                                     val,
                                     1,
@@ -4092,8 +4109,24 @@ impl<'p> Vm<'p> {
                         // one three back, a chain of dependent loads on every
                         // split call (6% of a `dv.getUint32(o, le)` loop). Only
                         // the reduction, an optimization, depends on the filter.
-                        let copy_method = if name == crate::bytecode::NO_NAME
-                            || matches!(strs[name as usize].as_str(), "slice" | "concat")
+                        let plain = if callee_v.is_heap() {
+                            match self.heap.get(callee_v.heap_index()) {
+                                HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
+                                HeapObj::Closure { func, .. } => {
+                                    Some((*func, callee_v.heap_index()))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        // The intrinsics the reduction recovers are natives,
+                        // so a plain function callee skips the recognizer: a
+                        // private method's call is unnamed, and every
+                        // `this.#m()` ran it.
+                        let copy_method = if plain.is_none()
+                            && (name == crate::bytecode::NO_NAME
+                                || matches!(strs[name as usize].as_str(), "slice" | "concat"))
                         {
                             self.captured_array_copy_method(func_id, ip)
                         } else {
@@ -4112,24 +4145,17 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        let plain = if callee_v.is_heap() {
-                            match self.heap.get(callee_v.heap_index()) {
-                                HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
-                                HeapObj::Closure { func, .. } => {
-                                    Some((*func, callee_v.heap_index()))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
                         if let Some((fid, closure)) = plain {
                             let p = self.func(fid as usize);
                             if !p.is_generator && !p.is_async {
-                                self.setup_call(
+                                // The lean push for a strict callee (every
+                                // class method: `super.m()`, `this.#m()`);
+                                // anything else goes on to `setup_call`.
+                                self.setup_call_this_outlined(
                                     fid,
                                     closure,
                                     this_val,
+                                    false,
                                     base,
                                     arg_base,
                                     argc,
@@ -7846,6 +7872,39 @@ impl<'p> Vm<'p> {
             callee: callee_val,
         });
         Ok(())
+    }
+
+    /// [`Self::setup_call_lean_this`] out of line, for the dispatch loop's
+    /// less frequent pushes (a `CallWithThis`, an accessor's call): inlined
+    /// there, the push grew the loop's body and its register pressure, and
+    /// rows that make none of those calls ran up to 8% slower.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    pub(crate) fn setup_call_this_outlined(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this_val: Value,
+        this_is_object: bool,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        self.setup_call_lean_this(
+            func_id,
+            closure,
+            this_val,
+            this_is_object,
+            caller_base,
+            arg_base,
+            argc,
+            dst,
+            caller_ip_next,
+            callee_val,
+        )
     }
 
     /// [`Self::setup_call_lean`] for a plain call (`this` undefined) whose

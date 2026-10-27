@@ -1713,6 +1713,10 @@ impl<'p> Vm<'p> {
             return None;
         }
         let key = js.as_str_wf();
+        // The key's table hash, made at the first indexed level and used at
+        // every other: a miss through the default chain hashed the key at
+        // the receiver, its prototype and %Object.prototype% in turn.
+        let mut tag = None;
         let mut cur = idx;
         for _ in 0..64 {
             if (cur == self.global_this && self.global_this != 0)
@@ -1723,7 +1727,12 @@ impl<'p> Vm<'p> {
             let HeapObj::Object(m) = self.heap.get(cur) else {
                 return None;
             };
-            if m.pos(key).is_some() {
+            let at = if m.is_indexed() {
+                m.pos_tagged(key, *tag.get_or_insert_with(|| crate::heap::prop_tag_of(key)))
+            } else {
+                m.pos(key)
+            };
+            if at.is_some() {
                 return Some(true);
             }
             if m.class.is_some() {
@@ -1768,6 +1777,8 @@ impl<'p> Vm<'p> {
         if key == "__proto__" {
             return None;
         }
+        // One table hash for the whole walk, as `plain_string_key_has`.
+        let mut tag = None;
         let mut cur = target.heap_index();
         for depth in 0..64 {
             if !self.ic_obj_ok(cur) {
@@ -1778,7 +1789,12 @@ impl<'p> Vm<'p> {
                 _ if depth == 0 => return self.plain_array_own_data_get(cur, key).map(PlainGet::Data),
                 _ => return None,
             };
-            if let Some(slot) = m.pos(key) {
+            let at = if m.is_indexed() {
+                m.pos_tagged(key, *tag.get_or_insert_with(|| crate::heap::prop_tag_of(key)))
+            } else {
+                m.pos(key)
+            };
+            if let Some(slot) = at {
                 let v = m.val_at(slot);
                 if m.attr_at(slot).accessor {
                     return Some(PlainGet::Getter(v));

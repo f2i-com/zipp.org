@@ -289,7 +289,13 @@ pub(crate) enum IcEntry {
         hops: IcHops,
         slot: u32,
     },
+    /// An accessor on the proto_of chain at `hops[last].slot`. `recv_shape`
+    /// is the receiver's hidden class at fill, as for `ProtoData`: a live
+    /// match proves the key still absent from the receiver, so a get or a
+    /// set through a prototype's accessor (`v.x` with `x` defined on
+    /// `Vec.prototype`) needs no own-key lookup first.
     ProtoAcc {
+        recv_shape: u32,
         first: u8,
         hops: IcHops,
         slot: u32,
@@ -500,6 +506,20 @@ pub(crate) struct SiteCell {
 
 impl SiteCell {
     const WRITE_PROVEN: u32 = 1 << 31;
+
+    /// `own_shape` of a pair that records where a DICTIONARY-mode receiver
+    /// held the key (`Vm::ic_cell_dict`). No shape is ever this, so no
+    /// shape-keyed hit takes the pair; a read of such a receiver tries the
+    /// slot first (`dict_hint`).
+    const DICT_HINT: u32 = u32::MAX;
+
+    /// The slot a dictionary-mode receiver last held the key at, if the
+    /// cell remembers one.
+    #[inline(always)]
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+    fn dict_hint(&self) -> Option<usize> {
+        (self.own_shape == Self::DICT_HINT).then_some((self.own_slot & !Self::WRITE_PROVEN) as usize)
+    }
 
     /// The slot of the key in a receiver of `shape`, if the cell knows it.
     /// (The safe profile has no inline hits to ask.)
@@ -790,6 +810,28 @@ impl<'p> Vm<'p> {
         {
             cell.own_shape = shape;
             cell.own_slot = slot as u32 | if write_proven { SiteCell::WRITE_PROVEN } else { 0 };
+        }
+    }
+
+    /// Remember that a dictionary-mode receiver held the key of the
+    /// property instruction at `(func_id, ip)` in `slot` (`SiteCell::
+    /// dict_hint`), unless the cell knows a shaped receiver's pair, which
+    /// the inline hits read. As `ic_cell_own`, never made for it.
+    #[inline]
+    fn ic_cell_dict(&mut self, func_id: u32, ip: usize, slot: usize) {
+        if slot >= SiteCell::WRITE_PROVEN as usize {
+            return;
+        }
+        if let Some(cell) = self
+            .site_ics
+            .get_mut(func_id as usize)
+            .and_then(Option::as_mut)
+            .and_then(|table| table.get_mut(ip))
+        {
+            if cell.own_shape == crate::shape::DICT || cell.own_shape == SiteCell::DICT_HINT {
+                cell.own_shape = SiteCell::DICT_HINT;
+                cell.own_slot = slot as u32;
+            }
         }
     }
 
@@ -1740,6 +1782,12 @@ impl<'p> Vm<'p> {
             slot,
         } = site.entries[0]
         else {
+            // A module namespace's export (`ns.key`), out of line: this probe
+            // has the site in hand, where `ic_get_prop` fetched it again after
+            // the dispatch loop's other leaves for the namespace's every read.
+            if let IcEntry::NsExport { .. } = site.entries[0] {
+                return self.ic_ns_export_hit(recv, &site.entries[0]);
+            }
             return None;
         };
         let (idx, m) = self.ic_recv_map(recv)?;
@@ -1821,17 +1869,9 @@ impl<'p> Vm<'p> {
             // binding out of its TDZ). The namespace map and its export map
             // were two hash lookups per read, a sixth of a module loop.
             if site.n > 0 {
-                if let IcEntry::NsExport { ns, ver, slot } = site.entries[0] {
-                    if recv.is_heap()
-                        && recv.heap_index() == ns
-                        && self.heap.version_of(ns) == ver
-                        && self.deferred_ns_state.is_empty()
-                    {
-                        if let Some(&v) = self.globals.get(slot as usize) {
-                            if !v.is_uninitialized() {
-                                return GetAct::Value(v);
-                            }
-                        }
+                if let IcEntry::NsExport { .. } = site.entries[0] {
+                    if let Some(v) = self.ic_ns_export_hit(recv, &site.entries[0]) {
+                        return GetAct::Value(v);
                     }
                 }
             }
@@ -1918,26 +1958,67 @@ impl<'p> Vm<'p> {
                     // failed guard retain the ordinary path below. JIT-enabled
                     // execution deliberately keeps the old feedback path.
                     if sh != crate::shape::DICT {
-                        if let IcEntry::ProtoData {
-                            recv_shape,
-                            first,
-                            hops,
-                            slot,
-                        } = site.entries[0]
-                        {
-                            if slot != u32::MAX
-                                && recv_shape == sh
-                                && m.class.is_none()
-                                && self.interp_own_resolve_vm_is_interpreter()
-                            {
-                                if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
-                                    let s = slot as usize;
-                                    if hm.key_get(s) == Some(key)
-                                        && !hm.attr_at(s).accessor
-                                    {
-                                        return GetAct::Value(hm.val_at(s));
+                        match site.entries[0] {
+                            IcEntry::ProtoData {
+                                recv_shape,
+                                first,
+                                hops,
+                                slot,
+                            } => {
+                                if slot != u32::MAX
+                                    && recv_shape == sh
+                                    && m.class.is_none()
+                                    && self.interp_own_resolve_vm_is_interpreter()
+                                {
+                                    if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                                        let s = slot as usize;
+                                        if hm.key_get(s) == Some(key)
+                                            && !hm.attr_at(s).accessor
+                                        {
+                                            return GetAct::Value(hm.val_at(s));
+                                        }
                                     }
                                 }
+                            }
+                            // An inherited accessor, by the same shape proof
+                            // (`ic_validate_get`'s `ProtoAcc` arm without the
+                            // own-key lookup).
+                            IcEntry::ProtoAcc {
+                                recv_shape,
+                                first,
+                                hops,
+                                slot,
+                            } => {
+                                if recv_shape == sh
+                                    && m.class.is_none()
+                                    && self.interp_own_resolve_vm_is_interpreter()
+                                    && self.ic_chain_ok(idx, first, &hops).is_some()
+                                {
+                                    match self.ic_chain_acc_get(hops, slot) {
+                                        GetAct::None => {}
+                                        act => return act,
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A dictionary-mode receiver: the slot where this site
+                    // last found its key in one, tried before the key search
+                    // (a map holds a key once, so the key there is the own
+                    // property). The search hashed or scanned the receiver's
+                    // keys on every read of such a receiver.
+                    if sh == crate::shape::DICT
+                        && self.interp_own_resolve_vm_is_interpreter()
+                        && !is_private_key(key)
+                    {
+                        if let Some(s) = self.ic_cell(func_id, ip).and_then(SiteCell::dict_hint) {
+                            if m.key_get(s) == Some(key) {
+                                return if m.attr_at(s).accessor {
+                                    self.ic_acc_get_from(m, s)
+                                } else {
+                                    GetAct::Value(m.val_at(s))
+                                };
                             }
                         }
                     }
@@ -1964,7 +2045,11 @@ impl<'p> Vm<'p> {
                             // and a string key may spell one (`o["#x"]`).
                             let (v, sh) = (m.val_at(slot), m.shape());
                             if !is_private_key(key) {
-                                self.ic_cell_own(func_id, ip, sh, slot, false);
+                                if sh == crate::shape::DICT {
+                                    self.ic_cell_dict(func_id, ip, slot);
+                                } else {
+                                    self.ic_cell_own(func_id, ip, sh, slot, false);
+                                }
                             }
                             return GetAct::Value(v);
                         }
@@ -2126,7 +2211,17 @@ impl<'p> Vm<'p> {
                 GetAct::Value(hm.val_at(slot as usize))
             }
             Walked::ChainAcc { first, hops, slot } => {
-                self.ic_install(func_id, ip, IcEntry::ProtoAcc { first, hops, slot });
+                let recv_shape = self.ic_recv_shape(recv);
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ProtoAcc {
+                        recv_shape,
+                        first,
+                        hops,
+                        slot,
+                    },
+                );
                 self.ic_chain_acc_get(hops, slot)
             }
             Walked::ChainMiss { first, hops } => {
@@ -2261,7 +2356,9 @@ impl<'p> Vm<'p> {
                     GetAct::None
                 }
             }
-            IcEntry::ProtoAcc { first, hops, slot } => {
+            IcEntry::ProtoAcc {
+                first, hops, slot, ..
+            } => {
                 if own.is_some() || m.class.is_some() {
                     return GetAct::None;
                 }
@@ -2445,6 +2542,28 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// `ns.key` through an `IcEntry::NsExport` way: the export's live slot,
+    /// the namespace [[Get]]'s answer, when the receiver is that namespace
+    /// at that version, no deferred namespace is pending and the binding is
+    /// out of its TDZ. `None` for anything else.
+    #[inline(never)]
+    fn ic_ns_export_hit(&self, recv: Value, e: &IcEntry) -> Option<Value> {
+        let IcEntry::NsExport { ns, ver, slot } = *e else {
+            return None;
+        };
+        if !recv.is_heap()
+            || recv.heap_index() != ns
+            || self.heap.version_of(ns) != ver
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        self.globals
+            .get(slot as usize)
+            .copied()
+            .filter(|v| !v.is_uninitialized())
+    }
+
     /// IC lookup + fill for a `SetProp` site. `SetAct::Done` means the own
     /// data slot was written; `Setter` hands a plain setter to frame-call.
     pub(crate) fn ic_set_prop(
@@ -2498,6 +2617,33 @@ impl<'p> Vm<'p> {
                         {
                             if before == shape {
                                 plan = self.ic_validate_add(&site.entries[0], idx, m);
+                            }
+                        } else if let IcEntry::ProtoAcc {
+                            recv_shape,
+                            first,
+                            hops,
+                            slot,
+                        } = site.entries[0]
+                        {
+                            // An inherited setter: the shape proves the key
+                            // absent from the receiver, as `ic_validate_set`'s
+                            // own-key lookup would.
+                            if recv_shape == shape
+                                && m.class.is_none()
+                                && self.ic_chain_ok(idx, first, &hops).is_some()
+                            {
+                                if let SetAct::Setter {
+                                    fid,
+                                    closure,
+                                    setter,
+                                } = self.ic_chain_acc_set(hops, slot)
+                                {
+                                    plan = Some(SetPlan::Setter {
+                                        fid,
+                                        closure,
+                                        setter,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2713,7 +2859,17 @@ impl<'p> Vm<'p> {
             Walked::ChainAcc { first, hops, slot } => {
                 // Inherited accessor governs the write (proto_chain_set):
                 // cache it; a getter-only accessor stays slow (reject path).
-                self.ic_install(func_id, ip, IcEntry::ProtoAcc { first, hops, slot });
+                let recv_shape = self.ic_recv_shape(recv);
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ProtoAcc {
+                        recv_shape,
+                        first,
+                        hops,
+                        slot,
+                    },
+                );
                 self.ic_chain_acc_set(hops, slot)
             }
         }
@@ -3018,7 +3174,9 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
-            IcEntry::ProtoAcc { first, hops, slot } => {
+            IcEntry::ProtoAcc {
+                first, hops, slot, ..
+            } => {
                 if own.is_some() || m.class.is_some() {
                     return None;
                 }
@@ -3328,6 +3486,20 @@ impl<'p> Vm<'p> {
                                 _ => {}
                             }
                         }
+                    }
+                    // A native method the site cached for this very receiver
+                    // (`Reflect.get(o, k)`): `ic_call_native`, asked next,
+                    // answers it, and the key lookup below could only find
+                    // what no frame calls. Every `Reflect.*` call hashed its
+                    // name against the namespace's keys here first.
+                    if site.entries[..site.n as usize].iter().any(|e| {
+                        matches!(*e, IcEntry::OwnNative { obj, ver, slot, bits, .. }
+                            if obj == idx
+                                && self.heap.version_of(idx) == ver
+                                && m.val_get(slot as usize).is_some_and(|v| v.bits() == bits)
+                                && !m.attr_at(slot as usize).accessor)
+                    }) {
+                        return None;
                     }
                     let own = m.pos(key);
                     let mut learned = None;
