@@ -6636,6 +6636,10 @@ impl<'p> Vm<'p> {
             return self.pop_frame_with(ret, stop_depth);
         }
         let (fbase, ret_dst) = (f.base, f.ret_dst);
+        // The caller's base, read before the stores below: read after them,
+        // it reloaded the frame count those stores had just written, and the
+        // return value's store waited on that chain.
+        let caller_base = if n >= 2 { self.frames[n - 2].base } else { 0 };
         self.frames.truncate(n - 1);
         self.tail_reuse_streak = 0;
         self.regs.truncate(fbase);
@@ -6643,7 +6647,6 @@ impl<'p> Vm<'p> {
             return true;
         }
         if ret_dst != RET_DISCARD {
-            let caller_base = self.frames[n - 2].base;
             self.regs[caller_base + ret_dst as usize] = ret;
         }
         false

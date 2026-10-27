@@ -1317,6 +1317,9 @@ impl<'p> Vm<'p> {
                     let Some((fid, closure, desc)) = self.lite_resolve(func_id, ip, callee_v) else {
                         hand_over!();
                     };
+                    // Every push puts the callee's window at the file's end:
+                    // its base, known before the push stores it.
+                    let callee_base = self.regs.len();
                     self.setup_call_lean_desc(fid, closure, desc, base, arg_base, argc, dst, ip + 1, callee_v)?;
                     steps += LITE_CALL_STEPS;
                     // The main loop's frame-transition safe point.
@@ -1330,9 +1333,11 @@ impl<'p> Vm<'p> {
                     if !FULL && self.lite_is_full(fid) {
                         exit!(LiteStep::Full);
                     }
-                    top = self.frames.len() - 1;
+                    top += 1;
+                    debug_assert_eq!(top, self.frames.len() - 1);
+                    debug_assert_eq!(callee_base, self.frames[top].base);
                     func_id = fid;
-                    base = self.frames[top].base;
+                    base = callee_base;
                     ip = 0;
                     code = self.lite_fn_code(func_id);
                     #[cfg(not(feature = "safe-sandbox"))]
