@@ -108,6 +108,23 @@ pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 /// How many arguments `Vm::arg_window` copies out on the stack.
 const ARGS_ON_STACK: usize = 8;
 
+/// `ZIPP_NO_JIT_SHARED_CONSTS=1`: compiled code embeds a fresh string per
+/// literal, as before `Vm::jit_const_str_bits` took the shared one.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_shared_const_strs_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_SHARED_CONSTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 #[inline(always)]
 fn lean_calls_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
@@ -2813,10 +2830,7 @@ impl<'p> Vm<'p> {
                                     if const_strs.contains_key(&idx) {
                                         continue;
                                     }
-                                    let c = self.func(func_id as usize).constants[idx as usize];
-                                    let v = self.resolve_const(func_id, c);
-                                    self.jit_const_strings.push(v); // GC root
-                                    const_strs.insert(idx, v.bits());
+                                    const_strs.insert(idx, self.jit_const_str_bits(func_id, idx));
                                 }
                                 // ── TypedArray pin plan ── from LIVE state: tie
                                 // each GetIndex/SetIndex to a pinned-TA snapshot
@@ -6363,12 +6377,29 @@ impl<'p> Vm<'p> {
             if const_strs.contains_key(&idx) {
                 continue;
             }
-            let c = self.func(func_id as usize).constants[idx as usize];
-            let v = self.resolve_const(func_id, c);
-            self.jit_const_strings.push(v); // GC root
-            const_strs.insert(idx, v.bits());
+            const_strs.insert(idx, self.jit_const_str_bits(func_id, idx));
         }
         const_strs
+    }
+
+    /// The bits compiled code embeds for `func_id`'s string constant `idx`:
+    /// the literal's one shared representation when it has one
+    /// (`resolve_const_slot`), the one the interpreter and every other
+    /// function load for the same text, so `node.kind === "bin"` between a
+    /// compiled producer and a compiled reader is equal bits rather than a
+    /// byte compare in `jit_strict_eq`. A fresh string otherwise, as before.
+    /// Rooted for the VM's life in `jit_const_strings` either way (compiled
+    /// code isn't traced by the GC).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_const_str_bits(&mut self, func_id: u32, idx: u32) -> u64 {
+        let v = if jit_shared_const_strs_enabled() {
+            self.resolve_const_slot(func_id, idx)
+        } else {
+            let c = self.func(func_id as usize).constants[idx as usize];
+            self.resolve_const(func_id, c)
+        };
+        self.jit_const_strings.push(v); // GC root
+        v.bits()
     }
 
     /// Run the compiled OSR region for the loop headed at `entry_ip` (in
