@@ -69,6 +69,8 @@ const CHECKS = [
   // artifact's `languages`, so the JavaScript-only build proves the refusal.
   ["native-depth.cjs"],
   ["python-frontend.cjs"],
+  // The TypeScript frontend's, adapting the same way.
+  ["typescript-frontend.cjs"],
   ["python-gpu.cjs"],
 ];
 

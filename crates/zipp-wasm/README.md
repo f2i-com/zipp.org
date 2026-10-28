@@ -26,9 +26,11 @@ brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 
 ## Build variants: ZIPP Lite, JavaScript, Python, and the torch package
 
-The crate builds several variants. The default is JavaScript-only; the Python
-variants add the experimental Python-subset frontend
-(`docs/python/FRONTEND.md`) behind `Engine.initSource(source,
+The crate builds several variants. The default is JavaScript-only; the
+`typescript` variant adds TypeScript behind `Engine.initSource(source,
+"typescript")` (its types read and dropped, so it runs as the same
+JavaScript would); the Python variants add the experimental Python-subset
+frontend (`docs/python/FRONTEND.md`) behind `Engine.initSource(source,
 "python")` alongside the unchanged JavaScript entry points. Torch is a package:
 built into `all`, or added to `python` at run time from a second module,
 `zipp_torch.wasm`, for hosts that want it.
@@ -37,6 +39,7 @@ built into `all`, or added to `python` at run time from a second module,
 | --- | --- | --- |
 | `lite` | `--profile lite --features lite` | JavaScript core; no Intl, Temporal, Python or Torch |
 | `javascript` (default) | none | `initScript`, `initSource(src, "javascript")` |
+| `typescript` | `--features typescript` | the above plus `initSource(src, "typescript")` |
 | `python` | `--features python-base` | the above plus `initSource(src, "python")`; torch only after `addPythonPackage` (below) |
 | `torch` | `torch/` crate | `zipp_torch.wasm` + its loader `zipp_torch.js`: the torch package for `python` |
 | `all` | `--features python` | `python` with torch built in: the same engine, one download |
@@ -45,7 +48,7 @@ built into `all`, or added to `python` at run time from a second module,
 ```sh
 cd crates/zipp-wasm
 ./build-variants.sh                   # javascript and all, into dist/<variant>/
-./build-variants.sh python torch      # any of: javascript | python | torch | all | interop
+./build-variants.sh python torch      # any of: javascript | typescript | python | torch | all | interop
 ./build-variants.sh lite              # separate ZIPP Lite package in dist/lite/
 ```
 
@@ -53,10 +56,13 @@ The script applies exactly the post-processing above (section strip,
 `target_features` strip, memory/import check, Brotli) to each engine build, in
 its own target directory, and prints a raw / Brotli-11 size table. A host can
 tell the variants apart at runtime: `zippProfile().languages` is
-`["javascript"]` or `["javascript","python"]`, `pythonPackages().torchBuiltIn`
-says whether torch is built in, and `initSource(src, "python")` on the
-JavaScript-only module fails with a clear message and disposes the engine like
-any failed initialization.
+`["javascript"]`, `["javascript","typescript"]` or `["javascript","python"]`,
+`pythonPackages().torchBuiltIn` says whether torch is built in, and
+`initSource(src, "python")` or `initSource(src, "typescript")` on a module
+without that language fails with a clear message (naming the module that has
+TypeScript) and disposes the engine like any failed initialization.
+`tests/node/typescript-frontend.cjs`, in `run-boundary-suite.cjs`, adapts to
+the artifact the same way.
 
 ### ZIPP Lite
 
@@ -162,6 +168,7 @@ one way to load any of them:
 | --- | --- | --- |
 | `zipp-<version>-javascript.wasm` | JavaScript | 1 MiB |
 | `zipp-<version>-javascript-lite.wasm` | JavaScript, without `Intl` and `Temporal` | 1 MiB |
+| `zipp-<version>-javascript-typescript.wasm` | JavaScript + TypeScript | 1 MiB |
 | `zipp-<version>-javascript-python.wasm` | JavaScript + experimental Python, torch built in | 16 MiB |
 | `zipp-<version>-javascript-python-base.wasm` | JavaScript + experimental Python, no torch | 16 MiB |
 | `zipp-<version>-torch-package.wasm` | the torch package for `-python-base` | |

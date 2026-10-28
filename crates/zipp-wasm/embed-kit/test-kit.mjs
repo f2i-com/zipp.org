@@ -78,7 +78,7 @@ ok(`modules.json names ${manifest.modules.length} modules of ${manifest.version}
   if (packed.length) ok(`${packed.length} .wasm.br files decompress to their modules, and ${js ? js.file + ".br loads" : "none is an engine"}`);
 }
 
-const engines = ["javascript", "lite", "javascript-python", "javascript-python-base"]
+const engines = ["javascript", "lite", "javascript-typescript", "javascript-python", "javascript-python-base"]
   .filter(v => byVariant.has(v) && (only.length === 0 || only.includes(v)));
 assert.ok(engines.length, "no engine module to check");
 const outputs = {};
@@ -123,6 +123,22 @@ for (const variant of engines) {
   } finally {
     engine.dispose();
     engine.free();
+  }
+
+  // TypeScript: run, in a sandbox with its functions, or refused.
+  const tsProgram = "enum E { A = 2, B } const total: number = E.B * 7; console.log(`ts ${total} ${E[3]}`);";
+  if (zipp.languages.includes("typescript")) {
+    assert.deepEqual(zipp.run(tsProgram, { language: "typescript" }).output, ["ts 21 B"]);
+    const sandbox = await zipp.createSandbox({ language: "typescript", isolate: false });
+    try {
+      const ran = await sandbox.run("function twice(n: number): number { return n * 2; }\nconsole.log('up');");
+      assert.deepEqual(ran.output, ["up"]);
+      assert.equal((await sandbox.call("twice", [21])).value, 42);
+    } finally {
+      await sandbox.close();
+    }
+  } else {
+    assert.throws(() => zipp.run(tsProgram, { language: "typescript" }));
   }
 
   if (zipp.languages.includes("python")) {

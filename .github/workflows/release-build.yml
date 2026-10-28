@@ -6,8 +6,9 @@ name: Release build
 #   zipp-<v>-windows-x86_64-portable.exe   the Windows CLI
 #   zipp-<v>-windows-x86_64-installer.msi  the same binary, a per-user install on PATH
 #   zipp-<v>-linux-x86_64 / -linux-arm64 / -linux-armv7   the Linux CLIs
-#   zipp-<v>-javascript.wasm, -javascript-lite.wasm, -javascript-python.wasm,
-#     -javascript-python-base.wasm, -torch-package.wasm   the WebAssembly modules,
+#   zipp-<v>-javascript.wasm, -javascript-lite.wasm, -javascript-typescript.wasm,
+#     -javascript-python.wasm, -javascript-python-base.wasm, -torch-package.wasm
+#     the WebAssembly modules,
 #     each engine carrying its own bindings (crates/zipp-wasm/embed-kit), and
 #     a Brotli copy of each (.wasm.br)
 #   zipp-<v>-wasm-embed-kit.zip            the loader, host SDK, types, docs and examples
@@ -275,6 +276,16 @@ jobs:
             optimize_flags: "--prefer-raw-size"
             stack_bytes: 1048576
             languages: '["javascript"]'
+          # JavaScript and TypeScript (types read and dropped): the
+          # TypeScript grammar is the whole size difference, so the
+          # JavaScript module above leaves it out.
+          - variant: javascript-typescript
+            suffix: web-typescript
+            features: "--features typescript"
+            profile: release
+            optimize_flags: ""
+            stack_bytes: 1048576
+            languages: '["javascript","typescript"]'
           - variant: javascript-python
             suffix: web-python
             features: "--features python"
@@ -405,6 +416,12 @@ jobs:
       - name: Exercise the Lite feature contract under Node
         if: matrix.variant == 'lite'
         run: node tests/node/lite.cjs
+
+      # The boundary suite ran typescript-frontend.cjs above; this names the
+      # TypeScript module's own contract on its own line in the log.
+      - name: Exercise the TypeScript frontend under Node
+        if: matrix.variant == 'javascript-typescript'
+        run: node tests/node/typescript-frontend.cjs
 
       # The base Python artifact has no torch until a host adds the package;
       # the torch job below proves base + package against the complete one.

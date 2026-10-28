@@ -94,7 +94,7 @@ async function inPage(page, version) {
     const { createZippHost } = await import("/host-sdk/zipp-host.mjs");
     const results = [];
     // Isolated sandboxes (their own Workers) for each engine.
-    for (const variant of ["javascript", "javascript-lite", "javascript-python"]) {
+    for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python"]) {
       const zipp = await loadZipp(`/zipp-${version}-${variant}.wasm`);
       const sandbox = await zipp.createSandbox({ permissions: { storage: true } });
       const out = (await sandbox.run("localStorage.setItem('k', 'v'); console.log(localStorage.getItem('k'), typeof fetch)")).output.join("|");
@@ -122,15 +122,18 @@ async function inPage(page, version) {
     try { await host.call("spin", [], { deadlineMs: 300 }); } catch (e) { spun = `${e.category} ${e.terminal} ${host.dead}`; }
     results.push({ type: "host-sdk", variant: "javascript", version, js: `${JSON.stringify(rendered)} ${spun}`, py: null });
     for (const type of ["wasm", "octet"]) {
-      for (const variant of ["javascript", "javascript-lite", "javascript-python", "javascript-python-base"]) {
+      for (const variant of ["javascript", "javascript-lite", "javascript-typescript", "javascript-python", "javascript-python-base"]) {
         const zipp = await loadZipp(`/zipp-${version}-${variant}.wasm?type=${type}`);
         const js = zipp.run("console.log([1, 2, 3].map(n => n * n).join(' '), typeof Intl)").output.join("|");
+        const ts = zipp.languages.includes("typescript")
+          ? zipp.run("const n: number = 21; console.log(`ts ${n * 2}`);", { language: "typescript" }).output.join("|")
+          : null;
         let py = null;
         if (zipp.languages.includes("python")) {
           if (variant === "javascript-python-base") await zipp.addTorch(`/zipp-${version}-torch-package.wasm?type=${type}`);
           py = zipp.run("import torch\nprint((torch.tensor([1.0, 2.0]) * 3).tolist())", { language: "python" }).output.join("|");
         }
-        results.push({ type, variant, version: zipp.meta.version, js, py });
+        results.push({ type, variant, version: zipp.meta.version, js, ts, py });
       }
     }
     return results;
@@ -184,7 +187,8 @@ for (const name of browsers) {
     }
     const intl = r.variant === "javascript-lite" ? "undefined" : "object";
     const pyOk = r.variant.includes("python") ? r.py === "[3.0, 6.0]" : r.py === null;
-    check(`${r.variant} served as ${r.type}`, r.version === version && r.js === `1 4 9 ${intl}` && pyOk, r);
+    const tsOk = r.variant.includes("typescript") ? r.ts === "ts 42" : r.ts === null;
+    check(`${r.variant} served as ${r.type}`, r.version === version && r.js === `1 4 9 ${intl}` && pyOk && tsOk, r);
   }
 
   await page.goto(`${origin}/csp.html`);

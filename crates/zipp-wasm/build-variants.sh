@@ -4,6 +4,7 @@
 #
 #   lite        JavaScript core without Intl, Temporal, Python or Torch
 #   javascript  JavaScript only (the shipped default)
+#   typescript  JavaScript + TypeScript (types read and dropped)
 #   python      JavaScript + Python, without the torch package
 #   torch       the torch package for `python`: zipp_torch.wasm + its loader
 #   all         JavaScript + Python with torch built in (python + torch in one)
@@ -36,6 +37,7 @@ unset RUSTFLAGS
 declare -A FEATURES=(
   [lite]="--features lite"
   [javascript]=""
+  [typescript]="--features typescript"
   [python]="--features python-base"
   [all]="--features python"
   [interop]="--features python-js-interop"
@@ -45,7 +47,7 @@ variants=("$@")
 [ ${#variants[@]} -eq 0 ] && variants=(javascript all)
 
 for v in "${variants[@]}"; do
-  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (lite | javascript | python | torch | all | interop)" >&2; exit 2; }
+  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (lite | javascript | typescript | python | torch | all | interop)" >&2; exit 2; }
 done
 
 compress() {

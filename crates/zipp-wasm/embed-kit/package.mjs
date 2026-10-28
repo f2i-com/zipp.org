@@ -40,6 +40,7 @@ const repo = path.resolve(crate, "../..");
 export const VARIANTS = {
   javascript: "javascript",
   lite: "javascript-lite",
+  "javascript-typescript": "javascript-typescript",
   "javascript-python": "javascript-python",
   "javascript-python-base": "javascript-python-base",
   "torch-package": "torch-package",
@@ -154,6 +155,18 @@ async function embed(variant, gluePath, input, outDir) {
   const profile = await profileOf(glue, wasm);
   const wantLite = variant === "lite";
   if ((profile.variant === "lite") !== wantLite) throw new Error(`module is not the ${variant} variant (${profile.variant})`);
+  // The languages a variant's name promises, in the order the engine lists
+  // them: a module built with the wrong features is refused, not shipped.
+  const wantLanguages = {
+    javascript: ["javascript"],
+    lite: ["javascript"],
+    "javascript-typescript": ["javascript", "typescript"],
+    "javascript-python": ["javascript", "python"],
+    "javascript-python-base": ["javascript", "python"],
+  }[variant];
+  if (JSON.stringify(profile.languages) !== JSON.stringify(wantLanguages)) {
+    throw new Error(`module is not the ${variant} variant (languages ${JSON.stringify(profile.languages)})`);
+  }
   const meta = {
     format: 1,
     variant,

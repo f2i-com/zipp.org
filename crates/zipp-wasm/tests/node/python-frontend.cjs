@@ -43,7 +43,7 @@ const FIB = [
 
 ok("profile lists the artifact's languages, JavaScript always first",
   Array.isArray(languages) && languages[0] === "javascript"
-    && languages.every((l) => l === "javascript" || l === "python"),
+    && languages.every((l) => l === "javascript" || l === "typescript" || l === "python"),
   JSON.stringify(languages));
 
 // ---- an unknown language is refused before anything is compiled ------------

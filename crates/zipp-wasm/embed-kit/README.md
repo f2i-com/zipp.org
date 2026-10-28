@@ -13,6 +13,7 @@ Pick an engine; each is one file from the release:
 | --- | --- |
 | `zipp-{{VERSION}}-javascript.wasm` | JavaScript, with `Intl` and `Temporal` |
 | `zipp-{{VERSION}}-javascript-lite.wasm` | JavaScript without `Intl` and `Temporal`, built for size |
+| `zipp-{{VERSION}}-javascript-typescript.wasm` | JavaScript and TypeScript (`language: "typescript"`; types read and dropped) |
 | `zipp-{{VERSION}}-javascript-python.wasm` | JavaScript and Python, torch built in |
 | `zipp-{{VERSION}}-javascript-python-base.wasm` | JavaScript and Python, without torch (smaller) |
 | `zipp-{{VERSION}}-torch-package.wasm` | torch, added to the `-python-base` engine when you need it |
@@ -110,7 +111,8 @@ paths. Other entries are matched as full URL prefixes. For example,
 `https://api.example.com/?scope=read` does not allow
 `https://api.example.com/other`.
 
-What each language can be given in this release:
+What each language can be given in this release (TypeScript, in the
+`-javascript-typescript` engine, is given exactly what JavaScript is):
 
 | Permission | JavaScript | Python |
 | --- | --- | --- |
@@ -137,6 +139,28 @@ The engine also has fixed ceilings (heap, string size, output, nesting);
 `zipp.profile.limits` lists them. Failures are `ZippSandboxError`s with a
 `category` (`guest`, `source`, `resource`, `timeout`, `host`, `usage`), a
 `terminal` flag, and `output`: what was printed before the failure.
+
+## TypeScript
+
+```js
+const zipp = await loadZipp("./zipp-{{VERSION}}-javascript-typescript.wasm");
+const sandbox = await zipp.createSandbox({ language: "typescript" });
+try {
+  const { output } = await sandbox.run(
+    "enum Size { S = 1, M, L }\nfunction area(s: Size): number { return s * s; }\nconsole.log(`${Size[3]} ${area(Size.L)}`);",
+  );
+  console.log(output);                                   // ["L 9"]
+  console.log((await sandbox.call("area", [2])).value);  // 4
+} finally {
+  await sandbox.close();
+}
+```
+
+The engine reads a TypeScript program's types and drops them, so it runs as
+the same JavaScript would (`enum`, `namespace` and parameter properties
+lowered as tsc lowers them); its functions are called with `sandbox.call`
+like a JavaScript program's. The other engines refuse `language:
+"typescript"`.
 
 ## Python and torch
 

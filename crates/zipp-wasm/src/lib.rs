@@ -2754,6 +2754,8 @@ const LINKED_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// JavaScript-only and the combined module apart.
 const LANGUAGES: &[&str] = &[
     "\"javascript\"",
+    #[cfg(feature = "typescript")]
+    "\"typescript\"",
     #[cfg(feature = "python")]
     "\"python\"",
 ];

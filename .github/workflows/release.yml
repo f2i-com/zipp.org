@@ -301,11 +301,13 @@ jobs:
             "zipp-$v-linux-armv7" \
             "zipp-$v-javascript.wasm" \
             "zipp-$v-javascript-lite.wasm" \
+            "zipp-$v-javascript-typescript.wasm" \
             "zipp-$v-javascript-python.wasm" \
             "zipp-$v-javascript-python-base.wasm" \
             "zipp-$v-torch-package.wasm" \
             "zipp-$v-javascript.wasm.br" \
             "zipp-$v-javascript-lite.wasm.br" \
+            "zipp-$v-javascript-typescript.wasm.br" \
             "zipp-$v-javascript-python.wasm.br" \
             "zipp-$v-javascript-python-base.wasm.br" \
             "zipp-$v-torch-package.wasm.br" \

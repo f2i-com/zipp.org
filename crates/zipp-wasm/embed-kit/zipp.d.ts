@@ -23,7 +23,7 @@ export type ZippSource =
 /** The `zipp.meta` record a release module carries. */
 export interface ZippMeta {
   format: 1;
-  variant: "javascript" | "lite" | "javascript-python" | "javascript-python-base" | "torch-package";
+  variant: "javascript" | "lite" | "javascript-typescript" | "javascript-python" | "javascript-python-base" | "torch-package";
   version: string;
   commit: string | null;
   languages: string[];
@@ -72,8 +72,8 @@ export interface ZippNetworkPermission {
 }
 
 export interface ZippSandboxOptions {
-  /** "javascript" (default) or "python" (Python modules only). */
-  language?: "javascript" | "python";
+  /** "javascript" (default), "typescript" (the javascript-typescript module only) or "python" (Python modules only). */
+  language?: "javascript" | "typescript" | "python";
   /** Run in a Worker / worker thread (default true). */
   isolate?: boolean;
   limits?: {
@@ -142,7 +142,7 @@ export interface Zipp {
   readonly languages: readonly string[];
   createSandbox(options?: ZippSandboxOptions): Promise<ZippSandbox>;
   /** Run `code` here and now, with nothing permitted; throws on failure. */
-  run(code: string, options?: { language?: "javascript" | "python"; instructionBudget?: number | null }): { output: string[] };
+  run(code: string, options?: { language?: "javascript" | "typescript" | "python"; instructionBudget?: number | null }): { output: string[] };
   /** Add the torch package to this javascript-python-base instance. */
   addTorch(source: ZippSource): Promise<unknown>;
 }

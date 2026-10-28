@@ -6,7 +6,7 @@
 # each engine variant with the release's features, profile, stack and
 # Binaryen flags; its Node boundary and contract tests; package-variant.sh;
 # then the torch package, its pairing test, the embed kit and test-kit.mjs.
-# Leaves in <out-dir> the files a release publishes (five .wasm and the kit's
+# Leaves in <out-dir> the files a release publishes (six .wasm and the kit's
 # .zip) plus the unpacked kit and each variant's glue and Node package.
 #
 # Requires what the CI jobs install: Rust 1.92.0 with wasm32-unknown-unknown,
@@ -23,12 +23,12 @@ export ZIPP_SOURCE_SHA="${ZIPP_SOURCE_SHA:-$(git rev-parse HEAD)}"
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' ../../Cargo.toml)"
 target=wasm32-unknown-unknown
 
-declare -A FEATURES=([javascript]="" [lite]="--features lite" [javascript-python]="--features python" [javascript-python-base]="--features python-base")
-declare -A PROFILE=([javascript]=release [lite]=lite [javascript-python]=release [javascript-python-base]=release)
-declare -A STACK=([javascript]=1048576 [lite]=1048576 [javascript-python]=16777216 [javascript-python-base]=16777216)
-declare -A OPTIMIZE=([javascript]="" [lite]="--prefer-raw-size" [javascript-python]="" [javascript-python-base]="")
+declare -A FEATURES=([javascript]="" [lite]="--features lite" [javascript-typescript]="--features typescript" [javascript-python]="--features python" [javascript-python-base]="--features python-base")
+declare -A PROFILE=([javascript]=release [lite]=lite [javascript-typescript]=release [javascript-python]=release [javascript-python-base]=release)
+declare -A STACK=([javascript]=1048576 [lite]=1048576 [javascript-typescript]=1048576 [javascript-python]=16777216 [javascript-python-base]=16777216)
+declare -A OPTIMIZE=([javascript]="" [lite]="--prefer-raw-size" [javascript-typescript]="" [javascript-python]="" [javascript-python-base]="")
 
-for v in javascript lite javascript-python javascript-python-base; do
+for v in javascript lite javascript-typescript javascript-python javascript-python-base; do
   echo "=== $v"
   profile="${PROFILE[$v]}"
   dir="target/release-variants/$v"
@@ -50,6 +50,7 @@ for v in javascript lite javascript-python javascript-python-base; do
   case "$v" in
     javascript) node tests/node/run-boundary-suite.cjs ;;
     lite) node tests/node/run-boundary-suite.cjs && node tests/node/lite.cjs ;;
+    javascript-typescript) node tests/node/run-boundary-suite.cjs && node tests/node/typescript-frontend.cjs ;;
     javascript-python)
       node tests/node/run-boundary-suite.cjs
       node tests/node/python-conv2d.cjs
