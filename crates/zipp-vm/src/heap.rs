@@ -7258,6 +7258,22 @@ pub struct Heap {
     /// `refresh_mirror`) and `free_slot` covering occupancy changes. The mirror carries the
     /// UNINITIALIZED sentinel verbatim — the emitted TDZ check depends on it.
     cell_vals_mirror: Vec<u64>,
+    /// One bit per slot holding an ATOM: a string whose text no other atom
+    /// has, so two different atoms are never `===` and the compare needs no
+    /// bytes (`collections::strict_eq`, `region_poly_eq`). The atoms are the
+    /// single-ASCII-character strings and the empty string of the interned
+    /// prefix, and each string literal's one shared representation
+    /// (`Vm::resolve_const_slot`, which keeps it for the VM's life). Never a
+    /// string built at run time, whatever its text. Grown on marking only;
+    /// a slot past the end is not an atom. `free_slot` clears a dying
+    /// string's bit, though no atom dies outside tests that drop the
+    /// literal caches.
+    atoms: Vec<u64>,
+    /// `atoms`' base and length in words, for the emitted compare.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) atoms_raw: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) atoms_words: u64,
     /// Raw bases of the mirrors and version table, re-cached whenever the
     /// vectors grow. Shape/cell/closure probes load their bases THROUGH the VM
     /// (`[rdi + offset]`) on every access. Tier-C loads `versions_raw` only on
@@ -8170,6 +8186,11 @@ impl Heap {
             #[cfg(feature = "jit")]
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            atoms: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            atoms_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            atoms_words: 0,
             #[cfg(feature = "jit")]
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             #[cfg(feature = "jit")]
@@ -8251,7 +8272,44 @@ impl Heap {
         };
         h.align_slot_table_capacities();
         h.recache_mirror_raws();
+        // The single-character strings and the empty string are atoms. The
+        // pad2 table after them is not: a `"07"` literal is a string of its
+        // own with the same text.
+        for idx in 0..=INTERN_EMPTY {
+            h.mark_atom(idx);
+        }
         h
+    }
+
+    /// Mark the string at `idx` an atom ([`Heap::atoms`]). The caller
+    /// guarantees no other atom has its text.
+    pub(crate) fn mark_atom(&mut self, idx: u32) {
+        debug_assert!(matches!(self.objs.get(idx as usize), Some(HeapObj::Str(_))));
+        let w = (idx >> 6) as usize;
+        if self.atoms.len() <= w {
+            self.atoms.resize((w + 1).next_power_of_two().max(8), 0);
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.atoms_raw = self.atoms.as_ptr() as u64;
+                self.atoms_words = self.atoms.len() as u64;
+            }
+        }
+        self.atoms[w] |= 1 << (idx & 63);
+    }
+
+    /// Whether the slot `idx` holds an atom ([`Heap::atoms`]).
+    #[inline]
+    pub(crate) fn is_atom(&self, idx: u32) -> bool {
+        self.atoms
+            .get((idx >> 6) as usize)
+            .is_some_and(|w| (w >> (idx & 63)) & 1 != 0)
+    }
+
+    #[inline]
+    fn clear_atom(&mut self, idx: u32) {
+        if let Some(w) = self.atoms.get_mut((idx >> 6) as usize) {
+            *w &= !(1 << (idx & 63));
+        }
     }
 
     /// Re-cache the raw bases emitted probes and Tier-C entry code read through
@@ -10697,6 +10755,8 @@ impl Heap {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
+            // The slot's next string is no atom (`Heap::atoms`).
+            HeapObj::Str(_) => self.clear_atom(idx),
             #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
@@ -12012,6 +12072,24 @@ pub(crate) mod gcoracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The atoms (`Heap::atoms`): the single characters and the empty string
+    /// from birth, not the two-digit table (a `"07"` literal has that text
+    /// too), a marked string, and no string once its slot is freed.
+    #[test]
+    fn atoms_cover_the_prefix_and_marked_strings_only() {
+        let mut h = Heap::new();
+        assert!(h.is_atom(b'a' as u32) && h.is_atom(INTERN_EMPTY));
+        assert!(!h.is_atom(INTERN_PAD2_START) && !h.is_atom(INTERN_PINNED_END));
+        let s = h.alloc_str("literal".to_string());
+        let t = h.alloc_str("built".to_string());
+        assert!(!h.is_atom(s) && !h.is_atom(t));
+        h.mark_atom(s);
+        assert!(h.is_atom(s) && !h.is_atom(t));
+        h.free_slot(s);
+        assert!(!h.is_atom(s), "a freed slot's next string is no atom");
+        assert!(!h.is_atom(u32::MAX), "a slot past the bitmap is no atom");
+    }
 
     /// `ObjMap::arguments_side_table` must leave exactly the map the three
     /// `define`s it replaces built: every field, both callee forms.

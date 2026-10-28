@@ -1181,6 +1181,7 @@ pub(crate) fn region_poly_eq(
     let do_bits = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
+    let atoms = ops.new_dynamic_label();
     let after = ops.new_dynamic_label();
     // rax = a_bits, rcx = b_bits (kept live across the type checks).
     dynasm!(ops
@@ -1219,12 +1220,40 @@ pub(crate) fn region_poly_eq(
         ; mov rdx, rax
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
-        ; jae => slow                          // a: non-interned heap → helper
+        ; jae => atoms                         // a: non-interned heap → atoms?
         ; mov rdx, rcx
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
-        ; jae => slow                          // b: non-interned heap → helper
+        ; jae => atoms                         // b: non-interned heap → atoms?
         ; jmp => do_bits
+        // Two different heap values, one outside the prefix. Both ATOMS
+        // (`Heap::atoms`: the prefix's characters, each literal's shared
+        // string) have different texts, so `===` is false without the
+        // helper: `node.kind === "bin"` when it holds "num". Anything else,
+        // or a slot past the bitmap, asks the helper.
+        ; => atoms
+        ; mov rdx, rax
+        ; and rdx, r9                          // a's index
+        ; mov r10, rcx
+        ; and r10, r9                          // b's index
+        ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_WORDS_OFFSET as i32]
+        ; mov r8, rdx
+        ; shr r8, 6
+        ; cmp r8, r11
+        ; jae => slow
+        ; mov r9, r10
+        ; shr r9, 6
+        ; cmp r9, r11
+        ; jae => slow
+        ; mov r11, [rdi + crate::vm::host_api::JIT_ATOMS_RAW_OFFSET as i32]
+        ; mov r8, [r11 + r8 * 8]
+        ; bt r8, rdx
+        ; jnc => slow
+        ; mov r9, [r11 + r9 * 8]
+        ; bt r9, r10
+        ; jnc => slow
+        ; mov al, ne as i8                     // `!==` → true, `===` → false
+        ; jmp => store
     );
     // ── one operand is a double ──────────────────────────────────────────────
     // The numeric path below calls `load_num_xmm` on BOTH operands, and that

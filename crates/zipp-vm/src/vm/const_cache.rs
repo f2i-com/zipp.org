@@ -49,6 +49,25 @@ pub(super) const CONST_DENSE_FUNCS: usize = 4096;
 #[cfg(feature = "jit")]
 const CONST_STRING_CACHE_MAX_FUNCTIONS: usize = 4096;
 
+/// `ZIPP_NO_ATOMS=1`: no literal is marked an atom (`Heap::atoms`), so a
+/// compare of two different literals reads their bytes again.
+fn atoms_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_ATOMS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 #[inline]
 fn slot_key(func_id: u32, const_idx: u32) -> u64 {
     ((func_id as u64) << 32) | const_idx as u64
@@ -214,6 +233,19 @@ impl<'p> Vm<'p> {
                 #[cfg(not(feature = "jit"))]
                 self.heap.freeze_shared_str(resolved.heap_index());
                 self.const_string_texts.insert(text, resolved);
+                // The text's one representation is an atom (`Heap::atoms`).
+                // A one-character ASCII or empty text's is the interned
+                // prefix slot, an atom already; should one not be, it stays
+                // unmarked rather than share that slot's text.
+                let i = resolved.heap_index();
+                let one_char = text.len() < 2;
+                if !one_char
+                    && i > crate::heap::INTERN_PINNED_END
+                    && matches!(self.heap.get(i), HeapObj::Str(_))
+                    && atoms_enabled()
+                {
+                    self.heap.mark_atom(i);
+                }
                 resolved
             }
         };

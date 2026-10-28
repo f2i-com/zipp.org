@@ -665,6 +665,10 @@ pub(crate) fn strict_eq(heap: &Heap, a: Value, b: Value) -> bool {
     }
     if a.is_heap() && b.is_heap() {
         let (ai, bi) = (a.heap_index(), b.heap_index());
+        // Two different atoms have different texts (`Heap::atoms`).
+        if heap.is_atom(ai) && heap.is_atom(bi) {
+            return false;
+        }
         if heap.is_str_like(ai) && heap.is_str_like(bi) {
             return heap.str_eq(ai, bi);
         }

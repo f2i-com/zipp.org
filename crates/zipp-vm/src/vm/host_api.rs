@@ -145,6 +145,14 @@ pub(crate) const JIT_VERSIONS_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'stat
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_IC_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
     + core::mem::offset_of!(crate::codegen::Jit, ic_table_raw);
+/// The heap's atom bitmap base and length in words (`Heap::atoms`), for
+/// `region_poly_eq`'s compare of two different strings.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ATOMS_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, atoms_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ATOMS_WORDS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, atoms_words);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     assert!(JIT_GLOBALS_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
