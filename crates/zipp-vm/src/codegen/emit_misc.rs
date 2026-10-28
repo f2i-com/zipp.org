@@ -521,13 +521,15 @@ pub(crate) fn emit_math_op(
     emit_math_identity_guard(ops, op, callee, this_v, bail, math_imul_guard);
     if argc == 1 {
         load_num_xmm(ops, arg_base, 0, bail);
-        dynasm!(ops
-            ; movq rdx, xmm0                  // arg f64 bits (arg1)
-            ; mov ecx, op as i32              // MathFn code (repr(u8), arg0)
-            ; mov rax, QWORD math_unary as i64
-            ; call rax
-            ; movq xmm0, rax                  // result f64 bits
-        );
+        if !emit_math_unary_inline(ops, op) {
+            dynasm!(ops
+                ; movq rdx, xmm0                  // arg f64 bits (arg1)
+                ; mov ecx, op as i32              // MathFn code (repr(u8), arg0)
+                ; mov rax, QWORD math_unary as i64
+                ; call rax
+                ; movq xmm0, rax                  // result f64 bits
+            );
+        }
         emit_box_num(ops, dst);
     } else if matches!(op, MathFn::Imul) {
         // `Math.imul(a,b)` INLINE — a 32-bit signed multiply, no FFI: ToInt32
@@ -556,6 +558,37 @@ pub(crate) fn emit_math_op(
         emit_box_num(ops, dst);
     }
     emit_region_bail(ops, ip, bail, epilogue);
+}
+
+/// `Math.<op>(x)` with `x` in xmm0 and the result left there, for an op one
+/// SSE instruction computes exactly as `helpers_num2::math_unary` does:
+/// `sqrt` (`sqrtsd`, the correctly rounded square root `f64::sqrt` is),
+/// `abs` (the sign bit cleared, as `f64::abs`) and, with SSE4.1, `floor`,
+/// `ceil` and `trunc` (`roundsd`, exact for every input as the `f64`
+/// methods are: ±0, ±∞ and NaN keep their class and sign). The caller boxes
+/// the result as it boxes the helper's (`emit_box_num` canonicalises NaN).
+/// False, having emitted nothing, for every other op or with
+/// `ZIPP_NO_MATH_INLINE=1`; the caller then calls the helper.
+pub(crate) fn emit_math_unary_inline(ops: &mut dynasmrt::x64::Assembler, op: MathFn) -> bool {
+    if !crate::codegen::math_inline_enabled() {
+        return false;
+    }
+    let sse41 = || std::arch::is_x86_feature_detected!("sse4.1");
+    match op {
+        MathFn::Sqrt => dynasm!(ops ; sqrtsd xmm0, xmm0),
+        MathFn::Abs => dynasm!(ops
+            ; movq rax, xmm0
+            ; btr rax, 63
+            ; movq xmm0, rax
+        ),
+        // roundsd's immediate: bit 3 suppresses the precision exception,
+        // bits 0-1 pick the mode (1 down, 2 up, 3 toward zero).
+        MathFn::Floor if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 9),
+        MathFn::Ceil if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 10),
+        MathFn::Trunc if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 11),
+        _ => return false,
+    }
+    true
 }
 
 /// The op/arity subset `emit_math_op` implements. Shared by both mem paths'

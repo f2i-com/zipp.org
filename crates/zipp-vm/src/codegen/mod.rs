@@ -490,6 +490,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_MATH_INLINE=1` calls the unary Math helper for `sqrt`,
+    /// `abs`, `floor`, `ceil` and `trunc` again (`emit_math_unary_inline`).
+    fn math_inline_enabled() = "ZIPP_NO_MATH_INLINE"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_NUM_SPLIT=1` makes `dbinop`'s f64 path load and test both
     /// operands again after the int path's tag tests found a non-Int.
     fn num_split_enabled() = "ZIPP_NO_NUM_SPLIT"

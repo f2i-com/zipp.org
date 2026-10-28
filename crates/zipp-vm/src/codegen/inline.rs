@@ -1087,13 +1087,15 @@ pub(crate) fn emit_inline_leaf_call(
                 emit_math_identity_guard(ops, op, gc, gt, bail, math_imul_guard);
                 if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
-                    dynasm!(ops
-                        ; movq rdx, xmm0
-                        ; mov ecx, op as i32
-                        ; mov rax, QWORD math_unary as i64
-                        ; call rax
-                        ; movq xmm0, rax
-                    );
+                    if !emit_math_unary_inline(ops, op) {
+                        dynasm!(ops
+                            ; movq rdx, xmm0
+                            ; mov ecx, op as i32
+                            ; mov rax, QWORD math_unary as i64
+                            ; call rax
+                            ; movq xmm0, rax
+                        );
+                    }
                     emit_box_num(ops, rg(d));
                 } else if matches!(op, MathFn::Imul) {
                     // `Math.imul` INLINE (native 32-bit signed multiply, no FFI) —
