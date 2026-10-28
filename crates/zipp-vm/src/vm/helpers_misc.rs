@@ -1269,6 +1269,31 @@ pub(crate) extern "win64" fn jit_call_ic_cross(
     })
 }
 
+/// Win64 helper for a Tier C generic op's first double (`ArithFb::Notify`,
+/// `Jit::note_first_double`): no allocation and no user code.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_arith_first_double(vm: *mut core::ffi::c_void, func_id: u32, ip: u32) {
+    // SAFETY: exclusive view; the body calling it holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit.note_first_double(func_id, ip);
+}
+
+/// Win64 helper for a Tier C double-only op whose operand is not a number,
+/// called on its way to the bail (`Jit::note_float_bail`): no allocation
+/// and no user code.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_float_bail(vm: *mut core::ffi::c_void, func_id: u32, ip: u32) {
+    // SAFETY: exclusive view; the bailing body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit.note_float_bail(func_id, ip);
+}
+
 /// Win64 helper for `new F(args…)` (`New`) in a compiled region or Tier C
 /// body: `construct` on the callee and the arguments in the caller's window,
 /// exactly as the interpreter's `New` runs it. r9 = (callee_reg<<16)|arg_base;

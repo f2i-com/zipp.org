@@ -2976,6 +2976,10 @@ pub(crate) fn compile_proto_mem(
     random_fuse: &FxHashMap<usize, crate::codegen::RandomScaleFusePlan>,
     // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
     plain_makefunc: &FxHashMap<usize, u32>,
+    // Arithmetic type feedback, one byte per ip (`Jit::arith_fb`), and the
+    // address of that table's first byte (0 for none).
+    arith_fb: Option<&[u8]>,
+    arith_fb_base: u64,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -3073,6 +3077,57 @@ pub(crate) fn compile_proto_mem(
     let n_trunc_arith = trunc_arith.iter().filter(|&&t| t).count();
     if n_trunc_arith != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C int32-trunc arith sites={n_trunc_arith}");
+    }
+    // Double-only arithmetic (`float_op_plan`), its operands and results kept
+    // in `FloatCache` when the body has enough of it.
+    let float_cands = float_op_candidates(proto, &trunc_arith, meter.is_some());
+    let float_ops = float_op_plan(&proto.code, &float_cands, arith_fb);
+    // A generic op the double-only form would serve records its first double
+    // and has the body recompiled (`ArithFb::Notify`).
+    let arith_fb_at = |ip: usize| -> ArithFb {
+        if arith_fb_base != 0 && float_cands.get(ip) == Some(&true) && !float_ops[ip] {
+            ArithFb::Notify {
+                addr: arith_fb_base + ip as u64,
+                func_id,
+                ip: ip as u32,
+            }
+        } else {
+            ArithFb::None
+        }
+    };
+    let n_float_ops = float_ops.iter().filter(|&&f| f).count();
+    // The cache's registers are saved and restored on every entry, which a
+    // body with a few double-only ops does not earn back (they still skip
+    // the Int attempt, without the cache). At least two slots: an op keeps
+    // its first operand while claiming the second.
+    let fc_slots = if n_float_ops < FloatCache::MIN_OPS {
+        0
+    } else {
+        n_float_ops.clamp(2, FloatCache::MAX_SLOTS)
+    };
+    let mut fc = FloatCache::new(fc_slots);
+    let mut fc_pending = FcEffect::None;
+    let fc_targeted: Vec<bool> = if fc_slots == 0 {
+        Vec::new()
+    } else {
+        let mut t = vec![false; n];
+        for (ip, instr) in proto.code.iter().enumerate() {
+            let edges = bytecode_control_target(instr)
+                .into_iter()
+                .chain(py_op_edges(instr).into_iter().flat_map(|(slow, pt)| [Some(slow), pt]).flatten());
+            for target in edges {
+                if (target as usize) < n {
+                    t[target as usize] = true;
+                }
+            }
+            if yield_heads.contains(&(ip as u32)) {
+                t[ip] = true;
+            }
+        }
+        t
+    };
+    if n_float_ops != 0 && crate::jitlog_enabled() {
+        eprintln!("[jit] fn{func_id} Tier-C float ops={n_float_ops} cache slots={fc_slots}");
     }
     let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
         plan_tierc_block_sroa(proto, &targeted, yield_heads)
@@ -3235,7 +3290,7 @@ pub(crate) fn compile_proto_mem(
         } else {
             0
         };
-    let frame: i32 =
+    let frame_core: i32 =
         40 + if str_append_cursor.is_some() {
             crate::vm::STR_APPEND_CURSOR_FRAME_BYTES
         } else {
@@ -3246,6 +3301,10 @@ pub(crate) fn compile_proto_mem(
             } else {
                 0
             };
+    // The float cache's callee-saved xmm registers are saved above the rest
+    // of the frame (16 bytes each keeps the frame's alignment).
+    let fc_save_off = frame_core;
+    let frame: i32 = frame_core + 16 * fc_slots as i32;
     let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
     let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
     let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
@@ -3257,7 +3316,7 @@ pub(crate) fn compile_proto_mem(
     let cursor_out_capacity_off = cursor_off + crate::vm::STR_APPEND_CURSOR_OUT_CAPACITY_OFF;
     // Byte offset of the headroom flag (1 = the carved window fits → inline; 0 =
     // fall back to the per-call helper). MUST equal the prologue store offset.
-    let leaf_flag_off = frame - 8;
+    let leaf_flag_off = frame_core - 8;
 
     // r13 (heap versions base) and r14 (JIT IC table base) are READ by the GetProp
     // inline-cache probe and by exact-identity leaf guards. A same-prototype
@@ -3356,6 +3415,10 @@ pub(crate) fn compile_proto_mem(
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
     );
+    for k in 0..fc_slots {
+        let off = fc_save_off + 16 * k as i32;
+        dynasm!(ops ; movdqu [rsp + off], Rx(FloatCache::FIRST_XMM + k as u8));
+    }
     if str_append_cursor.is_some() {
         dynasm!(ops
             // `jit_str_append_cursor_begin` forms `&mut StrAppendCursor`
@@ -3515,6 +3578,15 @@ pub(crate) fn compile_proto_mem(
     };
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
+        if fc_slots != 0 {
+            // What the previous op did to the registers the cache holds, then
+            // this op's entry: a jump target starts with nothing cached.
+            fc.apply(std::mem::replace(&mut fc_pending, FcEffect::None));
+            if fc_targeted[ip] {
+                fc.clear();
+            }
+            fc_pending = fc_effect(&proto.code[ip]);
+        }
         if let Some((m, bl)) = blocks.as_ref() {
             if let Some(&len) = bl.get(&ip) {
                 let stub = ops.new_dynamic_label();
@@ -3706,6 +3778,38 @@ pub(crate) fn compile_proto_mem(
                 ic_site += 1;
             }
             continue;
+        }
+        if float_ops[ip] {
+            let (dst, a, b, op) = match proto.code[ip] {
+                Instr::Add { dst, a, b } => (dst, a, b, DOp::Add),
+                Instr::Sub { dst, a, b } => (dst, a, b, DOp::Sub),
+                Instr::Mul { dst, a, b } => (dst, a, b, DOp::Mul),
+                Instr::Div { dst, a, b } => (dst, a, b, DOp::Div),
+                _ => return None,
+            };
+            emit_float_binop(&mut ops, &mut fc, func_id, ip, epilogue, dst, a, b, op);
+            fc_pending = FcEffect::None;
+            continue;
+        }
+        // `Math.sqrt(x)` in a body with double-only ops: its argument from the
+        // cache and its result into it, stored as a double.
+        if let Instr::MathOp {
+            dst,
+            op: op @ crate::bytecode::MathFn::Sqrt,
+            callee,
+            this_v,
+            arg_base,
+            argc: 1,
+        } = proto.code[ip]
+        {
+            if n_float_ops != 0 && crate::codegen::math_inline_enabled() {
+                let bail = ops.new_dynamic_label();
+                emit_math_identity_guard(&mut ops, op, callee, this_v, bail, heap.math_imul_guard);
+                emit_float_unary_sqrt(&mut ops, &mut fc, dst, arg_base, bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                fc_pending = FcEffect::None;
+                continue;
+            }
         }
         // Each op gets its OWN dedicated bail label (records THIS ip); a guard
         // miss resumes the interpreter exactly here, side-effect-free.
@@ -5014,6 +5118,7 @@ pub(crate) fn compile_proto_mem(
                 DOp::Sub,
                 int_hint,
                 trunc_arith[ip],
+                arith_fb_at(ip),
             ),
             Instr::Mul { dst, a, b } => {
                 // An Int product of two Ints is an Int (`dbinop`'s int path,
@@ -5029,6 +5134,7 @@ pub(crate) fn compile_proto_mem(
                     DOp::Mul,
                     int_hint,
                     false,
+                    arith_fb_at(ip),
                 )
             }
             Instr::Div { dst, a, b } => {
@@ -5045,6 +5151,7 @@ pub(crate) fn compile_proto_mem(
                     DOp::Div,
                     false,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Mod { dst, a, b } => {
@@ -5189,6 +5296,13 @@ pub(crate) fn compile_proto_mem(
                 let slow = ops.new_dynamic_label();
                 let f64_path = ops.new_dynamic_label();
                 let done_a = ops.new_dynamic_label();
+                let fb = arith_fb_at(ip);
+                // An overflow skips the feedback check (`dbinop`'s rule).
+                let ovf = match fb {
+                    ArithFb::None => None,
+                    ArithFb::Notify { .. } => Some(ops.new_dynamic_label()),
+                };
+                let past_check = ops.new_dynamic_label();
                 if int_hint {
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(a)]
@@ -5204,7 +5318,7 @@ pub(crate) fn compile_proto_mem(
                         ; add eax, ecx
                     );
                     if !trunc_arith[ip] {
-                        dynasm!(ops ; jo => f64_path);
+                        dynasm!(ops ; jo => ovf.unwrap_or(f64_path));
                     }
                     box_eax(&mut ops, dst);
                     match fuse_or[ip] {
@@ -5219,14 +5333,22 @@ pub(crate) fn compile_proto_mem(
                         }
                         None => dynasm!(ops ; jmp => done_a),
                     }
+                    if let Some(ovf) = ovf {
+                        dynasm!(ops ; => ovf);
+                        load_num_xmm(&mut ops, a, 0, slow);
+                        load_num_xmm(&mut ops, b, 1, slow);
+                        dynasm!(ops ; jmp => past_check);
+                    }
                 }
                 dynasm!(ops ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, slow);
                 load_num_xmm(&mut ops, b, 1, slow);
-                dynasm!(ops ; addsd xmm0, xmm1);
+                let first = emit_arith_fb_check(&mut ops, fb);
+                dynasm!(ops ; => past_check ; addsd xmm0, xmm1);
                 store_xmm(&mut ops, dst);
+                dynasm!(ops ; jmp => done_a);
+                emit_arith_fb_stub(&mut ops, fb, first, f64_path);
                 dynasm!(ops
-                    ; jmp => done_a
                     ; => slow
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]
@@ -7228,6 +7350,10 @@ pub(crate) fn compile_proto_mem(
             ; call r11
         );
     }
+    for k in 0..fc_slots {
+        let off = fc_save_off + 16 * k as i32;
+        dynasm!(ops ; movdqu Rx(FloatCache::FIRST_XMM + k as u8), [rsp + off]);
+    }
     dynasm!(ops
         ; add rsp, frame
         ; pop r14
@@ -7272,6 +7398,304 @@ pub(crate) fn compile_proto_mem(
         self_binding: None,
         int_tier: false,
     })
+}
+
+/// Tier C's double-operand cache: which VM registers' numeric values the
+/// callee-saved xmm8.. hold. An operand loaded by a double-only op
+/// (`float_op_plan`) and every such op's result are kept there, so the next
+/// double-only op reading them takes neither the register file's load nor
+/// its tag test, nor the Int attempt the generic arithmetic makes first.
+///
+/// The register file stays exact: every result is still stored as before, so
+/// a bail, a call and every op that reads a boxed operand see nothing
+/// different, and only double-only ops read the cache. What it may hold is
+/// bookkept op by op in emission order (`fc_effect`): an op that writes only
+/// its `dst` forgets that register, any other op forgets everything, and so
+/// does every jump target, so a value is cached only along a straight run
+/// from where it was loaded. Callee-saved registers survive the helper calls
+/// in that run; the body saves the ones it uses in its prologue. Nothing
+/// outside a body's own ops can write its registers once a direct eval,
+/// `with`, an eval scope and a mapped `arguments` are excluded
+/// (`float_op_plan`).
+pub(crate) struct FloatCache {
+    /// Slot k (xmm `FIRST_XMM + k`): the VM register it holds.
+    held: Vec<Option<u16>>,
+    /// Slot k's last use, for replacing the least recently used.
+    used: Vec<u32>,
+    clock: u32,
+}
+
+impl FloatCache {
+    pub(crate) const FIRST_XMM: u8 = 8;
+    pub(crate) const MAX_SLOTS: usize = 8;
+    /// Double-only ops a body needs before it keeps the cache at all.
+    pub(crate) const MIN_OPS: usize = 4;
+
+    fn new(slots: usize) -> FloatCache {
+        FloatCache {
+            held: vec![None; slots],
+            used: vec![0; slots],
+            clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.held.iter_mut().for_each(|h| *h = None);
+    }
+
+    fn forget(&mut self, reg: u16) {
+        for h in self.held.iter_mut() {
+            if *h == Some(reg) {
+                *h = None;
+            }
+        }
+    }
+
+    fn apply(&mut self, effect: FcEffect) {
+        match effect {
+            FcEffect::None => {}
+            FcEffect::Write(reg) => self.forget(reg),
+            FcEffect::Clear => self.clear(),
+        }
+    }
+
+    /// The xmm register holding `reg`, if one does.
+    fn find(&mut self, reg: u16) -> Option<u8> {
+        let k = self.held.iter().position(|&h| h == Some(reg))?;
+        self.clock += 1;
+        self.used[k] = self.clock;
+        Some(Self::FIRST_XMM + k as u8)
+    }
+
+    /// A slot for `reg`'s new value: an empty one, else the least recently
+    /// used other than `keep` (an operand the op still reads); none in a
+    /// body without the cache.
+    fn claim(&mut self, reg: u16, keep: Option<u8>) -> Option<u8> {
+        self.forget(reg);
+        let k = match self.held.iter().position(Option::is_none) {
+            Some(k) => k,
+            None => (0..self.held.len())
+                .filter(|&k| Some(Self::FIRST_XMM + k as u8) != keep)
+                .min_by_key(|&k| self.used[k])?,
+        };
+        self.clock += 1;
+        self.used[k] = self.clock;
+        self.held[k] = Some(reg);
+        Some(Self::FIRST_XMM + k as u8)
+    }
+}
+
+/// What an op does to the registers `FloatCache` holds.
+#[derive(Clone, Copy)]
+pub(crate) enum FcEffect {
+    /// Writes no register.
+    None,
+    /// Writes only this register.
+    Write(u16),
+    /// May write others (calls, multi-result ops, windows): forget everything.
+    Clear,
+}
+
+/// `FcEffect` of one op. Only ops known to write their `dst` alone (or
+/// nothing) are listed; everything else clears the cache.
+fn fc_effect(instr: &Instr) -> FcEffect {
+    match *instr {
+        Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::MathOp { dst, .. }
+        | Instr::TypeOf { dst, .. }
+        | Instr::TypeOfIs { dst, .. } => FcEffect::Write(dst),
+        Instr::SetProp { .. }
+        | Instr::SetIndex { .. }
+        | Instr::StoreGlobal { .. }
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::Jump { .. }
+        | Instr::JumpIfFalse { .. }
+        | Instr::JumpIfTrue { .. }
+        | Instr::JumpIfNotLt { .. }
+        | Instr::JumpIfNotLe { .. } => FcEffect::None,
+        _ => FcEffect::Clear,
+    }
+}
+
+/// The arithmetic ops Tier C may compile as one double operation once
+/// feedback says so (`float_op_plan`): every `Add`, `Sub`,
+/// `Mul` and `Div` but a truncation-only one (its Int path wraps), in a body
+/// that is not metered, not Python, and whose registers nothing but its own
+/// ops can write (no direct eval, `with`, eval scope or mapped `arguments`).
+/// None under `ZIPP_NO_FLOAT_CACHE=1`.
+pub(crate) fn float_op_candidates(proto: &FuncProto, trunc_arith: &[bool], metered: bool) -> Vec<bool> {
+    let code = &proto.code;
+    let mut out = vec![false; code.len()];
+    if metered
+        || !crate::codegen::float_cache_enabled()
+        || proto.arguments_reg.is_some()
+        || !proto.eval_sites.is_empty()
+        || has_py_ops(code)
+        || code.iter().any(|i| {
+            matches!(
+                i,
+                Instr::DirectEval { .. }
+                    | Instr::EvalScopeHas { .. }
+                    | Instr::EvalScopeSet { .. }
+                    | Instr::WithHas { .. }
+                    | Instr::WithGet { .. }
+                    | Instr::WithSet { .. }
+            )
+        })
+    {
+        return out;
+    }
+    for (ip, instr) in code.iter().enumerate() {
+        out[ip] = !trunc_arith.get(ip).copied().unwrap_or(true)
+            && matches!(
+                instr,
+                Instr::Add { .. } | Instr::Sub { .. } | Instr::Mul { .. } | Instr::Div { .. }
+            );
+    }
+    out
+}
+
+/// The candidates (`float_op_candidates`) Tier C compiles as one double
+/// operation: an `Add`, `Sub` or `Mul` whose compiled generic form has
+/// computed on a double (`ArithFb`), and every `Div` (whose only path is the
+/// double one anyway) once the body has one of the others; not one whose
+/// double-only form met a non-number in an earlier compile
+/// (`Jit::note_float_bail`). Such an op takes Int operands as their doubles,
+/// so two Ints give a double where the generic op's Int path gave an Int:
+/// the same number.
+pub(crate) fn float_op_plan(code: &[Instr], cands: &[bool], arith_fb: Option<&[u8]>) -> Vec<bool> {
+    let mut out = vec![false; code.len()];
+    let Some(fb) = arith_fb.filter(|fb| fb.len() == code.len()) else {
+        return out;
+    };
+    let double = crate::codegen::ARITH_FB_DOUBLE;
+    let other = crate::codegen::ARITH_FB_OTHER;
+    let mut marked = false;
+    for (ip, instr) in code.iter().enumerate() {
+        if !cands.get(ip).copied().unwrap_or(false) || fb[ip] & other != 0 {
+            continue;
+        }
+        let float = !matches!(instr, Instr::Div { .. }) && fb[ip] & double != 0;
+        marked |= float;
+        out[ip] = float || matches!(instr, Instr::Div { .. });
+    }
+    if !marked {
+        out.fill(false);
+    }
+    out
+}
+
+/// The xmm register holding `reg`'s numeric value for a double-only op: its
+/// `FloatCache` register, else `scratch` (0 or 1) loaded as a number (an Int
+/// as its double; anything else jumps to `bail`), copied into a cache slot
+/// when the body has one to give (not `keep`, an operand the op still reads).
+fn float_operand(
+    ops: &mut dynasmrt::x64::Assembler,
+    fc: &mut FloatCache,
+    reg: u16,
+    scratch: u8,
+    keep: Option<u8>,
+    bail: dynasmrt::DynamicLabel,
+) -> u8 {
+    if let Some(x) = fc.find(reg) {
+        return x;
+    }
+    load_num_xmm(ops, reg, scratch, bail);
+    match fc.claim(reg, keep) {
+        Some(x) => {
+            dynasm!(ops ; movapd Rx(x), Rx(scratch));
+            x
+        }
+        None => scratch,
+    }
+}
+
+/// `regs[dst] = regs[a] <op> regs[b]` as one double operation (see
+/// `float_op_plan`), its operands from `FloatCache` where it holds them
+/// (`float_operand`); the result stored as a double, as the generic op's
+/// double path stores it, and cached. An operand that is not a number bails
+/// at `ip` after `jit_float_bail` has marked the op and evicted the body, so
+/// the next compile makes it generic.
+#[allow(clippy::too_many_arguments)]
+fn emit_float_binop(
+    ops: &mut dynasmrt::x64::Assembler,
+    fc: &mut FloatCache,
+    func_id: u32,
+    ip: usize,
+    epilogue: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    op: DOp,
+) {
+    let bail = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let xa = float_operand(ops, fc, a, 0, None, bail);
+    let xb = float_operand(ops, fc, b, 1, Some(xa), bail);
+    if xa != 0 {
+        dynasm!(ops ; movapd xmm0, Rx(xa));
+    }
+    match op {
+        DOp::Add => dynasm!(ops ; addsd xmm0, Rx(xb)),
+        DOp::Sub => dynasm!(ops ; subsd xmm0, Rx(xb)),
+        DOp::Mul => dynasm!(ops ; mulsd xmm0, Rx(xb)),
+        DOp::Div => dynasm!(ops ; divsd xmm0, Rx(xb)),
+    }
+    store_xmm(ops, dst);
+    if let Some(xd) = fc.claim(dst, None) {
+        dynasm!(ops ; movapd Rx(xd), xmm0);
+    }
+    dynasm!(ops
+        ; jmp => done
+        ; => bail
+        ; mov rcx, rdi
+        ; mov edx, func_id as i32
+        ; mov r8d, ip as i32
+        ; mov rax, QWORD crate::vm::jit_float_bail as *const () as i64
+        ; call rax
+        ; mov DWORD [rsi], ip as i32
+        ; jmp => epilogue
+        ; => done
+    );
+}
+
+/// `regs[dst] = Math.sqrt(regs[arg])` in a body with double-only ops, after
+/// the caller's identity guard: the argument as `float_operand` gives it
+/// (anything but a number bails), the root stored as a double, as `sqrtsd`
+/// gives it, and cached. The generic arm's `emit_box_num` would make an
+/// integral root an Int: the same number.
+fn emit_float_unary_sqrt(
+    ops: &mut dynasmrt::x64::Assembler,
+    fc: &mut FloatCache,
+    dst: u16,
+    arg: u16,
+    bail: dynasmrt::DynamicLabel,
+) {
+    let xa = float_operand(ops, fc, arg, 0, None, bail);
+    dynasm!(ops ; sqrtsd xmm0, Rx(xa));
+    store_xmm(ops, dst);
+    if let Some(xd) = fc.claim(dst, None) {
+        dynasm!(ops ; movapd Rx(xd), xmm0);
+    }
 }
 
 /// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).

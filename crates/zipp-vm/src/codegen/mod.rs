@@ -576,6 +576,18 @@ env_off_switch!(
     fn int_mul_enabled() = "ZIPP_NO_INT_MUL"
 );
 
+/// `arith_fb` bit: the op computed on a double.
+pub(crate) const ARITH_FB_DOUBLE: u8 = 1;
+/// `arith_fb` bit: the op's double-only form met an operand that is not a
+/// number (`Jit::note_float_bail`).
+pub(crate) const ARITH_FB_OTHER: u8 = 2;
+
+env_off_switch!(
+    /// `ZIPP_NO_FLOAT_CACHE=1` compiles Tier C arithmetic without type
+    /// feedback: no double-only ops and no operand cache (`FloatCache`).
+    fn float_cache_enabled() = "ZIPP_NO_FLOAT_CACHE"
+);
+
 env_off_switch!(
     /// `ZIPP_NO_INT_MOD=1` drops the memory paths' Int `Mod` lane
     /// (`emit_int_mod_fast`): every `a % b` converts both operands to doubles
@@ -3720,6 +3732,13 @@ pub struct Jit {
     /// replaces the 2-3 hash probes (`compiled` miss + `blacklist` hit) that
     /// otherwise tax each call to a never-compiled function.
     fn_state: Vec<u8>,
+    /// Arithmetic type feedback, per func_id one byte per ip (`arith_table`):
+    /// [`ARITH_FB_DOUBLE`] once compiled generic code ran that `Add`/`Sub`/
+    /// `Mul` on a double (`ArithFb`), [`ARITH_FB_OTHER`] once Tier C's
+    /// double-only form of it met an operand that is not a number
+    /// (`Jit::note_float_bail`). Tier C compiles an op marked double and not
+    /// other as one double operation (`float_op_plan`).
+    arith_fb: Vec<Option<Box<[u8]>>>,
     regions: FxHashMap<(u32, u32), Region>,
     /// B199: the JIT-facing live cross-entry table, parallel to
     /// `cross_entries` — one 16-byte record per fid the emitted lanes read
@@ -4480,6 +4499,44 @@ impl Jit {
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
     }
 
+    /// The address of `func_id`'s feedback table (`arith_fb`), made with
+    /// `code_len` zero bytes if it has none; 0 if its table has another
+    /// length. A table is a boxed slice that is never replaced, so compiled
+    /// code may read it at this address for the VM's life.
+    pub fn arith_table(&mut self, func_id: u32, code_len: usize) -> u64 {
+        let i = func_id as usize;
+        if self.arith_fb.len() <= i {
+            self.arith_fb.resize_with(i + 1, || None);
+        }
+        let t = self.arith_fb[i].get_or_insert_with(|| vec![0u8; code_len].into_boxed_slice());
+        if t.len() == code_len {
+            t.as_ptr() as u64
+        } else {
+            0
+        }
+    }
+
+    /// The generic op at `(func_id, ip)` of a Tier C body computed on a
+    /// double for the first time (`ArithFb::Notify`): record it, and evict
+    /// the body (under the recompile cap) so its next compile gives the op
+    /// the double-only form.
+    pub fn note_first_double(&mut self, func_id: u32, ip: u32) {
+        if let Some(Some(t)) = self.arith_fb.get_mut(func_id as usize) {
+            if let Some(b) = t.get_mut(ip as usize) {
+                *b |= ARITH_FB_DOUBLE;
+            }
+        }
+        if self.meter.is_some() || self.fn_state(func_id) != FN_COMPILED {
+            return;
+        }
+        self.evict_tier_c(func_id, format_args!("first double at ip {ip}"));
+    }
+
+    /// `func_id`'s arithmetic feedback (`arith_fb`), if any op recorded some.
+    pub fn arith_feedback(&self, func_id: u32) -> Option<&[u8]> {
+        self.arith_fb.get(func_id as usize)?.as_deref()
+    }
+
     /// Dense tier state of `func_id` — the frame-entry fast path.
     #[inline]
     pub fn fn_state(&self, func_id: u32) -> u8 {
@@ -4614,6 +4671,8 @@ impl Jit {
             let ic_base_idx = self.reserve_ic_sites(n_sites);
             let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+            let arith_fb_base = self.arith_table(func_id, proto.code.len());
+            let arith_fb = self.arith_feedback(func_id).map(<[u8]>::to_vec);
             if let Some(f) = compile_proto_mem(
                 proto,
                 func_id,
@@ -4628,6 +4687,8 @@ impl Jit {
                 yield_heads,
                 random_fuse,
                 plain_makefunc,
+                arith_fb.as_deref(),
+                arith_fb_base,
             ) {
                 if crate::jitlog_enabled() {
                     eprintln!(
@@ -5869,6 +5930,31 @@ impl Jit {
             return;
         }
         *n = 0;
+        self.evict_tier_c(func_id, format_args!("call fallback at ip {ip}"));
+    }
+
+    /// A double-only op at `(func_id, ip)` (`float_op_plan`) met an operand
+    /// that is not a number, and its body is about to bail there: mark the op
+    /// ([`ARITH_FB_OTHER`]) so the next compile gives it the generic
+    /// arithmetic, and evict the body as the call fallback does. A
+    /// concatenating `Add` would otherwise bail on every call.
+    pub fn note_float_bail(&mut self, func_id: u32, ip: u32) {
+        if let Some(Some(t)) = self.arith_fb.get_mut(func_id as usize) {
+            if let Some(b) = t.get_mut(ip as usize) {
+                *b |= ARITH_FB_OTHER;
+            }
+        }
+        if self.meter.is_some() || self.fn_state(func_id) != FN_COMPILED {
+            return;
+        }
+        self.evict_tier_c(func_id, format_args!("float op at ip {ip} met a non-number"));
+    }
+
+    /// Evict `func_id`'s Tier C body so its next entry recompiles it, under
+    /// the cap of recompiles per body (`DIRECT_MISS_RECOMPILE_CAP`). The body
+    /// may be the one running: it is parked with the retired bodies, never
+    /// freed under itself.
+    fn evict_tier_c(&mut self, func_id: u32, why: std::fmt::Arguments) {
         let owner = (func_id, u32::MAX);
         let parks = self.direct_miss_recompiles.get(&owner).copied().unwrap_or(0);
         if parks >= DIRECT_MISS_RECOMPILE_CAP {
@@ -5878,7 +5964,7 @@ impl Jit {
             return;
         };
         if crate::jitlog_enabled() {
-            eprintln!("[jit] Tier C fn{func_id} EVICTED (call fallback at ip {ip})");
+            eprintln!("[jit] Tier C fn{func_id} EVICTED ({why})");
         }
         *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
         self.retired_fns.push(f);

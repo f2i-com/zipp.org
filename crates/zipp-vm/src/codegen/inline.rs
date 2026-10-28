@@ -880,6 +880,7 @@ pub(crate) fn emit_inline_leaf_call(
                     DOp::Add,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Sub { dst: d, a, b } => {
@@ -895,6 +896,7 @@ pub(crate) fn emit_inline_leaf_call(
                     DOp::Sub,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Mul { dst: d, a, b } => {
@@ -910,6 +912,7 @@ pub(crate) fn emit_inline_leaf_call(
                     DOp::Mul,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Div { dst: d, a, b } => {
@@ -925,6 +928,7 @@ pub(crate) fn emit_inline_leaf_call(
                     DOp::Div,
                     false,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Mod { dst: d, a, b } => {
@@ -1493,6 +1497,7 @@ pub(crate) fn emit_mi_body(
                     DOp::Add,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Sub { dst: d, a, b } => {
@@ -1508,6 +1513,7 @@ pub(crate) fn emit_mi_body(
                     DOp::Sub,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Mul { dst: d, a, b } => {
@@ -1523,6 +1529,7 @@ pub(crate) fn emit_mi_body(
                     DOp::Mul,
                     true,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Div { dst: d, a, b } => {
@@ -1538,6 +1545,7 @@ pub(crate) fn emit_mi_body(
                     DOp::Div,
                     false,
                     false,
+                    ArithFb::None,
                 )
             }
             Instr::Mod { dst: d, a, b } => {

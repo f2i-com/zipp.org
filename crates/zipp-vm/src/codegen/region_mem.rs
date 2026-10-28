@@ -919,6 +919,7 @@ pub(crate) fn compile_region_mem(
                 DOp::Sub,
                 int_hint(a, b),
                 trunc_arith[ip],
+                ArithFb::None,
             ),
             Instr::Mul { dst, a, b } => dbinop(
                 &mut ops,
@@ -931,6 +932,7 @@ pub(crate) fn compile_region_mem(
                 DOp::Mul,
                 int_hint(a, b),
                 false,
+                ArithFb::None,
             ),
             Instr::Div { dst, a, b } => dbinop(
                 &mut ops,
@@ -943,6 +945,7 @@ pub(crate) fn compile_region_mem(
                 DOp::Div,
                 false,
                 false,
+                ArithFb::None,
             ),
             Instr::Mod { dst, a, b } => {
                 // `a % b` for INTEGER-valued operands via i64 idiv (exact, and the

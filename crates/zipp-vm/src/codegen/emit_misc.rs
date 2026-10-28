@@ -655,6 +655,8 @@ pub(crate) fn math_op_emittable(op: MathFn, argc: u16) -> bool {
 /// has no integer form — mirrors the interpreter). Guards operands are numbers.
 /// `wrap` (Add/Sub only) drops the overflow branch: the caller proved with
 /// `trunc_only_arith_ips` that the result is observed only through ToInt32.
+/// `fb` marks the function's arithmetic feedback on the double path (see
+/// `ArithFb`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dbinop(
     ops: &mut dynasmrt::x64::Assembler,
@@ -667,6 +669,7 @@ pub(crate) fn dbinop(
     op: DOp,
     int_hint: bool,
     wrap: bool,
+    fb: ArithFb,
 ) {
     let f64_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -687,6 +690,14 @@ pub(crate) fn dbinop(
     let a_not_int = ops.new_dynamic_label();
     let b_not_int = ops.new_dynamic_label();
     let f64_op = ops.new_dynamic_label();
+    // Two Ints whose result is no Int (an overflow, a -0 product) skip the
+    // feedback check: they did not compute on a double, and marking the op
+    // would give it the double-only form, whose results stay doubles where
+    // this path gives Ints back.
+    let (ovf, past_check) = match fb {
+        ArithFb::None => (f64_path, f64_path),
+        ArithFb::Notify { .. } => (ops.new_dynamic_label(), ops.new_dynamic_label()),
+    };
     if int_ok {
         dynasm!(ops ; mov rax, [rbx + dreg(a)]);
         if !split {
@@ -722,7 +733,7 @@ pub(crate) fn dbinop(
         // i33 result's low 32 bits are exactly what every consumer's ToInt32
         // yields, so the overflow branch and the f64 redo are dead weight.
         if !(wrap && matches!(op, DOp::Add | DOp::Sub)) {
-            dynasm!(ops ; jo => f64_path);
+            dynasm!(ops ; jo => ovf);
         }
         if matches!(op, DOp::Mul) {
             // A zero product with a negative operand is -0, which no Int
@@ -733,7 +744,7 @@ pub(crate) fn dbinop(
                 ; test eax, eax
                 ; jnz => nonzero
                 ; or r10d, ecx
-                ; js => f64_path
+                ; js => ovf
                 ; => nonzero
             );
         }
@@ -761,14 +772,26 @@ pub(crate) fn dbinop(
             load_num_xmm(ops, b, 1, bail);
             dynasm!(ops ; jmp => f64_op);
         }
+        if ovf != f64_path {
+            dynasm!(ops ; => ovf);
+            load_num_xmm(ops, a, 0, bail);
+            load_num_xmm(ops, b, 1, bail);
+            dynasm!(ops ; jmp => past_check);
+        }
         // An overflow re-loads both operands from the register file, so the
         // clobbered eax (wrapped overflow value) is irrelevant.
         dynasm!(ops ; => f64_path);
     }
+    let reload = ops.new_dynamic_label();
+    dynasm!(ops ; => reload);
     load_num_xmm(ops, a, 0, bail);
     load_num_xmm(ops, b, 1, bail);
     if split {
         dynasm!(ops ; => f64_op);
+    }
+    let first = emit_arith_fb_check(ops, fb);
+    if past_check != f64_path {
+        dynasm!(ops ; => past_check);
     }
     match op {
         DOp::Add => dynasm!(ops ; addsd xmm0, xmm1),
@@ -780,7 +803,69 @@ pub(crate) fn dbinop(
     if int_ok {
         dynasm!(ops ; => done);
     }
+    emit_arith_fb_stub(ops, fb, first, reload);
     emit_region_bail(ops, ip, bail, epilogue);
+}
+
+/// Where compiled generic arithmetic records that it computed on a double
+/// (`Jit::arith_fb`, which Tier C compiles double-only ops from).
+#[derive(Clone, Copy)]
+pub(crate) enum ArithFb {
+    /// Records nothing.
+    None,
+    /// A Tier C body's op, which the double-only form would serve: the first
+    /// time its byte at `addr` lacks [`ARITH_FB_DOUBLE`], `jit_arith_first_double`
+    /// records it and evicts the body, so the next compile gives the op that
+    /// form.
+    Notify { addr: u64, func_id: u32, ip: u32 },
+}
+
+/// `ArithFb`'s record, on a double path with both operands loaded (xmm0,
+/// xmm1): `Notify` tests its bit and returns the label the caller must place
+/// `emit_arith_fb_stub` at.
+pub(crate) fn emit_arith_fb_check(
+    ops: &mut dynasmrt::x64::Assembler,
+    fb: ArithFb,
+) -> Option<dynasmrt::DynamicLabel> {
+    let double = crate::codegen::ARITH_FB_DOUBLE as i8;
+    match fb {
+        ArithFb::None => None,
+        ArithFb::Notify { addr, .. } => {
+            let first = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov r11, QWORD addr as i64
+                ; test BYTE [r11], double
+                ; jz => first
+            );
+            Some(first)
+        }
+    }
+}
+
+/// The out-of-line half of `ArithFb::Notify`: `jit_arith_first_double`, then
+/// back to `reload`, which loads the operands again (the call clobbered them)
+/// and now passes the check.
+pub(crate) fn emit_arith_fb_stub(
+    ops: &mut dynasmrt::x64::Assembler,
+    fb: ArithFb,
+    first: Option<dynasmrt::DynamicLabel>,
+    reload: dynasmrt::DynamicLabel,
+) {
+    let (Some(first), ArithFb::Notify { func_id, ip, .. }) = (first, fb) else {
+        return;
+    };
+    let over = ops.new_dynamic_label();
+    dynasm!(ops
+        ; jmp => over
+        ; => first
+        ; mov rcx, rdi
+        ; mov edx, func_id as i32
+        ; mov r8d, ip as i32
+        ; mov rax, QWORD crate::vm::jit_arith_first_double as *const () as i64
+        ; call rax
+        ; jmp => reload
+        ; => over
+    );
 }
 
 /// The `Add`/`Sub`/`AddInt` ips whose result is observed ONLY through ToInt32
