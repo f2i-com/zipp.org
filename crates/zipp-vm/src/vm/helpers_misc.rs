@@ -4948,6 +4948,12 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // A class method this site read before (`o.m` read ahead of its call's
+    // arguments, `ray.origin.sub(this.center)`): the memo's answer, ahead of
+    // the key scan and the shape memo.
+    if let Some(bits) = jit_class_read_hit(vm, idx, site_idx, func_id, name_idx) {
+        return bits;
+    }
 
     // `s.slice` / `s.indexOf` / ... on a primitive string: the method a
     // loop calls is read here on every iteration (string receivers are not
@@ -5145,7 +5151,9 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // its class chain — the interpreter-IC slow helper serves those
             // (polymorphic, guard-validated); a plain object walks the PROTO
             // CHAIN (`Object.create({val})` — the chain may hold the property).
-            None if map.class.is_some() => return crate::codegen::PROP_VIA_IC,
+            None if map.class.is_some() => {
+                return jit_class_read_fill(vm, obj, key, site_idx, func_id, name_idx)
+            }
             // A ctor-map receiver (`Function`, builtin constructors) has
             // [[Prototype]] = %Function.prototype% — NOT the walk's
             // no-`proto_of`-entry default of %Object.prototype% — and the
@@ -5568,6 +5576,102 @@ const ADD_WAY_HOPS: usize = 4;
 /// Sites an add way is kept for; past it a site takes the miss path as before.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const ADD_WAY_SITES_MAX: usize = 1 << 20;
+
+/// One JIT `GetProp` site's last class-method read (`Vm::jit_class_reads`):
+/// a receiver of class `class` and hidden shape `recv_shape` read `name`
+/// (in function `func`) as the method `value`, resolved on the class chain
+/// while the class was at version `ver` and `class_proto_epoch` at `epoch`.
+/// The guards are the interpreter's `ClassMethod` hit's: the shape proves
+/// the receiver still owns no such key, the version and epoch that the
+/// member tables still describe the chain.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ClassRead {
+    func: u32,
+    name: u32,
+    /// `shape::DICT` (0) marks an empty memo.
+    recv_shape: u32,
+    class: u32,
+    ver: u32,
+    epoch: u32,
+    value: u64,
+}
+
+/// The method a site's memo names for the class instance `idx`, if every
+/// guard still holds.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_class_read_hit(vm: &Vm, idx: u32, site_idx: u32, func: u32, name: u32) -> Option<u64> {
+    let m = vm.jit_class_reads.get(site_idx as usize)?;
+    if m.recv_shape == crate::shape::DICT || m.func != func || m.name != name {
+        return None;
+    }
+    match vm.heap.get(idx) {
+        HeapObj::Object(map)
+            if map.class == Some(m.class)
+                && map.shape() == m.recv_shape
+                && vm.heap.version_of(m.class) == m.ver
+                && vm.class_proto_epoch == m.epoch =>
+        {
+            Some(m.value)
+        }
+        _ => None,
+    }
+}
+
+/// A class instance's read of a key it does not own: a method on its class
+/// chain is the read's value (and the site's memo); anything else (a
+/// getter, which has to run, an absent key, an uncacheable chain) takes the
+/// interpreter-IC slow helper.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: u32, name: u32) -> u64 {
+    let idx = obj.heap_index();
+    let (class, recv_shape) = match vm.heap.get(idx) {
+        HeapObj::Object(map) => match map.class {
+            Some(c) => (c, map.shape()),
+            None => return crate::codegen::PROP_VIA_IC,
+        },
+        _ => return crate::codegen::PROP_VIA_IC,
+    };
+    let callee = match vm.ic_walk(obj, key) {
+        crate::vm::ic::Walked::ClassMethod { class: c, callee } if c == class => callee,
+        _ => return crate::codegen::PROP_VIA_IC,
+    };
+    if recv_shape != crate::shape::DICT && class_read_memo_enabled() {
+        let s = site_idx as usize;
+        if vm.jit_class_reads.len() <= s {
+            vm.jit_class_reads.resize(s + 1, ClassRead::default());
+        }
+        vm.jit_class_reads[s] = ClassRead {
+            func,
+            name,
+            recv_shape,
+            class,
+            ver: vm.heap.version_of(class),
+            epoch: vm.class_proto_epoch,
+            value: callee.bits(),
+        };
+    }
+    callee.bits()
+}
+
+/// `ZIPP_NO_CLASS_READ_MEMO=1` sends every class-method read in compiled
+/// code through the interpreter-IC slow helper, as before the memo.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn class_read_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CLASS_READ_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 
 /// One JIT `SetProp` site's last proved append (`Vm::jit_add_ways`): adding
 /// the site's key to a plain, extensible, classless object of shape `before`

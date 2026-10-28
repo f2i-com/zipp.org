@@ -2017,6 +2017,12 @@ pub struct Vm<'p> {
     /// every cache for each one. Pure memo: every hit rechecks it live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_ways: Vec<AddWay>,
+    /// The class method each JIT `GetProp` site last read off a class
+    /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
+    /// emitted probe serves a key that lives on the class, so every read
+    /// came to the miss helper. Pure memo: every hit rechecks it live.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_class_reads: Vec<ClassRead>,
     /// Per constructor body: whether it only stores its arguments and
     /// constants into `this`, and the proof of the last receiver a compiled
     /// `new` answered that way (`engine::ctor_store`).

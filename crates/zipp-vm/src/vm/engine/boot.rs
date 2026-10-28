@@ -398,6 +398,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_ways: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_class_reads: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
