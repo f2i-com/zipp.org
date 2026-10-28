@@ -318,11 +318,19 @@ impl<'p> Vm<'p> {
         let is_strict = {
             let proto = self.func(fid as usize);
             // A rest parameter's array is built by call setup too (and the
-            // window below drops the arguments past the parameters).
+            // window below drops the arguments past the parameters). A body
+            // with handler ops (`try`, `finally`) pushes its handlers on the
+            // top frame, which under this window is the caller's: a throw in
+            // the callback unwound to the caller's handler stack, so a
+            // `finally` never ran, a `catch` was missed, and the caller
+            // resumed at the callback's handler target (a hang, a stray
+            // TypeError, an index past the caller's code). Such a body takes
+            // only frame-backed entries, as a cross call's does.
             if proto.arguments_reg.is_some()
                 || proto.rest_reg.is_some()
                 || proto.is_async
                 || proto.is_generator
+                || crate::codegen::proto_has_handler_ops(proto)
             {
                 return None;
             }
