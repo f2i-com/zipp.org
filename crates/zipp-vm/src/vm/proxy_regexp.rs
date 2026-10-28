@@ -1354,6 +1354,29 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// `proto.pos(name)` for %RegExp.prototype%'s map `proto`. For `exec`
+    /// and `test`, the slot found last time while it still holds that key and
+    /// is not a deleted one: a key comparison instead of hashing the name.
+    /// `re.test(s)` looked up `test` (the Get) and then `exec` (RegExpExec's
+    /// proof) on every call, each a hash and a probe of the prototype's index.
+    /// Keys are unique among live slots, so a live slot holding the key is
+    /// the property, however the map changed since.
+    #[inline]
+    pub(crate) fn regexp_proto_pos(&self, proto: &ObjMap, name: &str) -> Option<usize> {
+        let memo = match name {
+            "exec" => &self.regexp_proto_slots[0],
+            "test" => &self.regexp_proto_slots[1],
+            _ => return proto.pos(name),
+        };
+        let s = memo.get() as usize;
+        if proto.key_get(s).is_some_and(|k| k == name) && !proto.is_hole(s) {
+            return Some(s);
+        }
+        let s = proto.pos(name)?;
+        memo.set(s as u32);
+        Some(s)
+    }
+
     #[inline]
     pub(crate) fn regexp_proto_slot_is_intrinsic(
         &self,
@@ -1362,7 +1385,7 @@ impl<'p> Vm<'p> {
         accessor: bool,
         native_id: u16,
     ) -> bool {
-        proto.pos(name).is_some_and(|slot| {
+        self.regexp_proto_pos(proto, name).is_some_and(|slot| {
             proto.attr_at(slot).accessor == accessor
                 && self.regexp_protocol_value_is_intrinsic(proto.val_at(slot), native_id)
         })

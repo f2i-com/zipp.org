@@ -721,6 +721,7 @@ impl<'p> Vm<'p> {
             iter_method_memo: Default::default(),
             #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
             array_iter_witness: Default::default(),
+            regexp_proto_slots: Default::default(),
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
             dollar262: 0,

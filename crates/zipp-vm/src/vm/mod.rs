@@ -3309,6 +3309,9 @@ pub struct Vm<'p> {
     /// to versions and two slot addresses (`construct::ArrayIterWitness`).
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     array_iter_witness: std::cell::Cell<construct::ArrayIterWitness>,
+    /// The slots of `exec` and `test` in %RegExp.prototype%'s map where
+    /// `Vm::regexp_proto_pos` last found them, rechecked by key on every use.
+    regexp_proto_slots: [std::cell::Cell<u32>; 2],
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.

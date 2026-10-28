@@ -162,9 +162,12 @@ impl<'p> Vm<'p> {
             }
         };
         let live = match self.heap.get(proto) {
-            HeapObj::Object(map) => map
-                .pos(name)
-                .and_then(|slot| (!map.attr_at(slot).accessor).then(|| map.val_at(slot))),
+            HeapObj::Object(map) => if proto == self.regexp_proto {
+                self.regexp_proto_pos(map, name)
+            } else {
+                map.pos(name)
+            }
+            .and_then(|slot| (!map.attr_at(slot).accessor).then(|| map.val_at(slot))),
             _ => None,
         }?;
         (live.is_heap() && live.heap_index() == expected).then_some(live)
