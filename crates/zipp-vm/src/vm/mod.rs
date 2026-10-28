@@ -2215,6 +2215,10 @@ pub struct Vm<'p> {
     /// The plain JSON walk's per-shape key decisions (`mathjson::JsonShapes`),
     /// kept across `JSON.stringify` calls: a shape id is never reissued.
     pub(crate) json_shapes: mathjson::JsonShapes,
+    /// `JSON.parse`'s key plans: for an object's member names in order (each
+    /// followed by a 0 byte, which no escape-free member name holds), the
+    /// plan its objects share and their shape (`mathjson::JsonKeyPlans`).
+    pub(crate) json_key_plans: mathjson::JsonKeyPlans,
     /// Short-subject ASCII execs each RegExp without a byte-optimized twin
     /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
     /// keyed by heap index; an entry leaves when its twin is built. A reused

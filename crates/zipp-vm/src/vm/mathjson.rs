@@ -266,6 +266,105 @@ pub(crate) struct JsonShapes {
 /// Shapes [`JsonShapes`] keeps before it starts over.
 const JSON_SHAPES_MAX: usize = 4096;
 
+/// `JSON.parse`'s objects, built as object literals are: an array of records
+/// repeats a handful of member-name sequences, and each sequence's objects
+/// share one key plan and one shape (`Heap::alloc_finalized`), where each
+/// object owned a `String` per name, an index built name by name and a
+/// shape walked name by name, and every one of those names was freed again
+/// at its death. Keyed by the names in order, each followed by a 0 byte (no
+/// escape-free member name holds one); kept across calls, and started over
+/// past [`JSON_KEY_PLANS_MAX`] sequences. A sequence a plan cannot hold
+/// (a repeated name, an element name, more than [`FINALIZE_STAGE_SLOTS`]
+/// members) is remembered as `None`.
+///
+/// A document whose objects rarely repeat a sequence (names drawn from data,
+/// as in a word-keyed tree) would pay a lookup and a new plan for nearly
+/// every object; past [`JSON_KEY_PLANS_TRIAL`] lookups in one parse with
+/// fewer hits than misses, the rest of that parse builds its objects name by
+/// name.
+#[cfg(not(feature = "wasm-lite"))]
+#[derive(Default)]
+pub(crate) struct JsonKeyPlans {
+    by_names: rustc_hash::FxHashMap<Box<[u8]>, Option<(crate::bytecode::StaticKeyPlan, u32)>>,
+    /// The key being looked up, reused.
+    scratch: Vec<u8>,
+    /// This parse's lookups that found a sequence, and that did not.
+    hits: u32,
+    misses: u32,
+}
+
+/// See [`JsonKeyPlans`].
+#[cfg(not(feature = "wasm-lite"))]
+const JSON_KEY_PLANS_TRIAL: u32 = 64;
+
+#[cfg(feature = "wasm-lite")]
+#[derive(Default)]
+pub(crate) struct JsonKeyPlans;
+
+/// Member-name sequences [`JsonKeyPlans`] keeps before it starts over.
+#[cfg(not(feature = "wasm-lite"))]
+const JSON_KEY_PLANS_MAX: usize = 1024;
+
+#[cfg(not(feature = "wasm-lite"))]
+impl JsonKeyPlans {
+    /// A new `JSON.parse` starts its own count.
+    fn begin_parse(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Whether this parse still looks up its objects' sequences.
+    #[inline]
+    fn worth_it(&self) -> bool {
+        self.hits.saturating_add(self.misses) < JSON_KEY_PLANS_TRIAL || self.hits >= self.misses
+    }
+
+    /// The plan and shape for objects whose member names are `names`.
+    fn plan(&mut self, names: &[&str]) -> Option<(crate::bytecode::StaticKeyPlan, u32)> {
+        self.scratch.clear();
+        for n in names {
+            self.scratch.extend_from_slice(n.as_bytes());
+            self.scratch.push(0);
+        }
+        if let Some(hit) = self.by_names.get(self.scratch.as_slice()) {
+            self.hits = self.hits.saturating_add(1);
+            return hit.clone();
+        }
+        self.misses = self.misses.saturating_add(1);
+        if self.by_names.len() >= JSON_KEY_PLANS_MAX {
+            self.by_names.clear();
+        }
+        let plan = crate::bytecode::StaticKeyPlan::new(names.iter().map(|n| n.to_string()).collect());
+        let entry = (plan.runtime_valid() && !plan.has_element_key()).then(|| {
+            let data = crate::shape::attr_bits(true, true, true, false);
+            let shape = plan.keys().iter().fold(crate::shape::EMPTY, |s, k| crate::shape::add(s, k, data));
+            (plan, shape)
+        });
+        self.by_names.insert(self.scratch.as_slice().into(), entry.clone());
+        entry
+    }
+}
+
+/// `ZIPP_NO_JSON_KEY_PLANS=1`: `JSON.parse` builds each object name by name
+/// again (`JsonKeyPlans`).
+#[cfg(not(feature = "wasm-lite"))]
+fn json_key_plans_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JSON_KEY_PLANS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl JsonShapes {
     /// `map`'s members; `map` has a settled shape (`shape_guardable`).
     fn members(&mut self, map: &crate::heap::ObjMap) -> Option<JsonMembers> {
@@ -2332,6 +2431,8 @@ impl<'p> Vm<'p> {
     }
 
     fn json_parse_scoped(&mut self, src: &[u8]) -> Result<Value, Thrown> {
+        #[cfg(not(feature = "wasm-lite"))]
+        self.json_key_plans.begin_parse();
         let mut i = 0;
         json_skip_ws(src, &mut i);
         let v = self.json_parse_value(src, &mut i, 0)?;
@@ -2424,6 +2525,17 @@ impl<'p> Vm<'p> {
         let mut pairs = JsonObjectPairs::default();
         #[cfg(not(feature = "wasm-lite"))]
         let mut pairs: Vec<(String, Value)> = Vec::new();
+        // The members so far while every name is escape-free and there are
+        // no more than a plan holds (`JsonKeyPlans`): `pairs` takes them over
+        // at the first that breaks that.
+        #[cfg(not(feature = "wasm-lite"))]
+        let mut planned = json_key_plans_enabled() && self.json_key_plans.worth_it();
+        #[cfg(not(feature = "wasm-lite"))]
+        let (mut names, mut vals, mut n) = (
+            [""; crate::bytecode::FINALIZE_STAGE_SLOTS],
+            [Value::UNDEFINED; crate::bytecode::FINALIZE_STAGE_SLOTS],
+            0usize,
+        );
         json_skip_ws(b, i);
         if b.get(*i) != Some(&b'}') {
             loop {
@@ -2442,16 +2554,13 @@ impl<'p> Vm<'p> {
                 // json-large corpus). Anything needing decoding still goes
                 // through the parser, which is where the escape,
                 // lone-surrogate and error rules live.
-                let key = match crate::vm::helpers_json::json_plain_key_enabled()
+                let (name, decoded) = match crate::vm::helpers_json::json_plain_key_enabled()
                     .then(|| crate::vm::helpers_json::json_scan_plain_key(b, i))
                     .flatten()
                 {
-                    Some(name) => name.to_string(),
-                    None => json_parse_string(src, i)?.to_lossy_string(),
+                    Some(name) => (Some(name), None),
+                    None => (None, Some(json_parse_string(src, i)?.to_lossy_string())),
                 };
-                // A member name is a guest string key: "@@…" is escaped out of
-                // the symbol-key space (`escape_guest_key`).
-                let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown::from_static("SyntaxError: Expected ':' in JSON object"));
@@ -2459,7 +2568,34 @@ impl<'p> Vm<'p> {
                 *i += 1;
                 json_skip_ws(b, i);
                 let val = self.json_parse_value(src, i, depth + 1)?;
-                pairs.push((key, val));
+                #[cfg(not(feature = "wasm-lite"))]
+                let kept = match name {
+                    Some(name)
+                        if planned
+                            && n < crate::bytecode::FINALIZE_STAGE_SLOTS
+                            && !crate::vm::helpers_numeric::guest_key_needs_escape(name) =>
+                    {
+                        names[n] = name;
+                        vals[n] = val;
+                        n += 1;
+                        true
+                    }
+                    _ => {
+                        if planned {
+                            planned = false;
+                            pairs.extend((0..n).map(|k| (names[k].to_string(), vals[k])));
+                        }
+                        false
+                    }
+                };
+                #[cfg(feature = "wasm-lite")]
+                let kept = false;
+                if !kept {
+                    // A member name is a guest string key: "@@…" is escaped
+                    // out of the symbol-key space (`escape_guest_key`).
+                    let key = escape_guest_key(decoded.unwrap_or_else(|| name.unwrap_or_default().to_string()));
+                    pairs.push((key, val));
+                }
                 json_skip_ws(b, i);
                 match b.get(*i) {
                     Some(b',') => *i += 1,
@@ -2473,6 +2609,14 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // '}'
+        #[cfg(not(feature = "wasm-lite"))]
+        if planned && n > 0 {
+            if let Some((plan, shape)) = self.json_key_plans.plan(&names[..n]) {
+                let idx = self.heap.alloc_finalized(&plan, &vals[..n], shape);
+                return Ok(self.adopt_current_realm_object(idx));
+            }
+            pairs.extend((0..n).map(|k| (names[k].to_string(), vals[k])));
+        }
         #[cfg(feature = "wasm-lite")]
         let map = pairs.into_map();
         #[cfg(not(feature = "wasm-lite"))]
