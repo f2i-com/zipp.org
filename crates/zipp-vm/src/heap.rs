@@ -12551,7 +12551,15 @@ mod tests {
             let HeapObj::Object(map) = heap.get_mut(idx) else {
                 unreachable!()
             };
+            // An append fills the cell's free slots in place
+            // (`ValStore::push`) and spills to the vector form once the cell
+            // is full, which hands the cell back.
+            for extra in len..val_slab_class_cap(class as u8) {
+                map.push_data(format!("fill{extra}"), Value::int(extra as i32));
+                assert!(matches!(map.vals, ValStore::Slab { .. }), "a cell with room fills in place");
+            }
             map.push_data("spill".into(), Value::int(99));
+            assert!(!matches!(map.vals, ValStore::Slab { .. }), "a full cell spills");
             heap.bump_version(idx);
             assert_eq!(heap.val_slab[class].free, vec![base]);
             heap.replace(idx, HeapObj::Date(0.0));
