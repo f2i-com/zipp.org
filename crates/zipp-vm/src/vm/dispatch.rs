@@ -4158,9 +4158,11 @@ impl<'p> Vm<'p> {
                             if !p.is_generator && !p.is_async {
                                 // The site's callee, for the leaf inliner's
                                 // choice when this function compiles
-                                // (`build_leaf_inline_plan`).
+                                // (`build_leaf_inline_plan`): nothing reads it
+                                // with the JIT off, where it was 4% of a
+                                // method-call program.
                                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                                if crate::codegen::cwt_leaf_enabled() {
+                                if self.jit_enabled && crate::codegen::cwt_leaf_enabled() {
                                     let _ = self.ic_call(func_id, ip, callee_v);
                                 }
                                 // The lean push for a strict callee (every
