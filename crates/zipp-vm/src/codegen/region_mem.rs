@@ -4325,6 +4325,18 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                 }
+                // The general route tries the native cross call first only
+                // where the site has called a user function (an inlined
+                // method or emitted arms planned); `p.then(f)`'s native
+                // callee keeps the IC helper, which the cross call would only
+                // have declined.
+                let general = if method_plan.contains_key(&ip)
+                    || cross_plan.get(&ip).is_some_and(|site| !site.cross3.is_empty())
+                {
+                    crate::vm::jit_call_with_this_cross as *const () as usize
+                } else {
+                    crate::vm::jit_call_with_this_ic as *const () as usize
+                };
                 if let Some(mp) = method_plan.get(&ip) {
                     debug_assert_eq!(mp.captured_callee, Some(callee));
                     emit_inline_method_call(
@@ -4337,7 +4349,7 @@ pub(crate) fn compile_region_mem(
                         arg_base,
                         argc,
                         dst,
-                        crate::vm::jit_call_with_this_ic as *const () as usize,
+                        general,
                         packed_fip,
                         packed_args,
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
@@ -4350,7 +4362,7 @@ pub(crate) fn compile_region_mem(
                         ip,
                         bail,
                         epilogue,
-                        crate::vm::jit_call_with_this_ic as *const () as usize,
+                        general,
                         packed_fip,
                         packed_args,
                         argc,

@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CWT_CROSS=1` makes a compiled `CallWithThis`'s general
+    /// route take the call IC at once, without first trying the native cross
+    /// call (`jit_call_with_this_cross`).
+    fn cwt_cross_enabled() = "ZIPP_NO_CWT_CROSS"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_REGION_CROSS3_CLASS=1` keeps a memory region's class-method
     /// `CallMethod` on its inline and helper routes, without the class
     /// lane Tier C emits (`jit_method_callee` and the emitted call).

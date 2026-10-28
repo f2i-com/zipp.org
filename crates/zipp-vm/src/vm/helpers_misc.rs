@@ -1701,6 +1701,55 @@ pub(crate) extern "win64" fn jit_call_with_this_ic(
     })
 }
 
+/// [`jit_call_with_this_ic`] that first makes the call native to native
+/// (`jit_cross_call_impl`, the B83 route, with the captured receiver as
+/// `this`), for the general route of a compiled `CallWithThis` site: the
+/// callee its leaf inline or emitted arms do not name (collections.ts's
+/// `this.cmp(a, b)` in a queue built with a second comparator after the
+/// first one's phase compiled the site) went through the windowed call.
+/// The receiver must be an ordinary object, which binds as itself for a
+/// strict and a sloppy callee alike (an arrow ignores it); any other
+/// receiver, and everything the cross call declines before an effect, take
+/// the IC route. `ZIPP_NO_CWT_CROSS=1` takes it always. ABI and protocol as
+/// [`jit_call_with_this_ic`].
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_call_with_this_cross(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        if crate::codegen::cwt_cross_enabled() {
+            let this_reg = (packed_args >> 32) as u16 as usize;
+            let callee_reg = (packed_args >> 16) as u16 as usize;
+            let arg_base = packed_args as u16 as usize;
+            let this = Value::from_bits(*caller_base_ptr.add(this_reg));
+            if this.is_heap() && matches!(vm.heap.get(this.heap_index()), HeapObj::Object(_)) {
+                let func_id = (packed_fip >> 32) as u32;
+                let caller_regs = u64::from(vm.func(func_id as usize).reg_count.max(1));
+                let packed = u64::from(argc) | (caller_regs << 16);
+                let r = vm.jit_cross_call_impl::<false>(
+                    caller_base_ptr,
+                    caller_base_ptr.add(arg_base),
+                    packed,
+                    *caller_base_ptr.add(callee_reg),
+                    Some(this),
+                );
+                if r != crate::codegen::SELF_CALL_DEOPT {
+                    return r;
+                }
+            }
+        }
+        vm.jit_region_call_impl(caller_base_ptr, packed_fip, packed_args, argc as u16, 2)
+    })
+}
+
 /// Win64 helper: full `===` for a region `Eq`/`Ne` whose operands are
 /// non-interned heap values (multi-char strings, objects, BigInts…). Read-only
 /// and side-effect-free — never deopts, never runs user code. Returns 0/1.

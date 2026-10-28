@@ -6666,7 +6666,18 @@ pub(crate) fn compile_proto_mem(
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
-                let call_with_this = crate::vm::jit_call_with_this_ic as *const () as usize;
+                // The general route (and a leaf inline's fallback) tries the
+                // native cross call first only where the site has called a
+                // user function (a leaf plan or emitted arms planned);
+                // `p.then(f)`'s native callee keeps the IC helper, which the
+                // cross call would only have declined.
+                let call_with_this = if leaf_plan.get(&ip).is_some()
+                    || cross_plan.get(&ip).is_some_and(|site| !site.cross3.is_empty())
+                {
+                    crate::vm::jit_call_with_this_cross as *const () as usize
+                } else {
+                    crate::vm::jit_call_with_this_ic as *const () as usize
+                };
                 // The emitted cross call of the one user function the site
                 // has called, with the receiver as `this` (the plain call's
                 // lane); every miss falls through to the paths below. Not
