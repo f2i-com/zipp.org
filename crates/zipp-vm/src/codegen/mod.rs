@@ -490,6 +490,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CROSS3_SELF_GLOBAL=1` keeps a Tier C body's self call
+    /// through its own global name off the emitted self arm.
+    fn cross3_self_global_enabled() = "ZIPP_NO_CROSS3_SELF_GLOBAL"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CROSS3_SLOPPY=1` keeps a plain call of a sloppy function off
     /// the emitted cross-call lane, as before it bound the global `this`.
     fn cross3_sloppy_enabled() = "ZIPP_NO_CROSS3_SLOPPY"

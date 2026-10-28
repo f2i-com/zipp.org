@@ -1986,19 +1986,24 @@ impl<'p> Vm<'p> {
         // own analysis and the generation is the one `set_cross_entry` will
         // leave. Until the install lands (this compile) the null entry routes
         // to the helper exactly as an evicted callee's would. Bodies that
-        // reach themselves through their own global name are left out: those
-        // are Tier A's and the reducers' shapes.
+        // reach themselves through their own global name were left out as
+        // Tier A's shape, but a body this Tier C compile plans is one Tier A
+        // passed over (`fold(e.left)` returns an object), and the lane
+        // revalidates the callee read from the global per call: a script's
+        // recursive functions all call themselves that way, and every such
+        // call took the generic cross-call helper (`ZIPP_NO_CROSS3_SELF_GLOBAL=1`
+        // leaves them out again).
         let self_arm = fid == caller_fid
             && whole_body
             && crate::codegen::cross3_self_enabled()
             && reg_count <= 64
             && crate::codegen::markdown_inline_plan(callee).is_none()
-            && callee.name_global.is_none_or(|own| {
+            && (crate::codegen::cross3_self_global_enabled() || callee.name_global.is_none_or(|own| {
                 !callee
                     .code
                     .iter()
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
-            });
+            }));
         let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry(fid)
         {
             Some((_entry, mask, json, markdown)) => {
