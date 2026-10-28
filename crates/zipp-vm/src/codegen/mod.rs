@@ -596,6 +596,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_RECV_CACHE=1` compiles every known-shape lane access in full,
+    /// without the receiver cache (`RecvCache`).
+    fn recv_cache_enabled() = "ZIPP_NO_RECV_CACHE"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_LATEST_LEAF=1`: a call site whose cache names several
     /// FuncProtos inlines none of them, instead of the latest
     /// (`Vm::ic_call_latest`).

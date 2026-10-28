@@ -3109,27 +3109,15 @@ pub(crate) fn compile_proto_mem(
     };
     let mut fc = FloatCache::new(fc_slots);
     let mut fc_pending = FcEffect::None;
-    let fc_targeted: Vec<bool> = if fc_slots == 0 {
-        Vec::new()
-    } else {
-        let mut t = vec![false; n];
-        for (ip, instr) in proto.code.iter().enumerate() {
-            let edges = bytecode_control_target(instr)
-                .into_iter()
-                .chain(py_op_edges(instr).into_iter().flat_map(|(slow, pt)| [Some(slow), pt]).flatten());
-            for target in edges {
-                if (target as usize) < n {
-                    t[target as usize] = true;
-                }
-            }
-            if yield_heads.contains(&(ip as u32)) {
-                t[ip] = true;
-            }
-        }
-        t
-    };
     if n_float_ops != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C float ops={n_float_ops} cache slots={fc_slots}");
+    }
+    // Known-shape receivers kept across a straight run (`RecvCache`).
+    let rc_slots = recv_cache_slots(proto, prop_shape, meter.is_some());
+    let mut rc = RecvCache::new(rc_slots);
+    let mut rc_pending = FcEffect::Clear;
+    if rc_slots != 0 && crate::jitlog_enabled() {
+        eprintln!("[jit] fn{func_id} Tier-C receiver cache slots={rc_slots}");
     }
     let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
         plan_tierc_block_sroa(proto, &targeted, yield_heads)
@@ -3304,9 +3292,11 @@ pub(crate) fn compile_proto_mem(
                 0
             };
     // The float cache's callee-saved xmm registers are saved above the rest
-    // of the frame (16 bytes each keeps the frame's alignment).
+    // of the frame (16 bytes each keeps the frame's alignment), and the
+    // receiver cache's slots above them (rounded up to 16 bytes).
     let fc_save_off = frame_core;
-    let frame: i32 = frame_core + 16 * fc_slots as i32;
+    let rc_off = fc_save_off + 16 * fc_slots as i32;
+    let frame: i32 = rc_off + (8 * rc_slots as i32 + 15) / 16 * 16;
     let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
     let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
     let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
@@ -3578,16 +3568,70 @@ pub(crate) fn compile_proto_mem(
             _ => None,
         }
     };
+    // Where the caches (`FloatCache`, `RecvCache`) start empty: every jump
+    // target and yield head, and every op a fused emission jumps to past the
+    // ops between, whose effects on the caches it does not have (the `| 0`
+    // fold, the fused compare-and-branch, the captured-Int increment and
+    // xorshift chains, a leaf call's predicate pair). A new fusion that jumps
+    // over ops must add its landing here.
+    let cache_targeted: Vec<bool> = if fc_slots == 0 && rc_slots == 0 {
+        Vec::new()
+    } else {
+        let mut t = vec![false; n + 1];
+        let mut mark = |ip: usize| {
+            if ip < t.len() {
+                t[ip] = true;
+            }
+        };
+        for (ip, instr) in proto.code.iter().enumerate() {
+            let edges = bytecode_control_target(instr)
+                .into_iter()
+                .chain(py_op_edges(instr).into_iter().flat_map(|(slow, pt)| [Some(slow), pt]).flatten());
+            for target in edges {
+                mark(target as usize);
+            }
+            if yield_heads.contains(&(ip as u32)) {
+                mark(ip);
+            }
+            if fuse_or[ip].is_some() {
+                mark(ip + 3);
+            }
+            if let Some(Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }) = proto.code.get(ip + 1) {
+                mark(ip + 2);
+            }
+            if upval_inc[ip].is_some() {
+                mark(ip + 6);
+            }
+            if let Some(plan) = upval_xorshift[ip] {
+                mark(ip + usize::from(plan.count) * 6);
+            }
+            if let Some(plan) = global_xorshift[ip] {
+                mark(ip + usize::from(plan.count) * 6);
+            }
+            if let Some(p) = leaf_plan.get(&ip).and_then(|lp| lp.span_code_unit_pred).and_then(|p| p.pair) {
+                mark(p.resume_ip as usize);
+            }
+        }
+        t
+    };
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
         if fc_slots != 0 {
             // What the previous op did to the registers the cache holds, then
             // this op's entry: a jump target starts with nothing cached.
             fc.apply(std::mem::replace(&mut fc_pending, FcEffect::None));
-            if fc_targeted[ip] {
+            if cache_targeted[ip] {
                 fc.clear();
             }
             fc_pending = fc_effect(&proto.code[ip]);
+        }
+        if rc_slots != 0 {
+            // As the float cache, but every op forgets every receiver unless
+            // its arm says what it writes (`RecvCache`).
+            rc.apply(std::mem::replace(&mut rc_pending, FcEffect::Clear));
+            if cache_targeted[ip] {
+                rc.clear();
+            }
         }
         if let Some((m, bl)) = blocks.as_ref() {
             if let Some(&len) = bl.get(&ip) {
@@ -3791,6 +3835,7 @@ pub(crate) fn compile_proto_mem(
             };
             emit_float_binop(&mut ops, &mut fc, func_id, ip, epilogue, dst, a, b, op);
             fc_pending = FcEffect::None;
+            rc_pending = FcEffect::Write(dst);
             continue;
         }
         // `Math.sqrt(x)` in a body with double-only ops: its argument from the
@@ -3810,6 +3855,7 @@ pub(crate) fn compile_proto_mem(
                 emit_float_unary_sqrt(&mut ops, &mut fc, dst, arg_base, bail);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 fc_pending = FcEffect::None;
+                rc_pending = FcEffect::Write(dst);
                 continue;
             }
         }
@@ -3838,6 +3884,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, QWORD boxed as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::LoadBool { dst, val } => {
                 let bits = BOOL_TAG | (val as u64);
@@ -3845,18 +3892,21 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, QWORD bits as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::LoadNull { dst } => {
                 dynasm!(ops
                     ; mov rax, QWORD Value::NULL.bits() as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::LoadUndefined { dst } => {
                 dynasm!(ops
                     ; mov rax, QWORD Value::UNDEFINED.bits() as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::LoadConst { dst, idx } => {
                 // Numeric / single-ASCII-char (interned slot) / pre-interned
@@ -3870,12 +3920,14 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, QWORD bits as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::Move { dst, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [rbx + dreg(dst)], rax
                 );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::MakeFunc { dst, .. } => {
                 // The helper re-reads this immutable site and validates the
@@ -5109,19 +5161,24 @@ pub(crate) fn compile_proto_mem(
                     ; => done_n
                 );
             }
-            Instr::Sub { dst, a, b } => dbinop(
-                &mut ops,
-                ip,
-                bail,
-                epilogue,
-                dst,
-                a,
-                b,
-                DOp::Sub,
-                int_hint,
-                trunc_arith[ip],
-                arith_fb_at(ip),
-            ),
+            // `dbinop` bails on an operand that is not a number rather than
+            // coerce it: no user code, so the receiver cache holds across it.
+            Instr::Sub { dst, a, b } => {
+                dbinop(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    dst,
+                    a,
+                    b,
+                    DOp::Sub,
+                    int_hint,
+                    trunc_arith[ip],
+                    arith_fb_at(ip),
+                );
+                rc_pending = FcEffect::Write(dst);
+            }
             Instr::Mul { dst, a, b } => {
                 // An Int product of two Ints is an Int (`dbinop`'s int path,
                 // with its overflow and -0 checks); anything else is f64.
@@ -5137,7 +5194,8 @@ pub(crate) fn compile_proto_mem(
                     int_hint,
                     false,
                     arith_fb_at(ip),
-                )
+                );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::Div { dst, a, b } => {
                 // Always f64 — JS `/` has no integer form (mirrors the region arm
@@ -5154,7 +5212,8 @@ pub(crate) fn compile_proto_mem(
                     false,
                     false,
                     ArithFb::None,
-                )
+                );
+                rc_pending = FcEffect::Write(dst);
             }
             Instr::Mod { dst, a, b } => {
                 // Integer-valued Number remainder, copied from the MEM-region
@@ -5680,7 +5739,13 @@ pub(crate) fn compile_proto_mem(
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
                 if let Some(&(shape, slot)) = prop_shape.get(&ip) {
-                    emit_prop_shape_get(&mut ops, obj, dst, shape, slot, cont);
+                    if let Some(k) = rc.find(obj, shape) {
+                        emit_recv_cached_get(&mut ops, rc_off + 8 * k as i32, dst, slot, cont);
+                    }
+                    let est = rc.establish(obj, shape).map(|k| rc_off + 8 * k as i32);
+                    let zero: Vec<i32> = rc.live().map(|k| rc_off + 8 * k as i32).collect();
+                    emit_prop_shape_get(&mut ops, obj, dst, shape, slot, cont, est, &zero);
+                    rc_pending = FcEffect::Write(dst);
                 }
                 // A class getter (`q.size`): looked up by `jit_getter_callee`
                 // and called natively by the arm that names its fid, with the
@@ -5852,6 +5917,19 @@ pub(crate) fn compile_proto_mem(
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
                 if let Some(&(shape, slot)) = prop_shape.get(&ip) {
+                    if let Some(k) = rc.find(obj, shape) {
+                        emit_recv_cached_set(
+                            &mut ops,
+                            rc_off + 8 * k as i32,
+                            obj,
+                            val,
+                            slot,
+                            heap.inline_store_lane_ok,
+                            cont,
+                        );
+                    }
+                    let est = rc.establish(obj, shape).map(|k| rc_off + 8 * k as i32);
+                    let zero: Vec<i32> = rc.live().map(|k| rc_off + 8 * k as i32).collect();
                     emit_prop_shape_set(
                         &mut ops,
                         obj,
@@ -5860,7 +5938,10 @@ pub(crate) fn compile_proto_mem(
                         slot,
                         heap.inline_store_lane_ok,
                         cont,
+                        est,
+                        &zero,
                     );
+                    rc_pending = FcEffect::None;
                 }
                 emit_ic_probe(
                     &mut ops,
@@ -7501,6 +7582,112 @@ impl FloatCache {
     }
 }
 
+/// Tier C's receiver cache: for a VM register whose object a known-shape lane
+/// (`PropShapePlan`) found at its planned shape, that shape and the object's
+/// vals base, kept in a frame slot, so the next lane access through the
+/// register in the same straight run reads or writes the slot's value
+/// without the receiver's tag test, mirror loads and shape compare.
+///
+/// Sound on the shape ways' terms (`emit_ic_probe`): an object keeps its
+/// shape and its vals base until something adds, deletes or redefines one of
+/// its properties, and only code that can run user code or change a map can
+/// do that. Such an op ends what the cache holds: every op forgets every
+/// register unless its arm opts in (`rc_pending`), and the arms that opt in
+/// change no map — double-only and Int arithmetic that bails rather than
+/// coerce, constant loads and moves, and lane accesses, whose other paths
+/// (the probe, the helpers, getters and setters) zero every slot the cache
+/// holds before they run. A slot of 0 sends the access to the full lane,
+/// which fills it again. Jump targets, and the ops a fused emission jumps to
+/// (`cache_targeted`), start with nothing cached; the register file stays
+/// the only home of every value.
+pub(crate) struct RecvCache {
+    /// Slot k: the register whose object it holds and the object's shape.
+    held: Vec<Option<(u16, u32)>>,
+    /// Slot k's last use, for replacing the least recently used.
+    used: Vec<u32>,
+    clock: u32,
+}
+
+impl RecvCache {
+    pub(crate) const MAX_SLOTS: usize = 4;
+
+    fn new(slots: usize) -> RecvCache {
+        RecvCache {
+            held: vec![None; slots],
+            used: vec![0; slots],
+            clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.held.iter_mut().for_each(|h| *h = None);
+    }
+
+    fn forget(&mut self, reg: u16) {
+        for h in self.held.iter_mut() {
+            if h.is_some_and(|(r, _)| r == reg) {
+                *h = None;
+            }
+        }
+    }
+
+    fn apply(&mut self, effect: FcEffect) {
+        match effect {
+            FcEffect::None => {}
+            FcEffect::Write(reg) => self.forget(reg),
+            FcEffect::Clear => self.clear(),
+        }
+    }
+
+    /// The slot holding `reg`'s object at `shape`, if one does.
+    fn find(&mut self, reg: u16, shape: u32) -> Option<usize> {
+        let k = self.held.iter().position(|&h| h == Some((reg, shape)))?;
+        self.clock += 1;
+        self.used[k] = self.clock;
+        Some(k)
+    }
+
+    /// The slot `reg`'s object at `shape` goes in: the one holding `reg`,
+    /// else an empty one, else the least recently used; none in a body
+    /// without the cache.
+    fn establish(&mut self, reg: u16, shape: u32) -> Option<usize> {
+        let k = match self.held.iter().position(|h| h.is_some_and(|(r, _)| r == reg)) {
+            Some(k) => k,
+            None => match self.held.iter().position(Option::is_none) {
+                Some(k) => k,
+                None => (0..self.held.len()).min_by_key(|&k| self.used[k])?,
+            },
+        };
+        self.clock += 1;
+        self.used[k] = self.clock;
+        self.held[k] = Some((reg, shape));
+        Some(k)
+    }
+
+    /// The slots holding a register now.
+    fn live(&self) -> impl Iterator<Item = usize> + '_ {
+        self.held.iter().enumerate().filter(|(_, h)| h.is_some()).map(|(k, _)| k)
+    }
+}
+
+/// How many receiver-cache slots (`RecvCache`) `proto`'s Tier C body gets:
+/// one per register at least two known-shape lane accesses go through, up to
+/// `RecvCache::MAX_SLOTS`; none under `ZIPP_NO_RECV_CACHE=1` or a meter.
+fn recv_cache_slots(proto: &FuncProto, prop_shape: &PropShapePlan, metered: bool) -> usize {
+    if metered || prop_shape.is_empty() || !crate::codegen::recv_cache_enabled() {
+        return 0;
+    }
+    let mut uses: FxHashMap<u16, u32> = FxHashMap::default();
+    for &ip in prop_shape.keys() {
+        let obj = match proto.code.get(ip) {
+            Some(Instr::GetProp { obj, .. } | Instr::SetProp { obj, .. }) => *obj,
+            _ => continue,
+        };
+        *uses.entry(obj).or_insert(0) += 1;
+    }
+    uses.values().filter(|&&n| n >= 2).count().min(RecvCache::MAX_SLOTS)
+}
+
 /// What an op does to the registers `FloatCache` holds.
 #[derive(Clone, Copy)]
 pub(crate) enum FcEffect {
@@ -7722,6 +7909,11 @@ fn emit_float_unary_sqrt(
 /// version-bumping mutation, one key sequence and its attributes per shape.
 /// Anything else falls through with the receiver's bits in rax, as the
 /// probe after it expects.
+///
+/// With the receiver cache (`RecvCache`): a hit keeps the vals base in the
+/// frame slot at `est`, and a miss zeroes every slot in `zero` (`est`'s
+/// among them) before the probe and helpers, which may run user code.
+#[allow(clippy::too_many_arguments)]
 fn emit_prop_shape_get(
     ops: &mut dynasmrt::x64::Assembler,
     obj: u16,
@@ -7729,6 +7921,8 @@ fn emit_prop_shape_get(
     shape: u32,
     slot: u32,
     done: dynasmrt::DynamicLabel,
+    est: Option<i32>,
+    zero: &[i32],
 ) {
     let miss = ops.new_dynamic_label();
     let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
@@ -7745,17 +7939,25 @@ fn emit_prop_shape_get(
         ; cmp DWORD [r9 + rcx*8], shape as i32 // live mirror shape (idx*16)
         ; jne => miss
         ; mov r9, [r9 + rcx*8 + hot_vals]      // live vals base
+    );
+    if let Some(off) = est {
+        dynasm!(ops ; mov [rsp + off], r9);
+    }
+    dynasm!(ops
         ; mov r10, [r9 + (slot as i32) * 8]
         ; mov [rbx + dreg(dst)], r10
         ; jmp => done
         ; => miss
     );
+    emit_recv_cache_zero(ops, zero);
 }
 
 /// The known-shape lane of a `SetProp` (`PropShapePlan`, a slot a write
 /// proved writable at `shape`): the store, then the nursery barrier for a
 /// heap value as the shape-way store does it (`emit_heap_store_barrier`).
-/// Anything else falls through with the receiver's bits in rax.
+/// Anything else falls through with the receiver's bits in rax. `est` and
+/// `zero` as `emit_prop_shape_get`'s.
+#[allow(clippy::too_many_arguments)]
 fn emit_prop_shape_set(
     ops: &mut dynasmrt::x64::Assembler,
     obj: u16,
@@ -7764,6 +7966,8 @@ fn emit_prop_shape_set(
     slot: u32,
     gen_lane: bool,
     done: dynasmrt::DynamicLabel,
+    est: Option<i32>,
+    zero: &[i32],
 ) {
     let miss = ops.new_dynamic_label();
     let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
@@ -7780,6 +7984,11 @@ fn emit_prop_shape_set(
         ; cmp DWORD [r9 + rcx*8], shape as i32
         ; jne => miss
         ; mov r9, [r9 + rcx*8 + hot_vals]
+    );
+    if let Some(off) = est {
+        dynasm!(ops ; mov [rsp + off], r9);
+    }
+    dynasm!(ops
         ; mov r10, [rbx + dreg(val)]
         ; mov [r9 + (slot as i32) * 8], r10   // COMMIT
         ; shr r10, 48
@@ -7790,6 +7999,66 @@ fn emit_prop_shape_set(
     );
     super::emit_heap_store_barrier(ops, gen_lane, done);
     dynasm!(ops ; => miss);
+    emit_recv_cache_zero(ops, zero);
+}
+
+/// Zero the receiver-cache slots at `offs` (`RecvCache`): on a lane's miss
+/// path, before code that may run user code or change a map.
+fn emit_recv_cache_zero(ops: &mut dynasmrt::x64::Assembler, offs: &[i32]) {
+    for &off in offs {
+        dynasm!(ops ; mov QWORD [rsp + off], 0);
+    }
+}
+
+/// A known-shape `GetProp` through the receiver cache (`RecvCache`): the
+/// value at `slot` of the vals base in the frame slot at `off`, and the op is
+/// done; a zeroed slot falls through to the full lane.
+fn emit_recv_cached_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    off: i32,
+    dst: u16,
+    slot: u32,
+    done: dynasmrt::DynamicLabel,
+) {
+    let full = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov r9, [rsp + off]
+        ; test r9, r9
+        ; jz => full
+        ; mov r10, [r9 + (slot as i32) * 8]
+        ; mov [rbx + dreg(dst)], r10
+        ; jmp => done
+        ; => full
+    );
+}
+
+/// A known-shape `SetProp` through the receiver cache (`RecvCache`), the
+/// store and barrier as `emit_prop_shape_set`'s; a zeroed slot falls through
+/// to the full lane.
+fn emit_recv_cached_set(
+    ops: &mut dynasmrt::x64::Assembler,
+    off: i32,
+    obj: u16,
+    val: u16,
+    slot: u32,
+    gen_lane: bool,
+    done: dynasmrt::DynamicLabel,
+) {
+    let full = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov r9, [rsp + off]
+        ; test r9, r9
+        ; jz => full
+        ; mov r10, [rbx + dreg(val)]
+        ; mov [r9 + (slot as i32) * 8], r10   // COMMIT
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // a primitive needs no barrier
+        ; jne => done
+        ; mov edx, [rbx + dreg(obj)]          // holder heap idx (low 32)
+        ; mov r8, [rbx + dreg(val)]
+    );
+    super::emit_heap_store_barrier(ops, gen_lane, done);
+    dynasm!(ops ; => full);
 }
 
 /// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).
