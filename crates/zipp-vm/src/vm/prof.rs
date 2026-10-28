@@ -804,8 +804,45 @@ pub(crate) mod pc {
     pub(crate) fn arm_current_thread() {}
     pub(crate) fn sample() {}
     /// Only the JIT registers ranges, so a build without one never calls this.
+    ///
+    /// `ZIPP_PERF_MAP=1` (on Linux) appends each emitted body to
+    /// `/tmp/perf-<pid>.map`, the map `perf report` reads for JIT code, so a
+    /// profile names the Tier C body or region a sample landed in rather
+    /// than one anonymous `??`.
     #[allow(dead_code)]
-    pub(crate) fn register(_start: u64, _len: usize, _label: impl FnOnce() -> String) {}
+    pub(crate) fn register(start: u64, len: usize, label: impl FnOnce() -> String) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static ON: AtomicU8 = AtomicU8::new(2);
+            let on = match ON.load(Ordering::Relaxed) {
+                2 => {
+                    let v = std::env::var_os("ZIPP_PERF_MAP").is_some() as u8;
+                    ON.store(v, Ordering::Relaxed);
+                    v
+                }
+                v => v,
+            };
+            if on == 1 {
+                let pid = std::process::id();
+                let path = format!("/tmp/perf-{pid}.map");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{start:x} {len:x} {}", label().replace(' ', "_"));
+                }
+                // `ZIPP_PERF_MAP=dump`: the body's bytes too, for a disassembly
+                // to lay the samples over.
+                if std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
+                    // SAFETY: the JIT registers a mapped, readable code range it
+                    // just emitted, `len` bytes from `start`.
+                    let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+                    let _ = std::fs::write(format!("/tmp/zipp-jit-{pid}-{start:x}.bin"), bytes);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (start, len, label);
+    }
     pub(crate) fn report() -> (Vec<(String, u64, f64)>, u64) {
         (Vec::new(), 0)
     }
