@@ -34,6 +34,47 @@ pub(crate) struct IterProtoProof {
     chain_len: u8,
 }
 
+/// `Vm::array_iter_pristine`'s whole proof in its cheapest form, for JIT
+/// builds (`Vm::array_iter_witness`): the heap versions of
+/// %Array.prototype%, %ArrayIteratorPrototype% and the ancestors the proof
+/// examined, and the addresses of the two own data slots it read
+/// (`@@iterator` and `next`) with the bits they held. While every version
+/// stands no key has been added to, deleted from or redefined on those
+/// objects, so their value columns have not moved and the addresses still
+/// name the slots (`Heap::bump_version`); an in-place overwrite changes the
+/// bits read through them. `iter_slot` 0 = no proof. The memos above re-read
+/// both slots through the maps on every check: an eighth of collections.ts.
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArrayIterWitness {
+    holder_ver: u32,
+    proto_ver: u32,
+    chain: [(u32, u32); 3],
+    chain_len: u8,
+    iter_slot: usize,
+    iter_bits: u64,
+    next_slot: usize,
+    next_bits: u64,
+}
+
+/// `ZIPP_NO_ARRAY_ITER_WITNESS=1` checks Array iteration through the memos
+/// alone again, without [`ArrayIterWitness`].
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+#[inline]
+fn array_iter_witness_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_ARRAY_ITER_WITNESS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable
     /// keys (object keys, or an array's index strings) onto `target`; returns
@@ -1278,8 +1319,81 @@ impl<'p> Vm<'p> {
     /// no own properties and the default prototype; it reads nothing a
     /// program can observe (no getter runs).
     pub(crate) fn array_iter_pristine(&self) -> bool {
-        self.realm_global_objs.is_empty()
-            && self.iter_holder_pristine(0, self.arr_proto, self.default_array_iter, true)
+        if !self.realm_global_objs.is_empty() {
+            return false;
+        }
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if self.array_iter_witness_holds() {
+            return true;
+        }
+        let ok = self.iter_holder_pristine(0, self.arr_proto, self.default_array_iter, true);
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if ok {
+            self.record_array_iter_witness();
+        }
+        ok
+    }
+
+    /// Whether [`ArrayIterWitness`]'s proof still stands: every version it
+    /// recorded, then the two slots' bits, read only once the versions have
+    /// proven the value columns unmoved.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn array_iter_witness_holds(&self) -> bool {
+        if !array_iter_witness_enabled() {
+            return false;
+        }
+        // SAFETY: read in place rather than copied out of the cell: the only
+        // write (`record_array_iter_witness`) never overlaps this read, the
+        // VM being single-threaded and nothing below re-entering it.
+        let w = unsafe { &*self.array_iter_witness.as_ptr() };
+        w.iter_slot != 0
+            && self.heap.version_of(self.arr_proto) == w.holder_ver
+            && self.heap.version_of(self.array_iter_proto) == w.proto_ver
+            && w.chain[..w.chain_len as usize]
+                .iter()
+                .all(|&(i, ver)| self.heap.version_of(i) == ver)
+            // SAFETY: both slots belong to the intrinsic prototypes, which the
+            // collector never frees (`gc_floor`), and the versions they were
+            // read at still stand, so no key add, delete or redefinition has
+            // reallocated either value column since the addresses were taken.
+            && unsafe { *(w.iter_slot as *const u64) } == w.iter_bits
+            && unsafe { *(w.next_slot as *const u64) } == w.next_bits
+    }
+
+    /// Record [`ArrayIterWitness`] from the memos a full proof (`closes`)
+    /// has just made or confirmed for %Array.prototype% and
+    /// %ArrayIteratorPrototype%. Nothing is recorded unless both are ordinary
+    /// objects holding the proven slots.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    fn record_array_iter_witness(&self) {
+        if !array_iter_witness_enabled() {
+            return;
+        }
+        let (hver, at) = self.iter_method_memo[0].get();
+        let p = self.iter_proto_memo[0].get();
+        if hver == 0 || p.proto_ver == 0 || p.chain_len == 0 || p.proto != self.array_iter_proto {
+            return;
+        }
+        let (HeapObj::Object(h), HeapObj::Object(ap)) =
+            (self.heap.get(self.arr_proto), self.heap.get(self.array_iter_proto))
+        else {
+            return;
+        };
+        let (Some(iter_v), Some(next_v)) = (h.val_get(at as usize), ap.val_get(p.next_slot as usize)) else {
+            return;
+        };
+        let size = std::mem::size_of::<Value>();
+        self.array_iter_witness.set(ArrayIterWitness {
+            holder_ver: self.heap.version_of(self.arr_proto),
+            proto_ver: self.heap.version_of(self.array_iter_proto),
+            chain: p.chain,
+            chain_len: p.chain_len,
+            iter_slot: h.vals_ptr_raw() as usize + at as usize * size,
+            iter_bits: iter_v.bits(),
+            next_slot: ap.vals_ptr_raw() as usize + p.next_slot as usize * size,
+            next_bits: next_v.bits(),
+        });
     }
 
     pub(crate) fn builtin_iter_fast(&self, v: Value, closes: bool) -> bool {
@@ -1303,7 +1417,18 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        self.iter_holder_pristine(slot, holder, default, closes)
+        // An Array's holder half from the witness, which proves the stricter
+        // `closes` condition and so either.
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if slot == 0 && self.array_iter_witness_holds() {
+            return true;
+        }
+        let ok = self.iter_holder_pristine(slot, holder, default, closes);
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if ok && slot == 0 && closes {
+            self.record_array_iter_witness();
+        }
+        ok
     }
 
     /// The prototype-level half of [`Self::builtin_iter_fast`]: `holder`'s own

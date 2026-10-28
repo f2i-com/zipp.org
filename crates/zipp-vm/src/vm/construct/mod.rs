@@ -14,3 +14,5 @@ mod iterate;
 mod modules_dispose;
 
 pub(crate) use iterate::{GenNextProof, IterProtoProof};
+#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+pub(crate) use iterate::ArrayIterWitness;

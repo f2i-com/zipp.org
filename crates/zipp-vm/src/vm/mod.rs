@@ -3305,6 +3305,10 @@ pub struct Vm<'p> {
     /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
     /// the own `@@iterator` data property last proven to be the default.
     iter_method_memo: [std::cell::Cell<(u32, u32)>; 4],
+    /// `array_iter_pristine`'s cheapest proof, the Array memos above reduced
+    /// to versions and two slot addresses (`construct::ArrayIterWitness`).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    array_iter_witness: std::cell::Cell<construct::ArrayIterWitness>,
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.
