@@ -5541,6 +5541,47 @@ pub(crate) fn compile_proto_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                // A class getter (`q.size`): looked up by `jit_getter_callee`
+                // and called natively by the arm that names its fid, with the
+                // receiver as `this` and no arguments, as the class-method
+                // lane calls a method. A lookup that declines and a getter no
+                // arm names take the probe and the helpers below.
+                if let Some(site) = cross_plan
+                    .get(&ip)
+                    .copied()
+                    .filter(|site| do_cross3 && site.class_getter && !site.cross3.is_empty())
+                {
+                    let lookup_miss = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                        ; mov rax, QWORD crate::vm::jit_getter_callee as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => lookup_miss
+                        ; mov [rsp + c3_off + 48], rax        // the arms' callee
+                    );
+                    for c3plan in site.cross3.iter() {
+                        emit_cross3_call(
+                            &mut ops,
+                            c3plan,
+                            Cross3Callee::Stash,
+                            Some(obj),
+                            obj,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            bail,
+                            cont,
+                            refetch.is_some(),
+                            None,
+                        );
+                    }
+                    dynasm!(ops ; => lookup_miss);
+                }
                 // A dense Array's length through its array mirror, ahead of the
                 // eight-way probe it always misses and the helper after it.
                 if crate::codegen::quick_len_enabled()

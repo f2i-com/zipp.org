@@ -971,6 +971,56 @@ impl<'p> Vm<'p> {
         callee.bits()
     }
 
+    /// The class getter a `GetProp` reads for `recv` (`q.size`), resolved and
+    /// not called, for the emitted getter lane: Tier C guards its fid and
+    /// calls it natively with the receiver as `this`. Served from the class
+    /// lane's memo (`jit_method_memo`, keyed by the site) under the cache's
+    /// own guards, else from the site's `ClassGetter` way serving `recv`
+    /// (`ic_class_getter_guards`), which it then memoizes. A primitive or
+    /// dictionary receiver, an own property of the key, a stale class or
+    /// prototype epoch, or a getter that is not a plain user function:
+    /// `SELF_CALL_DEOPT`, before any effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_getter_callee_impl(&mut self, recv_bits: u64, packed_fip: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let recv = Value::from_bits(recv_bits);
+        if !recv.is_heap() {
+            return SELF_CALL_DEOPT;
+        }
+        let way = crate::vm::method_memo_way(packed_fip);
+        if let Some(m) = self.jit_method_memo.get(way) {
+            if m.packed_fip == packed_fip
+                && self.ic_class_method_guards_hold(recv, m.recv_shape, m.class, m.ver, m.epoch)
+            {
+                return m.callee;
+            }
+        }
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let Some((recv_shape, class, ver, epoch, getter)) = self.ic_class_getter_guards(func_id, ip, recv)
+        else {
+            return SELF_CALL_DEOPT;
+        };
+        if self.ic_plain_fn(getter).is_none() {
+            return SELF_CALL_DEOPT;
+        }
+        if crate::vm::method_memo_enabled() {
+            if self.jit_method_memo.is_empty() {
+                self.jit_method_memo =
+                    vec![crate::vm::MethodMemo::default(); crate::vm::METHOD_MEMO_WAYS].into_boxed_slice();
+            }
+            self.jit_method_memo[way] = crate::vm::MethodMemo {
+                packed_fip,
+                recv_shape,
+                class,
+                ver,
+                epoch,
+                callee: getter.bits(),
+            };
+        }
+        getter.bits()
+    }
+
     /// Resolve a live `CallMethod` data property and, when its current value has
     /// a Tier-C cross entry, dispatch it native-to-native with the receiver as
     /// `this`. This is a pure prefix: accessors, proxies/exotics, primitives,

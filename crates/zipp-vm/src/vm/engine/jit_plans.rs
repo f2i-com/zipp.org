@@ -2341,6 +2341,7 @@ impl<'p> Vm<'p> {
                     cross3,
                     cross3m: None,
                     class_method: false,
+                    class_getter: false,
                 },
             );
         }
@@ -2532,6 +2533,44 @@ impl<'p> Vm<'p> {
                 .or_insert_with(crate::codegen::CrossCallSitePlan::default);
             site.class_method = true;
             site.cross3 = cross3;
+        }
+        // GetProp sites that have only ever resolved to class getters
+        // (`while (q.size > 0)`): the getter is looked up through the class
+        // lane's memo (`jit_getter_callee`) and called natively with the
+        // receiver as `this`, one arm per getter, as a class method is.
+        // The general route read it through the miss helper, the slow helper
+        // and the cache's walk, over a thousand instructions a read.
+        if class_lane && crate::codegen::cross3_getter_enabled() {
+            for (ip, instr) in caller.code.iter().enumerate() {
+                if !matches!(instr, Instr::GetProp { .. }) {
+                    continue;
+                }
+                let fids = self.ic_class_getter_fids(func_id, ip);
+                if fids.is_empty() {
+                    continue;
+                }
+                let mut cross3 = crate::codegen::Cross3CallPlan::default();
+                for fid in fids {
+                    if let Some(arm) =
+                        self.build_cross3_call_arm(func_id, ip, fid, 0, whole_body, false, &mut pending, &mut baked)
+                    {
+                        if !cross3.push(arm) {
+                            break;
+                        }
+                        if crate::jitlog_enabled() {
+                            eprintln!("[cross] fn{func_id}@{ip} CROSS3-GETTER fn{fid} native-emitted lane");
+                        }
+                    }
+                }
+                if cross3.is_empty() {
+                    continue;
+                }
+                let site = plan
+                    .entry(ip)
+                    .or_insert_with(crate::codegen::CrossCallSitePlan::default);
+                site.class_getter = true;
+                site.cross3 = cross3;
+            }
         }
 
         (plan, pending, baked)

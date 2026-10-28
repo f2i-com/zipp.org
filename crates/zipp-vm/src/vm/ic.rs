@@ -4240,6 +4240,69 @@ impl<'p> Vm<'p> {
         fids
     }
 
+    /// The function ids of the plain user getters a `GetProp` site's cache
+    /// holds, when it holds at least one way and every way is a class getter
+    /// (`IcEntry::ClassGetter`); the emitted getter lane bakes an arm per id
+    /// and revalidates it per read. Read-only, as `ic_class_method_fids`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_getter_fids(&self, func_id: u32, ip: usize) -> Vec<u32> {
+        let Some(site) = self.ic_site(func_id, ip) else {
+            return Vec::new();
+        };
+        let mut fids = Vec::new();
+        for e in &site.entries[..site.n as usize] {
+            match *e {
+                IcEntry::ClassGetter { getter, .. } => {
+                    let Some((fid, _)) = self.ic_plain_fn(getter) else {
+                        return Vec::new();
+                    };
+                    if !fids.contains(&fid) {
+                        fids.push(fid);
+                    }
+                }
+                _ => return Vec::new(),
+            }
+        }
+        fids
+    }
+
+    /// The class-getter way of `(func_id, ip)`'s cache that serves `recv`
+    /// now: `(recv_shape, class, ver, epoch, getter)` when the receiver has
+    /// the way's shape (so no own property of the key) and class, and the
+    /// class and the prototype epoch are where the way was filled -- the
+    /// cache's own `ClassGetter` hit (`ic_get_acc_tail`). For the getter
+    /// lane's memo (`Vm::jit_getter_callee_impl`). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_getter_guards(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+    ) -> Option<(u32, u32, u32, u32, Value)> {
+        let site = self.ic_site(func_id, ip)?;
+        let (_idx, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        if sh == crate::shape::DICT {
+            return None;
+        }
+        site.entries[..site.n as usize].iter().find_map(|e| match *e {
+            IcEntry::ClassGetter {
+                class,
+                ver,
+                epoch,
+                getter,
+                recv_shape,
+            } if recv_shape == sh
+                && m.class == Some(class)
+                && self.heap.version_of(class) == ver
+                && self.class_proto_epoch == epoch =>
+            {
+                Some((recv_shape, class, ver, epoch, getter))
+            }
+            _ => None,
+        })
+    }
+
     // ── plain Call sites ──
 
     /// Whether the site's cache holds at least one way and every way is a

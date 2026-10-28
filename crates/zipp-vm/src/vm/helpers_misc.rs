@@ -4307,6 +4307,22 @@ pub(crate) extern "win64" fn jit_method_callee(
     vm.jit_method_callee_impl(recv_bits, packed_fip)
 }
 
+/// Win64 helper for the emitted class-getter lane: the getter a `GetProp`
+/// reads for its receiver, resolved and not called
+/// (`Vm::jit_getter_callee_impl`). ABI: rcx=vm, rdx=receiver bits,
+/// r8=(func_id<<32)|ip. Getter bits, or `SELF_CALL_DEOPT` before any effect.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_getter_callee(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    packed_fip: u64,
+) -> u64 {
+    // SAFETY: exclusive view; the running native code holds no conflicting
+    // borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit_getter_callee_impl(recv_bits, packed_fip)
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_cross_method_call(
     vm: *mut core::ffi::c_void,

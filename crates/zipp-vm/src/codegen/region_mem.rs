@@ -1975,6 +1975,45 @@ pub(crate) fn compile_region_mem(
                         cont,
                     );
                 }
+                // A class getter on any receiver (the inline arms above take
+                // only the receivers they baked): looked up by
+                // `jit_getter_callee` and called natively by the arm that
+                // names its fid, as Tier C's GetProp does. Metered regions
+                // keep the helper route.
+                if let Some(site) = cross_plan.get(&ip).copied().filter(|site| {
+                    do_cross3 && blocks.is_none() && site.class_getter && !site.cross3.is_empty()
+                }) {
+                    let lookup_miss = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                        ; mov rax, QWORD crate::vm::jit_getter_callee as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => lookup_miss
+                        ; mov [rsp + c3_off + 48], rax        // the arms' callee
+                    );
+                    for c3plan in site.cross3.iter() {
+                        emit_cross3_call(
+                            &mut ops,
+                            c3plan,
+                            Cross3Callee::Stash,
+                            Some(obj),
+                            obj,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            bail,
+                            cont,
+                            refetch_pinned,
+                            ta_refetch,
+                        );
+                    }
+                    dynasm!(ops ; => lookup_miss);
+                }
                 let quick_length = quick_len_enabled()
                     && proto
                         .string_constants
@@ -5564,6 +5603,15 @@ fn emit_cross3_invoke(
     let inline_noroot = ops.new_dynamic_label();
     let inline_entered = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
+    // New high-water ground: the inline entry opens the window through
+    // `jit_cross3_enter` (out of line, below) instead of leaving the lane.
+    // The lane's own fallback used to be the only way to grow the register
+    // file, and a call site's helper grows it, so its next call ran inline;
+    // a getter's fallback (a framed getter call) never did, and its lane
+    // missed on every read. `ZIPP_NO_CROSS3_GROW=1` leaves the lane again.
+    let grow = (inline_regs && crate::codegen::cross3_grow_enabled()).then(|| ops.new_dynamic_label());
+    let entered = ops.new_dynamic_label();
+    let hw_miss = grow.unwrap_or(fb);
     let act = JIT_ACTIVATION_OFFSET as i32;
     let depth = JIT_CALL_DEPTH_OFFSET as i32;
     let c3 = iv.c3;
@@ -5630,7 +5678,7 @@ fn emit_cross3_invoke(
             // retains the helper's full resize/zero-fill implementation.
             ; add r8, iv.callee_regs as i32
             ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
-            ; ja => fb
+            ; ja => hw_miss
             ; mov [rsp + c3 + 24], rdx
             // A frame-free prior needs a visible duplicate while the callee
             // runs. High-water and root capacity are checked before mutation.
@@ -5699,6 +5747,7 @@ fn emit_cross3_invoke(
         );
     }
     dynasm!(ops
+        ; => entered
         // Re-derive the callee idx from the stashed bits (the helper call, or
         // optional stats counter maintenance, may have consumed rax).
         ; mov rax, [rsp + c3 + 48]
@@ -5872,8 +5921,26 @@ fn emit_cross3_invoke(
     if let Some((snap, plan_ta, _)) = ta_refetch {
         emit_cross_refetch_ta(ops, snap, plan_ta, array_epoch_cache);
     }
-    dynasm!(ops
-        ; jmp => cross_done
-        ; => fb
-    );
+    dynasm!(ops ; jmp => cross_done);
+    if let Some(grow) = grow {
+        // The window opened as the helper-entry lane opens it (r10d is still
+        // the callee idx; nothing has been mutated yet). Its result word has
+        // the inline entry's encoding, so the inline exit above closes it:
+        // the length restored from the base, and a root-stack duplicate the
+        // helper pushed popped by the same depth word.
+        dynasm!(ops
+            ; => grow
+            ; mov rcx, rdi
+            ; lea rdx, [rbx + dreg(iv.caller_regs)]
+            ; mov r8d, iv.callee_regs as i32
+            ; mov r9d, r10d
+            ; mov rax, QWORD heap.cross3_enter as i64
+            ; call rax
+            ; test rax, rax
+            ; jz => fb
+            ; mov [rsp + c3 + 24], rax
+            ; jmp => entered
+        );
+    }
+    dynasm!(ops ; => fb);
 }

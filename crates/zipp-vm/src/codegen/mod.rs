@@ -490,6 +490,20 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CROSS3_GROW=1` makes the emitted cross call's inline entry
+    /// leave the lane on new register high-water ground again, instead of
+    /// opening the window through `jit_cross3_enter`.
+    fn cross3_grow_enabled() = "ZIPP_NO_CROSS3_GROW"
+);
+
+env_off_switch!(
+    /// `ZIPP_NO_CROSS3_GETTER=1` reads a class getter in Tier C through the
+    /// miss and slow property helpers again, without the emitted lane that
+    /// looks it up (`jit_getter_callee`) and calls it natively.
+    fn cross3_getter_enabled() = "ZIPP_NO_CROSS3_GETTER"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_TIERC_CROSS3M=1` keeps Tier C's `CallMethod` of an own data
     /// property's function on the general route, without the memory
     /// region's emitted lane (`emit_cross3_method_call`).
@@ -1026,6 +1040,11 @@ pub struct CrossCallSitePlan {
     /// method: Tier C does not first try the own-data method call there,
     /// which cannot succeed for a member that lives on the class.
     pub class_method: bool,
+    /// A `GetProp` site whose every cached resolution was a class getter
+    /// (`q.size`): `cross3` holds an arm per getter, which Tier C calls
+    /// with the receiver as `this` once `jit_getter_callee` has looked the
+    /// getter up.
+    pub class_getter: bool,
 }
 
 /// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
