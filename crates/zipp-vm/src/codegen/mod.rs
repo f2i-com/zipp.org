@@ -490,6 +490,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CROSS3_SLOPPY=1` keeps a plain call of a sloppy function off
+    /// the emitted cross-call lane, as before it bound the global `this`.
+    fn cross3_sloppy_enabled() = "ZIPP_NO_CROSS3_SLOPPY"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CROSS3_CLASS=1` keeps a class-method `CallMethod` site on the
     /// general method route, without the emitted lane that calls the
     /// looked-up method natively.
@@ -1120,6 +1126,10 @@ pub struct SameProtoCross3Plan {
     /// `this` policy: true = arrow (captured `this` via the heap's
     /// this-mirror); false = strict plain function (`this = undefined`).
     pub arrow_this: bool,
+    /// A sloppy callee at a plain `Call`: the `this` its call binds, the
+    /// global object's bits (the lane runs only while no second realm
+    /// exists, so it is the callee's realm's). `None` for a strict callee.
+    pub sloppy_this: Option<u64>,
     /// The may-read-before-write register mask, valid while the callee's
     /// live `CrossEntryRec::mask_gen` equals `mask_gen`; the entry itself
     /// is loaded from the live table per call (B199), never baked.

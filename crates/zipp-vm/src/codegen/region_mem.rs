@@ -5307,6 +5307,9 @@ pub(crate) enum Cross3This {
     ArrowMirror,
     /// Strict plain function at a plain `Call` site: canonical undefined.
     Undefined,
+    /// Sloppy plain function at a plain `Call` site: the global object's
+    /// bits (`SameProtoCross3Plan::sloppy_this`).
+    Bits(u64),
     /// Method call: the receiver register's bits (reloaded — no user code has
     /// run since the guards read it).
     Receiver(u16),
@@ -5373,6 +5376,8 @@ pub(crate) fn emit_cross3_call(
         Cross3This::ArrowMirror
     } else if let Some(r) = this_reg {
         Cross3This::Receiver(r)
+    } else if let Some(bits) = plan.sloppy_this {
+        Cross3This::Bits(bits)
     } else {
         Cross3This::Undefined
     };
@@ -5700,6 +5705,12 @@ fn emit_cross3_invoke(
         Cross3This::Undefined => {
             dynasm!(ops
                 ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+                ; mov [r9], r11
+            );
+        }
+        Cross3This::Bits(bits) => {
+            dynasm!(ops
+                ; mov r11, QWORD bits as i64
                 ; mov [r9], r11
             );
         }

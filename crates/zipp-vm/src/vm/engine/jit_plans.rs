@@ -1929,6 +1929,10 @@ impl<'p> Vm<'p> {
         fid: u32,
         argc: u16,
         whole_body: bool,
+        // A plain `Call`, whose sloppy callee's `this` is the global object.
+        // A method call's receiver would need boxing for a sloppy callee, so
+        // its lanes keep to strict and arrow callees.
+        sloppy_ok: bool,
         pending: &mut Vec<u32>,
         baked: &mut Vec<u32>,
     ) -> Option<crate::codegen::SameProtoCross3Plan> {
@@ -1952,10 +1956,25 @@ impl<'p> Vm<'p> {
                 && crate::codegen::proto_has_handler_ops(callee))
             || usize::from(callee.param_count) != usize::from(argc)
             || argc > 6
-            || !(callee.lexical_this || callee.is_strict)
         {
             return None;
         }
+        // A sloppy function's `this` at a plain call is its realm's global
+        // object (OrdinaryCallBindThis), bound as a constant: the lane runs
+        // only while no second realm exists. A script's (and so a `.ts`
+        // file's) functions are sloppy, and every call to one took the
+        // generic cross-call helper: a seventh of the expression compiler.
+        let sloppy_this = if callee.lexical_this || callee.is_strict {
+            None
+        } else if sloppy_ok && crate::codegen::cross3_sloppy_enabled() {
+            Some(if self.global_this == 0 {
+                Value::UNDEFINED.bits()
+            } else {
+                Value::heap(self.global_this).bits()
+            })
+        } else {
+            return None;
+        };
         let reg_count = callee.reg_count.max(1);
         // B270: a body's own recursive site always finds its entry missing —
         // the plan builds before this compile installs it — and
@@ -2039,6 +2058,7 @@ impl<'p> Vm<'p> {
             callee_regs: reg_count,
             argc,
             arrow_this: callee.lexical_this,
+            sloppy_this,
             mask_gen,
             uninit_mask,
         })
@@ -2266,7 +2286,7 @@ impl<'p> Vm<'p> {
             let mut cross3 = crate::codegen::Cross3CallPlan::default();
             if (same_proto || mono_ok) && crate::codegen::cross3_enabled() && cross3_unmetered {
                 if let Some(arm) =
-                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
+                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, true, &mut pending, &mut baked)
                 {
                     let inserted = cross3.push(arm);
                     debug_assert!(inserted);
@@ -2294,6 +2314,7 @@ impl<'p> Vm<'p> {
                         poly_arm_fid,
                         argc,
                         whole_body,
+                        true,
                         &mut pending,
                         &mut baked,
                     ) {
@@ -2340,7 +2361,7 @@ impl<'p> Vm<'p> {
                     continue;
                 };
                 let Some(arm) =
-                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
+                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, false, &mut pending, &mut baked)
                 else {
                     continue;
                 };
@@ -2490,7 +2511,7 @@ impl<'p> Vm<'p> {
             if class_lane {
                 for fid in self.ic_class_method_fids(func_id, ip) {
                     if let Some(arm) =
-                        self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
+                        self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, false, &mut pending, &mut baked)
                     {
                         if !cross3.push(arm) {
                             break;
