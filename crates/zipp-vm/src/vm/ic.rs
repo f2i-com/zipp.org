@@ -4175,15 +4175,6 @@ impl<'p> Vm<'p> {
 
     // ── plain Call sites ──
 
-    /// Read-only probe of a `Call` site's inline cache for the Q4 leaf-inline
-    /// planner: if the site is MONOMORPHIC (exactly one filled way) and that way
-    /// is a `Callee` entry, return `(callee_bits, ver, fid, closure)` (`ver` is
-    /// the cached slot version — the inline guard re-checks it to catch a GC'd +
-    /// reused callee slot whose bits collide but version differs). Returns `None`
-    /// for an empty / polymorphic / disabled site — the planner then declines to
-    /// inline this call (it keeps the per-call helper). Performs NO fill and NO
-    /// side effect (unlike `ic_call`), so it's safe to call at compile time.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     /// Whether the site's cache holds at least one way and every way is a
     /// class method (a profitability signal: nothing is trusted from it).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4196,6 +4187,15 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// Read-only probe of a `Call` site's inline cache for the Q4 leaf-inline
+    /// planner: if the site is MONOMORPHIC (exactly one filled way) and that way
+    /// is a `Callee` entry, return `(callee_bits, ver, fid, closure)` (`ver` is
+    /// the cached slot version — the inline guard re-checks it to catch a GC'd +
+    /// reused callee slot whose bits collide but version differs). Returns `None`
+    /// for an empty / polymorphic / disabled site — the planner then declines to
+    /// inline this call (it keeps the per-call helper). Performs NO fill and NO
+    /// side effect (unlike `ic_call`), so it's safe to call at compile time.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_call_mono(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
         let site = self.ic_site(func_id, ip)?;
         if site.n != 1 {
