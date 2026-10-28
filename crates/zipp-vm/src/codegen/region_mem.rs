@@ -3573,7 +3573,7 @@ pub(crate) fn compile_region_mem(
                         heap.char_code_at,
                         heap.strict_eq,
                         heap.truthy,
-                        heap.call_ic,
+                        crate::vm::jit_call_ic_cross as *const () as usize,
                         packed_fip,
                         packed_args,
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),

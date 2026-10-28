@@ -6254,7 +6254,7 @@ pub(crate) fn compile_proto_mem(
                         heap.char_code_at,
                         heap.strict_eq,
                         heap.truthy,
-                        heap.call_ic,
+                        crate::vm::jit_call_ic_cross as *const () as usize,
                         packed_fip,
                         packed_args,
                         refetch,

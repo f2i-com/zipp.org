@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CALL_CROSS=1` makes an inlined leaf's fallback take the call
+    /// IC at once, without first trying the native cross call
+    /// (`jit_call_ic_cross`).
+    fn call_cross_enabled() = "ZIPP_NO_CALL_CROSS"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CWT_CROSS=1` makes a compiled `CallWithThis`'s general
     /// route take the call IC at once, without first trying the native cross
     /// call (`jit_call_with_this_cross`).
