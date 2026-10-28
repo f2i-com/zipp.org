@@ -1463,10 +1463,14 @@ impl<'p> Vm<'p> {
                         return v.bits();
                     }
                     let nv = self.get(base, val_reg);
-                    // No barrier: the collector roots every private field value.
+                    // No holder barrier: the collector roots private field
+                    // values; a minor takes the young ones from this record
+                    // (`record_young_value`), as the interpreter's way-0
+                    // write (`ic.rs`) leaves them.
                     if let Some(fields) = self.private_fields_mut(idx) {
                         fields[at].2 = nv;
                     }
+                    self.heap.record_young_value(nv);
                     return nv.bits();
                 }
             }
