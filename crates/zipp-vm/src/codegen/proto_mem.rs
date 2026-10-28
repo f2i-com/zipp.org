@@ -2980,6 +2980,8 @@ pub(crate) fn compile_proto_mem(
     // address of that table's first byte (0 for none).
     arith_fb: Option<&[u8]>,
     arith_fb_base: u64,
+    // The known-shape property lane's plan (`PropShapePlan`).
+    prop_shape: &PropShapePlan,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -5677,6 +5679,9 @@ pub(crate) fn compile_proto_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                if let Some(&(shape, slot)) = prop_shape.get(&ip) {
+                    emit_prop_shape_get(&mut ops, obj, dst, shape, slot, cont);
+                }
                 // A class getter (`q.size`): looked up by `jit_getter_callee`
                 // and called natively by the arm that names its fid, with the
                 // receiver as `this` and no arguments, as the class-method
@@ -5846,6 +5851,17 @@ pub(crate) fn compile_proto_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                if let Some(&(shape, slot)) = prop_shape.get(&ip) {
+                    emit_prop_shape_set(
+                        &mut ops,
+                        obj,
+                        val,
+                        shape,
+                        slot,
+                        heap.inline_store_lane_ok,
+                        cont,
+                    );
+                }
                 emit_ic_probe(
                     &mut ops,
                     IcProbe::Set {
@@ -7696,6 +7712,84 @@ fn emit_float_unary_sqrt(
     if let Some(xd) = fc.claim(dst, None) {
         dynasm!(ops ; movapd Rx(xd), xmm0);
     }
+}
+
+/// The known-shape lane of a `GetProp` (`PropShapePlan`): a receiver whose
+/// live shape mirror is `shape` has the key as own data in `slot`, read from
+/// the live vals mirror, and the op is done (`done`). It is one way of the
+/// shape-way probe (`emit_ic_probe`) with its pattern known when compiling,
+/// on the same soundness: a mirror refreshed after the map's last
+/// version-bumping mutation, one key sequence and its attributes per shape.
+/// Anything else falls through with the receiver's bits in rax, as the
+/// probe after it expects.
+fn emit_prop_shape_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    dst: u16,
+    shape: u32,
+    slot: u32,
+    done: dynasmrt::DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // a heap value
+        ; jne => miss
+        ; mov ecx, eax
+        ; mov r9, [rdi + hot_off]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8], shape as i32 // live mirror shape (idx*16)
+        ; jne => miss
+        ; mov r9, [r9 + rcx*8 + hot_vals]      // live vals base
+        ; mov r10, [r9 + (slot as i32) * 8]
+        ; mov [rbx + dreg(dst)], r10
+        ; jmp => done
+        ; => miss
+    );
+}
+
+/// The known-shape lane of a `SetProp` (`PropShapePlan`, a slot a write
+/// proved writable at `shape`): the store, then the nursery barrier for a
+/// heap value as the shape-way store does it (`emit_heap_store_barrier`).
+/// Anything else falls through with the receiver's bits in rax.
+fn emit_prop_shape_set(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    val: u16,
+    shape: u32,
+    slot: u32,
+    gen_lane: bool,
+    done: dynasmrt::DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD
+        ; jne => miss
+        ; mov ecx, eax
+        ; mov r9, [rdi + hot_off]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8], shape as i32
+        ; jne => miss
+        ; mov r9, [r9 + rcx*8 + hot_vals]
+        ; mov r10, [rbx + dreg(val)]
+        ; mov [r9 + (slot as i32) * 8], r10   // COMMIT
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // a primitive needs no barrier
+        ; jne => done
+        ; mov edx, eax                        // holder heap idx
+        ; mov r8, [rbx + dreg(val)]
+    );
+    super::emit_heap_store_barrier(ops, gen_lane, done);
+    dynasm!(ops ; => miss);
 }
 
 /// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).

@@ -1494,6 +1494,31 @@ impl<'p> Vm<'p> {
         plans
     }
 
+    /// Tier C's known-shape property lane (`codegen::PropShapePlan`): for each
+    /// `GetProp`, and each `SetProp` a write proved writable, the receiver
+    /// shape and own data slot the interpreter last found its key at
+    /// (`Vm::ic_cell_own_pair`). Empty under `ZIPP_NO_PROP_SHAPE_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_prop_shape_plan(&self, func_id: u32) -> crate::codegen::PropShapePlan {
+        let mut plan = crate::codegen::PropShapePlan::default();
+        if !crate::codegen::prop_shape_lane_enabled() || self.py_plans_skipped(func_id) {
+            return plan;
+        }
+        for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+            let set = match instr {
+                Instr::GetProp { .. } => false,
+                Instr::SetProp { .. } => true,
+                _ => continue,
+            };
+            if let Some((shape, slot, writable)) = self.ic_cell_own_pair(func_id, ip) {
+                if !set || writable {
+                    plan.insert(ip, (shape, slot));
+                }
+            }
+        }
+        plan
+    }
+
     /// Q4 v1: build the leaf-call inline plan for a memory-path region — the set
     /// of `Call` sites in `[start, end]` whose monomorphic cached callee is a
     /// PLAIN LEAF (`callee_leaf_ok`) the region emitter can inline straight-line.

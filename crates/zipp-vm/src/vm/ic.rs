@@ -801,6 +801,23 @@ impl<'p> Vm<'p> {
         self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)
     }
 
+    /// The receiver shape and own data slot the property instruction at
+    /// `(func_id, ip)` last found its key at (`SiteCell`), and whether a write
+    /// proved the slot writable: Tier C's known-shape lane (`PropShapePlan`)
+    /// tries that shape before its probe.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_cell_own_pair(&self, func_id: u32, ip: usize) -> Option<(u32, u32, bool)> {
+        let cell = self.ic_cell(func_id, ip)?;
+        if cell.own_shape == crate::shape::DICT || cell.own_shape == SiteCell::DICT_HINT {
+            return None;
+        }
+        Some((
+            cell.own_shape,
+            cell.own_slot & !SiteCell::WRITE_PROVEN,
+            cell.own_slot & SiteCell::WRITE_PROVEN != 0,
+        ))
+    }
+
     /// Remember that the key of the property instruction at `(func_id, ip)`
     /// is the data property in `slot` of a receiver of `shape` (writable,
     /// with `write_proven`). A table that does not exist yet is not made for

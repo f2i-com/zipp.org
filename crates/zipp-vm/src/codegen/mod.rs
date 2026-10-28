@@ -582,6 +582,19 @@ pub(crate) const ARITH_FB_DOUBLE: u8 = 1;
 /// number (`Jit::note_float_bail`).
 pub(crate) const ARITH_FB_OTHER: u8 = 2;
 
+/// Tier C's known-shape property lane, per `GetProp`/`SetProp` ip: the
+/// receiver shape and own data slot the interpreter last found the key at
+/// (`Vm::build_prop_shape_plan`). The emitted lane checks the receiver's live
+/// shape mirror against it and reads or writes that slot, ahead of the
+/// site's probe (`emit_prop_shape_get`, `emit_prop_shape_set`).
+pub(crate) type PropShapePlan = FxHashMap<usize, (u32, u32)>;
+
+env_off_switch!(
+    /// `ZIPP_NO_PROP_SHAPE_LANE=1` compiles Tier C property sites without the
+    /// known-shape lane (`PropShapePlan`).
+    fn prop_shape_lane_enabled() = "ZIPP_NO_PROP_SHAPE_LANE"
+);
+
 env_off_switch!(
     /// `ZIPP_NO_LATEST_LEAF=1`: a call site whose cache names several
     /// FuncProtos inlines none of them, instead of the latest
@@ -4595,6 +4608,8 @@ impl Jit {
         random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
         // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
         plain_makefunc: &FxHashMap<usize, u32>,
+        // The known-shape property lane's plan (`PropShapePlan`).
+        prop_shape: &PropShapePlan,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -4696,6 +4711,7 @@ impl Jit {
                 plain_makefunc,
                 arith_fb.as_deref(),
                 arith_fb_base,
+                prop_shape,
             ) {
                 if crate::jitlog_enabled() {
                     eprintln!(
