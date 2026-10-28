@@ -599,27 +599,52 @@ pub(crate) fn dbinop(
 ) {
     let f64_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    // Mul is EXCLUDED from the int fast path: hot integer multiplies (hash
-    // mixing `i * 40503`) overflow i32 after a few thousand iterations and
-    // would then pay the failed int attempt PLUS the f64 redo every time.
-    let int_ok = int_hint && matches!(op, DOp::Add | DOp::Sub);
+    // Mul takes it too unless `ZIPP_NO_INT_MUL=1`: an f64 product of two
+    // Ints left `2 * i + 1` a double, so every element key, compare and add
+    // downstream of it took its double path (an array store of such a key
+    // its helper). A product that overflows i32 (hash mixing `h * 31`) pays
+    // the `imul` and a predicted `jo` before the f64 path it took anyway.
+    let int_ok = int_hint
+        && (matches!(op, DOp::Add | DOp::Sub)
+            || (matches!(op, DOp::Mul) && crate::codegen::int_mul_enabled()));
+    // With `split`, a non-Int operand found by the int path's tag tests
+    // goes on to the f64 operation with the operands those tests loaded,
+    // where the f64 path used to load and test both again: a double product
+    // or sum then costs what it did with no int path in front of it.
+    // `ZIPP_NO_NUM_SPLIT=1` restores the reload.
+    let split = int_ok && crate::codegen::num_split_enabled();
+    let a_not_int = ops.new_dynamic_label();
+    let b_not_int = ops.new_dynamic_label();
+    let f64_op = ops.new_dynamic_label();
     if int_ok {
+        dynasm!(ops ; mov rax, [rbx + dreg(a)]);
+        if !split {
+            dynasm!(ops ; mov rcx, [rbx + dreg(b)]);
+        }
         dynasm!(ops
-            ; mov rax, [rbx + dreg(a)]
-            ; mov rcx, [rbx + dreg(b)]
             ; mov r10, rax
             ; shr r10, 48
             ; cmp r10d, INT_TAG_HI as i32
-            ; jne => f64_path
+        );
+        if split {
+            dynasm!(ops ; jne => a_not_int ; mov rcx, [rbx + dreg(b)]);
+        } else {
+            dynasm!(ops ; jne => f64_path);
+        }
+        dynasm!(ops
             ; mov r10, rcx
             ; shr r10, 48
             ; cmp r10d, INT_TAG_HI as i32
-            ; jne => f64_path
         );
+        if split {
+            dynasm!(ops ; jne => b_not_int);
+        } else {
+            dynasm!(ops ; jne => f64_path);
+        }
         match op {
             DOp::Add => dynasm!(ops ; add eax, ecx),
             DOp::Sub => dynasm!(ops ; sub eax, ecx),
-            DOp::Mul => dynasm!(ops ; imul eax, ecx),
+            DOp::Mul => dynasm!(ops ; mov r10d, eax ; imul eax, ecx),
             DOp::Div => unreachable!(),
         }
         // A truncation-only result WRAPS (see `trunc_only_arith_ips`): the
@@ -628,13 +653,52 @@ pub(crate) fn dbinop(
         if !(wrap && matches!(op, DOp::Add | DOp::Sub)) {
             dynasm!(ops ; jo => f64_path);
         }
+        if matches!(op, DOp::Mul) {
+            // A zero product with a negative operand is -0, which no Int
+            // encodes (the interpreter's rule): one operand is 0, so the
+            // other's sign is the sign of their or.
+            let nonzero = ops.new_dynamic_label();
+            dynasm!(ops
+                ; test eax, eax
+                ; jnz => nonzero
+                ; or r10d, ecx
+                ; js => f64_path
+                ; => nonzero
+            );
+        }
         box_eax(ops, dst);
-        // f64 fallback re-loads both operands from the register file, so the
+        dynasm!(ops ; jmp => done);
+        if split {
+            dynasm!(ops
+                // `a` an Int, `b` not: `b` must be a double (high16 in
+                // [0x7FFA, 0x7FFD] is a non-number tag, `load_num_xmm`'s rule).
+                ; => b_not_int
+                ; sub r10d, (INT_TAG_HI + 1) as i32
+                ; cmp r10d, 3
+                ; jbe => bail
+                ; xorps xmm0, xmm0
+                ; cvtsi2sd xmm0, eax
+                ; movq xmm1, rcx
+                ; jmp => f64_op
+                // `a` not an Int: it must be a double; `b` loads as either.
+                ; => a_not_int
+                ; sub r10d, (INT_TAG_HI + 1) as i32
+                ; cmp r10d, 3
+                ; jbe => bail
+                ; movq xmm0, rax
+            );
+            load_num_xmm(ops, b, 1, bail);
+            dynasm!(ops ; jmp => f64_op);
+        }
+        // An overflow re-loads both operands from the register file, so the
         // clobbered eax (wrapped overflow value) is irrelevant.
-        dynasm!(ops ; jmp => done ; => f64_path);
+        dynasm!(ops ; => f64_path);
     }
     load_num_xmm(ops, a, 0, bail);
     load_num_xmm(ops, b, 1, bail);
+    if split {
+        dynasm!(ops ; => f64_op);
+    }
     match op {
         DOp::Add => dynasm!(ops ; addsd xmm0, xmm1),
         DOp::Sub => dynasm!(ops ; subsd xmm0, xmm1),

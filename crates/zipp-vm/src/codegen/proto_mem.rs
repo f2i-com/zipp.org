@@ -5004,8 +5004,8 @@ pub(crate) fn compile_proto_mem(
                 trunc_arith[ip],
             ),
             Instr::Mul { dst, a, b } => {
-                // `dbinop` excludes Mul from the int fast path (always f64), so no
-                // overflow concern.
+                // An Int product of two Ints is an Int (`dbinop`'s int path,
+                // with its overflow and -0 checks); anything else is f64.
                 dbinop(
                     &mut ops,
                     ip,

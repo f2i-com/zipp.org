@@ -490,6 +490,18 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_NUM_SPLIT=1` makes `dbinop`'s f64 path load and test both
+    /// operands again after the int path's tag tests found a non-Int.
+    fn num_split_enabled() = "ZIPP_NO_NUM_SPLIT"
+);
+
+env_off_switch!(
+    /// `ZIPP_NO_INT_MUL=1` gives the boxed tiers' `Mul` its old f64-only
+    /// emission (`dbinop`): an Int product of two Ints is then a double.
+    fn int_mul_enabled() = "ZIPP_NO_INT_MUL"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_ARR_SET_MIRROR=1` sends every compiled `a[i] = v` through
     /// `jit_set_index` again, without the overwrite of a present element
     /// through the array mirror (`emit_arr_mirror_set`).
