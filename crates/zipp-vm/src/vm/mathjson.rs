@@ -250,6 +250,55 @@ fn json_member_prefix_bounded(
     json_push_char_bounded(out, ':')
 }
 
+/// The emitted members of a settled shape for the plain JSON walk
+/// (`Vm::json_plain_value_into`): each member's slot and `"key":` prefix.
+type JsonMembers = std::rc::Rc<[(usize, Box<str>)]>;
+
+/// What the plain JSON walk decides per key of an object, decided once per
+/// settled shape: the shape fixes the keys, their order and their
+/// attributes, and no shape id is ever reissued, so the decisions hold for
+/// the VM's life (`Vm::json_shapes`). `None` is a shape the walk declines.
+#[derive(Default)]
+pub(crate) struct JsonShapes {
+    by_shape: rustc_hash::FxHashMap<u32, Option<JsonMembers>>,
+}
+
+/// Shapes [`JsonShapes`] keeps before it starts over.
+const JSON_SHAPES_MAX: usize = 4096;
+
+impl JsonShapes {
+    /// `map`'s members; `map` has a settled shape (`shape_guardable`).
+    fn members(&mut self, map: &crate::heap::ObjMap) -> Option<JsonMembers> {
+        self.by_shape
+            .entry(map.shape())
+            .or_insert_with(|| json_shape_members(map))
+            .clone()
+    }
+}
+
+/// The per-key decisions of the plain walk's object arm for `map`'s keys: a
+/// hidden or non-enumerable key is skipped; an accessor, an integer-like key
+/// (which needs reordering) or a `toJSON` anywhere declines.
+fn json_shape_members(map: &crate::heap::ObjMap) -> Option<JsonMembers> {
+    if map.pos("toJSON").is_some() {
+        return None;
+    }
+    let mut members = Vec::new();
+    for i in map.slots() {
+        let key = map.key_at(i);
+        if is_hidden_key(key) || !map.attr_at(i).enumerable {
+            continue;
+        }
+        if map.attr_at(i).accessor || canonical_index_str(key).is_some() {
+            return None;
+        }
+        let mut prefix = String::new();
+        json_member_prefix_bounded(&mut prefix, false, guest_key_text(key)).ok()?;
+        members.push((i, prefix.into_boxed_str()));
+    }
+    Some(members.into())
+}
+
 fn json_quote_bounded(out: &mut String, text: &str) -> Result<(), JsonOutputError> {
     json_reserve_bounded(out, json_quoted_str_len(text)?)?;
     // `json_quote_into`'s own reserve is now a no-op: the exact escaped size is
@@ -660,7 +709,13 @@ impl<'p> Vm<'p> {
         out.try_reserve_exact(1024.min(MAX_STRING_BYTES)).ok()?;
         let mut active = Vec::new();
         active.try_reserve_exact(16).ok()?;
-        if !self.json_plain_value_into(root, 0, &mut active, &mut out) {
+        let mut shapes = std::mem::take(&mut self.json_shapes);
+        if shapes.by_shape.len() > JSON_SHAPES_MAX {
+            shapes.by_shape.clear();
+        }
+        let done = self.json_plain_value_into(root, 0, &mut active, &mut shapes, &mut out);
+        self.json_shapes = shapes;
+        if !done {
             return None;
         }
         // The fast walk is side-effect free, but recursively borrows the heap;
@@ -686,6 +741,7 @@ impl<'p> Vm<'p> {
         value: Value,
         depth: usize,
         active: &mut Vec<u32>,
+        shapes: &mut JsonShapes,
         out: &mut String,
     ) -> bool {
         // Past it the generic serializer takes over (and enforces the cap).
@@ -741,7 +797,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if !self.json_plain_value_into(item, depth + 1, active, out) {
+                    if !self.json_plain_value_into(item, depth + 1, active, shapes, out) {
                         active.pop();
                         return false;
                     }
@@ -765,10 +821,39 @@ impl<'p> Vm<'p> {
                     || map.class.is_some()
                     || map.is_ctor
                     || map.is_raw_json
-                    || map.pos("toJSON").is_some()
-                    || self.module_namespaces.contains_key(&idx)
-                    || self.deferred_ns_state.contains_key(&idx)
+                    || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+                    || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
                 {
+                    return false;
+                }
+                // A settled shape fixes the keys, their order and attributes:
+                // what the walk below decides per key, decided once per shape.
+                if map.shape_guardable() {
+                    let Some(members) = shapes.members(map) else {
+                        return false;
+                    };
+                    active.push(idx);
+                    if json_push_char_bounded(out, '{').is_err() {
+                        active.pop();
+                        return false;
+                    }
+                    for (k, (slot, prefix)) in members.iter().enumerate() {
+                        if (k != 0 && json_push_char_bounded(out, ',').is_err())
+                            || json_push_str_bounded(out, prefix).is_err()
+                            || !self.json_plain_value_into(map.val_at(*slot), depth + 1, active, shapes, out)
+                        {
+                            active.pop();
+                            return false;
+                        }
+                    }
+                    if json_push_char_bounded(out, '}').is_err() {
+                        active.pop();
+                        return false;
+                    }
+                    active.pop();
+                    return true;
+                }
+                if map.pos("toJSON").is_some() {
                     return false;
                 }
                 active.push(idx);
@@ -792,7 +877,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if !self.json_plain_value_into(map.val_at(i), depth + 1, active, out) {
+                    if !self.json_plain_value_into(map.val_at(i), depth + 1, active, shapes, out) {
                         active.pop();
                         return false;
                     }

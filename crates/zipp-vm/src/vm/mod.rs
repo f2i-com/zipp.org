@@ -2208,6 +2208,9 @@ pub struct Vm<'p> {
     /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
     /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
     pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,
+    /// The plain JSON walk's per-shape key decisions (`mathjson::JsonShapes`),
+    /// kept across `JSON.stringify` calls: a shape id is never reissued.
+    pub(crate) json_shapes: mathjson::JsonShapes,
     /// Short-subject ASCII execs each RegExp without a byte-optimized twin
     /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
     /// keyed by heap index; an entry leaves when its twin is built. A reused
