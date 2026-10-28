@@ -34,6 +34,26 @@ pub(crate) fn check_regex_literal(text: &str, flags: &str) -> R<()> {
 /// pressure; wider literals keep the per-field append sequence.
 const OBJECT_FINALIZE_MAX_FIELDS: usize = crate::bytecode::FINALIZE_STAGE_SLOTS;
 
+/// `ZIPP_NO_PREFIX_FINALIZE=1`: a literal whose run of static keys ends before
+/// its last member (`{ id, name, ...extra }`) makes every member the general
+/// way again, instead of the run in one `FinalizeObject` step.
+fn prefix_end_finalize_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_PREFIX_FINALIZE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Retain at most one plan's admissible name indices while the literal body is
 /// compiled. `static_keys` continues counting the full unique-static run, so a
 /// wider literal still fails `plan_names.len() == static_keys` and falls back;
@@ -1454,7 +1474,9 @@ impl<'a> FnCompiler<'a> {
         let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         let mut appendable = true;
         let mut static_keys = 0usize;
-        for prop in props {
+        // The members before the first one that ends the run.
+        let mut prefix_end = props.len();
+        for (i, prop) in props.iter().enumerate() {
             match prop {
                 // A data property with a static key. `static_key_text` returns
                 // None for a computed (or private) key, which ends the run just
@@ -1486,6 +1508,7 @@ impl<'a> FnCompiler<'a> {
                 _ => appendable = false,
             }
             if !appendable {
+                prefix_end = i;
                 break;
             }
         }
@@ -1496,26 +1519,38 @@ impl<'a> FnCompiler<'a> {
         // legacy hints and clears the plan pool, which a one-step finalize
         // site cannot survive. Only the VM's root program is exempt from that
         // path, so only it takes this lowering.
-        if plan_enabled
+        let finalize = plan_enabled
             && self.cx.main_goal
             && crate::bytecode::object_finalize_enabled()
-            && all_appendable
             && static_keys > 0
-            && static_keys <= OBJECT_FINALIZE_MAX_FIELDS
-        {
+            && static_keys <= OBJECT_FINALIZE_MAX_FIELDS;
+        if finalize && all_appendable {
             return self.object_literal_finalized(props, dst, static_keys);
         }
+        // A literal whose run of static keys ends in a spread, a computed key,
+        // an accessor, … (`{ id, name, ...extra }`): the run is made in one
+        // step as above, and the members after it are added to that object
+        // the general way. Its value expressions all come before the rest's,
+        // so the order of evaluation is the literal's.
+        let rest = if finalize && prefix_end_finalize_enabled() {
+            self.object_literal_finalized(&props[..prefix_end], dst, static_keys)?;
+            &props[prefix_end..]
+        } else {
+            props
+        };
         let alloc_ip = self.code.len();
-        self.emit(Instr::NewObject {
-            dst,
-            hint: static_keys.min(u16::MAX as usize) as u16,
-        });
+        if rest.len() == props.len() {
+            self.emit(Instr::NewObject {
+                dst,
+                hint: static_keys.min(u16::MAX as usize) as u16,
+            });
+        }
         let mut plan_names = Vec::with_capacity(if plan_enabled {
             static_keys.min(STATIC_KEY_PLAN_MAX_FIELDS)
         } else {
             0
         });
-        for prop in props {
+        for prop in rest {
             let save = self.next_reg;
             let planned_name = match prop {
                 ast::ObjectMember::Get { key, func } => {
