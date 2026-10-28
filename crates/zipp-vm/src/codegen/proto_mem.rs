@@ -3590,6 +3590,28 @@ pub(crate) fn compile_proto_mem(
             _ => None,
         }
     };
+    // The loop heads the interpreter's back-edge may enter this body at
+    // mid-call (`JitFn::run_at`, for a hot loop no region serves): the
+    // targets of backward `Jump`s, which are jump targets, so both caches
+    // start empty there. None under a meter or in a Python body, and none
+    // that is a yield head (which exits at once).
+    let osr_heads: Vec<u32> = if meter.is_some() || has_py_ops(&proto.code) || !crate::codegen::tierc_osr_enabled() {
+        Vec::new()
+    } else {
+        let mut v: Vec<u32> = proto
+            .code
+            .iter()
+            .enumerate()
+            .filter_map(|(ip, i)| match *i {
+                Instr::Jump { target } if (target as usize) <= ip => Some(target),
+                _ => None,
+            })
+            .filter(|t| !yield_heads.contains(t))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
     // Where a `JumpFinally`'s or an `EndFinally`'s routing can land: every
     // `break`/`continue` target leaving `try` blocks and every `finally`
     // entry (`emit_ip_dispatch`). All are jump targets, so both caches start
@@ -3654,6 +3676,28 @@ pub(crate) fn compile_proto_mem(
         }
         t
     };
+    // A mid-call entry (`JitFn::run_at`) finds its loop head in the bail
+    // word, which every other entry leaves at `NO_BAIL`: past the whole
+    // prologue, go to the head's label (and clear the word). A head this
+    // body does not have resumes the interpreter there.
+    if !osr_heads.is_empty() {
+        dynasm!(ops
+            ; mov eax, DWORD [rsi]
+            ; cmp eax, NO_BAIL as i32
+            ; je => labels[0]
+            ; mov DWORD [rsi], NO_BAIL as i32
+        );
+        for &h in &osr_heads {
+            dynasm!(ops
+                ; cmp eax, h as i32
+                ; je => labels[h as usize]
+            );
+        }
+        dynasm!(ops
+            ; mov DWORD [rsi], eax
+            ; jmp => epilogue
+        );
+    }
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
         if fc_slots != 0 {
@@ -7571,6 +7615,7 @@ pub(crate) fn compile_proto_mem(
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
+        osr_heads: osr_heads.into_boxed_slice(),
     })
 }
 

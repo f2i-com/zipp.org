@@ -119,6 +119,35 @@ pub const RUNTIME_FN_INSTRS_PER_CALL: usize = 32;
 /// ([`Jit::runtime_fn_wait`]): no loop header is at this ip.
 const RUNTIME_WAIT_IP: u32 = u32::MAX;
 
+/// Back-edges at loops no region serves before their function is compiled
+/// for a mid-call entry at the loop head (`JitFn::run_at`).
+const TIERC_OSR_AFTER: u8 = 64;
+
+/// Compiles a function's mid-call entry is given ([`Jit::tierc_osr_settle`])
+/// before its loops stay interpreted: a body evicted mid-loop is compiled
+/// again, as one a call evicts is.
+const TIERC_OSR_TRIES: u8 = 4;
+
+/// A bailing mid-call run shorter than this many timestamp-counter ticks
+/// (about a microsecond) ran at most an iteration or two of its loop.
+pub const TIERC_OSR_SHORT_CYCLES: u64 = 4000;
+
+/// Short bailing mid-call runs in a row after which a function's loops stay
+/// interpreted ([`Jit::tierc_osr_note_bail`]).
+const TIERC_OSR_SHORT_RUNS: u8 = 32;
+
+/// [`Jit::region_dead_state`]: no region will serve the loop.
+pub const REGION_DEAD: u8 = 1;
+/// [`Jit::region_dead_state`]: no region will serve the loop, and its
+/// function's Tier C body will not be entered at its head.
+pub const REGION_DEAD_NO_OSR: u8 = 2;
+
+/// [`Jit::tierc_osr_state`] past the back-edge count: the compiled body has
+/// mid-call entries.
+pub const OSR_READY: u8 = 254;
+/// [`Jit::tierc_osr_state`]: the function's loops stay interpreted.
+pub const OSR_OFF: u8 = 255;
+
 /// The loops of `code`: its distinct backward-jump targets (a loop's
 /// `continue`s jump back to the same header).
 fn loop_headers(code: &[Instr]) -> u32 {
@@ -599,6 +628,13 @@ env_off_switch!(
     /// `ZIPP_NO_RECV_CACHE=1` compiles every known-shape lane access in full,
     /// without the receiver cache (`RecvCache`).
     fn recv_cache_enabled() = "ZIPP_NO_RECV_CACHE"
+);
+
+env_off_switch!(
+    /// `ZIPP_NO_TIERC_OSR=1`: a hot loop no region serves stays interpreted
+    /// instead of entering its function's Tier C body at the loop head
+    /// (`JitFn::run_at`).
+    fn tierc_osr_enabled() = "ZIPP_NO_TIERC_OSR"
 );
 
 /// One `GetProp`'s class-method read for Tier C's class-method lane
@@ -3215,9 +3251,35 @@ pub struct JitFn {
     /// (the array builtins' callback window always has been); a Tier C body
     /// says the same through its cross entry instead.
     int_tier: bool,
+    /// The loop heads a Tier C body can be entered at mid-call (`run_at`):
+    /// the interpreter's back-edge hands it a hot loop no region serves.
+    /// Sorted; empty for every other body.
+    osr_heads: Box<[u32]>,
 }
 
 impl JitFn {
+    /// Whether the body can be entered at the loop head `ip` (`run_at`).
+    #[inline]
+    pub(crate) fn osr_head(&self, ip: u32) -> bool {
+        self.osr_heads.binary_search(&ip).is_ok()
+    }
+
+    /// [`JitFn::run`] entered at the loop head `ip` (`osr_head`) instead of
+    /// the top, over a register window the interpreter has run up to it: the
+    /// body's prologue reads `ip` from the bail word and goes there.
+    ///
+    /// # Safety
+    /// As [`JitFn::run`]; `ip` is one of the body's `osr_heads`.
+    pub(crate) unsafe fn run_at(&self, regs: *mut u64, vm: *mut core::ffi::c_void, ip: u32) -> (u64, u32) {
+        debug_assert!(self.osr_head(ip));
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            mem::transmute(self.entry);
+        let mut bail: u32 = ip;
+        let r = f(regs, &mut bail as *mut u32, vm);
+        (r, bail)
+    }
+
     /// B237: the emitted buffer's address range, for the PC profiler's
     /// sample-to-body mapping. The buffer is mmap'd and never moves.
     pub(crate) fn code_span(&self) -> (u64, usize) {
@@ -3830,6 +3892,14 @@ pub struct Jit {
     region_global_defers: FxHashMap<(u32, u32), u8>,
     fn_global_defers: FxHashMap<u32, u8>,
     region_counts: FxHashMap<(u32, u32), u32>,
+    /// Dense per-function [`Jit::tierc_osr_state`].
+    osr_state: Vec<u8>,
+    /// Failed [`Jit::tierc_osr_settle`]s per function, toward
+    /// [`TIERC_OSR_TRIES`].
+    osr_tries: FxHashMap<u32, u8>,
+    /// Short bailing mid-call runs in a row per function
+    /// ([`Jit::tierc_osr_note_bail`]).
+    osr_short: FxHashMap<u32, u8>,
     region_blacklist: FxHashSet<(u32, u32)>,
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
     /// compile for the key skips int and uses the double path instead.
@@ -4085,6 +4155,71 @@ impl Jit {
         if calls > JIT_THRESHOLD {
             self.region_counts.insert((func_id, RUNTIME_WAIT_IP), calls - JIT_THRESHOLD);
         }
+    }
+
+    /// Where `func_id`'s loops that no region serves stand toward entering
+    /// its compiled body mid-call (`Vm::try_run_tierc_osr`): the back-edges
+    /// counted so far, [`OSR_READY`] or [`OSR_OFF`]. One dense read, as the
+    /// interpreter asks at each such back-edge.
+    #[inline]
+    pub fn tierc_osr_state(&self, func_id: u32) -> u8 {
+        self.osr_state.get(func_id as usize).copied().unwrap_or(0)
+    }
+
+    /// Count a back-edge toward the compile: `true` when it is due.
+    pub(crate) fn tierc_osr_tick(&mut self, func_id: u32) -> bool {
+        let i = func_id as usize;
+        if self.osr_state.len() <= i {
+            self.osr_state.resize(i + 1, 0);
+        }
+        self.osr_state[i] += 1;
+        self.osr_state[i] >= TIERC_OSR_AFTER
+    }
+
+    /// After a due compile (or a ready body found gone or without the head):
+    /// ready, or counting again until [`TIERC_OSR_TRIES`] have failed.
+    pub(crate) fn tierc_osr_settle(&mut self, func_id: u32, ready: bool) {
+        let i = func_id as usize;
+        if self.osr_state.len() <= i {
+            self.osr_state.resize(i + 1, 0);
+        }
+        if ready {
+            self.osr_state[i] = OSR_READY;
+            return;
+        }
+        let tries = self.osr_tries.entry(func_id).or_insert(0);
+        *tries += 1;
+        self.osr_state[i] = if *tries >= TIERC_OSR_TRIES { OSR_OFF } else { 0 };
+    }
+
+    /// A mid-call run of `func_id`'s body that bailed, `short` when it lasted
+    /// under [`TIERC_OSR_SHORT_CYCLES`]: `true` (and the function's loops stay
+    /// interpreted from now on) once [`TIERC_OSR_SHORT_RUNS`] such runs came in
+    /// a row. A body that bails at the same op every iteration (a call it
+    /// cannot make natively) re-entered and bailed once per iteration, which
+    /// cost more than interpreting the loop; a long run resets the count.
+    pub(crate) fn tierc_osr_note_bail(&mut self, func_id: u32, short: bool) -> bool {
+        if !short {
+            self.osr_short.remove(&func_id);
+            return false;
+        }
+        let n = self.osr_short.entry(func_id).or_insert(0);
+        *n += 1;
+        if *n < TIERC_OSR_SHORT_RUNS {
+            return false;
+        }
+        self.osr_short.remove(&func_id);
+        self.tierc_osr_off(func_id);
+        true
+    }
+
+    /// `func_id`'s loops stay interpreted.
+    pub(crate) fn tierc_osr_off(&mut self, func_id: u32) {
+        let i = func_id as usize;
+        if self.osr_state.len() <= i {
+            self.osr_state.resize(i + 1, 0);
+        }
+        self.osr_state[i] = OSR_OFF;
     }
 
     /// A whole-function compile offer for `func_id`: `true` (decline it for
@@ -4942,20 +5077,43 @@ impl Jit {
         self.regions.get(&(func_id, entry_ip))
     }
 
-    /// Dense region-state check — the back-edge fast path. `true` iff the loop
-    /// headed at `entry_ip` is permanently blacklisted, so the caller can skip
-    /// `try_run_osr` + `record_region` entirely: `get_region` cannot hit (a
-    /// blacklisted key is never compiled) and `record_region` is a no-op
+    /// Dense region-state check — the back-edge fast path. Nonzero iff the
+    /// loop headed at `entry_ip` is permanently blacklisted, so the caller can
+    /// skip `try_run_osr` + `record_region` entirely: `get_region` cannot hit
+    /// (a blacklisted key is never compiled) and `record_region` is a no-op
     /// `false` for it. The loop-region sibling of the [`FN_DEAD`] check at
-    /// frame entry.
+    /// frame entry. 0 while a region may still serve the loop,
+    /// [`REGION_DEAD`] once none will, and [`REGION_DEAD_NO_OSR`] once its
+    /// function's Tier C body cannot be entered there either
+    /// (`Vm::try_run_tierc_osr`), so a back-edge of such a loop costs what it
+    /// did before that entry existed.
     #[inline]
-    pub fn region_dead(&self, func_id: u32, entry_ip: u32) -> bool {
-        self.interp_flags(func_id) & INTERP_NO_REGIONS != 0
-            || (self.dense_backedge
-                && self
-                    .region_dead
-                    .get(func_id as usize)
-                    .is_some_and(|v| v.get(entry_ip as usize).copied().unwrap_or(0) != 0))
+    pub fn region_dead_state(&self, func_id: u32, entry_ip: u32) -> u8 {
+        if self.interp_flags(func_id) & INTERP_NO_REGIONS != 0 {
+            return REGION_DEAD_NO_OSR;
+        }
+        if !self.dense_backedge {
+            return 0;
+        }
+        self.region_dead
+            .get(func_id as usize)
+            .and_then(|v| v.get(entry_ip as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The loop headed at `entry_ip` of `func_id` will not enter the
+    /// function's Tier C body ([`Jit::region_dead_state`]).
+    pub(crate) fn set_region_osr_off(&mut self, func_id: u32, entry_ip: u32) {
+        if let Some(b) = self
+            .region_dead
+            .get_mut(func_id as usize)
+            .and_then(|v| v.get_mut(entry_ip as usize))
+        {
+            if *b == REGION_DEAD {
+                *b = REGION_DEAD_NO_OSR;
+            }
+        }
     }
 
     /// Mirror a `region_blacklist` insert into the dense side table. Called at
@@ -4973,7 +5131,9 @@ impl Jit {
         if v.len() <= i {
             v.resize(i + 1, 0);
         }
-        v[i] = 1;
+        if v[i] == 0 {
+            v[i] = REGION_DEAD;
+        }
     }
 
     /// W9: `true` iff `func_id` owns at least one LIVE register-homed region.

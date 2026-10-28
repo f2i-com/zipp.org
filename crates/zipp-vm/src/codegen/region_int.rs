@@ -2766,6 +2766,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
+        osr_heads: Box::default(),
     })
 }
 

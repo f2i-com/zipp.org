@@ -482,6 +482,7 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
+        osr_heads: Box::default(),
     })
 }
 
@@ -575,6 +576,7 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
+        osr_heads: Box::default(),
     })
 }
 
@@ -699,6 +701,7 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
+        osr_heads: Box::default(),
     })
 }
 

@@ -925,6 +925,7 @@ pub(crate) fn compile_proto(
         entry: entry_ptr,
         self_binding,
         int_tier: true,
+        osr_heads: Box::default(),
     })
 }
 

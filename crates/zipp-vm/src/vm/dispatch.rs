@@ -2544,6 +2544,10 @@ impl<'p> Vm<'p> {
                         if t < ip {
                             self.maybe_gc();
                         }
+                        // The loop's `Jit::region_dead_state`, as the region
+                        // check below reads it (0 when that check never ran).
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        let mut dead = 0u8;
                         // â”€â”€ OSR tier â”€â”€ a backward jump is a loop back-edge. After
                         // the region heats up, compile `[target, ip]` (the loop
                         // body, headed at `target`) and run it natively; the
@@ -2561,9 +2565,12 @@ impl<'p> Vm<'p> {
                             // back-edge here, not 2 hash probes (`get_region`
                             // miss + `region_blacklist` hit). Mirrors the
                             // FN_DEAD check at frame entry — see
-                            // `Jit::region_dead`. `ZIPP_NO_DENSE_BACKEDGE=1`
+                            // `Jit::region_dead_state`. `ZIPP_NO_DENSE_BACKEDGE=1`
                             // restores the old always-probe path.
-                            && !self.jit.region_dead(func_id, t as u32)
+                            && {
+                                dead = self.jit.region_dead_state(func_id, t as u32);
+                                dead == 0
+                            }
                         {
                             if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                 // A region exit with a pending exception (a
@@ -2967,6 +2974,27 @@ impl<'p> Vm<'p> {
                                     ip = resume;
                                     continue;
                                 }
+                            }
+                        }
+                        // A loop no region serves: its function's Tier C body,
+                        // entered at the loop head (`try_run_tierc_osr`).
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if dead == crate::codegen::REGION_DEAD {
+                            if let Some((result, bail)) = self.try_run_tierc_osr(func_id, t as u32, base) {
+                                if bail == crate::codegen::NO_BAIL {
+                                    // The body returned: as a `Return`.
+                                    if self.pop_frame_with(result, stop_depth) {
+                                        return Ok(result);
+                                    }
+                                    break;
+                                }
+                                if self.pending_throw.is_some() {
+                                    let top = self.frames.len() - 1;
+                                    self.frames[top].ip = bail as usize;
+                                    return Err(Thrown(String::new()));
+                                }
+                                ip = bail as usize;
+                                continue;
                             }
                         }
                         ip = t;
@@ -6199,6 +6227,108 @@ impl<'p> Vm<'p> {
         {
             self.meter_return();
             self.meter_unpark(outer_steps);
+        }
+        Some((Value::from_bits(bits), bail))
+    }
+
+    /// A back-edge to the loop head `head` of `func_id`, which no region
+    /// serves (`Jit::region_dead_state`), while its `Jit::tierc_osr_state` is not
+    /// `OSR_OFF`: run the function's Tier C body from the loop head over the
+    /// frame's window (`JitFn::run_at`), compiling it first once such
+    /// back-edges have reached `TIERC_OSR_AFTER`. The body is the one a call
+    /// runs, entered past the ops the interpreter has run: its values are
+    /// all in the window (Tier C is the memory tier), the frame's handlers
+    /// are the ones its handler ops work on, and both operand caches start
+    /// empty at a loop head. `None` keeps interpreting; otherwise
+    /// `(result, bail)` as `try_run_jit` returns it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(never)]
+    pub(crate) fn try_run_tierc_osr(&mut self, func_id: u32, head: u32, base: usize) -> Option<(Value, u32)> {
+        let has_head = |vm: &Self| vm.jit.get(func_id).is_some_and(|f| f.osr_head(head));
+        // No entry for now: once the function's entry is off for good, the
+        // head's dead-region byte says so and the back-edge stops asking.
+        let decline = |vm: &mut Self| {
+            if vm.jit.tierc_osr_state(func_id) == crate::codegen::OSR_OFF {
+                vm.jit.set_region_osr_off(func_id, head);
+            }
+            None
+        };
+        match self.jit.tierc_osr_state(func_id) {
+            crate::codegen::OSR_OFF => return decline(self),
+            crate::codegen::OSR_READY => {
+                // Evicted since, or compiled without this entry.
+                if !has_head(self) {
+                    self.jit.tierc_osr_settle(func_id, false);
+                    return decline(self);
+                }
+            }
+            _ => {
+                if !self.jit.tierc_osr_tick(func_id) {
+                    return None;
+                }
+                if !has_head(self) {
+                    if !crate::codegen::tierc_osr_enabled()
+                        || self.jit.fn_state(func_id) == crate::codegen::FN_DEAD
+                        || self.func(func_id as usize).is_generator
+                        || self.func(func_id as usize).is_async
+                    {
+                        self.jit.tierc_osr_off(func_id);
+                        return decline(self);
+                    }
+                    if self.jit.get(func_id).is_none() {
+                        self.jit_compile_on_entry(func_id, base);
+                    }
+                    if !has_head(self) {
+                        self.jit.tierc_osr_settle(func_id, false);
+                        return decline(self);
+                    }
+                }
+                self.jit.tierc_osr_settle(func_id, true);
+            }
+        }
+        // The entry checks `try_run_jit` makes (a Tier C body bakes no
+        // self-binding).
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(func_id) {
+            return None;
+        }
+        let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        let (active_closure, active_callee) = self
+            .frames
+            .last()
+            .filter(|f| f.func == func_id && f.base == base)
+            .map(|f| {
+                (
+                    f.closure,
+                    if f.callee.is_heap() {
+                        f.callee.heap_index()
+                    } else {
+                        NO_CLOSURE
+                    },
+                )
+            })
+            .unwrap_or((NO_CLOSURE, NO_CLOSURE));
+        let upvals_raw = self.resolve_upvals_raw(active_closure);
+        let activation_token =
+            self.enter_tierc_activation(active_closure, active_callee, false, upvals_raw)?;
+        // SAFETY: `_rdtsc` has no preconditions on x86-64; the run is as
+        // `try_run_jit`'s, and `head` is one of the body's heads.
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let (bits, bail) = unsafe { (*jitfn).run_at(regs_ptr, vm_ptr, head) };
+        let ticks = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        self.leave_tierc_activation(activation_token);
+        if bail != crate::codegen::NO_BAIL
+            && self.jit.tierc_osr_note_bail(func_id, ticks < crate::codegen::TIERC_OSR_SHORT_CYCLES)
+        {
+            self.jit.set_region_osr_off(func_id, head);
+        }
+        if bail != crate::codegen::NO_BAIL && crate::jitlog_enabled() {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                let op = self.func(func_id as usize).code.get(bail as usize).copied();
+                eprintln!("[jit] Tier C fn{func_id} OSR at {head} bailed at {bail}: {op:?}");
+            }
         }
         Some((Value::from_bits(bits), bail))
     }
