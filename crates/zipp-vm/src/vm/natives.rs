@@ -1487,7 +1487,7 @@ impl<'p> Vm<'p> {
     /// (one Option check) for a main-realm built-in, which is every call until
     /// `$262.createRealm()` hands a realm-copied method to another realm.
     pub(crate) fn alloc_array_current_realm(&mut self, items: Vec<Value>) -> Value {
-        let idx = self.heap.alloc(HeapObj::Array(items));
+        let idx = self.heap.alloc_array_settled(items);
         if let Some(r) = self.native_callee_realm {
             let home = self.native_home(self.arr_proto);
             if home != self.arr_proto {

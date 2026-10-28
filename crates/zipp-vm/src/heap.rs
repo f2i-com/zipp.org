@@ -335,6 +335,25 @@ fn prefetch_line<T>(p: *const T) {
     let _ = p;
 }
 
+/// Copy `len` values from `src` to `dst` one 8-byte load at a time. A JIT
+/// helper's `src` is the register window compiled code has just stored value
+/// by value: `copy_nonoverlapping`'s 16-byte loads span two of those stores,
+/// which store-to-load forwarding cannot serve, and stalled every literal.
+/// The volatile reads keep the loads 8 bytes wide.
+///
+/// # Safety
+///
+/// As `copy_nonoverlapping`: `len` readable values at `src`, writable at
+/// `dst`, the two ranges disjoint.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline(always)]
+unsafe fn copy_vals_by_word(src: *const Value, dst: *mut Value, len: usize) {
+    for i in 0..len {
+        // SAFETY: this function's contract.
+        unsafe { dst.add(i).write(src.add(i).read_volatile()) };
+    }
+}
+
 /// [`ObjMap`]'s side index for canonical Array-index keys: index -> slot, in
 /// [`PropIndex::Split`]'s layout (parallel arrays, linear probing,
 /// backward-shift removal) so that a removal renumbers it with the same
@@ -3066,24 +3085,25 @@ impl ObjMap {
     #[cfg(not(feature = "safe-sandbox"))]
     fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
         // SAFETY: no borrowed handle is minted.
-        unsafe { self.refit_finalized_inner(plan, vals, shape, false) };
+        unsafe { self.refit_finalized_inner(plan, Some(vals), shape, false) };
         static_key_stats::object();
         static_key_stats::bulk_appends(plan.len());
     }
 
     /// `refit_finalized` for the construction-latched thin path. That path is
     /// reachable only while static-key telemetry is disabled, so avoid the
-    /// two otherwise-redundant atomic latch loads per literal.
+    /// two otherwise-redundant atomic latch loads per literal. `None` keeps
+    /// the shell's store, which the caller has already filled.
     ///
     /// # Safety
     ///
     /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
-    #[inline]
+    #[inline(always)]
     unsafe fn refit_finalized_no_stats(
         &mut self,
         plan: &StaticKeyPlan,
-        vals: ValStore,
+        vals: Option<ValStore>,
         shape: u32,
         borrow: bool,
     ) {
@@ -3091,19 +3111,26 @@ impl ObjMap {
         unsafe { self.refit_finalized_inner(plan, vals, shape, borrow) };
     }
 
+    /// `vals: None` keeps the shell's store (`alloc_finalized_thin` has
+    /// filled the cell it already holds and set its length): moving a new
+    /// store in read it back from the caller's stack with a 16-byte load over
+    /// two 8-byte stores, which store-to-load forwarding cannot serve, a
+    /// stall on every literal from a pooled shell.
+    ///
     /// # Safety
     ///
     /// With `borrow` set, `plan` must meet [`PlanHandle::borrowed`]'s contract.
     #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
     unsafe fn refit_finalized_inner(
         &mut self,
         plan: &StaticKeyPlan,
-        vals: ValStore,
+        vals: Option<ValStore>,
         shape: u32,
         borrow: bool,
     ) {
         debug_assert!(plan.runtime_valid());
-        debug_assert_eq!(vals.len(), plan.len());
+        debug_assert_eq!(vals.as_ref().unwrap_or(&self.vals).len(), plan.len());
         let n = plan.len();
         let ObjMap {
             keys,
@@ -3141,7 +3168,9 @@ impl ObjMap {
                 }
             }
         }
-        *store = vals;
+        if let Some(vals) = vals {
+            *store = vals;
+        }
         *attrs = PropAttrs::AllData { len: n as u32 };
         *class = None;
         *extensible = true;
@@ -8262,6 +8291,28 @@ impl Heap {
     /// birth path for cells: the marker takes the slot, the authoritative
     /// payload goes straight to the cell-value mirror.
     pub fn alloc_cell(&mut self, initial: Value) -> u32 {
+        // A recycled slot as `alloc_array_settled` takes one: the marker's
+        // tag goes straight into the slot. Through `alloc`, the payload-free
+        // enum was a one-byte store on the caller's stack that the general
+        // body read back with a 16-byte load, which store-to-load forwarding
+        // cannot serve: a stall on every cell (a captured variable's, per
+        // call of the function capturing it).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                #[cfg(feature = "jit")]
+                debug_assert_eq!(
+                    self.hot_mirror[idx as usize],
+                    HotMirror::CLEAR,
+                    "free_slot leaves a recycled slot's mirror cleared"
+                );
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Cell);
+                self.reuse_slot_stamp(idx);
+                self.cell_vals_mirror[idx as usize] = initial.bits();
+                return idx;
+            }
+        }
         let idx = self.alloc(HeapObj::Cell);
         self.cell_vals_mirror[idx as usize] = initial.bits();
         idx
@@ -8555,7 +8606,33 @@ impl Heap {
                 }
             }
         }
+        // `None`: the shell keeps its own store, the cell the values went
+        // into, with this literal's length set in place.
         let store = match class {
+            Some(_) if reuse_base.is_some() => {
+                let base = reuse_base.unwrap_or_default();
+                // SAFETY: (B258) the cell this same class carved for the
+                // pooled shell's previous occupant, `cap >= vals.len()` slots
+                // in a live, immovable chunk this heap owns; that occupant's
+                // slot holds the sweep's tombstone and its mirror was cleared
+                // and version bumped by `free_slot`, so no safe or emitted
+                // reference reaches the cell. `vals` may point straight into
+                // the VM's register window (the JIT helper passes it through
+                // without staging): the window is a root, the collector is
+                // non-moving and cannot run between the caller's poll and
+                // this copy, and the slab cell is not part of the window.
+                unsafe {
+                    copy_vals_by_word(
+                        vals.as_ptr(),
+                        std::ptr::with_exposed_provenance_mut::<Value>(base),
+                        vals.len(),
+                    );
+                }
+                if let Some(ValStore::Slab { owner_and_len, .. }) = shell.as_deref_mut().map(|b| &mut b.vals) {
+                    *owner_and_len = (*owner_and_len & !VAL_SLAB_OWNER_LEN_MASK) | vals.len();
+                }
+                None
+            }
             Some(class) => {
                 let cap = val_slab_class_cap(class);
                 let owner = &mut self.val_slab[class as usize];
@@ -8563,36 +8640,24 @@ impl Heap {
                 debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
                 debug_assert!((1..=16).contains(&vals.len()));
                 let owner_and_len = owner_addr | vals.len();
-                let base = match reuse_base {
-                    Some(base) => base,
-                    None => owner.alloc_cell(cap),
-                };
+                let base = owner.alloc_cell(cap);
                 // SAFETY: as in `alloc_finalized` — a cell of `cap >=
                 // vals.len()` slots inside a live, immovable chunk this heap
-                // owns, aliased by nothing: either fresh from this class's
-                // free list or cursor, or (B258) the cell this same class
-                // carved for the pooled shell's previous occupant, whose
-                // slot holds the sweep's tombstone and whose mirror was
-                // cleared and version bumped by `free_slot`, so no safe or
-                // emitted reference reaches it. `vals` may point straight
-                // into the VM's register window (the JIT helper passes it
-                // through without staging): the window is a root, the
-                // collector is non-moving and cannot run between the
-                // caller's poll and this copy, and the slab cell is not part
-                // of the window.
+                // owns, aliased by nothing: fresh from this class's free list
+                // or cursor. The window's `vals` as above.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
+                    copy_vals_by_word(
                         vals.as_ptr(),
                         std::ptr::with_exposed_provenance_mut::<Value>(base),
                         vals.len(),
                     );
                 }
-                ValStore::Slab {
+                Some(ValStore::Slab {
                     base,
                     owner_and_len,
-                }
+                })
             }
-            None => ValStore::Vec(vals.to_vec()),
+            None => Some(ValStore::Vec(vals.to_vec())),
         };
         let boxed = match shell {
             Some(mut b) => {
@@ -8604,6 +8669,7 @@ impl Heap {
                 unsafe { b.refit_finalized_no_stats(plan, store, shape, borrow) };
                 b
             }
+            // Only a pooled shell supplies a cell to keep.
             None => Box::new(ObjMap::finalized_from_store_no_stats(
                 if borrow {
                     // SAFETY: this function's contract.
@@ -8611,7 +8677,7 @@ impl Heap {
                 } else {
                     PlanHandle::owned(plan.clone())
                 },
-                store,
+                store.unwrap_or_else(|| unreachable!("a kept store needs a shell")),
                 shape,
             )),
         };
@@ -8771,6 +8837,24 @@ impl Heap {
         unsafe { std::ptr::write(slot, obj) };
     }
 
+    /// [`Heap::reuse_slot_write`] of `HeapObj::Array(items)`, the vector's
+    /// three words written from registers into an empty `Array` installed
+    /// first. The enum built on the stack was copied into the slot with
+    /// 16-byte loads that straddled the vector's 8-byte stores, which
+    /// store-to-load forwarding cannot serve: a stall on every array literal.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reuse_slot_write_array(&mut self, idx: u32, items: Vec<Value>) {
+        let mut items = std::mem::ManuallyDrop::new(items);
+        let (ptr, len, cap) = (items.as_mut_ptr(), items.len(), items.capacity());
+        self.reuse_slot_write(idx, HeapObj::Array(Vec::new()));
+        if let HeapObj::Array(v) = &mut self.objs[idx as usize] {
+            // SAFETY: the parts of a vector given up above (`ManuallyDrop`),
+            // written over an empty one, which owns nothing to leak.
+            unsafe { std::ptr::write(v, Vec::from_raw_parts(ptr, len, cap)) };
+        }
+    }
+
     /// B257: the bookkeeping tail of a slot reuse — `alloc_settled`'s version
     /// bump, young-log entry and oracle stamp, unchanged.
     #[cfg(not(feature = "safe-sandbox"))]
@@ -8802,6 +8886,7 @@ impl Heap {
     /// mirror store. Growth and every non-default configuration go through
     /// [`Heap::alloc`] unchanged.
     #[allow(dead_code)] // the x86 JIT helpers are the callers
+    #[inline(always)]
     pub(crate) fn alloc_array_settled(&mut self, items: Vec<Value>) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
@@ -8813,7 +8898,7 @@ impl Heap {
                     "free_slot leaves a recycled slot's mirror cleared"
                 );
                 self.reuse_slot_begin();
-                self.reuse_slot_write(idx, HeapObj::Array(items));
+                self.reuse_slot_write_array(idx, items);
                 self.reuse_slot_stamp(idx);
                 if self.oracle {
                     self.thin_stats[2] += 1;

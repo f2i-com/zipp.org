@@ -115,7 +115,11 @@ impl<'p> Vm<'p> {
 
     /// The tests of [`Vm::flat_new_class_instance`]: whether `cv` is a class
     /// its flat path takes, and if so its constructor (`fid`, `closure`, the
-    /// function value). Nothing is made.
+    /// function value). Nothing is made. Inlined: returned through memory,
+    /// the answer was written field by field and read back with a 16-byte
+    /// load that store-to-load forwarding cannot serve, a stall on every
+    /// `new` from compiled code (`jit_new_ic`).
+    #[inline(always)]
     pub(crate) fn flat_new_class_target(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
         if !cv.is_heap() {
             return None;
