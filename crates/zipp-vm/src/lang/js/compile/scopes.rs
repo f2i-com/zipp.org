@@ -216,6 +216,7 @@ impl<'a> FnCompiler<'a> {
             self_name: None,
             captured,
             late_boxed: HashSet::default(),
+            copy_boxed: HashSet::default(),
             cell_regs: HashSet::default(),
             lexical_regs: HashSet::default(),
             const_regs: HashSet::default(),
@@ -780,6 +781,7 @@ impl<'a> FnCompiler<'a> {
             && !self.script_eval_lexicals
             && !self.captured.contains(name)
             && !self.late_boxed.contains(name)
+            && !self.copy_boxed.contains(name)
     }
 
     /// Bind `name` to the next spill slot, in the innermost scope.

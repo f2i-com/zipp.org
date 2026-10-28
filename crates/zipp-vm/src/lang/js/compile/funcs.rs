@@ -1965,6 +1965,52 @@ impl<'a> FnCompiler<'a> {
 
     /// The enclosing-function chain to hand a function nested in THIS one: our
     /// own enclosing chain plus a snapshot of our current bindings.
+    /// For a function or arrow expression about to be compiled whose free
+    /// names `free` include copy-boxed parameters (`copy_boxed`): copy each
+    /// into a fresh cell now, right before the closure is made, and bind its
+    /// name to that cell in a scope of its own while the child compiles, so
+    /// the child captures the copy. The parameter is never written, so the
+    /// copy is its value for good. `None` when there is nothing to copy;
+    /// otherwise [`Self::copy_box_done`] closes the scope (and frees the
+    /// cell registers) once the child is compiled — the caller makes the
+    /// closure straight after, reading the cells first.
+    fn copy_box_for_child(&mut self, free: &[String]) -> Option<()> {
+        if self.copy_boxed.is_empty() {
+            return None;
+        }
+        let mut names: Vec<&String> = free.iter().filter(|n| self.copy_boxed.contains(*n)).collect();
+        if names.is_empty() {
+            return None;
+        }
+        names.sort();
+        names.dedup();
+        let mut copies = Vec::with_capacity(names.len());
+        for n in names {
+            // A parameter: a register of the function scope, never shadowed
+            // (`copy_box_names` rules out every other binding of the name).
+            match self.resolve_existing(n) {
+                Some(Binding::Local(r)) => copies.push((n.clone(), r)),
+                _ => debug_assert!(false, "copy-boxed `{n}` is not a plain register"),
+            }
+        }
+        self.push_scope();
+        for (n, r) in copies {
+            let t = self.alloc_reg();
+            self.emit(Instr::Move { dst: t, src: r });
+            self.emit(Instr::MakeCell { reg: t });
+            self.scopes.last_mut().unwrap().push((n, t));
+            self.cell_regs.insert(t);
+        }
+        Some(())
+    }
+
+    /// The end of [`Self::copy_box_for_child`]'s scope.
+    fn copy_box_done(&mut self, opened: Option<()>) {
+        if opened.is_some() {
+            self.pop_scope();
+        }
+    }
+
     pub(crate) fn child_enclosing(&self) -> Vec<EnclosingFn> {
         let mut e = self.enclosing.clone();
         e.push(self.snapshot());
@@ -2041,6 +2087,13 @@ impl<'a> FnCompiler<'a> {
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
+        // Its free names, when a deferral or a copied parameter asks for them.
+        let free = if self.cx.lazy_mode != lazy::LazyMode::Off || !self.copy_boxed.is_empty() {
+            capture::function_free_names(f)
+        } else {
+            Vec::new()
+        };
+        let copies = self.copy_box_for_child(&free);
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
@@ -2048,7 +2101,7 @@ impl<'a> FnCompiler<'a> {
             let nested = if lazy_ok { self.cx.lazy_scan_fn(f) } else { None };
             self.lazy_prepare(
                 lazy::LazyKind::FuncExpr { name: name.clone(), self_name: self_name.clone() },
-                capture::function_free_names(f),
+                free,
                 nested,
                 (f.span.start, f.span.end),
                 name.as_deref().unwrap_or("<script>"),
@@ -2076,6 +2129,7 @@ impl<'a> FnCompiler<'a> {
                 enclosing,
             )?,
         };
+        self.copy_box_done(copies);
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         self.cx.mark_preamble_fn(&mut proto, f.span.start);
         let has_upvalues = !proto.upvalues.is_empty();
@@ -2099,6 +2153,12 @@ impl<'a> FnCompiler<'a> {
         }
         let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
         self.stash_arrow_child_with_shadows(&names, &a.body);
+        let free = if self.cx.lazy_mode != lazy::LazyMode::Off || !self.copy_boxed.is_empty() {
+            capture::arrow_free_names(a)
+        } else {
+            Vec::new()
+        };
+        let copies = self.copy_box_for_child(&free);
         let enclosing = self.child_enclosing();
         let stub = if self.cx.lazy_mode == lazy::LazyMode::Off {
             None
@@ -2107,7 +2167,7 @@ impl<'a> FnCompiler<'a> {
             let own_strict = matches!(&a.body, ast::ArrowBody::Block(b) if has_use_strict(&b.directives));
             self.lazy_prepare(
                 lazy::LazyKind::Arrow,
-                capture::arrow_free_names(a),
+                free,
                 nested,
                 (a.span.start, a.span.end),
                 name,
@@ -2133,6 +2193,7 @@ impl<'a> FnCompiler<'a> {
                 self.in_derived_ctor,
             )?,
         };
+        self.copy_box_done(copies);
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         self.cx.mark_preamble_fn(&mut proto, a.span.start);

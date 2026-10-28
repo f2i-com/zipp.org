@@ -29,8 +29,9 @@ use rustc_hash::FxHashSet as HashSet;
 use rustc_hash::FxHashSet;
 
 use crate::parse::ast::{
-    Arg, ArrayElem, Arrow, ArrowBody, Class, ClassMember, Expr, ForInit, ForTarget, Function,
-    MemberProp, ObjectMember, Params, Pattern, PropKey, Stmt, Target, VarDecl, VarKind,
+    Arg, ArrayElem, Arrow, ArrowBody, Class, ClassMember, ExportDecl, ExportDefault, Expr, ForInit,
+    ForTarget, Function, ImportSpecifier, Member, MemberProp, ObjectMember, Params, Pattern, PropKey,
+    Stmt, Target, VarDecl, VarKind,
 };
 
 /// The working set of every walk below: names borrowed from the AST, hashed
@@ -671,6 +672,417 @@ pub fn late_box_names(
         .filter(|n| !kept.contains(n.as_str()) && !lexical.contains(n.as_str()))
         .cloned()
         .collect()
+}
+
+/// The captured parameters a nested function can capture BY VALUE: never
+/// written or declared again anywhere in the function (nor in anything nested
+/// in it), captured only by function and arrow EXPRESSIONS, which the compiler
+/// makes on the spot. Such a parameter stays a plain register, and each of
+/// those closures gets a cell of its own holding the value right before it is
+/// made: the binding never changes, so every copy reads what the shared cell
+/// would have, and a call that makes no closure makes no cell. Declarations,
+/// classes and object accessors capture through other paths, so a name they
+/// capture is left out; so is everything when `params` is not simple (a
+/// default could capture a parameter not yet bound) or the body has a
+/// `with`. The caller leaves out scripts, generators, async functions and
+/// bodies that direct-eval or name `arguments`, as for `late_box_names`.
+pub fn copy_box_names(
+    params: &[String],
+    params_ast: Option<&Params>,
+    body: &[Stmt],
+    captured: &HashSet<String>,
+) -> HashSet<String> {
+    if !params_ast.is_some_and(|p| p.simple) || !params.iter().any(|p| captured.contains(p.as_str())) {
+        return HashSet::default();
+    }
+    let mut scan = WriteScan::default();
+    for s in body {
+        scan.stmt(s);
+    }
+    if scan.with_seen {
+        return HashSet::default();
+    }
+    params
+        .iter()
+        .filter(|p| {
+            captured.contains(p.as_str())
+                && !scan.written.contains(p.as_str())
+                && !scan.blocked.contains(p.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// [`copy_box_names`]' walk: every name written (an assignment, update or
+/// for-in/of target, at any depth) or declared (a `var`/`let`/`const`, a
+/// function, class or catch binding, a parameter of a nested function, an
+/// import) anywhere in a body, and the free names of the nested functions
+/// that are not function or arrow expressions. Exhaustive over the tree, as
+/// `expr_refs` is: a missed write would let a closure see a stale copy.
+#[derive(Default)]
+struct WriteScan<'a> {
+    written: Names<'a>,
+    blocked: Names<'a>,
+    with_seen: bool,
+}
+
+impl<'a> WriteScan<'a> {
+    fn stmts(&mut self, v: &'a [Stmt]) {
+        for s in v {
+            self.stmt(s);
+        }
+    }
+
+    fn stmt(&mut self, s: &'a Stmt) {
+        match s {
+            Stmt::Block(v) => self.stmts(v),
+            Stmt::Empty | Stmt::Debugger | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
+            Stmt::Return(e) => {
+                if let Some(e) = e {
+                    self.expr(e);
+                }
+            }
+            Stmt::If { test, cons, alt } => {
+                self.expr(test);
+                self.stmt(cons);
+                if let Some(a) = alt {
+                    self.stmt(a);
+                }
+            }
+            Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+                self.expr(test);
+                self.stmt(body);
+            }
+            Stmt::For { init, test, update, body } => {
+                match init.as_deref() {
+                    Some(ForInit::Var(d)) => self.var_decl(d),
+                    Some(ForInit::Expr(e)) => self.expr(e),
+                    None => {}
+                }
+                if let Some(t) = test {
+                    self.expr(t);
+                }
+                if let Some(u) = update {
+                    self.expr(u);
+                }
+                self.stmt(body);
+            }
+            Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+                match left {
+                    ForTarget::Var(d) => self.var_decl(d),
+                    ForTarget::Target(t) => self.target(t),
+                }
+                self.expr(right);
+                self.stmt(body);
+            }
+            Stmt::Switch { disc, cases } => {
+                self.expr(disc);
+                for c in cases {
+                    if let Some(t) = &c.test {
+                        self.expr(t);
+                    }
+                    self.stmts(&c.body);
+                }
+            }
+            Stmt::Try { block, handler, finalizer } => {
+                self.stmts(block);
+                if let Some(h) = handler {
+                    if let Some(p) = &h.param {
+                        self.pattern(p);
+                    }
+                    self.stmts(&h.body);
+                }
+                if let Some(f) = finalizer {
+                    self.stmts(f);
+                }
+            }
+            Stmt::Labeled { body, .. } => self.stmt(body),
+            Stmt::With { object, body } => {
+                self.with_seen = true;
+                self.expr(object);
+                self.stmt(body);
+            }
+            Stmt::VarDecl(d) => self.var_decl(d),
+            Stmt::FnDecl(f) => self.blocked_function(f),
+            Stmt::ClassDecl(c) => self.blocked_class(c),
+            Stmt::Import(i) => {
+                for sp in &i.specifiers {
+                    match sp {
+                        ImportSpecifier::Default(n) | ImportSpecifier::Namespace(n) => {
+                            self.written.insert(&**n);
+                        }
+                        ImportSpecifier::Named { local, .. } => {
+                            self.written.insert(&**local);
+                        }
+                    }
+                }
+            }
+            Stmt::Export(e) => match &**e {
+                ExportDecl::Decl(s) => self.stmt(s),
+                ExportDecl::Default(ExportDefault::Expr(e)) => self.expr(e),
+                ExportDecl::Default(ExportDefault::Function(f)) => self.blocked_function(f),
+                ExportDecl::Default(ExportDefault::Class(c)) => self.blocked_class(c),
+                ExportDecl::Named { .. } | ExportDecl::All { .. } => {}
+            },
+        }
+    }
+
+    fn var_decl(&mut self, d: &'a crate::parse::ast::VarDecl) {
+        for decl in &d.decls {
+            self.pattern(&decl.id);
+            if let Some(i) = &decl.init {
+                self.expr(i);
+            }
+        }
+    }
+
+    /// A binding pattern: every name it binds is a declaration.
+    fn pattern(&mut self, p: &'a Pattern) {
+        match p {
+            Pattern::Ident(n) => {
+                self.written.insert(&**n);
+            }
+            Pattern::Array(els) => {
+                for el in els.iter().flatten() {
+                    self.pattern(&el.pat);
+                }
+            }
+            Pattern::Object { props, rest } => {
+                for pr in props {
+                    self.prop_key(&pr.key);
+                    self.pattern(&pr.value);
+                }
+                if let Some(r) = rest {
+                    self.pattern(r);
+                }
+            }
+            Pattern::Assign { left, right } => {
+                self.pattern(left);
+                self.expr(right);
+            }
+            Pattern::Rest(p) => self.pattern(p),
+        }
+    }
+
+    fn target(&mut self, t: &'a Target) {
+        match t {
+            Target::Ident { name, .. } => {
+                self.written.insert(&**name);
+            }
+            Target::Member(m) => self.member(m),
+            Target::Call(c) => self.call(c),
+            Target::Array(els) => {
+                for el in els.iter().flatten() {
+                    self.target(&el.target);
+                    if let Some(d) = &el.default {
+                        self.expr(d);
+                    }
+                }
+            }
+            Target::Object { props, rest } => {
+                for p in props {
+                    self.prop_key(&p.key);
+                    self.target(&p.target);
+                    if let Some(d) = &p.default {
+                        self.expr(d);
+                    }
+                }
+                if let Some(r) = rest {
+                    self.target(r);
+                }
+            }
+        }
+    }
+
+    fn prop_key(&mut self, k: &'a PropKey) {
+        match k {
+            PropKey::Computed(e) => self.expr(e),
+            PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) | PropKey::Private(_) => {}
+        }
+    }
+
+    fn member(&mut self, m: &'a Member) {
+        self.expr(&m.object);
+        if let MemberProp::Computed(k) = &m.prop {
+            self.expr(k);
+        }
+    }
+
+    fn call(&mut self, c: &'a crate::parse::ast::CallExpr) {
+        self.expr(&c.callee);
+        self.args(&c.args);
+    }
+
+    fn args(&mut self, args: &'a [Arg]) {
+        for a in args {
+            match a {
+                Arg::Expr(e) | Arg::Spread(e) => self.expr(e),
+            }
+        }
+    }
+
+    /// A function or arrow EXPRESSION's insides (its own name and parameters
+    /// count as declarations).
+    fn function(&mut self, f: &'a Function) {
+        if let Some(n) = &f.name {
+            self.written.insert(&**n);
+        }
+        for p in &f.params.items {
+            self.pattern(p);
+        }
+        self.stmts(&f.body.stmts);
+    }
+
+    /// A nested function some other path makes (a declaration, a method, an
+    /// accessor): what it captures is blocked, and its insides are walked.
+    fn blocked_function(&mut self, f: &'a Function) {
+        fn_node_free(f, &mut self.blocked);
+        self.function(f);
+    }
+
+    fn blocked_class(&mut self, c: &'a Class) {
+        class_free(c, &mut self.blocked);
+        if let Some(n) = &c.name {
+            self.written.insert(&**n);
+        }
+        for d in &c.decorators {
+            self.expr(d);
+        }
+        if let Some(s) = &c.superclass {
+            self.expr(s);
+        }
+        for m in &c.body {
+            match m {
+                ClassMember::Method(m) => {
+                    self.prop_key(&m.key);
+                    for d in &m.decorators {
+                        self.expr(d);
+                    }
+                    self.function(&m.func);
+                }
+                ClassMember::Field(f) => {
+                    self.prop_key(&f.key);
+                    if let Some(v) = &f.value {
+                        self.expr(v);
+                    }
+                    for d in &f.decorators {
+                        self.expr(d);
+                    }
+                    if let Some(a) = &f.accessor {
+                        self.function(&a.getter);
+                        self.function(&a.setter);
+                    }
+                }
+                ClassMember::StaticBlock(v) => self.stmts(v),
+            }
+        }
+    }
+
+    fn expr(&mut self, e: &'a Expr) {
+        match e {
+            Expr::Ident(_)
+            | Expr::This
+            | Expr::Super
+            | Expr::Null
+            | Expr::Bool(_)
+            | Expr::Num(_)
+            | Expr::BigInt(_)
+            | Expr::Str(_)
+            | Expr::Regex { .. }
+            | Expr::NewTarget
+            | Expr::ImportMeta => {}
+            Expr::Array(els, _) => {
+                for el in els.iter().flatten() {
+                    match el {
+                        ArrayElem::Expr(e) | ArrayElem::Spread(e) => self.expr(e),
+                    }
+                }
+            }
+            Expr::Object(members, _) => {
+                for m in members {
+                    match m {
+                        ObjectMember::Prop { key, value, init, .. } => {
+                            self.prop_key(key);
+                            self.expr(value);
+                            if let Some(i) = init {
+                                self.expr(i);
+                            }
+                        }
+                        ObjectMember::Method { key, func }
+                        | ObjectMember::Get { key, func }
+                        | ObjectMember::Set { key, func } => {
+                            self.prop_key(key);
+                            self.blocked_function(func);
+                        }
+                        ObjectMember::Spread(e) => self.expr(e),
+                    }
+                }
+            }
+            Expr::Template(t) => {
+                for e in &t.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::TaggedTemplate { tag, quasi } => {
+                self.expr(tag);
+                for e in &quasi.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::Unary { arg, .. } => self.expr(arg),
+            Expr::Update { target, .. } => self.target(target),
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                self.expr(left);
+                self.expr(right);
+            }
+            Expr::Assign { target, value, .. } => {
+                self.target(target);
+                self.expr(value);
+            }
+            Expr::Cond { test, cons, alt } => {
+                self.expr(test);
+                self.expr(cons);
+                self.expr(alt);
+            }
+            Expr::Call(c) => self.call(c),
+            Expr::New { callee, args, .. } => {
+                self.expr(callee);
+                self.args(args);
+            }
+            Expr::Member(m) => self.member(m),
+            Expr::Chain(inner) => self.expr(inner),
+            Expr::Seq(v) => {
+                for e in v {
+                    self.expr(e);
+                }
+            }
+            Expr::Arrow(a) => {
+                for p in &a.params.items {
+                    self.pattern(p);
+                }
+                match &a.body {
+                    ArrowBody::Expr(e) => self.expr(e),
+                    ArrowBody::Block(b) => self.stmts(&b.stmts),
+                }
+            }
+            Expr::Function(f) => self.function(f),
+            Expr::Class(c) => self.blocked_class(c),
+            Expr::Yield { arg, .. } => {
+                if let Some(a) = arg {
+                    self.expr(a);
+                }
+            }
+            Expr::Await(a) => self.expr(a),
+            Expr::PrivateIn { object, .. } => self.expr(object),
+            Expr::ImportCall { spec, options, .. } => {
+                self.expr(spec);
+                if let Some(o) = options {
+                    self.expr(o);
+                }
+            }
+        }
+    }
 }
 
 /// The free names of a closure expression: what a `return` of it must box

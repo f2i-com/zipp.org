@@ -697,6 +697,11 @@ struct FnCompiler<'a> {
     /// returned closures capture them (`capture::late_box_names`): plain
     /// registers, boxed by the `return` that makes such a closure.
     late_boxed: HashSet<String>,
+    /// Captured parameters left out of `captured` because nothing writes them
+    /// and only function and arrow expressions capture them
+    /// (`capture::copy_box_names`): plain registers, copied into a fresh cell
+    /// for each such closure as it is made (`copy_box_for_child`).
+    copy_boxed: HashSet<String>,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,

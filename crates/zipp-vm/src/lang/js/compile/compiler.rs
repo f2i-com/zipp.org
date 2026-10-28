@@ -45,6 +45,28 @@ fn arrow_lexical_unbox_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_COPY_BOX=1` boxes every captured parameter at entry again,
+/// instead of copying an unwritten one into each closure that captures it
+/// (`capture::copy_box_names`).
+#[inline]
+fn copy_box_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_COPY_BOX").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
 impl Compiler {
     /// Whether `name` names a binding of the eval's VARIABLE ENVIRONMENT — the
     /// calling function's own activation. Such a name is re-used by a top-level
@@ -476,22 +498,33 @@ impl Compiler {
         }
         // Bindings only directly returned closures capture stay plain until
         // the `return` that makes one (`capture::late_box_names`).
-        let late_boxed = if is_script
+        let box_later = !(is_script
             || is_generator
             || is_async
             || body_refs_eval
             || body_refs_arguments
-            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa))
-        {
-            HashSet::default()
-        } else {
+            || params_ast.is_some_and(|pa| capture::params_reference("arguments", pa)));
+        let late_boxed = if box_later {
             capture::late_box_names(params_ast, body, &captured)
+        } else {
+            HashSet::default()
         };
         for n in &late_boxed {
             captured.remove(n);
         }
+        // Parameters nothing writes, which function and arrow expressions
+        // capture by value (`capture::copy_box_names`).
+        let copy_boxed = if box_later && copy_box_enabled() {
+            capture::copy_box_names(params, params_ast, body, &captured)
+        } else {
+            HashSet::default()
+        };
+        for n in &copy_boxed {
+            captured.remove(n);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.late_boxed = late_boxed;
+        fc.copy_boxed = copy_boxed;
         if body_refs_eval {
             fc.box_all_locals = true;
         }
