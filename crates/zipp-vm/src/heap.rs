@@ -9168,15 +9168,11 @@ impl Heap {
     /// The mirror of an object given its class after its allocation
     /// (`ctor_store_new`): the fid word names the class (`FID_MIRROR_CLASS`),
     /// as `refresh_mirror` would write it, without re-reading the slot.
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn note_instance_class(&mut self, idx: u32, class: u32) {
         self.hot_mirror[idx as usize].fid = class_mirror_fid(class);
     }
-
-    #[cfg(not(feature = "jit"))]
-    #[inline(always)]
-    pub(crate) fn note_instance_class(&mut self, _idx: u32, _class: u32) {}
 
 
     /// W9: enter a static-pretenure scope (docs/archive/NURSERY_DESIGN.md §4) — until the
