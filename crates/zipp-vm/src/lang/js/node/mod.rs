@@ -98,6 +98,12 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         self.node_installed = true;
+        // The bootstrap is JavaScript the JIT may compile: pin the register
+        // file before it runs, as each entry pins it before native code can
+        // hold a window pointer (`reserve_jit_regs`; the entry's own call is
+        // then a no-op).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.reserve_jit_regs();
         if LIVE.load(Ordering::Relaxed) && self.console_sink.is_none() {
             self.console_sink = Some(Box::new(|stream, line| {
                 use std::io::Write;
