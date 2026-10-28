@@ -98,6 +98,8 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         match id {
+            #[cfg(feature = "webassembly")]
+            native::WASM_LAZY_GET => self.wasm_lazy_get(state),
             native::DEC_ADD_INITIALIZER => {
                 let class = state[0];
                 let which = state[1].as_f64() as u8;

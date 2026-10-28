@@ -3521,6 +3521,15 @@ pub struct Vm<'p> {
     /// The host object, and the CommonJS loader (both roots).
     pub(crate) node_host: Value,
     pub(crate) node_cjs: Value,
+    /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
+    #[cfg(feature = "webassembly")]
+    pub(crate) wasm: Option<Box<webassembly::WasmRuntime>>,
+    /// The `WebAssembly` namespace object, and the members its accessors hand
+    /// out once the layer has loaded (both roots).
+    #[cfg(feature = "webassembly")]
+    pub(crate) wasm_ns: Value,
+    #[cfg(feature = "webassembly")]
+    pub(crate) wasm_layer: Value,
     /// The first exception a `setTimeout` callback let escape. It ends the
     /// event loop and becomes the program's error when the main job itself
     /// completed normally (Node's uncaught-exception exit). Rooted.
@@ -3628,6 +3637,8 @@ mod indexing_date;
 pub mod instrument;
 mod mathjson;
 mod natives;
+#[cfg(feature = "webassembly")]
+pub(crate) mod webassembly;
 mod props;
 mod setup;
 pub(crate) use builtins::builtin_stats;

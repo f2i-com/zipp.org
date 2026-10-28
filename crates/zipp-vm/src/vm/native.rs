@@ -180,6 +180,13 @@ pub const NODE_HOST_CJS: u16 = 2117;
 pub const NODE_HOST_INSPECT: u16 = 2118;
 pub const NODE_HOST_READ_STDIN: u16 = 2119;
 pub const NODE_HOST_TIMER: u16 = 2120;
+/// `WebAssembly`'s runtime (vm/webassembly): the layer's one native,
+/// `op(name, ...args)`.
+#[cfg(feature = "webassembly")]
+pub const WASM_HOST_OP: u16 = 2121;
+/// A `WebAssembly` member's lazy accessor (a `NativeClosure` over its name).
+#[cfg(feature = "webassembly")]
+pub const WASM_LAZY_GET: u16 = 2122;
 pub const FR_REGISTER: u16 = 298;
 pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
@@ -1773,6 +1780,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         NODE_HOST_INSPECT => ("inspect", 1),
         NODE_HOST_READ_STDIN => ("readStdin", 2),
         NODE_HOST_TIMER => ("timer", 2),
+        #[cfg(feature = "webassembly")]
+        WASM_HOST_OP => ("op", 1),
         FR_REGISTER => ("register", 2),
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),

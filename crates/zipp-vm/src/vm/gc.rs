@@ -559,6 +559,21 @@ impl Vm<'_> {
         root_val!(self.node_tick_hook);
         root_val!(self.node_host);
         root_val!(self.node_cjs);
+        // WebAssembly: the namespace, its members, the JavaScript functions
+        // instances import, and the buffers handed out over memories.
+        #[cfg(feature = "webassembly")]
+        {
+            root_val!(self.wasm_ns);
+            root_val!(self.wasm_layer);
+            if let Some(rt) = &self.wasm {
+                for &v in &rt.imports {
+                    root_val!(v);
+                }
+                for ab in rt.buffer_roots() {
+                    root_idx!(ab);
+                }
+            }
+        }
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
         // roots just like the region-embedded constant strings below.

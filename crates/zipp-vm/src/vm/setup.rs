@@ -2560,6 +2560,25 @@ impl<'p> Vm<'p> {
             self.setup_define(idx, "@@toStringTag", tag, data_nw);
             idx
         };
+        // WebAssembly: a namespace of lazy accessors (vm/webassembly).
+        #[cfg(feature = "webassembly")]
+        let wasm_ns = {
+            let names: Vec<Value> = crate::vm::webassembly::MEMBERS
+                .iter()
+                .map(|name| self.setup_str(name))
+                .collect();
+            let idx = self.wasm_namespace(obj_proto, &names);
+            let tag = self.setup_str("WebAssembly");
+            let data_nw = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            self.setup_define(idx, "@@toStringTag", tag, data_nw);
+            idx
+        };
         // DisposableStack (ES2026 explicit resource management): use/adopt/defer/
         // dispose/move methods, a `disposed` accessor, [Symbol.dispose] (= dispose),
         // and @@toStringTag "DisposableStack".
@@ -2926,6 +2945,8 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "wasm-lite"))]
             ("Intl", self.intl_ns),
             ("Atomics", atomics_ns),
+            #[cfg(feature = "webassembly")]
+            ("WebAssembly", wasm_ns),
             ("DisposableStack", self.disposablestack_ctor),
             ("AsyncDisposableStack", self.asyncdisposablestack_ctor),
             ("SuppressedError", self.suppressederror_ctor),

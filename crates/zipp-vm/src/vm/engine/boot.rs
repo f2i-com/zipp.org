@@ -793,6 +793,12 @@ impl<'p> Vm<'p> {
             node_tick_pending: false,
             node_host: Value::UNDEFINED,
             node_cjs: Value::UNDEFINED,
+            #[cfg(feature = "webassembly")]
+            wasm: None,
+            #[cfg(feature = "webassembly")]
+            wasm_ns: Value::UNDEFINED,
+            #[cfg(feature = "webassembly")]
+            wasm_layer: Value::UNDEFINED,
             uncaught_timer_throw: None,
         }
     }
