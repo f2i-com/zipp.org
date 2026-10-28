@@ -139,6 +139,63 @@ pub(crate) extern "win64" fn jit_end_finally(vm: *mut core::ffi::c_void, kind_bi
     }
 }
 
+/// What [`jit_end_finally_route`] returns for a normal completion: go on to
+/// the next op.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const END_FINALLY_NEXT: u64 = u64::MAX;
+
+/// `JumpFinally { target, floor }` in a Tier C body — a `break` or
+/// `continue` leaving `try` blocks (a `for-of`'s body is one): the
+/// interpreter arm's routing (`Vm::route_jump_through_finally`) on the
+/// activation's own frame (handler-op bodies take only frame-backed
+/// entries), which pops the handlers above `floor` and enters the first
+/// `finally` with a jump completion, or reaches `target`. Returns the ip to
+/// go on at. Allocates nothing and runs no user code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_jump_finally(vm: *mut core::ffi::c_void, target: u64, floor: u64) -> u64 {
+    // SAFETY: the running VM; the calling body holds no borrow of it.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let target = target as u32;
+    u64::from(vm.route_jump_through_finally(target, floor as usize).unwrap_or(target))
+}
+
+/// `EndFinally { kind_reg, val_reg }` in a Tier C body, as the interpreter
+/// arm resumes the completion its `finally` was entered with: a normal one
+/// goes on to the next op ([`END_FINALLY_NEXT`]), a `break`/`continue` jump
+/// goes on routing toward its target (`jit_jump_finally`'s) and returns the
+/// ip to go on at, and a return or throw declines (`SELF_CALL_DEOPT`) for the
+/// interpreter's unwinding, before any effect.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_end_finally_route(
+    vm: *mut core::ffi::c_void,
+    kind_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let kind = Value::from_bits(kind_bits);
+    if !kind.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let raw = kind.as_int();
+    match raw & 3 {
+        0 => END_FINALLY_NEXT,
+        3 => {
+            let val = Value::from_bits(val_bits);
+            if !val.is_int() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            // SAFETY: as `jit_jump_finally`'s.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            let target = val.as_int() as u32;
+            let floor = (raw >> 2) as usize;
+            u64::from(vm.route_jump_through_finally(target, floor).unwrap_or(target))
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// `IterCloseFinally { iter, kind_reg }` — normal and jump completions do not
 /// close (the loop exhausted or re-enters); return/throw completions decline
 /// (IteratorClose runs observable user code).

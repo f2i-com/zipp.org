@@ -1298,12 +1298,15 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // activation) and declines observable protocol steps purely.
             // Functions with handler ops never receive cross entries, so
             // frame-free activations cannot reach the bracket helpers.
+            // `JumpFinally` (a `break`/`continue` leaving the bracket) routes
+            // through the frame's handlers as the interpreter does.
             Instr::GetIterator { .. }
             | Instr::IterPrime { .. }
             | Instr::IterNext { .. }
             | Instr::PushFinally { .. }
             | Instr::PopFinally
             | Instr::EndFinally { .. }
+            | Instr::JumpFinally { .. }
             | Instr::IterCloseFinally { .. }
             | Instr::ObjectKeys { .. } => {
                 if !crate::vm::tierc_iter_enabled() {
@@ -1828,7 +1831,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             } => (u2(key, obj), Some(dst)),
             // The finally bracket manipulates frame state only; EndFinally and
             // IterCloseFinally read their completion registers on either path.
-            Instr::PushFinally { .. } | Instr::PopFinally => (u0(), None),
+            Instr::PushFinally { .. } | Instr::PopFinally | Instr::JumpFinally { .. } => (u0(), None),
             Instr::EndFinally { kind_reg, val_reg } => (u2(kind_reg, val_reg), None),
             Instr::IterCloseFinally { iter, kind_reg } => (u2(iter, kind_reg), None),
             // IterNext writes three registers, which does not fit the
@@ -2134,7 +2137,9 @@ fn plan_tierc_block_sroa_site(
             | Instr::JumpIfFalse { .. }
             | Instr::JumpIfTrue { .. }
             | Instr::JumpIfNotLt { .. }
-            | Instr::JumpIfNotLe { .. } => return None,
+            | Instr::JumpIfNotLe { .. }
+            | Instr::JumpFinally { .. }
+            | Instr::EndFinally { .. } => return None,
             _ => {}
         }
     }
@@ -2738,7 +2743,13 @@ fn do_mask_passes(
             }
             let out = s | defs[ip].map_or(0, |d| 1u64 << d);
             let (s1, s2) = match code[ip] {
-                Instr::Jump { target } => (Some(target as usize), None),
+                // A `break`/`continue` out of `try` blocks reaches its target or
+                // a `finally` entry; a handler's entry (reached by such a jump or
+                // a throw from anywhere in its block) gets the state at its push,
+                // which every point of the block's has.
+                Instr::Jump { target } | Instr::JumpFinally { target, .. } => (Some(target as usize), None),
+                Instr::PushFinally { target, .. } => (Some(ip + 1), Some(target as usize)),
+                Instr::PushHandler { catch_target, .. } => (Some(ip + 1), Some(catch_target as usize)),
                 Instr::JumpIfFalse { target, .. }
                 | Instr::JumpIfTrue { target, .. }
                 | Instr::JumpIfNotLt { target, .. }
@@ -2890,7 +2901,13 @@ fn do_wide_mask_passes(
                 out[d / 64] |= 1u64 << (d % 64);
             }
             let (s1, s2) = match code[ip] {
-                Instr::Jump { target } => (Some(target as usize), None),
+                // A `break`/`continue` out of `try` blocks reaches its target or
+                // a `finally` entry; a handler's entry (reached by such a jump or
+                // a throw from anywhere in its block) gets the state at its push,
+                // which every point of the block's has.
+                Instr::Jump { target } | Instr::JumpFinally { target, .. } => (Some(target as usize), None),
+                Instr::PushFinally { target, .. } => (Some(ip + 1), Some(target as usize)),
+                Instr::PushHandler { catch_target, .. } => (Some(ip + 1), Some(catch_target as usize)),
                 Instr::JumpIfFalse { target, .. }
                 | Instr::JumpIfTrue { target, .. }
                 | Instr::JumpIfNotLt { target, .. }
@@ -3572,6 +3589,24 @@ pub(crate) fn compile_proto_mem(
             Instr::JumpIfTrue { cond, target } if cond == dst => Some((false, target)),
             _ => None,
         }
+    };
+    // Where a `JumpFinally`'s or an `EndFinally`'s routing can land: every
+    // `break`/`continue` target leaving `try` blocks and every `finally`
+    // entry (`emit_ip_dispatch`). All are jump targets, so both caches start
+    // empty there.
+    let route_landings: Vec<u32> = {
+        let mut v: Vec<u32> = proto
+            .code
+            .iter()
+            .filter_map(|i| match *i {
+                Instr::JumpFinally { target, .. } | Instr::PushFinally { target, .. } => Some(target),
+                _ => None,
+            })
+            .filter(|&t| (t as usize) < n)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     };
     // Where the caches (`FloatCache`, `RecvCache`) start empty: every jump
     // target and yield head, and every op a fused emission jumps to past the
@@ -4382,20 +4417,40 @@ pub(crate) fn compile_proto_mem(
                     ; jmp => epilogue
                 );
             }
-            Instr::EndFinally { kind_reg, .. } => {
-                // Only the NORMAL completion falls through natively; abrupt
-                // completions decline into the interpreter's routing.
-                let helper = crate::vm::jit_end_finally as *const () as usize;
+            Instr::EndFinally { kind_reg, val_reg } => {
+                // A normal completion goes on to the next op and a
+                // `break`/`continue` jump goes on routing toward its target
+                // (`jit_end_finally_route`); a return or a throw declines into
+                // the interpreter's unwinding.
+                let helper = crate::vm::jit_end_finally_route as *const () as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]
+                    ; mov r8, [rbx + dreg(val_reg)]
                     ; mov rax, QWORD helper as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
+                    ; cmp rax, -1                         // END_FINALLY_NEXT
+                    ; je => labels[ip + 1]
                 );
+                emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::JumpFinally { target, floor } => {
+                // The interpreter arm's routing (`jit_jump_finally`): the
+                // target, or the first `finally` on the way, entered with a
+                // jump completion.
+                let helper = crate::vm::jit_jump_finally as *const () as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, target as i32
+                    ; mov r8d, floor as i32
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                );
+                emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
             }
             Instr::IterCloseFinally { kind_reg, .. } => {
                 // Normal/jump completions do not close; return/throw decline
@@ -8084,6 +8139,28 @@ fn emit_class_read_guard(
         ; jne => miss
         ; cmp DWORD [rdi + epoch_off], lane.epoch as i32
         ; jne => miss
+    );
+}
+
+/// Go on at the ip in eax, which a `JumpFinally`'s or an `EndFinally`'s
+/// routing returned: the label of whichever of `landings` it is (every
+/// `break`/`continue` target and `finally` entry of the body), else the
+/// interpreter, at that ip (the routing is done; it must not run again).
+fn emit_ip_dispatch(
+    ops: &mut dynasmrt::x64::Assembler,
+    labels: &[dynasmrt::DynamicLabel],
+    landings: &[u32],
+    epilogue: dynasmrt::DynamicLabel,
+) {
+    for &l in landings {
+        dynasm!(ops
+            ; cmp eax, l as i32
+            ; je => labels[l as usize]
+        );
+    }
+    dynasm!(ops
+        ; mov DWORD [rsi], eax
+        ; jmp => epilogue
     );
 }
 
