@@ -7252,12 +7252,43 @@ pub(crate) fn compile_proto_mem(
         "Tier C ic_site cursor desynced from reserved sites"
     );
 
+    // `ZIPP_PERF_MAP=ops` (Linux): where each op's code begins, so a profile
+    // of this body can be laid over its bytecode.
+    let op_offsets: Vec<(usize, usize)> = if perf_map_ops() {
+        (0..n)
+            .filter_map(|ip| ops.labels().resolve_dynamic(labels[ip]).ok().map(|o| (ip, o.0)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    if !op_offsets.is_empty() {
+        write_op_offsets(func_id, entry_ptr as u64, &proto.code, &op_offsets);
+    }
     Some(JitFn {
         _buf: buf,
         entry: entry_ptr,
         self_binding: None,
         int_tier: false,
     })
+}
+
+/// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).
+fn perf_map_ops() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops")
+}
+
+/// Append `func_id body_start ip offset op` lines for one Tier C body to
+/// `/tmp/zipp-ops-<pid>.txt`.
+fn write_op_offsets(func_id: u32, start: u64, code: &[Instr], offsets: &[(usize, usize)]) {
+    use std::io::Write;
+    let path = format!("/tmp/zipp-ops-{}.txt", std::process::id());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        for &(ip, off) in offsets {
+            let op = format!("{:?}", code[ip]);
+            let name = op.split([' ', '{', '(']).next().unwrap_or("");
+            let _ = writeln!(f, "{func_id} {start:x} {ip} {off:x} {name}");
+        }
+    }
 }
