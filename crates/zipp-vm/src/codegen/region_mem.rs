@@ -4978,6 +4978,13 @@ pub(crate) fn compile_region_mem(
                     | ((next as u64) << 32)
                     | ((value_dst as u64) << 16)
                     | done_dst as u64;
+                // A dense Array's step through its mirror first, with no call
+                // (nothing allocates, so nothing pinned moves).
+                let step_done = ops.new_dynamic_label();
+                let native_step = crate::codegen::iter_mirror_step_enabled();
+                if native_step {
+                    emit_arr_mirror_iter_step(&mut ops, value_dst, done_dst, iter, idx, step_done);
+                }
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rbx                        // frame register window
@@ -4999,6 +5006,9 @@ pub(crate) fn compile_region_mem(
                     emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                if native_step {
+                    dynasm!(ops ; => step_done);
+                }
             }
             Instr::PushFinally {
                 target,

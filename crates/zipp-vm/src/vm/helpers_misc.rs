@@ -8118,6 +8118,15 @@ pub(crate) extern "win64" fn jit_iter_next(
                     *regs.add(done_dst) = Value::bool(false).bits();
                     *regs.add(idx_reg) = Value::int((cur + 1) as i32).bits();
                 }
+                // The dense store answered alone: settle the array's mirror
+                // entry, under `jit_get_index`'s conditions (the test above
+                // has excluded a virtual length), so the emitted step
+                // (`emit_arr_mirror_iter_step`) serves the next ones.
+                if (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&it_heap_idx))
+                    && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&it_heap_idx))
+                {
+                    vm.heap.repair_arr_mirror(it_heap_idx);
+                }
                 iterstats::native_step();
                 return 0;
             }

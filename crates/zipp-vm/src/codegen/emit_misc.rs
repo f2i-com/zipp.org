@@ -1467,6 +1467,79 @@ pub(crate) fn emit_arr_mirror_set(
     );
 }
 
+/// A for-of step (`IterNext`) over a dense Array, emitted: the helper's first
+/// fast path (`jit_iter_next`'s positional walk) through the array mirror,
+/// with no call. Taken only with no collection pending and none under
+/// stress (the helper's step is the loop's safe point), an iterated Array
+/// whose mirror entry is live (a dense store with no element overlay, no
+/// arguments mapping and no virtual length, so its length is the store's),
+/// and an Int cursor that is not negative. Below the length a present
+/// element is the step's value, `done` false and the cursor one further; at
+/// the length the step writes `done` true alone, as the helper's exhaustion
+/// does. A hole, a dead entry and everything else fall through to the
+/// helper with rax, rcx, rdx, r8, r9 and r10 clobbered.
+pub(crate) fn emit_arr_mirror_iter_step(
+    ops: &mut dynasmrt::x64::Assembler,
+    value_dst: u16,
+    done_dst: u16,
+    iter: u16,
+    idx: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
+    };
+    let miss = ops.new_dynamic_label();
+    let exhausted = ops.new_dynamic_label();
+    dynasm!(ops
+        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+        ; jne => miss
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne => miss
+        ; mov rax, [rbx + dreg(iter)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => miss
+        ; mov rdx, [rbx + dreg(idx)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => miss
+        ; test edx, edx
+        ; js => miss                          // a negative cursor: the helper's
+        ; mov edx, edx
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + JIT_ARR_MIRROR_LEN_OFFSET as i32]
+        ; jae => miss
+        ; mov r9, [rdi + JIT_ARR_MIRROR_RAW_OFFSET as i32]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; mov r8, [r9]
+        ; test r8, r8
+        ; jz => miss                          // a dead entry ([0, 0])
+        ; cmp rdx, [r9 + 8]
+        ; jae => exhausted
+        ; mov rax, [r8 + rdx * 8]
+        ; mov r10, QWORD ARR_HOLE_BITS as i64
+        ; cmp rax, r10
+        ; je => miss                          // a hole reads the chain
+        ; mov [rbx + dreg(value_dst)], rax
+        ; mov r10, QWORD BOOL_TAG as i64
+        ; mov [rbx + dreg(done_dst)], r10     // false
+        ; inc edx
+        ; mov r10, QWORD INT_TAG as i64
+        ; or rdx, r10
+        ; mov [rbx + dreg(idx)], rdx
+        ; jmp => done
+        ; => exhausted
+        ; mov r10, QWORD (BOOL_TAG | 1) as i64
+        ; mov [rbx + dreg(done_dst)], r10     // true; the value is left
+        ; jmp => done
+        ; => miss
+    );
+}
+
 /// Emit a region op's bail block: the success path skips it; the block records
 /// the resume ip into `[rsi]` and jumps to the shared epilogue (which restores
 /// the 4-push/40-byte frame). Unlike the function JIT no result is set — a

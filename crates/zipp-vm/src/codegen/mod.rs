@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_ITER_MIRROR_STEP=1` sends every compiled for-of step to
+    /// `jit_iter_next` again, without the emitted dense-Array step through
+    /// the array mirror (`emit_arr_mirror_iter_step`).
+    fn iter_mirror_step_enabled() = "ZIPP_NO_ITER_MIRROR_STEP"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CALL_CROSS=1` makes an inlined leaf's fallback take the call
     /// IC at once, without first trying the native cross call
     /// (`jit_call_ic_cross`).
