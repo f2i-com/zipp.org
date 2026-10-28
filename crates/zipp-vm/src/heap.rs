@@ -6072,7 +6072,10 @@ impl From<Vec<u8>> for AbData {
 
 impl std::ops::Deref for AbData {
     type Target = [u8];
-    #[inline]
+    // Always inline: every TypedArray and DataView element access reads its
+    // buffer through here, and with the `External` arm the optimizer stopped
+    // inlining it (an out-of-line call per access, dataview-binary +4.6%).
+    #[inline(always)]
     fn deref(&self) -> &[u8] {
         match self {
             AbData::Local(v) => v,
@@ -6088,7 +6091,8 @@ impl std::ops::Deref for AbData {
 }
 
 impl std::ops::DerefMut for AbData {
-    #[inline]
+    // As `deref`.
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut [u8] {
         match self {
             AbData::Local(v) => v,
