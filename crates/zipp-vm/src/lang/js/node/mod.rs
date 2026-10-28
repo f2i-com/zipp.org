@@ -423,7 +423,9 @@ impl<'p> Vm<'p> {
             }
             NODE_HOST_HRTIME => {
                 // `[seconds, nanoseconds]` since a fixed point of this process.
-                let d = crate::vm::clock::Instant::now().duration_since(node_epoch());
+                // A difference, which the wasm `Instant` has as well (it has no
+                // `duration_since`); both saturate at zero.
+                let d = crate::vm::clock::Instant::now() - node_epoch();
                 let items = vec![
                     Value::num(d.as_secs() as f64),
                     Value::num(d.subsec_nanos() as f64),
