@@ -4,8 +4,8 @@ Zipp is one engine for several languages. The core is language-neutral in
 structure and JavaScript's in meaning: one bytecode, one VM, one heap and
 collector, one set of native tiers. A language is a frontend that compiles
 its source to that bytecode, plus whatever it adds where its semantics are
-not JavaScript's. JavaScript and Python are built in; this page is how they
-fit together and how another language would.
+not JavaScript's. JavaScript, TypeScript and Python are built in; this page
+is how they fit together and how another language would.
 
 ## Layout
 
@@ -18,7 +18,10 @@ crates/zipp-vm/src/
   codegen/                  the native tiers (x86-64; codegen_aarch64.rs)
   lang/
     mod.rs                  the `Language` trait and the table of languages
-    js/                     JavaScript: parse/, compile/, front.rs, mod.rs
+    js/                     JavaScript: parse/ (jsx.rs: JSX), compile/, node/,
+                            front.rs, mod.rs
+    ts/                     TypeScript: types.rs, expr.rs, decl.rs, class.rs,
+                            lower.rs, legacy.rs, elide.rs, config.rs, mod.rs
     python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
                             vm/, jit/, mod.rs
 ```
@@ -94,3 +97,57 @@ need nothing from a language.
   method, a getter) goes to the executor or the runtime, and through the
   VM's ordinary call protocol, which owns re-entrancy, the recursion limit
   and the GC's safe points.
+
+## TypeScript
+
+TypeScript is the one language that needs nothing past the parser. It is a
+dialect of JavaScript's grammar: the JavaScript parser reads a `.ts`, `.mts`
+or `.cts` file with `ParseOptions::typescript` on and calls into `lang/ts`
+at each place the grammars part, and the tree that comes out is the one the
+same program written in JavaScript gives. There is no transpile step and no
+JavaScript text; the compiler, the VM and the JIT run it as they run
+JavaScript.
+
+- **Types are read and dropped** (`types.rs`): a recursive descent over
+  tsc's type grammar that checks what it reads and builds nothing.
+  Annotations, type parameters and arguments, `as`, `satisfies`, `!`,
+  `interface`, `type`, `declare`, overload signatures and abstract members
+  leave no trace.
+- **Constructs with a run-time meaning are lowered** (`lower.rs`) to the
+  tree of the JavaScript tsc emits: `enum` (constant-folded, reverse-mapped;
+  a `const enum`'s members are inlined where read), `namespace`, constructor
+  parameter properties, `import x = …` and `export = …`.
+- **Imports used only as types are elided** (`elide.rs`), as tsc elides
+  them; a `.ts` module's `export { T } from` of a name its dependency does
+  not export (a type) is left out rather than a link error.
+- **`tsconfig.json` decides class fields** (`config.rs`): with
+  `useDefineForClassFields` (or a target of ES2022 or later) fields are
+  defined on the instance; otherwise, and with no config, they are assigned
+  in the constructor, which is tsc's default.
+- **`experimentalDecorators` are tsc's legacy decorators** (`legacy.rs`):
+  with the option on, a decorated class lowers to the calls tsc emits
+  (`__decorate`, `__param`, a decorated class's references inside its body
+  read the decorated class), and with `emitDecoratorMetadata` the
+  `design:type`, `design:paramtypes` and `design:returntype` entries follow,
+  types serialized as tsc serializes them. Without the option decorators are
+  the standard ones.
+- **Modules resolve the way TypeScript names them**: `./x` finds `./x.ts`,
+  `./x.tsx` or `./x/index.ts`, and `./x.js` finds `./x.ts` or `./x.tsx`.
+- **JSX** (`.tsx`, and `.jsx` read the same way without types) is read by
+  the JavaScript parser (`lang/js/parse/jsx.rs`) and lowered as it is read,
+  to the calls tsc emits for the project's `jsx` setting: React's automatic
+  runtime (`_jsx`/`_jsxs` imported from `<jsxImportSource>/jsx-runtime`,
+  `react-jsxdev`'s `jsxDEV`) or the classic `React.createElement` through
+  `jsxFactory` and `jsxFragmentFactory`, with a file's `@jsx`, `@jsxFrag`,
+  `@jsxImportSource` and `@jsxRuntime` pragmas over the config. With no
+  `jsx` set, or `preserve` (which leaves lowering to a bundler, Next.js's
+  with the automatic runtime), it is the automatic runtime. Text is trimmed
+  and character references decoded as tsc does; a tag's type arguments
+  (`<Select<Opt> />`) are dropped, and in a `.tsx` file `<T>` starts an
+  element, so a generic arrow is written `<T,>(x) => x` as tsc requires.
+
+The ambiguous prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against
+`f < T > (x)`, `<T>x` against `<T>(x) => …`) are settled as tsc settles
+them, with the parser's snapshot as the fallback point. `zipp ts file.ts`
+(or `zipp file.ts`, `zipp app.tsx`, `zipp app.jsx`) runs a file; `zipp
+ts-sweep <paths>` parses a corpus and groups the failures.

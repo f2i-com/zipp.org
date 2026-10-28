@@ -1047,6 +1047,13 @@ impl<'p> Vm<'p> {
                         if let Some(&p) = self.prototypes.get(&l) {
                             return ClassLookup::Live(Value::heap(p));
                         }
+                        // A level whose prototype was never made still owns
+                        // its `constructor` (the class), which no table holds
+                        // and the farther prototype resumed at would answer
+                        // with its own class instead.
+                        if key == "constructor" {
+                            return ClassLookup::Method(Value::heap(l));
+                        }
                         if l == cidx {
                             break;
                         }

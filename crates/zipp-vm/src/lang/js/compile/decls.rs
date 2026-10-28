@@ -342,13 +342,13 @@ impl<'a> FnCompiler<'a> {
                 };
                 // Iterators of for-of frames BETWEEN here and the target close
                 // (innermost first); the target loop's own exit path closes its.
-                let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
+                let iters: Vec<(Reg, bool)> = self.loop_ctx[idx + 1..]
                     .iter()
                     .rev()
-                    .filter_map(|c| c.iter_close)
+                    .filter_map(|c| c.iter_close.map(|r| (r, c.iter_async)))
                     .collect();
-                for it in iters {
-                    self.emit(Instr::IterClose { iter: it });
+                for (it, is_await) in iters {
+                    self.emit_iter_close(it, is_await);
                 }
                 self.emit_loop_jump(idx, true);
             }
@@ -371,13 +371,13 @@ impl<'a> FnCompiler<'a> {
                         );
                     }
                 };
-                let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
+                let iters: Vec<(Reg, bool)> = self.loop_ctx[idx + 1..]
                     .iter()
                     .rev()
-                    .filter_map(|c| c.iter_close)
+                    .filter_map(|c| c.iter_close.map(|r| (r, c.iter_async)))
                     .collect();
-                for it in iters {
-                    self.emit(Instr::IterClose { iter: it });
+                for (it, is_await) in iters {
+                    self.emit_iter_close(it, is_await);
                 }
                 self.emit_loop_jump(idx, false);
             }
@@ -472,11 +472,9 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
-                // Evaluate the return value FIRST (its side effects precede the
-                // iterator closes), then run IteratorClose on every enclosing for-of /
-                // for-await-of (innermost first) — a `return` is an abrupt completion
-                // that closes the iterator (a throwing `return()` then propagates,
-                // discarding the value). `break`/`throw` already close via their paths.
+                // The return value is evaluated first; the enclosing loops'
+                // close handlers then close their iterators (a throwing
+                // `return()` propagates, discarding the value).
                 let v = match argument {
                     Some(arg) => {
                         let v = self.expr(arg)?;
@@ -496,20 +494,9 @@ impl<'a> FnCompiler<'a> {
                     }
                     None => None,
                 };
-                // A sync for-of closes on a return completion from its own
-                // `IterCloseFinally` handler — which runs AFTER the body's `try`
-                // handlers, where the spec puts it. Emitting here as well would
-                // close twice, so only for-await frames (no such handler) do.
-                let iters: Vec<Reg> = self
-                    .loop_ctx
-                    .iter()
-                    .rev()
-                    .filter(|c| !c.close_via_finally)
-                    .filter_map(|c| c.iter_close)
-                    .collect();
-                for it in iters {
-                    self.emit(Instr::IterClose { iter: it });
-                }
+                // Every for-of and for-await loop closes on a return completion
+                // from its own close handler, which runs AFTER the body's `try`
+                // handlers, where the spec puts it.
                 match v {
                     Some(v) => self.emit(Instr::Return { src: v }),
                     None => self.emit(Instr::ReturnUndefined),
@@ -1666,9 +1653,12 @@ impl<'a> FnCompiler<'a> {
                 // per element), so draining up front is observable on a generator
                 // or a custom iterator: it ran ahead of the default, and a
                 // throwing default found later elements already pulled.
-                if fixed
-                    .iter()
-                    .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
+                // (A pattern of `ITER_PROBE` elements or more would spell a
+                // probe in `IterToArray`'s count.)
+                if fixed.len() >= crate::bytecode::ITER_PROBE as usize
+                    || fixed
+                        .iter()
+                        .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
                 {
                     return self.extract_array_pattern_stepwise(fixed, rest, src);
                 }

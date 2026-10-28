@@ -121,15 +121,12 @@ impl<'p> Vm<'p> {
             return None;
         }
         let ci = cv.heap_index();
-        let simple = match self.heap.get(ci) {
-            HeapObj::Class(c) => {
-                c.ctor.is_some()
-                    && c.has_explicit_ctor
-                    && c.parent.is_none()
-                    && !c.extends_null
-                    && c.dec.is_none()
-            }
-            _ => false,
+        let (simple, explicit) = match self.heap.get(ci) {
+            HeapObj::Class(c) => (
+                c.ctor.is_some() && c.parent.is_none() && !c.extends_null && c.dec.is_none(),
+                c.has_explicit_ctor,
+            ),
+            _ => (false, false),
         };
         if !simple
             || !self.obj_realm.is_empty()
@@ -144,6 +141,19 @@ impl<'p> Vm<'p> {
         let Some((fid, closure)) = self.ic_plain_fn(f) else {
             return None;
         };
+        // A class with no constructor of its own (`class C { x = 0 }`) has, for
+        // a base class, its field initializers as its body, run as a call
+        // (with no arguments, `new.target` undefined). Run as a construction
+        // here it is the same, unless something in it can see `new.target`
+        // (the test the frame-free call makes, which is the JIT's).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if !explicit && !self.ctor_body_framefree(fid) {
+            return None;
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        if !explicit {
+            return None;
+        }
         Some((fid, closure, f))
     }
 

@@ -1521,6 +1521,19 @@ pub enum ConsoleStream {
     Stderr,
 }
 
+/// What every object a regex literal makes shares: its compiled program,
+/// source and flags (all `Arc`s), and its byte-optimized twin once one is
+/// built. Keyed by the constants the site loads, compared by their bits.
+pub(crate) struct RegExpLiteralSite {
+    pattern_bits: u64,
+    flags_bits: u64,
+    regex: std::sync::Arc<regress::Regex>,
+    source: std::sync::Arc<str>,
+    flags: std::sync::Arc<str>,
+    twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+    uses: u32,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -2010,6 +2023,12 @@ pub struct Vm<'p> {
     /// every cache for each one. Pure memo: every hit rechecks it live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_ways: Vec<AddWay>,
+    /// The class method each JIT `GetProp` site last read off a class
+    /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
+    /// emitted probe serves a key that lives on the class, so every read
+    /// came to the miss helper. Pure memo: every hit rechecks it live.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_class_reads: Vec<ClassRead>,
     /// Per constructor body: whether it only stores its arguments and
     /// constants into `this`, and the proof of the last receiver a compiled
     /// `new` answered that way (`engine::ctor_store`).
@@ -2147,6 +2166,9 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
+    /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
+    pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,
     /// Short-subject ASCII execs each RegExp without a byte-optimized twin
     /// has run on its base program (`ensure_regexp_ascii_twin_deferred`),
     /// keyed by heap index; an entry leaves when its twin is built. A reused
@@ -2862,6 +2884,9 @@ pub struct Vm<'p> {
     /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
     /// are GC ROOTS.
     timer_queue: Vec<(clock::Instant, Value)>,
+    /// The callbacks (bits) of the queued timeouts Node's `unref()` was
+    /// called on: the loop ends when only these remain.
+    pub(crate) timer_unref: rustc_hash::FxHashSet<u64>,
     /// Monotonic-clock reading at VM construction — the
     /// `$262.agent.monotonicNow()` epoch.
     vm_start_mono_ms: f64,
@@ -2973,13 +2998,30 @@ pub struct Vm<'p> {
     /// cycle) instead of failing or re-evaluating.
     module_pending_reexports: std::collections::HashMap<
         std::path::PathBuf,
-        (
+        std::sync::Arc<(
             Vec<(String, String, String)>,
             Vec<String>,
             Vec<(String, String)>,
             Option<std::path::PathBuf>,
-        ),
+        )>,
     >,
+    /// Requested path -> canonical module path, for the re-export walks: a
+    /// barrel file's `export *` list is walked for every name imported through
+    /// it, and each step canonicalized its specifier with a filesystem call.
+    pub(crate) module_canon_memo: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// (in-flight module, export name) -> the live slot its pending re-exports
+    /// resolved it to. A slot never changes once bound.
+    pub(crate) module_pending_resolved: std::collections::HashMap<(std::path::PathBuf, String), u32>,
+    /// A module's exports as its source declares them, read once without
+    /// running it (see `Vm::static_export`).
+    pub(crate) module_static_exports: std::collections::HashMap<std::path::PathBuf, ModuleStaticExports>,
+    /// Forward bindings: an export of a module not loaded yet, which a cycle
+    /// member importing through an in-flight `export *` (a barrel file) bound
+    /// before that module's turn to evaluate came. (canonical path, exported
+    /// name) -> the live slot the module adopts for that export when it loads.
+    /// Resolving the binding by loading the module there instead evaluated it
+    /// out of order — ahead of the modules listed before it in the barrel.
+    pub(crate) module_forward: std::collections::HashMap<(std::path::PathBuf, String), u32>,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
@@ -3404,6 +3446,19 @@ pub struct Vm<'p> {
     /// results collected across later guest re-entry — spread, rest,
     /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
     host_result_roots: Vec<Value>,
+    /// Node's globals (`lang/js/node`): installed for this run, the partial
+    /// lines `process.stdout`/`stderr.write` left, and the function the
+    /// run's end calls (a root).
+    pub(crate) node_installed: bool,
+    pub(crate) node_partial: [String; 2],
+    pub(crate) node_exit_hook: Value,
+    /// `process.nextTick`'s queue runner (a root), and whether it has work:
+    /// ticks run before the microtasks at each checkpoint.
+    pub(crate) node_tick_hook: Value,
+    pub(crate) node_tick_pending: bool,
+    /// The host object, and the CommonJS loader (both roots).
+    pub(crate) node_host: Value,
+    pub(crate) node_cjs: Value,
     /// The first exception a `setTimeout` callback let escape. It ends the
     /// event loop and becomes the program's error when the main job itself
     /// completed normally (Node's uncaught-exception exit). Rooted.
@@ -3619,6 +3674,11 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 mod handler_pool;
 pub(crate) mod prof;
+// ── Node's globals ── for a program the command runs from a file
+// (`lang/js/node/`): a module of `vm` for the same reason as Python's below.
+#[path = "../lang/js/node/mod.rs"]
+pub(crate) mod node;
+
 // ── Python's half of the VM ── its instructions' semantics, runtime
 // tables and library natives. The files live with the rest of the language
 // in `lang/python/vm/`; they are modules of `vm` because they implement the
@@ -3689,6 +3749,19 @@ impl<'p> Vm<'p> {
     /// Every console emission goes through here.
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        // A partial line `process.stdout.write` left begins this one.
+        let partial = &mut self.node_partial[to_stderr as usize];
+        if !partial.is_empty() {
+            let mut joined = std::mem::take(partial);
+            joined.push_str(&line);
+            return self.push_console_line_raw(joined, to_stderr);
+        }
+        self.push_console_line_raw(line, to_stderr)
+    }
+
+    /// [`Self::push_console_line`] without a partial line to join.
+    #[inline]
+    pub(crate) fn push_console_line_raw(&mut self, line: String, to_stderr: bool) {
         if let Some(sink) = self.console_sink.as_mut() {
             let stream = if to_stderr {
                 ConsoleStream::Stderr
@@ -3706,4 +3779,23 @@ impl<'p> Vm<'p> {
             self.output.push(line);
         }
     }
+}
+
+/// A module's exports as its parsed source declares them (`Vm::static_export`).
+#[derive(Default)]
+pub(crate) struct ModuleStaticExports {
+    /// Exported name -> whether its own local binding is a `var`.
+    pub(crate) own: std::collections::HashMap<String, bool>,
+    /// Names exported through a re-export (`export { x } from`, `export * as x`).
+    pub(crate) indirect: std::collections::HashSet<String>,
+    /// The module has an `export * from`, which may supply any other name.
+    pub(crate) star: bool,
+    /// The source could not be read or parsed: nothing is known.
+    pub(crate) unknown: bool,
+    /// Exported names whose binding is a function declaration.
+    pub(crate) functions: std::collections::HashSet<String>,
+    /// The module's top level only declares (functions, and bindings of
+    /// literals and function expressions) and imports nothing, so running it
+    /// ahead of its turn is unobservable.
+    pub(crate) inert: bool,
 }

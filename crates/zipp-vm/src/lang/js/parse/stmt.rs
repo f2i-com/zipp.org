@@ -91,7 +91,14 @@ impl<'s> Parser<'s> {
         } else {
             ScopeKind::Script
         });
-        let body = self.parse_stmt_items(|p| !p.at_eof())?;
+        let mut body = self.parse_stmt_items(|p| !p.at_eof())?;
+        if self.ts {
+            self.ts_finish_program(&mut body);
+            self.ts_legacy_helpers(&mut body);
+        }
+        if self.jsx.is_some() {
+            self.jsx_finish_program(&mut body)?;
+        }
         for (name, pos) in std::mem::take(&mut self.pending_export_locals) {
             if !self.scopes.module_binds(&name) {
                 return Err(SyntaxError::new(
@@ -161,6 +168,9 @@ impl<'s> Parser<'s> {
         if !self.scopes.at_module_top_level() {
             return Ok(None);
         }
+        if self.ts {
+            return self.ts_module_decl();
+        }
         if self.at_kw(Keyword::Import) {
             let save = self.save();
             let pos = self.cur().span.start;
@@ -180,7 +190,7 @@ impl<'s> Parser<'s> {
         Ok(None)
     }
 
-    fn parse_import_rest(&mut self, pos: u32) -> PResult<ImportDecl> {
+    pub(crate) fn parse_import_rest(&mut self, pos: u32) -> PResult<ImportDecl> {
         // `import "m"` — side effect only.
         if let TokenKind::Str(s) = self.cur().kind.clone() {
             self.bump_after_operand()?;
@@ -226,7 +236,7 @@ impl<'s> Parser<'s> {
     /// Record one ExportedName, rejecting a duplicate. §16.2.3.1: a module's
     /// ExportedNames must be unique — `export {x}; export {x};` is an error even
     /// though both name the same binding.
-    fn record_export_name(&mut self, name: &ModuleExportName, pos: u32) -> PResult<()> {
+    pub(crate) fn record_export_name(&mut self, name: &ModuleExportName, pos: u32) -> PResult<()> {
         let text: Name = match name {
             ModuleExportName::Ident(n) => n.clone(),
             ModuleExportName::Str(s) => s.to_lossy_string().into(),
@@ -242,7 +252,7 @@ impl<'s> Parser<'s> {
     }
 
     /// The current token is the UNESCAPED contextual keyword `want`.
-    fn at_contextual(&self, want: &str) -> bool {
+    pub(crate) fn at_contextual(&self, want: &str) -> bool {
         matches!(&self.cur().kind,
             TokenKind::Ident { name, had_escape: false, private: false, .. } if &**name == want)
     }
@@ -263,7 +273,7 @@ impl<'s> Parser<'s> {
     /// so `source` needs two tokens of lookahead: it is the phase only when an
     /// ImportedBinding follows AND `from` follows that. This is the same bounded
     /// rewind `Parser::save`/`restore` already exists for.
-    fn import_phase_prefix(&mut self) -> PResult<ImportPhase> {
+    pub(crate) fn import_phase_prefix(&mut self) -> PResult<ImportPhase> {
         let defer = self.at_contextual("defer");
         if !defer && !self.at_contextual("source") {
             return Ok(ImportPhase::Evaluation);
@@ -340,7 +350,7 @@ impl<'s> Parser<'s> {
 
     /// `with { type: "json" }`. The legacy `assert` spelling is accepted the
     /// same way; the keyword itself is not recorded because nothing consumes it.
-    fn parse_import_attributes(&mut self) -> PResult<Vec<ImportAttribute>> {
+    pub(crate) fn parse_import_attributes(&mut self) -> PResult<Vec<ImportAttribute>> {
         let is_with = self.at_kw(Keyword::With);
         let is_assert =
             matches!(&self.cur().kind, TokenKind::Ident { name, .. } if &**name == "assert");
@@ -388,7 +398,7 @@ impl<'s> Parser<'s> {
         Ok(out)
     }
 
-    fn parse_module_export_name(&mut self) -> PResult<ModuleExportName> {
+    pub(crate) fn parse_module_export_name(&mut self) -> PResult<ModuleExportName> {
         if let TokenKind::Str(s) = self.cur().kind.clone() {
             // `ModuleExportName : StringLiteral` — a Syntax Error if
             // IsStringWellFormedUnicode of its StringValue is false. `StrVal`
@@ -406,7 +416,7 @@ impl<'s> Parser<'s> {
         Ok(ModuleExportName::Ident(self.ident_name()?))
     }
 
-    fn parse_export_rest(&mut self, pos: u32) -> PResult<ExportDecl> {
+    pub(crate) fn parse_export_rest(&mut self, pos: u32) -> PResult<ExportDecl> {
         // `export * from "m"` / `export * as ns from "m"`
         if self.eat(Punct::Star, false)? {
             let alias = if self.eat_kw(Keyword::As, false)? {
@@ -479,6 +489,15 @@ impl<'s> Parser<'s> {
                     let c = self.parse_class_rest_dec(cstart, decorators)?;
                     if let Some(n) = &c.name {
                         self.declare(&n.clone(), BindKind::Class, cstart)?;
+                    }
+                    if self.ts && self.ts_state.legacy_decorators {
+                        let mut stmts = self
+                            .ts_legacy_lower(c, crate::lang::ts::legacy::LegacyExport::Default)?;
+                        let Some(Stmt::Export(last)) = stmts.pop() else {
+                            unreachable!("a lowered default export ends with it")
+                        };
+                        self.stmt_scratch.extend(stmts);
+                        return Ok(*last);
                     }
                     return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
                 }
@@ -553,7 +572,22 @@ impl<'s> Parser<'s> {
         }
         // `export var/let/const/function/class …` — the declaration binds
         // exactly as it would without the `export`.
+        if self.ts && self.ts_state.legacy_decorators {
+            self.ts_state.legacy_export = true;
+        }
         let decl = self.parse_stmt_list_item()?;
+        if self.ts {
+            self.ts_state.legacy_export = false;
+            // A class lowered for its legacy decorators ends with its export.
+            if let Stmt::Export(e) = decl {
+                if let ExportDecl::Named { specifiers, .. } = &*e {
+                    for sp in specifiers {
+                        self.record_export_name(&sp.exported, pos)?;
+                    }
+                }
+                return Ok(*e);
+            }
+        }
         // …and its ExportedNames are its BoundNames, which 16.2.3.1 requires to
         // be unique across the whole ModuleItemList. Nothing was recording them,
         // so `export var a, a;` — one declaration naming `a` twice — parsed.
@@ -598,6 +632,12 @@ impl<'s> Parser<'s> {
         // here through the Block, and the brace is what makes it a declaration
         // again rather than an Annex B clause.
         self.stmt_pos = StmtPos::ListItem;
+        let ts_export = self.ts && std::mem::take(&mut self.ts_state.legacy_export);
+        if self.ts {
+            if let Some(s) = self.ts_stmt()? {
+                return Ok(s);
+            }
+        }
         // `ClassDeclaration : DecoratorList_opt class …`. The DecoratorList is the
         // only thing that can start a statement with `@`, so seeing one commits to
         // a class declaration (or a decorated `export`, handled by
@@ -617,6 +657,9 @@ impl<'s> Parser<'s> {
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
             }
+            if self.ts && self.ts_state.legacy_decorators {
+                return self.ts_legacy_decl(c, ts_export);
+            }
             return Ok(Stmt::ClassDecl(Box::new(c)));
         }
         if let Some(m) = self.parse_module_decl()? {
@@ -626,6 +669,10 @@ impl<'s> Parser<'s> {
             let start = self.cur().span.start;
             self.bump_after_operand()?;
             let f = self.parse_function_rest(false, false, start)?;
+            // An overload signature or ambient function declares nothing.
+            if self.ts && std::mem::take(&mut self.ts_state.bodiless) {
+                return Ok(Stmt::Empty);
+            }
             if let Some(n) = &f.name {
                 let bk = fn_bind_kind(&f);
                 self.declare(&n.clone(), bk, start)?;
@@ -640,6 +687,9 @@ impl<'s> Parser<'s> {
             if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                 self.bump_after_operand()?;
                 let f = self.parse_function_rest(true, false, start)?;
+                if self.ts && std::mem::take(&mut self.ts_state.bodiless) {
+                    return Ok(Stmt::Empty);
+                }
                 if let Some(n) = &f.name {
                     self.declare(&n.clone(), BindKind::GenFunction, start)?;
                 }
@@ -657,6 +707,9 @@ impl<'s> Parser<'s> {
             let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
+            }
+            if self.ts && self.ts_state.legacy_decorators {
+                return self.ts_legacy_decl(c, ts_export);
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
         }
@@ -788,6 +841,9 @@ impl<'s> Parser<'s> {
     fn parse_declarator(&mut self, kind: VarKind) -> PResult<Declarator> {
         let pos = self.cur().span.start;
         let id = self.parse_binding_pattern()?;
+        // TypeScript: an annotated `const` may go without an initializer in
+        // an ambient context (a `.d.ts` file's `export const x: T;`).
+        let ts_typed = self.ts && self.ts_binding_suffix()?;
         // `using` binds resources by NAME so it can dispose them in reverse
         // declaration order; a pattern has no single name to record, so the
         // grammar takes a BindingIdentifier and nothing else. The FIRST
@@ -818,7 +874,7 @@ impl<'s> Parser<'s> {
         }
         // `const` without an initializer is an early error — except in a
         // for-in/of head, which parses through a different path.
-        if init.is_none() && kind == VarKind::Const {
+        if init.is_none() && kind == VarKind::Const && !ts_typed {
             return Err(SyntaxError::new(
                 "SyntaxError: missing initializer in const declaration",
                 pos,
@@ -1240,6 +1296,9 @@ impl<'s> Parser<'s> {
         let out = if let Some(kind) = self.at_var_decl_start(true)? {
             let pos = self.cur().span.start;
             let pat = self.parse_binding_pattern()?;
+            if self.ts {
+                self.ts_binding_suffix()?;
+            }
             self.declare_pattern(&pat, kind, pos)?;
             if self.at_kw(Keyword::In) || self.at_kw(Keyword::Of) {
                 let of = self.at_kw(Keyword::Of);
@@ -1322,6 +1381,9 @@ impl<'s> Parser<'s> {
                     while self.eat(Punct::Comma, true)? {
                         let p2 = self.cur().span.start;
                         let id = self.parse_binding_pattern()?;
+                        if self.ts {
+                            self.ts_binding_suffix()?;
+                        }
                         self.declare_pattern(&id, kind, p2)?;
                         let init = if self.eat(Punct::Eq, true)? {
                             Some(self.parse_assign_full()?)
@@ -1517,6 +1579,9 @@ impl<'s> Parser<'s> {
             let param = if self.eat(Punct::LParen, true)? {
                 let pos = self.cur().span.start;
                 let p = self.parse_binding_pattern()?;
+                if self.ts {
+                    self.ts_annotation_opt()?;
+                }
                 // Annex B B.3.5 allows `catch (e) { var e }` only for a SIMPLE
                 // parameter, so the scope records which shape it was.
                 if let Pattern::Ident(n) = &p {

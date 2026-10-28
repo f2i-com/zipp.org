@@ -831,11 +831,9 @@ struct LoopCtx {
     /// nested one runs IteratorClose on it (a `break` targeting this loop closes
     /// via its own block). `None` for other loops.
     iter_close: Option<Reg>,
-    /// Set when this for-of's body runs under the `IterCloseFinally` handler, which
-    /// already closes on a `return` completion — `return` must then NOT also emit an
-    /// inline `IterClose` for this frame or the iterator closes twice. False for
-    /// `for await`, whose inline close is still the only one.
-    close_via_finally: bool,
+    /// A `for await` frame: its iterator closes by awaiting `return()`
+    /// (AsyncIteratorClose) rather than with `IterClose`.
+    iter_async: bool,
     /// A label frame whose statement is itself a label chain ending in an
     /// iteration statement (`a: b: for …`): `a` is in that loop's label set, so
     /// `continue a` targets the loop (see `continue_through_label_set`).
@@ -876,7 +874,7 @@ impl LoopCtx {
             label,
             handler_depth,
             iter_close: None,
-            close_via_finally: false,
+            iter_async: false,
             labels_iteration: false,
         }
     }
@@ -889,7 +887,7 @@ impl LoopCtx {
             label,
             handler_depth,
             iter_close: None,
-            close_via_finally: false,
+            iter_async: false,
             labels_iteration: false,
         }
     }
@@ -904,7 +902,7 @@ impl LoopCtx {
             label: Some(label),
             handler_depth,
             iter_close: None,
-            close_via_finally: false,
+            iter_async: false,
             labels_iteration: false,
         }
     }

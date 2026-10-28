@@ -196,16 +196,27 @@ impl<'a> FnCompiler<'a> {
                     self.dec_next_reg(1);
                 }
             }
+            let save = self.next_reg;
             let e = self.alloc_reg();
+            // V8's message, as programs and their tests read it.
+            let msg = self.alloc_reg();
+            let text = crate::parse::ast::Expr::Str(crate::parse::token::StrVal::Utf8(
+                "Assignment to constant variable.".into(),
+            ));
+            if let Ok(m) = self.expr_into(&text, msg) {
+                if m != msg {
+                    self.emit(Instr::Move { dst: msg, src: m });
+                }
+            }
             self.emit(Instr::NewError {
                 dst: e,
                 kind: 1,
-                arg: crate::bytecode::OptReg::new(None),
+                arg: crate::bytecode::OptReg::new(Some(msg)),
                 opts: crate::bytecode::OptReg::new(None),
                 errors: crate::bytecode::OptReg::new(None),
             });
             self.emit(Instr::Throw { src: e });
-            self.dec_next_reg(1);
+            self.set_next_reg(save);
             return;
         }
         match b {

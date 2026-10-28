@@ -2360,69 +2360,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let a0 = if argc >= 1 {
-                            self.get(base, arg_base)
-                        } else {
-                            Value::UNDEFINED
-                        };
-                        let v = match op {
-                            G::Number => {
-                                if argc == 0 {
-                                    Value::num(0.0)
-                                } else {
-                                    Value::num(self.to_number_coerce(a0)?)
-                                }
-                            }
-                            G::String => {
-                                if argc == 0 {
-                                    self.alloc_str(String::new())
-                                } else if a0.is_heap()
-                                    && matches!(
-                                        self.heap.get(a0.heap_index()),
-                                        HeapObj::Symbol { .. }
-                                    )
-                                {
-                                    // `String(symbol)` is allowed (unlike ToString,
-                                    // which throws) and yields "Symbol(desc)".
-                                    self.symbol_descriptive_value(a0)?
-                                } else {
-                                    // Proper ToString: routes objects/functions
-                                    // through their `toString` (so a function yields
-                                    // its real source via Function.prototype.toString).
-                                    // Identity for strings (exact WTF-8 content).
-                                    self.to_str_value(a0)?
-                                }
-                            }
-                            G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
-                            G::ParseInt => {
-                                // ToString(string) FIRST (observable toString, abrupt),
-                                // then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity
-                                // → 0 = default base).
-                                let s = self.to_js_string(a0)?;
-                                // ToInt32 WRAPS mod 2^32; Rust's `as i32` on a
-                                // float saturates, which turned
-                                // `parseInt("0x10", 1e308)` into an
-                                // out-of-range radix (NaN) instead of 0.
-                                let radix = if argc >= 2 {
-                                    let rv = self.get(base, arg_base + 1);
-                                    let r = self.to_number_strict(rv)?;
-                                    crate::vm::helpers_num2::to_int32(r)
-                                } else {
-                                    0
-                                };
-                                Value::num(parse_int(&s, radix))
-                            }
-                            G::ParseFloat => {
-                                let s = self.to_js_string(a0)?;
-                                Value::num(parse_float(&s))
-                            }
-                            // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
-                            // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
-                            // and propagates abrupt completions (a throwing valueOf or
-                            // a Symbol/BigInt argument → TypeError), so use strict ToNumber.
-                            G::IsNaN => Value::bool(self.to_number_strict(a0)?.is_nan()),
-                            G::IsFinite => Value::bool(self.to_number_strict(a0)?.is_finite()),
-                        };
+                        let v = self.global_fn_value(op, base, arg_base, argc)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2980,7 +2918,7 @@ impl<'p> Vm<'p> {
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
                                 let (cross_plan, cross_pending, cross_baked) =
-                                    self.build_cross_call_plan(func_id, Some(base));
+                                    self.build_cross_call_plan(func_id, Some(base), false);
                                 self.jit.note_cross_baked(func_id, &cross_baked);
                                 // B199: a "no entry yet" decline at a REGION is
                                 // deferred (capped) instead of baked — the callee
@@ -4218,6 +4156,13 @@ impl<'p> Vm<'p> {
                         if let Some((fid, closure)) = plain {
                             let p = self.func(fid as usize);
                             if !p.is_generator && !p.is_async {
+                                // The site's callee, for the leaf inliner's
+                                // choice when this function compiles
+                                // (`build_leaf_inline_plan`).
+                                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                                if crate::codegen::cwt_leaf_enabled() {
+                                    let _ = self.ic_call(func_id, ip, callee_v);
+                                }
                                 // The lean push for a strict callee (every
                                 // class method: `super.m()`, `this.#m()`);
                                 // anything else goes on to `setup_call`.

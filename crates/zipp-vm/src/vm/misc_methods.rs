@@ -293,9 +293,8 @@ impl<'p> Vm<'p> {
         // the frames it needs, so one already compiled runs without (a
         // promise reaction's callback the drain calls, `drain_microtasks`).
         let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
-        if self.frames.is_empty()
-            && !(ups.is_empty() && self.jit.get(fid).is_some_and(|body| body.int_tier()))
-        {
+        let frameless = self.frames.is_empty();
+        if frameless && !(ups.is_empty() && self.jit.int_body(fid).is_some()) {
             return None;
         }
         // A capturing closure reads upvalue cells (heap) — outside the
@@ -338,6 +337,12 @@ impl<'p> Vm<'p> {
         } else {
             return None;
         };
+        // A callback whose compile failed for good stays interpreted: trying
+        // again built every plan and declined on each call of the builtin —
+        // `xs.map(f)` with an uncompilable `f`, once per `map`.
+        if self.jit.is_blacklisted(fid) {
+            return None;
+        }
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
@@ -381,7 +386,7 @@ impl<'p> Vm<'p> {
             // Callback compilation happens outside a live caller bytecode
             // frame/site, so there is no receiver exemplar to bake.
             let method_plan = rustc_hash::FxHashMap::default();
-            let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None);
+            let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None, true);
             self.jit.note_cross_pending(fid, &cross_pending);
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             self.jit.compile(
@@ -406,11 +411,17 @@ impl<'p> Vm<'p> {
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
             return None;
         }
-        let body = self.jit.get(fid)?;
+        // With no frame under it, the int-tier body (see above).
+        let body = if frameless {
+            self.jit.int_body(fid)?
+        } else {
+            self.jit.get(fid)?
+        };
+        let int_body = body.int_tier();
         let (entry, self_binding) = (body.entry(), body.self_binding());
         let uninit_mask = match self.jit.cross_entry(fid) {
-            Some((_, mask, _, _)) => mask,
-            None => u64::MAX,
+            Some((_, mask, _, _)) if !int_body => mask,
+            _ => u64::MAX,
         };
         let proto = self.func(fid as usize);
         Some(NativeCb {

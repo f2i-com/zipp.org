@@ -106,6 +106,13 @@ fn store_key_ok(key: &str) -> bool {
 /// 0) under distinct names, and a final `return`. Anything else in the body
 /// (a read, a call, a branch, a default or rest parameter, `arguments`) and
 /// the scan finds nothing.
+///
+/// A base class's declared fields, inlined at the head of its constructor
+/// (`x;` or `x = 0`, and TypeScript's parameter properties), are
+/// `DefineField`s of constants into `this` before those stores: each adds its
+/// key, in order, and a later store to a defined key writes that key's value
+/// in place — on a fresh instance the define is an append and the store an
+/// own write, so the finished instance is the same keys and values.
 fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreSrc)>> {
     if p.is_generator
         || p.is_async
@@ -120,9 +127,26 @@ fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreS
         *src.get_mut(i as usize + 1)? = Some(StoreSrc::Arg(i));
     }
     let mut keys: Vec<(String, StoreSrc)> = Vec::new();
+    // How many of `keys`, from the front, a `DefineField` made.
+    let mut defined = 0usize;
     let last = p.code.len().checked_sub(1)?;
     for (pc, ins) in p.code.iter().enumerate() {
         let (dst, v) = match *ins {
+            Instr::DefineField { obj: 0, name, val } => {
+                let key = p.string_constants.get(name as usize)?;
+                let v = (*src.get(val as usize)?)?;
+                // Fields come first, under distinct names.
+                if defined != keys.len()
+                    || !store_key_ok(key)
+                    || keys.len() == STORE_MAX
+                    || keys.iter().any(|(k, _)| k == key)
+                {
+                    return None;
+                }
+                keys.push((key.clone(), v));
+                defined += 1;
+                continue;
+            }
             Instr::Move { dst, src: s } => (dst, *src.get(s as usize)?),
             Instr::LoadInt { dst, val } => (dst, Some(StoreSrc::Bits(Value::int(val).bits()))),
             Instr::LoadNull { dst } => (dst, Some(StoreSrc::Bits(Value::NULL.bits()))),
@@ -138,6 +162,11 @@ fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreS
             Instr::SetProp { obj: 0, name, val, .. } => {
                 let key = p.string_constants.get(name as usize)?;
                 let v = (*src.get(val as usize)?)?;
+                // A store to a field the body defined writes it in place.
+                if let Some(i) = keys[..defined].iter().position(|(k, _)| k == key) {
+                    keys[i].1 = v;
+                    continue;
+                }
                 if !store_key_ok(key) || keys.len() == STORE_MAX || keys.iter().any(|(k, _)| k == key) {
                     return None;
                 }

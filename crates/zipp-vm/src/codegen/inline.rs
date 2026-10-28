@@ -41,6 +41,13 @@ pub(crate) fn span_code_unit_pair_enabled() -> bool {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_CWT_LEAF=1` leaves a `CallWithThis` site (`o.f(x)` whose
+    /// callee was read before its arguments) to the call helper instead of
+    /// inlining a leaf callee that never reads `this`.
+    fn cwt_leaf_enabled() = "ZIPP_NO_CWT_LEAF"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_INLINE_SAME_PROTO_GUARD=1` restores the read-only
     /// `jit_leaf_same_func_proto` helper call at each polymorphic leaf site.
     /// The default emits the same proof from VM-relative mirrors and falls
@@ -1139,6 +1146,9 @@ pub(crate) fn emit_inline_leaf_call(
             // the region GetIndex generic tail). Deopt sentinel → re-run the call.
             Instr::GetIndex { dst: d, obj, key } => {
                 let bail = ops.new_dynamic_label();
+                // A present dense element first, through the array mirror.
+                let done = ops.new_dynamic_label();
+                emit_arr_mirror_get(ops, rg(d), rg(obj), rg(key), done);
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(rg(obj))]
@@ -1149,6 +1159,7 @@ pub(crate) fn emit_inline_leaf_call(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(rg(d))], rax
+                    ; => done
                 );
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }

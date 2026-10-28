@@ -1293,24 +1293,11 @@ impl<'p> Vm<'p> {
             } => {
                 let p = self.get(base, pattern);
                 let f = self.get(base, flags);
-                // IsRegExp(pattern) (ctor step 1) reads `@@match` once, for
-                // both the shortcut below and the build.
-                let pattern_is_regexp = self.is_regexp(p)?;
-                // `RegExp(re)` (NOT `new`) with no flags returns `re`
-                // unchanged when re's `constructor` is RegExp (ctor step 2.b).
-                let mut short = None;
-                if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && pattern_is_regexp {
-                    let c = self.get_prop(p, "constructor")?;
-                    if self.same_value(c, Value::heap(self.regexp_ctor)) {
-                        short = Some(p);
-                    }
-                }
-                let v = match short {
-                    Some(v) => v,
-                    None => {
-                        let pre = self.regexp_pattern_snapshot_after(p, pattern_is_regexp);
-                        self.build_regexp_snapshot(p, f, pre)?
-                    }
+                // Every `NewRegExp` the compiler emits is a literal's.
+                let v = if is_construct {
+                    self.new_regexp_literal((u64::from(func_id) << 32) | ip as u64, p, f)?
+                } else {
+                    self.new_regexp_value(p, f, is_construct)?
                 };
                 self.set(base, dst, v);
                 ip += 1;
@@ -1430,7 +1417,7 @@ impl<'p> Vm<'p> {
                             // promise waiting on them.
                             match self
                                 .dynamic_import_base_dir(func_id)
-                                .map(|d| d.join(&spec_str))
+                                .map(|d| crate::vm::node::resolve::specifier_path(Some(&d), &spec_str))
                             {
                                 None => Err(self.make_error(1, None)),
                                 // A fresh Evaluate() for the eager
@@ -1492,7 +1479,7 @@ impl<'p> Vm<'p> {
                             // the joined path.
                             match self
                                 .dynamic_import_base_dir(func_id)
-                                .map(|d| d.join(&spec_str))
+                                .map(|d| crate::vm::node::resolve::specifier_path(Some(&d), &spec_str))
                             {
                                 None => Err(self.make_error(1, None)),
                                 Some(path) => {
@@ -3654,11 +3641,18 @@ impl<'p> Vm<'p> {
                 let it = self.get(base, iter);
                 let r = self.get(base, ret);
                 let m = self.get_member(it, "return", it)?;
-                if m.is_nullish() || !self.is_callable(m) {
+                if m.is_nullish() {
                     // No `return` method â†’ the outer generator just returns `ret`.
                     self.set(base, has_dst, Value::bool(false));
+                } else if !self.is_callable(m) {
+                    // GetMethod: present but not callable.
+                    return Err(Thrown(
+                        "TypeError: the iterator's 'return' is not a function".into(),
+                    ));
                 } else {
-                    let res = self.call_value(m, it, &[r])?;
+                    // `ret == dst`: AsyncIteratorClose's bare call.
+                    let args: &[Value] = if ret == dst { &[] } else { &[r] };
+                    let res = self.call_value(m, it, args)?;
                     self.set(base, dst, res);
                     self.set(base, has_dst, Value::bool(true));
                 }
@@ -4208,7 +4202,7 @@ impl<'p> Vm<'p> {
                     };
                 // Tier-C cross-call plan (B83) — also built before &mut self.jit.
                 let (cross_plan, cross_pending, cross_baked) =
-                    self.build_cross_call_plan(func_id, Some(base));
+                    self.build_cross_call_plan(func_id, Some(base), true);
                 self.jit.note_cross_pending(func_id, &cross_pending);
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));

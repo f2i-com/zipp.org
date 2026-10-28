@@ -15,6 +15,7 @@ Everything else:
 | [`PERFORMANCE.md`](PERFORMANCE.md) | The canonical benchmark captures against Node, Bun, Deno and QuickJS, with the gaps |
 | [`CORRECTNESS.md`](CORRECTNESS.md) | Test262 and language coverage |
 | [`GPU.md`](GPU.md) | Torch on the browser GPU, the GPU lab, GPU graphs from JavaScript and Python |
+| [`NODE.md`](NODE.md) | Running Node programs: Node's globals, npm packages, CommonJS, the core modules |
 | [`python/RUNNING.md`](python/RUNNING.md) | Running Python projects |
 | [`python/FRONTEND.md`](python/FRONTEND.md) | Python on ZIPP: scope, integration contract, compiler and runtime |
 | [`python/TORCH_COMPATIBILITY.md`](python/TORCH_COMPATIBILITY.md) | The supported `torch` surface |

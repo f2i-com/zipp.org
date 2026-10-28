@@ -350,6 +350,20 @@ impl<'a> FnCompiler<'a> {
             let dst = self.temp();
             return self.update(*op, true, target, dst, true);
         }
+        // `[a, b] = [b, a];`: no array is built when nothing reads it.
+        if let ast::Expr::Assign {
+            op: ast::AssignOp::Assign,
+            target: ast::Target::Array(els),
+            value,
+            ..
+        } = e
+        {
+            if let ast::Expr::Array(items, _) = &**value {
+                if let Some(r) = self.assign_array_literal(els, items, None)? {
+                    return Ok(r);
+                }
+            }
+        }
         self.expr(e)
     }
 

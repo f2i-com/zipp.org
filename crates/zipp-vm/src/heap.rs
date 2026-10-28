@@ -7169,6 +7169,19 @@ pub struct Heap {
     /// installs it as the activation's `upvals_raw`.
     #[cfg(feature = "jit")]
     upvals_mirror: Vec<u64>,
+    /// ARRAY MIRROR, parallel to `objs`: a dense Array occupant's element
+    /// base and length, `[base, len]`, or `[0, 0]`. Emitted Tier-C element
+    /// reads (`a[i]`) bounds-check against it and load `base[i]` with no
+    /// helper call, re-checking the hole tag per read. The discipline is the
+    /// shape mirror's: every event that can move, resize or reinterpret the
+    /// storage CLEARS the entry (the `get_mut` chokepoint, `bump_version`,
+    /// `replace` and `free_slot`, the same sites that dirty
+    /// `array_snapshot_epoch`), and only `jit_get_index`, having answered a
+    /// read from the dense store with no side-table overlay and no mapped
+    /// `arguments`, REPAIRS it. An in-place element overwrite moves nothing
+    /// and needs no clear.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    arr_mirror: Vec<[u64; 2]>,
     /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
     /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
     /// emitted Tier-C `UpvalGet` reads a captured variable in three loads
@@ -7197,6 +7210,11 @@ pub struct Heap {
     pub(crate) this_mirror_raw: u64,
     #[cfg(feature = "jit")]
     pub(crate) upvals_mirror_raw: u64,
+    /// `arr_mirror`'s base and entry count, for the emitted element reads.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_mirror_raw: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) arr_mirror_len: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
     /// Raw base of `gen` (B264): the inline dense-array store lane tests the
@@ -8090,6 +8108,12 @@ impl Heap {
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             #[cfg(feature = "jit")]
             upvals_mirror: vec![0; versions.len()],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_mirror: vec![[0, 0]; versions.len()],
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_mirror_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            arr_mirror_len: 0,
             #[cfg(feature = "jit")]
             hot_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8177,6 +8201,8 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.hot_mirror_len = self.hot_mirror.len() as u32;
+            self.arr_mirror_raw = self.arr_mirror.as_ptr() as u64;
+            self.arr_mirror_len = self.arr_mirror.len() as u32;
         }
         self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -9456,6 +9482,8 @@ impl Heap {
             self.this_mirror.push(Value::UNDEFINED.bits());
             self.upvals_mirror.push(0);
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.arr_mirror.push([0, 0]);
         self.recache_mirror_raws();
         #[cfg(feature = "jit")]
         match hot {
@@ -9527,6 +9555,8 @@ impl Heap {
             shrink(&mut self.this_mirror, target);
             shrink(&mut self.upvals_mirror, target);
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        shrink(&mut self.arr_mirror, target);
         shrink(&mut self.gen, target);
         shrink(&mut self.born, target);
         self.align_slot_table_capacities();
@@ -9560,6 +9590,8 @@ impl Heap {
             align(&mut self.this_mirror, cap);
             align(&mut self.upvals_mirror, cap);
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        align(&mut self.arr_mirror, cap);
         if self.nursery {
             align(&mut self.gen, cap);
         }
@@ -9611,6 +9643,10 @@ impl Heap {
                 .saturating_add(vec_capacity_bytes(&self.hot_mirror))
                 .saturating_add(vec_capacity_bytes(&self.this_mirror))
                 .saturating_add(vec_capacity_bytes(&self.upvals_mirror));
+        }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            n = n.saturating_add(vec_capacity_bytes(&self.arr_mirror));
         }
         n = n
             .saturating_add(vec_capacity_bytes(&self.gen))
@@ -9724,6 +9760,8 @@ impl Heap {
             self.this_mirror.reserve_exact(step);
             self.upvals_mirror.reserve_exact(step);
         }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.arr_mirror.reserve_exact(step);
         if self.nursery {
             self.gen.reserve_exact(step);
             self.recache_gen_raw();
@@ -10360,9 +10398,20 @@ impl Heap {
             .saturating_add({
                 #[cfg(feature = "jit")]
                 {
+                    let arr = {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            self.charged_slot_bytes(&self.arr_mirror)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            0
+                        }
+                    };
                     self.charged_slot_bytes(&self.hot_mirror)
                         + self.charged_slot_bytes(&self.this_mirror)
                         + self.charged_slot_bytes(&self.upvals_mirror)
+                        + arr
                 }
                 #[cfg(not(feature = "jit"))]
                 {
@@ -10507,6 +10556,7 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(&dead, HeapObj::Array(_)) {
             self.dirty_array_snapshots();
+            self.arr_mirror[idx as usize] = [0, 0];
         }
         // B198: clear only the cold mirrors the dying occupant OWNED — the
         // induction with `refresh_mirror`'s kind-conditional writes keeps
@@ -11051,6 +11101,7 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(&old, HeapObj::Array(_)) {
             self.dirty_array_snapshots();
+            self.arr_mirror[idx as usize] = [0, 0];
         }
         // B198: a replace can change occupant KIND, so the old occupant's
         // cold mirrors are cleared here under the same induction free_slot
@@ -11089,6 +11140,7 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(self.objs[idx as usize], HeapObj::Array(_)) {
             self.dirty_array_snapshots();
+            self.arr_mirror[idx as usize] = [0, 0];
         }
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         // Invalidate, don't refresh: callers bump on either side of the
@@ -11141,8 +11193,20 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(self.objs[idx as usize], HeapObj::Array(_)) {
             self.dirty_array_snapshots();
+            self.arr_mirror[idx as usize] = [0, 0];
         }
         &mut self.objs[idx as usize]
+    }
+
+    /// Settle slot `idx`'s array mirror from its live dense store (see the
+    /// field). The caller has proved the store answers element reads alone:
+    /// no side-table overlay, no mapped `arguments`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn repair_arr_mirror(&mut self, idx: u32) {
+        if let HeapObj::Array(items) = &self.objs[idx as usize] {
+            self.arr_mirror[idx as usize] = [items.as_ptr() as u64, items.len() as u64];
+        }
     }
 
     /// B256: overwrite ONE present element of a dense Array in place —

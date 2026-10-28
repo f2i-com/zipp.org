@@ -729,6 +729,28 @@ pub fn run_file_then_exit(
     run_with_policy(src, base_dir, false, true, Some(script_name))
 }
 
+/// Give the programs this process runs from files Node's globals
+/// (`process`, `global`, `structuredClone`, `queueMicrotask`, timers that
+/// can be cleared), with `argv` as `process.argv`: for a host that runs a
+/// program as `node` would, such as the `zipp` command. A run with a harness
+/// prelude never has them.
+pub fn set_node_runtime(on: bool, argv: Vec<String>) {
+    vm::node::set_enabled(on, argv);
+}
+
+/// Write what a program run with Node's globals prints as it prints it, to
+/// this process's stdout and stderr, instead of into its `Outcome` (the
+/// command's runs; see `set_node_runtime`).
+pub fn set_node_live_output(on: bool) {
+    vm::node::set_live_output(on);
+}
+
+/// The exit status a program run with Node's globals asked for
+/// (`process.exitCode`), 0 when it set none.
+pub fn node_exit_code() -> i32 {
+    vm::node::exit_code()
+}
+
 /// Keep compiled code in `dir` between processes, or not at all (`None`, the
 /// default): large scripts run with [`run_file_then_exit`], and Python's
 /// runtime and library modules ([`frontend::set_python_runtime_cache`] names
@@ -963,7 +985,12 @@ pub fn run_module_file(
     };
     // A syntax error is reported where it is, in the entry's file URL, as
     // its frames and its `import.meta.url` name it.
-    let entry_ast = front::parse_module_located(&src).map_err(|f| {
+    let entry_ast = if lang::ts::is_ts_path(path) || lang::ts::config::is_jsx_path(path) {
+        lang::ts::parse_module(&src, lang::ts::config::config_for(path))
+    } else {
+        front::parse_module_located(&src)
+    }
+    .map_err(|f| {
         let url = std::path::absolute(path).map(|p| vm::file_url(&p));
         f.located(&src, url.as_deref().ok())
     })?;

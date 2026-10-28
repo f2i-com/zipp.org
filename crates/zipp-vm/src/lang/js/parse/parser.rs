@@ -386,6 +386,24 @@ impl Scope {
         }
     }
 
+    /// Remove an import binding of `name`, if this scope has one.
+    fn take_import(&mut self, name: &str) -> bool {
+        if !self.lex.iter().any(|(n, k, _)| &**n == name && *k == BindKind::Import) {
+            return false;
+        }
+        self.lex.retain(|(n, k, _)| !(&**n == name && *k == BindKind::Import));
+        if let Some(index) = self.lex_index.as_mut() {
+            index.remove(name);
+            for (n, k, _) in &self.lex {
+                if &**n == name {
+                    let all_functions = index.entry(n.clone()).or_insert(true);
+                    *all_functions &= *k == BindKind::Function;
+                }
+            }
+        }
+        true
+    }
+
     fn has_lex(&self, name: &str) -> bool {
         match &self.lex_index {
             Some(index) => index.contains_key(name),
@@ -437,6 +455,13 @@ impl Scope {
 #[derive(Debug, Default)]
 pub(crate) struct ScopeStack {
     pub scopes: Vec<Scope>,
+    /// TypeScript: a value declaration may share its name with an import,
+    /// which TypeScript then knows to be a type (they live in different
+    /// declaration spaces: `import { Symbol }` of an interface beside `function
+    /// Symbol`). The import gives way, and its name is recorded here for the
+    /// import to be dropped (`lang/ts/elide.rs`).
+    pub(crate) ts: bool,
+    pub(crate) import_clashes: Vec<Name>,
 }
 
 impl ScopeStack {
@@ -493,6 +518,9 @@ impl ScopeStack {
         pos: u32,
         annexb_dup_ok: bool,
     ) -> PResult<()> {
+        if self.ts && kind != BindKind::Import {
+            self.ts_take_import(name);
+        }
         let Some(scope) = self.scopes.last_mut() else {
             return Ok(());
         };
@@ -518,6 +546,35 @@ impl ScopeStack {
     /// arrow body or a plain Block all push a scope, so depth alone settles it.
     pub(crate) fn at_module_top_level(&self) -> bool {
         self.scopes.len() == 1 && self.scopes[0].kind == ScopeKind::Module
+    }
+
+    /// Is `name` declared in a scope inside the outermost one, so a reference
+    /// to it here does not reach a top-level binding of that name?
+    pub(crate) fn shadowed(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(1)
+            .any(|s| s.has_lex(name) || s.has_var(name))
+    }
+
+    /// How many scopes are open.
+    pub(crate) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Is `name` declared in a scope opened after the first `depth`?
+    pub(crate) fn binds_from(&self, depth: usize, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(depth)
+            .any(|s| s.has_lex(name) || s.has_var(name))
+    }
+
+    /// Is `name` declared in the innermost scope (lexically or by a `var`)?
+    pub(crate) fn declared_here(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|s| s.has_lex(name) || s.has_var(name))
     }
 
     /// Is `name` bound anywhere at the module's top level (lexically or by a
@@ -557,9 +614,20 @@ impl ScopeStack {
         }
     }
 
+    /// TypeScript: a value declaration of `name` in the innermost scope takes
+    /// the place of an import binding of it there (see `import_clashes`).
+    pub(crate) fn ts_take_import(&mut self, name: &str) {
+        if self.scopes.len() == 1 && self.scopes[0].take_import(name) {
+            self.import_clashes.push(name.into());
+        }
+    }
+
     /// A `var` conflicts with any lexical binding between here and the nearest
     /// var boundary, inclusive.
     pub(crate) fn declare_var(&mut self, name: &str, pos: u32) -> PResult<()> {
+        if self.ts {
+            self.ts_take_import(name);
+        }
         for scope in self.scopes.iter().rev() {
             if let Some(p) = &scope.simple_catch_param {
                 // Annex B B.3.5 carve-out.
@@ -607,6 +675,22 @@ pub struct ParseOptions {
     pub allow_super_call: bool,
     pub allow_await_expr: bool,
     pub allow_yield_expr: bool,
+    /// Read TypeScript: the grammar of `crate::lang::ts`, whose types are
+    /// checked and dropped as they are read, so the tree is the one the same
+    /// program written in JavaScript would give.
+    pub typescript: bool,
+    /// TypeScript's `useDefineForClassFields`: class fields stay fields
+    /// (defined on the instance) rather than becoming assignments at the head
+    /// of the constructor (see `lang/ts/config.rs`).
+    pub ts_define_fields: bool,
+    /// TypeScript's `experimentalDecorators` and `emitDecoratorMetadata`:
+    /// decorators are the legacy ones, lowered to tsc's helper calls (see
+    /// `lang/ts/legacy.rs`).
+    pub ts_legacy_decorators: bool,
+    pub ts_decorator_metadata: bool,
+    /// Read JSX (a `.jsx` or `.tsx` file), lowered as these options say
+    /// (see `jsx.rs`).
+    pub jsx: Option<super::jsx::JsxOptions>,
 }
 
 impl Default for ParseOptions {
@@ -620,6 +704,11 @@ impl Default for ParseOptions {
             allow_super_call: false,
             allow_await_expr: false,
             allow_yield_expr: false,
+            typescript: false,
+            ts_define_fields: false,
+            ts_legacy_decorators: false,
+            ts_decorator_metadata: false,
+            jsx: None,
         }
     }
 }
@@ -700,6 +789,33 @@ pub struct Parser<'s> {
     pub(crate) arg_scratch: Vec<Arg>,
     /// The same for object literal members (`parse_object_literal`).
     pub(crate) member_scratch: Vec<ObjectMember>,
+    /// The source is TypeScript (`ParseOptions::typescript`): the hooks into
+    /// `crate::lang::ts` are taken.
+    pub(crate) ts: bool,
+    /// What the TypeScript grammar keeps while it reads (see `lang/ts`).
+    pub(crate) ts_state: crate::lang::ts::TsState,
+    /// JSX's settings and what its lowering has used, when the file has JSX.
+    pub(crate) jsx: Option<Box<super::jsx::JsxState>>,
+}
+
+/// Where a speculative parse started, to go back to: TypeScript decides some
+/// prefixes (`(a): T => …` against `(a)`, `f<T>(x)` against `f < T > (x)`)
+/// only by trying one reading. Everything a failed attempt may have changed
+/// is here; the scratch lists and the recursion count restore themselves on
+/// the error path.
+pub(crate) struct Snapshot {
+    pos: u32,
+    tok: Token,
+    prev_end: u32,
+    ctx: Ctx,
+    cover: Cover,
+    labels: Vec<Name>,
+    parenthesized: bool,
+    stmt_pos: StmtPos,
+    scope_depth: usize,
+    tree_depth: usize,
+    /// TypeScript's legacy-decorator classes open (`TsState::legacy_classes`).
+    legacy_depth: usize,
 }
 
 /// How many validator levels one recursive activation may add above the
@@ -746,7 +862,10 @@ impl<'s> Parser<'s> {
             tok,
             prev_end: 0,
             ctx,
-            scopes: ScopeStack::default(),
+            scopes: ScopeStack {
+                ts: opts.typescript,
+                ..ScopeStack::default()
+            },
             cover: Cover::default(),
             labels: Vec::new(),
             parenthesized: false,
@@ -761,7 +880,118 @@ impl<'s> Parser<'s> {
             stmt_scratch: Vec::new(),
             arg_scratch: Vec::new(),
             member_scratch: Vec::new(),
+            ts: opts.typescript,
+            ts_state: crate::lang::ts::TsState {
+                define_fields: opts.ts_define_fields,
+                legacy_decorators: opts.ts_legacy_decorators,
+                decorator_metadata: opts.ts_decorator_metadata,
+                ..Default::default()
+            },
+            jsx: opts
+                .jsx
+                .map(|o| Box::new(super::jsx::JsxState::new(o, src))),
         })
+    }
+
+    /// The parser's position and state, for [`Self::rewind`].
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            pos: self.lx.pos(),
+            tok: self.tok.clone(),
+            prev_end: self.prev_end,
+            ctx: self.ctx,
+            cover: self.cover.clone(),
+            labels: self.labels.clone(),
+            parenthesized: self.parenthesized,
+            stmt_pos: self.stmt_pos,
+            scope_depth: self.scopes.scopes.len(),
+            tree_depth: self.tree_depth,
+            legacy_depth: self.ts_state.legacy_classes.len(),
+        }
+    }
+
+    /// Go back to `s`, undoing a speculative parse that failed or was not
+    /// wanted.
+    pub(crate) fn rewind(&mut self, s: Snapshot) {
+        self.lx.seek(s.pos);
+        self.tok = s.tok;
+        self.prev_end = s.prev_end;
+        self.ctx = s.ctx;
+        self.cover = s.cover;
+        self.labels = s.labels;
+        self.parenthesized = s.parenthesized;
+        self.stmt_pos = s.stmt_pos;
+        self.scopes.scopes.truncate(s.scope_depth);
+        self.tree_depth = s.tree_depth;
+        self.ts_state.legacy_classes.truncate(s.legacy_depth);
+    }
+
+    /// The source text `start..end`.
+    /// The whole source text.
+    pub(crate) fn source(&self) -> &'s str {
+        self.src
+    }
+
+    pub(crate) fn src_text(&self, start: u32, end: u32) -> &'s str {
+        self.src.get(start as usize..end as usize).unwrap_or("")
+    }
+
+    /// The source text's length.
+    pub(crate) fn src_len(&self) -> u32 {
+        self.src.len() as u32
+    }
+
+    /// A one-token lookahead's rewind point: [`Self::save`] plus `prev_end`.
+    pub(crate) fn peek_state(&self) -> (u32, Token, u32) {
+        (self.lx.pos(), self.tok.clone(), self.prev_end)
+    }
+
+    pub(crate) fn peek_restore(&mut self, s: (u32, Token, u32)) {
+        self.lx.seek(s.0);
+        self.tok = s.1;
+        self.prev_end = s.2;
+    }
+
+    /// The current token is a compound punctuator of which only the first
+    /// character belongs to the production: `>>`, `>=` and the like ending a
+    /// TypeScript type argument list (`Array<Array<T>>`), or `<<` opening one
+    /// whose first type is generic (`Mock<<T>(x: T) => T>`). Take that
+    /// character and lex the rest again as the token that follows it.
+    pub(crate) fn split_first(&mut self) -> PResult<()> {
+        let at = self.tok.span.start + 1;
+        self.prev_end = at;
+        self.lx.seek(at);
+        self.tok = self.lx.next_token(false)?;
+        Ok(())
+    }
+
+    /// Lex on from byte `pos`, whose token becomes the current one. JSX reads
+    /// its own text and hands the lexer back its position this way; the
+    /// trivia before the token is skipped, so `newline_before` is right.
+    pub(crate) fn resume_at(&mut self, pos: u32, regex_allowed: bool) -> PResult<()> {
+        self.prev_end = pos;
+        self.lx.seek(pos);
+        self.tok = self.lx.next_token(regex_allowed)?;
+        Ok(())
+    }
+
+    /// The first byte at or after `pos` that is not whitespace or part of a
+    /// comment. Moves the lexer, so a [`Self::resume_at`] must follow before
+    /// tokens are read again.
+    pub(crate) fn skip_trivia_from(&mut self, pos: u32) -> PResult<u32> {
+        self.lx.seek(pos);
+        self.lx.skip_trivia()?;
+        Ok(self.lx.pos())
+    }
+
+    /// This parse's one allocation of the name `s` (see `Lexer::intern`).
+    pub(crate) fn intern_name(&mut self, s: &str) -> Name {
+        self.lx.intern(s)
+    }
+
+    /// The source text from byte `pos` on.
+    pub(crate) fn rest_from(&self, pos: u32) -> &'s str {
+        self.src.get(pos as usize..).unwrap_or("")
     }
 
     /// The upper bound on the finished program's tree height — see the

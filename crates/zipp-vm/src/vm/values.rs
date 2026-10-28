@@ -1234,6 +1234,20 @@ impl<'p> Vm<'p> {
         key: &str,
     ) -> Result<Option<Value>, Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_get_slow_in(ctx, func_id, ip, name, o, key)
+    }
+
+    /// [`Self::private_get_slow`] for code running as `ctx`: compiled code,
+    /// whose running callee is not the top frame's (`jit_private_prop_ic`).
+    pub(crate) fn private_get_slow_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+    ) -> Result<Option<Value>, Thrown> {
         let site = private_site(func_id, name);
         if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // Declaring-class-resolved, KIND-aware access (spec PrivateGet):
@@ -1315,6 +1329,21 @@ impl<'p> Vm<'p> {
         v: Value,
     ) -> Result<bool, Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_set_slow_in(ctx, func_id, ip, name, o, key, v)
+    }
+
+    /// [`Self::private_set_slow`] for code running as `ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn private_set_slow_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+        v: Value,
+    ) -> Result<bool, Thrown> {
         let site = private_site(func_id, name);
         if let Some((b2, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // PrivateFieldSet on a field already present: its entry for this
@@ -1413,6 +1442,21 @@ impl<'p> Vm<'p> {
         v: Value,
     ) -> Result<(), Thrown> {
         let ctx = self.frames.last().map_or(Value::UNDEFINED, |f| f.callee);
+        self.private_set_strict_in(ctx, func_id, ip, name, o, key, v)
+    }
+
+    /// [`Self::private_set_strict`] for code running as `ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn private_set_strict_in(
+        &mut self,
+        ctx: Value,
+        func_id: u32,
+        ip: usize,
+        name: u32,
+        o: Value,
+        key: &str,
+        v: Value,
+    ) -> Result<(), Thrown> {
         let site = private_site(func_id, name);
         if let Some((b, kind, owner, pid)) = self.resolve_private_site(ctx, site, key) {
             // Declaring-class-resolved, KIND-aware write (spec PrivateSet). A
@@ -2940,6 +2984,30 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `new RegExp(p, f)` (`is_construct`), `RegExp(p, f)`, and a regular
+    /// expression literal: the `NewRegExp` instruction, shared by the
+    /// interpreter and compiled code (`jit_new_regexp_ic`).
+    pub(crate) fn new_regexp_value(
+        &mut self,
+        p: Value,
+        f: Value,
+        is_construct: bool,
+    ) -> Result<Value, Thrown> {
+        // IsRegExp(pattern) (ctor step 1) reads `@@match` once, for
+        // both the shortcut below and the build.
+        let pattern_is_regexp = self.is_regexp(p)?;
+        // `RegExp(re)` (NOT `new`) with no flags returns `re`
+        // unchanged when re's `constructor` is RegExp (ctor step 2.b).
+        if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && pattern_is_regexp {
+            let c = self.get_prop(p, "constructor")?;
+            if self.same_value(c, Value::heap(self.regexp_ctor)) {
+                return Ok(p);
+            }
+        }
+        let pre = self.regexp_pattern_snapshot_after(p, pattern_is_regexp);
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
     /// RegExpInitialize against an already-taken pattern snapshot.
     pub(crate) fn build_regexp_snapshot(
         &mut self,
@@ -3110,6 +3178,78 @@ impl<'p> Vm<'p> {
         if let Some(b) = exact_bytes {
             self.regexp_exact_source.insert(idx, b);
         }
+        self.install_regexp_proto(idx);
+        Ok(Value::heap(idx))
+    }
+
+    /// The object a regex literal's evaluation makes (`NewRegExp`, whose
+    /// pattern and flags are the site's string constants). Each evaluation
+    /// is a new object, as the spec requires, but everything about it but
+    /// `lastIndex` is the same every time: the first builds it through the
+    /// constructor's path and keeps its program, source and flags for the
+    /// site, and the rest share them (three reference counts, no parse of
+    /// the flags, no string copies, no cache lookup). After a few evaluations
+    /// the site builds the byte-optimized twin once, which a fresh object
+    /// per evaluation would never live long enough to earn.
+    pub(crate) fn new_regexp_literal(
+        &mut self,
+        site: u64,
+        p: Value,
+        f: Value,
+    ) -> Result<Value, Thrown> {
+        const TWIN_AFTER: u32 = 8;
+        if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
+            if t.pattern_bits == p.bits() && t.flags_bits == f.bits() {
+                t.uses = t.uses.saturating_add(1);
+                let want_twin = t.twin.is_none() && t.uses >= TWIN_AFTER;
+                let data = crate::heap::RegExpData {
+                    regex: t.regex.clone(),
+                    source: t.source.clone(),
+                    flags: t.flags.clone(),
+                    last_index: Value::int(0),
+                    ascii_twin: t.twin.clone(),
+                };
+                let idx = self.heap.alloc(HeapObj::RegExp(Box::new(data)));
+                self.install_regexp_proto(idx);
+                if want_twin {
+                    self.ensure_regexp_ascii_twin(idx);
+                    let twin = match self.heap.get(idx) {
+                        HeapObj::RegExp(re) => re.ascii_twin.clone(),
+                        _ => None,
+                    };
+                    if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
+                        t.twin = twin;
+                    }
+                }
+                return Ok(Value::heap(idx));
+            }
+        }
+        let v = self.new_regexp_value(p, f, true)?;
+        let idx = v.heap_index();
+        // A lone-surrogate pattern keeps its exact source in a side table
+        // per object; such a site builds every object in full.
+        if self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&idx) {
+            if let HeapObj::RegExp(re) = self.heap.get(idx) {
+                let site_data = RegExpLiteralSite {
+                    pattern_bits: p.bits(),
+                    flags_bits: f.bits(),
+                    regex: re.regex.clone(),
+                    source: re.source.clone(),
+                    flags: re.flags.clone(),
+                    twin: None,
+                    uses: 1,
+                };
+                if self.regexp_literal_sites.len() >= 4096 {
+                    self.regexp_literal_sites.clear();
+                }
+                self.regexp_literal_sites.insert(site, site_data);
+            }
+        }
+        Ok(v)
+    }
+
+    /// A new RegExp's [[Prototype]], as RegExpAlloc gives it.
+    fn install_regexp_proto(&mut self, idx: u32) {
         // RegExpAlloc is OrdinaryCreateFromConstructor(%RegExp%, "%RegExp.prototype%"),
         // and %RegExp% is the CURRENT Realm Record's — so a literal evaluated by
         // createRealm-child code (`other.eval("/foo/")`) inherits the CHILD's
@@ -3126,8 +3266,90 @@ impl<'p> Vm<'p> {
             };
             self.proto_of.insert(idx, Value::heap(proto));
         }
-        Ok(Value::heap(idx))
     }
 
     // ── Temporal.Duration ──
+}
+
+impl<'p> Vm<'p> {
+    /// The value of a call of the intrinsic global function `op` (`Number`,
+    /// `String`, `Boolean`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`)
+    /// with the `argc` arguments at `arg_base` of the window at `base`: the
+    /// `GlobalFn` instruction once its callee is known to be the intrinsic
+    /// (`global_fn_is_intrinsic`). Shared by the interpreter and compiled
+    /// code (`jit_global_fn_ic`).
+    pub(crate) fn global_fn_value(
+        &mut self,
+        op: crate::bytecode::GlobalFn,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Value, Thrown> {
+        use crate::bytecode::GlobalFn as G;
+        use super::helpers_numeric::{parse_float, parse_int};
+        let a0 = if argc >= 1 {
+            self.get(base, arg_base)
+        } else {
+            Value::UNDEFINED
+        };
+        let v = match op {
+            G::Number => {
+                if argc == 0 {
+                    Value::num(0.0)
+                } else {
+                    Value::num(self.to_number_coerce(a0)?)
+                }
+            }
+            G::String => {
+                if argc == 0 {
+                    self.alloc_str(String::new())
+                } else if a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Symbol { .. }
+                    )
+                {
+                    // `String(symbol)` is allowed (unlike ToString,
+                    // which throws) and yields "Symbol(desc)".
+                    self.symbol_descriptive_value(a0)?
+                } else {
+                    // Proper ToString: routes objects/functions
+                    // through their `toString` (so a function yields
+                    // its real source via Function.prototype.toString).
+                    // Identity for strings (exact WTF-8 content).
+                    self.to_str_value(a0)?
+                }
+            }
+            G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
+            G::ParseInt => {
+                // ToString(string) FIRST (observable toString, abrupt),
+                // then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity
+                // → 0 = default base).
+                let s = self.to_js_string(a0)?;
+                // ToInt32 WRAPS mod 2^32; Rust's `as i32` on a
+                // float saturates, which turned
+                // `parseInt("0x10", 1e308)` into an
+                // out-of-range radix (NaN) instead of 0.
+                let radix = if argc >= 2 {
+                    let rv = self.get(base, arg_base + 1);
+                    let r = self.to_number_strict(rv)?;
+                    crate::vm::helpers_num2::to_int32(r)
+                } else {
+                    0
+                };
+                Value::num(parse_int(&s, radix))
+            }
+            G::ParseFloat => {
+                let s = self.to_js_string(a0)?;
+                Value::num(parse_float(&s))
+            }
+            // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
+            // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
+            // and propagates abrupt completions (a throwing valueOf or
+            // a Symbol/BigInt argument → TypeError), so use strict ToNumber.
+            G::IsNaN => Value::bool(self.to_number_strict(a0)?.is_nan()),
+            G::IsFinite => Value::bool(self.to_number_strict(a0)?.is_finite()),
+        };
+        Ok(v)
+    }
 }

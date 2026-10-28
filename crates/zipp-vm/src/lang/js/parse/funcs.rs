@@ -67,6 +67,9 @@ impl<'s> Parser<'s> {
                 None => None,
             }
         };
+        if self.ts && self.at(Punct::Lt) {
+            self.ts_type_params()?;
+        }
         let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
         Ok(Function {
             name,
@@ -109,7 +112,11 @@ impl<'s> Parser<'s> {
         let params_at = self.cur().span.start;
         let params = self.parse_params()?;
         self.check_unique_params(&params, unique, params_at)?;
-        let body = self.parse_fn_body_with_params(Some(&params))?;
+        let body = if self.ts {
+            self.ts_fn_body(&params)?
+        } else {
+            self.parse_fn_body_with_params(Some(&params))?
+        };
 
         self.leave_fn_code(fn_code);
         self.ctx = saved;
@@ -172,6 +179,9 @@ impl<'s> Parser<'s> {
         is_generator: bool,
         start: u32,
     ) -> PResult<Function> {
+        if self.ts && self.at(Punct::Lt) {
+            self.ts_type_params()?;
+        }
         let saved_super = self.ctx.super_prop;
         // A method — object literal or class — may use `super.x`.
         self.ctx.super_prop = true;
@@ -226,6 +236,9 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn parse_params(&mut self) -> PResult<Params> {
+        if self.ts {
+            return self.ts_params();
+        }
         self.expect(Punct::LParen, true)?;
         let mut items = Vec::new();
         while !self.at(Punct::RParen) {
@@ -532,6 +545,9 @@ impl<'s> Parser<'s> {
         } else {
             None
         };
+        if self.ts && self.at(Punct::Lt) {
+            self.ts_type_params()?;
+        }
         let superclass = if self.eat_kw(Keyword::Extends, true)? {
             // The heritage is an expression whatever the class sits in, so a
             // CoverInitializedName inside it (`class extends {b = 1} {}`) is
@@ -558,6 +574,13 @@ impl<'s> Parser<'s> {
             None
         };
         let derived = superclass.is_some();
+        if self.ts {
+            self.ts_class_heritage_tail()?;
+        }
+        let legacy = self.ts && self.ts_state.legacy_decorators;
+        if legacy {
+            self.ts_legacy_enter(name.as_ref(), !decorators.is_empty());
+        }
 
         self.expect(Punct::LBrace, true)?;
         // `[In]` restores inside the braces — see `parse_args`. Nothing a
@@ -570,12 +593,21 @@ impl<'s> Parser<'s> {
         self.ctx.in_ = true;
         let mut body = Vec::new();
         let mut saw_ctor = false;
+        // TypeScript: the fields its constructor's parameter properties declare.
+        let mut ts_fields = Vec::new();
         while !self.at(Punct::RBrace) && !self.at_eof() {
             // A stray `;` between members is legal and means nothing.
             if self.eat(Punct::Semi, true)? {
                 continue;
             }
-            let m = self.parse_class_member(derived)?;
+            let m = if self.ts {
+                match self.ts_class_member(derived, &mut ts_fields)? {
+                    Some(m) => m,
+                    None => continue,
+                }
+            } else {
+                self.parse_class_member(derived)?
+            };
             if let ClassMember::Method(cm) = &m {
                 if cm.kind == MethodKind::Constructor {
                     if saw_ctor {
@@ -590,6 +622,15 @@ impl<'s> Parser<'s> {
         }
         let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
+        if self.ts {
+            if legacy {
+                self.ts_legacy_strip(&mut body)?;
+            }
+            self.ts_finish_class(&mut body, ts_fields, derived, start);
+        }
+        if legacy {
+            self.ts_legacy_exit();
+        }
         self.ctx.in_ = saved_in;
         self.ctx.strict = saved_strict;
         Self::check_class_body(&body, body_end)?;
@@ -735,8 +776,20 @@ impl<'s> Parser<'s> {
         // assumes the slice begins there.
         let start = self.cur().span.start;
         let mut m = self.parse_class_member_inner(derived, start)?;
+        self.attach_member_decorators(&mut m, decorators, dec_start)?;
+        Ok(m)
+    }
+
+    /// Give class member `m` the DecoratorList read before it, at
+    /// `dec_start`.
+    pub(crate) fn attach_member_decorators(
+        &self,
+        m: &mut ClassMember,
+        decorators: Vec<Expr>,
+        dec_start: u32,
+    ) -> PResult<()> {
         if !decorators.is_empty() {
-            match &mut m {
+            match m {
                 ClassMember::Method(cm) => {
                     // §15.7.1: `It is a Syntax Error if … ClassElement is
                     // DecoratorList MethodDefinition and PropName of
@@ -760,11 +813,18 @@ impl<'s> Parser<'s> {
                 }
             }
         }
-        Ok(m)
+        Ok(())
     }
 
-    fn parse_class_member_inner(&mut self, derived: bool, start: u32) -> PResult<ClassMember> {
-        let is_static = if self.at_kw(Keyword::Static) {
+    pub(crate) fn parse_class_member_inner(
+        &mut self,
+        derived: bool,
+        start: u32,
+    ) -> PResult<ClassMember> {
+        // TypeScript's modifier list may have held the `static` already.
+        let is_static = if self.ts && std::mem::take(&mut self.ts_state.member_static) {
+            true
+        } else if self.at_kw(Keyword::Static) {
             let save = self.save();
             self.bump_after_operand()?;
             // `static` may itself be the member NAME: a field
@@ -869,6 +929,9 @@ impl<'s> Parser<'s> {
         let is_generator = self.eat(Punct::Star, false)?;
 
         let key = self.parse_prop_key()?;
+        if self.ts {
+            self.ts_member_key_suffix()?;
+        }
 
         if self.at(Punct::LParen) {
             // PropName, not spelling: `class C { 'constructor'(){} }` defines the
@@ -945,6 +1008,9 @@ impl<'s> Parser<'s> {
     /// get/set pair that reads and writes it.
     fn parse_auto_accessor(&mut self, is_static: bool, start: u32) -> PResult<ClassMember> {
         let key = self.parse_prop_key()?;
+        if self.ts {
+            self.ts_member_key_suffix()?;
+        }
         let value = if self.eat(Punct::Eq, true)? {
             let saved = self.ctx;
             self.ctx.in_field_init = true;

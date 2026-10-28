@@ -1877,6 +1877,23 @@ fn fnjit_mem_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
+/// Whether Tier C will try `proto` (it may still decline in the emitter).
+/// `ZIPP_TIER_A_LEAVES=1` keeps a non-recursive body on Tier A, as before.
+fn tier_c_may_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> bool {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    {
+        static LEAVES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*LEAVES.get_or_init(|| std::env::var_os("ZIPP_TIER_A_LEAVES").is_some())
+            && fnjit_mem_enabled()
+            && mem_can_compile(proto, const_strs)
+    }
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    {
+        let _ = (proto, const_strs);
+        false
+    }
+}
+
 /// Tier-C admission of the proper-tail-call PREFIX op (`TailCall`): the
 /// compiler always follows it with the ordinary `Call`+`Return` of the same
 /// site, so Tier C admits it and emits nothing — see the `mem_can_compile`
@@ -3536,6 +3553,11 @@ pub struct Jit {
     threshold_override: u32,
     counts: FxHashMap<u32, u32>,
     compiled: FxHashMap<u32, JitFn>,
+    /// A non-recursive integer body's Tier A code, kept beside the Tier C body
+    /// `compiled` holds for it (see `compile`): Tier A needs neither a frame
+    /// nor an activation, so the callers with no frame under them (a promise
+    /// job, a host-run callback) can still run the function natively.
+    int_bodies: FxHashMap<u32, JitFn>,
     blacklist: FxHashSet<u32>,
     /// Dense per-func_id tier state ([`FN_COLD`]/[`FN_COMPILED`]/[`FN_DEAD`]),
     /// grown on demand. One array read on EVERY interpreted frame entry
@@ -3974,6 +3996,16 @@ impl Jit {
         self.compiled.get(&func_id)
     }
 
+    /// `func_id`'s int-tier body, which runs with no frame under it: its
+    /// compiled body when that is Tier A, else the Tier A code kept beside
+    /// a Tier C body.
+    pub fn int_body(&self, func_id: u32) -> Option<&JitFn> {
+        self.compiled
+            .get(&func_id)
+            .filter(|b| b.int_tier())
+            .or_else(|| self.int_bodies.get(&func_id))
+    }
+
     /// Native entry pointer for a SELF-CALL target, via a one-entry cache that
     /// the hot recursive path hits every time (skipping the `compiled` HashMap
     /// lookup). See `self_cache`. Returns `None` if `func_id` isn't compiled.
@@ -3992,6 +4024,13 @@ impl Jit {
     /// Record an interpreter entry into `func_id`. Returns `true` once it
     /// crosses the threshold and is neither compiled nor blacklisted — the
     /// caller should then attempt `compile`.
+    /// Whether a compile of `func_id` failed for good (the function stays on
+    /// the interpreter).
+    #[inline]
+    pub fn is_blacklisted(&self, func_id: u32) -> bool {
+        self.blacklist.contains(&func_id)
+    }
+
     pub fn record_and_should_compile(&mut self, func_id: u32) -> bool {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return false;
@@ -4342,7 +4381,22 @@ impl Jit {
             return;
         }
         let meter = self.meter;
-        match compile_proto(proto, func_id, self_call_helper, self_val_bits, meter) {
+        // Tier A is for self-recursive integer bodies (fib). One that does
+        // not call itself (`(a, b) => a - b`) gains nothing from it over
+        // Tier C and loses the cross entry only Tier C gives: a compiled
+        // caller's call to it then declines and takes the generic call, every
+        // time. Such a body becomes the function's body only when Tier C
+        // declines; otherwise it is kept beside Tier C's for the callers
+        // that have no frame to give a Tier C body (`int_body`).
+        let mut tier_a_fallback = None;
+        let tier_a = match compile_proto(proto, func_id, self_call_helper, self_val_bits, meter) {
+            Some(f) if f.self_binding().is_none() && tier_c_may_compile(proto, const_strs) => {
+                tier_a_fallback = Some(f);
+                None
+            }
+            other => other,
+        };
+        match tier_a {
             Some(f) => {
                 // Tier A was the ONLY compiled tier with no JITLOG line of its
                 // own, so its reach could be assumed but never measured — and a
@@ -4464,6 +4518,11 @@ impl Jit {
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
+                if let Some(a) = tier_a_fallback.take() {
+                    let (at, n) = a.code_span();
+                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    self.int_bodies.insert(func_id, a);
+                }
                 // An `arguments` body takes no cross entry, framed or not:
                 // only a call setup builds its arguments object, so every
                 // call reaches it through one and `try_run_jit`.
@@ -4517,6 +4576,19 @@ impl Jit {
                 );
                 return;
             }
+        }
+        if let Some(f) = tier_a_fallback {
+            if crate::jitlog_enabled() {
+                eprintln!(
+                    "[jit] Tier A fn{func_id} compiled (Tier C declined; {} ops)",
+                    proto.code.len()
+                );
+            }
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+            self.compiled.insert(func_id, f);
+            self.set_fn_state(func_id, FN_COMPILED);
+            return;
         }
         if crate::jitlog_enabled() {
             eprintln!("[jit] fn{func_id} BLACKLISTED (neither Tier A nor Tier C compiled)");

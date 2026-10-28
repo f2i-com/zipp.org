@@ -226,7 +226,7 @@ impl<'s> Lexer<'s> {
     /// version the regex tables, Node 24 and the pinned Test262 are on
     /// (17.0), so `var \u{558}` declared a variable that `/\p{ID_Start}/u`
     /// did not match.
-    fn is_id_start(c: char) -> bool {
+    pub(crate) fn is_id_start(c: char) -> bool {
         if c.is_ascii() {
             return c.is_ascii_alphabetic() || c == '$' || c == '_';
         }
@@ -242,7 +242,7 @@ impl<'s> Lexer<'s> {
     /// (U+00B2 SUPERSCRIPT TWO). U+00B7 was hand-special-cased below precisely
     /// because the approximation could not express `Other_ID_Continue`; the real
     /// table covers it and the special case is gone.
-    fn is_id_part(c: char) -> bool {
+    pub(crate) fn is_id_part(c: char) -> bool {
         if c.is_ascii() {
             return c.is_ascii_alphanumeric() || c == '$' || c == '_';
         }
@@ -283,7 +283,7 @@ impl<'s> Lexer<'s> {
     /// Skip whitespace, line terminators and comments, recording whether any
     /// line terminator was crossed (which ASI and the no-LineTerminator-here
     /// restrictions are defined in terms of).
-    fn skip_trivia(&mut self) -> LResult<()> {
+    pub(crate) fn skip_trivia(&mut self) -> LResult<()> {
         // Where this run began — see the `-->` arm below.
         let run_start = self.pos;
         loop {
@@ -578,7 +578,7 @@ impl<'s> Lexer<'s> {
     }
 
     /// This lexer's one allocation of the identifier `s`.
-    fn intern(&mut self, s: &str) -> super::ast::Name {
+    pub(crate) fn intern(&mut self, s: &str) -> super::ast::Name {
         if self.names.is_empty() {
             if let Some(n) = self.few.iter().find(|n| &***n == s) {
                 return n.clone();

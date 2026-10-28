@@ -6,7 +6,7 @@
 use super::*;
 
 use crate::parse::ast::{
-    self, AssignOp, CallExpr, Expr, MemberProp, PropKey, Target, TargetElem, TargetProp,
+    self, ArrayElem, AssignOp, CallExpr, Expr, MemberProp, PropKey, Target, TargetElem, TargetProp,
 };
 
 /// `ZIPP_NO_CONCAT_PAIR_FUSE=1` restores identifier `x += (b + c)` to the
@@ -515,6 +515,116 @@ impl<'a> FnCompiler<'a> {
             }
             Target::Call(c) => self.assign_call_target(c),
         }
+    }
+
+    /// `[a, b] = [x, y]`: an array pattern assigned an array literal of
+    /// plain elements (the swap idiom). The literal is evaluated as always,
+    /// into a register window; then, while Array iteration is the built-in
+    /// one (`IterToArray`'s probe), iterating the fresh literal reads its
+    /// elements in order and nothing else, so each target takes its element
+    /// straight from the window: no array, no iterator, no `finally`
+    /// bracket (whose handler op forces every call to the function through
+    /// a frame). The targets are still evaluated, defaulted and stored in
+    /// the spec's order. Otherwise the literal becomes its array and the
+    /// stepwise driver runs. `dst`: where the expression's value (the array)
+    /// goes, `None` when it is discarded. `None` back when the shape does
+    /// not apply (a rest element, a hole or spread in the literal).
+    pub(crate) fn assign_array_literal(
+        &mut self,
+        els: &[Option<TargetElem>],
+        items: &[Option<ArrayElem>],
+        dst: Option<Reg>,
+    ) -> R<Option<Reg>> {
+        let n = items.len();
+        if n == 0
+            || n >= crate::bytecode::ITER_PROBE as usize
+            || els.iter().any(|e| matches!(e, Some(t) if t.rest))
+            || !items.iter().all(|i| matches!(i, Some(ArrayElem::Expr(_))))
+            || self.next_reg as usize + n + 2 > Reg::MAX as usize
+        {
+            return Ok(None);
+        }
+        // A discarded value still has a register to name (`expr_discarded`'s
+        // contract), left allocated as a temp is.
+        let out = match dst {
+            Some(d) => d,
+            None => self.temp(),
+        };
+        let save = self.next_reg;
+        let base = self.next_reg;
+        for _ in items {
+            self.alloc_reg();
+        }
+        let block_top = self.next_reg;
+        for (i, item) in items.iter().enumerate() {
+            let Some(ArrayElem::Expr(e)) = item else {
+                unreachable!()
+            };
+            let slot = base + i as Reg;
+            let v = self.expr_into(e, slot)?;
+            if v != slot {
+                self.emit(Instr::Move { dst: slot, src: v });
+            }
+            self.set_next_reg(block_top);
+        }
+        let probe = self.alloc_reg();
+        self.emit(Instr::IterToArray {
+            dst: probe,
+            src: base,
+            count: crate::bytecode::ITER_PROBE | n as u32,
+        });
+        let to_slow = self.here();
+        self.emit(Instr::JumpIfFalse {
+            cond: probe,
+            target: 0,
+        });
+        for (i, el) in els.iter().enumerate() {
+            let Some(te) = el else { continue };
+            let save_el = self.next_reg;
+            let pre = self.pre_member_ref(&te.target)?;
+            // A default replaces the value in place: the window keeps the
+            // literal's elements for the array the expression evaluates to.
+            let val = if i < n && te.default.is_none() {
+                base + i as Reg
+            } else {
+                let v = self.alloc_reg();
+                if i < n {
+                    self.emit(Instr::Move {
+                        dst: v,
+                        src: base + i as Reg,
+                    });
+                } else {
+                    self.emit(Instr::LoadUndefined { dst: v });
+                }
+                v
+            };
+            match pre {
+                Some((obj, key)) => self.store_pre_ref(te.default.as_ref(), obj, &key, val)?,
+                None => self.assign_maybe_default(&te.target, te.default.as_ref(), val)?,
+            }
+            self.set_next_reg(save_el);
+        }
+        if dst.is_some() {
+            self.emit(Instr::NewArray {
+                dst: out,
+                arg_base: base,
+                argc: n as u16,
+            });
+        }
+        let to_end = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let slow = self.here();
+        self.patch_jump(to_slow, slow);
+        self.emit(Instr::NewArray {
+            dst: out,
+            arg_base: base,
+            argc: n as u16,
+        });
+        self.assign_array_target(els, out)?;
+        let end = self.here();
+        self.patch_jump(to_end, end);
+        self.set_next_reg(save);
+        Ok(Some(out))
     }
 
     pub(crate) fn assign_array_target(&mut self, els: &[Option<TargetElem>], src_in: Reg) -> R<()> {
@@ -1368,6 +1478,22 @@ impl<'a> FnCompiler<'a> {
                 }
             },
             // Destructuring assignment to existing targets: `[a,b]=arr`, `({x}=o)`.
+            Target::Array(els)
+                if matches!(op, AssignOp::Assign) && matches!(value, Expr::Array(..)) =>
+            {
+                let Expr::Array(items, _) = value else {
+                    unreachable!()
+                };
+                if let Some(r) = self.assign_array_literal(els, items, Some(dst))? {
+                    return Ok(r);
+                }
+                let src = self.expr_into(value, dst)?;
+                if src != dst {
+                    self.emit(Instr::Move { dst, src });
+                }
+                self.assign_target(target, dst)?;
+                return Ok(dst);
+            }
             Target::Array(_) | Target::Object { .. } => {
                 let src = self.expr_into(value, dst)?;
                 if src != dst {

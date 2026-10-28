@@ -1281,6 +1281,50 @@ pub(crate) extern "win64" fn jit_iter_to_array_ic(
     })
 }
 
+/// Win64 helper for `IterToArray`'s probe (`bytecode::ITER_PROBE`): whether
+/// Array iteration is the built-in one, as a boolean Value. Reads memoized
+/// prototype slots only; no allocation and no user code, so no call protocol.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_probe(vm: *mut core::ffi::c_void) -> u64 {
+    // SAFETY: read-only view; the running code holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    Value::bool(vm.array_iter_pristine()).bits()
+}
+
+/// Win64 helper for `IterToArray` of a plain Array whose iteration is the
+/// built-in one: the array itself, as `iter_to_array`'s positional arm
+/// answers, with none of the call protocol (no allocation, no user code).
+/// `SELF_CALL_DEOPT`, having done nothing, for anything else, which then
+/// takes `jit_iter_to_array_ic`.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_to_array_plain(
+    vm: *mut core::ffi::c_void,
+    src_bits: u64,
+) -> u64 {
+    let src = Value::from_bits(src_bits);
+    if !src.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the running code holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let idx = src.heap_index();
+    // A mapped `arguments` object's dense slots are refreshed by the general
+    // route before they are read; it takes that route.
+    if matches!(vm.heap.get(idx), HeapObj::Array(_))
+        && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&idx))
+        && vm.builtin_iter_fast(src, true)
+    {
+        return src_bits;
+    }
+    crate::codegen::SELF_CALL_DEOPT
+}
+
 /// Win64 helper for a non-spread `ArrayAppend` (`[a, ...b, x]`'s `x`): push
 /// onto the literal under construction, as the interpreter's arm does. No
 /// user code and no heap allocation, so no call protocol: returns the
@@ -1369,6 +1413,73 @@ pub(crate) extern "win64" fn jit_obj_enum_ic(
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         vm.jit_region_obj_enum_impl(caller_base_ptr, packed_args)
+    })
+}
+
+/// Win64 helper for `GlobalFn` (`Number(x)`, `Boolean(x)`, `parseInt(s, r)`,
+/// `parseFloat(s)`, `isNaN(x)`, `isFinite(x)` and `String(x)`) in a Tier C
+/// body, `packed_args` = `callee | arg_base << 16 | argc << 32 | op << 48`:
+/// the interpreter's value (`Vm::global_fn_value`), with the call protocol
+/// (coercion runs `valueOf`/`toString`). A callee that is no longer the
+/// intrinsic declines with nothing done, for the interpreter's call.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_global_fn_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_global_fn_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
+/// Win64 helper for a private name in compiled code: a read `o.#x`
+/// (`GetProp`, op 0), a write `o.#x = v` (`SetPrivate`, op 1) and a field
+/// initializer's add (`SetProp`, op 2). `packed_args` = `obj | val << 16 |
+/// name << 32 | op << 56`. A read returns the value; a write returns `val`'s
+/// own bits, stored back over its register unchanged.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_private_prop_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_private_prop_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
+/// Win64 helper for `NewRegExp` (a regular expression literal, `RegExp(p,
+/// f)` or `new RegExp(p, f)`) in a Tier C body, `packed_args` = `pattern |
+/// flags << 16 | is_construct << 32`: the interpreter's value
+/// (`Vm::new_regexp_value`), with the call protocol (`@@match`, `source`,
+/// `flags` and a pattern's `toString` are user code).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_new_regexp_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_new_regexp_impl(caller_base_ptr, packed_fip, packed_args)
     })
 }
 
@@ -1848,6 +1959,35 @@ pub(crate) extern "win64" fn jit_get_index(
     let key = Value::from_bits(key_bits);
     if !arr.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // The common read first: a present element of a dense Array at an int
+    // key. With no side table on the array (no element override, no
+    // `defineProperty`'d index) and no arguments mapping, the element is its
+    // own data property and shadows the chain: the Array arm below answers
+    // the same after its lookups.
+    if key.is_int() {
+        let raw = vm;
+        // SAFETY: read-only view; the running code holds no conflicting borrow.
+        let vm = unsafe { &*(raw as *const Vm) };
+        let aidx = arr.heap_index();
+        if let HeapObj::Array(items) = vm.heap.get(aidx) {
+            if let Some(&v) = usize::try_from(key.as_int()).ok().and_then(|i| items.get(i)) {
+                if !v.is_hole()
+                    && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
+                    && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
+                {
+                    // The store answered alone: let emitted reads of this
+                    // array answer from it too (`Heap::arr_mirror`).
+                    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                    {
+                        // SAFETY: the shared view above is not used again.
+                        let vm = unsafe { &mut *(raw as *mut Vm) };
+                        vm.heap.repair_arr_mirror(aidx);
+                    }
+                    return v.bits();
+                }
+            }
+        }
     }
     // A key built by concatenation is a rope until something reads it. The
     // arm below wants its bytes in place, and a loop over more than 32 fresh
@@ -4808,6 +4948,12 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     if matches!(key.as_bytes().first(), Some(b'#')) || !vm.deferred_ns_state.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // A class method this site read before (`o.m` read ahead of its call's
+    // arguments, `ray.origin.sub(this.center)`): the memo's answer, ahead of
+    // the key scan and the shape memo.
+    if let Some(bits) = jit_class_read_hit(vm, idx, site_idx, func_id, name_idx) {
+        return bits;
+    }
 
     // `s.slice` / `s.indexOf` / ... on a primitive string: the method a
     // loop calls is read here on every iteration (string receivers are not
@@ -5005,7 +5151,9 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // its class chain — the interpreter-IC slow helper serves those
             // (polymorphic, guard-validated); a plain object walks the PROTO
             // CHAIN (`Object.create({val})` — the chain may hold the property).
-            None if map.class.is_some() => return crate::codegen::PROP_VIA_IC,
+            None if map.class.is_some() => {
+                return jit_class_read_fill(vm, obj, key, site_idx, func_id, name_idx)
+            }
             // A ctor-map receiver (`Function`, builtin constructors) has
             // [[Prototype]] = %Function.prototype% — NOT the walk's
             // no-`proto_of`-entry default of %Object.prototype% — and the
@@ -5428,6 +5576,102 @@ const ADD_WAY_HOPS: usize = 4;
 /// Sites an add way is kept for; past it a site takes the miss path as before.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const ADD_WAY_SITES_MAX: usize = 1 << 20;
+
+/// One JIT `GetProp` site's last class-method read (`Vm::jit_class_reads`):
+/// a receiver of class `class` and hidden shape `recv_shape` read `name`
+/// (in function `func`) as the method `value`, resolved on the class chain
+/// while the class was at version `ver` and `class_proto_epoch` at `epoch`.
+/// The guards are the interpreter's `ClassMethod` hit's: the shape proves
+/// the receiver still owns no such key, the version and epoch that the
+/// member tables still describe the chain.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ClassRead {
+    func: u32,
+    name: u32,
+    /// `shape::DICT` (0) marks an empty memo.
+    recv_shape: u32,
+    class: u32,
+    ver: u32,
+    epoch: u32,
+    value: u64,
+}
+
+/// The method a site's memo names for the class instance `idx`, if every
+/// guard still holds.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_class_read_hit(vm: &Vm, idx: u32, site_idx: u32, func: u32, name: u32) -> Option<u64> {
+    let m = vm.jit_class_reads.get(site_idx as usize)?;
+    if m.recv_shape == crate::shape::DICT || m.func != func || m.name != name {
+        return None;
+    }
+    match vm.heap.get(idx) {
+        HeapObj::Object(map)
+            if map.class == Some(m.class)
+                && map.shape() == m.recv_shape
+                && vm.heap.version_of(m.class) == m.ver
+                && vm.class_proto_epoch == m.epoch =>
+        {
+            Some(m.value)
+        }
+        _ => None,
+    }
+}
+
+/// A class instance's read of a key it does not own: a method on its class
+/// chain is the read's value (and the site's memo); anything else (a
+/// getter, which has to run, an absent key, an uncacheable chain) takes the
+/// interpreter-IC slow helper.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: u32, name: u32) -> u64 {
+    let idx = obj.heap_index();
+    let (class, recv_shape) = match vm.heap.get(idx) {
+        HeapObj::Object(map) => match map.class {
+            Some(c) => (c, map.shape()),
+            None => return crate::codegen::PROP_VIA_IC,
+        },
+        _ => return crate::codegen::PROP_VIA_IC,
+    };
+    let callee = match vm.ic_walk(obj, key) {
+        crate::vm::ic::Walked::ClassMethod { class: c, callee } if c == class => callee,
+        _ => return crate::codegen::PROP_VIA_IC,
+    };
+    if recv_shape != crate::shape::DICT && class_read_memo_enabled() {
+        let s = site_idx as usize;
+        if vm.jit_class_reads.len() <= s {
+            vm.jit_class_reads.resize(s + 1, ClassRead::default());
+        }
+        vm.jit_class_reads[s] = ClassRead {
+            func,
+            name,
+            recv_shape,
+            class,
+            ver: vm.heap.version_of(class),
+            epoch: vm.class_proto_epoch,
+            value: callee.bits(),
+        };
+    }
+    callee.bits()
+}
+
+/// `ZIPP_NO_CLASS_READ_MEMO=1` sends every class-method read in compiled
+/// code through the interpreter-IC slow helper, as before the memo.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn class_read_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CLASS_READ_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 
 /// One JIT `SetProp` site's last proved append (`Vm::jit_add_ways`): adding
 /// the site's key to a plain, extensible, classless object of shape `before`
@@ -7731,6 +7975,24 @@ pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed
         target,
         kind_reg,
         val_reg,
+    });
+    0
+}
+
+/// Win64 helper for a Tier C `PushHandler` (a JavaScript `try`): the
+/// interpreter's arm verbatim on the activation's own frame (bodies with
+/// handler ops take only frame-backed entries). `packed` is
+/// `catch_target << 16 | catch_reg`. Total, never deopts.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` with at least one live frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_push_catch(vm: *mut core::ffi::c_void, packed: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let top = vm.frames.len() - 1;
+    vm.frames[top].handlers.push(Handler::Catch {
+        target: (packed >> 16) as u32,
+        reg: packed as u16,
     });
     0
 }

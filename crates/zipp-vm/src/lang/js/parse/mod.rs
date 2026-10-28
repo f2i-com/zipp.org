@@ -29,6 +29,7 @@ pub mod ast;
 pub mod cover;
 pub mod expr;
 pub mod funcs;
+pub mod jsx;
 pub mod lexer;
 pub(crate) mod limits;
 pub mod parser;

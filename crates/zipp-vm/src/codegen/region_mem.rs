@@ -93,6 +93,42 @@ fn cross_array_epoch_cache_off(c3_off: i32, plan: &TaPinPlan) -> Option<i32> {
 /// `obj_bits`. The identity half is required for `globalA = preexistingB`,
 /// which changes no Heap payload and therefore cannot advance the epoch.
 /// Any mismatch refreshes every Array pin and advances the stack cache.
+/// The general `obj.name(args…)` route of a region's CallMethod: the
+/// interpreter-IC call helper (`emit_region_call_ic`), which also emits the
+/// op's bail block. A name-chosen builtin lane whose helper declined (a user
+/// method of the same name) continues here.
+#[allow(clippy::too_many_arguments)]
+fn emit_region_general_method(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    heap: &HeapHelpers,
+    name: u32,
+    obj: u16,
+    arg_base: u16,
+    argc: u16,
+    dst: u16,
+    refetch_pinned: bool,
+    ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
+) {
+    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+    let packed_args = ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+    emit_region_call_ic(
+        ops,
+        ip,
+        bail,
+        epilogue,
+        heap.call_method_ic,
+        packed_fip,
+        packed_args,
+        argc,
+        dst,
+        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+        ta_refetch,
+    );
+}
+
 pub(crate) fn emit_cross_refetch_ta(
     ops: &mut dynasmrt::x64::Assembler,
     snapshot_helper: usize,
@@ -2424,6 +2460,10 @@ pub(crate) fn compile_region_mem(
                         dynasm!(ops ; jmp => ta_done ; => ta_slow);
                     } // end TA-kind branch
                 }
+                // An unpinned receiver: a present dense element through the
+                // array mirror, else the helper.
+                let mirror_done = ops.new_dynamic_label();
+                emit_arr_mirror_get(&mut ops, dst, obj, key, mirror_done);
                 // Generic element read `a[i]` via a win64 helper (dense arrays,
                 // flat-ASCII strings, and unpinned TypedArrays). Returns the
                 // element bits, `undefined` for out-of-range, or the deopt
@@ -2438,6 +2478,7 @@ pub(crate) fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
+                    ; => mirror_done
                 );
                 if pinned.is_some() {
                     dynasm!(ops ; => ta_done);
@@ -3062,9 +3103,12 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else if argc == 0 && key == "pop" {
                     // `arr.pop()`: `jit_array_pop` serves a plain dense Array
-                    // in place and declines anything else before any effect.
-                    // The array's storage shrinks, so pinned snapshots are
-                    // re-derived as after a push.
+                    // in place and declines anything else before any effect,
+                    // when the call takes the general route (a queue's own
+                    // `pop` is the same name). The array's storage shrinks,
+                    // so pinned snapshots are re-derived as after a push.
+                    let general = ops.new_dynamic_label();
+                    let pop_done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -3072,13 +3116,28 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     if let Some((snap, plan, cache)) = ta_refetch {
                         emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    dynasm!(ops ; jmp => pop_done ; => general);
+                    emit_region_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        &heap,
+                        name,
+                        obj,
+                        arg_base,
+                        argc,
+                        dst,
+                        refetch_pinned,
+                        ta_refetch,
+                    );
+                    dynasm!(ops ; => pop_done);
                 } else if argc == 1 && matches!(key, "push" | "charCodeAt") {
                     // The whitelisted 1-arg builtins keep their dedicated win64
                     // helpers: receiver + arg0 bits in, result bits out, deopt
@@ -3135,6 +3194,7 @@ pub(crate) fn compile_region_mem(
                             ; => cc_slow
                         );
                     }
+                    let general = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -3143,7 +3203,7 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general                       // not the builtin: a user method
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // `arr.push(x)` GROWS the array's `Vec` (reallocating its
@@ -3160,7 +3220,23 @@ pub(crate) fn compile_region_mem(
                     if str_pin.is_some() {
                         dynasm!(ops ; => cc_done);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    let lane_done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => lane_done ; => general);
+                    emit_region_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        &heap,
+                        name,
+                        obj,
+                        arg_base,
+                        argc,
+                        dst,
+                        refetch_pinned,
+                        ta_refetch,
+                    );
+                    dynasm!(ops ; => lane_done);
                 } else {
                     // B193: the emitted CallMethod cross lane first — every
                     // guard miss falls through to the unchanged helper block
@@ -3680,7 +3756,33 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::IterToArray { dst, count, .. }
+                if !py && count & !0x7FFF == crate::bytecode::ITER_PROBE =>
+            {
+                // `[a, b] = [b, a]`'s probe: a pure read, no call protocol.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::IterToArray { dst, src, count } if !py => {
+                // A plain Array first: itself, with no call protocol.
+                let general = ops.new_dynamic_label();
+                let plain_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_iter_to_array_plain as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => general
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => plain_done
+                    ; => general
+                );
                 // `[a, b] = v`: `jit_iter_to_array_ic`, with the call protocol.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
@@ -3696,6 +3798,7 @@ pub(crate) fn compile_region_mem(
                     refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                     ta_refetch,
                 );
+                dynasm!(ops ; => plain_done);
             }
             Instr::ArrayAppend { arr, val, spread: false } if !py => {
                 // `[...v, x]`'s `x`: a plain push (`jit_array_append_plain`).

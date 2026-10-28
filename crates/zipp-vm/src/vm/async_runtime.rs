@@ -4505,6 +4505,21 @@ impl<'p> Vm<'p> {
     /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
     /// run in the same drain). The whole event loop.
     pub fn drain_microtasks(&mut self) {
+        // `process.nextTick`'s callbacks run first at a checkpoint, and again
+        // after the microtasks while those queued more (Node's order).
+        loop {
+            if self.node_tick_pending {
+                self.node_run_ticks();
+            }
+            self.drain_microtasks_queue();
+            if !self.node_tick_pending {
+                break;
+            }
+        }
+    }
+
+    /// [`Self::drain_microtasks`]'s promise jobs.
+    fn drain_microtasks_queue(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
         // The embedding/main-script call that reached this checkpoint was one
         // job. WeakRef targets kept during it may now be cleared before the
@@ -4601,7 +4616,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
                     _ => return false,
                 };
-                if !self.jit.get(fid).is_some_and(|body| body.int_tier()) {
+                if self.jit.int_body(fid).is_none() {
                     return false;
                 }
                 self.close_job_window(window);
@@ -4843,6 +4858,19 @@ impl<'p> Vm<'p> {
                 self.timer_queue.clear();
                 break;
             }
+            // Only unref'd timeouts left (and no waiter): the loop is done,
+            // as Node's is; they never run.
+            if !self.timer_unref.is_empty()
+                && self.async_waiters.is_empty()
+                && self
+                    .timer_queue
+                    .iter()
+                    .all(|(_, cb)| self.timer_unref.contains(&cb.bits()))
+            {
+                self.timer_queue.clear();
+                self.timer_unref.clear();
+                break;
+            }
             let now = crate::vm::clock::Instant::now();
             let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
             let next_wait = self
@@ -4892,11 +4920,15 @@ impl<'p> Vm<'p> {
                 break;
             }
             let mut insertion_index = 0usize;
+            let unref = &mut self.timer_unref;
             self.timer_queue.retain(|&(deadline, callback)| {
                 let index = insertion_index;
                 insertion_index = insertion_index.saturating_add(1);
                 if deadline <= now {
                     fired.push((deadline, index, callback));
+                    if !unref.is_empty() {
+                        unref.remove(&callback.bits());
+                    }
                     false
                 } else {
                     true

@@ -47,6 +47,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_TIERC_TRY=1` leaves every function holding a `try`/`catch`
+    /// (or a BigInt literal) interpreted, as before Tier C admitted them.
+    fn tierc_try_enabled() = "ZIPP_NO_TIERC_TRY"
+);
+
+env_off_switch!(
     /// Defer flat-ASCII builder metadata across a compiler-proved call-free
     /// Tier-C loop. `ZIPP_NO_STR_APPEND_CURSOR=1` restores one
     /// `jit_str_append_index_ascii` boundary crossing per appended character.
@@ -1190,6 +1196,43 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] object literal op (disabled)");
                 }
             }
+            // A class field's definition: `jit_define_field`'s append, or a
+            // decline that replays the full definition in the interpreter.
+            Instr::DefineField { .. } => {}
+            // An object literal's spread (`{ ...e, left }`, everywhere in
+            // TypeScript) and its named properties after one: the region's
+            // `jit_obj_init_ic`, with the call protocol (a spread's getters
+            // are user code).
+            Instr::InitDataProp { name, .. } if name <= 0xFF_FFFF => {}
+            Instr::ObjectSpread { .. } => {}
+            // Every other intrinsic global call (`Number(x)`, `parseInt`, …)
+            // through `jit_global_fn_ic`, with the call protocol.
+            Instr::GlobalFn { op, argc, .. }
+                if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {}
+            // A JavaScript array literal's element or spread: the region's
+            // `jit_array_append_ic`, with the call protocol (a spread runs
+            // the iterator protocol, user code).
+            Instr::ArrayAppend { .. } if !py => {}
+            // `f(...xs)`: the region's `jit_call_spread_ic`, with the call
+            // protocol (the iterator and the callee are user code).
+            Instr::CallSpread { .. } if !py => {}
+            // A regular expression literal (one object per evaluation) or
+            // `RegExp(p, f)`: `jit_new_regexp_ic`, with the call protocol.
+            Instr::NewRegExp { .. } if !py => {}
+            // `o.#x = v`: `jit_private_prop_ic` (a private setter is user code).
+            Instr::SetPrivate { name, .. } if !py && name <= 0xFF_FFFF => {}
+            // Array destructuring (`const [a, b] = v`, `[x, y] = [y, x]`): the
+            // region's `jit_iter_to_array_ic`, with the call protocol (a
+            // non-array iterator is user code).
+            Instr::IterToArray { count, .. } if !py && count <= 0xFFFF => {}
+            // A destructuring's close of an unexhausted iterator, and its
+            // error-path form: the region's `jit_iter_op_ic` (`return()` is
+            // user code).
+            Instr::IterClose { .. } | Instr::IterCloseQuiet { .. } if !py => {
+                if !crate::vm::tierc_iter_enabled() {
+                    reject!("[tierC-reject] iterator/finally op (disabled)");
+                }
+            }
             Instr::NewArray { .. } => {
                 if !crate::vm::tierc_new_array_enabled() {
                     reject!("[tierC-reject] op NewArray (disabled)");
@@ -1320,6 +1363,22 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] op Throw (disabled)");
                 }
             }
+            // `try`/`catch`: the interpreter's handler push and pop, on the
+            // activation's own frame (a body with handler ops takes only
+            // frame-backed entries, as the `finally` bracket's do above). A
+            // throw inside unwinds to the handler through the interpreter,
+            // which runs the `catch`. A BigInt literal (`0n`): its immediate,
+            // or the interpreter's constant for a large one.
+            Instr::PushHandler { .. } | Instr::PopHandler => {
+                if !tierc_try_enabled() {
+                    reject!("[tierC-reject] try/catch (disabled)");
+                }
+            }
+            Instr::LoadBigInt { value, .. } => {
+                if !tierc_try_enabled() || Value::small_bigint(value.get()).is_none() {
+                    reject!("[tierC-reject] BigInt literal (disabled or not an immediate)");
+                }
+            }
             // Captured accesses use Tier-C-specific helpers. A frame-free native
             // cross-call installs its live closure explicitly; using the region
             // helper here would read `frames.last()` (the CALLER) and silently
@@ -1433,6 +1492,16 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
     }
     ok
+}
+
+/// Whether `name` is a private name (`#x`), which Tier C reads and writes
+/// through `jit_private_prop_ic` rather than the inline cache.
+fn tierc_private_name(proto: &FuncProto, name: u32) -> bool {
+    name <= 0xFF_FFFF
+        && proto
+            .string_constants
+            .get(name as usize)
+            .is_some_and(|s| s.starts_with('#'))
 }
 
 fn tierc_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
@@ -1682,6 +1751,20 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::GetProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
             Instr::AppendDataProp { obj, val, .. } => (u2(obj, val), None),
+            Instr::DefineField { obj, val, .. } => (u2(obj, val), None),
+            // The literal's own bits come back into its register.
+            Instr::InitDataProp { obj, val, .. } => (u2(obj, val), Some(obj)),
+            Instr::ObjectSpread { target, src } => (u2(target, src), Some(target)),
+            Instr::ArrayAppend { arr, val, .. } => (u2(arr, val), Some(arr)),
+            Instr::CallSpread { dst, callee, args } => (u2(callee, args), Some(dst)),
+            // A private write: `val`'s own bits come back into its register.
+            Instr::SetPrivate { obj, val, .. } => (u2(obj, val), Some(val)),
+            Instr::IterToArray { dst, src, .. } => (u1(src), Some(dst)),
+            // The iterator's own bits come back into its register.
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => (u1(iter), Some(iter)),
+            Instr::NewRegExp {
+                dst, pattern, flags, ..
+            } => (u2(pattern, flags), Some(dst)),
             Instr::SetHomeObject { method, home } => (u2(method, home), None),
             Instr::DeleteProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::NewArray {
@@ -4036,6 +4119,30 @@ pub(crate) fn compile_proto_mem(
                 });
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            // A JavaScript body's BigInt literal: admission took only the
+            // immediates.
+            Instr::LoadBigInt { dst, value } if !py => {
+                let bits = Value::small_bigint(value.get()).map_or(0, Value::bits);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            // A JavaScript `try`: the interpreter's handler push, on this
+            // activation's own frame (handler-op bodies take only
+            // frame-backed entries).
+            Instr::PushHandler {
+                catch_target,
+                catch_reg,
+            } if !py => {
+                let packed = ((catch_target as u64) << 16) | catch_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD crate::vm::jit_push_catch as *const () as i64
+                    ; call rax
+                );
+            }
             Instr::LoadBigInt { dst, value } => {
                 let value = value.get();
                 if let Some(bits) = small_bigint_bits(value) {
@@ -4244,6 +4351,30 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::DefineField { obj, name, val } => {
+                // As AppendDataProp's packing; the helper appends or declines
+                // with nothing done (the interpreter then replays the full
+                // CreateDataPropertyOrThrow). An append can move the
+                // receiver's property storage and bumps its version, so
+                // pinned bases are refreshed after it.
+                let helper = crate::vm::jit_define_field as *const () as usize;
+                let packed_name = ((func_id as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, QWORD packed_name as i64
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
                 );
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
@@ -5195,6 +5326,9 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::GetIndex { dst, obj, key } => {
+                // A present dense element first, through the array mirror.
+                let done = ops.new_dynamic_label();
+                emit_arr_mirror_get(&mut ops, dst, obj, key, done);
                 // Generic element read `a[i]` via the win64 helper (dense arrays,
                 // flat-ASCII strings, unpinned TypedArrays); `undefined` for
                 // out-of-range, deopt sentinel for receivers/keys needing
@@ -5211,6 +5345,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
             }
             Instr::TypeOf { dst, a } => {
                 // `typeof v` → a heap string (jit_typeof). Total (no deopt). The
@@ -5318,6 +5453,60 @@ pub(crate) fn compile_proto_mem(
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
+            }
+            Instr::GetProp { dst, obj, name } if !py && tierc_private_name(proto, name) => {
+                // `o.#x`: `jit_private_prop_ic` op 0 (no inline-cache way
+                // ever holds a private name). The site stays reserved.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (name as u64) << 32,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+                ic_site += 1;
+            }
+            Instr::SetProp { obj, name, val, .. } if !py && tierc_private_name(proto, name) => {
+                // A private field initializer's add: op 2.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 2u64 << 56,
+                    0,
+                    val,
+                    refetch,
+                    None,
+                );
+                ic_site += 1;
+            }
+            Instr::SetPrivate { obj, name, val } if !py => {
+                // `o.#x = v`: op 1.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_prop_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    val,
+                    refetch,
+                    None,
+                );
             }
             Instr::GetProp { dst, obj, name } => {
                 // 8-way inline cache (call-free on hit), then the miss helper,
@@ -5545,6 +5734,14 @@ pub(crate) fn compile_proto_mem(
                 // re-fetches the versions pointer explicitly below.
                 let key = proto.string_constants[name as usize].as_str();
                 let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
+                // A dedicated lane is chosen by the method's NAME, and a user
+                // method may share it (a queue's `push`, a cache's `get`): its
+                // helper declines before any effect and the call takes the
+                // general route below (`general`), as the final arm's does,
+                // rather than bailing the whole body to the interpreter on
+                // every such call.
+                let general = ops.new_dynamic_label();
+                let mut lane = false;
                 if key == "random" && argc == 0 && tierc_random_method_enabled() {
                     // Unlike arithmetic Math intrinsics, `Math.random()` must
                     // observe an own-property replacement. Route through the
@@ -5600,7 +5797,7 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail                          // live prototype/realm mismatch
+                        ; je => general                          // live prototype/realm mismatch
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // Case mapping allocates the result and can grow the heap's
@@ -5609,7 +5806,7 @@ pub(crate) fn compile_proto_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if tierc_coll_mutate_enabled()
                     && matches!((key, argc), ("set", 2) | ("clear", 0))
                 {
@@ -5633,10 +5830,10 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail                          // own/proto/realm override
+                        ; je => general                          // own/proto/realm override
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if substring_arity_ok && matches!(key, "substring" | "slice") {
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
@@ -5650,7 +5847,7 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // The result allocation can move the heap versions Vec.
@@ -5659,7 +5856,7 @@ pub(crate) fn compile_proto_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if matches!(key, "get" | "has") {
                     // Map.get / Map.has / Set.has — the region arm verbatim:
                     // `has` retries as Set (op 2) before deopting; a wrong
@@ -5690,16 +5887,16 @@ pub(crate) fn compile_proto_mem(
                             ; call rax
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
-                            ; je => bail
+                            ; je => general
                         );
                     } else {
-                        dynasm!(ops ; => set_try ; jmp => bail);
+                        dynasm!(ops ; => set_try ; jmp => general);
                     }
                     dynasm!(ops
                         ; => coll_done
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else if matches!(key, "charCodeAt" | "indexOf" | "push") && argc == 1 {
                     // charCodeAt / indexOf / push — one-arg dedicated helpers.
                     let helper = match key {
@@ -5715,11 +5912,31 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    lane = true;
                 } else {
+                    // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
+                    // the region arm, which declines before any effect; the
+                    // route below then serves the call as it always has.
+                    let pop_done = (key == "pop" && argc == 0).then(|| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; mov rax, QWORD crate::vm::jit_array_pop as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     // Every remaining name/arity: the same live-IC route as
                     // `random` — a USER function/closure runs to completion
                     // through the method cross-call or generic helper; natives
@@ -5745,6 +5962,31 @@ pub(crate) fn compile_proto_mem(
                         refetch,
                         method_own_slot_direct,
                     );
+                    if let Some(done) = pop_done {
+                        dynasm!(ops ; => done);
+                    }
+                }
+                if lane {
+                    let lane_done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => lane_done ; => general);
+                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    emit_tierc_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_method_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        arg_base,
+                        refetch,
+                        method_own_slot_direct,
+                    );
+                    dynasm!(ops ; => lane_done);
                 }
             }
             Instr::Call {
@@ -5898,6 +6140,187 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::GlobalFn {
+                dst,
+                op,
+                callee,
+                arg_base,
+                argc,
+            } if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_global_fn_ic as *const () as usize,
+                    packed_fip,
+                    callee as u64
+                        | (arg_base as u64) << 16
+                        | (argc as u64) << 32
+                        | (op as u8 as u64) << 48,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ArrayAppend { arr, val, spread } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_array_append_ic as *const () as usize,
+                    packed_fip,
+                    arr as u64 | (val as u64) << 16 | (spread as u64) << 32,
+                    0,
+                    arr,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::IterToArray { dst, count, .. }
+                if !py && count & !0x7FFF == crate::bytecode::ITER_PROBE =>
+            {
+                // `[a, b] = [b, a]`'s probe: a pure read, no call protocol.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::IterToArray { dst, src, count } if !py => {
+                // A plain Array first: itself, with no call protocol.
+                let general = ops.new_dynamic_label();
+                let plain_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_iter_to_array_plain as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => general
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => plain_done
+                    ; => general
+                );
+                // `[a, b] = v`: `jit_iter_to_array_ic`, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_to_array_ic as *const () as usize,
+                    packed_fip,
+                    src as u64 | (count as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+                dynasm!(ops ; => plain_done);
+            }
+            Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if !py => {
+                // `jit_iter_op_ic` op 2 (close) or 3 (quiet close), as the
+                // region arm.
+                let op: u64 = if matches!(proto.code[ip], Instr::IterClose { .. }) {
+                    2
+                } else {
+                    3
+                };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_iter_op_ic as *const () as usize,
+                    packed_fip,
+                    iter as u64 | op << 56,
+                    0,
+                    iter,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::CallSpread { dst, callee, args } if !py => {
+                // `f(...v)`: `jit_call_spread_ic`, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_spread_ic as *const () as usize,
+                    packed_fip,
+                    callee as u64 | (args as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::NewRegExp {
+                dst,
+                pattern,
+                flags,
+                is_construct,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_new_regexp_ic as *const () as usize,
+                    packed_fip,
+                    pattern as u64 | (flags as u64) << 16 | (is_construct as u64) << 32,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ObjectSpread { target, src } => {
+                // `{ ...src }`: `jit_obj_init_ic` op 0, as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
+                    packed_fip,
+                    target as u64 | (src as u64) << 16,
+                    0,
+                    target,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::InitDataProp { obj, name, val } => {
+                // A literal's named data property (`jit_obj_init_ic` op 1),
+                // as the region arm.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_init_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
+                    0,
+                    obj,
+                    refetch,
+                    None,
+                );
             }
             Instr::LoadClassValue { dst, class_id } => {
                 // The class binding through `jit_load_class_value_ic`; see
@@ -6104,19 +6527,48 @@ pub(crate) fn compile_proto_mem(
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    crate::vm::jit_call_with_this_ic as *const () as usize,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    refetch,
-                    None,
-                );
+                let call_with_this = crate::vm::jit_call_with_this_ic as *const () as usize;
+                // A leaf callee that never reads `this`, inlined under its
+                // guard; a miss makes the call through the same helper.
+                match leaf_plan.get(&ip).filter(|_| lane_done.is_none()) {
+                    Some(lp) => emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        heap.math_imul_guard,
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
+                        call_with_this,
+                        packed_fip,
+                        packed_args,
+                        refetch,
+                        None,
+                        None,
+                    ),
+                    None => emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        call_with_this,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch,
+                        None,
+                    ),
+                }
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
                 }

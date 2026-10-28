@@ -404,6 +404,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_ways: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_class_reads: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
@@ -437,6 +439,7 @@ impl<'p> Vm<'p> {
             array_stringify_active: Vec::new(),
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regexp_literal_sites: rustc_hash::FxHashMap::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),
             handler_pool: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
@@ -517,6 +520,7 @@ impl<'p> Vm<'p> {
             realm_throw_type_errors: std::collections::HashMap::new(),
             async_waiters: Vec::new(),
             timer_queue: Vec::new(),
+            timer_unref: rustc_hash::FxHashSet::default(),
             vm_start_mono_ms: crate::vm::clock::now_mono_ms(),
             #[cfg(not(feature = "wasm-single-agent"))]
             agent_shared: None,
@@ -529,6 +533,10 @@ impl<'p> Vm<'p> {
             mailbox: std::sync::Arc::new(agents::Mailbox::default()),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
+            module_forward: std::collections::HashMap::new(),
+            module_canon_memo: std::collections::HashMap::new(),
+            module_pending_resolved: std::collections::HashMap::new(),
+            module_static_exports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             in_probe_sites: Vec::new(),
             obj_proto: 0,
@@ -765,6 +773,13 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            node_installed: false,
+            node_partial: [String::new(), String::new()],
+            node_exit_hook: Value::UNDEFINED,
+            node_tick_hook: Value::UNDEFINED,
+            node_tick_pending: false,
+            node_host: Value::UNDEFINED,
+            node_cjs: Value::UNDEFINED,
             uncaught_timer_throw: None,
         }
     }

@@ -1340,7 +1340,8 @@ impl<'p> Vm<'p> {
         let Some(proto) = self.main_func(func_id) else {
             return false;
         };
-        if std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
+        static MIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MIXED.get_or_init(|| std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none())
             && recognize_mixed(proto, start, end).is_some()
         {
             return self.mixed_field_loop(func_id, start, end);

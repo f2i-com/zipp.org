@@ -74,6 +74,16 @@ pub const FORIN_SNAPSHOT_PREFIX: usize = 6;
 /// ClassElementName, so the second instruction must reuse the first's coerced
 /// key — re-coercing would run a `toString`/`@@toPrimitive` key a second time.
 pub const KEY_WRITEBACK: u8 = 0x80;
+
+/// `IterToArray.count` in `ITER_PROBE..=ITER_PROBE | 0x7FFF` is no drain but a
+/// question, answered `true`/`false` into `dst` with nothing observable read:
+/// is Array iteration the built-in one (`Array.prototype[@@iterator]`,
+/// `%ArrayIteratorPrototype%.next`, no `return`)? `[a, b] = [b, a]` asks it
+/// before reading its literal's elements positionally instead of through an
+/// iterator. Within the 16 bits the JIT tiers admit, so a probe compiles
+/// wherever `IterToArray` does; a real pattern never has that many elements
+/// (one that did is destructured stepwise).
+pub const ITER_PROBE: u32 = 0x8000;
 #[cfg_attr(feature = "wasm-lite", repr(u16))]
 /// One bytecode instruction. Kept as a fieldful enum (not packed bytes) for v1:
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
@@ -658,6 +668,8 @@ pub enum Instr {
     /// `return`: if absent (undefined/null), sets `has_dst` to false (the yield* loop
     /// then makes the OUTER generator return `ret`); otherwise calls it with `ret`,
     /// sets `has_dst` true and writes the (to-be-awaited) result into `dst`.
+    /// With `ret == dst` the call passes no argument: a `for await` loop's
+    /// AsyncIteratorClose (7.4.13), which calls `return()` bare.
     AsyncIterReturnStep {
         dst: Reg,
         has_dst: Reg,
@@ -2077,6 +2089,7 @@ pub enum Instr {
     /// pattern has a `...rest`) into a fresh array; arrays/strings/Map/Set (and
     /// anything else) pass through, since positional `GetIndex` already handles
     /// them. Bounding keeps `let [a,b] = infiniteIterator` from looping forever.
+    /// A `count` with [`ITER_PROBE`] set asks a question instead (see there).
     IterToArray {
         dst: Reg,
         src: Reg,

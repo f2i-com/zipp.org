@@ -251,11 +251,34 @@ pub fn compile_script_with_preamble_and_origin(
     compile_with_origin(Some(preamble), source, options, origin)
 }
 
+/// [`compile_script_with_preamble_and_origin`] for a TypeScript guest: the
+/// guest's types are read and dropped (`lang/ts`), and the program is the
+/// one its JavaScript would be. The preamble is JavaScript, which reads the
+/// same as TypeScript.
+pub fn compile_typescript_with_preamble_and_origin(
+    preamble: &str,
+    source: &str,
+    options: &CompileOptions,
+    origin: &ScriptOrigin,
+) -> Result<ScriptState, String> {
+    compile_with_origin_as(Some(preamble), source, options, origin, true)
+}
+
 fn compile_with_origin(
     preamble: Option<&str>,
     source: &str,
     options: &CompileOptions,
     origin: &ScriptOrigin,
+) -> Result<ScriptState, String> {
+    compile_with_origin_as(preamble, source, options, origin, false)
+}
+
+fn compile_with_origin_as(
+    preamble: Option<&str>,
+    source: &str,
+    options: &CompileOptions,
+    origin: &ScriptOrigin,
+    typescript: bool,
 ) -> Result<ScriptState, String> {
     let allow_return = options.goal.allow_return();
     let (full, guest_start, strict): (std::borrow::Cow<str>, usize, bool) = match preamble {
@@ -285,7 +308,12 @@ fn compile_with_origin(
         }
     });
     let name = origin.name.as_deref();
-    let ast = crate::front::parse_script_with_located(&full, allow_return, strict).map_err(|f| {
+    let parsed = if typescript {
+        crate::lang::ts::parse_script_strict(&full, allow_return, strict)
+    } else {
+        crate::front::parse_script_with_located(&full, allow_return, strict)
+    };
+    let ast = parsed.map_err(|f| {
         match f.pos {
             Some(pos) => crate::compile::locate_message(&f.message, &full, pos, name, at.as_ref()),
             None => f.message,
