@@ -4928,6 +4928,8 @@ impl<'p> Vm<'p> {
             TE_ENCODE | TE_ENCODE_INTO | TE_ENCODING_GET | TD_DECODE | TD_ENCODING_GET
             | TD_FATAL_GET | TD_IGNORE_BOM_GET => self.text_codec_native(id, this, args)?,
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
+            #[cfg(feature = "webassembly")]
+            WASM_HOST_OP => self.wasm_host_op(args)?,
             WR_DEREF => {
                 let target =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {

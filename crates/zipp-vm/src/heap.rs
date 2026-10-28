@@ -5747,6 +5747,22 @@ pub enum AbData {
     /// SharedArrayBuffer is agent-local.
     #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     Shared(std::sync::Arc<SharedMem>),
+    /// Bytes owned outside the heap: a WebAssembly memory's, which its
+    /// runtime owns (vm/webassembly). Never resized through the buffer; when
+    /// the memory grows and its bytes move, the runtime detaches this buffer
+    /// and makes a new one, as the JS API specifies for `Memory.grow`.
+    #[cfg(feature = "webassembly")]
+    External(ExternalBytes),
+}
+
+/// The window an `AbData::External` buffer sees: an address and a length,
+/// valid until the owner detaches the buffer (see that variant).
+#[cfg(feature = "webassembly")]
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalBytes {
+    /// The address, as an integer so the heap stays `Send`.
+    pub ptr: usize,
+    pub len: usize,
 }
 
 /// The process-shared byte store behind a `SharedArrayBuffer`. The backing
@@ -5907,6 +5923,8 @@ impl AbData {
         match self {
             AbData::Local(v) => v.len(),
             AbData::Shared(m) => m.byte_len(),
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) => e.len,
         }
     }
 
@@ -5917,6 +5935,9 @@ impl AbData {
         match self {
             AbData::Local(v) => v.capacity(),
             AbData::Shared(m) => m.capacity(),
+            // Owned and accounted for by the WebAssembly runtime.
+            #[cfg(feature = "webassembly")]
+            AbData::External(_) => 0,
         }
     }
     #[inline]
@@ -5935,6 +5956,8 @@ impl AbData {
         match self {
             AbData::Local(v) => Some(v),
             AbData::Shared(_) => None,
+            #[cfg(feature = "webassembly")]
+            AbData::External(_) => None,
         }
     }
     /// The shared store, when this is a SharedArrayBuffer's data.
@@ -5942,6 +5965,8 @@ impl AbData {
     pub fn shared(&self) -> Option<&std::sync::Arc<SharedMem>> {
         match self {
             AbData::Local(_) => None,
+            #[cfg(feature = "webassembly")]
+            AbData::External(_) => None,
             AbData::Shared(m) => Some(m),
         }
     }
@@ -5952,6 +5977,9 @@ impl AbData {
         match self {
             AbData::Local(v) => v.resize(n, 0u8),
             AbData::Shared(m) => m.set_byte_len(n),
+            // Only ever cleared, by a detach: the bytes stay the owner's.
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) => e.len = e.len.min(n),
         }
     }
     /// Monotonic counterpart to [`AbData::resize_bytes`], used by
@@ -5968,6 +5996,8 @@ impl AbData {
                 }
             }
             AbData::Shared(m) => m.grow_byte_len(n),
+            #[cfg(feature = "webassembly")]
+            AbData::External(_) => false,
         }
     }
 }
@@ -5986,6 +6016,12 @@ impl std::ops::Deref for AbData {
         match self {
             AbData::Local(v) => v,
             AbData::Shared(m) => m.as_slice(),
+            // SAFETY: the owner keeps `len` bytes at `ptr` alive and in place
+            // for as long as this buffer is attached (see `External`).
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) if e.len == 0 => &[],
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) => unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) },
         }
     }
 }
@@ -6009,6 +6045,11 @@ impl std::ops::DerefMut for AbData {
             AbData::Shared(_) => {
                 panic!("SharedArrayBuffer mutation is disabled by the safe-sandbox profile")
             }
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) if e.len == 0 => &mut [],
+            // SAFETY: as for `deref`; the heap hands out one borrow at a time.
+            #[cfg(feature = "webassembly")]
+            AbData::External(e) => unsafe { std::slice::from_raw_parts_mut(e.ptr as *mut u8, e.len) },
         }
     }
 }

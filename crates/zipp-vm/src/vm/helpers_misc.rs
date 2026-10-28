@@ -2685,6 +2685,8 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                 let flags = match vm.heap.get(buffer) {
                     HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
                         crate::heap::AbData::Local(_) => TA_SNAP_LOCAL,
+                        #[cfg(feature = "webassembly")]
+                        crate::heap::AbData::External(_) => TA_SNAP_LOCAL,
                         crate::heap::AbData::Shared(_) => 0,
                     },
                     _ => return None,
@@ -2817,6 +2819,8 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             let (base, flags) = match vm.heap.get_mut(buffer) {
                 HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
                     crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
+                    #[cfg(feature = "webassembly")]
+                    crate::heap::AbData::External(e) => (e.ptr as *mut u8, TA_SNAP_LOCAL),
                     crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
                 },
                 _ => return None,
@@ -2845,6 +2849,8 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
         let (base, flags) = match vm.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
                 crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
+                #[cfg(feature = "webassembly")]
+                crate::heap::AbData::External(e) => (e.ptr as *mut u8, TA_SNAP_LOCAL),
                 crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
             },
             _ => return None,
