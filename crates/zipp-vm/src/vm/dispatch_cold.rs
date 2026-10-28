@@ -4208,6 +4208,7 @@ impl<'p> Vm<'p> {
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));
                 let plain_makefunc = self.build_plain_makefunc_plan(func_id);
                 let prop_shape = self.build_prop_shape_plan(func_id);
+                let class_read = self.build_class_read_plan(func_id);
                 self.jit.compile(
                     func_id,
                     proto_ref,
@@ -4223,6 +4224,7 @@ impl<'p> Vm<'p> {
                     &random_fuse,
                     &plain_makefunc,
                     &prop_shape,
+                    &class_read,
                 );
             }
         }

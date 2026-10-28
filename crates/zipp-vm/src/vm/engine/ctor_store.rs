@@ -268,6 +268,8 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                 m.class = Some(class);
             }
+            // The mirror names the class (`FID_MIRROR_CLASS`).
+            self.heap.note_instance_class(idx, class);
         } else if proto.is_heap() {
             self.proto_of.insert(idx, proto);
         }

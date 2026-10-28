@@ -818,6 +818,40 @@ impl<'p> Vm<'p> {
         ))
     }
 
+    /// The class-method read the `GetProp` at `(func_id, ip)`'s cache made
+    /// first (way 0 an `IcEntry::ClassMethod`), for Tier C's class-method
+    /// lane (`ClassReadPlan`): the guards are the interpreter's own hit's
+    /// (`ic_get_prop` way 0), the receiver's class read from its mirror
+    /// (`FID_MIRROR_CLASS`). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_method_read(&self, func_id: u32, ip: usize) -> Option<crate::codegen::ClassReadLane> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                epoch,
+                callee,
+                recv_shape,
+                ..
+            } if recv_shape != crate::shape::DICT
+                && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
+            {
+                Some(crate::codegen::ClassReadLane {
+                    recv_shape,
+                    class,
+                    ver,
+                    epoch,
+                    value: callee.bits(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Remember that the key of the property instruction at `(func_id, ip)`
     /// is the data property in `slot` of a receiver of `shape` (writable,
     /// with `write_proven`). A table that does not exist yet is not made for
@@ -1138,7 +1172,7 @@ impl<'p> Vm<'p> {
         }
         let idx = recv.heap_index();
         let mir = self.heap.hot_mirror_of(idx);
-        if mir.shape == crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE {
+        if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
             return false;
         }
         let Some(slot) = self.own_writable_slot_cached(mir.shape, key) else {
@@ -1202,7 +1236,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
-        if mir.shape == crate::shape::DICT || mir.fid != crate::heap::FID_MIRROR_NONE {
+        if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
             return None;
         }
         let slot = self.own_data_slot_cached(mir.shape, key)?;
@@ -1451,7 +1485,7 @@ impl<'p> Vm<'p> {
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
         if mir.shape == crate::shape::DICT
-            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
             || !self.ic_func_eligible(func_id)
         {
@@ -1495,7 +1529,7 @@ impl<'p> Vm<'p> {
         }
         let mir = self.heap.hot_mirror_of(recv.heap_index());
         if mir.shape == crate::shape::DICT
-            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
             || !self.ic_func_eligible(func_id)
         {
@@ -2683,7 +2717,7 @@ impl<'p> Vm<'p> {
         let idx = recv.heap_index();
         let mir = self.heap.hot_mirror_of(idx);
         if mir.shape == crate::shape::DICT
-            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
             || !self.ic_func_eligible(func_id)
         {
@@ -2733,7 +2767,7 @@ impl<'p> Vm<'p> {
         let idx = recv.heap_index();
         let mir = self.heap.hot_mirror_of(idx);
         if mir.shape == crate::shape::DICT
-            || mir.fid != crate::heap::FID_MIRROR_NONE
+            || !crate::heap::fid_mirror_plain(mir.fid)
             || !self.deferred_ns_state.is_empty()
             || !self.ic_func_eligible(func_id)
         {

@@ -123,9 +123,41 @@ pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 /// no plain callable either, so the emitted call guard never matches it,
 /// but distinct from [`FID_MIRROR_NONE`] so the interpreter's mirror-guarded
 /// property read (`Vm::ic_get_prop_own_hit`) declines the receivers its
-/// caches exclude without loading the map.
+/// caches exclude without loading the map. Below [`FID_MIRROR_CLASS`], with
+/// the function ids, so a plain object's word is one compare away
+/// (`fid_mirror_plain`).
 #[cfg(feature = "jit")]
-pub(crate) const FID_MIRROR_CTOR: u32 = u32::MAX - 1;
+pub(crate) const FID_MIRROR_CTOR: u32 = FID_MIRROR_CLASS - 1;
+
+/// The fid-mirror bit of a class instance's map: the word is the bit and its
+/// class's heap index (`object_mirror_fid`), so Tier C's class-method lane
+/// can check a receiver's class without loading its map. No function id has
+/// the bit (function tables stay far below 2^31), so the emitted call guards
+/// never match it; [`FID_MIRROR_NONE`] has it too.
+#[cfg(feature = "jit")]
+pub(crate) const FID_MIRROR_CLASS: u32 = 0x8000_0000;
+
+/// Whether a fid-mirror word is a plain object's: no fid, or a class
+/// instance's (`FID_MIRROR_CLASS`). The interpreter's mirror-guarded property
+/// paths take these and decline functions and built-in constructors.
+#[cfg(feature = "jit")]
+#[inline(always)]
+pub(crate) fn fid_mirror_plain(fid: u32) -> bool {
+    fid >= FID_MIRROR_CLASS
+}
+
+/// The fid-mirror word of an instance of the class at heap index `class`
+/// ([`FID_MIRROR_CLASS`]); [`FID_MIRROR_NONE`] for an index too large to
+/// mark, which no heap reaches.
+#[cfg(feature = "jit")]
+#[inline(always)]
+pub(crate) fn class_mirror_fid(class: u32) -> u32 {
+    if class < FID_MIRROR_NONE & !FID_MIRROR_CLASS {
+        FID_MIRROR_CLASS | class
+    } else {
+        FID_MIRROR_NONE
+    }
+}
 
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
 /// position, far below `u32::MAX`).
@@ -6624,12 +6656,17 @@ fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
 }
 
 /// An object's fid-mirror word: [`FID_MIRROR_CTOR`] for a built-in
-/// constructor's map, else [`FID_MIRROR_NONE`].
+/// constructor's map, its class's mark for a class instance
+/// (`class_mirror_fid`), else [`FID_MIRROR_NONE`].
 #[cfg(feature = "jit")]
 #[inline(always)]
 fn object_mirror_fid(map: &ObjMap) -> u32 {
     if map.is_ctor {
         FID_MIRROR_CTOR
+    } else if let Some(class) = map.class {
+        // A heap index is far below 2^31 (`class_mirror_fid`'s bound, which
+        // the lane's planner checks), so the mark is the bit alone.
+        FID_MIRROR_CLASS | class
     } else {
         FID_MIRROR_NONE
     }
@@ -9127,6 +9164,19 @@ impl Heap {
     #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub fn refresh_mirror(&mut self, _idx: u32) {}
+
+    /// The mirror of an object given its class after its allocation
+    /// (`ctor_store_new`): the fid word names the class (`FID_MIRROR_CLASS`),
+    /// as `refresh_mirror` would write it, without re-reading the slot.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn note_instance_class(&mut self, idx: u32, class: u32) {
+        self.hot_mirror[idx as usize].fid = class_mirror_fid(class);
+    }
+
+    #[cfg(not(feature = "jit"))]
+    #[inline(always)]
+    pub(crate) fn note_instance_class(&mut self, _idx: u32, _class: u32) {}
 
 
     /// W9: enter a static-pretenure scope (docs/archive/NURSERY_DESIGN.md §4) — until the

@@ -2982,6 +2982,8 @@ pub(crate) fn compile_proto_mem(
     arith_fb_base: u64,
     // The known-shape property lane's plan (`PropShapePlan`).
     prop_shape: &PropShapePlan,
+    // The class-method lane's plan (`ClassReadPlan`).
+    class_read: &crate::codegen::ClassReadPlan,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -3118,6 +3120,9 @@ pub(crate) fn compile_proto_mem(
     let mut rc_pending = FcEffect::Clear;
     if rc_slots != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C receiver cache slots={rc_slots}");
+    }
+    if !class_read.is_empty() && crate::jitlog_enabled() {
+        eprintln!("[jit] fn{func_id} Tier-C class-read lanes={}", class_read.len());
     }
     let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
         plan_tierc_block_sroa(proto, &targeted, yield_heads)
@@ -5738,6 +5743,9 @@ pub(crate) fn compile_proto_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                if let Some(lane) = class_read.get(&ip) {
+                    emit_class_read_get(&mut ops, obj, dst, lane, cont);
+                }
                 if let Some(&(shape, slot)) = prop_shape.get(&ip) {
                     if let Some(k) = rc.find(obj, shape) {
                         emit_recv_cached_get(&mut ops, rc_off + 8 * k as i32, dst, slot, cont);
@@ -8000,6 +8008,54 @@ fn emit_prop_shape_set(
     super::emit_heap_store_barrier(ops, gen_lane, done);
     dynasm!(ops ; => miss);
     emit_recv_cache_zero(ops, zero);
+}
+
+/// Tier C's class-method lane of a `GetProp` (`ClassReadPlan`): a receiver
+/// whose mirror has the lane's shape and names its class
+/// (`FID_MIRROR_CLASS`), with the class at the version and
+/// `class_proto_epoch` the read resolved under, reads the method the
+/// interpreter's cache found, and the op is done (`done`). The guards are
+/// the interpreter's `ClassMethod` hit's (`ic_get_prop` way 0) and the
+/// class-read memo's (`jit_class_read_hit`), whose method value they keep
+/// alive as the class's chain does: a changed member bumps the version or
+/// the epoch. Anything else falls through with the receiver's bits in rax.
+fn emit_class_read_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    dst: u16,
+    lane: &crate::codegen::ClassReadLane,
+    done: dynasmrt::DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let fid_off = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+    let versions_raw = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let epoch_off = crate::vm::host_api::JIT_CLASS_PROTO_EPOCH_OFFSET as i32;
+    let class_fid = crate::heap::class_mirror_fid(lane.class);
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // a heap value
+        ; jne => miss
+        ; mov ecx, eax
+        ; mov r9, [rdi + hot_off]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8], lane.recv_shape as i32
+        ; jne => miss
+        ; cmp DWORD [r9 + rcx*8 + fid_off], class_fid as i32
+        ; jne => miss
+        ; mov r11, [rdi + versions_raw]
+        ; mov ecx, lane.class as i32
+        ; cmp DWORD [r11 + rcx*4], lane.ver as i32
+        ; jne => miss
+        ; cmp DWORD [rdi + epoch_off], lane.epoch as i32
+        ; jne => miss
+        ; mov r10, QWORD lane.value as i64
+        ; mov [rbx + dreg(dst)], r10
+        ; jmp => done
+        ; => miss
+    );
 }
 
 /// Zero the receiver-cache slots at `offs` (`RecvCache`): on a lane's miss

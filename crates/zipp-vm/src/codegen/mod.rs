@@ -601,6 +601,33 @@ env_off_switch!(
     fn recv_cache_enabled() = "ZIPP_NO_RECV_CACHE"
 );
 
+/// One `GetProp`'s class-method read for Tier C's class-method lane
+/// (`ClassReadPlan`): what the site's interpreter cache resolved a class
+/// instance's read of a method to (`IcEntry::ClassMethod`), and the guards
+/// that answer stands on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClassReadLane {
+    /// The receiver's hidden shape, which proves it owns no such key.
+    pub recv_shape: u32,
+    /// The class's heap index, which the receiver's mirror names
+    /// (`FID_MIRROR_CLASS`).
+    pub class: u32,
+    /// The class's heap version and `class_proto_epoch` when it resolved.
+    pub ver: u32,
+    pub epoch: u32,
+    /// The method's value bits.
+    pub value: u64,
+}
+
+/// Tier C's class-method lane, per `GetProp` ip (`Vm::build_class_read_plan`).
+pub(crate) type ClassReadPlan = FxHashMap<usize, ClassReadLane>;
+
+env_off_switch!(
+    /// `ZIPP_NO_CLASS_READ_LANE=1` compiles Tier C property reads without the
+    /// class-method lane (`ClassReadPlan`).
+    fn class_read_lane_enabled() = "ZIPP_NO_CLASS_READ_LANE"
+);
+
 env_off_switch!(
     /// `ZIPP_NO_LATEST_LEAF=1`: a call site whose cache names several
     /// FuncProtos inlines none of them, instead of the latest
@@ -4616,6 +4643,8 @@ impl Jit {
         plain_makefunc: &FxHashMap<usize, u32>,
         // The known-shape property lane's plan (`PropShapePlan`).
         prop_shape: &PropShapePlan,
+        // The class-method lane's plan (`ClassReadPlan`).
+        class_read: &ClassReadPlan,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -4718,6 +4747,7 @@ impl Jit {
                 arith_fb.as_deref(),
                 arith_fb_base,
                 prop_shape,
+                class_read,
             ) {
                 if crate::jitlog_enabled() {
                     eprintln!(

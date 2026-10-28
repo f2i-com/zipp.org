@@ -1519,6 +1519,26 @@ impl<'p> Vm<'p> {
         plan
     }
 
+    /// Tier C's class-method lane (`codegen::ClassReadPlan`): for each
+    /// `GetProp` whose interpreter cache's first way read a class instance's
+    /// method (`Vm::ic_class_method_read`), that read and its guards. Empty
+    /// under `ZIPP_NO_CLASS_READ_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_class_read_plan(&self, func_id: u32) -> crate::codegen::ClassReadPlan {
+        let mut plan = crate::codegen::ClassReadPlan::default();
+        if !crate::codegen::class_read_lane_enabled() || self.py_plans_skipped(func_id) {
+            return plan;
+        }
+        for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+            if matches!(instr, Instr::GetProp { .. }) {
+                if let Some(lane) = self.ic_class_method_read(func_id, ip) {
+                    plan.insert(ip, lane);
+                }
+            }
+        }
+        plan
+    }
+
     /// Q4 v1: build the leaf-call inline plan for a memory-path region — the set
     /// of `Call` sites in `[start, end]` whose monomorphic cached callee is a
     /// PLAIN LEAF (`callee_leaf_ok`) the region emitter can inline straight-line.

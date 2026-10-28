@@ -398,6 +398,7 @@ impl<'p> Vm<'p> {
             self.jit.note_cross_pending(fid, &cross_pending);
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
+            let class_read = self.build_class_read_plan(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -413,6 +414,7 @@ impl<'p> Vm<'p> {
                 &rustc_hash::FxHashMap::default(),
                 &plain_makefunc,
                 &prop_shape,
+                &class_read,
             );
         }
         // The direct global routes the body was compiled with, as
