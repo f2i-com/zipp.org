@@ -6032,6 +6032,7 @@ pub(crate) fn compile_proto_mem(
                                 &mut ops,
                                 c3plan,
                                 callee,
+                                None,
                                 arg_base,
                                 dst,
                                 proto.reg_count.max(1),
@@ -6531,6 +6532,35 @@ pub(crate) fn compile_proto_mem(
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
                 let call_with_this = crate::vm::jit_call_with_this_ic as *const () as usize;
+                // The emitted cross call of the one user function the site
+                // has called, with the receiver as `this` (the plain call's
+                // lane); every miss falls through to the paths below. Not
+                // ahead of a leaf inline, which is cheaper still, and whose
+                // fallback is not this op's helper block (the lanes' `bail`).
+                let cwt_cross = (do_cross3 && lane_done.is_none() && leaf_plan.get(&ip).is_none())
+                    .then(|| cross_plan.get(&ip).copied())
+                    .flatten()
+                    .filter(|site| !site.cross3.is_empty());
+                let cross_done = ops.new_dynamic_label();
+                if let Some(site) = cwt_cross {
+                    for c3plan in site.cross3.iter() {
+                        emit_cross3_call(
+                            &mut ops,
+                            c3plan,
+                            callee,
+                            Some(this_v),
+                            arg_base,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            bail,
+                            cross_done,
+                            refetch.is_some(),
+                            None,
+                        );
+                    }
+                }
                 // A leaf callee that never reads `this`, inlined under its
                 // guard; a miss makes the call through the same helper.
                 match leaf_plan.get(&ip).filter(|_| lane_done.is_none()) {
@@ -6574,6 +6604,9 @@ pub(crate) fn compile_proto_mem(
                 }
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
+                }
+                if cwt_cross.is_some() {
+                    dynasm!(ops ; => cross_done);
                 }
             }
             Instr::StrAppendInPlace { dst, a, b } => {

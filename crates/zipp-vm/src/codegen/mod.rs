@@ -482,6 +482,13 @@ pub(crate) fn quick_len_enabled() -> bool {
     }
 }
 
+env_off_switch!(
+    /// `ZIPP_NO_CROSS3_CWT=1` keeps every `CallWithThis` site (the method
+    /// call `o.m(args)` lowered as `GetProp`, the arguments, `CallWithThis`)
+    /// on the generic helper, without the emitted cross-call lane.
+    fn cross3_cwt_enabled() = "ZIPP_NO_CROSS3_CWT"
+);
+
 pub(crate) fn cross3m_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);

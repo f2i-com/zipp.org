@@ -3381,6 +3381,7 @@ pub(crate) fn compile_region_mem(
                                 &mut ops,
                                 c3plan,
                                 callee,
+                                None,
                                 arg_base,
                                 dst,
                                 proto.reg_count.max(1),
@@ -4193,6 +4194,34 @@ pub(crate) fn compile_region_mem(
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
+                // The emitted cross call of the site's one user callee, with
+                // the receiver as `this` (Tier C's twin); not ahead of a
+                // method inline, whose fallback is its own helper block.
+                // Metered regions keep the helper route.
+                let cwt_cross = (blocks.is_none() && lane_done.is_none() && !method_plan.contains_key(&ip))
+                    .then(|| cross_plan.get(&ip).copied())
+                    .flatten()
+                    .filter(|site| !site.cross3.is_empty());
+                let cross_done = ops.new_dynamic_label();
+                if let Some(site) = cwt_cross {
+                    for c3plan in site.cross3.iter() {
+                        emit_cross3_call(
+                            &mut ops,
+                            c3plan,
+                            callee,
+                            Some(this_v),
+                            arg_base,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            bail,
+                            cross_done,
+                            refetch_pinned,
+                            ta_refetch,
+                        );
+                    }
+                }
                 if let Some(mp) = method_plan.get(&ip) {
                     debug_assert_eq!(mp.captured_callee, Some(callee));
                     emit_inline_method_call(
@@ -4229,6 +4258,9 @@ pub(crate) fn compile_region_mem(
                 }
                 if let Some(done) = lane_done {
                     dynasm!(ops ; => done);
+                }
+                if cwt_cross.is_some() {
+                    dynasm!(ops ; => cross_done);
                 }
             }
             Instr::StrConcat { dst, a, b } => {
@@ -5292,6 +5324,9 @@ pub(crate) fn emit_cross3_call(
     ops: &mut dynasmrt::x64::Assembler,
     plan: crate::codegen::SameProtoCross3Plan,
     callee: u16,
+    // A `CallWithThis` site's receiver register (the strict callee's
+    // `this`); `None` at a plain `Call`.
+    this_reg: Option<u16>,
     arg_base: u16,
     dst: u16,
     caller_regs: u16,
@@ -5322,6 +5357,8 @@ pub(crate) fn emit_cross3_call(
     );
     let this_src = if plan.arrow_this {
         Cross3This::ArrowMirror
+    } else if let Some(r) = this_reg {
+        Cross3This::Receiver(r)
     } else {
         Cross3This::Undefined
     };

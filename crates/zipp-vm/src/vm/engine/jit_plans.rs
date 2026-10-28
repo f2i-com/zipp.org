@@ -2318,6 +2318,43 @@ impl<'p> Vm<'p> {
                 },
             );
         }
+        // -- the CallWithThis lane -- `o.m(args)` lowered as `GetProp`, the
+        // arguments, `CallWithThis` (spec order: `ray.origin.sub(this.center)`)
+        // holds its callee in a register, as a plain call does, so a site the
+        // interpreter has only seen call one user function gets the plain
+        // call's emitted lane, with the receiver as `this`. A class method's
+        // call went through the generic helper on every call: a third of the
+        // ray tracer. Admission is the plain call's (`build_cross3_call_arm`:
+        // strict or arrow callee, argc == params, a frame-free entry), and
+        // the lane revalidates the callee's fid per call.
+        #[cfg(feature = "instrument")]
+        let cwt_unmetered = self.instr_rec.is_none();
+        #[cfg(not(feature = "instrument"))]
+        let cwt_unmetered = true;
+        if cwt_unmetered && crate::codegen::cross3_enabled() && crate::codegen::cross3_cwt_enabled() {
+            for (ip, instr) in caller.code.iter().enumerate() {
+                let Instr::CallWithThis { argc, .. } = *instr else {
+                    continue;
+                };
+                let Some((_bits, _ver, fid, _closure)) = self.ic_call_mono(func_id, ip) else {
+                    continue;
+                };
+                let Some(arm) =
+                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
+                else {
+                    continue;
+                };
+                let mut cross3 = crate::codegen::Cross3CallPlan::default();
+                let inserted = cross3.push(arm);
+                debug_assert!(inserted);
+                if crate::jitlog_enabled() {
+                    eprintln!("[cross] fn{func_id}@{ip} CROSS3-CWT fn{fid} native-emitted lane");
+                }
+                plan.entry(ip)
+                    .or_insert_with(crate::codegen::CrossCallSitePlan::default)
+                    .cross3 = cross3;
+            }
+        }
         // -- B193: the CallMethod lane -- admitted only with a LIVE receiver
         // exemplar (an in-flight frame at `exemplar_base`): a settled
         // non-DICT shape whose `name` slot holds plain own DATA -- a user
