@@ -58,10 +58,12 @@ const STABLE: &str = r#"
 /// plus spilled stores (`o.extra = i` moves a slab store to a `Vec`, and the
 /// shell still pools) and dictionary-mode maps (`delete o.a`, never pooled).
 /// Every field of every object is read back, so a wrong cell is a wrong sum.
+/// Enough rounds for several minors of their own: at 24000 the run crossed
+/// its first collection only through a cell each `for (const k in o)` made.
 const MIXED: &str = r#"
   "use strict";
   (function () {
-    const rounds = 24000;
+    const rounds = 96000;
     let checksum = 0;
     const keep = [];
 
