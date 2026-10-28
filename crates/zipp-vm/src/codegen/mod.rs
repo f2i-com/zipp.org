@@ -2426,6 +2426,23 @@ pub(crate) fn trunc_or_fuse_enabled() -> bool {
     }
 }
 
+/// Tier C's `switch` over string literals compares the discriminant's bits
+/// with every case's before the case-by-case run (`str_case_chains` in
+/// `proto_mem`). `ZIPP_NO_STR_CASE_BITS=1` leaves the run alone.
+pub(crate) fn str_case_bits_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_STR_CASE_BITS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn hasprop_pin_absent_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);

@@ -3633,6 +3633,11 @@ pub(crate) fn compile_proto_mem(
         v.dedup();
         v
     };
+    let str_case_chains = if blocks.is_none() && crate::codegen::str_case_bits_enabled() {
+        str_case_chains(proto, const_strs, yield_heads)
+    } else {
+        FxHashMap::default()
+    };
     // Where the caches (`FloatCache`, `RecvCache`) start empty: every jump
     // target and yield head, and every op a fused emission jumps to past the
     // ops between, whose effects on the caches it does not have (the `| 0`
@@ -3999,6 +4004,9 @@ pub(crate) fn compile_proto_mem(
                 // Numeric / single-ASCII-char (interned slot) / pre-interned
                 // multi-char string (bits rooted in jit_const_strings). Mirrors
                 // the region LoadConst arm. mem_can_compile gated the kinds.
+                if let Some((x, cases)) = str_case_chains.get(&ip) {
+                    emit_str_case_bits(&mut ops, *x, cases, &labels);
+                }
                 let c = proto.constants[idx as usize];
                 let bits = single_char_const_bits(proto, c)
                     .or_else(|| const_strs.get(&idx).copied())
@@ -7845,6 +7853,134 @@ fn recv_cache_slots(proto: &FuncProto, prop_shape: &PropShapePlan, metered: bool
         *uses.entry(obj).or_insert(0) += 1;
     }
     uses.values().filter(|&&n| n >= 2).count().min(RecvCache::MAX_SLOTS)
+}
+
+/// One case of a [`str_case_chains`] run: the literal's bits, the registers
+/// its `LoadConst` and `Eq` write, its branch target, and whether the head
+/// compares its bits (not for a text an earlier case already has).
+struct StrCase {
+    bits: u64,
+    c: u16,
+    t: u16,
+    target: u32,
+    check: bool,
+}
+
+/// A `switch` over string literals (`switch (node.kind) { case "bin": … }`)
+/// compiles to a run of `LoadConst c; Eq t, x, c; JumpIfTrue t, T`, one per
+/// case, with the same `x`. A literal loads as its one shared string
+/// (`Vm::jit_const_str_bits`), so a discriminant holding one of the case
+/// literals is equal BITS to it, but `region_poly_eq` sends every `Eq` of two
+/// different heap strings to `jit_strict_eq` to compare bytes: the third case
+/// cost three helper calls. This maps the head of each run of two or more
+/// such cases to `x` and the cases; the head then compares `x`'s bits with
+/// each case's first ([`emit_str_case_bits`]). Equal bits are the same
+/// string, and an earlier case with different text cannot equal it by
+/// content, so the first case whose bits match is the one the run would
+/// take; a case repeating an earlier text is never taken by the run, and is
+/// not compared. No match falls into the run, unchanged, which still
+/// answers a string equal by content only. A run ends where its ops stop
+/// matching or at a yield head (which must still exit).
+fn str_case_chains(
+    proto: &FuncProto,
+    const_strs: &FxHashMap<u32, u64>,
+    yield_heads: &[u32],
+) -> FxHashMap<usize, (u16, Vec<StrCase>)> {
+    let code = &proto.code;
+    let text = |idx: u32| -> Option<&str> {
+        let raw = proto.constants.get(idx as usize)?;
+        if !raw.is_heap() || raw.heap_index() & crate::vm::STRING_CONST_BIT == 0 {
+            return None;
+        }
+        let si = (raw.heap_index() & !crate::vm::STRING_CONST_BIT) as usize;
+        proto.string_constants.get(si).map(String::as_str)
+    };
+    let mut out = FxHashMap::default();
+    let mut ip = 0;
+    while ip + 2 < code.len() {
+        let mut x0: Option<u16> = None;
+        let mut cases: Vec<StrCase> = Vec::new();
+        let mut texts: Vec<&str> = Vec::new();
+        let mut j = ip;
+        while j + 2 < code.len() {
+            let (Instr::LoadConst { dst: c, idx }, Instr::Eq { dst: t, a, b }, Instr::JumpIfTrue { cond, target }) =
+                (code[j], code[j + 1], code[j + 2])
+            else {
+                break;
+            };
+            let (Some(&bits), Some(s)) = (const_strs.get(&idx), text(idx)) else {
+                break;
+            };
+            let x = if a == c {
+                b
+            } else if b == c {
+                a
+            } else {
+                break;
+            };
+            if x == c || t == x || cond != t || x0.is_some_and(|x0| x0 != x) {
+                break;
+            }
+            if (j..j + 3).any(|k| k > ip && yield_heads.contains(&(k as u32))) {
+                break;
+            }
+            let check = !texts.contains(&s);
+            texts.push(s);
+            x0 = Some(x);
+            cases.push(StrCase { bits, c, t, target, check });
+            j += 3;
+        }
+        match x0 {
+            Some(x) if cases.len() >= 2 => {
+                out.insert(ip, (x, cases));
+                ip = j;
+            }
+            _ => ip += 1,
+        }
+    }
+    out
+}
+
+/// The head of a [`str_case_chains`] run: `x`'s bits against each case's;
+/// on a match, the registers the run writes up to that case (each literal,
+/// and `false` for each test before it, `true` for its own), then a jump to
+/// its target. No match falls through to the run.
+fn emit_str_case_bits(
+    ops: &mut dynasmrt::x64::Assembler,
+    x: u16,
+    cases: &[StrCase],
+    labels: &[dynasmrt::DynamicLabel],
+) {
+    let fall = ops.new_dynamic_label();
+    let lands: Vec<_> = cases.iter().map(|_| ops.new_dynamic_label()).collect();
+    dynasm!(ops ; mov rax, [rbx + dreg(x)]);
+    for (case, &land) in cases.iter().zip(&lands) {
+        if case.check {
+            dynasm!(ops
+                ; mov r10, QWORD case.bits as i64
+                ; cmp rax, r10
+                ; je => land
+            );
+        }
+    }
+    dynasm!(ops ; jmp => fall);
+    for (k, (case, &land)) in cases.iter().zip(&lands).enumerate() {
+        if !case.check {
+            continue;
+        }
+        dynasm!(ops ; => land);
+        for (j, before) in cases[..=k].iter().enumerate() {
+            let answer = BOOL_TAG | u64::from(j == k);
+            dynasm!(ops
+                ; mov r10, QWORD before.bits as i64
+                ; mov [rbx + dreg(before.c)], r10
+                ; mov r10, QWORD answer as i64
+                ; mov [rbx + dreg(before.t)], r10
+            );
+        }
+        dynasm!(ops ; jmp => labels[case.target as usize]);
+    }
+    dynasm!(ops ; => fall);
 }
 
 /// What an op does to the registers `FloatCache` holds.
