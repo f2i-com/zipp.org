@@ -2896,7 +2896,14 @@ impl<'p> Vm<'p> {
             } else if let Some(exact) = mono {
                 (Some(exact), false)
             } else if poly_on {
-                (self.ic_call_same_proto(func_id, ip), true)
+                // Ways naming different protos: the latest one, unless
+                // `ZIPP_NO_LATEST_LEAF=1`.
+                let same = self.ic_call_same_proto(func_id, ip).or_else(|| {
+                    crate::codegen::latest_leaf_enabled()
+                        .then(|| self.ic_call_latest(func_id, ip))
+                        .flatten()
+                });
+                (same, true)
             } else {
                 (None, false)
             };

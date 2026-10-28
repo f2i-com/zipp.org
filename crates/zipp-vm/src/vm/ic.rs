@@ -4378,6 +4378,37 @@ impl<'p> Vm<'p> {
         Some(first)
     }
 
+    /// The most recently filled way of a call site with two or more, when it
+    /// is a `Callee` entry: for the leaf planner where the ways name different
+    /// FuncProtos, so a site whose callee changed with the program's phase (a
+    /// priority queue's comparator, then another queue's) inlines the one it
+    /// calls now instead of none. Read-only, as `ic_call_same_proto`, and the
+    /// emitted guard re-checks the live callee's proto on every call. A full
+    /// site's latest fill is the way before its round-robin cursor (which a
+    /// probation visit also advances: a heuristic, never a proof).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_call_latest(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n < 2 {
+            return None;
+        }
+        let k = if (site.n as usize) < IC_WAYS {
+            site.n as usize - 1
+        } else {
+            (site.rot as usize + IC_WAYS - 1) % IC_WAYS
+        };
+        match site.entries[k] {
+            IcEntry::Callee {
+                bits,
+                ver,
+                fid,
+                closure,
+                ..
+            } => Some((bits, ver, fid, closure)),
+            _ => None,
+        }
+    }
+
     /// Read-only profitability witness for a genuinely polymorphic plain-call
     /// site: at least two filled `Callee` ways, every filled way names a
     /// structurally cross-callable plain function, and at least two distinct

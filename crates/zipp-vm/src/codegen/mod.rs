@@ -583,6 +583,13 @@ pub(crate) const ARITH_FB_DOUBLE: u8 = 1;
 pub(crate) const ARITH_FB_OTHER: u8 = 2;
 
 env_off_switch!(
+    /// `ZIPP_NO_LATEST_LEAF=1`: a call site whose cache names several
+    /// FuncProtos inlines none of them, instead of the latest
+    /// (`Vm::ic_call_latest`).
+    fn latest_leaf_enabled() = "ZIPP_NO_LATEST_LEAF"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_FLOAT_CACHE=1` compiles Tier C arithmetic without type
     /// feedback: no double-only ops and no operand cache (`FloatCache`).
     fn float_cache_enabled() = "ZIPP_NO_FLOAT_CACHE"
