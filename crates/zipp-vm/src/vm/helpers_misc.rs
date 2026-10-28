@@ -8245,7 +8245,12 @@ pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed
     let kind_reg = ((packed >> 16) & 0xFFFF) as u16;
     let val_reg = (packed & 0xFFFF) as u16;
     let top = vm.frames.len() - 1;
-    vm.frames[top].handlers.push(Handler::Finally {
+    let hs = &mut vm.frames[top].handlers;
+    // A recycled buffer for the frame's first push, as the interpreter's arm.
+    if hs.capacity() == 0 {
+        *hs = crate::vm::handler_pool::take(&mut vm.handler_pool);
+    }
+    hs.push(Handler::Finally {
         target,
         kind_reg,
         val_reg,
@@ -8264,7 +8269,12 @@ pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed
 pub(crate) extern "win64" fn jit_push_catch(vm: *mut core::ffi::c_void, packed: u64) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let top = vm.frames.len() - 1;
-    vm.frames[top].handlers.push(Handler::Catch {
+    let hs = &mut vm.frames[top].handlers;
+    // A recycled buffer for the frame's first push, as the interpreter's arm.
+    if hs.capacity() == 0 {
+        *hs = crate::vm::handler_pool::take(&mut vm.handler_pool);
+    }
+    hs.push(Handler::Catch {
         target: (packed >> 16) as u32,
         reg: packed as u16,
     });

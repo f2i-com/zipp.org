@@ -741,6 +741,14 @@ impl<'p> Vm<'p> {
                     popped.as_ref().is_some_and(|f| f.base == new_base && f.func == fid),
                     "B272: the frame-backed cross activation must pop its own frame"
                 );
+                // Its handler buffer's storage, for another frame's first
+                // push, as the interpreter's return keeps it (`handler_pool`):
+                // a for-of in the callee allocated and freed one per call.
+                if let Some(mut f) = popped {
+                    if f.handlers.capacity() != 0 {
+                        crate::vm::handler_pool::give(&mut self.handler_pool, std::mem::take(&mut f.handlers));
+                    }
+                }
             }
             self.regs.truncate(new_base);
             bits
