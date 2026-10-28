@@ -3243,43 +3243,78 @@ pub(crate) fn compile_region_mem(
                     // below (a pure prefix). Metered regions keep the helper
                     // route so interpreter-parity charging stays exact.
                     let mc_done = ops.new_dynamic_label();
-                    let c3m = cross_plan.get(&ip).and_then(|site| site.cross3m);
-                    if let Some(mp) = c3m {
-                        if blocks.is_none() {
-                            // The lane owns its bail stub: the arm-level
-                            // `bail` label is only DEFINED by the generic
-                            // helper's `emit_region_bail`, which an mi-plan
-                            // site never emits (its fallback uses a private
-                            // label) — referencing it from here dangled.
-                            let mc_bail = ops.new_dynamic_label();
-                            emit_cross3_method_call(
-                                &mut ops,
-                                mp,
-                                obj,
-                                arg_base,
-                                dst,
-                                proto.reg_count.max(1),
-                                c3_off,
-                                &heap,
-                                mc_bail,
-                                mc_done,
-                                refetch_pinned,
-                                ta_refetch,
-                            );
-                            emit_region_bail(&mut ops, ip, mc_bail, epilogue);
-                        }
-                    }
+                    let c3m = cross_plan
+                        .get(&ip)
+                        .and_then(|site| site.cross3m)
+                        .filter(|_| blocks.is_none());
                     // Generic `obj.m(args…)`: the interpreter-IC call helper
                     // (see `emit_region_call_ic`). Packing: r9 = (name<<32) |
                     // (obj<<16) | arg_base; argc via the stack.
                     let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                     let packed_args =
                         ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    let mi = method_plan.get(&ip);
+                    // The inlined body (Q7, below) makes no call; the cross lane
+                    // makes a native one. With both at a site the inline's
+                    // per-receiver arms go first, as a prefix whose miss tries
+                    // the cross lane and then the helper, as the Call arm
+                    // prefers a leaf inline to its cross lane. The cross lane
+                    // first served `o.m(...)` with a call whenever its shape
+                    // mirror happened to be settled, 70% more instructions than
+                    // the inline (call_method under Node's globals). A
+                    // captured-callee plan is the fused GetProp form, whose
+                    // prefix mode writes the callee rather than checking it: it
+                    // keeps the cross lane first.
+                    let mi_first = c3m.is_some() && mi.is_some_and(|mp| mp.captured_callee.is_none());
+                    if mi_first {
+                        let mi_miss = ops.new_dynamic_label();
+                        emit_inline_method_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            mi.expect("checked above"),
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                            Some((mi_miss, mc_done)),
+                        );
+                        dynasm!(ops ; => mi_miss);
+                    }
+                    if let Some(mp) = c3m {
+                        // The lane owns its bail stub: the arm-level
+                        // `bail` label is only DEFINED by the generic
+                        // helper's `emit_region_bail`, which an mi-plan
+                        // site never emits (its fallback uses a private
+                        // label) — referencing it from here dangled.
+                        let mc_bail = ops.new_dynamic_label();
+                        emit_cross3_method_call(
+                            &mut ops,
+                            mp,
+                            obj,
+                            arg_base,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            mc_bail,
+                            mc_done,
+                            refetch_pinned,
+                            ta_refetch,
+                        );
+                        emit_region_bail(&mut ops, ip, mc_bail, epilogue);
+                    }
                     // Q7 method inlining: a trivial class method on a known
                     // receiver shape at this site is inlined behind a per-receiver
                     // identity+version guard; a guard miss / tight headroom falls
                     // through to the SAME helper below (a pure prefix).
-                    if let Some(mp) = method_plan.get(&ip) {
+                    if let Some(mp) = mi.filter(|_| !mi_first) {
                         emit_inline_method_call(
                             &mut ops,
                             ip,
