@@ -619,7 +619,9 @@ pub(crate) struct ClassReadLane {
     pub value: u64,
 }
 
-/// Tier C's class-method lane, per `GetProp` ip (`Vm::build_class_read_plan`).
+/// Tier C's class-method lane, per `GetProp` or `CallMethod` ip
+/// (`Vm::build_class_read_plan`): a `GetProp` reads the method, a
+/// `CallMethod`'s class-method arms take it without the lookup's call.
 pub(crate) type ClassReadPlan = FxHashMap<usize, ClassReadLane>;
 
 env_off_switch!(

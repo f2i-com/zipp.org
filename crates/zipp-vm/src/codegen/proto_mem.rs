@@ -6289,6 +6289,19 @@ pub(crate) fn compile_proto_mem(
                     let class_done = ops.new_dynamic_label();
                     if let Some(site) = class_lane {
                         let lookup_miss = ops.new_dynamic_label();
+                        let have_callee = ops.new_dynamic_label();
+                        // The method the class-method lane's guards name
+                        // (`ClassReadPlan`) without the lookup's call; a
+                        // receiver they do not hold for takes the lookup.
+                        if let Some(lane) = class_read.get(&ip) {
+                            let guard_miss = ops.new_dynamic_label();
+                            emit_class_read_guard(&mut ops, obj, lane, guard_miss);
+                            dynasm!(ops
+                                ; mov rax, QWORD lane.value as i64
+                                ; jmp => have_callee
+                                ; => guard_miss
+                            );
+                        }
                         dynasm!(ops
                             ; mov rcx, rdi                        // vm
                             ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -6298,6 +6311,7 @@ pub(crate) fn compile_proto_mem(
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
                             ; je => lookup_miss
+                            ; => have_callee
                             ; mov [rsp + c3_off + 48], rax        // the arms' callee
                         );
                         for c3plan in site.cross3.iter() {
@@ -8027,6 +8041,25 @@ fn emit_class_read_get(
     done: dynasmrt::DynamicLabel,
 ) {
     let miss = ops.new_dynamic_label();
+    emit_class_read_guard(ops, obj, lane, miss);
+    dynasm!(ops
+        ; mov r10, QWORD lane.value as i64
+        ; mov [rbx + dreg(dst)], r10
+        ; jmp => done
+        ; => miss
+    );
+}
+
+/// The guards of the class-method lane (`emit_class_read_get`) for the
+/// receiver in `obj`: anything but a receiver of the lane's shape and class,
+/// with the class at the lane's version and epoch, jumps to `miss` with the
+/// receiver's bits in rax. Clobbers rcx, r9, r10 and r11.
+fn emit_class_read_guard(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    lane: &crate::codegen::ClassReadLane,
+    miss: dynasmrt::DynamicLabel,
+) {
     let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
     let fid_off = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
     let versions_raw = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
@@ -8051,10 +8084,6 @@ fn emit_class_read_get(
         ; jne => miss
         ; cmp DWORD [rdi + epoch_off], lane.epoch as i32
         ; jne => miss
-        ; mov r10, QWORD lane.value as i64
-        ; mov [rbx + dreg(dst)], r10
-        ; jmp => done
-        ; => miss
     );
 }
 

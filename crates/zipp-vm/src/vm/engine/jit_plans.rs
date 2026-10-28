@@ -1520,9 +1520,9 @@ impl<'p> Vm<'p> {
     }
 
     /// Tier C's class-method lane (`codegen::ClassReadPlan`): for each
-    /// `GetProp` whose interpreter cache's first way read a class instance's
-    /// method (`Vm::ic_class_method_read`), that read and its guards. Empty
-    /// under `ZIPP_NO_CLASS_READ_LANE=1`.
+    /// `GetProp` or `CallMethod` whose interpreter cache's first way read a
+    /// class instance's method (`Vm::ic_class_method_read`), that read and
+    /// its guards. Empty under `ZIPP_NO_CLASS_READ_LANE=1`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_class_read_plan(&self, func_id: u32) -> crate::codegen::ClassReadPlan {
         let mut plan = crate::codegen::ClassReadPlan::default();
@@ -1530,7 +1530,7 @@ impl<'p> Vm<'p> {
             return plan;
         }
         for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
-            if matches!(instr, Instr::GetProp { .. }) {
+            if matches!(instr, Instr::GetProp { .. } | Instr::CallMethod { .. }) {
                 if let Some(lane) = self.ic_class_method_read(func_id, ip) {
                     plan.insert(ip, lane);
                 }

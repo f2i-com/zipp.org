@@ -818,10 +818,11 @@ impl<'p> Vm<'p> {
         ))
     }
 
-    /// The class-method read the `GetProp` at `(func_id, ip)`'s cache made
-    /// first (way 0 an `IcEntry::ClassMethod`), for Tier C's class-method
-    /// lane (`ClassReadPlan`): the guards are the interpreter's own hit's
-    /// (`ic_get_prop` way 0), the receiver's class read from its mirror
+    /// The class-method read the `GetProp` or `CallMethod` at
+    /// `(func_id, ip)`'s cache made first (way 0 an `IcEntry::ClassMethod`),
+    /// for Tier C's class-method lane (`ClassReadPlan`): the guards are the
+    /// interpreter's own hit's (`ic_get_prop` way 0) and the method memo's
+    /// (`jit_method_callee_impl`), the receiver's class read from its mirror
     /// (`FID_MIRROR_CLASS`). Read-only.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_method_read(&self, func_id: u32, ip: usize) -> Option<crate::codegen::ClassReadLane> {

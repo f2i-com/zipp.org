@@ -1,27 +1,28 @@
-//! Method reads on class instances from compiled code (Tier C's class-method
-//! lane, `ClassReadPlan`, with the class in the receiver's mirror), with what
-//! must send a read elsewhere: another class with the same fields, a
-//! subclass, a plain object of the same shape, the method replaced, deleted
-//! and restored on the prototype, an own property shadowing it, an instance
-//! given another prototype, and a getter defined over it. Run interpreted, at
-//! the default thresholds, with every function compiled at once, under GC
-//! stress and with the lane off; the expected lines are Node 24's.
+//! Method reads and method calls on class instances from compiled code (Tier
+//! C's class-method lane, `ClassReadPlan`, with the class in the receiver's
+//! mirror), with what must send them elsewhere: another class with the same
+//! fields, a subclass, a plain object of the same shape, the method replaced,
+//! deleted and restored on the prototype, an own property shadowing it, an
+//! instance given another prototype, and a getter defined over it. Run
+//! interpreted, at the default thresholds, with every function compiled at
+//! once, under GC stress and with the lane off; the expected lines are Node
+//! 24's.
 
-const EXPECTED: &str = "210000
-1787.5
-350
+const EXPECTED: &str = "210210000
+1789287.5
+350350
 TypeError
-350
+350350
 TypeError
-350
-312.5
-550
-787.5
-150
-350
-100
-350
-100";
+350350
+312812.5
+550550
+788287.5
+150150
+350350
+200
+350350
+100100";
 
 #[test]
 fn class_read_lane_child() {
@@ -97,9 +98,12 @@ function round(o) {
   const h = b.sum;
   return h.call(b);
 }
+// The same calls as method calls (one `CallMethod` each), whose class-method
+// arms take the method from the same guards.
+function round2(o) { return o.scale(2).scale(0.5).sum(); }
 function chain(o, n) {
   let acc = 0;
-  for (let i = 0; i < n; i++) acc += round(o);
+  for (let i = 0; i < n; i++) acc += round(o) + round2(o) * 1000;
   return acc;
 }
 function tryChain(o, n) {
