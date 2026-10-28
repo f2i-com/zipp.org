@@ -5949,6 +5949,48 @@ pub(crate) fn compile_proto_mem(
                     let packed_fip = ((func_id as u64) << 32) | ip as u64;
                     let packed_args =
                         ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    // A class-method site: the method its cache resolves for
+                    // the receiver, looked up and not called
+                    // (`jit_method_callee`), then called natively by the arm
+                    // that names its fid, the receiver as `this`. A lookup that
+                    // declines and a method no arm names take the route below.
+                    let class_lane = cross_plan
+                        .get(&ip)
+                        .copied()
+                        .filter(|site| do_cross3 && site.class_method && !site.cross3.is_empty());
+                    let class_done = ops.new_dynamic_label();
+                    if let Some(site) = class_lane {
+                        let lookup_miss = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                            ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => lookup_miss
+                            ; mov [rsp + c3_off + 48], rax        // the arms' callee
+                        );
+                        for c3plan in site.cross3.iter() {
+                            emit_cross3_call(
+                                &mut ops,
+                                c3plan,
+                                Cross3Callee::Stash,
+                                Some(obj),
+                                arg_base,
+                                dst,
+                                proto.reg_count.max(1),
+                                c3_off,
+                                &heap,
+                                bail,
+                                class_done,
+                                refetch.is_some(),
+                                None,
+                            );
+                        }
+                        dynasm!(ops ; => lookup_miss);
+                    }
                     emit_tierc_general_method(
                         &mut ops,
                         ip,
@@ -5964,6 +6006,9 @@ pub(crate) fn compile_proto_mem(
                         method_own_slot_direct
                             && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
                     );
+                    if class_lane.is_some() {
+                        dynasm!(ops ; => class_done);
+                    }
                     if let Some(done) = pop_done {
                         dynasm!(ops ; => done);
                     }
@@ -6031,7 +6076,7 @@ pub(crate) fn compile_proto_mem(
                             emit_cross3_call(
                                 &mut ops,
                                 c3plan,
-                                callee,
+                                Cross3Callee::Reg(callee),
                                 None,
                                 arg_base,
                                 dst,
@@ -6547,7 +6592,7 @@ pub(crate) fn compile_proto_mem(
                         emit_cross3_call(
                             &mut ops,
                             c3plan,
-                            callee,
+                            Cross3Callee::Reg(callee),
                             Some(this_v),
                             arg_base,
                             dst,

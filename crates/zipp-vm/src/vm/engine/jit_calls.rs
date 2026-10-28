@@ -910,6 +910,67 @@ impl<'p> Vm<'p> {
         Some((packed, callee.bits(), recv.bits()))
     }
 
+    /// The callee the `CallMethod` at `packed_fip` reaches for the receiver
+    /// `recv_bits`, as the interpreter's method cache resolves it (a class
+    /// method, an own one), with nothing called: the emitted class-method lane
+    /// guards its fid and calls it natively (`emit_cross3_call`). The lookup
+    /// half of `jit_cross_method_call_impl`, without its helper-driven call.
+    /// `SELF_CALL_DEOPT` for a primitive receiver or a member the cache does
+    /// not resolve to a user function, before any effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_method_callee_impl(&mut self, recv_bits: u64, packed_fip: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let recv = Value::from_bits(recv_bits);
+        if !recv.is_heap() {
+            return SELF_CALL_DEOPT;
+        }
+        // The class method this site last resolved, under the cache's own
+        // guards: ahead of decoding the instruction and walking the cache's
+        // tables, which took the lookup to over 300 instructions a call.
+        let way = crate::vm::method_memo_way(packed_fip);
+        if let Some(m) = self.jit_method_memo.get(way) {
+            if m.packed_fip == packed_fip
+                && self.ic_class_method_guards_hold(recv, m.recv_shape, m.class, m.ver, m.epoch)
+            {
+                return m.callee;
+            }
+        }
+        // `func()` borrows for the program's lifetime (as in
+        // `jit_cross_method_call_impl`).
+        let key = {
+            let proto = self.func(func_id as usize);
+            let Some(Instr::CallMethod { name, .. }) = proto.code.get(ip).copied() else {
+                return SELF_CALL_DEOPT;
+            };
+            let Some(key) = proto.string_constants.get(name as usize) else {
+                return SELF_CALL_DEOPT;
+            };
+            key.as_str()
+        };
+        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
+            return SELF_CALL_DEOPT;
+        };
+        if crate::vm::method_memo_enabled() {
+            if let Some((recv_shape, class, ver, epoch)) = self.ic_class_method_guards(func_id, ip, recv, callee) {
+                if self.jit_method_memo.is_empty() {
+                    self.jit_method_memo =
+                        vec![crate::vm::MethodMemo::default(); crate::vm::METHOD_MEMO_WAYS].into_boxed_slice();
+                }
+                self.jit_method_memo[way] = crate::vm::MethodMemo {
+                    packed_fip,
+                    recv_shape,
+                    class,
+                    ver,
+                    epoch,
+                    callee: callee.bits(),
+                };
+            }
+        }
+        callee.bits()
+    }
+
     /// Resolve a live `CallMethod` data property and, when its current value has
     /// a Tier-C cross entry, dispatch it native-to-native with the receiver as
     /// `this`. This is a pure prefix: accessors, proxies/exotics, primitives,

@@ -2470,13 +2470,42 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // CallMethod sites that have only ever resolved to class methods.
+        // CallMethod sites that have only ever resolved to class methods. Each
+        // gets, beside the flag, the emitted lane of the methods it has called
+        // (`this.peek()`, `a.dot(b)`): the method is looked up by the cache's
+        // own helper and called natively, one arm per method, each admitted
+        // and revalidated as the plain call's is. The general method route
+        // made the call itself: two thirds of a class method call's cost.
+        let class_lane = cwt_unmetered
+            && crate::codegen::cross3_enabled()
+            && crate::codegen::cross3_class_enabled();
         for (ip, instr) in caller.code.iter().enumerate() {
-            if matches!(instr, Instr::CallMethod { .. }) && self.ic_site_only_class_methods(func_id, ip) {
-                plan.entry(ip)
-                    .or_insert_with(crate::codegen::CrossCallSitePlan::default)
-                    .class_method = true;
+            let Instr::CallMethod { argc, .. } = *instr else {
+                continue;
+            };
+            if !self.ic_site_only_class_methods(func_id, ip) {
+                continue;
             }
+            let mut cross3 = crate::codegen::Cross3CallPlan::default();
+            if class_lane {
+                for fid in self.ic_class_method_fids(func_id, ip) {
+                    if let Some(arm) =
+                        self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, &mut pending, &mut baked)
+                    {
+                        if !cross3.push(arm) {
+                            break;
+                        }
+                        if crate::jitlog_enabled() {
+                            eprintln!("[cross] fn{func_id}@{ip} CROSS3-CLASS fn{fid} native-emitted lane");
+                        }
+                    }
+                }
+            }
+            let site = plan
+                .entry(ip)
+                .or_insert_with(crate::codegen::CrossCallSitePlan::default);
+            site.class_method = true;
+            site.cross3 = cross3;
         }
 
         (plan, pending, baked)

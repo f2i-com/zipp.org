@@ -4173,6 +4173,73 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether `recv` still passes the guards of a class-method way the
+    /// class-method lane's memo copied (`ic_class_method_guards`): the
+    /// cache's own `ClassMethod` hit, receiver checks included.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn ic_class_method_guards_hold(&self, recv: Value, shape: u32, class: u32, ver: u32, epoch: u32) -> bool {
+        let Some((_idx, m)) = self.ic_recv_map(recv) else {
+            return false;
+        };
+        m.shape() == shape
+            && m.class == Some(class)
+            && self.heap.version_of(class) == ver
+            && self.class_proto_epoch == epoch
+    }
+
+    /// The guards of the class-method way of `(func_id, ip)`'s cache that
+    /// serves `recv` with `callee`: `(recv_shape, class, ver, epoch)`, for the
+    /// class-method lane's memo (`Vm::jit_method_callee_impl`). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_method_guards(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        callee: Value,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        let (_idx, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        site.entries[..site.n as usize].iter().find_map(|e| match *e {
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                epoch,
+                callee: c,
+                recv_shape,
+                ..
+            } if recv_shape == sh && c.bits() == callee.bits() && m.class == Some(class) => {
+                Some((recv_shape, class, ver, epoch))
+            }
+            _ => None,
+        })
+    }
+
+    /// The function ids of the class methods a `CallMethod` site's cache
+    /// holds, when every way is one (`ic_site_only_class_methods`); the
+    /// emitted class-method lane bakes an arm per id and revalidates it per
+    /// call. Read-only, as `ic_call_mono`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_method_fids(&self, func_id: u32, ip: usize) -> Vec<u32> {
+        let Some(site) = self.ic_site(func_id, ip) else {
+            return Vec::new();
+        };
+        let mut fids = Vec::new();
+        for e in &site.entries[..site.n as usize] {
+            match e {
+                IcEntry::ClassMethod { fid, .. } => {
+                    if !fids.contains(fid) {
+                        fids.push(*fid);
+                    }
+                }
+                _ => return Vec::new(),
+            }
+        }
+        fids
+    }
+
     // ── plain Call sites ──
 
     /// Whether the site's cache holds at least one way and every way is a

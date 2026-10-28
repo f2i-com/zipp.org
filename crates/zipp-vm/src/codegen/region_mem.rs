@@ -3380,7 +3380,7 @@ pub(crate) fn compile_region_mem(
                             emit_cross3_call(
                                 &mut ops,
                                 c3plan,
-                                callee,
+                                Cross3Callee::Reg(callee),
                                 None,
                                 arg_base,
                                 dst,
@@ -4208,7 +4208,7 @@ pub(crate) fn compile_region_mem(
                         emit_cross3_call(
                             &mut ops,
                             c3plan,
-                            callee,
+                            Cross3Callee::Reg(callee),
                             Some(this_v),
                             arg_base,
                             dst,
@@ -5312,6 +5312,17 @@ pub(crate) enum Cross3This {
     Receiver(u16),
 }
 
+/// Where an emitted cross call's callee bits come from.
+#[derive(Clone, Copy)]
+pub(crate) enum Cross3Callee {
+    /// The call's callee register (`Call`, `CallWithThis`).
+    Reg(u16),
+    /// The scratch's callee-bits word (`c3 + 48`), where the class-method
+    /// lane leaves the method its lookup helper resolved; the invoke stores
+    /// the same bits there again.
+    Stash,
+}
+
 /// B189b: the fully-emitted same-proto cross call at a plain `Call` site.
 /// Every baked datum (`plan.entry`/`uninit_mask` via `epoch`, the callee by
 /// `fid_mirror`, the call environment by the three nonempty bytes,
@@ -5323,9 +5334,9 @@ pub(crate) enum Cross3This {
 pub(crate) fn emit_cross3_call(
     ops: &mut dynasmrt::x64::Assembler,
     plan: crate::codegen::SameProtoCross3Plan,
-    callee: u16,
-    // A `CallWithThis` site's receiver register (the strict callee's
-    // `this`); `None` at a plain `Call`.
+    callee: Cross3Callee,
+    // A method call's receiver register (the strict callee's `this`);
+    // `None` at a plain `Call`.
     this_reg: Option<u16>,
     arg_base: u16,
     dst: u16,
@@ -5339,12 +5350,15 @@ pub(crate) fn emit_cross3_call(
 ) {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET};
     let fb = ops.new_dynamic_label();
+    match callee {
+        Cross3Callee::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+        Cross3Callee::Stash => dynasm!(ops ; mov rax, [rsp + c3 + 48]),
+    }
     // -- callee guard: tag + identity-free fid match; leaves callee idx in
     // r10d and the callee BITS in rax (the invoke stashes them). B195: the
     // fid lives in the hot record — one lea doubles the scale-8 index so
     // [r11 + r10*8 + 4] addresses base + idx*16 + fid. --
     dynasm!(ops
-        ; mov rax, [rbx + dreg(callee)]
         ; mov r10, rax
         ; shr r10, 48
         ; cmp r10d, TAG_HEAP_HI as i32

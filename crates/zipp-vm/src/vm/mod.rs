@@ -2034,6 +2034,11 @@ pub struct Vm<'p> {
     /// Pure memo: every hit rechecks the receiver's shape live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_leaf_reads: Box<[LeafRead]>,
+    /// The class method each compiled class-method `CallMethod` site last
+    /// resolved, direct-mapped by site (`helpers_misc::MethodMemo`). Pure
+    /// memo: every hit rechecks the cache way's guards live.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_method_memo: Box<[MethodMemo]>,
     /// Per constructor body: whether it only stores its arguments and
     /// constants into `this`, and the proof of the last receiver a compiled
     /// `new` answered that way (`engine::ctor_store`).

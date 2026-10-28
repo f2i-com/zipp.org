@@ -4230,6 +4230,80 @@ mod own_method_panic_boundary_tests {
 /// # Safety
 /// The pointers are the pinned live register window and its instruction-declared
 /// argument subwindow, supplied by generated code.
+/// One way of `Vm::jit_method_memo`: the class method the `CallMethod` at
+/// `packed_fip` last resolved (`callee`), with the guards of the cache way
+/// that served it (`Vm::ic_class_method_guards`). An empty way's
+/// `packed_fip` is `u64::MAX`, which no site packs to.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct MethodMemo {
+    pub(crate) packed_fip: u64,
+    pub(crate) recv_shape: u32,
+    pub(crate) class: u32,
+    pub(crate) ver: u32,
+    pub(crate) epoch: u32,
+    pub(crate) callee: u64,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Default for MethodMemo {
+    fn default() -> Self {
+        MethodMemo {
+            packed_fip: u64::MAX,
+            recv_shape: crate::shape::DICT,
+            class: 0,
+            ver: 0,
+            epoch: 0,
+            callee: 0,
+        }
+    }
+}
+
+/// Ways of `Vm::jit_method_memo` (32 bytes each, allocated at the first fill).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const METHOD_MEMO_WAYS: usize = 512;
+
+/// The way of `Vm::jit_method_memo` that holds the site `packed_fip`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn method_memo_way(packed_fip: u64) -> usize {
+    (packed_fip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize & (METHOD_MEMO_WAYS - 1)
+}
+
+/// `ZIPP_NO_METHOD_MEMO=1` resolves every class-method lane lookup through
+/// the interpreter's method cache again (`Vm::jit_method_callee_impl`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn method_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_METHOD_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Win64 helper for the emitted class-method lane: the callee a `CallMethod`
+/// reaches for its receiver, resolved and not called
+/// (`Vm::jit_method_callee_impl`). ABI: rcx=vm, rdx=receiver bits,
+/// r8=(func_id<<32)|ip. Callee bits, or `SELF_CALL_DEOPT` before any effect.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_method_callee(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    packed_fip: u64,
+) -> u64 {
+    // SAFETY: exclusive view; the running native code holds no conflicting
+    // borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit_method_callee_impl(recv_bits, packed_fip)
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_cross_method_call(
     vm: *mut core::ffi::c_void,

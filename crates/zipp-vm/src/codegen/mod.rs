@@ -489,6 +489,13 @@ env_off_switch!(
     fn cross3_cwt_enabled() = "ZIPP_NO_CROSS3_CWT"
 );
 
+env_off_switch!(
+    /// `ZIPP_NO_CROSS3_CLASS=1` keeps a class-method `CallMethod` site on the
+    /// general method route, without the emitted lane that calls the
+    /// looked-up method natively.
+    fn cross3_class_enabled() = "ZIPP_NO_CROSS3_CLASS"
+);
+
 pub(crate) fn cross3m_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
