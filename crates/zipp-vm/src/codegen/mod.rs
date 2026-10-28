@@ -957,6 +957,10 @@ pub struct CrossCallSitePlan {
     /// receivers, one method fid). Keyed in the same per-ip map — Call and
     /// CallMethod ips never collide.
     pub cross3m: Option<Cross3MethodPlan>,
+    /// A `CallMethod` site whose every cached resolution was a class
+    /// method: Tier C does not first try the own-data method call there,
+    /// which cannot succeed for a member that lives on the class.
+    pub class_method: bool,
 }
 
 /// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
