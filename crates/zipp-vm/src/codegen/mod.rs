@@ -490,6 +490,19 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_CWT_POLY=1` plans a `CallWithThis` site's emitted lane only
+    /// when its cache is monomorphic, without an arm per callee of a
+    /// polymorphic one.
+    fn cwt_poly_enabled() = "ZIPP_NO_CWT_POLY"
+);
+
+env_off_switch!(
+    /// `ZIPP_NO_CALL_FALLBACK_RECOMPILE=1` never recompiles a Tier C body
+    /// whose call site keeps reaching its fallback (`Jit::note_call_fallback`).
+    fn call_fallback_recompile_enabled() = "ZIPP_NO_CALL_FALLBACK_RECOMPILE"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_ITER_MIRROR_STEP=1` sends every compiled for-of step to
     /// `jit_iter_next` again, without the emitted dense-Array step through
     /// the array mirror (`emit_arr_mirror_iter_step`).
@@ -3259,6 +3272,9 @@ const _: () = assert!(IC_ROT_PERIOD == 256);
 const DIRECT_MISS_EVICTION_THRESHOLD: IcRotCursor = 32;
 /// Maximum adaptive park/recompile events per Tier-C body or OSR region.
 const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
+/// Fallback calls at one compiled call site before its body is recompiled
+/// (`Jit::note_call_fallback`).
+const CALL_FALLBACK_RECOMPILE_THRESHOLD: u32 = 4096;
 
 /// One way of a JIT'd `GetProp`/`SetProp` site's inline cache. `repr(C)` with a
 /// fixed layout the native code indexes directly: `obj_bits @0`, `vals_ptr @8`,
@@ -3789,6 +3805,10 @@ pub struct Jit {
     /// growth, outside the JS heap limit). Sibling proven sites are batched and
     /// the remaining number of parks is capped.
     direct_miss_recompiles: FxHashMap<(u32, u32), u8>,
+    /// Calls that reached a compiled call site's fallback (its leaf inline
+    /// and emitted arms named another callee), by `(func_id, ip)`, until
+    /// `note_call_fallback` recompiles the body.
+    call_fallback_counts: FxHashMap<(u32, u32), u32>,
     /// Tier C bodies evicted by the accessor site gate, parked for the same
     /// reason as `retired`: the fill helper that evicts runs INSIDE the native
     /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
@@ -5811,6 +5831,54 @@ impl Jit {
             }
         }
         DirectMissGate::Recompile
+    }
+
+    /// A call at `(func_id, ip)` in a compiled body reached the site's
+    /// fallback helper: none of the callees its leaf inline and emitted arms
+    /// name. After `CALL_FALLBACK_RECOMPILE_THRESHOLD` of them the function's
+    /// Tier C body is evicted, as the direct-miss gate evicts one, so its
+    /// next compile plans the site from the cache as it is now (a second
+    /// comparator, a closure made anew per round), under the same cap of
+    /// recompiles per body. The body may be the one running: it is parked
+    /// with the retired bodies, never freed under itself. A metered VM keeps
+    /// its body.
+    pub fn note_call_fallback(&mut self, func_id: u32, ip: u32) {
+        // Only a Tier C body is recompiled; a region's site (records.ts's
+        // `makeOrders` runs as one) is not counted, which would cost a map
+        // update per call for nothing.
+        if !call_fallback_recompile_enabled() || self.meter.is_some() || self.fn_state(func_id) != FN_COMPILED {
+            return;
+        }
+        let n = self.call_fallback_counts.entry((func_id, ip)).or_insert(0);
+        *n += 1;
+        if *n < CALL_FALLBACK_RECOMPILE_THRESHOLD {
+            return;
+        }
+        *n = 0;
+        let owner = (func_id, u32::MAX);
+        let parks = self.direct_miss_recompiles.get(&owner).copied().unwrap_or(0);
+        if parks >= DIRECT_MISS_RECOMPILE_CAP {
+            return;
+        }
+        let Some(f) = self.compiled.remove(&func_id) else {
+            return;
+        };
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] Tier C fn{func_id} EVICTED (call fallback at ip {ip})");
+        }
+        *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
+        self.retired_fns.push(f);
+        // Re-armed one short of the threshold, so the very next entry
+        // recompiles: a body entered a handful of times (records.ts's
+        // `makeOrders`, once a round) would otherwise run interpreted, or in
+        // an OSR region, for the rest of the program.
+        let rearm = self.fn_threshold().saturating_sub(1);
+        self.counts.insert(func_id, rearm);
+        self.set_fn_state(func_id, FN_COLD);
+        self.clear_cross_entry(func_id);
+        if self.self_cache.is_some_and(|(id, _)| id == func_id) {
+            self.self_cache = None;
+        }
     }
 
     /// Whether this compile omitted the identity probes at `site`. Miss helpers

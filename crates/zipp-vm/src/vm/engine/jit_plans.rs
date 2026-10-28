@@ -2363,19 +2363,40 @@ impl<'p> Vm<'p> {
                 let Instr::CallWithThis { argc, .. } = *instr else {
                     continue;
                 };
-                let Some((_bits, _ver, fid, _closure)) = self.ic_call_mono(func_id, ip) else {
-                    continue;
-                };
-                let Some(arm) =
-                    self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, false, &mut pending, &mut baked)
-                else {
-                    continue;
+                // A monomorphic site's one callee, or one arm per distinct
+                // function a polymorphic site has called (a comparator that
+                // changed with the program's phase: the site is recompiled
+                // with both once its fallback has seen enough calls,
+                // `Jit::note_call_fallback`).
+                let fids: Vec<u32> = match self.ic_call_mono(func_id, ip) {
+                    Some((_bits, _ver, fid, _closure)) => vec![fid],
+                    None if crate::codegen::cwt_poly_enabled() => {
+                        let mut fids = Vec::new();
+                        for (_bits, _ver, fid, _closure) in self.ic_call_poly_fids(func_id, ip).unwrap_or_default() {
+                            if !fids.contains(&fid) {
+                                fids.push(fid);
+                            }
+                        }
+                        fids
+                    }
+                    None => Vec::new(),
                 };
                 let mut cross3 = crate::codegen::Cross3CallPlan::default();
-                let inserted = cross3.push(arm);
-                debug_assert!(inserted);
-                if crate::jitlog_enabled() {
-                    eprintln!("[cross] fn{func_id}@{ip} CROSS3-CWT fn{fid} native-emitted lane");
+                for fid in fids {
+                    let Some(arm) =
+                        self.build_cross3_call_arm(func_id, ip, fid, argc, whole_body, false, &mut pending, &mut baked)
+                    else {
+                        continue;
+                    };
+                    if !cross3.push(arm) {
+                        break;
+                    }
+                    if crate::jitlog_enabled() {
+                        eprintln!("[cross] fn{func_id}@{ip} CROSS3-CWT fn{fid} native-emitted lane");
+                    }
+                }
+                if cross3.is_empty() {
+                    continue;
                 }
                 plan.entry(ip)
                     .or_insert_with(crate::codegen::CrossCallSitePlan::default)

@@ -1244,6 +1244,10 @@ pub(crate) extern "win64" fn jit_call_ic_cross(
 ) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
+        // Not counted for a recompile (`Jit::note_call_fallback`): a plain
+        // call's leaf most often misses on a callback made anew per call of
+        // its caller, which the recompiled body served worse without the
+        // inline (sort-variants.js's `lowerBound(a, x, cmp)`, +0.6%).
         if crate::codegen::call_cross_enabled() {
             let callee_reg = (packed_args >> 16) as u16 as usize;
             let arg_base = packed_args as u16 as usize;
@@ -1769,6 +1773,9 @@ pub(crate) extern "win64" fn jit_call_with_this_cross(
 ) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
+        // The site's planned lanes missed: past a threshold the body is
+        // recompiled from the cache as it is now.
+        vm.jit.note_call_fallback((packed_fip >> 32) as u32, packed_fip as u32);
         if crate::codegen::cwt_cross_enabled() {
             let this_reg = (packed_args >> 32) as u16 as usize;
             let callee_reg = (packed_args >> 16) as u16 as usize;
