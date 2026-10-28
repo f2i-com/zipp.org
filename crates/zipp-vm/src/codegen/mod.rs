@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_TIERC_CROSS3M=1` keeps Tier C's `CallMethod` of an own data
+    /// property's function on the general route, without the memory
+    /// region's emitted lane (`emit_cross3_method_call`).
+    fn tierc_cross3m_enabled() = "ZIPP_NO_TIERC_CROSS3M"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_MATH_INLINE=1` calls the unary Math helper for `sqrt`,
     /// `abs`, `floor`, `ceil` and `trunc` again (`emit_math_unary_inline`).
     fn math_inline_enabled() = "ZIPP_NO_MATH_INLINE"

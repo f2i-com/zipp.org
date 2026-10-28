@@ -3224,7 +3224,10 @@ pub(crate) fn compile_proto_mem(
     // activation 24B @ c3, window base|flags @ c3+24, result @ c3+32, bail
     // slot @ c3+40); + a 16B leaf-headroom-flag slot when inlining (48 and 16
     // both keep the frame's 16-alignment after the 6 pushes).
-    let do_cross3 = meter.is_none() && cross_plan.values().any(|site| !site.cross3.is_empty());
+    let do_cross3 = meter.is_none()
+        && cross_plan.values().any(|site| {
+            !site.cross3.is_empty() || (site.cross3m.is_some() && tierc_cross3m_enabled())
+        });
     let cursor_off: i32 = 40;
     let c3_off: i32 = cursor_off
         + if str_append_cursor.is_some() {
@@ -5964,6 +5967,34 @@ pub(crate) fn compile_proto_mem(
                     let packed_fip = ((func_id as u64) << 32) | ip as u64;
                     let packed_args =
                         ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    // An own data property holding a function (`this.cmp(a, b)`
+                    // with `cmp` set in the constructor): the memory region's
+                    // CROSS3M lane, the method read through the receiver's hot
+                    // mirror at the planned shape and slot and called natively;
+                    // any guard miss falls through to the lanes below. The
+                    // general route ran the call through the windowed helper,
+                    // ten times a plain closure call's instructions.
+                    let own_lane = cross_plan
+                        .get(&ip)
+                        .and_then(|site| site.cross3m)
+                        .filter(|_| do_cross3 && tierc_cross3m_enabled());
+                    let own_done = ops.new_dynamic_label();
+                    if let Some(mp) = own_lane {
+                        emit_cross3_method_call(
+                            &mut ops,
+                            mp,
+                            obj,
+                            arg_base,
+                            dst,
+                            proto.reg_count.max(1),
+                            c3_off,
+                            &heap,
+                            bail,
+                            own_done,
+                            refetch.is_some(),
+                            None,
+                        );
+                    }
                     // A class-method site: the method its cache resolves for
                     // the receiver, looked up and not called
                     // (`jit_method_callee`), then called natively by the arm
@@ -6023,6 +6054,9 @@ pub(crate) fn compile_proto_mem(
                     );
                     if class_lane.is_some() {
                         dynasm!(ops ; => class_done);
+                    }
+                    if own_lane.is_some() {
+                        dynasm!(ops ; => own_done);
                     }
                     if let Some(done) = pop_done {
                         dynasm!(ops ; => done);
