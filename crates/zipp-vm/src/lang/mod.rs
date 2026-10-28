@@ -26,6 +26,7 @@ pub use ts::run_file as run_typescript_file;
 /// would read it) without compiling or running it: the syntax error, located,
 /// if it has one. For tools that check a corpus.
 pub fn check_typescript(source: &str) -> Result<(), String> {
+    ts::built()?;
     ts::parse_auto(source, ts::TsConfig::default())
         .map(drop)
         .map_err(|f| f.located(source, None))
@@ -34,6 +35,7 @@ pub fn check_typescript(source: &str) -> Result<(), String> {
 /// [`check_typescript`] for the file at `path`, read as it would be run: a
 /// `.tsx` or `.jsx` file has JSX, lowered as its `tsconfig.json` says.
 pub fn check_typescript_file(path: &Path, source: &str) -> Result<(), String> {
+    ts::built()?;
     ts::parse_auto(source, ts::config::config_for(path))
         .map(drop)
         .map_err(|f| f.located(source, None))

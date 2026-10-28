@@ -234,7 +234,7 @@ impl<'s> Parser<'s> {
             // `[In]` is on inside it however the arrow was reached.
             self.ctx.in_ = true;
             ArrowBody::Block(self.parse_fn_body_with_params(Some(&params))?)
-        } else if self.ts {
+        } else if self.ts() {
             // TypeScript reads which names a reference reaches (import
             // elision), so the parameters are in scope here as in a block body.
             self.scopes.push(super::parser::ScopeKind::Function);

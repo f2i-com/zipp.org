@@ -5,6 +5,7 @@
 //! a module. Read through `this` at the top level, which a module leaves
 //! undefined; the expected lines are Node 24's
 //! (`--experimental-transform-types`).
+#![cfg(feature = "typescript")]
 
 use std::path::Path;
 

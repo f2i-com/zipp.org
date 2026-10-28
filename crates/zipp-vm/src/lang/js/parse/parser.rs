@@ -459,12 +459,19 @@ pub(crate) struct ScopeStack {
     /// which TypeScript then knows to be a type (they live in different
     /// declaration spaces: `import { Symbol }` of an interface beside `function
     /// Symbol`). The import gives way, and its name is recorded here for the
-    /// import to be dropped (`lang/ts/elide.rs`).
-    pub(crate) ts: bool,
+    /// import to be dropped (`lang/ts/elide.rs`). Read through [`Self::ts`].
+    pub(crate) ts_on: bool,
     pub(crate) import_clashes: Vec<Name>,
 }
 
 impl ScopeStack {
+    /// The scopes are a TypeScript file's: never in a build without the
+    /// `typescript` feature (see [`Parser::ts`]).
+    #[inline(always)]
+    pub(crate) fn ts(&self) -> bool {
+        cfg!(feature = "typescript") && self.ts_on
+    }
+
     pub(crate) fn push(&mut self, kind: ScopeKind) {
         let var_boundary = matches!(
             kind,
@@ -518,7 +525,7 @@ impl ScopeStack {
         pos: u32,
         annexb_dup_ok: bool,
     ) -> PResult<()> {
-        if self.ts && kind != BindKind::Import {
+        if self.ts() && kind != BindKind::Import {
             self.ts_take_import(name);
         }
         let Some(scope) = self.scopes.last_mut() else {
@@ -625,7 +632,7 @@ impl ScopeStack {
     /// A `var` conflicts with any lexical binding between here and the nearest
     /// var boundary, inclusive.
     pub(crate) fn declare_var(&mut self, name: &str, pos: u32) -> PResult<()> {
-        if self.ts {
+        if self.ts() {
             self.ts_take_import(name);
         }
         for scope in self.scopes.iter().rev() {
@@ -790,8 +797,8 @@ pub struct Parser<'s> {
     /// The same for object literal members (`parse_object_literal`).
     pub(crate) member_scratch: Vec<ObjectMember>,
     /// The source is TypeScript (`ParseOptions::typescript`): the hooks into
-    /// `crate::lang::ts` are taken.
-    pub(crate) ts: bool,
+    /// `crate::lang::ts` are taken. Read through [`Self::ts`].
+    ts_on: bool,
     /// What the TypeScript grammar keeps while it reads (see `lang/ts`).
     pub(crate) ts_state: crate::lang::ts::TsState,
     /// JSX's settings and what its lowering has used, when the file has JSX.
@@ -827,6 +834,14 @@ pub(crate) struct Snapshot {
 const TREE_LEVELS_PER_ACTIVATION: usize = 8;
 
 impl<'s> Parser<'s> {
+    /// The source is TypeScript. Never in a build without the `typescript`
+    /// feature: every hook into `crate::lang::ts` sits behind this, so that
+    /// build's optimizer drops the whole TypeScript grammar.
+    #[inline(always)]
+    pub(crate) fn ts(&self) -> bool {
+        cfg!(feature = "typescript") && self.ts_on
+    }
+
     #[cfg(test)]
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
         Parser::new_exact(src, None, opts)
@@ -863,7 +878,7 @@ impl<'s> Parser<'s> {
             prev_end: 0,
             ctx,
             scopes: ScopeStack {
-                ts: opts.typescript,
+                ts_on: opts.typescript,
                 ..ScopeStack::default()
             },
             cover: Cover::default(),
@@ -880,7 +895,7 @@ impl<'s> Parser<'s> {
             stmt_scratch: Vec::new(),
             arg_scratch: Vec::new(),
             member_scratch: Vec::new(),
-            ts: opts.typescript,
+            ts_on: opts.typescript,
             ts_state: crate::lang::ts::TsState {
                 define_fields: opts.ts_define_fields,
                 legacy_decorators: opts.ts_legacy_decorators,

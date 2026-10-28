@@ -92,7 +92,7 @@ impl<'s> Parser<'s> {
             ScopeKind::Script
         });
         let mut body = self.parse_stmt_items(|p| !p.at_eof())?;
-        if self.ts {
+        if self.ts() {
             self.ts_finish_program(&mut body);
             self.ts_legacy_helpers(&mut body);
         }
@@ -168,7 +168,7 @@ impl<'s> Parser<'s> {
         if !self.scopes.at_module_top_level() {
             return Ok(None);
         }
-        if self.ts {
+        if self.ts() {
             return self.ts_module_decl();
         }
         if self.at_kw(Keyword::Import) {
@@ -490,7 +490,7 @@ impl<'s> Parser<'s> {
                     if let Some(n) = &c.name {
                         self.declare(&n.clone(), BindKind::Class, cstart)?;
                     }
-                    if self.ts && self.ts_state.legacy_decorators {
+                    if self.ts() && self.ts_state.legacy_decorators {
                         let mut stmts = self
                             .ts_legacy_lower(c, crate::lang::ts::legacy::LegacyExport::Default)?;
                         let Some(Stmt::Export(last)) = stmts.pop() else {
@@ -572,11 +572,11 @@ impl<'s> Parser<'s> {
         }
         // `export var/let/const/function/class …` — the declaration binds
         // exactly as it would without the `export`.
-        if self.ts && self.ts_state.legacy_decorators {
+        if self.ts() && self.ts_state.legacy_decorators {
             self.ts_state.legacy_export = true;
         }
         let decl = self.parse_stmt_list_item()?;
-        if self.ts {
+        if self.ts() {
             self.ts_state.legacy_export = false;
             // A class lowered for its legacy decorators ends with its export.
             if let Stmt::Export(e) = decl {
@@ -632,8 +632,8 @@ impl<'s> Parser<'s> {
         // here through the Block, and the brace is what makes it a declaration
         // again rather than an Annex B clause.
         self.stmt_pos = StmtPos::ListItem;
-        let ts_export = self.ts && std::mem::take(&mut self.ts_state.legacy_export);
-        if self.ts {
+        let ts_export = self.ts() && std::mem::take(&mut self.ts_state.legacy_export);
+        if self.ts() {
             if let Some(s) = self.ts_stmt()? {
                 return Ok(s);
             }
@@ -657,7 +657,7 @@ impl<'s> Parser<'s> {
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
             }
-            if self.ts && self.ts_state.legacy_decorators {
+            if self.ts() && self.ts_state.legacy_decorators {
                 return self.ts_legacy_decl(c, ts_export);
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
@@ -670,7 +670,7 @@ impl<'s> Parser<'s> {
             self.bump_after_operand()?;
             let f = self.parse_function_rest(false, false, start)?;
             // An overload signature or ambient function declares nothing.
-            if self.ts && std::mem::take(&mut self.ts_state.bodiless) {
+            if self.ts() && std::mem::take(&mut self.ts_state.bodiless) {
                 return Ok(Stmt::Empty);
             }
             if let Some(n) = &f.name {
@@ -687,7 +687,7 @@ impl<'s> Parser<'s> {
             if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                 self.bump_after_operand()?;
                 let f = self.parse_function_rest(true, false, start)?;
-                if self.ts && std::mem::take(&mut self.ts_state.bodiless) {
+                if self.ts() && std::mem::take(&mut self.ts_state.bodiless) {
                     return Ok(Stmt::Empty);
                 }
                 if let Some(n) = &f.name {
@@ -708,7 +708,7 @@ impl<'s> Parser<'s> {
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
             }
-            if self.ts && self.ts_state.legacy_decorators {
+            if self.ts() && self.ts_state.legacy_decorators {
                 return self.ts_legacy_decl(c, ts_export);
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
@@ -843,7 +843,7 @@ impl<'s> Parser<'s> {
         let id = self.parse_binding_pattern()?;
         // TypeScript: an annotated `const` may go without an initializer in
         // an ambient context (a `.d.ts` file's `export const x: T;`).
-        let ts_typed = self.ts && self.ts_binding_suffix()?;
+        let ts_typed = self.ts() && self.ts_binding_suffix()?;
         // `using` binds resources by NAME so it can dispose them in reverse
         // declaration order; a pattern has no single name to record, so the
         // grammar takes a BindingIdentifier and nothing else. The FIRST
@@ -1296,7 +1296,7 @@ impl<'s> Parser<'s> {
         let out = if let Some(kind) = self.at_var_decl_start(true)? {
             let pos = self.cur().span.start;
             let pat = self.parse_binding_pattern()?;
-            if self.ts {
+            if self.ts() {
                 self.ts_binding_suffix()?;
             }
             self.declare_pattern(&pat, kind, pos)?;
@@ -1381,7 +1381,7 @@ impl<'s> Parser<'s> {
                     while self.eat(Punct::Comma, true)? {
                         let p2 = self.cur().span.start;
                         let id = self.parse_binding_pattern()?;
-                        if self.ts {
+                        if self.ts() {
                             self.ts_binding_suffix()?;
                         }
                         self.declare_pattern(&id, kind, p2)?;
@@ -1579,7 +1579,7 @@ impl<'s> Parser<'s> {
             let param = if self.eat(Punct::LParen, true)? {
                 let pos = self.cur().span.start;
                 let p = self.parse_binding_pattern()?;
-                if self.ts {
+                if self.ts() {
                     self.ts_annotation_opt()?;
                 }
                 // Annex B B.3.5 allows `catch (e) { var e }` only for a SIMPLE

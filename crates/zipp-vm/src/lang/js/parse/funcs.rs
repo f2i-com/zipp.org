@@ -67,7 +67,7 @@ impl<'s> Parser<'s> {
                 None => None,
             }
         };
-        if self.ts && self.at(Punct::Lt) {
+        if self.ts() && self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
         let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
@@ -112,7 +112,7 @@ impl<'s> Parser<'s> {
         let params_at = self.cur().span.start;
         let params = self.parse_params()?;
         self.check_unique_params(&params, unique, params_at)?;
-        let body = if self.ts {
+        let body = if self.ts() {
             self.ts_fn_body(&params)?
         } else {
             self.parse_fn_body_with_params(Some(&params))?
@@ -179,7 +179,7 @@ impl<'s> Parser<'s> {
         is_generator: bool,
         start: u32,
     ) -> PResult<Function> {
-        if self.ts && self.at(Punct::Lt) {
+        if self.ts() && self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
         let saved_super = self.ctx.super_prop;
@@ -236,7 +236,7 @@ impl<'s> Parser<'s> {
     }
 
     pub(crate) fn parse_params(&mut self) -> PResult<Params> {
-        if self.ts {
+        if self.ts() {
             return self.ts_params();
         }
         self.expect(Punct::LParen, true)?;
@@ -545,7 +545,7 @@ impl<'s> Parser<'s> {
         } else {
             None
         };
-        if self.ts && self.at(Punct::Lt) {
+        if self.ts() && self.at(Punct::Lt) {
             self.ts_type_params()?;
         }
         let superclass = if self.eat_kw(Keyword::Extends, true)? {
@@ -574,10 +574,10 @@ impl<'s> Parser<'s> {
             None
         };
         let derived = superclass.is_some();
-        if self.ts {
+        if self.ts() {
             self.ts_class_heritage_tail()?;
         }
-        let legacy = self.ts && self.ts_state.legacy_decorators;
+        let legacy = self.ts() && self.ts_state.legacy_decorators;
         if legacy {
             self.ts_legacy_enter(name.as_ref(), !decorators.is_empty());
         }
@@ -600,7 +600,7 @@ impl<'s> Parser<'s> {
             if self.eat(Punct::Semi, true)? {
                 continue;
             }
-            let m = if self.ts {
+            let m = if self.ts() {
                 match self.ts_class_member(derived, &mut ts_fields)? {
                     Some(m) => m,
                     None => continue,
@@ -622,7 +622,7 @@ impl<'s> Parser<'s> {
         }
         let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
-        if self.ts {
+        if self.ts() {
             if legacy {
                 self.ts_legacy_strip(&mut body)?;
             }
@@ -822,7 +822,7 @@ impl<'s> Parser<'s> {
         start: u32,
     ) -> PResult<ClassMember> {
         // TypeScript's modifier list may have held the `static` already.
-        let is_static = if self.ts && std::mem::take(&mut self.ts_state.member_static) {
+        let is_static = if self.ts() && std::mem::take(&mut self.ts_state.member_static) {
             true
         } else if self.at_kw(Keyword::Static) {
             let save = self.save();
@@ -929,7 +929,7 @@ impl<'s> Parser<'s> {
         let is_generator = self.eat(Punct::Star, false)?;
 
         let key = self.parse_prop_key()?;
-        if self.ts {
+        if self.ts() {
             self.ts_member_key_suffix()?;
         }
 
@@ -1008,7 +1008,7 @@ impl<'s> Parser<'s> {
     /// get/set pair that reads and writes it.
     fn parse_auto_accessor(&mut self, is_static: bool, start: u32) -> PResult<ClassMember> {
         let key = self.parse_prop_key()?;
-        if self.ts {
+        if self.ts() {
             self.ts_member_key_suffix()?;
         }
         let value = if self.eat(Punct::Eq, true)? {

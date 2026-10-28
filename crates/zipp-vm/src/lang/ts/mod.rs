@@ -46,12 +46,28 @@ pub(crate) mod legacy;
 mod lower;
 mod types;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "typescript"))]
 mod tests;
 
 use super::{Language, LanguageId};
 use crate::embed::ScriptState;
 pub(crate) use config::TsConfig;
+
+/// What every TypeScript entry point answers in a build without the
+/// `typescript` feature (whose parser leaves the grammar out, see
+/// `Parser::ts`). `tsconfig.json`'s and `package.json`'s reader (`config`)
+/// stays: the JavaScript module loader reads `package.json` with it.
+pub(crate) const NOT_BUILT: &str = "TypeScript support is not built; enable the `typescript` Cargo feature";
+
+/// [`NOT_BUILT`] when this build has no TypeScript.
+#[inline]
+pub(crate) fn built() -> Result<(), String> {
+    if cfg!(feature = "typescript") {
+        Ok(())
+    } else {
+        Err(NOT_BUILT.into())
+    }
+}
 
 /// The TypeScript entry of the language table.
 pub(super) struct TypeScript;
@@ -75,6 +91,7 @@ impl Language for TypeScript {
     }
 
     fn compile(&self, source: &str) -> Result<ScriptState, String> {
+        built()?;
         let ast =
             parse_script(source, true, TsConfig::default()).map_err(|f| f.located(source, None))?;
         let program = crate::compile::compile_main_program(&ast, source)?;
@@ -82,6 +99,7 @@ impl Language for TypeScript {
     }
 
     fn compile_to_text(&self, source: &str) -> Result<String, String> {
+        built()?;
         let ast = parse_auto(source, TsConfig::default()).map_err(|f| f.located(source, None))?;
         let program = if ast.goal == Goal::Module {
             crate::compile::compile_main_module(&ast, source)?
@@ -425,6 +443,7 @@ pub(crate) fn is_ts_path(path: &Path) -> bool {
 /// A TypeScript module's syntax error names the file, as an entry's does.
 pub(crate) fn parse_module_file(path: &Path, code: &str) -> Result<Program, String> {
     if is_ts_path(path) || config::is_jsx_path(path) {
+        built()?;
         parse_module(code, config::config_for(path)).map_err(|f| {
             #[cfg(not(feature = "wasm-no-fs-loader"))]
             let url = std::path::absolute(path).map(|p| crate::vm::file_url(&p)).ok();
@@ -472,6 +491,7 @@ pub(crate) fn resolve_candidates(raw: &Path) -> Vec<std::path::PathBuf> {
 /// `.mts`) through the module loader, so the `.ts` files it imports load as
 /// TypeScript too; otherwise as a script, like `zipp js`.
 pub fn run_file(path: &Path) -> Result<crate::Outcome, String> {
+    built()?;
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");

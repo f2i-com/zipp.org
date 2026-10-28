@@ -59,8 +59,10 @@ console_error_panic_hook = "=0.1.7"
 # engine IS the JavaScript VM, and the Python runtime is itself JavaScript the
 # engine compiles); `python` adds the Python parser and the lowering code,
 # which is the whole size difference, so it stays off the default artifact.
+# `typescript` adds the TypeScript grammar the same way.
 #
 #   JavaScript only (the shipped default): cargo build --release --target wasm32-unknown-unknown
+#   JavaScript + TypeScript:               cargo build --release --target wasm32-unknown-unknown --features typescript
 #   JavaScript + Python:                   cargo build --release --target wasm32-unknown-unknown --features python
 #
 # `build-variants.sh` builds selected variants and prints sizes, including Lite.
@@ -68,6 +70,9 @@ console_error_panic_hook = "=0.1.7"
 default = []
 # ZIPP Lite: JavaScript core without Intl, Temporal, Python or Torch.
 lite = ["zipp-vm/wasm-lite"]
+# `Engine.initSource(source, "typescript")`: TypeScript, its types read and
+# dropped (the `javascript-typescript` artifact).
+typescript = ["zipp-vm/typescript"]
 # `Engine.initSource(source, "python")`: the experimental Python-subset
 # frontend (docs/python/FRONTEND.md).
 python = ["zipp-vm/python"]

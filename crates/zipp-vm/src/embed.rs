@@ -261,6 +261,7 @@ pub fn compile_typescript_with_preamble_and_origin(
     options: &CompileOptions,
     origin: &ScriptOrigin,
 ) -> Result<ScriptState, String> {
+    crate::lang::ts::built()?;
     compile_with_origin_as(Some(preamble), source, options, origin, true)
 }
 

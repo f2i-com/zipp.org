@@ -266,7 +266,7 @@ impl<'s> Parser<'s> {
         let (tag, after) = self.jsx_name(pos)?;
         pos = self.skip_trivia_from(after)?;
         // `<Select<Option> …>`: type arguments, read and dropped.
-        if self.ts && self.jsx_byte(pos) == b'<' {
+        if self.ts() && self.jsx_byte(pos) == b'<' {
             self.resume_at(pos, false)?;
             self.ts_type_args()?;
             pos = self.cur().span.start;
@@ -579,7 +579,7 @@ impl<'s> Parser<'s> {
     /// factory's namespace), counted as a use of an import of it.
     fn jsx_ref(&mut self, name: &str) -> Expr {
         let n = self.intern_name(name);
-        if self.ts {
+        if self.ts() {
             self.ts_note_ref(&n);
             if !self.ts_state.legacy_classes.is_empty() {
                 if let Some(alias) = self.ts_class_alias(&n) {

@@ -158,7 +158,7 @@ impl<'s> Parser<'s> {
     fn parse_assign_inner(&mut self) -> PResult<Expr> {
         // TypeScript: whether this is a conditional's true branch, read once
         // here so it reaches no nested expression (`TsState::no_ret_arrow`).
-        let ts_no_ret = self.ts && std::mem::take(&mut self.ts_state.no_ret_arrow);
+        let ts_no_ret = self.ts() && std::mem::take(&mut self.ts_state.no_ret_arrow);
         // `yield` is an AssignmentExpression of its own, not an operand.
         if self.ctx.yield_ && self.at_kw(Keyword::Yield) {
             return self.parse_yield();
@@ -172,7 +172,7 @@ impl<'s> Parser<'s> {
         let start = self.cur().span.start;
         // TypeScript arrows (`(a: T): R => …`, `<T>(a: T) => …`) are read by
         // `lang::ts`, which leaves anything else to the cover grammar below.
-        if self.ts && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
+        if self.ts() && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
             if let Some(e) = self.ts_arrow(false, start, ts_no_ret)? {
                 return Ok(e);
             }
@@ -363,7 +363,7 @@ impl<'s> Parser<'s> {
             self.restore(save);
             return Ok(None);
         }
-        if self.ts && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
+        if self.ts() && (self.at(Punct::LParen) || self.at(Punct::Lt)) {
             if let Some(e) = self.ts_arrow(true, start, false)? {
                 return Ok(Some(e));
             }
@@ -402,7 +402,7 @@ impl<'s> Parser<'s> {
         // b in c : d;;)` parses the `in`.
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
-        if self.ts {
+        if self.ts() {
             self.ts_state.no_ret_arrow = true;
         }
         let cons = self.parse_assign()?;
@@ -542,7 +542,7 @@ impl<'s> Parser<'s> {
         let mut links = 0usize;
         loop {
             // TypeScript's `as T` / `satisfies T`, at relational precedence.
-            if self.ts && min <= 9 && self.ts_at_as() {
+            if self.ts() && min <= 9 && self.ts_at_as() {
                 self.ts_as_suffix()?;
                 continue;
             }
@@ -637,7 +637,7 @@ impl<'s> Parser<'s> {
         use Punct as P;
         // TypeScript's type assertion `<T>expr` (in a `.tsx` file, `<T>`
         // starts an element).
-        if self.ts && self.jsx.is_none() && self.at(P::Lt) {
+        if self.ts() && self.jsx.is_none() && self.at(P::Lt) {
             self.ts_type_assertion_head()?;
             return self.parse_unary();
         }
@@ -858,7 +858,7 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
                 // TypeScript: `E.A` of a `const enum` is its value.
-                if self.ts && !self.ts_state.const_enums.is_empty() {
+                if self.ts() && !self.ts_state.const_enums.is_empty() {
                     self.ts_inline_const_enum(&mut e);
                 }
             } else if self.at(Punct::QuestionDot) {
@@ -930,10 +930,10 @@ impl<'s> Parser<'s> {
                     optional: false,
                     pos,
                 }));
-            } else if self.ts && self.at(Punct::Bang) && !self.cur().newline_before {
+            } else if self.ts() && self.at(Punct::Bang) && !self.cur().newline_before {
                 // TypeScript's non-null assertion `e!`.
                 self.bump_after_operand()?;
-            } else if self.ts
+            } else if self.ts()
                 && (self.at(Punct::Lt) || self.at(Punct::Shl))
                 && self.ts_type_args_in_expr()?
             {
@@ -1107,7 +1107,7 @@ impl<'s> Parser<'s> {
         if self.at(Punct::QuestionDot) {
             return Err(self.err_here("SyntaxError: 'new' cannot be applied to an optional chain"));
         }
-        if self.ts && self.at(Punct::Lt) {
+        if self.ts() && self.at(Punct::Lt) {
             self.ts_type_args_in_expr()?;
         }
         let args = if self.at(Punct::LParen) {
@@ -1216,7 +1216,7 @@ impl<'s> Parser<'s> {
             }
             self.bump_after_operand()?;
             let c = self.parse_class_rest_dec(start, decorators)?;
-            if self.ts && self.ts_state.legacy_decorators {
+            if self.ts() && self.ts_state.legacy_decorators {
                 self.ts_legacy_expr_class(&c)?;
             }
             return Ok(Expr::Class(Box::new(c)));
@@ -1380,7 +1380,7 @@ impl<'s> Parser<'s> {
                     Keyword::Class => {
                         self.bump_after_operand()?;
                         let c = self.parse_class_rest(start)?;
-                        if self.ts && self.ts_state.legacy_decorators {
+                        if self.ts() && self.ts_state.legacy_decorators {
                             self.ts_legacy_expr_class(&c)?;
                         }
                         Ok(Expr::Class(Box::new(c)))
@@ -1544,7 +1544,7 @@ impl<'s> Parser<'s> {
         let TokenKind::Ident { name, .. } = tok.kind else {
             unreachable!()
         };
-        if self.ts {
+        if self.ts() {
             self.ts_note_ref(&name);
             // A decorated class's name inside its body (legacy decorators).
             if !self.ts_state.legacy_classes.is_empty() {
@@ -1821,7 +1821,7 @@ impl<'s> Parser<'s> {
         let key_pos = self.cur().span.start;
         let key = self.parse_public_prop_key()?;
         // `m() {}` (and TypeScript's `m<T>() {}`)
-        if self.at(Punct::LParen) || (self.ts && self.at(Punct::Lt)) {
+        if self.at(Punct::LParen) || (self.ts() && self.at(Punct::Lt)) {
             let func = self.parse_method_rest(false, false, start)?;
             return Ok((
                 ObjectMember::Method {
@@ -1859,7 +1859,7 @@ impl<'s> Parser<'s> {
             ));
         }
         let name = name.clone();
-        if self.ts {
+        if self.ts() {
             self.ts_note_ref(&name);
         }
         // Shorthand re-reads the key as an IdentifierReference without going

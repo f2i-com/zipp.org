@@ -77,9 +77,16 @@ python-native-gpu = ["python"]
 # Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
 # `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
 # build is a pure interpreter with no unsafe codegen.
-default = ["jit", "webassembly"]
+default = ["jit", "typescript", "webassembly"]
 # The `WebAssembly` global (see the `wasmi` dependency).
 webassembly = ["dep:wasmi"]
+# TypeScript (and `.jsx`/`.tsx` files), read by the JavaScript parser with
+# their types dropped (`lang/ts`). On by default; off, the language is still
+# listed (a `.ts` file is still recognised as TypeScript) and compiling it is
+# the error, and the parser's TypeScript grammar is left out of the build.
+# zipp-wasm ships it as its own module (the `typescript` variant), so the
+# JavaScript module does not carry it.
+typescript = []
 jit = ["dep:dynasm", "dep:dynasmrt", "regress/rx-jit"]
 regex-linear = ["regress/linear-ascii"]
 # The storage census (`ZIPP_CENSUS`, vm/census.rs): what code, caches, frames,
