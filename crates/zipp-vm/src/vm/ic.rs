@@ -4208,7 +4208,11 @@ impl<'p> Vm<'p> {
     /// The guards of the class-method way of `(func_id, ip)`'s cache that
     /// serves `recv` with `callee`: `(recv_shape, class, ver, epoch)`, for the
     /// class-method lane's memo (`Vm::jit_method_callee_impl`). Read-only.
+    /// Inlined into its one caller: returned through memory, the four words
+    /// were stored one by one and read back with a 16-byte load that
+    /// store-to-load forwarding cannot serve.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(always)]
     pub(crate) fn ic_class_method_guards(
         &self,
         func_id: u32,

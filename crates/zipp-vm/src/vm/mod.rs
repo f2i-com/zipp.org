@@ -243,10 +243,16 @@ impl ActivationRootStack {
 /// frame-free `prior` is also duplicated in `jit_tierc_activation_stack` so GC
 /// can see it while this token lives only in a Rust local. A frame-backed prior
 /// needs no duplicate root: its real interpreter `Frame` remains installed.
+///
+/// The prior state is kept as three words (`TiercActivationState::to_words`):
+/// as the padded struct, the token lived across the native call as a stack
+/// copy that unaligned 8-byte loads read back across its byte and word
+/// stores, which store-to-load forwarding cannot serve (a stall on every
+/// cross call).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TiercActivationToken {
-    prior: TiercActivationState,
+    prior: [u64; 3],
     rooted_prior: bool,
 }
 
@@ -259,6 +265,29 @@ impl TiercActivationState {
         callee: NO_CLOSURE,
         upvals_raw: 0,
     };
+
+    /// The state as three words: `active | frame_free << 8 | closure << 32`,
+    /// `callee`, `upvals_raw`.
+    #[inline(always)]
+    fn to_words(self) -> [u64; 3] {
+        [
+            self.active as u64 | (self.frame_free as u64) << 8 | (self.closure as u64) << 32,
+            self.callee as u64,
+            self.upvals_raw,
+        ]
+    }
+
+    /// The inverse of [`TiercActivationState::to_words`].
+    #[inline(always)]
+    fn from_words(w: [u64; 3]) -> Self {
+        Self {
+            active: w[0] & 1 != 0,
+            frame_free: (w[0] >> 8) & 1 != 0,
+            closure: (w[0] >> 32) as u32,
+            callee: w[1] as u32,
+            upvals_raw: w[2],
+        }
+    }
 }
 
 /// Largest length a HOLE-extending operation materializes in an array's dense

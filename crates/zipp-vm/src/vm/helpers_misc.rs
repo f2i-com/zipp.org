@@ -7237,7 +7237,7 @@ impl<'p> Vm<'p> {
             upvals_raw,
         };
         Some(TiercActivationToken {
-            prior,
+            prior: prior.to_words(),
             rooted_prior,
         })
     }
@@ -7247,15 +7247,12 @@ impl<'p> Vm<'p> {
     /// metering continuation can re-enter the VM.
     #[inline(always)]
     pub(crate) fn leave_tierc_activation(&mut self, token: TiercActivationToken) {
+        let prior = TiercActivationState::from_words(token.prior);
         if token.rooted_prior {
             let rooted = self.jit_tierc_activation_stack.pop();
-            debug_assert_eq!(
-                rooted,
-                Some(token.prior),
-                "Tier-C activation-root stack imbalance"
-            );
+            debug_assert_eq!(rooted, Some(prior), "Tier-C activation-root stack imbalance");
         }
-        self.jit_tierc_activation = token.prior;
+        self.jit_tierc_activation = prior;
     }
 }
 
@@ -7357,6 +7354,32 @@ mod tierc_activation_root_tests {
         }
         assert_eq!(vm.jit_tierc_activation, TiercActivationState::EMPTY);
         assert!(vm.jit_tierc_activation_stack.is_empty());
+    }
+
+    #[test]
+    fn token_words_carry_every_field() {
+        let states = [
+            TiercActivationState::EMPTY,
+            state(0, 0, false),
+            state(u32::MAX - 1, 7, true),
+            TiercActivationState {
+                active: false,
+                frame_free: true,
+                closure: 0x8000_0001,
+                callee: u32::MAX,
+                upvals_raw: 0xFFFF_8000_1234_5678,
+            },
+        ];
+        for s in states {
+            assert_eq!(TiercActivationState::from_words(s.to_words()), s);
+        }
+        // A restore through a token gives back exactly the state it replaced.
+        let program = fixture();
+        let mut vm = Vm::new(&program);
+        vm.jit_tierc_activation = states[3];
+        let token = vm.enter_tierc_activation(5, 6, true, 0x40).expect("entry");
+        vm.leave_tierc_activation(token);
+        assert_eq!(vm.jit_tierc_activation, states[3]);
     }
 }
 
