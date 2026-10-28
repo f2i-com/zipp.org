@@ -96,6 +96,49 @@ fn switch_tdz_names(cases: &[ast::SwitchCase]) -> rustc_hash::FxHashSet<String> 
     early
 }
 
+/// Whether a for-in/of head expression can make nothing that keeps a view of
+/// the loop's lexical names while they are in their dead zone: no function,
+/// arrow or class, and no direct `eval`. Such a head needs no runtime TDZ
+/// cells, since a direct read of one of the names there is the compile-time
+/// ReferenceError `param_tdz` emits either way. Conservative: any shape not
+/// listed keeps the cells.
+fn head_captures_nothing(e: &ast::Expr) -> bool {
+    use ast::Expr as E;
+    let args_ok = |args: &[ast::Arg]| {
+        args.iter()
+            .all(|a| matches!(a, ast::Arg::Expr(x) if head_captures_nothing(x)))
+    };
+    match e {
+        E::Ident(_) | E::This | E::Null | E::Bool(_) | E::Num(_) | E::Str(_) => true,
+        E::Member(m) => {
+            head_captures_nothing(&m.object)
+                && match &m.prop {
+                    ast::MemberProp::Ident(_) => true,
+                    ast::MemberProp::Computed(k) => head_captures_nothing(k),
+                    ast::MemberProp::Private(_) => false,
+                }
+        }
+        E::Call(c) => {
+            !matches!(&c.callee, E::Ident(id) if &**id == "eval")
+                && head_captures_nothing(&c.callee)
+                && args_ok(&c.args)
+        }
+        E::New { callee, args, .. } => head_captures_nothing(callee) && args_ok(args),
+        E::Array(elems, _) => elems.iter().all(|el| match el {
+            None => true,
+            Some(ast::ArrayElem::Expr(x)) => head_captures_nothing(x),
+            Some(ast::ArrayElem::Spread(_)) => false,
+        }),
+        E::Binary { left, right, .. } | E::Logical { left, right, .. } => {
+            head_captures_nothing(left) && head_captures_nothing(right)
+        }
+        E::Cond { test, cons, alt } => {
+            head_captures_nothing(test) && head_captures_nothing(cons) && head_captures_nothing(alt)
+        }
+        _ => false,
+    }
+}
+
 impl<'a> FnCompiler<'a> {
     /// Compile an `if`/`else` BRANCH. Annex B B.3.3: a bare FunctionDeclaration
     /// used directly as a branch (not inside a `{ }` block) is block-scoped to
@@ -1210,7 +1253,9 @@ impl<'a> FnCompiler<'a> {
         // in `right` captures an uninitialized cell for each head name and
         // throws ReferenceError when it later reads it (the head env binding
         // is never initialized), instead of capturing the outer binding.
-        let head_tdz_scope = !tdz_added.is_empty();
+        // Only for a `right` that can capture (`head_captures_nothing`): the
+        // cell was an allocation at every entry to the loop.
+        let head_tdz_scope = !tdz_added.is_empty() && !head_captures_nothing(right);
         if head_tdz_scope {
             self.push_scope();
             for n in &tdz_added {
@@ -1706,7 +1751,8 @@ impl<'a> FnCompiler<'a> {
         // in `right` captures an uninitialized cell for each head name and
         // throws ReferenceError when it later reads it (the head env binding
         // is never initialized), instead of capturing the outer binding.
-        let head_tdz_scope = !tdz_added.is_empty();
+        // Only for a `right` that can capture (`head_captures_nothing`).
+        let head_tdz_scope = !tdz_added.is_empty() && !head_captures_nothing(right);
         if head_tdz_scope {
             self.push_scope();
             for n in &tdz_added {
