@@ -5531,6 +5531,14 @@ pub(crate) fn compile_proto_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                // A dense Array's length through its array mirror, ahead of the
+                // eight-way probe it always misses and the helper after it.
+                if crate::codegen::quick_len_enabled()
+                    && crate::codegen::arr_len_mirror_enabled()
+                    && proto.string_constants.get(name as usize).is_some_and(|s| s == "length")
+                {
+                    emit_arr_mirror_len(&mut ops, obj, dst, cont);
+                }
                 emit_ic_probe(
                     &mut ops,
                     IcProbe::Get { dst },

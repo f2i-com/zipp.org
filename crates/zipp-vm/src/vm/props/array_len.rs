@@ -83,6 +83,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn array_grow_js_len(&mut self, arr_idx: u32, i: usize) {
         if i + 1 > self.js_array_len(arr_idx) {
             self.array_js_len.insert(arr_idx, (i + 1) as u32);
+            // The JS length leaves the dense store's: an emitted `.length`
+            // must not read it from the array mirror any longer.
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.clear_arr_mirror(arr_idx);
         }
     }
 

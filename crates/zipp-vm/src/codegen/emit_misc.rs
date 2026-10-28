@@ -1264,6 +1264,50 @@ pub(crate) fn emit_arr_mirror_get(
     );
 }
 
+/// `dst = obj.length` for a dense Array through its array mirror entry, with
+/// no call: heap tag, the mirror's bounds, a live entry (a cleared one is
+/// `[0, 0]`; a live one's base is never null, an empty Vec's included), and
+/// the entry's length, boxed as an Int. A live entry is the dense store of an
+/// Array with no element overlay, no arguments mapping and no virtual length
+/// (`jit_get_index` repairs only those, and every write of a virtual length
+/// clears the entry), so its length is the JS length. Jumps to `done` with
+/// `dst` written; anything else falls through with rax, rcx, r9 and r10
+/// clobbered, which the property probe after it reloads or the helpers it
+/// leads to clobber anyway.
+pub(crate) fn emit_arr_mirror_len(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    dst: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+    let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => miss
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + arr_len]
+        ; jae => miss
+        ; mov r9, [rdi + arr_raw]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; cmp QWORD [r9], 0
+        ; je => miss                          // no live entry
+        ; mov rcx, [r9 + 8]
+        ; cmp rcx, i32::MAX
+        ; ja => miss                          // not an Int
+        ; mov rax, QWORD Value::int(0).bits() as i64
+        ; or rax, rcx
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => miss
+    );
+}
+
 /// Emit a region op's bail block: the success path skips it; the block records
 /// the resume ip into `[rsi]` and jumps to the shared epilogue (which restores
 /// the 4-push/40-byte frame). Unlike the function JIT no result is set — a

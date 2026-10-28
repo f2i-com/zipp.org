@@ -11198,9 +11198,20 @@ impl Heap {
         &mut self.objs[idx as usize]
     }
 
+    /// Clear slot `idx`'s array mirror entry without touching the store: the
+    /// Array's JS length is leaving its dense store's (a virtual length), which
+    /// an emitted `.length` read from the entry would miss.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn clear_arr_mirror(&mut self, idx: u32) {
+        if let Some(e) = self.arr_mirror.get_mut(idx as usize) {
+            *e = [0, 0];
+        }
+    }
+
     /// Settle slot `idx`'s array mirror from its live dense store (see the
     /// field). The caller has proved the store answers element reads alone:
-    /// no side-table overlay, no mapped `arguments`.
+    /// no side-table overlay, no mapped `arguments`, no virtual length.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn repair_arr_mirror(&mut self, idx: u32) {

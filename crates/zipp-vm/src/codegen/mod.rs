@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_ARR_LEN_MIRROR=1` reads a dense Array's `.length` in
+    /// compiled code through the property probe and `jit_quick_len` again,
+    /// not through its array mirror entry (`emit_arr_mirror_len`).
+    fn arr_len_mirror_enabled() = "ZIPP_NO_ARR_LEN_MIRROR"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CROSS3_SELF_GLOBAL=1` keeps a Tier C body's self call
     /// through its own global name off the emitted self arm.
     fn cross3_self_global_enabled() = "ZIPP_NO_CROSS3_SELF_GLOBAL"

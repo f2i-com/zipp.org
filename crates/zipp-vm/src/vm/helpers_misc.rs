@@ -1977,9 +1977,12 @@ pub(crate) extern "win64" fn jit_get_index(
                     && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
                 {
                     // The store answered alone: let emitted reads of this
-                    // array answer from it too (`Heap::arr_mirror`).
+                    // array answer from it too (`Heap::arr_mirror`). Not an
+                    // array with a virtual length: an emitted `.length` reads
+                    // a live entry's length as the JS length
+                    // (`emit_arr_mirror_len`).
                     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                    {
+                    if vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&aidx) {
                         // SAFETY: the shared view above is not used again.
                         let vm = unsafe { &mut *(raw as *mut Vm) };
                         vm.heap.repair_arr_mirror(aidx);

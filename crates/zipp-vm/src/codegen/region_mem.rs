@@ -2018,6 +2018,11 @@ pub(crate) fn compile_region_mem(
                         ; => ql_generic
                     );
                 }
+                // A dense Array's length through its array mirror, ahead of the
+                // eight-way probe it always misses and the helper after it.
+                if quick_length && crate::codegen::arr_len_mirror_enabled() {
+                    emit_arr_mirror_len(&mut ops, obj, dst, cont);
+                }
                 emit_ic_probe(
                     &mut ops,
                     IcProbe::Get { dst },
