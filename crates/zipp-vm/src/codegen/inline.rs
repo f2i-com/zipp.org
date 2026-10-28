@@ -682,27 +682,51 @@ pub(crate) fn emit_inline_leaf_call(
     // committed before the lane's exit steps). `None` keeps the generic
     // emission below byte-identical.
     if let Some(lane) = &plan.typed_lane {
-        emit_typed_lane(ops, lane, plan.cell_get, plan.cell_set, dst, fallback);
+        if !lane_boxed_fallback_enabled() {
+            emit_typed_lane(ops, lane, plan.cell_get, plan.cell_set, dst, fallback);
+            dynasm!(ops
+                ; jmp => done
+                ; => fallback
+            );
+            let helper_bail = ops.new_dynamic_label();
+            emit_region_call_ic(
+                ops,
+                call_ip,
+                helper_bail,
+                epilogue,
+                helper,
+                packed_fip,
+                packed_args,
+                argc,
+                dst,
+                refetch,
+                ta_refetch,
+            );
+            dynasm!(ops ; => done);
+            return;
+        }
+        // A lane guard that misses takes the boxed expansion below, which
+        // serves any representation, not the real call. The lane is typed by
+        // the arguments the planner saw: `s = plain(s, 0.5)` with `s` the Int
+        // 0 at plan time got Int loads, and every later call, `s` a double,
+        // missed into the call helper (636 instructions an iteration, against
+        // 90 for the boxed body alone). Nothing commits before the lane's
+        // exit steps, so its miss is a clean start for the boxed body; the
+        // global-route check the lane made its first step is the boxed body's
+        // to make again.
+        let lane_miss = ops.new_dynamic_label();
+        emit_typed_lane(ops, lane, plan.cell_get, plan.cell_set, dst, lane_miss);
         dynasm!(ops
             ; jmp => done
-            ; => fallback
+            ; => lane_miss
         );
-        let helper_bail = ops.new_dynamic_label();
-        emit_region_call_ic(
-            ops,
-            call_ip,
-            helper_bail,
-            epilogue,
-            helper,
-            packed_fip,
-            packed_args,
-            argc,
-            dst,
-            refetch,
-            ta_refetch,
-        );
-        dynasm!(ops ; => done);
-        return;
+        if let Some(epoch) = plan.direct_global_route_epoch {
+            let epoch_off = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
+            dynasm!(ops
+                ; cmp DWORD [rdi + epoch_off], epoch as i32
+                ; jne => fallback
+            );
+        }
     }
     dynasm!(ops
         // ── arg binding ── reg 0 (callee `this`) = undefined; positional args

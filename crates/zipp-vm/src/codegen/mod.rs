@@ -2016,6 +2016,12 @@ pub(crate) fn int_computed_leaf_enabled() -> bool {
     }
 }
 
+env_off_switch!(
+    /// `ZIPP_NO_LANE_BOXED_FALLBACK=1` sends a leaf splice's typed-lane guard
+    /// miss straight to the real call again instead of the boxed expansion.
+    fn lane_boxed_fallback_enabled() = "ZIPP_NO_LANE_BOXED_FALLBACK"
+);
+
 /// Typed splice lanes — `ZIPP_NO_TYPED_SPLICE=1` pins every leaf plan's
 /// `typed_lane` to `None` (the boxed per-op splice loop, byte-identical to
 /// the prior emission). Read at plan time only.
