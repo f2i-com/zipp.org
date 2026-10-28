@@ -4184,6 +4184,18 @@ impl<'p> Vm<'p> {
     /// inline this call (it keeps the per-call helper). Performs NO fill and NO
     /// side effect (unlike `ic_call`), so it's safe to call at compile time.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// Whether the site's cache holds at least one way and every way is a
+    /// class method (a profitability signal: nothing is trusted from it).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_site_only_class_methods(&self, func_id: u32, ip: usize) -> bool {
+        self.ic_site(func_id, ip).is_some_and(|site| {
+            site.n > 0
+                && site.entries[..site.n as usize]
+                    .iter()
+                    .all(|e| matches!(e, IcEntry::ClassMethod { .. }))
+        })
+    }
+
     pub(crate) fn ic_call_mono(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
         let site = self.ic_site(func_id, ip)?;
         if site.n != 1 {

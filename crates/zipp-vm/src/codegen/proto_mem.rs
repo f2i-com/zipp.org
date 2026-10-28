@@ -5786,7 +5786,8 @@ pub(crate) fn compile_proto_mem(
                             dst,
                             arg_base,
                             refetch,
-                            method_own_slot_direct,
+                            method_own_slot_direct
+                                && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
                         );
                     }
                 } else if key == "toUpperCase" && argc == 0 && tierc_string_upper_enabled() {
@@ -5960,7 +5961,8 @@ pub(crate) fn compile_proto_mem(
                         dst,
                         arg_base,
                         refetch,
-                        method_own_slot_direct,
+                        method_own_slot_direct
+                            && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
                     );
                     if let Some(done) = pop_done {
                         dynasm!(ops ; => done);
@@ -5984,7 +5986,8 @@ pub(crate) fn compile_proto_mem(
                         dst,
                         arg_base,
                         refetch,
-                        method_own_slot_direct,
+                        method_own_slot_direct
+                            && !cross_plan.get(&ip).is_some_and(|site| site.class_method),
                     );
                     dynasm!(ops ; => lane_done);
                 }

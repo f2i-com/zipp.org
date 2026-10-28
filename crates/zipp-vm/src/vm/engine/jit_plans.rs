@@ -2314,6 +2314,7 @@ impl<'p> Vm<'p> {
                     same_proto2,
                     cross3,
                     cross3m: None,
+                    class_method: false,
                 },
             );
         }
@@ -2430,6 +2431,14 @@ impl<'p> Vm<'p> {
                         .or_insert_with(crate::codegen::CrossCallSitePlan::default)
                         .cross3m = Some(c3m);
                 }
+            }
+        }
+        // CallMethod sites that have only ever resolved to class methods.
+        for (ip, instr) in caller.code.iter().enumerate() {
+            if matches!(instr, Instr::CallMethod { .. }) && self.ic_site_only_class_methods(func_id, ip) {
+                plan.entry(ip)
+                    .or_insert_with(crate::codegen::CrossCallSitePlan::default)
+                    .class_method = true;
             }
         }
 
