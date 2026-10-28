@@ -617,6 +617,52 @@ impl<'p> Vm<'p> {
         self.dataview_get_leaf(view_idx, method, position, little_endian)
     }
 
+    /// A `view.name(args…)` call with the `argc` arguments at `arg_base` of
+    /// the window at `base`, through the pristine DataView lanes in the order
+    /// the interpreter's `CallMethod` arm tries them: the numeric getters,
+    /// the numeric setters, the BigInt accessors. For compiled code's method
+    /// fallback, which otherwise reached them through the generic builtin
+    /// dispatch. `Ok(None)`: nothing observable happened.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn dataview_call_lanes(
+        &mut self,
+        recv: Value,
+        key: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if !recv.is_heap() || !matches!(self.heap.get(recv.heap_index()), HeapObj::DataView { .. }) {
+            return Ok(None);
+        }
+        let view = recv.heap_index();
+        let arg = |vm: &Self, i: u16| {
+            if argc > i {
+                vm.get(base, arg_base + i)
+            } else {
+                Value::UNDEFINED
+            }
+        };
+        let position = arg(self, 0);
+        if let Some(v) = self.dataview_interp_get_fast(view, key, position, arg(self, 1))? {
+            return Ok(Some(v));
+        }
+        if argc >= 2 && key.as_bytes().first() == Some(&b's') {
+            let (value, little_endian) = (arg(self, 1), arg(self, 2));
+            if self
+                .dataview_interp_set_fast(view, key, position, value, little_endian)?
+                .is_some()
+            {
+                return Ok(Some(Value::UNDEFINED));
+            }
+        }
+        if key.len() > 6 && key.as_bytes()[3..6] == *b"Big" {
+            let (a1, a2) = (arg(self, 1), arg(self, 2));
+            return self.dataview_interp_big_fast(view, key, position, a1, a2);
+        }
+        Ok(None)
+    }
+
     /// `dataview_interp_get_fast`'s twin for the pristine numeric setters:
     /// `view.setUint32(pos, v, le)` with a non-negative integral `pos` and a
     /// Number `v`, so that neither ToIndex nor ToNumber can run code, on a

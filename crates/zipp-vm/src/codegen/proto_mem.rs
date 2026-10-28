@@ -1463,7 +1463,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     && tierc_random_method_enabled()
                     && matches!(key, Some("random")))
                     || (tierc_coll_mutate_enabled()
-                        && matches!((key, argc), (Some("set"), 2) | (Some("clear"), 0)))
+                        && matches!(
+                            (key, argc),
+                            (Some("set"), 2) | (Some("clear"), 0) | (Some("add"), 1) | (Some("delete"), 1)
+                        ))
                     || (argc == 0
                         && tierc_string_upper_enabled()
                         && matches!(key, Some("toUpperCase")))
@@ -6208,29 +6211,63 @@ pub(crate) fn compile_proto_mem(
                     }
                     lane = true;
                 } else if tierc_coll_mutate_enabled()
-                    && matches!((key, argc), ("set", 2) | ("clear", 0))
+                    && matches!(
+                        (key, argc),
+                        ("set", 2) | ("clear", 0) | ("add", 1) | ("delete", 1)
+                    )
                 {
-                    let op = i32::from(key == "clear");
-                    if argc == 2 {
-                        dynasm!(ops
+                    // The region arm's ops: 0 = Map.set, 1 = Map.clear,
+                    // 2 = Set.add, 3 = Map.delete, retried as 4 = Set.delete
+                    // when the helper's kind proof rejects a Set.
+                    let op: i32 = match key {
+                        "set" => 0,
+                        "clear" => 1,
+                        "add" => 2,
+                        _ => 3,
+                    };
+                    let load_args = |ops: &mut dynasmrt::x64::Assembler| match argc {
+                        2 => dynasm!(ops
                             ; mov r8, [rbx + dreg(arg_base)]
                             ; mov r9, [rbx + dreg(arg_base + 1)]
-                        );
-                    } else {
-                        dynasm!(ops
+                        ),
+                        1 => dynasm!(ops
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; xor r9d, r9d
+                        ),
+                        _ => dynasm!(ops
                             ; xor r8d, r8d
                             ; xor r9d, r9d
-                        );
-                    }
+                        ),
+                    };
+                    let mutate_done = ops.new_dynamic_label();
+                    load_args(&mut ops);
                     dynasm!(ops
                         ; mov QWORD [rsp + 32], op
                         ; mov rcx, rdi                        // vm
-                        ; mov rdx, [rbx + dreg(obj)]          // Map receiver bits
+                        ; mov rdx, [rbx + dreg(obj)]          // collection receiver bits
                         ; mov rax, QWORD heap.coll_mutate as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => general                          // own/proto/realm override
+                        ; jne => mutate_done
+                    );
+                    if op == 3 {
+                        load_args(&mut ops);
+                        dynasm!(ops
+                            ; mov QWORD [rsp + 32], 4
+                            ; mov rcx, rdi
+                            ; mov rdx, [rbx + dreg(obj)]
+                            ; mov rax, QWORD heap.coll_mutate as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general                      // own/proto/realm override
+                        );
+                    } else {
+                        dynasm!(ops ; jmp => general);           // own/proto/realm override
+                    }
+                    dynasm!(ops
+                        ; => mutate_done
                         ; mov [rbx + dreg(dst)], rax
                     );
                     lane = true;

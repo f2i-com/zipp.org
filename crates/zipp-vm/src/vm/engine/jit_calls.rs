@@ -2413,6 +2413,12 @@ impl<'p> Vm<'p> {
                 };
             }
         }
+        // A pristine DataView accessor, as the interpreter's arm serves it.
+        match self.dataview_call_lanes(recv, key, base, arg_base, argc) {
+            Ok(Some(v)) => return v.bits(),
+            Ok(None) => {}
+            Err(t) => return self.jit_thrown_to_sentinel(t),
+        }
         match self.try_builtin_method(recv, key, base, arg_base, argc) {
             Ok(Some(v)) => return v.bits(),
             Ok(None) => {}
