@@ -372,6 +372,44 @@ pub(crate) fn load_num_xmm(
     );
 }
 
+/// `a % b` for two Ints, a dividend of at least 0 and a divisor above 0: one
+/// 32-bit `idiv`, and the remainder an Int (below the divisor, and never -0,
+/// as the dividend is not negative). Any other pair goes to `slow`, the
+/// arm's integer-valued double path, which owns the negative dividend's -0,
+/// `% 0`, `% -1` and fractions. `k % 10` converted both operands to doubles
+/// and back to check they were integers, a chain of conversions ahead of
+/// the division on every iteration. Off under `ZIPP_NO_INT_MOD=1`.
+pub(crate) fn emit_int_mod_fast(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    b: u16,
+    slow: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) {
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rcx, [rbx + dreg(b)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => slow
+        ; mov r10, rcx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => slow
+        ; test eax, eax
+        ; js => slow
+        ; test ecx, ecx
+        ; jle => slow
+        ; cdq
+        ; idiv ecx
+        ; mov eax, edx
+    );
+    box_eax(ops, dst);
+    dynasm!(ops ; jmp => done);
+}
+
 /// Store `xmm0` (an f64 result) into `regs[dst]` as a double `Value`.
 pub(crate) fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     dynasm!(ops

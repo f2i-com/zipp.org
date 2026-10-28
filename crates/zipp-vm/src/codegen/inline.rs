@@ -932,6 +932,11 @@ pub(crate) fn emit_inline_leaf_call(
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
                 let rem_nz = ops.new_dynamic_label();
+                if crate::codegen::int_mod_enabled() {
+                    let dbl_mod = ops.new_dynamic_label();
+                    emit_int_mod_fast(ops, rg(d), rg(a), rg(b), dbl_mod, mod_done);
+                    dynasm!(ops ; => dbl_mod);
+                }
                 load_num_xmm(ops, rg(a), 0, bail);
                 load_num_xmm(ops, rg(b), 1, bail);
                 dynasm!(ops
@@ -1540,6 +1545,11 @@ pub(crate) fn emit_mi_body(
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
                 let rem_nz = ops.new_dynamic_label();
+                if crate::codegen::int_mod_enabled() {
+                    let dbl_mod = ops.new_dynamic_label();
+                    emit_int_mod_fast(ops, rg(d), rg(a), rg(b), dbl_mod, mod_done);
+                    dynasm!(ops ; => dbl_mod);
+                }
                 load_num_xmm(ops, rg(a), 0, bail);
                 load_num_xmm(ops, rg(b), 1, bail);
                 dynasm!(ops

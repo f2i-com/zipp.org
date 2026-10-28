@@ -577,6 +577,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_INT_MOD=1` drops the memory paths' Int `Mod` lane
+    /// (`emit_int_mod_fast`): every `a % b` converts both operands to doubles
+    /// and back around its `idiv`.
+    fn int_mod_enabled() = "ZIPP_NO_INT_MOD"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_ARR_SET_MIRROR=1` sends every compiled `a[i] = v` through
     /// `jit_set_index` again, without the overwrite of a present element
     /// through the array mirror (`emit_arr_mirror_set`).

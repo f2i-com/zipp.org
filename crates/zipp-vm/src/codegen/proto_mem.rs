@@ -5052,11 +5052,16 @@ pub(crate) fn compile_proto_mem(
                 // path.  Every unsupported case exits at this exact ip before
                 // observable coercion: the interpreter owns fractional/zero,
                 // BigInt and object-ToNumeric semantics.
-                load_num_xmm(&mut ops, a, 0, bail);
-                load_num_xmm(&mut ops, b, 1, bail);
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
                 let rem_signed = ops.new_dynamic_label();
+                if crate::codegen::int_mod_enabled() {
+                    let dbl_mod = ops.new_dynamic_label();
+                    emit_int_mod_fast(&mut ops, dst, a, b, dbl_mod, mod_done);
+                    dynasm!(ops ; => dbl_mod);
+                }
+                load_num_xmm(&mut ops, a, 0, bail);
+                load_num_xmm(&mut ops, b, 1, bail);
                 dynasm!(ops
                     ; cvttsd2si rax, xmm0
                     ; cvttsd2si rcx, xmm1

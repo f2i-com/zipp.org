@@ -949,11 +949,16 @@ pub(crate) fn compile_region_mem(
                 // remainder takes the dividend's sign — JS `%` for integers).
                 // Non-integer operands or `% 0` bail to the interpreter (true fmod
                 // / NaN). xmm2/rax/rcx/rdx are scratch in this memory path.
-                load_num_xmm(&mut ops, a, 0, bail); // xmm0 = a
-                load_num_xmm(&mut ops, b, 1, bail); // xmm1 = b
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
                 let rem_signed = ops.new_dynamic_label();
+                if crate::codegen::int_mod_enabled() {
+                    let dbl_mod = ops.new_dynamic_label();
+                    emit_int_mod_fast(&mut ops, dst, a, b, dbl_mod, mod_done);
+                    dynasm!(ops ; => dbl_mod);
+                }
+                load_num_xmm(&mut ops, a, 0, bail); // xmm0 = a
+                load_num_xmm(&mut ops, b, 1, bail); // xmm1 = b
                 dynasm!(ops
                     ; cvttsd2si rax, xmm0            // a → i64 (trunc toward 0)
                     ; cvttsd2si rcx, xmm1            // b → i64
