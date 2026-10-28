@@ -1742,7 +1742,96 @@ pub(crate) fn fmt_f64_into(out: &mut String, n: f64) {
     if fmt_binary_fraction_into(out, neg, abs) {
         return;
     }
+    if fmt_short_decimal_into(out, neg, abs) {
+        return;
+    }
     fmt_f64_general_into(out, neg, abs);
+}
+
+/// Print a non-integral `abs` in `[1e-4, 1e15)` whose shortest decimal is
+/// short — a price, a ratio, `0.1` — without the formatting machinery.
+/// Returns false, writing nothing, for anything else.
+///
+/// At `d` fraction digits, `N / 10^d` is a candidate for each integer `N`
+/// near `m = abs × 10^d`. With `N < 2^53` and `10^d` both exact,
+/// `N as f64 / 10^d` is the correctly rounded quotient — exactly what
+/// reading the decimal back gives — so `N` round-trips iff that equals
+/// `abs`. While `m < 2^51`, `10^d` times an ulp of `abs` is under a half, so
+/// at most one `N` round-trips, within a quarter of the exact product and so
+/// among the four integers around `m` (itself within half an ulp of that
+/// product). So one try at the largest such `d` decides it: the shortest
+/// round-tripping decimal, scaled to `d` digits, is a round-tripping
+/// candidate there, hence THE candidate, and its trailing zeros come off to
+/// give the shortest digits Number::toString prints. No candidate means the
+/// shortest needs more digits (sixteen or so significant ones), which the
+/// general path handles.
+///
+/// The general path ran the shortest-digits search through `{:e}` into a
+/// fresh `String`, split it, collected the digits into another and probed
+/// for a tie: most of the number formatting in JSON.stringify of prices.
+fn fmt_short_decimal_into(out: &mut String, neg: bool, abs: f64) -> bool {
+    const POW10: [f64; 16] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+    ];
+    const LIMIT: f64 = 2_251_799_813_685_248.0; // 2^51
+    if !(1e-4..1e15).contains(&abs) {
+        return false;
+    }
+    let mut d = 15usize;
+    while d > 0 && !(abs * POW10[d] < LIMIT) {
+        d -= 1;
+    }
+    if d == 0 {
+        return false;
+    }
+    let p = POW10[d];
+    let m = abs * p;
+    // Nearly always the nearest integer; the other three only when not.
+    let near = m.round() as u64;
+    let base = (m.floor() as u64).saturating_sub(1);
+    let Some(mut n) = std::iter::once(near)
+        .chain((base..base + 4).filter(|&n| n != near))
+        .find(|&n| n as f64 / p == abs)
+    else {
+        return false;
+    };
+    while n % 10 == 0 && d > 0 {
+        n /= 10;
+        d -= 1;
+    }
+    if d == 0 {
+        // Integral after all: the caller's integer branch prints those.
+        return false;
+    }
+    // Digits backward: `d` fraction digits (leading zeros included), the
+    // point, the whole part, the sign. `n < 2^51` has at most 16 digits, and
+    // below 1 the whole part is the one `0`: at most 19 bytes.
+    let mut buf = [0u8; 24];
+    let mut at = buf.len();
+    let scale = 10u64.pow(d as u32);
+    let mut frac = n % scale;
+    for _ in 0..d {
+        at -= 1;
+        buf[at] = b'0' + (frac % 10) as u8;
+        frac /= 10;
+    }
+    at -= 1;
+    buf[at] = b'.';
+    let mut w = n / scale;
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (w % 10) as u8;
+        w /= 10;
+        if w == 0 {
+            break;
+        }
+    }
+    if neg {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    out.push_str(std::str::from_utf8(&buf[at..]).unwrap());
+    true
 }
 
 /// The general case of [`fmt_f64_into`]: a finite, non-zero, non-integral
@@ -1786,6 +1875,56 @@ fn fmt_f64_general_into(out: &mut String, neg: bool, abs: f64) {
         out.push(if e2 >= 0 { '+' } else { '-' });
         use std::fmt::Write;
         let _ = write!(out, "{}", e2.abs());
+    }
+}
+
+#[cfg(test)]
+mod fmt_short_decimal_tests {
+    use super::{fmt_f64_general_into, fmt_short_decimal_into};
+
+    /// Whenever the short-decimal path prints, it prints what the general
+    /// path does; and it takes the common short decimals.
+    #[test]
+    fn short_decimals_match_the_general_path() {
+        let mut taken = 0usize;
+        let mut check = |x: f64| {
+            for v in [x, -x] {
+                if v == 0.0 || !v.is_finite() || v.fract() == 0.0 {
+                    continue;
+                }
+                let mut fast = String::new();
+                if fmt_short_decimal_into(&mut fast, v < 0.0, v.abs()) {
+                    let mut slow = String::new();
+                    fmt_f64_general_into(&mut slow, v < 0.0, v.abs());
+                    assert_eq!(fast, slow, "for {v:e}");
+                    taken += 1;
+                }
+            }
+        };
+        for k in 1..300_000u64 {
+            check(k as f64 / 100.0);
+            check(k as f64 / 1000.0);
+            check(k as f64 / 7.0);
+            check(k as f64 * 0.1);
+        }
+        for x in [0.1 + 0.2, 1.0 / 3.0, std::f64::consts::PI, 1e-4, 0.0001234, 99999999999999.9, 123456789012.345] {
+            check(x);
+        }
+        // Pseudo-random doubles across the range, and their short roundings.
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..300_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let x = f64::from_bits((s >> 12) | 0x3F00_0000_0000_0000) * 2f64.powi((s % 60) as i32 - 20);
+            check(x);
+            check((x * 1e4).round() / 1e4);
+            check((x * 1e2).round() / 1e2);
+        }
+        assert!(taken > 1_000_000, "the path took only {taken}");
+        let mut out = String::new();
+        assert!(fmt_short_decimal_into(&mut out, false, 42.17));
+        assert_eq!(out, "42.17");
     }
 }
 
