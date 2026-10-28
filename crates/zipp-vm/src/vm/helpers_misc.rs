@@ -5428,6 +5428,59 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const JIT_SHAPE_SLOT_MAX: usize = 1 << 16;
 
+/// One way of `Vm::jit_leaf_reads`: an inlined leaf body's `GetProp` with
+/// the key `packed` (`jit_get_prop_leaf`'s) last found its key as the own
+/// data property in `slot` of a receiver of hidden shape `shape`. An empty
+/// way's `packed` is `u64::MAX`, which no key packs to (a function id and a
+/// string index both below `u32::MAX`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct LeafRead {
+    packed: u64,
+    shape: u32,
+    slot: u32,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Default for LeafRead {
+    fn default() -> Self {
+        LeafRead {
+            packed: u64::MAX,
+            shape: crate::shape::DICT,
+            slot: 0,
+        }
+    }
+}
+
+/// Ways of `Vm::jit_leaf_reads` (16 bytes each, allocated at the first fill).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const LEAF_READ_WAYS: usize = 1024;
+
+/// The way of `Vm::jit_leaf_reads` that holds the key `packed`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn leaf_read_way(packed: u64) -> usize {
+    (packed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize & (LEAF_READ_WAYS - 1)
+}
+
+/// `ZIPP_NO_LEAF_READ_MEMO=1` resolves every inlined leaf body's property
+/// read by its key again (`jit_get_prop_leaf`), as before the memo.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn leaf_read_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_LEAF_READ_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Win64 helper: a SITE-FREE named property read, for a `GetProp` inside an
 /// INLINED LEAF BODY.
 ///
@@ -5467,9 +5520,24 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
     }
     // SAFETY: exclusive view; the running region holds no conflicting borrow.
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = obj.heap_index();
+    // The slot this key was last read at, for a receiver of the same shape:
+    // a shape fixes its keys and their attributes, so the slot holds the
+    // same own data property. Ahead of resolving the key's string and
+    // scanning the receiver's keys for it, which was three quarters of a
+    // loop calling `(a, o) => a.x * o.x + a.y * o.y + a.z * o.z`.
+    let way = leaf_read_way(packed);
+    if let Some(m) = vm.jit_leaf_reads.get(way) {
+        if m.packed == packed && vm.deferred_ns_state.is_empty() && vm.ic_obj_ok(idx) {
+            if let HeapObj::Object(map) = vm.heap.get(idx) {
+                if map.shape() == m.shape {
+                    return map.val_at(m.slot as usize).bits();
+                }
+            }
+        }
+    }
     let func_id = (packed >> 32) as u32;
     let name_idx = packed as u32;
-    let idx = obj.heap_index();
     // `vm.func`, not `program.functions[..]` — the callee can be an eval function
     // (the M1.3 lesson).
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
@@ -5488,7 +5556,18 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                 if map.attr_at(s).accessor {
                     return crate::codegen::SELF_CALL_DEOPT; // getter runs user code
                 }
-                return map.val_at(s).bits();
+                let (bits, shape) = (map.val_at(s).bits(), map.shape());
+                if shape != crate::shape::DICT && leaf_read_memo_enabled() {
+                    if vm.jit_leaf_reads.is_empty() {
+                        vm.jit_leaf_reads = vec![LeafRead::default(); LEAF_READ_WAYS].into_boxed_slice();
+                    }
+                    vm.jit_leaf_reads[way] = LeafRead {
+                        packed,
+                        shape,
+                        slot: s as u32,
+                    };
+                }
+                return bits;
             }
             // Not own. Walk a PROVABLY clean prototype chain so a legitimately
             // inherited read (or a provably absent one) does not deopt on every

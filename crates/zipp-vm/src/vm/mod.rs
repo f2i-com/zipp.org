@@ -2029,6 +2029,11 @@ pub struct Vm<'p> {
     /// came to the miss helper. Pure memo: every hit rechecks it live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_class_reads: Vec<ClassRead>,
+    /// The own data slot an inlined leaf body's `GetProp` last read, by its
+    /// `(callee fid, name)` key, direct-mapped (`helpers_misc::LeafRead`).
+    /// Pure memo: every hit rechecks the receiver's shape live.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_leaf_reads: Box<[LeafRead]>,
     /// Per constructor body: whether it only stores its arguments and
     /// constants into `this`, and the proof of the last receiver a compiled
     /// `new` answered that way (`engine::ctor_store`).
