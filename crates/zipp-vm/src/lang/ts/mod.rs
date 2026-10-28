@@ -479,16 +479,20 @@ pub fn run_file(path: &Path) -> Result<crate::Outcome, String> {
     let module = match ext {
         "mts" => true,
         "cts" => false,
-        _ => looks_like_module(&src) || jsx_needs_module(&config),
+        _ => jsx_needs_module(&config),
     };
     let name = std::path::absolute(path).unwrap_or_else(|_| path.into());
     let name = name.to_string_lossy();
     if !module {
+        // A script unless it does not parse as one, as tsc decides: an
+        // `import` or `export` at the top level is a syntax error in a
+        // script, while one inside a `namespace` (`export const x`, which
+        // the text scan takes for a module's) is the namespace's own.
         match parse_script(&src, true, config) {
             Ok(ast) => return run_script(&src, ast, path, &name),
-            // A script that does not parse may be a module the scan missed.
+            // Not a script: the module loader reports a module's errors.
             Err(e) => {
-                if parse_module(&src, config).is_err() {
+                if !looks_like_module(&src) && parse_module(&src, config).is_err() {
                     return Err(e.located(&src, Some(&name)));
                 }
             }
