@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_REGION_CROSS3_CLASS=1` keeps a memory region's class-method
+    /// `CallMethod` on its inline and helper routes, without the class
+    /// lane Tier C emits (`jit_method_callee` and the emitted call).
+    fn region_cross3_class_enabled() = "ZIPP_NO_REGION_CROSS3_CLASS"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CROSS3_GROW=1` makes the emitted cross call's inline entry
     /// leave the lane on new register high-water ground again, instead of
     /// opening the window through `jit_cross3_enter`.

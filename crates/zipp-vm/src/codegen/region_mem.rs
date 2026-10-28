@@ -3362,6 +3362,57 @@ pub(crate) fn compile_region_mem(
                         );
                         emit_region_bail(&mut ops, ip, mc_bail, epilogue);
                     }
+                    // A class-method site: the method its cache resolves for
+                    // the receiver, looked up by `jit_method_callee` and called
+                    // natively by the arm that names its fid, as Tier C's
+                    // CallMethod does (`ZIPP_NO_REGION_CROSS3_CLASS=1` leaves it
+                    // out). A lookup that declines and a method no arm names
+                    // take the routes below. Its own bail stub, as the lane
+                    // above: the arm's `bail` is defined only by the helper. A
+                    // site with an inlined (trivial) method keeps its inline
+                    // arms, which make no call, as its first route.
+                    let class_lane = cross_plan.get(&ip).copied().filter(|site| {
+                        do_cross3
+                            && blocks.is_none()
+                            && mi.is_none()
+                            && site.class_method
+                            && !site.cross3.is_empty()
+                            && crate::codegen::region_cross3_class_enabled()
+                    });
+                    if let Some(site) = class_lane {
+                        let lookup_miss = ops.new_dynamic_label();
+                        let cl_bail = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                            ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => lookup_miss
+                            ; mov [rsp + c3_off + 48], rax        // the arms' callee
+                        );
+                        for c3plan in site.cross3.iter() {
+                            emit_cross3_call(
+                                &mut ops,
+                                c3plan,
+                                Cross3Callee::Stash,
+                                Some(obj),
+                                arg_base,
+                                dst,
+                                proto.reg_count.max(1),
+                                c3_off,
+                                &heap,
+                                cl_bail,
+                                mc_done,
+                                refetch_pinned,
+                                ta_refetch,
+                            );
+                        }
+                        emit_region_bail(&mut ops, ip, cl_bail, epilogue);
+                        dynasm!(ops ; => lookup_miss);
+                    }
                     // Q7 method inlining: a trivial class method on a known
                     // receiver shape at this site is inlined behind a per-receiver
                     // identity+version guard; a guard miss / tight headroom falls
