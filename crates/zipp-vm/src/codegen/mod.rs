@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_ARR_SET_MIRROR=1` sends every compiled `a[i] = v` through
+    /// `jit_set_index` again, without the overwrite of a present element
+    /// through the array mirror (`emit_arr_mirror_set`).
+    fn arr_set_mirror_enabled() = "ZIPP_NO_ARR_SET_MIRROR"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_ARR_LEN_MIRROR=1` reads a dense Array's `.length` in
     /// compiled code through the property probe and `jit_quick_len` again,
     /// not through its array mirror entry (`emit_arr_mirror_len`).

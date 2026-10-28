@@ -3924,6 +3924,12 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::SetIndex { obj, key, val } => {
+                // A present element of a dense Array overwritten through its
+                // array mirror, no helper and no refetch (nothing moves).
+                let set_done = ops.new_dynamic_label();
+                if crate::codegen::arr_set_mirror_enabled() {
+                    emit_arr_mirror_set(&mut ops, obj, key, val, set_done);
+                }
                 // The region path's generic element write: dense store/grow and
                 // unpinned-TypedArray number stores; observable coercion or
                 // exotic receivers deopt. A grow REALLOCATES the dense Vec, so
@@ -3943,6 +3949,7 @@ pub(crate) fn compile_proto_mem(
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => set_done);
             }
             Instr::CallMethodComputed {
                 dst,

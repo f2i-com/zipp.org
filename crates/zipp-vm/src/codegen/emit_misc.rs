@@ -1308,6 +1308,68 @@ pub(crate) fn emit_arr_mirror_len(
     );
 }
 
+/// `obj[key] = val` overwriting a PRESENT element of a dense Array through its
+/// array mirror entry, with no call but the nursery barrier's: heap and Int
+/// tags, the mirror's bounds, a key below the live entry's length, and an
+/// element that is not a hole; the store then commits and, for a heap value
+/// only, runs the value-grain barrier (`jit_shape_set_barrier`, infallible).
+/// The overwrite is `Heap::array_overwrite_present`'s: it moves no storage
+/// and changes nothing that is present, so no snapshot or mirror moves, and
+/// an own present element shadows any prototype setter. A live entry is the
+/// dense store of an Array with no element overlay (frozen, sealed and
+/// `defineProperty`'d arrays have one), no arguments mapping and no virtual
+/// length. Jumps to `done`; anything else falls through with rax, rcx, rdx,
+/// r8, r9, r10 and r11 clobbered, which the helper after it clobbers anyway.
+pub(crate) fn emit_arr_mirror_set(
+    ops: &mut dynasmrt::x64::Assembler,
+    obj: u16,
+    key: u16,
+    val: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    let miss = ops.new_dynamic_label();
+    let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+    let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => miss
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, 0x7FF9                    // Value TAG_INT >> 48
+        ; jne => miss
+        ; mov edx, edx                        // a negative int is huge
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + arr_len]
+        ; jae => miss
+        ; mov r9, [rdi + arr_raw]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; cmp rdx, [r9 + 8]
+        ; jae => miss
+        ; mov r9, [r9]
+        ; mov r10, QWORD ARR_HOLE_BITS as i64
+        ; cmp [r9 + rdx * 8], r10
+        ; je => miss                          // a hole: not an overwrite
+        ; mov r10, [rbx + dreg(val)]
+        ; mov [r9 + rdx * 8], r10             // COMMIT
+        ; mov r11, r10
+        ; shr r11, 48
+        ; cmp r11d, 0x7FFD                    // a primitive: no barrier
+        ; jne => done
+        ; mov rcx, rdi                        // vm
+        ; mov edx, eax                        // holder heap idx
+        ; mov r8, r10                         // value bits
+        ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
+        ; call rax
+        ; jmp => done
+        ; => miss
+    );
+}
+
 /// Emit a region op's bail block: the success path skips it; the block records
 /// the resume ip into `[rsi]` and jumps to the shared epilogue (which restores
 /// the 4-push/40-byte frame). Unlike the function JIT no result is set — a

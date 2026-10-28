@@ -2669,6 +2669,13 @@ pub(crate) fn compile_region_mem(
                     }
                     dynasm!(ops ; => sdone ; jmp => ta_done ; => ta_slow);
                 }
+                // A present element of an unpinned dense Array overwritten
+                // through its array mirror: no helper, and no snapshot refresh
+                // (nothing moves).
+                let set_done = ops.new_dynamic_label();
+                if crate::codegen::arr_set_mirror_enabled() {
+                    emit_arr_mirror_set(&mut ops, obj, key, val, set_done);
+                }
                 // Generic element write `a[i] = v` via a win64 helper (dense
                 // arrays — store/grow — and unpinned TypedArrays with number
                 // values). Returns 0 (ok) or the deopt sentinel.
@@ -2696,6 +2703,7 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; => ta_done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => set_done);
             }
             Instr::CallMethodComputed {
                 dst,
