@@ -1907,7 +1907,22 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() || !matches!(self.heap.get(cv.heap_index()), HeapObj::Class(_)) {
             return None;
         }
-        let target = self.flat_new_class_target(cv)?;
+        // The last class this resolved, while its slot holds the same object
+        // (a class's constructor and kind never change; the version moves
+        // when the slot is freed) and no second realm exists.
+        let ci = cv.heap_index();
+        let memo = self.new_class_memo;
+        let target = if memo.0 == cv.bits()
+            && memo.1 == self.heap.version_of(ci)
+            && self.obj_realm.is_empty()
+            && self.realm_global_objs.is_empty()
+        {
+            (memo.2, memo.3, Value::from_bits(memo.4))
+        } else {
+            let t = self.flat_new_class_target(cv)?;
+            self.new_class_memo = (cv.bits(), self.heap.version_of(ci), t.0, t.1, t.2.bits());
+            t
+        };
         // A body that only stores its arguments: the finished instance.
         if let Some(v) = self.ctor_store_new(target.0, cv.heap_index(), Value::UNDEFINED, base, arg_base, argc) {
             return Some(v.bits());

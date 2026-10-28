@@ -2073,6 +2073,10 @@ pub struct Vm<'p> {
     /// `new` answered that way (`engine::ctor_store`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     ctor_stores: rustc_hash::FxHashMap<u32, engine::ctor_store::CtorStore>,
+    /// The constructor `ctor_store_new` served last: its fid, stores and
+    /// proof (a copy of its `ctor_stores` entry, rechecked at every use).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ctor_store_last: engine::ctor_store::CtorStoreLast,
     /// Per function: 0 not yet scanned, 1 its body cannot observe its frame's
     /// `new.target` (so a compiled `new` may run it frame-free), 2 it can
     /// (`Vm::ctor_body_framefree`).
@@ -2729,6 +2733,11 @@ pub struct Vm<'p> {
     /// `new` helper hands it over (`func << 32 | ip`), and the frame count
     /// then; `error_stack::NO_JIT_SITE` otherwise. Read by `mark_error_data`.
     pub(crate) jit_new_site: (u64, usize),
+    /// The last class a compiled `new` resolved (`jit_new_base_class`): its
+    /// Value bits, its slot's version then, and its constructor's fid,
+    /// closure and Value bits. All-zero (no class has bits 0) until set.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) new_class_memo: (u64, u32, u32, u32, u64),
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.

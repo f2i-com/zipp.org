@@ -412,6 +412,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ctor_store_last: Default::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_framefree: Vec::new(),
             shape_key_plans: Default::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
@@ -607,6 +609,8 @@ impl<'p> Vm<'p> {
             error_stacks: Default::default(),
             script_name: None,
             jit_new_site: (super::super::error_stack::NO_JIT_SITE, 0),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            new_class_memo: (0, 0, 0, 0, 0),
             fn_name_cells: crate::slot_table::SlotSet::default(),
             const_cells: crate::slot_table::SlotSet::default(),
             const_cells_nonempty: 0,

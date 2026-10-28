@@ -234,6 +234,11 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.ctor_stores.remove(&fid);
+            if self.ctor_store_last.0 == fid {
+                self.ctor_store_last = Default::default();
+            }
+            // The last class a compiled `new` resolved may have this body.
+            self.new_class_memo = (0, 0, 0, 0, 0);
             if let Some(c) = self.ctor_framefree.get_mut(f) {
                 *c = 0;
             }

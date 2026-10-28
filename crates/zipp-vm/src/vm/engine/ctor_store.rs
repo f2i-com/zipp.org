@@ -67,6 +67,13 @@ pub(crate) struct StoreProof {
     plan: StaticKeyPlan,
 }
 
+/// `Vm::ctor_store_last`: a constructor's fid, its stores and its proof.
+pub(crate) type CtorStoreLast = (
+    u32,
+    Option<std::rc::Rc<[(String, StoreSrc)]>>,
+    Option<std::rc::Rc<StoreProof>>,
+);
+
 /// The most stores a body may make here: the shared key lists stop at 16.
 const STORE_MAX: usize = 16;
 
@@ -212,6 +219,27 @@ impl<'p> Vm<'p> {
         if !ctor_store_enabled() {
             return None;
         }
+        // The constructor this served last, while its proof still holds:
+        // the instance without the table lookup and the two counted clones
+        // (the pair is moved out and back).
+        if self.ctor_store_last.0 == fid {
+            let last = std::mem::take(&mut self.ctor_store_last);
+            if let (Some(keys), Some(proof)) = (&last.1, &last.2) {
+                let proto_idx = if class != u32::MAX {
+                    u32::MAX
+                } else if proto.is_heap() {
+                    proto.heap_index()
+                } else {
+                    u32::MAX - 1 // no proof is for this
+                };
+                if proto_idx != u32::MAX - 1 && self.store_proof_holds(proof, class, proto_idx) {
+                    let made = self.ctor_store_make(keys, proof, class, proto, base, arg_base, argc);
+                    self.ctor_store_last = last;
+                    return Some(made);
+                }
+            }
+            self.ctor_store_last = last;
+        }
         let (keys, proof) = match self.ctor_stores.get(&fid) {
             Some(e) => (e.keys.clone(), e.proof.clone()),
             None => {
@@ -252,6 +280,26 @@ impl<'p> Vm<'p> {
                 p
             }
         };
+        let made = self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc);
+        self.ctor_store_last = (fid, Some(keys), Some(proof));
+        Some(made)
+    }
+
+    /// The instance `ctor_store_new` makes once `proof` holds: the stores'
+    /// values from the caller's window, born finished, then given its class
+    /// or its [[Prototype]].
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn ctor_store_make(
+        &mut self,
+        keys: &[(String, StoreSrc)],
+        proof: &StoreProof,
+        class: u32,
+        proto: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Value {
         // The construction the body's call was: a safe point, before the
         // allocation (the arguments are in the caller's window, a root).
         self.maybe_gc();
@@ -273,7 +321,7 @@ impl<'p> Vm<'p> {
         } else if proto.is_heap() {
             self.proto_of.insert(idx, proto);
         }
-        Some(Value::heap(idx))
+        Value::heap(idx)
     }
 
     /// Whether `p` still proves the stores for a fresh instance of `class`
