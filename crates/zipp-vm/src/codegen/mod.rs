@@ -490,6 +490,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_BARRIER_FILTER=1` calls the store barrier for every heap
+    /// value an emitted store commits into an older holder, without first
+    /// testing that the value is young (`emit_heap_store_barrier`).
+    fn barrier_filter_enabled() = "ZIPP_NO_BARRIER_FILTER"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_CWT_POLY=1` plans a `CallWithThis` site's emitted lane only
     /// when its cache is monomorphic, without an arm per callee of a
     /// polymorphic one.

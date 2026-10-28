@@ -1405,6 +1405,44 @@ pub(crate) fn emit_arr_mirror_len(
     );
 }
 
+/// The nursery value barrier after a committed store of a heap value into an
+/// object, as `jit_shape_set_barrier` runs it, called only when it can record
+/// an edge. With the generation bytes kept (`gen_lane`: the nursery is on and
+/// the GC oracle off), a young holder, or a value that is not young, needs
+/// none in either barrier mode (`Heap::write_barrier_val`): only a young value
+/// stored into an older holder calls. A long-lived array or object taking
+/// long-lived values (a priority queue's swaps) called on every store.
+/// Expects the holder's heap index in edx and the value's bits in r8, the
+/// helper's arguments; jumps to `done` either way, clobbering rcx, r10 and
+/// r11 besides the call's volatiles. `ZIPP_NO_BARRIER_FILTER=1` drops the
+/// value's test (the identity-way store's holder test predates it).
+pub(crate) fn emit_heap_store_barrier(
+    ops: &mut dynasmrt::x64::Assembler,
+    gen_lane: bool,
+    done: dynasmrt::DynamicLabel,
+) {
+    if gen_lane {
+        dynasm!(ops
+            ; mov r11, [rdi + crate::vm::host_api::JIT_GEN_RAW_OFFSET as i32]
+            ; test BYTE [r11 + rdx], crate::heap::JIT_GEN_STATE_MASK as i8
+            ; jz => done                          // a young holder
+        );
+        if crate::codegen::barrier_filter_enabled() {
+            dynasm!(ops
+                ; mov r10d, r8d                   // the value's heap index
+                ; test BYTE [r11 + r10], crate::heap::JIT_GEN_STATE_MASK as i8
+                ; jnz => done                     // a value that is not young
+            );
+        }
+    }
+    dynasm!(ops
+        ; mov rcx, rdi                            // vm
+        ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
+        ; call rax
+        ; jmp => done
+    );
+}
+
 /// `obj[key] = val` overwriting a PRESENT element of a dense Array through its
 /// array mirror entry, with no call but the nursery barrier's: heap and Int
 /// tags, the mirror's bounds, a key below the live entry's length, and an
@@ -1422,6 +1460,7 @@ pub(crate) fn emit_arr_mirror_set(
     obj: u16,
     key: u16,
     val: u16,
+    gen_lane: bool,
     done: dynasmrt::DynamicLabel,
 ) {
     let miss = ops.new_dynamic_label();
@@ -1457,14 +1496,11 @@ pub(crate) fn emit_arr_mirror_set(
         ; shr r11, 48
         ; cmp r11d, 0x7FFD                    // a primitive: no barrier
         ; jne => done
-        ; mov rcx, rdi                        // vm
         ; mov edx, eax                        // holder heap idx
         ; mov r8, r10                         // value bits
-        ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
-        ; call rax
-        ; jmp => done
-        ; => miss
     );
+    emit_heap_store_barrier(ops, gen_lane, done);
+    dynasm!(ops ; => miss);
 }
 
 /// A for-of step (`IterNext`) over a dense Array, emitted: the helper's first

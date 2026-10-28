@@ -631,7 +631,7 @@ pub(crate) fn emit_ic_probe(
             let skip = ops.new_dynamic_label();
             let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
             let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
-            let IcProbe::Set { val, .. } = probe_kind else {
+            let IcProbe::Set { val, gen_lane } = probe_kind else {
                 unreachable!()
             };
             dynasm!(ops
@@ -674,15 +674,12 @@ pub(crate) fn emit_ic_probe(
                 ; shr r10, 48
                 ; cmp r10d, 0x7FFD                    // primitive store: no edge
                 ; jne => cont
-                ; mov rcx, rdi                        // vm
                 ; mov rax, [rbx + dreg(obj)]
                 ; mov edx, eax                        // holder heap idx
                 ; mov r8, [rbx + dreg(val)]           // val_bits
-                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
-                ; call rax
-                ; jmp => cont
-                ; => skip
             );
+            super::emit_heap_store_barrier(ops, gen_lane, cont);
+            dynasm!(ops ; => skip);
         }
         if matches!(probe_kind, IcProbe::Get { .. }) && super::shape_ways_enabled() {
             // ── SHAPE WAYS (B178) ── the native form of the shape-slot memo:
@@ -842,20 +839,9 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r10d, 0x7FFD                // primitive store: no edge
                 ; jne => cont
                 ; mov edx, eax                    // holder heap idx
-            );
-            if gen_lane {
-                dynasm!(ops
-                    ; mov r11, [rdi + crate::vm::host_api::JIT_GEN_RAW_OFFSET as i32]
-                    ; test BYTE [r11 + rdx], crate::heap::JIT_GEN_STATE_MASK as i8
-                    ; jz => cont                  // young holder: no barrier
-                );
-            }
-            dynasm!(ops
-                ; mov rcx, rdi                    // vm
                 ; mov r8, [rbx + dreg(val)]       // val_bits
-                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as *const () as i64
-                ; call rax
             );
+            super::emit_heap_store_barrier(ops, gen_lane, cont);
         }
     }
     dynasm!(ops

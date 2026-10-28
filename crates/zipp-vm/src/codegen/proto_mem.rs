@@ -3931,7 +3931,7 @@ pub(crate) fn compile_proto_mem(
                 // array mirror, no helper and no refetch (nothing moves).
                 let set_done = ops.new_dynamic_label();
                 if crate::codegen::arr_set_mirror_enabled() {
-                    emit_arr_mirror_set(&mut ops, obj, key, val, set_done);
+                    emit_arr_mirror_set(&mut ops, obj, key, val, heap.inline_store_lane_ok, set_done);
                 }
                 // The region path's generic element write: dense store/grow and
                 // unpinned-TypedArray number stores; observable coercion or

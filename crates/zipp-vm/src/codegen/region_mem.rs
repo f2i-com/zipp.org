@@ -2713,7 +2713,7 @@ pub(crate) fn compile_region_mem(
                 // (nothing moves).
                 let set_done = ops.new_dynamic_label();
                 if crate::codegen::arr_set_mirror_enabled() {
-                    emit_arr_mirror_set(&mut ops, obj, key, val, set_done);
+                    emit_arr_mirror_set(&mut ops, obj, key, val, heap.inline_store_lane_ok, set_done);
                 }
                 // Generic element write `a[i] = v` via a win64 helper (dense
                 // arrays — store/grow — and unpinned TypedArrays with number
