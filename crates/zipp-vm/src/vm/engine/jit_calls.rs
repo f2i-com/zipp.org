@@ -926,6 +926,8 @@ impl<'p> Vm<'p> {
 
         let func_id = (packed_fip >> 32) as u32;
         let ip = packed_fip as u32 as usize;
+        // `func()` borrows for the program's lifetime, which outlives
+        // `&mut self`: the key is borrowed, not copied, for every call.
         let (obj, name, arg_base, argc, caller_regs, key) = {
             let proto = self.func(func_id as usize);
             let Some(Instr::CallMethod {
@@ -934,21 +936,14 @@ impl<'p> Vm<'p> {
                 arg_base,
                 argc,
                 ..
-            }) = proto.code.get(ip).cloned()
+            }) = proto.code.get(ip).copied()
             else {
                 return SELF_CALL_DEOPT;
             };
             let Some(key) = proto.string_constants.get(name as usize) else {
                 return SELF_CALL_DEOPT;
             };
-            (
-                obj,
-                name,
-                arg_base,
-                argc,
-                proto.reg_count.max(1),
-                key.clone(),
-            )
+            (obj, name, arg_base, argc, proto.reg_count.max(1), key.as_str())
         };
 
         // The emitted helper owns both pointers and derives them from the same
@@ -967,7 +962,7 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
         }
-        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, &key) else {
+        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
             return SELF_CALL_DEOPT;
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);

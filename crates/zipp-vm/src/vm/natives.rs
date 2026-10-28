@@ -1847,15 +1847,22 @@ impl<'p> Vm<'p> {
     /// Pierces BOUND functions and PROXIES (the spec recurses to the target —
     /// before the tag check, since `new other.Proxy(mainTarget, …)` realm-tags
     /// the proxy object itself while its function realm is the TARGET's).
-    pub(crate) fn get_function_realm(&self, mut f: Value) -> u32 {
+    #[inline]
+    pub(crate) fn get_function_realm(&self, f: Value) -> u32 {
         // B242: with no child realm ever created, EVERY function's realm is
         // the main one, bound/proxy piercing included — so the answer is
         // known before the probe. This is a hot-call-path question (the
         // same-proto leaf guard asks it per call), and the probe was 4.5% of
-        // calls-closures for a map that no ordinary program ever fills.
+        // calls-closures for a map that no ordinary program ever fills. The
+        // check is inline at each caller; the walk is not.
         if self.obj_realm.is_empty() {
             return 0;
         }
+        self.function_realm_walk(f)
+    }
+
+    #[cold]
+    fn function_realm_walk(&self, mut f: Value) -> u32 {
         loop {
             if !f.is_heap() {
                 return 0;
