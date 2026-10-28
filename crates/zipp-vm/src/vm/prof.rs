@@ -831,7 +831,8 @@ pub(crate) mod pc {
                     let _ = writeln!(f, "{start:x} {len:x} {}", label().replace(' ', "_"));
                 }
                 // `ZIPP_PERF_MAP=dump`: the body's bytes too, for a disassembly
-                // to lay the samples over.
+                // to lay the samples over. (A sandbox build has no JIT.)
+                #[cfg(not(feature = "safe-sandbox"))]
                 if std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
                     // SAFETY: the JIT registers a mapped, readable code range it
                     // just emitted, `len` bytes from `start`.
