@@ -1836,8 +1836,12 @@ impl<'p> Vm<'p> {
         if !js.is_wellformed() || js.as_bytes().starts_with(b"@@") {
             return None;
         }
-        let key = js.as_str_wf();
-        if key == "__proto__" {
+        self.plain_chain_get_str(target, js.as_str_wf())
+    }
+
+    /// [`Vm::plain_chain_get`] for a key the caller holds as text.
+    pub(crate) fn plain_chain_get_str(&self, target: Value, key: &str) -> Option<PlainGet> {
+        if !target.is_heap() || !self.deferred_ns_state.is_empty() || key == "__proto__" {
             return None;
         }
         // One table hash for the whole walk, as `plain_string_key_has`.

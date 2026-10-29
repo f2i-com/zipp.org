@@ -1375,6 +1375,67 @@ impl<'p> Vm<'p> {
         self.with_host_roots(&[desc], |vm| vm.read_descriptor_fields(desc))
     }
 
+    /// ToPropertyDescriptor for a descriptor whose six fields are, wherever
+    /// each is found, data properties of ordinary objects, or absent: read in
+    /// place. No Proxy trap or getter can run, so the spec's interleaving of
+    /// [[HasProperty]] and [[Get]] is unobservable, and the fields' values
+    /// are what the general path would read. `None` for anything else.
+    ///
+    /// The general path spelled each field name as a fresh string twice, six
+    /// times a definition. A wasm-bindgen module copying its data out
+    /// (`Reflect.defineProperty(o, k, {value, writable, enumerable,
+    /// configurable})`, softn.com's apps a few hundred thousand times a
+    /// second) spent more time naming the fields than defining the property.
+    #[allow(clippy::type_complexity)]
+    fn plain_descriptor_fields(
+        &self,
+        desc: Value,
+    ) -> Option<
+        Result<
+            (
+                Option<Value>,
+                Option<Value>,
+                Option<Value>,
+                Option<bool>,
+                Option<bool>,
+                Option<bool>,
+            ),
+            Thrown,
+        >,
+    > {
+        let read = |key: &str| match self.plain_chain_get_str(desc, key)? {
+            crate::vm::values::PlainGet::Data(v) => Some(Some(v)),
+            crate::vm::values::PlainGet::Absent => Some(None),
+            crate::vm::values::PlainGet::Getter(_) => None,
+        };
+        let enumerable = read("enumerable")?;
+        let configurable = read("configurable")?;
+        let value = read("value")?;
+        let writable = read("writable")?;
+        let get = read("get")?;
+        let set = read("set")?;
+        // Steps 12.b / 14.b and 15, in the general path's order.
+        if get.is_some_and(|g| g != Value::UNDEFINED && !self.is_callable(g)) {
+            return Some(Err(Thrown::from_static("TypeError: Getter must be a function")));
+        }
+        if set.is_some_and(|s| s != Value::UNDEFINED && !self.is_callable(s)) {
+            return Some(Err(Thrown::from_static("TypeError: Setter must be a function")));
+        }
+        if (get.is_some() || set.is_some()) && (value.is_some() || writable.is_some()) {
+            return Some(Err(Thrown::from_static(
+                "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+            )));
+        }
+        Some(Ok((
+            value,
+            get,
+            set,
+            writable.map(|v| self.truthy(v)),
+            enumerable.map(|v| self.truthy(v)),
+            configurable.map(|v| self.truthy(v)),
+        )))
+    }
+
     fn read_descriptor_fields(
         &mut self,
         desc: Value,
@@ -1396,6 +1457,9 @@ impl<'p> Vm<'p> {
             return Err(Thrown::from_static(
                 "TypeError: Property description must be an object",
             ));
+        }
+        if let Some(fields) = self.plain_descriptor_fields(desc) {
+            return fields;
         }
         // Presence uses [[HasProperty]] (walks the prototype chain), so a
         // descriptor whose value/writable/enumerable/configurable/get/set is
