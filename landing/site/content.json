@@ -4042,7 +4042,7 @@
       "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 29 October 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 3,034 commits over 154 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 3,046 commits over 154 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -4061,9 +4061,9 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "3,034",
+                  "value": "3,046",
                   "label": "Commits from 29 May to 29 October 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 899 in October"
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 911 in October"
                 },
                 {
                   "value": "32",
@@ -4218,6 +4218,10 @@
             {
               "type": "p",
               "text": "WebAssembly came last: the JS API on the wasmi interpreter on 28 October (`67c770a4`), then on 29 October Wasmtime's compiler behind a feature (`cdce552a`), which the next commit, an unrelated change to object-literal spread, overwrote; the commit after it restored it by name (`df66cffa`). Each VM now picks its runtime, Wasmtime while its JIT is on, and both are held to a sandbox's step budget, heap limit and abort (`f539d27e`); a class method called on an instance is inlined at its call site (`b49cf737`). The release's own gates then found four faults: the dependency audit refused Wasmtime 44 for eight advisories, so the release ships Wasmtime 36, the long-term support line (`051577de`); its smoke test had an extra parenthesis and its 32-bit Arm build dead code (`1a0098b0`, `85fb9d3e`); and the publish step refused notes that still read as pre-release. v0.0.31 was published from the commit that reworded them, `fcfb1934`, the first release whose command lines are profile-guided (`7ee15ed3`). Measured on the published binaries, its JIT runs the 78 benchmark programs in 0.892× v0.0.30's time and 0.857× Node 24's, and its interpreter in 0.742× QuickJS's; the canonical capture of the 0.0.31 engine puts its JIT at 0.629× Node's time over the 30 benchmark rows and its interpreter at 0.574× Bellard's QuickJS's ([benchmarks](/benchmarks/))."
+            },
+            {
+              "type": "p",
+              "text": "The fixes came within hours, most of them found running softn.com's apps in zipp-browser. The apps would not open on v0.0.31: minified code had named a method's local like its class, and an arrow inside the method saw the class (`08f34f83`). Their WebAssembly ran on wasmi, because a program of 256 functions or more starts with its JIT off for its size and v0.0.31 chose the runtime by that switch; WebAssembly now keeps Wasmtime unless the JIT is turned off (`b1ad3d32`). Wasmtime's runtime also kept every JavaScript value ever handed to WebAssembly, and an app grew from 3.6 GB to 9.1 GB in two minutes; a value is now let go once WebAssembly can no longer reach it (`8a907ba8`). `Reflect.set` and `Object.defineProperty` read a descriptor in place (`b952aca0`), `WebAssembly`'s members became writable as in a browser (`47dbb574`), and the WebAssembly modules hand a host its app's state as one JSON text instead of about eleven calls a property (`29f8dbdf`). The first release run of v0.0.32 then failed Test262 on one test the arrow fix had broken, a static initializer's arrow reading its class's name through `eval`; the fix (`e312cf40`) was tagged in its place, and v0.0.32 was published from it six hours after v0.0.31."
             }
           ]
         },
@@ -4393,6 +4397,11 @@
                   "date": "2026-10-29",
                   "title": "Wasmtime, overwritten and restored; both runtimes metered; class methods inlined; v0.0.31",
                   "text": "`cdce552a`, `df66cffa`, `f539d27e`, `b49cf737`, `051577de`, `fcfb1934`."
+                },
+                {
+                  "date": "2026-10-29",
+                  "title": "Wasmtime for large programs, externrefs let go, state in one JSON text; the gate catches a regression; v0.0.32",
+                  "text": "`08f34f83`, `b1ad3d32`, `8a907ba8`, `29f8dbdf`, `e312cf40`."
                 }
               ]
             }
@@ -7217,6 +7226,36 @@
           {
             "type": "p",
             "text": "`WebAssembly` is a global in the command line: the JS API, with modules compiled by Wasmtime while the JIT is on and interpreted by wasmi otherwise, each instruction charged to a sandbox's step budget and each memory to its heap limit, and a host's abort honoured within milliseconds (`67c770a4`, `f539d27e`). A loop of 200 million iterations takes 36 ms on Wasmtime, 289 on wasmi and 73 in Node 24. The JIT inlines a class method at its call site, `this` bound to the receiver (`b49cf737`), and the release's command lines are the first built with profile-guided optimization (`7ee15ed3`). Measured on the published binaries, the bundled applications take 0.83× to 0.97× v0.0.30's time, most of it the profile, and the 78 benchmark programs 0.892× with the JIT, 0.912× interpreted and 0.742× QuickJS's. The dependency audit refused the Wasmtime the work began on, and the release ships the long-term support line, 36.0.19 (`051577de`). [v0.0.31](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.31) was published on 29 October from `fcfb1934`."
+          }
+        ]
+      },
+      {
+        "slug": "webassembly-fixes-faster-host-reads-and-v0-0-32",
+        "date": "2026-10-29",
+        "title": "WebAssembly fixes, faster host reads, and v0.0.32",
+        "summary": "Six hours after v0.0.31: WebAssembly in a large program runs on Wasmtime, `externref` values are let go, the WebAssembly modules hand a host its app's state as one JSON text, and an arrow in a class method sees the method's locals.",
+        "tags": [
+          "javascript",
+          "webassembly",
+          "release"
+        ],
+        "commits": [
+          "08f34f83",
+          "b1ad3d32",
+          "8a907ba8",
+          "b952aca0",
+          "47dbb574",
+          "29f8dbdf",
+          "e312cf40"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "v0.0.31 chose a VM's WebAssembly runtime by whether its JIT was on, and a JavaScript program of 256 functions or more starts with its JIT off for its size, as does one compiled lazily: every real script fell to the wasmi interpreter, and a counting loop took 42 ms in a small file and 321 ms in one that also held 300 unrelated functions. Only the JIT turned off now sends WebAssembly to wasmi (`b1ad3d32`). Wasmtime's runtime also kept every JavaScript value WebAssembly was ever given as an `externref`; a module passing objects by reference, as wasm-bindgen's do, kept them all, and an app built that way grew from 3.6 GB to 9.1 GB in two minutes in zipp-browser. A value is now let go once WebAssembly can no longer reach it, and the app holds steady at about 2.3 GB (`8a907ba8`)."
+          },
+          {
+            "type": "p",
+            "text": "The WebAssembly modules' `getGlobalsBatch` used to build what it returned property by property across the boundary, about eleven calls a property; it now writes a batch as one JSON text, and reading a 400-object simulation's state takes 1.4 ms in Node instead of 8.3 (`29f8dbdf`). `Reflect.set` and `Object.defineProperty` read a descriptor in place, so glue shaped like wasm-bindgen's runs in 820 ms instead of 1,298 (`b952aca0`), and `WebAssembly`'s members are writable data properties, as in a browser (`47dbb574`). An arrow function in a class method now sees the method's locals over the class's name, which minified code names alike; softn.com's apps would not open without it (`08f34f83`). That fix broke one Test262 test, a static initializer's arrow reading its class's name through `eval`, and the release gate refused the first tagged commit for it; [v0.0.32](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.32) was published on 29 October from the fix, `e312cf40`. Its [notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.32.md) also describe everything v0.0.31 brought."
           }
         ]
       }

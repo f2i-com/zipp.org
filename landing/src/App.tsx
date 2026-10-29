@@ -31,7 +31,7 @@ const DOC_LINKS = [
   { href: SANDBOX_PLAYGROUND_URL, title: 'Sandbox playground', text: 'Run JavaScript in a default-deny sandbox, with a switch for every permission and limit.' },
   { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
   // A dated snapshot: the figures the /journey/ page itself states (tests/embed.test.mjs checks they agree).
-  { href: '/journey/', title: 'The Zipp story', text: '3,034 commits in 154 days, to 29 October 2026, told in nine acts with the mistakes left in.' },
+  { href: '/journey/', title: 'The Zipp story', text: '3,046 commits in 154 days, to 29 October 2026, told in nine acts with the mistakes left in.' },
   { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
 ]
 
