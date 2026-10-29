@@ -90,6 +90,8 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::OpenUsingScope { dst: r0, .. }
         | Instr::TemplateGetCached { dst: r0, .. }
         | Instr::TemplateSetCached { src: r0, .. }
+        // `pattern`/`flags` are constant indices, not registers.
+        | Instr::RegExpLitProbe { dst: r0, .. }
         | Instr::Return { src: r0, .. } => {
             *r0 = m(*r0);
         }
@@ -170,6 +172,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::DateParse { dst: r0, src: r1, .. }
         | Instr::GetIterator { dst: r0, src: r1, .. }
         | Instr::GetIteratorObj { dst: r0, src: r1, .. }
+        | Instr::RegExpLitTest { dst: r0, arg: r1, .. }
         | Instr::IterToArray { dst: r0, src: r1, .. } => {
             *r0 = m(*r0);
             *r1 = m(*r1);

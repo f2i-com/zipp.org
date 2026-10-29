@@ -350,6 +350,9 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
             argc,
             ..
         } => callee == r || this_v == r || in_args(arg_base, argc),
+        // `pattern`/`flags` are constant indices, not registers.
+        Instr::RegExpLitProbe { .. } => false,
+        Instr::RegExpLitTest { arg, .. } => arg == r,
         Instr::TailCall {
             callee,
             arg_base,
@@ -444,6 +447,8 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::Call { dst, .. }
         | Instr::CallWithThis { dst, .. }
         | Instr::RegExpMethod { dst, .. }
+        | Instr::RegExpLitProbe { dst, .. }
+        | Instr::RegExpLitTest { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
@@ -519,6 +524,8 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::Call { dst, .. }
         | Instr::CallWithThis { dst, .. }
         | Instr::RegExpMethod { dst, .. }
+        | Instr::RegExpLitProbe { dst, .. }
+        | Instr::RegExpLitTest { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }

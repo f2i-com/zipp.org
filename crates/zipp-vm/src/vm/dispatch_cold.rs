@@ -1302,6 +1302,26 @@ impl<'p> Vm<'p> {
                 self.set(base, dst, v);
                 ip += 1;
             }
+            Instr::RegExpLitProbe {
+                dst,
+                pattern,
+                flags,
+            } => {
+                let yes = self.regexp_literal_test_probe(func_id, pattern, flags)?;
+                self.set(base, dst, Value::bool(yes));
+                ip += 1;
+            }
+            Instr::RegExpLitTest {
+                dst,
+                arg,
+                pattern,
+                flags,
+            } => {
+                let a = self.get(base, arg);
+                let v = self.regexp_literal_test(func_id, pattern, flags, a)?;
+                self.set(base, dst, v);
+                ip += 1;
+            }
             Instr::ImportCall {
                 dst,
                 spec,

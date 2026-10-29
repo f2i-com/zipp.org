@@ -3235,6 +3235,229 @@ impl<'p> Vm<'p> {
         Ok(v)
     }
 
+    /// The core `RegExpLitProbe` and `RegExpLitTest` share for the literal of
+    /// function `func_id` whose pattern and flags are its constants `pat`
+    /// and `flg`, once the probe has built it (`Some(None)`: a literal the
+    /// shortcut never serves). Keyed by those constant indices, which name
+    /// the literal's text for as long as the function exists. The strings a
+    /// `LoadConst` makes of them do not: a long one is made afresh at each
+    /// load, and a freed one's heap slot can hold another string next.
+    #[inline]
+    fn regexp_literal_entry(
+        &self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+    ) -> Option<&Option<std::sync::Arc<crate::heap::RegExpCore>>> {
+        self.regexp_literal_cores.get(&(func_id, pat, flg))
+    }
+
+    /// The core, built: the literal compiled through the constructor's path
+    /// (`new_regexp_value`) and its object dropped. `None`, cached as such,
+    /// for a lone-surrogate pattern, whose exact source lives beside each
+    /// object in full. A failed build (a resource limit: the pattern was
+    /// checked when it compiled) throws, as the literal's evaluation would.
+    fn regexp_literal_core_build(
+        &mut self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+    ) -> Result<Option<std::sync::Arc<crate::heap::RegExpCore>>, Thrown> {
+        let p = self.resolve_const_slot(func_id, pat);
+        let f = self.resolve_const_slot(func_id, flg);
+        let v = self.new_regexp_value(p, f, true)?;
+        let idx = v.heap_index();
+        let core = if self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&idx) {
+            match self.heap.get(idx) {
+                HeapObj::RegExp(re) => Some(re.core.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if self.regexp_literal_cores.len() >= 4096 {
+            self.regexp_literal_cores.clear();
+        }
+        self.regexp_literal_cores.insert((func_id, pat, flg), core.clone());
+        Ok(core)
+    }
+
+    /// The half of `RegExpLitProbe` that needs no core: no child realm
+    /// exists, and %RegExp.prototype% holds the intrinsic `test` as a data
+    /// property. A fresh object of a literal then has no own property but
+    /// `lastIndex` and that prototype, so the Get of `test` on it is a read
+    /// nobody can see, and nothing before the call could tell it from none.
+    fn regexp_literal_test_pristine(&self) -> bool {
+        if !self.realm_global_objs.is_empty() {
+            return false;
+        }
+        let expected = self.regexp_method_intrinsics[crate::bytecode::RegExpMethod::Test.index()];
+        if expected == 0 {
+            return false;
+        }
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(map) => self.regexp_proto_pos(map, "test").is_some_and(|slot| {
+                let v = map.val_at(slot);
+                !map.attr_at(slot).accessor && v.is_heap() && v.heap_index() == expected
+            }),
+            _ => false,
+        }
+    }
+
+    /// `RegExpLitProbe`'s answer from what is known already, or `None` when
+    /// the literal's core must first be built (`regexp_literal_test_probe`,
+    /// which compiled code reaches through the interpreter).
+    pub(crate) fn regexp_literal_test_probe_known(
+        &self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+    ) -> Option<bool> {
+        if !self.regexp_literal_test_pristine() {
+            return Some(false);
+        }
+        self.regexp_literal_entry(func_id, pat, flg).map(Option::is_some)
+    }
+
+    /// `RegExpLitProbe`: whether `/re/.test(..)` may leave the literal's
+    /// object unmade. The first time the answer could be yes the literal's
+    /// core is built here, where the literal is evaluated.
+    pub(crate) fn regexp_literal_test_probe(
+        &mut self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+    ) -> Result<bool, Thrown> {
+        match self.regexp_literal_test_probe_known(func_id, pat, flg) {
+            Some(yes) => Ok(yes),
+            None => Ok(self.regexp_literal_core_build(func_id, pat, flg)?.is_some()),
+        }
+    }
+
+    /// `RegExpLitTest`: the intrinsic `RegExp.prototype.test` (the probe
+    /// proved the Get) called with `arg` on a fresh object of the literal.
+    /// RegExpExec's Get of `exec` is the first point the object could be
+    /// seen, so while `exec` is the intrinsic data property the literal's
+    /// core runs on the vehicle (`regexp_literal_vehicle`) at `lastIndex` 0,
+    /// as a fresh object's, and whatever the run writes there dies as the
+    /// object would have. Otherwise the object is made and the method's
+    /// steps continue on it, as `REGEXP_TEST` takes them, with the string
+    /// ToString already made: ToString runs once.
+    pub(crate) fn regexp_literal_test(
+        &mut self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+        arg: Value,
+    ) -> Result<Value, Thrown> {
+        // A primitive's ToString runs no code, so the proof may come first.
+        if !self.is_object_value(arg) {
+            if let Some(r) = self.regexp_literal_test_fast(func_id, pat, flg, arg)? {
+                return Ok(r);
+            }
+        }
+        let s = self.to_str_value(arg)?;
+        // An object's ToString may have replaced `exec`: prove it after.
+        if let Some(r) = self.regexp_literal_test_fast(func_id, pat, flg, s)? {
+            return Ok(r);
+        }
+        let this = self.with_host_roots(&[s], |vm| vm.regexp_literal_object(func_id, pat, flg))?;
+        let exec = self.with_host_roots(&[this, s], |vm| vm.get_prop(this, "exec"))?;
+        if self.is_callable(exec) {
+            let res = self.with_host_roots(&[this, s], |vm| vm.call_value(exec, this, &[s]))?;
+            if res != Value::NULL && !self.is_object_value(res) {
+                return Err(Thrown::from_static(
+                    "TypeError: RegExp exec method returned something other than an Object or null",
+                ));
+            }
+            return Ok(Value::bool(res != Value::NULL));
+        }
+        let r = self.with_host_roots(&[this, s], |vm| vm.regexp_exec_impl(this.heap_index(), s, false))?;
+        Ok(Value::bool(r != Value::NULL))
+    }
+
+    /// A fresh object of the literal, as its evaluation makes one: from the
+    /// cached core, or, when the cache let it go, built in full.
+    fn regexp_literal_object(&mut self, func_id: u32, pat: u32, flg: u32) -> Result<Value, Thrown> {
+        if let Some(Some(core)) = self.regexp_literal_entry(func_id, pat, flg) {
+            let core = core.clone();
+            let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                core,
+                last_index: Value::int(0),
+            }));
+            self.install_regexp_proto(idx);
+            return Ok(Value::heap(idx));
+        }
+        let p = self.resolve_const_slot(func_id, pat);
+        let f = self.resolve_const_slot(func_id, flg);
+        self.new_regexp_value(p, f, true)
+    }
+
+    /// [`Self::regexp_literal_test`] on the vehicle, for a primitive
+    /// `input`, when `exec` is still the intrinsic data property of the main
+    /// %RegExp.prototype% and the literal's core is cached; `None`, having
+    /// done nothing, otherwise. (The compiled code's direct lane, which
+    /// declines what this declines and an object input.)
+    pub(crate) fn regexp_literal_test_fast(
+        &mut self,
+        func_id: u32,
+        pat: u32,
+        flg: u32,
+        input: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        if !self.realm_global_objs.is_empty() {
+            return Ok(None);
+        }
+        let exec_ok = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => {
+                self.regexp_proto_slot_is_intrinsic(m, "exec", false, crate::vm::native::REGEXP_EXEC)
+            }
+            _ => false,
+        };
+        if !exec_ok {
+            return Ok(None);
+        }
+        let Some(re) = self.regexp_literal_vehicle(func_id, pat, flg) else {
+            return Ok(None);
+        };
+        let r = self.regexp_exec_impl(re, input, false)?;
+        Ok(Some(Value::bool(r != Value::NULL)))
+    }
+
+    /// The VM's hidden RegExp that a literal's `test` runs on in place of the
+    /// object it would have made (`regexp_literal_test_fast`), given the
+    /// literal's core and `lastIndex` 0; `None` when that core is not
+    /// cached. An ordinary main-realm RegExp with no own properties, made on
+    /// first use, rooted by the collector, and never handed to a program.
+    fn regexp_literal_vehicle(&mut self, func_id: u32, pat: u32, flg: u32) -> Option<u32> {
+        let core = std::sync::Arc::as_ptr(self.regexp_literal_entry(func_id, pat, flg)?.as_ref()?);
+        let v = self.regexp_vehicle;
+        if v != 0 {
+            let same = matches!(self.heap.get(v),
+                HeapObj::RegExp(re) if std::sync::Arc::as_ptr(&re.core) == core);
+            let swap = if same {
+                None
+            } else {
+                self.regexp_literal_entry(func_id, pat, flg).cloned().flatten()
+            };
+            if let HeapObj::RegExp(re) = self.heap.get_mut(v) {
+                if let Some(c) = swap {
+                    re.core = c;
+                }
+                re.last_index = Value::int(0);
+            }
+            return Some(v);
+        }
+        let core = self.regexp_literal_entry(func_id, pat, flg)?.clone()?;
+        let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+            core,
+            last_index: Value::int(0),
+        }));
+        self.install_regexp_proto(idx);
+        self.regexp_vehicle = idx;
+        Some(idx)
+    }
+
     /// A new RegExp's [[Prototype]], as RegExpAlloc gives it.
     fn install_regexp_proto(&mut self, idx: u32) {
         // RegExpAlloc is OrdinaryCreateFromConstructor(%RegExp%, "%RegExp.prototype%"),

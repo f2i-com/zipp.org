@@ -127,6 +127,8 @@ pub(crate) fn typeof_alias_kills(i: &Instr, r: Reg) -> bool {
         | Instr::Call { dst, .. }
         | Instr::CallWithThis { dst, .. }
         | Instr::RegExpMethod { dst, .. }
+        | Instr::RegExpLitProbe { dst, .. }
+        | Instr::RegExpLitTest { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }

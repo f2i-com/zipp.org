@@ -1011,6 +1011,91 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// `/re/.test(arg)`: a regex literal as the receiver of a one-argument
+    /// `test` call. `RegExpLitProbe`, asked where the literal is evaluated,
+    /// says whether its object need exist; if not, nothing is made, the
+    /// argument is evaluated and `RegExpLitTest` runs the intrinsic on the
+    /// literal's core. Otherwise the ordinary lowering runs around the same
+    /// argument code: the object and the Get of `test` before it, the
+    /// captured call after it. `None` for any other call.
+    fn regexp_literal_test(&mut self, m: &Member, c: &CallExpr, dst: Reg) -> R<Option<Reg>> {
+        use crate::bytecode::RegExpMethod;
+        let (Expr::Regex { pattern, flags }, MemberProp::Ident(prop)) = (&m.object, &m.prop) else {
+            return Ok(None);
+        };
+        if m.optional
+            || RegExpMethod::from_name(prop) != Some(RegExpMethod::Test)
+            || c.args.len() != 1
+            || !matches!(c.args[0], Arg::Expr(_))
+            || !crate::bytecode::regexp_literal_test_enabled()
+        {
+            return Ok(None);
+        }
+        // Every register below has one definition (on its path): above the
+        // high-water mark, as `capture_member_callee_impl` keeps a captured
+        // receiver and callee, so no other statement's def lands on them.
+        self.set_next_reg(self.next_reg.max(self.max_reg));
+        let (pat, flg) = self.regex_literal_const_idx(pattern, flags)?;
+        let probe = self.alloc_reg();
+        self.emit(Instr::RegExpLitProbe {
+            dst: probe,
+            pattern: pat,
+            flags: flg,
+        });
+        let this_v = self.alloc_reg();
+        let callee = self.alloc_reg();
+        let to_args = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: probe,
+            target: 0,
+        });
+        let pt = self.alloc_reg();
+        self.emit(Instr::LoadConst { dst: pt, idx: pat });
+        let ft = self.alloc_reg();
+        self.emit(Instr::LoadConst { dst: ft, idx: flg });
+        self.emit(Instr::NewRegExp {
+            dst: this_v,
+            pattern: pt,
+            flags: ft,
+            is_construct: true,
+        });
+        let name = self.string_name(prop);
+        self.emit(Instr::GetProp {
+            dst: callee,
+            obj: this_v,
+            name,
+        });
+        let args = self.here();
+        self.patch_jump(to_args, args);
+        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+        let to_fast = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: probe,
+            target: 0,
+        });
+        self.emit(Instr::RegExpMethod {
+            dst,
+            op: RegExpMethod::Test,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        });
+        let to_end = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let fast = self.here();
+        self.patch_jump(to_fast, fast);
+        self.emit(Instr::RegExpLitTest {
+            dst,
+            arg: arg_base,
+            pattern: pat,
+            flags: flg,
+        });
+        let end = self.here();
+        self.patch_jump(to_end, end);
+        Ok(Some(dst))
+    }
+
     // NOTE: `Target::Call` (Annex B `f() = 1`) has no arm to add here — neither
     // function in this file matches on an assignment target. Its lowering
     // (evaluate the call, then throw a ReferenceError) belongs to the assignment
@@ -1792,6 +1877,9 @@ impl<'a> FnCompiler<'a> {
         // the hostile bytecode-vm's spliced dispatch loop went 15 -> 16 homes,
         // one over the pool, and fell from INT-GPR to MEM (68ms -> 260ms).
         if let Expr::Member(m) = peeled {
+            if let Some(r) = self.regexp_literal_test(m, c, dst)? {
+                return Ok(r);
+            }
             let (callee, this_v) = self.capture_member_callee_for_call(m, &c.args)?;
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
             self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);

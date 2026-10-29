@@ -1367,6 +1367,86 @@ pub(crate) extern "win64" fn jit_iter_probe(vm: *mut core::ffi::c_void) -> u64 {
     Value::bool(vm.array_iter_pristine()).bits()
 }
 
+/// Win64 helper for `RegExpLitProbe`: `Vm::regexp_literal_test_probe_known`
+/// as a boolean Value, a pure read (no allocation, no user code), so no
+/// call protocol. `SELF_CALL_DEOPT`, having done nothing, when the
+/// literal's core must first be built: the interpreter replays the probe.
+///
+/// ABI: rcx=vm, edx=func_id, r8d=pattern constant, r9d=flags constant.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_lit_probe(
+    vm: *mut core::ffi::c_void,
+    func_id: u32,
+    pat: u32,
+    flg: u32,
+) -> u64 {
+    // SAFETY: read-only view; the running code holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    match vm.regexp_literal_test_probe_known(func_id, pat, flg) {
+        Some(yes) => Value::bool(yes).bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Win64 helper for `RegExpLitTest`'s direct lane: the literal's `test` on
+/// the vehicle (`Vm::regexp_literal_test_fast`) for a primitive argument,
+/// whose ToString runs no code. `SELF_CALL_DEOPT`, having done nothing,
+/// for an object argument or whatever that declines; the emitter then
+/// calls `jit_regexp_lit_test_ic`. A throw once the match has begun is
+/// committed as `CALL_THREW`, `pending_throw` set, never to be replayed.
+/// The match may allocate, so callers refetch pinned pointers after it.
+///
+/// ABI: rcx=vm, edx=func_id, r8=`pattern | flags << 32` (constant
+/// indices), r9=argument bits.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the running frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_lit_test(
+    vm: *mut core::ffi::c_void,
+    func_id: u32,
+    consts: u64,
+    arg_bits: u64,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        let arg = Value::from_bits(arg_bits);
+        if vm.is_object_value(arg) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        match vm.regexp_literal_test_fast(func_id, consts as u32, (consts >> 32) as u32, arg) {
+            Ok(Some(v)) => v.bits(),
+            Ok(None) => crate::codegen::SELF_CALL_DEOPT,
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
+    })
+}
+
+/// Win64 helper for `RegExpLitTest` past its direct lane, `packed_args` =
+/// `arg | pattern << 16 | flags << 40` (constant indices below 2^24, which
+/// the emitter checks): the interpreter's arm
+/// (`Vm::regexp_literal_test`), with the call protocol (the argument's
+/// ToString and a replaced `exec` are user code).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_lit_test_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_regexp_lit_test_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
 /// Win64 helper for `IterToArray` of a plain Array whose iteration is the
 /// built-in one: the array itself, as `iter_to_array`'s positional arm
 /// answers, with none of the call protocol (no allocation, no user code).

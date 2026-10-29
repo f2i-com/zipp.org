@@ -555,6 +555,10 @@ impl Vm<'_> {
         for &v in &self.host_result_roots {
             root_val!(v);
         }
+        // The hidden RegExp a literal's fused `test` runs on.
+        if self.regexp_vehicle != 0 {
+            root_idx!(self.regexp_vehicle);
+        }
         root_val!(self.node_exit_hook);
         root_val!(self.node_tick_hook);
         root_val!(self.node_host);

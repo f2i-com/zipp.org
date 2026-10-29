@@ -5719,6 +5719,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::NewFinalizationRegistry { cleanup, .. } => vec![cleanup],
         Instr::NewPromise { executor, .. } => vec![executor],
         Instr::NewRegExp { pattern, flags, .. } => vec![pattern, flags],
+        // `pattern`/`flags` are constant indices, not registers.
+        Instr::RegExpLitProbe { .. } => vec![],
+        Instr::RegExpLitTest { arg, .. } => vec![arg],
         Instr::BigIntFrom { arg, .. } => vec![arg],
         Instr::ArrayAppend { arr, val, .. } => vec![arr, val],
         Instr::SetRaw { arr, raw } => vec![arr, raw],

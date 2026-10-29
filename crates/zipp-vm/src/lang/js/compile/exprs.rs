@@ -430,6 +430,43 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// A regex literal's pattern and flags, checked and loaded into two new
+    /// temps (pattern first): what every evaluation of the literal reads,
+    /// the same two string constants each time.
+    pub(crate) fn regex_literal_consts(&mut self, pattern: &StrVal, flags: &str) -> R<(Reg, Reg)> {
+        let (pat, flg) = self.regex_literal_const_idx(pattern, flags)?;
+        let pt = self.temp();
+        self.emit(Instr::LoadConst { dst: pt, idx: pat });
+        let ft = self.temp();
+        self.emit(Instr::LoadConst { dst: ft, idx: flg });
+        Ok((pt, ft))
+    }
+
+    /// A regex literal's pattern and flags, checked, as their constant
+    /// indices (pattern first).
+    pub(crate) fn regex_literal_const_idx(&mut self, pattern: &StrVal, flags: &str) -> R<(u32, u32)> {
+        let text = pattern.to_lossy_string();
+        let pat = self.str_const(pattern);
+        // EARLY ERROR: a RegularExpressionLiteral must parse under the
+        // `Pattern` goal at COMPILE time, not when it is evaluated. The
+        // difference is observable — `if (false) { /a{2,1}/ }` must be a
+        // SyntaxError for the whole program, and until this check
+        // existed that program ran to completion.
+        //
+        // Safe to reject here because it was measured, not assumed: of
+        // 3,391 distinct regex literals extracted from 13,922 real
+        // library files, `regress` rejects zero, while catching all ten
+        // spec-invalid patterns probed and accepting all eighteen
+        // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
+        // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
+        // `[\q{abc}]` under `v`). A program whose bodies may wait for
+        // their first call checks every literal before it compiles
+        // (`compile_main_program_lazy`).
+        check_regex_literal(&text, flags)?;
+        let flg = self.add_string_const(flags);
+        Ok((pat, flg))
+    }
+
     /// Compile `e` placing its value into `dst` (or another register it already
     /// occupies, which the caller may use directly). Returns the register that
     /// actually holds the result.
@@ -484,29 +521,7 @@ impl<'a> FnCompiler<'a> {
                 // why `Expr::Regex` needs no span of its own: the parser hands
                 // over the exact code units rather than the lossy U+FFFD view
                 // the compiler used to repair by slicing a parallel buffer.
-                let text = pattern.to_lossy_string();
-                let pat = self.str_const(pattern);
-                // EARLY ERROR: a RegularExpressionLiteral must parse under the
-                // `Pattern` goal at COMPILE time, not when it is evaluated. The
-                // difference is observable — `if (false) { /a{2,1}/ }` must be a
-                // SyntaxError for the whole program, and until this check
-                // existed that program ran to completion.
-                //
-                // Safe to reject here because it was measured, not assumed: of
-                // 3,391 distinct regex literals extracted from 13,922 real
-                // library files, `regress` rejects zero, while catching all ten
-                // spec-invalid patterns probed and accepting all eighteen
-                // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
-                // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
-                // `[\q{abc}]` under `v`). A program whose bodies may wait for
-                // their first call checks every literal before it compiles
-                // (`compile_main_program_lazy`).
-                check_regex_literal(&text, flags)?;
-                let flg = self.add_string_const(flags);
-                let pt = self.temp();
-                self.emit(Instr::LoadConst { dst: pt, idx: pat });
-                let ft = self.temp();
-                self.emit(Instr::LoadConst { dst: ft, idx: flg });
+                let (pt, ft) = self.regex_literal_consts(pattern, flags)?;
                 self.emit(Instr::NewRegExp {
                     dst,
                     pattern: pt,

@@ -446,6 +446,8 @@ impl<'p> Vm<'p> {
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
             regexp_literal_sites: rustc_hash::FxHashMap::default(),
+            regexp_literal_cores: rustc_hash::FxHashMap::default(),
+            regexp_vehicle: 0,
             json_shapes: Default::default(),
             json_key_plans: Default::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),

@@ -1219,6 +1219,13 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // A regular expression literal (one object per evaluation) or
             // `RegExp(p, f)`: `jit_new_regexp_ic`, with the call protocol.
             Instr::NewRegExp { .. } if !py => {}
+            // `/re/.test(x)`: the probe (`jit_regexp_lit_probe`, a pure read)
+            // and the fused call (`jit_regexp_lit_test`, a guarded direct
+            // lane, then `jit_regexp_lit_test_ic` with the call protocol).
+            // (The IC packs both constant indices below 2^24.)
+            Instr::RegExpLitProbe { .. } if !py => {}
+            Instr::RegExpLitTest { pattern, flags, .. }
+                if !py && pattern < 1 << 24 && flags < 1 << 24 => {}
             // `o.#x = v`: `jit_private_prop_ic` (a private setter is user code).
             Instr::SetPrivate { name, .. } if !py && name <= 0xFF_FFFF => {}
             // Array destructuring (`const [a, b] = v`, `[x, y] = [y, x]`): the
@@ -1771,6 +1778,9 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::NewRegExp {
                 dst, pattern, flags, ..
             } => (u2(pattern, flags), Some(dst)),
+            // `pattern`/`flags` are constant indices, not registers.
+            Instr::RegExpLitProbe { dst, .. } => (u0(), Some(dst)),
+            Instr::RegExpLitTest { dst, arg, .. } => (u1(arg), Some(dst)),
             Instr::SetHomeObject { method, home } => (u2(method, home), None),
             Instr::DeleteProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::NewArray {
@@ -6824,6 +6834,80 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+            }
+            Instr::RegExpLitProbe {
+                dst,
+                pattern,
+                flags,
+            } if !py => {
+                // `/re/.test(x)`'s probe: a pure read, no call protocol. A
+                // literal whose core is not built yet replays the probe in
+                // the interpreter, which builds it.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, func_id as i32
+                    ; mov r8d, pattern as i32
+                    ; mov r9d, flags as i32
+                    ; mov rax, QWORD crate::vm::jit_regexp_lit_probe as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::RegExpLitTest {
+                dst,
+                arg,
+                pattern,
+                flags,
+            } if !py => {
+                // The direct lane first, as `RegExpMethod`'s: a decline has
+                // done nothing and takes the interpreter's arm with the call
+                // protocol; a committed throw bails.
+                let slow = ops.new_dynamic_label();
+                let direct_bail = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let consts = pattern as u64 | (flags as u64) << 32;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, func_id as i32
+                    ; mov r8, QWORD consts as i64
+                    ; mov r9, [rbx + dreg(arg)]
+                    ; mov rax, QWORD crate::vm::jit_regexp_lit_test as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => slow
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => direct_bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, direct_bail, epilogue);
+                dynasm!(ops
+                    ; jmp => done
+                    ; => slow
+                );
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_regexp_lit_test_ic as *const () as usize,
+                    packed_fip,
+                    arg as u64 | (pattern as u64) << 16 | (flags as u64) << 40,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+                dynasm!(ops ; => done);
             }
             Instr::ObjectSpread { target, src } => {
                 // `{ ...src }`: `jit_obj_init_ic` op 0, as the region arm.

@@ -1552,6 +1552,9 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             v.push(this_v);
             r(v, Some(dst))
         }
+        // `pattern`/`flags` are constant indices, not registers.
+        Instr::RegExpLitProbe { dst, .. } => r(vec![], Some(dst)),
+        Instr::RegExpLitTest { dst, arg, .. } => r(vec![arg], Some(dst)),
         Instr::New {
             dst,
             callee,

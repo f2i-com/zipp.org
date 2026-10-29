@@ -2209,6 +2209,17 @@ pub struct Vm<'p> {
     /// A regex literal's site (`func_id << 32 | ip` of its `NewRegExp`) and
     /// what each evaluation's new object shares (`Vm::new_regexp_literal`).
     pub(crate) regexp_literal_sites: rustc_hash::FxHashMap<u64, RegExpLiteralSite>,
+    /// The core a `/re/.test(x)` literal's `RegExpLitProbe`/`RegExpLitTest`
+    /// share, by function and the pattern's and flags' constant indices
+    /// (`Vm::regexp_literal_entry`); `None` for one never served that way.
+    pub(crate) regexp_literal_cores: rustc_hash::FxHashMap<
+        (u32, u32, u32),
+        Option<std::sync::Arc<crate::heap::RegExpCore>>,
+    >,
+    /// The hidden RegExp a literal's fused `test` runs on instead of the
+    /// object it would have made (`Vm::regexp_literal_test`); 0 until first
+    /// used. A GC root, never visible to a program.
+    pub(crate) regexp_vehicle: u32,
     /// The plain JSON walk's per-shape key decisions (`mathjson::JsonShapes`),
     /// kept across `JSON.stringify` calls: a shape id is never reissued.
     pub(crate) json_shapes: mathjson::JsonShapes,

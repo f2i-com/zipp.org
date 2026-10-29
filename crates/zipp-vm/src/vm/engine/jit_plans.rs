@@ -5376,6 +5376,8 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::MathOp { dst, .. }
         | Instr::Call { dst, .. }
         | Instr::RegExpMethod { dst, .. }
+        | Instr::RegExpLitProbe { dst, .. }
+        | Instr::RegExpLitTest { dst, .. }
         | Instr::CallMethod { dst, .. }
         // The captured member-call form defines exactly `dst`, like `Call`;
         // without this arm a split `s.charCodeAt(a[i])` between a callee's

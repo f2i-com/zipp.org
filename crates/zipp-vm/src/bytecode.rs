@@ -1469,6 +1469,35 @@ pub enum Instr {
         flags: Reg,
         is_construct: bool,
     },
+    /// `/re/.test(x)`'s question, asked where the literal is evaluated
+    /// (`Compiler::regexp_literal_test`): `dst = true` when the literal's
+    /// object need not be made, `false` when the ordinary lowering after it
+    /// must run (`NewRegExp`, the Get of `test`, `RegExpMethod`). True means
+    /// no child realm exists and the Get of `test` on a fresh object of the
+    /// literal finds the intrinsic data property of %RegExp.prototype%, so
+    /// nothing before `RegExpLitTest` could tell the object from none; the
+    /// first true also builds the literal's core
+    /// (`Vm::regexp_literal_test_probe`), which may throw as the literal's
+    /// evaluation would. `pattern`/`flags` are the literal's CONSTANT
+    /// indices, not registers: they, unlike the strings loaded from them,
+    /// name its text for good.
+    RegExpLitProbe {
+        dst: Reg,
+        pattern: u32,
+        flags: u32,
+    },
+    /// `dst = /re/.test(arg)` once `RegExpLitProbe` said true and the
+    /// argument is evaluated: the intrinsic `RegExp.prototype.test` on a
+    /// fresh object of the literal (`pattern`/`flags` constant indices, as
+    /// the probe's). ToString(arg), then RegExpExec, which makes that
+    /// object only when a replaced `exec` would receive it
+    /// (`Vm::regexp_literal_test`).
+    RegExpLitTest {
+        dst: Reg,
+        arg: Reg,
+        pattern: u32,
+        flags: u32,
+    },
     /// `dst = <array of obj's own enumerable string keys>` — Object.keys backing.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys {
@@ -4776,6 +4805,27 @@ impl RegExpMethod {
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
+    }
+}
+
+/// `ZIPP_NO_RX_LIT_TEST=1` compiles `/re/.test(x)` as before, with no
+/// `RegExpLitProbe`/`RegExpLitTest`: the same bytecode in every execution
+/// mode either way (the variable is part of the code-cache key).
+#[inline]
+pub(crate) fn regexp_literal_test_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_RX_LIT_TEST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
     }
 }
 

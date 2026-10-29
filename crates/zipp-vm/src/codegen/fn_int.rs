@@ -358,6 +358,8 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Call { dst, .. }
         | Instr::CallWithThis { dst, .. }
         | Instr::RegExpMethod { dst, .. }
+        | Instr::RegExpLitProbe { dst, .. }
+        | Instr::RegExpLitTest { dst, .. }
         // MathOp and CallMethod DEFINE their dst. They used to fall through the
         // `_` arm below and report "writes nothing", so a register defined by
         // `Math.imul(..)` or a pinned-string `charCodeAt(..)` looked

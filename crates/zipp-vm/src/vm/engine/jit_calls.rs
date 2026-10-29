@@ -1665,6 +1665,39 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind `jit_regexp_lit_test_ic`: the interpreter's
+    /// `RegExpLitTest` arm (`Vm::regexp_literal_test`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_regexp_lit_test_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as usize;
+        if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let a = self.get(base, (packed_args & 0xFFFF) as u16);
+        let pat = ((packed_args >> 16) & 0xFF_FFFF) as u32;
+        let flg = (packed_args >> 40) as u32;
+        self.jit_call_depth += 1;
+        let r = self.regexp_literal_test(func_id as u32, pat, flg, a);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_obj_enum_ic`]: the interpreter's arms
     /// for `ObjectKeys`/`ObjectValues`/`ObjectEntries` (without the
     /// interpreter-only whole-loop reductions), `ForInKeys` and `LenOf`.
