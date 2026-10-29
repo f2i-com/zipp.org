@@ -798,6 +798,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "webassembly")]
             wasm: None,
             #[cfg(feature = "webassembly")]
+            wasm_resident: 0,
+            #[cfg(feature = "webassembly")]
             wasm_ns: Value::UNDEFINED,
             #[cfg(feature = "webassembly")]
             wasm_layer: Value::UNDEFINED,
@@ -1084,6 +1086,12 @@ impl<'p> Vm<'p> {
             .saturating_add(self.regexp_result_props.resident_bytes())
             .saturating_add(self.array_js_len.resident_bytes())
             .saturating_add(self.arguments_objs.resident_bytes());
+        // WebAssembly memories and tables, outside every heap object: what
+        // their runtime's limiter granted.
+        #[cfg(feature = "webassembly")]
+        {
+            n = n.saturating_add(self.wasm_resident);
+        }
         n = self.regexp_exact_source.values().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.regexp_exact_source)),
             |n, bytes| n.saturating_add(bytes.capacity()),

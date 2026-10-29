@@ -71,6 +71,17 @@ so a catastrophic pattern runs until the wall-clock timeout instead of raising
 a catchable `RangeError`. Use the separately built `zipp-sandbox` when
 compile-time JIT/unsafe exclusion, or the full resource policy, matters.
 
+`WebAssembly` runs on wasmi, an interpreter, or in the 64-bit release CLIs on
+Wasmtime, which compiles it, whenever the JIT is on (`ZIPP_NOJIT=1`, which the
+sandboxed child sets, keeps it on wasmi; so does `ZIPP_WASM_INTERP=1` alone).
+Under a step budget or heap limit (an embedder's, or the sandbox's) its
+instructions are charged to the budget and its memories and tables count
+against the heap limit. A host's abort request stops it within milliseconds:
+Wasmtime checks at each 5 ms epoch tick, wasmi between slices of its fuel.
+The exception is a module's start function on wasmi, which wasmi cannot
+resume, so there the request is seen at the start function's imports and
+the step budget bounds it.
+
 ## Conformance and language coverage
 
 The core Test262 corpus is pinned to
@@ -209,6 +220,7 @@ ZIPP_JITDECLINE=1   the planner check that rejected a region
 ZIPP_PROF=1         runtime phase sampling
 ZIPP_PROF_PC=1      Windows x86-64 emitted/native PC attribution
 ZIPP_NOJIT=1        interpreter-only (presence checked; unset for JIT)
+ZIPP_WASM_INTERP=1  WebAssembly on wasmi even with the JIT on
 ```
 
 Feature-ablation environment probes are cached outside hot paths; calling

@@ -20,7 +20,9 @@
 # This is the corpus tools/pgo.sh trains the canonical benchmark build on;
 # that script adds the provenance contract and the structural comparison of
 # the corpus with every scored program, which a release build does not repeat.
-# RUSTFLAGS, when set (the workflow's -Dwarnings), applies to both builds.
+# RUSTFLAGS, when set (the workflow's -Dwarnings), applies to both builds, and
+# so does ZIPP_CLI_FEATURES, a list of the CLI's features to add (the 64-bit
+# release CLIs' `wasm-jit`).
 # Needs the toolchain's llvm-tools component, Python 3 and sha256sum.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -76,10 +78,12 @@ for input in "${inputs[@]}"; do stage_args+=(--file "$input"); done
 "$python" -I tools/pgo_training.py "${stage_args[@]}"
 
 base_flags=${RUSTFLAGS:-}
+features=()
+if [[ -n ${ZIPP_CLI_FEATURES:-} ]]; then features=(--features "$ZIPP_CLI_FEATURES"); fi
 echo "== stage 1/4: instrumented build =="
 CARGO_TARGET_DIR="$work_n/target" \
   RUSTFLAGS="$base_flags -Cprofile-generate=$work_n/profiles" \
-  cargo build --locked --release --package zipp-cli --bin zipp --target "$target"
+  cargo build --locked --release --package zipp-cli --bin zipp --target "$target" ${features[@]+"${features[@]}"}
 
 # train DIR LIST: the corpus once, its profiles in DIR and their list in LIST.
 train() {
@@ -122,7 +126,7 @@ echo "== stage 4/4: profile-guided release build =="
 ZIPP_PGO_PROFILE_SHA256=$profile_sha256 \
   ZIPP_PGO_TRAINING_RECIPE_SHA256=$recipe_sha256 \
   RUSTFLAGS="$base_flags -Cprofile-use=$work_n/merged.profdata" \
-  cargo build --locked --release --package zipp-cli --bin zipp --target "$target"
+  cargo build --locked --release --package zipp-cli --bin zipp --target "$target" ${features[@]+"${features[@]}"}
 binary="target/$target/release/$exe"
 "$binary" --version | grep -E '^(zipp |pgo profile sha256)'
 if ! "$binary" --version | grep -q "pgo profile sha256: $profile_sha256"; then

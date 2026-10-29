@@ -3532,6 +3532,14 @@ pub struct Vm<'p> {
     /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
     #[cfg(feature = "webassembly")]
     pub(crate) wasm: Option<Box<webassembly::WasmRuntime>>,
+    /// Bytes of WebAssembly memories and tables the runtime's limiter has
+    /// granted (tables at 8 bytes an element). Neither shrinks while the VM
+    /// lives, so this is what they hold: the heap audit counts it, and a
+    /// growth is admitted against the heap ceiling first
+    /// (`webassembly::grow`). Kept on the VM, not in the store, for the audit
+    /// to read while a runtime is growing one.
+    #[cfg(feature = "webassembly")]
+    pub(crate) wasm_resident: usize,
     /// The `WebAssembly` namespace object, and the members its accessors hand
     /// out once the layer has loaded (both roots).
     #[cfg(feature = "webassembly")]

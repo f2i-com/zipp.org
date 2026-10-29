@@ -1,9 +1,10 @@
 //! `WebAssembly`: the JavaScript API for running WebAssembly modules.
 //!
 //! The modules themselves are decoded, validated and run by a runtime: [wasmi],
-//! an interpreter written in Rust (`interp.rs`), or with the `wasm-jit`
-//! feature [Wasmtime], which compiles them to machine code (`jit.rs`) and runs
-//! a heavy module some ten times faster. This module is the bridge, the same
+//! an interpreter written in Rust (`interp.rs`), and with the `wasm-jit`
+//! feature also [Wasmtime], which compiles them to machine code (`jit.rs`) and
+//! runs a heavy module some ten times faster; each VM uses one of them
+//! ([`WasmRuntime`]). This module is the bridge, the same
 //! for both: the runtime keeps one store per VM and numbers the modules,
 //! functions, memories, tables and globals in it, and the API's classes
 //! (`webassembly.js`, JavaScript like Node's layer) carry those numbers and
@@ -161,16 +162,207 @@ impl From<Thrown> for Failure {
 
 type Op<T> = Result<T, Failure>;
 
-#[cfg(not(feature = "wasm-jit"))]
 mod interp;
-#[cfg(not(feature = "wasm-jit"))]
-pub(crate) use interp::WasmRuntime;
 #[cfg(feature = "wasm-jit")]
 mod jit;
+
+/// The runtime one VM's WebAssembly runs on, chosen when the VM first uses
+/// WebAssembly (`Vm::wasm_runtime`): Wasmtime in a `wasm-jit` build whose
+/// JIT is on, else wasmi. A VM with its JIT off (`ZIPP_NOJIT=1`, as the
+/// sandbox's child sets it) thus runs no generated code for WebAssembly
+/// either; `ZIPP_WASM_INTERP=1` picks wasmi with the JIT on.
+pub(crate) enum WasmRuntime {
+    Interp(interp::Runtime),
+    #[cfg(feature = "wasm-jit")]
+    Jit(jit::Runtime),
+}
+
+impl WasmRuntime {
+    /// Every Value the runtime holds for the collector.
+    pub(crate) fn roots(&self, f: &mut dyn FnMut(Value)) {
+        match self {
+            WasmRuntime::Interp(rt) => rt.roots(f),
+            #[cfg(feature = "wasm-jit")]
+            WasmRuntime::Jit(rt) => rt.roots(f),
+        }
+    }
+}
+
+/// What a WebAssembly store made before its VM's step budget says, when the
+/// budget is set later: the store counts no fuel, so its code cannot run
+/// under the budget.
+const UNMETERED_MSG: &str = "WebAssembly made before this VM's step budget was set cannot run under it";
+
+/// Fuel standing for no budget: the runtimes count fuel down in 64 bits, and
+/// `i64::MAX` steps is past any run.
+const UNLIMITED_FUEL: u64 = i64::MAX as u64;
+
+/// The most fuel wasmi is given at once in a call it can resume: running
+/// out of a slice hands control back, the steps are charged, and the meter
+/// (a host's abort request among its states) decides whether it goes on.
+/// About a few milliseconds of WebAssembly.
+const FUEL_SLICE: u64 = 1 << 22;
+
+/// Whether the VM at address `vm` must stop running WebAssembly now: its
+/// meter has stopped the script, or the host asked it to abort
+/// (`Vm::wasm_meter_fuel`). Wasmtime's epoch callback asks this.
 #[cfg(feature = "wasm-jit")]
-pub(crate) use jit::WasmRuntime;
+fn stop_requested(vm: usize) -> bool {
+    if vm == 0 {
+        return false;
+    }
+    // SAFETY: as in `grow`.
+    let vm = unsafe { &*(vm as *const Vm<'static>) };
+    #[cfg(feature = "instrument")]
+    {
+        vm.wasm_meter_fuel().is_err()
+    }
+    #[cfg(not(feature = "instrument"))]
+    {
+        let _ = vm;
+        false
+    }
+}
+
+/// A runtime limiter's growth by `bytes` (memory, or table elements at 8
+/// bytes each) in the VM at address `vm`: admitted against the VM's heap
+/// ceiling and counted in `Vm::wasm_resident`. `Err` with the meter's
+/// message when the ceiling refuses it; the growth then fails, and the VM
+/// has stopped the script.
+fn grow(vm: usize, bytes: usize) -> Result<(), &'static str> {
+    if vm == 0 {
+        return Ok(());
+    }
+    // SAFETY: `vm` is the live VM, set by the operation running this growth
+    // (`Host::vm`); the VM is suspended in that operation, as for an import.
+    let vm = unsafe { &mut *(vm as *mut Vm<'static>) };
+    #[cfg(feature = "instrument")]
+    vm.instrument_preflight_external_heap_growth(bytes)?;
+    vm.wasm_resident = vm.wasm_resident.saturating_add(bytes);
+    Ok(())
+}
+
+/// A failure as the text of the error an import raises with it, unwinding
+/// through the WebAssembly frames (the exception itself stays pending).
+fn failure_message(failure: Failure) -> String {
+    match failure {
+        Failure::Thrown(thrown) => thrown.0,
+        Failure::Record(kind, message) => format!("{kind}: {message}"),
+    }
+}
+
+/// The bytes a table of `elements` takes, as the limiters count them.
+fn table_bytes(elements: usize) -> usize {
+    elements.saturating_mul(8)
+}
+
+/// `ZIPP_WASM_INTERP=1`: WebAssembly on wasmi whatever the JIT.
+#[cfg(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn wasm_interp_forced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZIPP_WASM_INTERP").is_some())
+}
 
 impl<'p> Vm<'p> {
+    /// The VM's runtime, made on first use (see [`WasmRuntime`]).
+    pub(crate) fn wasm_runtime(&mut self) -> &mut WasmRuntime {
+        if self.wasm.is_none() {
+            #[cfg(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let compiled = self.jit_enabled && !wasm_interp_forced();
+            #[cfg(not(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+            let compiled = false;
+            // A VM with a meter gets a store that counts fuel, for good.
+            let metered = self.wasm_metered();
+            let rt = if compiled {
+                #[cfg(feature = "wasm-jit")]
+                {
+                    WasmRuntime::Jit(jit::Runtime::new(metered))
+                }
+                #[cfg(not(feature = "wasm-jit"))]
+                unreachable!("no compiling runtime in this build")
+            } else {
+                WasmRuntime::Interp(interp::Runtime::new(metered))
+            };
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            if crate::jitlog_enabled() {
+                let name = if compiled { "wasmtime" } else { "wasmi" };
+                eprintln!("[wasm] runtime {name}{}", if metered { ", metered" } else { "" });
+            }
+            self.wasm = Some(Box::new(rt));
+        }
+        self.wasm.as_mut().expect("made above")
+    }
+
+    /// Whether a runtime made now must count fuel: the VM has a meter.
+    fn wasm_metered(&self) -> bool {
+        #[cfg(feature = "instrument")]
+        {
+            self.wasm_meter_attached()
+        }
+        #[cfg(not(feature = "instrument"))]
+        false
+    }
+
+    /// The fuel for WebAssembly about to run in a store that counts it
+    /// (`metered`): what the VM's meter allows, or [`UNLIMITED_FUEL`]. A
+    /// store that does not count fuel may run only while the VM has no
+    /// finite budget. `Err` when nothing may run (`Vm::wasm_meter_fuel`).
+    fn wasm_fuel(&self, metered: bool) -> Op<Option<u64>> {
+        #[cfg(feature = "instrument")]
+        let fuel = self.wasm_meter_fuel().map_err(|m| Failure::Thrown(Thrown(m.into())))?;
+        #[cfg(not(feature = "instrument"))]
+        let fuel: Option<u64> = None;
+        match (metered, fuel) {
+            (true, fuel) => Ok(Some(fuel.unwrap_or(UNLIMITED_FUEL))),
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(Failure::Record("RangeError", UNMETERED_MSG.into())),
+        }
+    }
+
+    /// Charge the steps WebAssembly took; see `Vm::wasm_meter_charge`.
+    fn wasm_charge(&mut self, used: u64, ran_out: bool) -> Op<()> {
+        #[cfg(feature = "instrument")]
+        self.wasm_meter_charge(used, ran_out)
+            .map_err(|m| Failure::Thrown(Thrown(m.into())))?;
+        #[cfg(not(feature = "instrument"))]
+        let _ = (used, ran_out);
+        Ok(())
+    }
+
+    /// `otherwise`, unless the VM's meter has stopped the script (its fuel
+    /// or the heap ceiling ran out inside WebAssembly) or the host asked it
+    /// to abort: then the meter's message, which no `catch` gets past.
+    fn wasm_stopped(&self, otherwise: Failure) -> Failure {
+        #[cfg(feature = "instrument")]
+        if let Some(message) = self.wasm_meter_terminal() {
+            return Failure::Thrown(Thrown(message.into()));
+        }
+        #[cfg(feature = "instrument")]
+        if let Err(message) = self.wasm_meter_fuel() {
+            return Failure::Thrown(Thrown(message.into()));
+        }
+        otherwise
+    }
+
+    /// The wasmi runtime, for its imports to call back through. Only that
+    /// runtime's code asks, so only a VM running it.
+    fn wasmi_runtime(&mut self) -> *mut interp::Runtime {
+        match self.wasm_runtime() {
+            WasmRuntime::Interp(rt) => rt,
+            #[cfg(feature = "wasm-jit")]
+            WasmRuntime::Jit(_) => unreachable!("a wasmi import in a VM running Wasmtime"),
+        }
+    }
+
+    /// The Wasmtime runtime, as [`Vm::wasmi_runtime`].
+    #[cfg(feature = "wasm-jit")]
+    fn wasmtime_runtime(&mut self) -> *mut jit::Runtime {
+        match self.wasm_runtime() {
+            WasmRuntime::Jit(rt) => rt,
+            WasmRuntime::Interp(_) => unreachable!("a Wasmtime import in a VM running wasmi"),
+        }
+    }
+
     /// The `WebAssembly` namespace object, made at setup with one lazy
     /// accessor per member, keyed by `names` (setup's interned strings for
     /// [`MEMBERS`]).
@@ -224,10 +416,23 @@ impl<'p> Vm<'p> {
     pub(crate) fn wasm_host_op(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
         let name = self.display(arg(0));
-        let rt = self.wasm_runtime();
-        let outcome = stats::time(0, || self.wasm_op(rt, &name, arg(1), arg(2), arg(3)));
-        // Whatever ran may have grown a memory.
-        self.wasm_detach_stale(rt);
+        let (a, b, c) = (arg(1), arg(2), arg(3));
+        // Whatever ran may have grown a memory: stale buffers are detached.
+        let outcome = match self.wasm_runtime() {
+            WasmRuntime::Interp(rt) => {
+                let rt: *mut interp::Runtime = rt;
+                let outcome = stats::time(0, || self.wasmi_op(rt, &name, a, b, c));
+                self.wasmi_detach_stale(rt);
+                outcome
+            }
+            #[cfg(feature = "wasm-jit")]
+            WasmRuntime::Jit(rt) => {
+                let rt: *mut jit::Runtime = rt;
+                let outcome = stats::time(0, || self.wasmtime_op(rt, &name, a, b, c));
+                self.wasmtime_detach_stale(rt);
+                outcome
+            }
+        };
         match outcome {
             Ok(v) => Ok(v),
             Err(Failure::Thrown(t)) => Err(t),

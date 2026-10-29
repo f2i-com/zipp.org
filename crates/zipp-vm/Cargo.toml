@@ -44,6 +44,10 @@ num-traits = "0.2"
 # an optimised build without those settings (fast incremental builds), turn on
 # `wasm-portable-dispatch`.
 wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
+# wasmi's own core, for `LimiterError`: the error its `ResourceLimiter`
+# returns, which wasmi does not re-export. The store's limiter counts
+# WebAssembly memory against the VM's heap ceiling (vm/webassembly).
+wasmi_core = { version = "2", optional = true, default-features = false }
 # `wasm-jit`: modules compiled to machine code by Wasmtime's Cranelift instead
 # (vm/webassembly/jit.rs) -- some ten times faster on a heavy module, for a
 # much larger build. Its custom sections, which Wasmtime does not keep, read
@@ -96,7 +100,7 @@ python-native-gpu = ["python"]
 # build is a pure interpreter with no unsafe codegen.
 default = ["jit", "typescript", "webassembly"]
 # The `WebAssembly` global (see the `wasmi` dependency).
-webassembly = ["dep:wasmi"]
+webassembly = ["dep:wasmi", "dep:wasmi_core"]
 # Loop dispatch for WebAssembly, whatever the build: for optimised builds that
 # do not use fat LTO and one codegen unit (see the `wasmi` dependency).
 wasm-portable-dispatch = ["webassembly", "wasmi/portable-dispatch"]

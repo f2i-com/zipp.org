@@ -2300,6 +2300,7 @@ dependencies = [
  "self_cell",
  "unicode-normalization",
  "wasmi",
+ "wasmi_core",
  "wasmparser 0.246.2",
  "wasmtime",
  "wat",

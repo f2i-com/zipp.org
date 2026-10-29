@@ -138,6 +138,10 @@ pub(crate) const BUDGET_MSG: &str = "RangeError: script exceeded its instruction
 pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by the host";
 /// Raised when a script exceeds the heap ceiling its host set.
 pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
+/// Raised when WebAssembly would run while a trace is recorded: a trace has
+/// no rows for its instructions, so it could not be proved.
+#[cfg(all(feature = "webassembly", not(feature = "meter-only")))]
+pub(crate) const WASM_TRACE_MSG: &str = "RangeError: WebAssembly cannot run while an execution trace is recorded";
 pub(crate) const OUTPUT_MSG: &str = "RangeError: script exceeded its output budget";
 
 /// What one buffered console line costs beyond the text it carries.
@@ -1953,6 +1957,68 @@ impl super::Vm<'_> {
                 rec.used = rec.used.wrapping_add(n as u64);
             }
         }
+    }
+
+    /// The steps WebAssembly about to run may take, as its runtime's fuel:
+    /// `Ok(None)` without a finite budget, else the steps left with an
+    /// enclosing native run's unspent loan (which `charge_steps` reclaims).
+    /// `Err` when nothing may run: a terminal status, a host's abort request,
+    /// or a trace being recorded, which has no rows for WebAssembly.
+    #[cfg(feature = "webassembly")]
+    pub(crate) fn wasm_meter_fuel(&self) -> Result<Option<u64>, &'static str> {
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        #[cfg(not(feature = "meter-only"))]
+        {
+            if rec.tracing {
+                return Err(WASM_TRACE_MSG);
+            }
+            if rec
+                .abort
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(ABORT_MSG);
+            }
+        }
+        let loan = self.jit_steps.max(0) as u64;
+        Ok(rec.finite_remaining(self.meter_hot()).map(|left| left.saturating_add(loan)))
+    }
+
+    /// Charge `used` steps of WebAssembly (as `charge_steps` does);
+    /// `ran_out`: its fuel ran out with work left, which is the budget's
+    /// exhaustion even when it spent exactly what was left. `Err` with the
+    /// meter's terminal message, reached now or before.
+    #[cfg(feature = "webassembly")]
+    pub(crate) fn wasm_meter_charge(&mut self, used: u64, ran_out: bool) -> Result<(), &'static str> {
+        if self.instr_rec.is_none() {
+            return Ok(());
+        }
+        self.charge_steps(used.min(i64::MAX as u64) as i64);
+        let Some(rec) = rec_mut!(self) else {
+            return Ok(());
+        };
+        if ran_out && rec.terminal_message().is_none() {
+            rec.exhaust(ResourceExhaustion::Steps);
+        }
+        rec.terminal_message().map_or(Ok(()), Err)
+    }
+
+    /// The meter's terminal message, if it has stopped the script.
+    #[cfg(feature = "webassembly")]
+    pub(crate) fn wasm_meter_terminal(&self) -> Option<&'static str> {
+        self.instr_rec.as_ref()?.terminal_message()
+    }
+
+    /// Whether the VM has a meter, which a WebAssembly store must then
+    /// charge: its runtime is made metered (`webassembly::WasmRuntime`).
+    #[cfg(feature = "webassembly")]
+    pub(crate) fn wasm_meter_attached(&self) -> bool {
+        self.instr_rec.is_some()
     }
 
     /// Whether the last native run stopped because it ran out of lent steps

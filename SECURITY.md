@@ -109,6 +109,14 @@ or unsafe-code trust boundary.
 Treat those aliases as defense in depth, not as substitutes for the separately
 built `zipp-sandbox` artifact.
 
+A sandboxed script under those aliases may use `WebAssembly`. Its child turns
+both JITs off, so the modules run on the wasmi interpreter even in a CLI that
+compiles WebAssembly with Wasmtime otherwise. Every instruction WebAssembly
+executes is charged to the instruction budget, and every memory and table it
+creates or grows counts against the heap limit before it is allocated, so
+neither limit can be bypassed by moving work into a module. The hardened
+`zipp-sandbox` build has no `WebAssembly` global.
+
 The default (JIT) profile bounds source nesting as well — parser recursion,
 expression chains and the finished tree's depth — so a deeply nested script,
 `eval` or `Function` source fails with a catchable RangeError instead of

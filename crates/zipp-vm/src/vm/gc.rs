@@ -570,15 +570,7 @@ impl Vm<'_> {
             root_val!(self.wasm_ns);
             root_val!(self.wasm_layer);
             if let Some(rt) = &self.wasm {
-                for &v in &rt.imports {
-                    root_val!(v);
-                }
-                for &v in &rt.externs {
-                    root_val!(v);
-                }
-                for ab in rt.buffer_roots() {
-                    root_idx!(ab);
-                }
+                rt.roots(&mut |v| root_val!(v));
             }
         }
         // Short interpreter string constants memoized by immutable

@@ -40,6 +40,11 @@ python = ["zipp-vm/python"]
 # CPU evaluator would have run them; the CPU evaluator otherwise.
 gpu = ["python", "dep:zipp-gpu", "zipp-vm/python-native-gpu"]
 python-js-interop = ["python", "zipp-vm/python-js-interop"]
+# WebAssembly compiled to machine code by Wasmtime when the JIT is on; wasmi
+# still runs it with the JIT off (`ZIPP_NOJIT=1`, the sandbox's child) or
+# `ZIPP_WASM_INTERP=1`. The 64-bit release CLIs build with it
+# (release-build.yml); Wasmtime does not compile for 32-bit hosts.
+wasm-jit = ["zipp-vm/wasm-jit"]
 secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]
 # `ZIPP_CENSUS=1` (stderr) or `ZIPP_CENSUS=<file>`: the storage census of a

@@ -10,19 +10,63 @@ use crate::value::Value;
 use crate::vm::helpers_num2::to_int32;
 use crate::vm::{Thrown, Vm};
 
-use super::{stats, Failure, Op};
+use super::{grow, stats, table_bytes, Failure, Op, FUEL_SLICE};
 
 use wasmi::{
-    AsContext, AsContextMut, Caller, Engine, Extern, ExternRef, ExternType, Func, Global, Instance, Memory,
-    MemoryType, Module, Mutability, Nullable, Ref, RefType, Store, StoreContextMut, Table,
-    TableType, Val, ValType,
+    AsContext, AsContextMut, Caller, Config, Engine, Extern, ExternRef, ExternType, Func, Global, Instance,
+    Memory, MemoryType, Module, Mutability, Nullable, Ref, RefType, ResourceLimiter, ResumableCall, Store,
+    StoreContextMut, Table, TableType, TrapCode, Val, ValType,
 };
+use wasmi_core::LimiterError;
 
-/// The store's data: the VM, for an import to call back into. Set before
-/// every entry into WebAssembly, as the VM may have moved since.
+/// The store's data: the VM, for an import to call back into and for the
+/// limiter to admit growth against, set by every operation as the VM may
+/// have moved since; the fuel the store held when last set or charged for
+/// (`Vm::wasmi_fuel_settle`); and whether the running call can be resumed
+/// when it runs out (a call, not an instantiation's start function), so
+/// that its fuel comes in slices (`FUEL_SLICE`).
 #[derive(Default)]
-pub(crate) struct WasmHost {
+pub(crate) struct Host {
     vm: usize,
+    fuel_mark: u64,
+    sliced: bool,
+}
+
+/// Every memory's and table's growth, the initial size included, is admitted
+/// against the VM's heap ceiling (`super::grow`); a refusal traps, as the
+/// script has been stopped. A growth past the entity's own maximum fails
+/// without taking anything.
+impl ResourceLimiter for Host {
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> Result<bool, LimiterError> {
+        if maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        grow(self.vm, desired.saturating_sub(current))
+            .map(|()| true)
+            .map_err(|_| LimiterError::ResourceLimiterDeniedAllocation)
+    }
+
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> Result<bool, LimiterError> {
+        if maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        grow(self.vm, table_bytes(desired.saturating_sub(current)))
+            .map(|()| true)
+            .map_err(|_| LimiterError::ResourceLimiterDeniedAllocation)
+    }
+
+    // wasmi's own defaults (`StoreLimits`).
+    fn instances(&self) -> usize {
+        10_000
+    }
+
+    fn tables(&self) -> usize {
+        10_000
+    }
+
+    fn memories(&self) -> usize {
+        10_000
+    }
 }
 
 /// A memory and the `ArrayBuffer` last handed out for it, with the bytes it
@@ -33,9 +77,12 @@ struct WasmMemory {
 }
 
 /// Everything WebAssembly in one VM: the store and what is numbered in it.
-pub(crate) struct WasmRuntime {
+pub(crate) struct Runtime {
     engine: Engine,
-    store: Store<WasmHost>,
+    store: Store<Host>,
+    /// Whether the engine counts fuel: the VM had a meter when the runtime
+    /// was made (`Vm::wasm_fuel`).
+    metered: bool,
     modules: Vec<Module>,
     instances: Vec<Instance>,
     funcs: Vec<Func>,
@@ -54,15 +101,15 @@ pub(crate) struct WasmRuntime {
     callers: Vec<usize>,
 }
 
-impl WasmRuntime {
+impl Runtime {
     /// The store context for the next operation: the innermost running
     /// import's when there is one, else the store's.
-    fn ctx(&mut self) -> StoreContextMut<'_, WasmHost> {
+    fn ctx(&mut self) -> StoreContextMut<'_, Host> {
         match self.callers.last() {
             // SAFETY: the address is of a `Caller` that `js_import` pushed and
             // pops before returning; while it is on the stack that frame is
             // suspended in `call_value`, so nothing else uses the caller.
-            Some(&caller) => unsafe { (*(caller as *mut Caller<'static, WasmHost>)).as_context_mut() },
+            Some(&caller) => unsafe { (*(caller as *mut Caller<'static, Host>)).as_context_mut() },
             None => self.store.as_context_mut(),
         }
     }
@@ -194,48 +241,67 @@ impl wasmi::errors::HostError for JsException {}
 
 /// The body of every JavaScript import: convert the arguments, call the
 /// function, convert its result.
-fn js_import(mut caller: Caller<'_, WasmHost>, index: usize, params: &[Val], results: &mut [Val]) -> Result<(), wasmi::Error> {
+fn js_import(mut caller: Caller<'_, Host>, index: usize, params: &[Val], results: &mut [Val]) -> Result<(), wasmi::Error> {
     // SAFETY: `vm` was set to the live VM by the entry into WebAssembly that
-    // is running this import (see `WasmHost`), and the VM is suspended in
+    // is running this import (see `Host`), and the VM is suspended in
     // that entry, inside `wasm_host_op`.
     let vm = unsafe { &mut *(caller.data().vm as *mut Vm<'static>) };
-    let rt = vm.wasm_runtime();
+    let rt = vm.wasmi_runtime();
     // SAFETY: the runtime is boxed in the VM and outlives this call.
-    unsafe { (*rt).callers.push(&mut caller as *mut Caller<'_, WasmHost> as usize) };
-    let outcome = stats::time(2, || vm.wasm_import_call(rt, index, params, results));
+    unsafe { (*rt).callers.push(&mut caller as *mut Caller<'_, Host> as usize) };
+    // The WebAssembly that called is charged for its work so far, and the
+    // JavaScript charges its own; returning, WebAssembly gets what is left.
+    // SAFETY (each `&mut *rt`): as above; no other reference is live.
+    let outcome = vm
+        .wasmi_fuel_settle(unsafe { &mut *rt }, false)
+        .and_then(|()| stats::time(2, || vm.wasmi_import_call(rt, index, params, results)).map_err(Failure::Thrown))
+        .and_then(|()| vm.wasmi_fuel_open(unsafe { &mut *rt }));
     unsafe { (*rt).callers.pop() };
-    outcome.map_err(|thrown| wasmi::Error::host(JsException(thrown.0)))
+    outcome.map_err(|failure| wasmi::Error::host(JsException(super::failure_message(failure))))
+}
+
+impl Runtime {
+    /// An empty runtime: its own engine, counting fuel when `metered`, and
+    /// a store whose growth the limiter admits.
+    pub(super) fn new(metered: bool) -> Self {
+        let mut config = Config::default();
+        config.consume_fuel(metered);
+        let engine = Engine::new(&config);
+        let mut store = Store::new(&engine, Host::default());
+        store.limiter(|host| host);
+        Runtime {
+            engine,
+            store,
+            metered,
+            modules: Vec::new(),
+            instances: Vec::new(),
+            funcs: Vec::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            imports: Vec::new(),
+            externs: Vec::new(),
+            extern_refs: Vec::new(),
+            extern_ids: HashMap::new(),
+            callers: Vec::new(),
+        }
+    }
+
+    /// Every Value the runtime holds for the collector: the imported
+    /// functions, the `externref` values and the buffers over memories.
+    pub(super) fn roots(&self, f: &mut dyn FnMut(Value)) {
+        self.imports.iter().chain(&self.externs).for_each(|&v| f(v));
+        self.buffer_roots().for_each(|ab| f(Value::heap(ab)));
+    }
 }
 
 impl<'p> Vm<'p> {
-    /// The VM's runtime, made on first use.
-    pub(crate) fn wasm_runtime(&mut self) -> *mut WasmRuntime {
-        if self.wasm.is_none() {
-            let engine = Engine::default();
-            let store = Store::new(&engine, WasmHost::default());
-            self.wasm = Some(Box::new(WasmRuntime {
-                engine,
-                store,
-                modules: Vec::new(),
-                instances: Vec::new(),
-                funcs: Vec::new(),
-                memories: Vec::new(),
-                tables: Vec::new(),
-                globals: Vec::new(),
-                imports: Vec::new(),
-                externs: Vec::new(),
-                extern_refs: Vec::new(),
-                extern_ids: HashMap::new(),
-                callers: Vec::new(),
-            }));
-        }
-        &mut **self.wasm.as_mut().unwrap()
-    }
-
-    pub(super) fn wasm_op(&mut self, rt: *mut WasmRuntime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
+    pub(super) fn wasmi_op(&mut self, rt: *mut Runtime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
         // SAFETY: the runtime is boxed in the VM and is never dropped while
         // the VM lives; an import re-entering here gets the same box.
         let rt = unsafe { &mut *rt };
+        // The limiter admits growth in this VM, whatever the operation.
+        rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
         let index = |v: Value| -> usize {
             if v.is_number() && v.as_f64() >= 0.0 { v.as_f64() as usize } else { usize::MAX }
         };
@@ -252,7 +318,7 @@ impl<'p> Vm<'p> {
                 Value::num((rt.modules.len() - 1) as f64)
             }
             "moduleImports" => {
-                let module = self.wasm_module(rt, index(a))?;
+                let module = self.wasmi_module(rt, index(a))?;
                 let mut out = Vec::new();
                 for import in module.imports() {
                     let (m, n) = (import.module().to_string(), import.name().to_string());
@@ -263,7 +329,7 @@ impl<'p> Vm<'p> {
                 self.wasm_array(out)
             }
             "moduleExports" => {
-                let module = self.wasm_module(rt, index(a))?;
+                let module = self.wasmi_module(rt, index(a))?;
                 let mut out = Vec::new();
                 for export in module.exports() {
                     let n = export.name().to_string();
@@ -274,7 +340,7 @@ impl<'p> Vm<'p> {
                 self.wasm_array(out)
             }
             "customSections" => {
-                let module = self.wasm_module(rt, index(a))?;
+                let module = self.wasmi_module(rt, index(a))?;
                 let wanted = self.display(b);
                 let sections: Vec<Vec<u8>> = module
                     .custom_sections()
@@ -291,7 +357,7 @@ impl<'p> Vm<'p> {
                 }
                 self.wasm_array(out)
             }
-            "instantiate" => self.wasm_instantiate(rt, index(a), b)?,
+            "instantiate" => self.wasmi_instantiate(rt, index(a), b)?,
             "instanceExports" => {
                 let instance = *rt
                     .instances
@@ -320,7 +386,7 @@ impl<'p> Vm<'p> {
                 }
                 self.wasm_array(out)
             }
-            "call" => self.wasm_call(rt, index(a), b)?,
+            "call" => self.wasmi_call(rt, index(a), b)?,
             "memoryNew" => {
                 let mut builder = MemoryType::builder();
                 builder.min(index(a) as u64);
@@ -329,7 +395,7 @@ impl<'p> Vm<'p> {
                     .build()
                     .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Memory: {e}")))?;
                 let memory = Memory::new(rt.ctx(), ty)
-                    .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Memory: {e}")))?;
+                    .map_err(|e| self.wasm_stopped(Failure::Record("RangeError", format!("WebAssembly.Memory: {e}"))))?;
                 Value::num(rt.memory_id(memory) as f64)
             }
             "memoryBuffer" => {
@@ -357,7 +423,7 @@ impl<'p> Vm<'p> {
                 let memory = rt.memories.get(id).ok_or_else(|| Failure::Record("TypeError", "no such memory".into()))?.memory;
                 let old = memory
                     .grow(rt.ctx(), index(b) as u64)
-                    .map_err(|_| Failure::Record("RangeError", "WebAssembly.Memory.grow: failed to grow memory".into()))?;
+                    .map_err(|_| self.wasm_stopped(Failure::Record("RangeError", "WebAssembly.Memory.grow: failed to grow memory".into())))?;
                 // Growing always detaches the old buffer, moved or not.
                 if let Some((ab, _)) = rt.memories[id].buffer.take() {
                     self.wasm_detach(ab);
@@ -374,15 +440,15 @@ impl<'p> Vm<'p> {
                 };
                 let ty = TableType::new(element, index(a) as u32, max);
                 let table = Table::new(rt.ctx(), ty, null)
-                    .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Table: {e}")))?;
+                    .map_err(|e| self.wasm_stopped(Failure::Record("RangeError", format!("WebAssembly.Table: {e}"))))?;
                 Value::num(rt.table_id(table) as f64)
             }
             "tableSize" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmi_table(rt, index(a))?;
                 Value::num(table.size(rt.ctx()) as f64)
             }
             "tableGet" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmi_table(rt, index(a))?;
                 match table.get(rt.ctx(), index(b) as u64) {
                     Some(Ref::Func(Nullable::Val(f))) => {
                         let id = rt.func_id(f);
@@ -399,7 +465,7 @@ impl<'p> Vm<'p> {
                 }
             }
             "tableSet" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmi_table(rt, index(a))?;
                 let given = self.wasm_items(c);
                 let element = table.ty(rt.ctx()).element();
                 let value = rt.table_element(element, &given)?;
@@ -409,13 +475,13 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
             "tableGrow" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmi_table(rt, index(a))?;
                 let given = self.wasm_items(c);
                 let element = table.ty(rt.ctx()).element();
                 let init = rt.table_element(element, &given)?;
                 let old = table
                     .grow(rt.ctx(), index(b) as u64, init)
-                    .map_err(|_| Failure::Record("RangeError", "WebAssembly.Table.grow: failed to grow table".into()))?;
+                    .map_err(|_| self.wasm_stopped(Failure::Record("RangeError", "WebAssembly.Table.grow: failed to grow table".into())))?;
                 Value::num(old as f64)
             }
             "globalNew" => {
@@ -426,23 +492,23 @@ impl<'p> Vm<'p> {
                     "f64" => ValType::F64,
                     other => return Err(Failure::Record("TypeError", format!("WebAssembly.Global: unsupported type {other}"))),
                 };
-                let value = self.wasm_from_js(rt, c, ty)?;
+                let value = self.wasmi_from_js(rt, c, ty)?;
                 let mutability = if b.is_bool() && b.as_bool() { Mutability::Var } else { Mutability::Const };
                 let global = Global::new(rt.ctx(), value, mutability);
                 Value::num(rt.global_id(global) as f64)
             }
             "globalGet" => {
-                let global = self.wasm_global(rt, index(a))?;
+                let global = self.wasmi_global(rt, index(a))?;
                 let value = global.get(rt.ctx());
-                self.wasm_to_js(rt, &value)?
+                self.wasmi_to_js(rt, &value)?
             }
             "globalSet" => {
-                let global = self.wasm_global(rt, index(a))?;
+                let global = self.wasmi_global(rt, index(a))?;
                 let ty = global.ty(rt.ctx());
                 if ty.mutability() == Mutability::Const {
                     return Err(Failure::Record("TypeError", "WebAssembly.Global: cannot set an immutable global".into()));
                 }
-                let value = self.wasm_from_js(rt, b, ty.content())?;
+                let value = self.wasmi_from_js(rt, b, ty.content())?;
                 global
                     .set(rt.ctx(), value)
                     .map_err(|e| Failure::Record("TypeError", format!("WebAssembly.Global: {e}")))?;
@@ -452,8 +518,8 @@ impl<'p> Vm<'p> {
         })
     }
 
-    fn wasm_instantiate(&mut self, rt: &mut WasmRuntime, module_id: usize, resolved: Value) -> Op<Value> {
-        let module = self.wasm_module(rt, module_id)?;
+    fn wasmi_instantiate(&mut self, rt: &mut Runtime, module_id: usize, resolved: Value) -> Op<Value> {
+        let module = self.wasmi_module(rt, module_id)?;
         let types: Vec<ExternType> = module.imports().map(|i| i.ty().clone()).collect();
         let items = self.wasm_items(resolved);
         if items.len() != types.len() {
@@ -489,7 +555,7 @@ impl<'p> Vm<'p> {
                     if gt.mutability() == Mutability::Var {
                         return Err(link("must be a WebAssembly.Global to be mutable"));
                     }
-                    let v = self.wasm_from_js(rt, value, gt.content())?;
+                    let v = self.wasmi_from_js(rt, value, gt.content())?;
                     Extern::Global(Global::new(rt.ctx(), v, Mutability::Const))
                 }
                 _ => return Err(link("does not match the kind the module expects")),
@@ -497,30 +563,123 @@ impl<'p> Vm<'p> {
             externs.push(ext);
         }
         rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
-        let instance = Instance::new(rt.ctx(), &module, &externs).map_err(|e| self.wasm_failure(e, "LinkError"))?;
+        // Instantiating runs the start function, which wasmi calls in a way
+        // that cannot be resumed: its fuel is all the meter allows, not a
+        // slice, so a host's abort request reaches it only at its imports.
+        let outer = std::mem::replace(&mut rt.ctx().data_mut().sliced, false);
+        let made = self.wasmi_fuel_open(rt).map(|()| Instance::new(rt.ctx(), &module, &externs));
+        rt.ctx().data_mut().sliced = outer;
+        let made = made?;
+        self.wasmi_fuel_settle(rt, matches!(&made, Err(e) if e.as_trap_code() == Some(TrapCode::OutOfFuel)))?;
+        let instance = made.map_err(|e| self.wasmi_failure(e, "LinkError"))?;
         rt.instances.push(instance);
         Ok(Value::num((rt.instances.len() - 1) as f64))
     }
 
-    fn wasm_call(&mut self, rt: &mut WasmRuntime, id: usize, args: Value) -> Op<Value> {
+    /// Before WebAssembly runs: the store's fuel set to what the VM's meter
+    /// allows (`Vm::wasm_fuel`), at most a slice in a call that can resume,
+    /// and marked. `Err` when nothing may run.
+    fn wasmi_fuel_open(&mut self, rt: &mut Runtime) -> Op<()> {
+        if let Some(fuel) = self.wasm_fuel(rt.metered)? {
+            let mut ctx = rt.ctx();
+            let fuel = if ctx.data().sliced { fuel.min(FUEL_SLICE) } else { fuel };
+            // A store made metered counts fuel: setting it cannot fail.
+            let _ = ctx.set_fuel(fuel);
+            ctx.data_mut().fuel_mark = fuel;
+        }
+        Ok(())
+    }
+
+    /// `func` called: in a metered store resumably, its fuel in slices
+    /// (`wasmi_fuel_next`), each charged as it is spent, so a host's abort
+    /// request stops it within a slice; else as one plain call. The outer
+    /// `Err` is the meter's (the budget spent, the script stopped or
+    /// aborted), the inner the call's own.
+    fn wasmi_run(&mut self, rt: &mut Runtime, func: Func, params: &[Val], results: &mut [Val]) -> Op<Result<(), wasmi::Error>> {
+        self.wasmi_fuel_open(rt)?;
+        if !rt.metered {
+            return Ok(stats::time(1, || func.call(rt.ctx(), params, results)));
+        }
+        let mut step = stats::time(1, || func.call_resumable(rt.ctx(), params, results));
+        loop {
+            match step {
+                Ok(ResumableCall::Finished) => {
+                    self.wasmi_fuel_settle(rt, false)?;
+                    return Ok(Ok(()));
+                }
+                // A JavaScript import's exception: not resumed, it unwinds.
+                Ok(ResumableCall::HostTrap(trap)) => {
+                    self.wasmi_fuel_settle(rt, false)?;
+                    return Ok(Err(trap.into_host_error()));
+                }
+                Ok(ResumableCall::OutOfFuel(call)) => {
+                    self.wasmi_fuel_next(rt, call.required_fuel())?;
+                    step = stats::time(1, || call.resume(rt.ctx(), results));
+                }
+                Err(e) => {
+                    self.wasmi_fuel_settle(rt, e.as_trap_code() == Some(TrapCode::OutOfFuel))?;
+                    return Ok(Err(e));
+                }
+            }
+        }
+    }
+
+    /// A resumable call ran out of its slice, needing `required` fuel to
+    /// take its next step: the slice is charged, and the meter decides --
+    /// stopped or aborted, it ends here; with fewer steps left than the step
+    /// needs, the budget is spent; else the next slice (or what the step
+    /// needs, if more) is given.
+    fn wasmi_fuel_next(&mut self, rt: &mut Runtime, required: u64) -> Op<()> {
+        self.wasmi_fuel_settle(rt, false)?;
+        let left = self.wasm_fuel(rt.metered)?.unwrap_or(super::UNLIMITED_FUEL);
+        if left < required.max(1) {
+            return self.wasm_charge(0, true);
+        }
+        let fuel = left.min(FUEL_SLICE.max(required));
+        let mut ctx = rt.ctx();
+        // As in `wasmi_fuel_open`.
+        let _ = ctx.set_fuel(fuel);
+        ctx.data_mut().fuel_mark = fuel;
+        Ok(())
+    }
+
+    /// After WebAssembly ran, or as it calls out: the fuel it spent since the
+    /// mark is charged to the VM's meter, and the mark moved to what is left.
+    /// `ran_out`: it stopped for want of fuel. `Err` with the meter's message
+    /// when the budget is spent.
+    fn wasmi_fuel_settle(&mut self, rt: &mut Runtime, ran_out: bool) -> Op<()> {
+        if !rt.metered {
+            return Ok(());
+        }
+        let mut ctx = rt.ctx();
+        let left = ctx.get_fuel().unwrap_or(0);
+        let mark = std::mem::replace(&mut ctx.data_mut().fuel_mark, left);
+        self.wasm_charge(mark.saturating_sub(left), ran_out)
+    }
+
+    fn wasmi_call(&mut self, rt: &mut Runtime, id: usize, args: Value) -> Op<Value> {
         let func = *rt.funcs.get(id).ok_or_else(|| Failure::Record("TypeError", "no such function".into()))?;
         let ty = func.ty(rt.ctx());
         let given = self.wasm_items(args);
         let mut params = Vec::with_capacity(ty.params().len());
         for (i, &t) in ty.params().iter().enumerate() {
             let v = given.get(i).copied().unwrap_or(Value::UNDEFINED);
-            params.push(self.wasm_from_js(rt, v, t)?);
+            params.push(self.wasmi_from_js(rt, v, t)?);
         }
         let mut results: Vec<Val> = ty.results().iter().map(|&t| Val::default_for_ty(t)).collect();
         rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
-        stats::time(1, || func.call(rt.ctx(), &params, &mut results)).map_err(|e| self.wasm_failure(e, "RuntimeError"))?;
+        let metered = rt.metered;
+        let outer = std::mem::replace(&mut rt.ctx().data_mut().sliced, metered);
+        let ran = self.wasmi_run(rt, func, &params, &mut results);
+        rt.ctx().data_mut().sliced = outer;
+        ran?.map_err(|e| self.wasmi_failure(e, "RuntimeError"))?;
         match results.len() {
             0 => Ok(Value::UNDEFINED),
-            1 => self.wasm_to_js(rt, &results[0]),
+            1 => self.wasmi_to_js(rt, &results[0]),
             _ => {
                 let mut out = Vec::with_capacity(results.len());
                 for r in &results {
-                    out.push(self.wasm_to_js(rt, r)?);
+                    out.push(self.wasmi_to_js(rt, r)?);
                 }
                 Ok(self.wasm_array(out))
             }
@@ -528,12 +687,12 @@ impl<'p> Vm<'p> {
     }
 
     /// An import's call: arguments in, the JavaScript function, result out.
-    fn wasm_import_call(&mut self, rt: *mut WasmRuntime, index: usize, params: &[Val], results: &mut [Val]) -> Result<(), Thrown> {
-        // SAFETY: as in `wasm_op`.
+    fn wasmi_import_call(&mut self, rt: *mut Runtime, index: usize, params: &[Val], results: &mut [Val]) -> Result<(), Thrown> {
+        // SAFETY: as in `wasmi_op`.
         let rt = unsafe { &mut *rt };
         // The memory may have grown in the WebAssembly code that called this.
-        self.wasm_detach_stale(rt);
-        let to_js = |vm: &mut Self, rt: &mut WasmRuntime, p: &Val| match vm.wasm_to_js(rt, p) {
+        self.wasmi_detach_stale(rt);
+        let to_js = |vm: &mut Self, rt: &mut Runtime, p: &Val| match vm.wasmi_to_js(rt, p) {
             Ok(v) => Ok(v),
             Err(Failure::Thrown(t)) => Err(t),
             Err(Failure::Record(kind, message)) => Err(Thrown(format!("{kind}: {message}"))),
@@ -544,7 +703,7 @@ impl<'p> Vm<'p> {
         }
         let f = rt.imports[index];
         let r = self.call_value(f, Value::UNDEFINED, &args)?;
-        let from_js = |vm: &mut Self, rt: &mut WasmRuntime, v: Value, t: ValType| match vm.wasm_from_js(rt, v, t) {
+        let from_js = |vm: &mut Self, rt: &mut Runtime, v: Value, t: ValType| match vm.wasmi_from_js(rt, v, t) {
             Ok(v) => Ok(v),
             Err(Failure::Thrown(t)) => Err(t),
             Err(Failure::Record(kind, message)) => Err(Thrown(format!("{kind}: {message}"))),
@@ -569,18 +728,18 @@ impl<'p> Vm<'p> {
     /// What a wasmi error from instantiating or calling becomes: a JavaScript
     /// exception from an import stays itself (still pending in the VM); a
     /// trap is a `RuntimeError`; anything else is `otherwise`.
-    fn wasm_failure(&mut self, e: wasmi::Error, otherwise: &'static str) -> Failure {
+    fn wasmi_failure(&mut self, e: wasmi::Error, otherwise: &'static str) -> Failure {
         if let Some(js) = e.downcast_ref::<JsException>() {
             return Failure::Thrown(Thrown(js.0.clone()));
         }
         if let Some(code) = e.as_trap_code() {
-            return Failure::Record("RuntimeError", code.to_string());
+            return self.wasm_stopped(Failure::Record("RuntimeError", code.to_string()));
         }
-        Failure::Record(otherwise, e.to_string())
+        self.wasm_stopped(Failure::Record(otherwise, e.to_string()))
     }
 
     /// A wasm value as JavaScript sees it.
-    fn wasm_to_js(&mut self, rt: &mut WasmRuntime, v: &Val) -> Op<Value> {
+    fn wasmi_to_js(&mut self, rt: &mut Runtime, v: &Val) -> Op<Value> {
         Ok(match v {
             Val::I32(i) => Value::num(*i as f64),
             Val::I64(i) => self.make_bigint(*i as i128),
@@ -597,7 +756,7 @@ impl<'p> Vm<'p> {
     }
 
     /// A JavaScript value as a wasm value of type `t`.
-    fn wasm_from_js(&mut self, rt: &mut WasmRuntime, v: Value, t: ValType) -> Op<Val> {
+    fn wasmi_from_js(&mut self, rt: &mut Runtime, v: Value, t: ValType) -> Op<Val> {
         Ok(match t {
             ValType::I32 => Val::I32(to_int32(self.to_number_strict(v)?)),
             ValType::I64 => Val::I64(match self.to_bigint(v)? {
@@ -626,8 +785,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Detach the buffers of the memories whose bytes moved or resized.
-    pub(super) fn wasm_detach_stale(&mut self, rt: *mut WasmRuntime) {
-        // SAFETY: as in `wasm_op`.
+    pub(super) fn wasmi_detach_stale(&mut self, rt: *mut Runtime) {
+        // SAFETY: as in `wasmi_op`.
         let rt = unsafe { &mut *rt };
         for (i, ab) in rt.stale_buffers() {
             self.wasm_detach(ab);
@@ -635,18 +794,18 @@ impl<'p> Vm<'p> {
         }
     }
 
-    fn wasm_module(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Module> {
+    fn wasmi_module(&mut self, rt: &mut Runtime, id: usize) -> Op<Module> {
         rt.modules
             .get(id)
             .cloned()
             .ok_or_else(|| Failure::Record("TypeError", "WebAssembly: not a WebAssembly.Module".into()))
     }
 
-    fn wasm_table(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Table> {
+    fn wasmi_table(&mut self, rt: &mut Runtime, id: usize) -> Op<Table> {
         rt.tables.get(id).copied().ok_or_else(|| Failure::Record("TypeError", "no such table".into()))
     }
 
-    fn wasm_global(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Global> {
+    fn wasmi_global(&mut self, rt: &mut Runtime, id: usize) -> Op<Global> {
         rt.globals.get(id).copied().ok_or_else(|| Failure::Record("TypeError", "no such global".into()))
     }
 }

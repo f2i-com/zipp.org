@@ -233,7 +233,7 @@ jobs:
   engine:
     name: Engine (unit tests + audit regressions)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -295,6 +295,13 @@ jobs:
         run: |
           cargo +1.92.0 check --locked -p zipp-vm --no-default-features
           cargo +1.92.0 check --locked -p zipp-vm --no-default-features --features safe-sandbox
+      # The 64-bit release CLIs run WebAssembly on Wasmtime (`wasm-jit`) with
+      # the JIT on, on wasmi with it off; the other builds have wasmi alone.
+      # Both runtimes, under the step budget and heap ceiling and without.
+      - name: WebAssembly on wasmi and on Wasmtime, metered and not
+        run: |
+          cargo +1.92.0 test --locked -p zipp-vm --features instrument --test webassembly --test webassembly_metering
+          cargo +1.92.0 test --locked -p zipp-vm --features instrument,wasm-jit --test webassembly --test webassembly_metering
 
   wasm:
     name: WebAssembly host boundary

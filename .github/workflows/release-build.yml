@@ -78,18 +78,23 @@ jobs:
         # `pgo`: the CLI is built with profile-guided optimization
         # (tools/release/pgo-build.sh), trained on bench/pgo-training on the
         # runner itself, so only where the runner can run its own binary.
+        # `features`: the CLI's features added to the defaults; the 64-bit
+        # CLIs compile WebAssembly with Wasmtime (`wasm-jit`), which has no
+        # 32-bit host.
         include:
           - name: windows-x86_64
             os: windows-2022
             target: x86_64-pc-windows-msvc
             arch: x86_64
             pgo: true
+            features: wasm-jit
           # The Linux CLIs build on 22.04 for glibc 2.35 compatibility.
           - name: linux-x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: x86_64
             pgo: true
+            features: wasm-jit
           # Natively on an Arm runner, with the whole pinned Test262 corpus:
           # the aarch64 JIT ships for the first time here.
           - name: linux-arm64
@@ -98,6 +103,7 @@ jobs:
             arch: arm64
             test262: full
             pgo: true
+            features: wasm-jit
           # 32-bit Arm, no JIT: cross-built, run under QEMU user emulation.
           # It stays a plain release build: training under emulation would
           # profile the emulator's timing, not the target's.
@@ -113,6 +119,7 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.92.0"
       RUSTFLAGS: -Dwarnings
       RUN_PREFIX: ${{ matrix.run_prefix }}
+      ZIPP_CLI_FEATURES: ${{ matrix.features }}
       RELEASE_VERSION: ${{ needs.identify.outputs.version }}
       EXPECTED_COMMIT: ${{ needs.identify.outputs.commit }}
     steps:
@@ -149,6 +156,7 @@ jobs:
         run: >-
           cargo build --locked --release --package zipp-cli --bin zipp
           --target ${{ matrix.target }}
+          ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       # An instrumented build, the training corpus, the merged profile and
       # the profile-guided build; the binary lands where the plain build's

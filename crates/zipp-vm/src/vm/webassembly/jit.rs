@@ -24,12 +24,12 @@ use crate::value::Value;
 use crate::vm::helpers_num2::to_int32;
 use crate::vm::{Thrown, Vm};
 
-use super::{stats, Failure, Op};
+use super::{grow, stats, table_bytes, Failure, Op};
 
 use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Engine, Extern, ExternRef, ExternType, Func, Global, GlobalType,
-    Instance, Memory, MemoryType, Module, Mutability, OwnedRooted, Ref, RefType, RootScope, Rooted, Store,
-    StoreContextMut, Table, TableType, Trap, Val, ValType,
+    Instance, Memory, MemoryType, Module, Mutability, OwnedRooted, Ref, RefType, ResourceLimiter, RootScope,
+    Rooted, Store, StoreContextMut, Table, TableType, Trap, UpdateDeadline, Val, ValType,
 };
 
 /// How much native stack WebAssembly may use. The VM's threads (the page's,
@@ -37,18 +37,47 @@ use wasmtime::{
 /// a browser allows a deeply recursive program.
 const MAX_WASM_STACK: usize = 8 * 1024 * 1024;
 
-/// The process's engine.
-fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
+/// The process's engines: one whose code counts fuel and checks its epoch,
+/// for VMs with a meter (`metered`), and one whose code does neither, for
+/// the rest. A module is compiled for one of them and runs only in its
+/// stores.
+fn engine(metered: bool) -> &'static Engine {
+    static ENGINES: [OnceLock<Engine>; 2] = [OnceLock::new(), OnceLock::new()];
+    let engine = ENGINES[metered as usize].get_or_init(|| {
         let mut config = Config::new();
         config.max_wasm_stack(MAX_WASM_STACK);
         // No backtrace for a trap: a JavaScript exception thrown through
         // WebAssembly frames (Emscripten's `invoke_*` do this on purpose)
         // would pay for one every time.
         config.wasm_backtrace_max_frames(None);
+        config.consume_fuel(metered);
+        config.epoch_interruption(metered);
         Engine::new(&config).expect("the WebAssembly engine's configuration is valid")
-    })
+    });
+    if metered {
+        start_epoch_ticker();
+    }
+    engine
+}
+
+/// How often the metered engine's epoch advances: how soon WebAssembly
+/// running on it notices a host's abort request.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The thread advancing the metered engine's epoch, started with it. At each
+/// tick the code running in every metered store reaches its deadline and
+/// asks its VM's meter whether to go on (`Runtime::new`).
+fn start_epoch_ticker() {
+    static TICKER: OnceLock<()> = OnceLock::new();
+    TICKER.get_or_init(|| {
+        let spawned = std::thread::Builder::new().name("zipp-wasm-epoch".into()).spawn(|| loop {
+            std::thread::sleep(EPOCH_TICK);
+            engine(true).increment_epoch();
+        });
+        // Without the thread the deadline set at each entry is never
+        // reached: WebAssembly still runs, and the step budget still holds.
+        drop(spawned);
+    });
 }
 
 /// A compiled module, and its custom sections (which Wasmtime does not keep).
@@ -57,17 +86,18 @@ struct Compiled {
     custom: Vec<(String, Vec<u8>)>,
 }
 
-/// `bytes` compiled: the module compiled before from the same bytes, if any.
-fn compile(bytes: &[u8]) -> wasmtime::Result<Arc<Compiled>> {
-    static MODULES: OnceLock<Mutex<HashMap<(usize, u64), Arc<Compiled>>>> = OnceLock::new();
+/// `bytes` compiled for the engine `metered` names: the module compiled
+/// before from the same bytes for it, if any.
+fn compile(bytes: &[u8], metered: bool) -> wasmtime::Result<Arc<Compiled>> {
+    static MODULES: OnceLock<Mutex<HashMap<(bool, usize, u64), Arc<Compiled>>>> = OnceLock::new();
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
-    let key = (bytes.len(), hasher.finish());
+    let key = (metered, bytes.len(), hasher.finish());
     let modules = MODULES.get_or_init(Mutex::default);
     if let Some(compiled) = modules.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Ok(compiled.clone());
     }
-    let module = Module::new(engine(), bytes)?;
+    let module = Module::new(engine(metered), bytes)?;
     let custom = wasmparser::Parser::new(0)
         .parse_all(bytes)
         .filter_map(|payload| match payload {
@@ -80,11 +110,36 @@ fn compile(bytes: &[u8]) -> wasmtime::Result<Arc<Compiled>> {
     Ok(compiled)
 }
 
-/// The store's data: the VM, for an import to call back into. Set before
-/// every entry into WebAssembly, as the VM may have moved since.
+/// The store's data: the VM, for an import to call back into and for the
+/// limiter to admit growth against, set by every operation as the VM may
+/// have moved since; and the fuel the store held when last set or charged
+/// for (`Vm::wasmtime_fuel_settle`).
 #[derive(Default)]
-pub(crate) struct WasmHost {
+pub(crate) struct Host {
     vm: usize,
+    fuel_mark: u64,
+}
+
+/// Every memory's and table's growth, the initial size included, is admitted
+/// against the VM's heap ceiling (`super::grow`); a refusal traps, as the
+/// script has been stopped. A growth past the entity's own maximum fails
+/// without taking anything.
+impl ResourceLimiter for Host {
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        if maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        grow(self.vm, desired.saturating_sub(current)).map_err(wasmtime::Error::msg)?;
+        Ok(true)
+    }
+
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        if maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        grow(self.vm, table_bytes(desired.saturating_sub(current))).map_err(wasmtime::Error::msg)?;
+        Ok(true)
+    }
 }
 
 /// A memory and the `ArrayBuffer` last handed out for it, with the bytes it
@@ -94,7 +149,7 @@ struct WasmMemory {
     buffer: Option<(u32, ExternalBytes)>,
 }
 
-/// A store context an operation runs in, by address (see `WasmRuntime::ctx`).
+/// A store context an operation runs in, by address (see `Runtime::ctx`).
 #[derive(Clone, Copy)]
 enum Context {
     /// A running import's `Caller`.
@@ -103,11 +158,14 @@ enum Context {
     Scope(usize),
 }
 
-type ScopeCtx = RootScope<StoreContextMut<'static, WasmHost>>;
+type ScopeCtx = RootScope<StoreContextMut<'static, Host>>;
 
 /// Everything WebAssembly in one VM: the store and what is numbered in it.
-pub(crate) struct WasmRuntime {
-    store: Store<WasmHost>,
+pub(crate) struct Runtime {
+    store: Store<Host>,
+    /// Whether the store is on the engine that counts fuel: the VM had a
+    /// meter when the runtime was made (`Vm::wasm_fuel`).
+    metered: bool,
     modules: Vec<Arc<Compiled>>,
     instances: Vec<Instance>,
     funcs: Vec<Func>,
@@ -129,16 +187,16 @@ pub(crate) struct WasmRuntime {
     contexts: Vec<Context>,
 }
 
-impl WasmRuntime {
+impl Runtime {
     /// The store context for the next operation: the innermost running
     /// import's or operation's, else the store's.
-    fn ctx(&mut self) -> StoreContextMut<'_, WasmHost> {
+    fn ctx(&mut self) -> StoreContextMut<'_, Host> {
         match self.contexts.last() {
             // SAFETY: the address is of a `Caller` that `js_import` pushed and
             // pops before returning; while it is on the stack that frame is
             // suspended, so nothing else uses the caller.
-            Some(&Context::Caller(caller)) => unsafe { (*(caller as *mut Caller<'static, WasmHost>)).as_context_mut() },
-            // SAFETY: as for a caller: the scope is `wasm_op`'s, popped before
+            Some(&Context::Caller(caller)) => unsafe { (*(caller as *mut Caller<'static, Host>)).as_context_mut() },
+            // SAFETY: as for a caller: the scope is `wasmtime_op`'s, popped before
             // it is dropped.
             Some(&Context::Scope(scope)) => unsafe { (*(scope as *mut ScopeCtx)).as_context_mut() },
             None => self.store.as_context_mut(),
@@ -276,85 +334,116 @@ impl std::error::Error for JsException {}
 /// The body of every JavaScript import: convert the arguments, call the
 /// function, convert its result.
 fn js_import(
-    mut caller: Caller<'_, WasmHost>,
+    mut caller: Caller<'_, Host>,
     index: usize,
     result_types: &[ValType],
     params: &[Val],
     results: &mut [Val],
 ) -> wasmtime::Result<()> {
     // SAFETY: `vm` was set to the live VM by the entry into WebAssembly that
-    // is running this import (see `WasmHost`), and the VM is suspended in
+    // is running this import (see `Host`), and the VM is suspended in
     // that entry, inside `wasm_host_op`.
     let vm = unsafe { &mut *(caller.data().vm as *mut Vm<'static>) };
-    let rt = vm.wasm_runtime();
+    let rt = vm.wasmtime_runtime();
     // SAFETY: the runtime is boxed in the VM and outlives this call.
-    unsafe { (*rt).contexts.push(Context::Caller(&mut caller as *mut Caller<'_, WasmHost> as usize)) };
-    let outcome = stats::time(2, || vm.wasm_import_call(rt, index, result_types, params, results));
+    unsafe { (*rt).contexts.push(Context::Caller(&mut caller as *mut Caller<'_, Host> as usize)) };
+    // The WebAssembly that called is charged for its work so far, and the
+    // JavaScript charges its own; returning, WebAssembly gets what is left.
+    // SAFETY (each `&mut *rt`): as above; no other reference is live.
+    let outcome = vm
+        .wasmtime_fuel_settle(unsafe { &mut *rt }, false)
+        .and_then(|()| {
+            stats::time(2, || vm.wasmtime_import_call(rt, index, result_types, params, results)).map_err(Failure::Thrown)
+        })
+        .and_then(|()| vm.wasmtime_fuel_open(unsafe { &mut *rt }));
     unsafe { (*rt).contexts.pop() };
-    outcome.map_err(|thrown| wasmtime::Error::new(JsException(thrown.0)))
+    outcome.map_err(|failure| wasmtime::Error::new(JsException(super::failure_message(failure))))
+}
+
+impl Runtime {
+    /// An empty runtime: a store on the process's engine that counts fuel
+    /// when `metered`, whose growth the limiter admits. A metered store's
+    /// code, at each epoch tick, goes on only while its VM's meter allows:
+    /// a host's abort request, or a script the meter stopped, ends it there.
+    pub(super) fn new(metered: bool) -> Self {
+        let mut store = Store::new(engine(metered), Host::default());
+        store.limiter(|host| host);
+        if metered {
+            store.epoch_deadline_callback(|ctx| {
+                if super::stop_requested(ctx.data().vm) {
+                    Err(wasmtime::Error::msg("the host stopped the script"))
+                } else {
+                    Ok(UpdateDeadline::Continue(1))
+                }
+            });
+        }
+        Runtime {
+            store,
+            metered,
+            modules: Vec::new(),
+            instances: Vec::new(),
+            funcs: Vec::new(),
+            func_ids: HashMap::new(),
+            memories: Vec::new(),
+            tables: Vec::new(),
+            globals: Vec::new(),
+            imports: Vec::new(),
+            externs: Vec::new(),
+            extern_refs: Vec::new(),
+            extern_ids: HashMap::new(),
+            contexts: Vec::new(),
+        }
+    }
+
+    /// Every Value the runtime holds for the collector: the imported
+    /// functions, the `externref` values and the buffers over memories.
+    pub(super) fn roots(&self, f: &mut dyn FnMut(Value)) {
+        self.imports.iter().chain(&self.externs).for_each(|&v| f(v));
+        self.buffer_roots().for_each(|ab| f(Value::heap(ab)));
+    }
 }
 
 impl<'p> Vm<'p> {
-    /// The VM's runtime, made on first use.
-    pub(crate) fn wasm_runtime(&mut self) -> *mut WasmRuntime {
-        if self.wasm.is_none() {
-            let store = Store::new(engine(), WasmHost::default());
-            self.wasm = Some(Box::new(WasmRuntime {
-                store,
-                modules: Vec::new(),
-                instances: Vec::new(),
-                funcs: Vec::new(),
-                func_ids: HashMap::new(),
-                memories: Vec::new(),
-                tables: Vec::new(),
-                globals: Vec::new(),
-                imports: Vec::new(),
-                externs: Vec::new(),
-                extern_refs: Vec::new(),
-                extern_ids: HashMap::new(),
-                contexts: Vec::new(),
-            }));
-        }
-        &mut **self.wasm.as_mut().unwrap()
-    }
-
     /// One operation, in a root scope of its own: the references it makes to
     /// pass `externref`s are let go when it ends.
-    pub(super) fn wasm_op(&mut self, rt: *mut WasmRuntime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
+    pub(super) fn wasmtime_op(&mut self, rt: *mut Runtime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
         // SAFETY: the runtime is boxed in the VM and is never dropped while
         // the VM lives; an import re-entering here gets the same box.
         let runtime = unsafe { &mut *rt };
         // SAFETY: the scope is used only through `contexts` while this frame
         // runs, and is popped before it is dropped.
-        let ctx: StoreContextMut<'static, WasmHost> = unsafe { std::mem::transmute(runtime.ctx()) };
+        let ctx: StoreContextMut<'static, Host> = unsafe { std::mem::transmute(runtime.ctx()) };
         let mut scope: ScopeCtx = RootScope::new(ctx);
         runtime.contexts.push(Context::Scope(&mut scope as *mut ScopeCtx as usize));
-        let outcome = self.wasm_op_in(rt, name, a, b, c);
+        let outcome = self.wasmtime_op_in(rt, name, a, b, c);
         // SAFETY: as above.
         unsafe { (*rt).contexts.pop() };
         drop(scope);
         outcome
     }
 
-    fn wasm_op_in(&mut self, rt: *mut WasmRuntime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
-        // SAFETY: as in `wasm_op`.
+    fn wasmtime_op_in(&mut self, rt: *mut Runtime, name: &str, a: Value, b: Value, c: Value) -> Op<Value> {
+        // SAFETY: as in `wasmtime_op`.
         let rt = unsafe { &mut *rt };
+        // The limiter admits growth in this VM, whatever the operation.
+        rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
         let index = |v: Value| -> usize {
             if v.is_number() && v.as_f64() >= 0.0 { v.as_f64() as usize } else { usize::MAX }
         };
         Ok(match name {
             "validate" => {
                 let bytes = self.wasm_bytes(a)?;
-                Value::bool(Module::validate(engine(), &bytes).is_ok())
+                Value::bool(Module::validate(engine(rt.metered), &bytes).is_ok())
             }
             "compile" => {
                 let bytes = self.wasm_bytes(a)?;
-                let compiled = compile(&bytes).map_err(|e| Failure::Record("CompileError", format!("{e:#}")))?;
+                let compiled =
+                    compile(&bytes, rt.metered).map_err(|e| Failure::Record("CompileError", format!("{e:#}")))?;
                 rt.modules.push(compiled);
                 Value::num((rt.modules.len() - 1) as f64)
             }
             "moduleImports" => {
-                let compiled = self.wasm_module(rt, index(a))?;
+                let compiled = self.wasmtime_module(rt, index(a))?;
                 let mut out = Vec::new();
                 for import in compiled.module.imports() {
                     let (m, n) = (import.module().to_string(), import.name().to_string());
@@ -365,7 +454,7 @@ impl<'p> Vm<'p> {
                 self.wasm_array(out)
             }
             "moduleExports" => {
-                let compiled = self.wasm_module(rt, index(a))?;
+                let compiled = self.wasmtime_module(rt, index(a))?;
                 let mut out = Vec::new();
                 for export in compiled.module.exports() {
                     let n = export.name().to_string();
@@ -376,7 +465,7 @@ impl<'p> Vm<'p> {
                 self.wasm_array(out)
             }
             "customSections" => {
-                let compiled = self.wasm_module(rt, index(a))?;
+                let compiled = self.wasmtime_module(rt, index(a))?;
                 let wanted = self.display(b);
                 let mut out = Vec::new();
                 for (_, data) in compiled.custom.iter().filter(|(n, _)| *n == wanted) {
@@ -388,7 +477,7 @@ impl<'p> Vm<'p> {
                 }
                 self.wasm_array(out)
             }
-            "instantiate" => self.wasm_instantiate(rt, index(a), b)?,
+            "instantiate" => self.wasmtime_instantiate(rt, index(a), b)?,
             "instanceExports" => {
                 let instance = *rt
                     .instances
@@ -419,7 +508,7 @@ impl<'p> Vm<'p> {
                 }
                 self.wasm_array(out)
             }
-            "call" => self.wasm_call(rt, index(a), b)?,
+            "call" => self.wasmtime_call(rt, index(a), b)?,
             "memoryNew" => {
                 let min = u32::try_from(index(a)).map_err(|_| Failure::Record("RangeError", "WebAssembly.Memory: initial is too large".into()))?;
                 let max = if b.is_undefined() {
@@ -428,7 +517,7 @@ impl<'p> Vm<'p> {
                     Some(u32::try_from(index(b)).map_err(|_| Failure::Record("RangeError", "WebAssembly.Memory: maximum is too large".into()))?)
                 };
                 let memory = Memory::new(rt.ctx(), MemoryType::new(min, max))
-                    .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Memory: {e}")))?;
+                    .map_err(|e| self.wasm_stopped(Failure::Record("RangeError", format!("WebAssembly.Memory: {e}"))))?;
                 Value::num(rt.memory_id(memory) as f64)
             }
             "memoryBuffer" => {
@@ -456,7 +545,7 @@ impl<'p> Vm<'p> {
                 let memory = rt.memories.get(id).ok_or_else(|| Failure::Record("TypeError", "no such memory".into()))?.memory;
                 let old = memory
                     .grow(rt.ctx(), index(b) as u64)
-                    .map_err(|_| Failure::Record("RangeError", "WebAssembly.Memory.grow: failed to grow memory".into()))?;
+                    .map_err(|_| self.wasm_stopped(Failure::Record("RangeError", "WebAssembly.Memory.grow: failed to grow memory".into())))?;
                 // Growing always detaches the old buffer, moved or not.
                 if let Some((ab, _)) = rt.memories[id].buffer.take() {
                     self.wasm_detach(ab);
@@ -470,15 +559,15 @@ impl<'p> Vm<'p> {
                     if externs { (RefType::EXTERNREF, Ref::Extern(None)) } else { (RefType::FUNCREF, Ref::Func(None)) };
                 let ty = TableType::new(element, index(a) as u32, max);
                 let table = Table::new(rt.ctx(), ty, null)
-                    .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Table: {e}")))?;
+                    .map_err(|e| self.wasm_stopped(Failure::Record("RangeError", format!("WebAssembly.Table: {e}"))))?;
                 Value::num(rt.table_id(table) as f64)
             }
             "tableSize" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmtime_table(rt, index(a))?;
                 Value::num(table.size(rt.ctx()) as f64)
             }
             "tableGet" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmtime_table(rt, index(a))?;
                 match table.get(rt.ctx(), index(b) as u64) {
                     Some(Ref::Func(Some(f))) => {
                         let id = rt.func_id(f);
@@ -495,7 +584,7 @@ impl<'p> Vm<'p> {
                 }
             }
             "tableSet" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmtime_table(rt, index(a))?;
                 let given = self.wasm_items(c);
                 let element = table.ty(rt.ctx()).element().clone();
                 let value = rt.table_element(&element, &given)?;
@@ -505,13 +594,13 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
             "tableGrow" => {
-                let table = self.wasm_table(rt, index(a))?;
+                let table = self.wasmtime_table(rt, index(a))?;
                 let given = self.wasm_items(c);
                 let element = table.ty(rt.ctx()).element().clone();
                 let init = rt.table_element(&element, &given)?;
                 let old = table
                     .grow(rt.ctx(), index(b) as u64, init)
-                    .map_err(|_| Failure::Record("RangeError", "WebAssembly.Table.grow: failed to grow table".into()))?;
+                    .map_err(|_| self.wasm_stopped(Failure::Record("RangeError", "WebAssembly.Table.grow: failed to grow table".into())))?;
                 Value::num(old as f64)
             }
             "globalNew" => {
@@ -522,24 +611,24 @@ impl<'p> Vm<'p> {
                     "f64" => ValType::F64,
                     other => return Err(Failure::Record("TypeError", format!("WebAssembly.Global: unsupported type {other}"))),
                 };
-                let value = self.wasm_from_js(rt, c, &ty)?;
+                let value = self.wasmtime_from_js(rt, c, &ty)?;
                 let mutability = if b.is_bool() && b.as_bool() { Mutability::Var } else { Mutability::Const };
                 let global = Global::new(rt.ctx(), GlobalType::new(ty, mutability), value)
                     .map_err(|e| Failure::Record("TypeError", format!("WebAssembly.Global: {e}")))?;
                 Value::num(rt.global_id(global) as f64)
             }
             "globalGet" => {
-                let global = self.wasm_global(rt, index(a))?;
+                let global = self.wasmtime_global(rt, index(a))?;
                 let value = global.get(rt.ctx());
-                self.wasm_to_js(rt, &value)?
+                self.wasmtime_to_js(rt, &value)?
             }
             "globalSet" => {
-                let global = self.wasm_global(rt, index(a))?;
+                let global = self.wasmtime_global(rt, index(a))?;
                 let ty = global.ty(rt.ctx());
                 if ty.mutability() == Mutability::Const {
                     return Err(Failure::Record("TypeError", "WebAssembly.Global: cannot set an immutable global".into()));
                 }
-                let value = self.wasm_from_js(rt, b, ty.content())?;
+                let value = self.wasmtime_from_js(rt, b, ty.content())?;
                 global
                     .set(rt.ctx(), value)
                     .map_err(|e| Failure::Record("TypeError", format!("WebAssembly.Global: {e}")))?;
@@ -549,8 +638,8 @@ impl<'p> Vm<'p> {
         })
     }
 
-    fn wasm_instantiate(&mut self, rt: &mut WasmRuntime, module_id: usize, resolved: Value) -> Op<Value> {
-        let compiled = self.wasm_module(rt, module_id)?;
+    fn wasmtime_instantiate(&mut self, rt: &mut Runtime, module_id: usize, resolved: Value) -> Op<Value> {
+        let compiled = self.wasmtime_module(rt, module_id)?;
         let types: Vec<ExternType> = compiled.module.imports().map(|i| i.ty()).collect();
         let items = self.wasm_items(resolved);
         if items.len() != types.len() {
@@ -587,7 +676,7 @@ impl<'p> Vm<'p> {
                     if gt.mutability() == Mutability::Var {
                         return Err(link("must be a WebAssembly.Global to be mutable"));
                     }
-                    let v = self.wasm_from_js(rt, value, gt.content())?;
+                    let v = self.wasmtime_from_js(rt, value, gt.content())?;
                     let global = Global::new(rt.ctx(), GlobalType::new(gt.content().clone(), Mutability::Const), v)
                         .map_err(|e| Failure::Record("LinkError", format!("WebAssembly.Instance: import #{i}: {e}")))?;
                     Extern::Global(global)
@@ -597,31 +686,66 @@ impl<'p> Vm<'p> {
             externs.push(ext);
         }
         rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
-        let instance =
-            Instance::new(rt.ctx(), &compiled.module, &externs).map_err(|e| self.wasm_failure(e, "LinkError"))?;
+        // Instantiating runs the start function.
+        self.wasmtime_fuel_open(rt)?;
+        let made = Instance::new(rt.ctx(), &compiled.module, &externs);
+        self.wasmtime_fuel_settle(rt, matches!(&made, Err(e) if out_of_fuel(e)))?;
+        let instance = made.map_err(|e| self.wasmtime_failure(e, "LinkError"))?;
         rt.instances.push(instance);
         Ok(Value::num((rt.instances.len() - 1) as f64))
     }
 
-    fn wasm_call(&mut self, rt: &mut WasmRuntime, id: usize, args: Value) -> Op<Value> {
+    /// Before WebAssembly runs: the store's fuel set to what the VM's meter
+    /// allows (`Vm::wasm_fuel`), and marked. `Err` when nothing may run.
+    fn wasmtime_fuel_open(&mut self, rt: &mut Runtime) -> Op<()> {
+        if let Some(fuel) = self.wasm_fuel(rt.metered)? {
+            let mut ctx = rt.ctx();
+            // A store on the metered engine counts fuel: setting it cannot fail.
+            let _ = ctx.set_fuel(fuel);
+            ctx.data_mut().fuel_mark = fuel;
+            // Its code checks the epoch too: the next tick asks the meter
+            // (`Runtime::new`). The default deadline, 0, has always passed.
+            ctx.set_epoch_deadline(1);
+        }
+        Ok(())
+    }
+
+    /// After WebAssembly ran, or as it calls out: the fuel it spent since the
+    /// mark is charged to the VM's meter, and the mark moved to what is left.
+    /// `ran_out`: it stopped for want of fuel. `Err` with the meter's message
+    /// when the budget is spent.
+    fn wasmtime_fuel_settle(&mut self, rt: &mut Runtime, ran_out: bool) -> Op<()> {
+        if !rt.metered {
+            return Ok(());
+        }
+        let mut ctx = rt.ctx();
+        let left = ctx.get_fuel().unwrap_or(0);
+        let mark = std::mem::replace(&mut ctx.data_mut().fuel_mark, left);
+        self.wasm_charge(mark.saturating_sub(left), ran_out)
+    }
+
+    fn wasmtime_call(&mut self, rt: &mut Runtime, id: usize, args: Value) -> Op<Value> {
         let func = *rt.funcs.get(id).ok_or_else(|| Failure::Record("TypeError", "no such function".into()))?;
         let ty = func.ty(rt.ctx());
         let given = self.wasm_items(args);
         let mut params = Vec::with_capacity(ty.params().len());
         for (i, t) in ty.params().enumerate() {
             let v = given.get(i).copied().unwrap_or(Value::UNDEFINED);
-            params.push(self.wasm_from_js(rt, v, &t)?);
+            params.push(self.wasmtime_from_js(rt, v, &t)?);
         }
         let mut results: Vec<Val> = ty.results().map(|t| Val::default_for_ty(&t).unwrap_or(Val::I32(0))).collect();
         rt.ctx().data_mut().vm = self as *mut Vm<'p> as usize;
-        stats::time(1, || func.call(rt.ctx(), &params, &mut results)).map_err(|e| self.wasm_failure(e, "RuntimeError"))?;
+        self.wasmtime_fuel_open(rt)?;
+        let ran = stats::time(1, || func.call(rt.ctx(), &params, &mut results));
+        self.wasmtime_fuel_settle(rt, matches!(&ran, Err(e) if out_of_fuel(e)))?;
+        ran.map_err(|e| self.wasmtime_failure(e, "RuntimeError"))?;
         match results.len() {
             0 => Ok(Value::UNDEFINED),
-            1 => self.wasm_to_js(rt, &results[0]),
+            1 => self.wasmtime_to_js(rt, &results[0]),
             _ => {
                 let mut out = Vec::with_capacity(results.len());
                 for r in &results {
-                    out.push(self.wasm_to_js(rt, r)?);
+                    out.push(self.wasmtime_to_js(rt, r)?);
                 }
                 Ok(self.wasm_array(out))
             }
@@ -629,19 +753,19 @@ impl<'p> Vm<'p> {
     }
 
     /// An import's call: arguments in, the JavaScript function, result out.
-    fn wasm_import_call(
+    fn wasmtime_import_call(
         &mut self,
-        rt: *mut WasmRuntime,
+        rt: *mut Runtime,
         index: usize,
         result_types: &[ValType],
         params: &[Val],
         results: &mut [Val],
     ) -> Result<(), Thrown> {
-        // SAFETY: as in `wasm_op`.
+        // SAFETY: as in `wasmtime_op`.
         let rt = unsafe { &mut *rt };
         // The memory may have grown in the WebAssembly code that called this.
-        self.wasm_detach_stale(rt);
-        let to_js = |vm: &mut Self, rt: &mut WasmRuntime, p: &Val| match vm.wasm_to_js(rt, p) {
+        self.wasmtime_detach_stale(rt);
+        let to_js = |vm: &mut Self, rt: &mut Runtime, p: &Val| match vm.wasmtime_to_js(rt, p) {
             Ok(v) => Ok(v),
             Err(Failure::Thrown(t)) => Err(t),
             Err(Failure::Record(kind, message)) => Err(Thrown(format!("{kind}: {message}"))),
@@ -652,7 +776,7 @@ impl<'p> Vm<'p> {
         }
         let f = rt.imports[index];
         let r = self.call_value(f, Value::UNDEFINED, &args)?;
-        let from_js = |vm: &mut Self, rt: &mut WasmRuntime, v: Value, t: &ValType| match vm.wasm_from_js(rt, v, t) {
+        let from_js = |vm: &mut Self, rt: &mut Runtime, v: Value, t: &ValType| match vm.wasmtime_from_js(rt, v, t) {
             Ok(v) => Ok(v),
             Err(Failure::Thrown(t)) => Err(t),
             Err(Failure::Record(kind, message)) => Err(Thrown(format!("{kind}: {message}"))),
@@ -673,20 +797,20 @@ impl<'p> Vm<'p> {
     /// What an error from instantiating or calling becomes: a JavaScript
     /// exception from an import stays itself (still pending in the VM); a
     /// trap is a `RuntimeError`; anything else is `otherwise`.
-    fn wasm_failure(&mut self, e: wasmtime::Error, otherwise: &'static str) -> Failure {
+    fn wasmtime_failure(&mut self, e: wasmtime::Error, otherwise: &'static str) -> Failure {
         if let Some(js) = e.downcast_ref::<JsException>() {
             return Failure::Thrown(Thrown(js.0.clone()));
         }
         if let Some(trap) = e.downcast_ref::<Trap>() {
             // "integer divide by zero", without Wasmtime's "wasm trap: ".
             let message = trap.to_string();
-            return Failure::Record("RuntimeError", message.trim_start_matches("wasm trap: ").to_string());
+            return self.wasm_stopped(Failure::Record("RuntimeError", message.trim_start_matches("wasm trap: ").to_string()));
         }
-        Failure::Record(otherwise, format!("{e:#}"))
+        self.wasm_stopped(Failure::Record(otherwise, format!("{e:#}")))
     }
 
     /// A wasm value as JavaScript sees it.
-    fn wasm_to_js(&mut self, rt: &mut WasmRuntime, v: &Val) -> Op<Value> {
+    fn wasmtime_to_js(&mut self, rt: &mut Runtime, v: &Val) -> Op<Value> {
         Ok(match v {
             Val::I32(i) => Value::num(*i as f64),
             Val::I64(i) => self.make_bigint(*i as i128),
@@ -703,7 +827,7 @@ impl<'p> Vm<'p> {
     }
 
     /// A JavaScript value as a wasm value of type `t`.
-    fn wasm_from_js(&mut self, rt: &mut WasmRuntime, v: Value, t: &ValType) -> Op<Val> {
+    fn wasmtime_from_js(&mut self, rt: &mut Runtime, v: Value, t: &ValType) -> Op<Val> {
         Ok(match t {
             ValType::I32 => Val::I32(to_int32(self.to_number_strict(v)?)),
             ValType::I64 => Val::I64(match self.to_bigint(v)? {
@@ -738,8 +862,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Detach the buffers of the memories whose bytes moved or resized.
-    pub(super) fn wasm_detach_stale(&mut self, rt: *mut WasmRuntime) {
-        // SAFETY: as in `wasm_op`.
+    pub(super) fn wasmtime_detach_stale(&mut self, rt: *mut Runtime) {
+        // SAFETY: as in `wasmtime_op`.
         let rt = unsafe { &mut *rt };
         for (i, ab) in rt.stale_buffers() {
             self.wasm_detach(ab);
@@ -747,20 +871,25 @@ impl<'p> Vm<'p> {
         }
     }
 
-    fn wasm_module(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Arc<Compiled>> {
+    fn wasmtime_module(&mut self, rt: &mut Runtime, id: usize) -> Op<Arc<Compiled>> {
         rt.modules
             .get(id)
             .cloned()
             .ok_or_else(|| Failure::Record("TypeError", "WebAssembly: not a WebAssembly.Module".into()))
     }
 
-    fn wasm_table(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Table> {
+    fn wasmtime_table(&mut self, rt: &mut Runtime, id: usize) -> Op<Table> {
         rt.tables.get(id).copied().ok_or_else(|| Failure::Record("TypeError", "no such table".into()))
     }
 
-    fn wasm_global(&mut self, rt: &mut WasmRuntime, id: usize) -> Op<Global> {
+    fn wasmtime_global(&mut self, rt: &mut Runtime, id: usize) -> Op<Global> {
         rt.globals.get(id).copied().ok_or_else(|| Failure::Record("TypeError", "no such global".into()))
     }
+}
+
+/// Whether WebAssembly stopped for want of fuel.
+fn out_of_fuel(e: &wasmtime::Error) -> bool {
+    matches!(e.downcast_ref::<Trap>(), Some(Trap::OutOfFuel))
 }
 
 /// Whether two Wasmtime handles name the same entity. They have no

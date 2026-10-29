@@ -46,6 +46,32 @@ if [[ "$arch" == x86_64 ]]; then
   jitlog="$(ZIPP_JIT_THRESHOLD=1 ZIPP_JITLOG=1 "$@" js smoke.js 2>&1)"
   grep -q 'compiled' <<<"$jitlog"
 fi
+# WebAssembly, with the JIT on and off: Wasmtime runs it in a CLI built with
+# `wasm-jit` (ZIPP_CLI_FEATURES, as release-build.yml sets it) while the JIT
+# is on, wasmi otherwise, as the runtime line of the JIT log says.
+cat > "$work/wasm.js" <<'SMOKE'
+const head = [0, 97, 115, 109, 1, 0, 0, 0];
+const count = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([...head, 1, 6, 1, 96, 1, 127, 1, 127,
+  3, 2, 1, 0, 7, 9, 1, 5, 99, 111, 117, 110, 116, 0, 0, 10, 26, 1, 24, 0, 2, 64, 3, 64, 32, 0, 69, 13, 1, 32, 0,
+  65, 1, 107, 33, 0, 12, 0, 11, 11, 65, 7, 11])))).exports.count;
+const memory = new WebAssembly.Memory({ initial: 2 });
+new Uint8Array(memory.buffer)[70000] = 9;
+console.log(`zipp-wasm-smoke ${count(1000000)} ${new Uint8Array(memory.buffer)[70000]} ${memory.buffer.byteLength}`);
+SMOKE
+for jit in on off; do
+  if [[ $jit == off ]]; then nojit=(env ZIPP_NOJIT=1); else nojit=(env); fi
+  wasm="$("${nojit[@]}" ZIPP_JITLOG=1 "$@" js wasm.js 2>&1 | tr -d '\r')"
+  if ! grep -qx 'zipp-wasm-smoke 7 9 131072' <<<"$wasm"; then
+    echo "wasm smoke output (JIT $jit): $wasm" >&2
+    exit 1
+  fi
+  runtime=wasmi
+  if [[ $jit == on && ${ZIPP_CLI_FEATURES:-} == *wasm-jit* ]]; then runtime=wasmtime; fi
+  if ! grep -q "^\[wasm\] runtime $runtime" <<<"$wasm"; then
+    echo "wasm smoke (JIT $jit) did not run on $runtime: $wasm" >&2
+    exit 1
+  fi
+done
 python="$("$@" py smoke.py | tr -d '\r')"
 if [[ "$python" != "zipp-release-smoke 14 ['b', 'a']" ]]; then
   echo "python smoke output: $python" >&2
