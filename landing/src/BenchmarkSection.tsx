@@ -144,7 +144,7 @@ const READING: Record<Mode, { title: string; copy: string }[]> = {
     { title: 'Same answers', copy: `Every run’s output must equal CPython’s. ${python.zippOnlyPrograms} more programs (the torch ones) have no CPython counterpart and are left out of every figure here.` },
   ],
   release: [
-    { title: `What ${rel.version} changed`, copy: `The published ${rel.version} and ${rel.previous} Windows binaries, as downloaded, on bundled applications: one script per library, a fixed workload, the bundle’s compile included. These are plain release builds, not the profile-guided build the other tabs measure.` },
+    { title: `What ${rel.version} changed`, copy: `The published ${rel.version} and ${rel.previous} Windows binaries, as downloaded, on bundled applications: one script per library, a fixed workload, the bundle’s compile included. They are the release builds as published (profile-guided since 0.0.31, with the release’s features and its own training run), not the canonical profile-guided build the other tabs measure.` },
     { title: 'Two dies, one processor', copy: `The Ryzen 9 9950X3D has one die with ${rel.dies.large} and one with ${rel.dies.small}. Large programs feel the difference, so every figure is given for both: runs are pinned to one core of the chosen die.` },
     { title: 'A release comparison', copy: 'Measured for the release notes with scratch scripts on an otherwise idle machine, not one of the stamped, provenance-checked captures behind the other tabs. The notes carry the full method, the memory figures and the slower rows.' },
   ],
@@ -192,7 +192,7 @@ export function BenchmarkSection() {
 
       {mode === 'release' ? (
         <p className="benchmark-capture-note">
-          Measured {longDate(rel.measuredAt)} on native Windows x86-64 · the published ZIPP {rel.version} and {rel.previous} Windows binaries, plain release builds
+          Measured {longDate(rel.measuredAt)} on native Windows x86-64 · the published ZIPP {rel.version} and {rel.previous} Windows binaries, as published
           {' '}· Bellard’s QuickJS {rel.quickjs}. A release comparison from the {rel.version} notes, not a stamped capture. Native CLI results, not the browser build.
         </p>
       ) : (
@@ -306,7 +306,7 @@ export function BenchmarkSection() {
               { label: `${rel.version}, ${rel.dies.small}`, value: relVsQuickjs('small', 'current') },
               { label: `PGO build, ${rel.dies.large}`, value: relVsQuickjs('large', 'pgo') },
             ]} />
-            <small>Geomeans over the {rel.bundles.filter((bundle) => bundle.large.quickjs !== null).length} apps QuickJS runs, cache off. The profile-guided build of the same engine is not shipped.</small>
+            <small>Geomeans over the {rel.bundles.filter((bundle) => bundle.large.quickjs !== null).length} apps QuickJS runs, cache off. The canonical profile-guided build of the same engine is not shipped.</small>
           </article>
           <article className="ratio-card suite-card">
             <span>The {rel.programs.count} benchmark programs</span>
@@ -498,8 +498,8 @@ export function BenchmarkSection() {
                 Node {jit.startupMs.node.toFixed(1)} ms, Bun {jit.startupMs.bun.toFixed(1)} ms, Deno {jit.startupMs.deno.toFixed(1)} ms.
               </p>
               <p>
-                <strong>The download is a plain release build.</strong> The published <code>zipp-{versionOf(release.zipp.version)}-windows-x86_64-portable.exe</code> runs
-                the normal 13 rows at {x(release.normalVsNode.all_measured.value)} Node ({range(release.normalVsNode.all_measured.ci)}); the PGO build takes{' '}
+                <strong>The download is the release build:</strong> profile-guided since 0.0.31, but with the release’s features and its own training run. The published <code>zipp-{versionOf(release.zipp.version)}-windows-x86_64-portable.exe</code> runs
+                the normal 13 rows at {x(release.normalVsNode.all_measured.value)} Node ({range(release.normalVsNode.all_measured.ci)}); the canonical PGO build takes{' '}
                 {release.pgoOverRelease.all_measured ? x(release.pgoOverRelease.all_measured.value) : '—'} of its time on the same rows. That compares the two
                 builds, not profile guidance alone: the PGO build also leaves out the GPU and Python features and has its own CPU target and linker.
               </p>
@@ -527,7 +527,7 @@ export function BenchmarkSection() {
           {mode === 'python' && (
             <>
               <p>
-                The published {versionOf(python.zipp.version)} binary (<code>{python.zipp.sha256.slice(0, 8)}…{python.zipp.sha256.slice(-6)}</code>, the plain release build: the PGO
+                The published {versionOf(python.zipp.version)} binary (<code>{python.zipp.sha256.slice(0, 8)}…{python.zipp.sha256.slice(-6)}</code>, the release build: the canonical PGO
                 build has no Python) against CPython {python.cpython}, a fresh process per engine per repetition, interleaved. Ratios are medians of
                 the in-process work time; geometric means: micro {x(pyWorkJit.micro)}, macro {x(pyWorkJit.macro)}, all {x(pyWorkJit.all)} with the JIT,
                 {' '}{x(pyWorkInterp.all)} without it. Whole-process wall time: {x(pyWallJit.all)} with the JIT.
