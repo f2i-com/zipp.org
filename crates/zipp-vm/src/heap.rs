@@ -5979,12 +5979,26 @@ impl std::fmt::Debug for SharedMem {
 
 impl AbData {
     /// Current byte length (Shared: the visible length, not the capacity).
+    /// One arm inline, as `deref`'s (see there).
     #[inline]
     pub fn len(&self) -> usize {
         match self {
             AbData::Local(v) => v.len(),
+            #[cfg(not(feature = "webassembly"))]
             AbData::Shared(m) => m.byte_len(),
             #[cfg(feature = "webassembly")]
+            _ => self.other_len(),
+        }
+    }
+
+    /// `len` of a store that is not a `Local` one, out of line.
+    #[cfg(feature = "webassembly")]
+    #[cold]
+    #[inline(never)]
+    fn other_len(&self) -> usize {
+        match self {
+            AbData::Local(v) => v.len(),
+            AbData::Shared(m) => m.byte_len(),
             AbData::External(e) => e.len,
         }
     }
@@ -6072,48 +6086,82 @@ impl From<Vec<u8>> for AbData {
 
 impl std::ops::Deref for AbData {
     type Target = [u8];
-    // Always inline: every TypedArray and DataView element access reads its
-    // buffer through here, and with the `External` arm the optimizer stopped
-    // inlining it (an out-of-line call per access, dataview-binary +4.6%).
-    #[inline(always)]
+    // Every TypedArray and DataView element access reads its buffer through
+    // here, so this must stay small enough to inline into those helpers: a
+    // third arm inline (`External`) left it, and the DataView leaves around
+    // it, out of line (dataview-binary +4.6%, a program with no WebAssembly
+    // in it). An ordinary buffer is the one arm here; a shared one and a
+    // WebAssembly memory's are read out of line (`AbData::other_bytes`).
+    #[inline]
     fn deref(&self) -> &[u8] {
         match self {
             AbData::Local(v) => v,
+            #[cfg(not(feature = "webassembly"))]
             AbData::Shared(m) => m.as_slice(),
-            // SAFETY: the owner keeps `len` bytes at `ptr` alive and in place
-            // for as long as this buffer is attached (see `External`).
             #[cfg(feature = "webassembly")]
-            AbData::External(e) if e.len == 0 => &[],
-            #[cfg(feature = "webassembly")]
-            AbData::External(e) => unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) },
+            _ => self.other_bytes(),
         }
     }
 }
 
 impl std::ops::DerefMut for AbData {
     // As `deref`.
-    #[inline(always)]
+    #[inline]
     fn deref_mut(&mut self) -> &mut [u8] {
         match self {
             AbData::Local(v) => v,
-            // SAFETY (engine contract): JS SharedArrayBuffer memory is racy by
-            // spec — tearing on concurrent non-atomic access is a permitted
-            // outcome, so handing out a byte view of shared memory is sound
-            // for the engine's usage. Within one VM the heap hands out only
-            // one buffer borrow at a time; Atomics ops never use this path
-            // (they use real atomic instructions on SharedMem directly).
-            #[cfg(not(feature = "safe-sandbox"))]
-            AbData::Shared(m) => unsafe {
-                std::slice::from_raw_parts_mut(m.base_ptr(), m.byte_len())
-            },
-            #[cfg(feature = "safe-sandbox")]
-            AbData::Shared(_) => {
-                panic!("SharedArrayBuffer mutation is disabled by the safe-sandbox profile")
-            }
+            #[cfg(not(feature = "webassembly"))]
+            AbData::Shared(m) => shared_bytes_mut(m),
             #[cfg(feature = "webassembly")]
+            _ => self.other_bytes_mut(),
+        }
+    }
+}
+
+/// A SharedArrayBuffer's bytes, mutable.
+#[inline]
+fn shared_bytes_mut(m: &SharedMem) -> &mut [u8] {
+    // SAFETY (engine contract): JS SharedArrayBuffer memory is racy by spec
+    // — tearing on concurrent non-atomic access is a permitted outcome, so
+    // handing out a byte view of shared memory is sound for the engine's
+    // usage. Within one VM the heap hands out only one buffer borrow at a
+    // time; Atomics ops never use this path (they use real atomic
+    // instructions on SharedMem directly).
+    #[cfg(not(feature = "safe-sandbox"))]
+    return unsafe { std::slice::from_raw_parts_mut(m.base_ptr(), m.byte_len()) };
+    #[cfg(feature = "safe-sandbox")]
+    {
+        let _ = m;
+        panic!("SharedArrayBuffer mutation is disabled by the safe-sandbox profile")
+    }
+}
+
+#[cfg(feature = "webassembly")]
+impl AbData {
+    /// `deref` of a store that is not a `Local` one, out of line (see there).
+    #[cold]
+    #[inline(never)]
+    fn other_bytes(&self) -> &[u8] {
+        match self {
+            AbData::Local(v) => v,
+            AbData::Shared(m) => m.as_slice(),
+            AbData::External(e) if e.len == 0 => &[],
+            // SAFETY: the owner keeps `len` bytes at `ptr` alive and in place
+            // for as long as this buffer is attached (see `External`).
+            AbData::External(e) => unsafe { std::slice::from_raw_parts(e.ptr as *const u8, e.len) },
+        }
+    }
+
+    /// `deref_mut` of a store that is not a `Local` one, out of line.
+    #[cold]
+    #[inline(never)]
+    fn other_bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            AbData::Local(v) => v,
+            AbData::Shared(m) => shared_bytes_mut(m),
             AbData::External(e) if e.len == 0 => &mut [],
-            // SAFETY: as for `deref`; the heap hands out one borrow at a time.
-            #[cfg(feature = "webassembly")]
+            // SAFETY: as for `other_bytes`; the heap hands out one borrow at
+            // a time.
             AbData::External(e) => unsafe { std::slice::from_raw_parts_mut(e.ptr as *mut u8, e.len) },
         }
     }
