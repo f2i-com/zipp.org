@@ -317,3 +317,30 @@ fn long_loops_run_in_constant_stack() {
     );
     assert_eq!(run(&src), vec!["3000000"]);
 }
+
+/// A program big enough to start with its JavaScript interpreted -- 256
+/// functions or more, as any real page is -- still runs its WebAssembly on
+/// Wasmtime in a `wasm-jit` build: only a refused JIT (`ZIPP_NOJIT`, an
+/// embedder turning it off) means wasmi. 0.0.31 took the size cutoff for a
+/// refusal, and WebAssembly in a browser page or a large script ran seven
+/// times slower on wasmi. Which runtime ran shows in the exports' order:
+/// Wasmtime keeps the module's, wasmi sorts them by name.
+#[cfg(all(feature = "wasm-jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_large_program_keeps_compiled_webassembly() {
+    let wat = r#"(module
+        (func (export "zeta") (result i32) i32.const 1)
+        (func (export "alpha") (result i32) i32.const 2))"#;
+    let body = "console.log(WebAssembly.Module.exports(new WebAssembly.Module(m)).map(function (e) { return e.name; }).join());";
+    let refused = std::env::var_os("ZIPP_NOJIT").is_some() || std::env::var_os("ZIPP_WASM_INTERP").is_some();
+    let expected = if refused { "alpha,zeta" } else { "zeta,alpha" };
+    let small = program(&[("m", wat)], body);
+    assert_eq!(run(&small), vec![expected], "a small program");
+    let mut large = String::new();
+    for i in 0..300 {
+        large.push_str(&format!("function f{i}(x) {{ return x + {i}; }}
+"));
+    }
+    large.push_str(&small);
+    assert_eq!(run(&large), vec![expected], "a program of 300 functions");
+}

@@ -3405,6 +3405,14 @@ pub struct Vm<'p> {
     /// measurement.
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     jit_enabled: bool,
+    /// The JIT refused rather than only not wanted: `ZIPP_NOJIT`, the
+    /// embedder turning it off (`set_jit_enabled(false)`, as the sandbox's
+    /// child does), a trace being recorded. The VM's WebAssembly then runs on
+    /// wasmi (`Vm::wasm_runtime`). A program that starts interpreted for its
+    /// size (`jit_wanted`) or because it compiles lazily still compiles its
+    /// WebAssembly: that choice is about its own JavaScript.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    jit_refused: bool,
     /// Current native self-recursion depth (guards `jit_self_call`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_recurse_depth: u32,

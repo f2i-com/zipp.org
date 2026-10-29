@@ -168,9 +168,12 @@ mod jit;
 
 /// The runtime one VM's WebAssembly runs on, chosen when the VM first uses
 /// WebAssembly (`Vm::wasm_runtime`): Wasmtime in a `wasm-jit` build whose
-/// JIT is on, else wasmi. A VM with its JIT off (`ZIPP_NOJIT=1`, as the
-/// sandbox's child sets it) thus runs no generated code for WebAssembly
-/// either; `ZIPP_WASM_INTERP=1` picks wasmi with the JIT on.
+/// JIT is not refused, else wasmi. A VM whose JIT is refused (`ZIPP_NOJIT=1`,
+/// as the sandbox's child sets it, or turned off by its embedder) thus runs no
+/// generated code for WebAssembly either; `ZIPP_WASM_INTERP=1` picks wasmi
+/// with the JIT on. A program that only starts interpreted -- one of 256
+/// functions or more, or compiled lazily, as every page in a browser is --
+/// keeps Wasmtime.
 pub(crate) enum WasmRuntime {
     Interp(interp::Runtime),
     #[cfg(feature = "wasm-jit")]
@@ -268,7 +271,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn wasm_runtime(&mut self) -> &mut WasmRuntime {
         if self.wasm.is_none() {
             #[cfg(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let compiled = self.jit_enabled && !wasm_interp_forced();
+            let compiled = !self.jit_refused && !wasm_interp_forced();
             #[cfg(not(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
             let compiled = false;
             // A VM with a meter gets a store that counts fuel, for good.

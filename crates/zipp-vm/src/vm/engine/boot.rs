@@ -752,6 +752,8 @@ impl<'p> Vm<'p> {
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit_enabled: jit_wanted(program),
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            jit_refused: std::env::var_os("ZIPP_NOJIT").is_some(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1194,6 +1196,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
+        self.jit_refused = !on || std::env::var_os("ZIPP_NOJIT").is_some();
         // The first ARM64 tier has no native step-meter yet. Once a recorder or
         // budget is attached, it must remain interpreted even if a caller later
         // tries to re-enable the JIT through the differential-test hook.
@@ -1271,6 +1274,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.jit_enabled = false;
+            self.jit_refused = true;
         }
     }
 }
