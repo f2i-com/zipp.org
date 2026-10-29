@@ -36,6 +36,27 @@ fn class_methods_capture_lexicals_before_their_declarations() {
 }
 
 #[test]
+fn arrows_see_method_locals_named_like_their_class() {
+    // The class's own name is a scope OUTSIDE its methods: a method's local of
+    // that name shadows it for every closure inside the method, arrows too.
+    // Minifiers name both alike (`class e { parse() { let e = ...; r = () => e.x } }`).
+    assert_eq!(
+        output(
+            r#"
+        var A = class e { m() { let e = { v: 1 }; return (() => e.v)(); } };
+        var B = class e { m() { let e = { v: 2 }; return (() => () => e.v)()(); } };
+        var C = class e { m() { let e = { v: 3 }; return (function () { return e.v; })(); } };
+        var D = class e { m() { return (() => typeof e)(); } };
+        var E = class e { f = (() => { let e = 5; return () => e; })(); };
+        var F = class e { m() { for (let e of [6]) return (() => e)(); } };
+        console.log(new A().m(), new B().m(), new C().m(), new D().m(), new E().f(), new F().m());
+    "#
+        ),
+        ["1 2 3 function 5 6"]
+    );
+}
+
+#[test]
 fn constructor_closure_writes_share_hoisted_var_cells() {
     assert_eq!(
         output(

@@ -871,6 +871,7 @@ impl<'a> FnCompiler<'a> {
                 .class_names
                 .iter()
                 .any(|(n, id)| *id == cid && n == name)
+                && !self.bound_inside_class_element(name)
             {
                 return Binding::ClassName(cid);
             }
@@ -959,6 +960,23 @@ impl<'a> FnCompiler<'a> {
         }
         !self.scopes.iter().any(|s| s.binds(name))
             && !self.self_name.as_ref().is_some_and(|(n, _)| n == name)
+            && !self.bound_inside_class_element(name)
+    }
+
+    /// True when `name` is bound by a function between this one and the class
+    /// element it is part of: the method an arrow sits in, or an arrow in
+    /// between. Their scopes are nearer than the class's own name, so they
+    /// shadow it -- in `class e { m() { let e = {}; return () => e } }` the
+    /// arrow's `e` is the method's object, not the class. Arrows inherit
+    /// `super_class`, so without this the class name won over every binding
+    /// an arrow captures from its method; minified code names both alike, and
+    /// softn.com's UI parser found its document root to be its own class.
+    /// The functions outside the class are `class_enclosing`; those after it in
+    /// this function's chain are inside the class element.
+    fn bound_inside_class_element(&self, name: &str) -> bool {
+        self.enclosing
+            .get(self.cx.class_enclosing.len()..)
+            .is_some_and(|inner| inner.iter().any(|enc| enc.cell_locals.get(name).is_some()))
     }
 
     /// True when `name` is bound by a function ENCLOSING this one — a boxed
