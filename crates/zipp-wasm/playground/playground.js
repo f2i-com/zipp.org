@@ -847,6 +847,14 @@ el.canvas.addEventListener("blur", () => { input.keys = {}; });
 // ---- boot ---------------------------------------------------------------------
 startWorker();
 clearCanvas();
-if (!restore()) loadSample("python");
+// A link can say what to show: `?sample=training` opens that sample rather
+// than the project kept in this browser, `gpu=webgpu` picks where its GPU
+// graphs run, and `run=1` starts it -- a shared link, or a kiosk that boots
+// into a demo (zipp-linux).
+const linked = new URLSearchParams(location.search);
+if ([...el.gpuBackend.options].some((o) => o.value === linked.get("gpu"))) el.gpuBackend.value = linked.get("gpu");
+if (Object.hasOwn(SAMPLES, linked.get("sample") ?? "")) {
+  loadSample(linked.get("sample")).then(() => { if (linked.get("run") === "1") run(); });
+} else if (!restore()) loadSample("python");
 else log(`Restored ${project.name} from this browser. Press Run.`, "note");
 renderFiles();
