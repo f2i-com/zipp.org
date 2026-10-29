@@ -1716,8 +1716,9 @@ impl<'p> Vm<'p> {
 
     /// The site's way-0 private field `(brand, id, pos)` for code running as
     /// `ctx` (compiled code, whose running callee is not the top frame's):
-    /// what [`Self::ic_private_get_tail`] checks against the top frame.
-    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    /// what [`Self::ic_private_get_tail`] checks against the top frame. For the
+    /// x86-64 JIT's region private reads.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
     #[inline]
     pub(crate) fn ic_private_way0(&self, func_id: u32, ip: usize, ctx: Value) -> Option<(u64, u32, u32)> {
         let Some(IcEntry::Private { head, brand, id, pos }) =

@@ -4645,7 +4645,8 @@ pub(crate) fn plan_borrow_enabled() -> bool {
     }
 }
 
-#[cfg(test)]
+// The sizes are a 64-bit host's.
+#[cfg(all(test, target_pointer_width = "64"))]
 mod static_key_plan_layout_tests {
     use super::*;
 
@@ -4656,7 +4657,6 @@ mod static_key_plan_layout_tests {
     /// (a boxed slice: 16) the source positions error stacks report. Keep
     /// that startup/many-function cost, plus the retained-charge assumptions
     /// for non-empty plans, explicit.
-    #[cfg(target_pointer_width = "64")]
     #[test]
     fn func_proto_and_plan_metadata_layouts_are_pinned() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);

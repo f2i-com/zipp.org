@@ -730,6 +730,7 @@ mod tests {
             eval_calls: Box::default(),
             source: Default::default(),
             fused: Default::default(),
+            call_sites: Box::default(),
         }
     }
 

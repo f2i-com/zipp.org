@@ -148,8 +148,8 @@ pub(crate) fn fid_mirror_plain(fid: u32) -> bool {
 
 /// The fid-mirror word of an instance of the class at heap index `class`
 /// ([`FID_MIRROR_CLASS`]); [`FID_MIRROR_NONE`] for an index too large to
-/// mark, which no heap reaches.
-#[cfg(feature = "jit")]
+/// mark, which no heap reaches. Only the x86-64 JIT marks class instances.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
 pub(crate) fn class_mirror_fid(class: u32) -> u32 {
     if class < FID_MIRROR_NONE & !FID_MIRROR_CLASS {
