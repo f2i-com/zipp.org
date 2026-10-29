@@ -26,7 +26,7 @@
 // Node from a `data:` URL; a Content-Security-Policy must allow one of them
 // in `script-src`. One file, no dependencies: copy it anywhere.
 
-export const ZIPP_LOADER_VERSION = "1.4.0";
+export const ZIPP_LOADER_VERSION = "1.5.0";
 
 const GLUE_SECTION = "zipp.glue";
 const META_SECTION = "zipp.meta";
