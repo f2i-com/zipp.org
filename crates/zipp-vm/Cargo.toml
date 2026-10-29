@@ -44,13 +44,6 @@ num-traits = "0.2"
 # an optimised build without those settings (fast incremental builds), turn on
 # `wasm-portable-dispatch`.
 wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
-# `wasm-jit`: modules compiled to machine code by Wasmtime's Cranelift instead
-# (vm/webassembly/jit.rs) -- some ten times faster on a heavy module, for a
-# much larger build. Its custom sections, which Wasmtime does not keep, read
-# with the wasmparser it already uses. 44 is the newest that builds on Rust
-# 1.92.
-wasmtime = { version = "44", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "gc", "gc-drc", "parallel-compilation"] }
-wasmparser = { version = "0.246", optional = true, default-features = false, features = ["std"] }
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 self_cell = "1.3.0"
@@ -100,10 +93,6 @@ webassembly = ["dep:wasmi"]
 # Loop dispatch for WebAssembly, whatever the build: for optimised builds that
 # do not use fat LTO and one codegen unit (see the `wasmi` dependency).
 wasm-portable-dispatch = ["webassembly", "wasmi/portable-dispatch"]
-# WebAssembly compiled to machine code by Wasmtime rather than interpreted by
-# wasmi (see the `wasmtime` dependency). Off by default; native embedders that
-# run heavy modules (zipp-browser) turn it on.
-wasm-jit = ["webassembly", "dep:wasmtime", "dep:wasmparser"]
 # TypeScript (and `.jsx`/`.tsx` files), read by the JavaScript parser with
 # their types dropped (`lang/ts`). On by default; off, the language is still
 # listed (a `.ts` file is still recognised as TypeScript) and compiling it is

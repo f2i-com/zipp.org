@@ -49,9 +49,7 @@ fn namespace_and_values() {
         console.log(typeof WebAssembly, Object.prototype.toString.call(WebAssembly));
         console.log(WebAssembly.validate(arith), WebAssembly.validate(new Uint8Array([0, 97, 115, 109])));
         var m = new WebAssembly.Module(arith);
-        // By name: Wasmtime lists them in the module's order, as the JS API
-        // says, and wasmi by name.
-        console.log(JSON.stringify(WebAssembly.Module.exports(m).sort(function (a, b) { return a.name < b.name ? -1 : 1; })));
+        console.log(JSON.stringify(WebAssembly.Module.exports(m)));
         var e = new WebAssembly.Instance(m).exports;
         console.log(e.add(2, 3), e.add(0x7fffffff, 1), e.add("4", 1.9), e.add.length);
         console.log(e.mul64(1n << 20n, 1n << 30n), e.mul64(1n << 40n, 1n << 30n), e.mul64(-3n, 5n));

@@ -123,6 +123,57 @@ pub(crate) fn static_key_text(k: &ast::PropKey) -> Option<String> {
     }
 }
 
+/// Whether spreading `s` in an object literal (`{ ...s }`) can be written as
+/// defining its properties in place (`Compiler::object_spread_inline`): an
+/// object literal of data properties with static keys (no `__proto__`, no
+/// method, accessor, computed key or spread of its own), `null`, or
+/// `c ? a : b` / `c && a` of those. Such a literal is fresh and ordinary, so
+/// CopyDataProperties reads back exactly the properties it was just given,
+/// with no getter or trap to run. (Integer keys copy first, but an ordinary
+/// target lists them first whatever order they arrive in.)
+pub(crate) fn spread_source_inlinable(s: &Expr, depth: u32) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match s {
+        Expr::Object(props, _) => props.iter().all(|p| {
+            matches!(p, ast::ObjectMember::Prop { key, .. }
+                if static_key_text(key).is_some_and(|k| k != "__proto__"))
+        }),
+        Expr::Null => true,
+        Expr::Cond { cons, alt, .. } => {
+            spread_source_inlinable(cons, depth + 1) && spread_source_inlinable(alt, depth + 1)
+        }
+        Expr::Logical {
+            op: ast::LogicalOp::And,
+            right,
+            ..
+        } => spread_source_inlinable(right, depth + 1),
+        _ => false,
+    }
+}
+
+/// `ZIPP_NO_SPREAD_INLINE=1` compiles every object-literal spread through
+/// `ObjectSpread`, as before `object_spread_inline` (the same bytecode in
+/// every execution mode either way; the variable is part of the code-cache
+/// key).
+fn spread_inline_enabled() -> bool {
+    if crate::WASM_STATIC_SWITCHES {
+        return true;
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SPREAD_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// UTF-16 code units → the lone-surrogate MARKER form (`\u{FFFD}XXXX` per lone
 /// unit, `\u{FFFD}fffd` for a literal U+FFFD) that `add_string_const_wtf8`
 /// expects and `resolve_const` decodes back to exact WTF-8 at intern time. The
@@ -1603,6 +1654,10 @@ impl<'a> FnCompiler<'a> {
                     false,
                     all_appendable,
                 )?,
+                ast::ObjectMember::Spread(s) if spread_inline_enabled() && spread_source_inlinable(s, 0) => {
+                    self.object_spread_inline(dst, s)?;
+                    None
+                }
                 ast::ObjectMember::Spread(s) => {
                     let src = self.expr(s)?;
                     self.emit(Instr::ObjectSpread { target: dst, src });
@@ -1620,6 +1675,65 @@ impl<'a> FnCompiler<'a> {
             self.install_static_key_plan(alloc_ip, dst, &plan_names);
         }
         Ok(dst)
+    }
+
+    /// `...s` in the literal at `dst` for a `s` that `spread_source_inlinable`
+    /// accepts: each of its properties defined on `dst` where the spread
+    /// stands, its values evaluated in its order, and no source object made
+    /// (`{ ...base, ...(gift ? { note } : {}) }`, the optional-field idiom).
+    /// A `c && a` whose `c` is falsy spreads `c` itself: nothing for any
+    /// primitive, which is what `ObjectSpread` is left to decide, since a
+    /// falsy object (`IsHTMLDDA`) has properties of its own to copy.
+    fn object_spread_inline(&mut self, dst: Reg, s: &Expr) -> R<()> {
+        match s {
+            Expr::Object(props, _) => {
+                for p in props {
+                    let ast::ObjectMember::Prop {
+                        key,
+                        value,
+                        shorthand,
+                        ..
+                    } = p
+                    else {
+                        unreachable!("spread_source_inlinable admits data properties only")
+                    };
+                    let save = self.next_reg;
+                    self.object_data_prop(dst, key, PropVal::Expr(value), false, *shorthand, false)?;
+                    self.set_next_reg(save);
+                }
+            }
+            Expr::Null => {}
+            Expr::Cond { test, cons, alt } => {
+                let jfs = self.emit_test_jumps(test)?;
+                self.object_spread_inline(dst, cons)?;
+                let jmp = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                let else_start = self.here();
+                for jf in jfs {
+                    self.patch_jump(jf, else_start);
+                }
+                self.object_spread_inline(dst, alt)?;
+                let end = self.here();
+                self.patch_jump(jmp, end);
+            }
+            Expr::Logical { left, right, .. } => {
+                let save = self.next_reg;
+                let l = self.expr(left)?;
+                let to_falsy = self.here();
+                self.emit(Instr::JumpIfFalse { cond: l, target: 0 });
+                self.object_spread_inline(dst, right)?;
+                let jmp = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                let falsy = self.here();
+                self.patch_jump(to_falsy, falsy);
+                self.emit(Instr::ObjectSpread { target: dst, src: l });
+                let end = self.here();
+                self.patch_jump(jmp, end);
+                self.set_next_reg(save);
+            }
+            _ => unreachable!("spread_source_inlinable admits no other expression"),
+        }
+        Ok(())
     }
 
     /// Install a plan only after every property has compiled successfully. All
