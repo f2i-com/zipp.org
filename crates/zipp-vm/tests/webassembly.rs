@@ -344,3 +344,39 @@ fn a_large_program_keeps_compiled_webassembly() {
     large.push_str(&small);
     assert_eq!(run(&large), vec![expected], "a program of 300 functions");
 }
+
+/// A JavaScript value given to WebAssembly as an `externref` lives while
+/// WebAssembly can reach it, not for the VM's life. Every value a module was
+/// passed used to stay a root for good: one taking objects by reference, as
+/// wasm-bindgen's do, kept all it was ever given, and softn.com's apps grew by
+/// gigabytes a minute in zipp-browser. Passing ten times the objects now
+/// leaves the heap about where it was, and a value still comes back as itself.
+/// (wasmi has no collector for its references, so this is Wasmtime's.)
+#[cfg(all(feature = "wasm-jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn externref_values_are_let_go() {
+    if std::env::var_os("ZIPP_NOJIT").is_some() || std::env::var_os("ZIPP_WASM_INTERP").is_some() {
+        return;
+    }
+    let wat = r#"(module (func (export "id") (param externref) (result externref) local.get 0))"#;
+    let heap_after = |n: usize| {
+        let body = format!(
+            "var id = new WebAssembly.Instance(new WebAssembly.Module(m)).exports.id;
+             var kept = {{ kept: true }}, same = id(kept) === kept;
+             for (var i = 0; i < {n}; i++) {{
+                 var o = {{ i: i, pad: new Array(64).fill(i) }};
+                 if (id(o) !== o) same = false;
+             }}
+             console.log(same, id(kept) === kept, id(null) === null);"
+        );
+        let mut state = embed::compile_script(&program(&[("m", wat)], &body)).expect("compiles");
+        state.run_init().expect("runs");
+        state.run_microtasks();
+        assert_eq!(state.take_output(), vec!["true true true"], "{n} objects");
+        state.heap_bytes()
+    };
+    let small = heap_after(20_000);
+    let large = heap_after(200_000);
+    assert!(large < small * 3, "the heap grew with the objects passed: {small} bytes after 20,000, {large} after 200,000");
+}
+
