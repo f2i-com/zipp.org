@@ -25,12 +25,19 @@
 //!   callers of the running imports are kept on a stack.
 //!
 //! Values cross as the JS API says: `i32`, `f32` and `f64` as Numbers, `i64`
-//! as BigInt, `funcref` as an exported function or null. SIMD values and
-//! `externref` are not supported.
+//! as BigInt, `funcref` as an exported function or null, `externref` as the
+//! JavaScript value itself (null as a null reference). SIMD values are not
+//! supported.
+//!
+//! - **`externref`** values are kept in the runtime, one wasmi `ExternRef` per
+//!   distinct JavaScript value (GC roots), for as long as the VM lives: what
+//!   WebAssembly holds a reference to cannot be known to have gone. This is
+//!   what wasm-bindgen's reference-types output (its `externref` table) needs.
 //!
 //! [wasmi]: https://github.com/wasmi-labs/wasmi
 //! [`AbData::External`]: crate::heap::AbData::External
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::heap::{AbData, ExternalBytes, HeapObj, ObjMap, PropAttr};
@@ -40,7 +47,7 @@ use crate::vm::native::{self, WASM_HOST_OP, WASM_LAZY_GET};
 use crate::vm::{Thrown, Vm};
 
 use wasmi::{
-    AsContext, AsContextMut, Caller, Engine, Extern, ExternType, Func, Global, Instance, Memory,
+    AsContext, AsContextMut, Caller, Engine, Extern, ExternRef, ExternType, Func, Global, Instance, Memory,
     MemoryType, Module, Mutability, Nullable, Ref, RefType, Store, StoreContextMut, Table,
     TableType, Val, ValType,
 };
@@ -95,6 +102,11 @@ pub(crate) struct WasmRuntime {
     globals: Vec<Global>,
     /// The JavaScript functions instances import (GC roots).
     pub(crate) imports: Vec<Value>,
+    /// The JavaScript values WebAssembly has been given as `externref`s (GC
+    /// roots), each with its wasmi reference, and by value, to find them again.
+    pub(crate) externs: Vec<Value>,
+    extern_refs: Vec<ExternRef>,
+    extern_ids: HashMap<u64, u32>,
     /// The running imports' `Caller`s, innermost last, as addresses: a call
     /// into WebAssembly from inside an import goes through the innermost.
     callers: Vec<usize>,
@@ -151,6 +163,49 @@ impl WasmRuntime {
                 (self.globals.len() - 1) as u32
             }
         }
+    }
+
+    /// `v` as an `externref`: the same reference for the same value.
+    fn extern_ref(&mut self, v: Value) -> ExternRef {
+        if let Some(&i) = self.extern_ids.get(&v.bits()) {
+            return self.extern_refs[i as usize];
+        }
+        let i = self.externs.len() as u32;
+        let r = ExternRef::new(self.ctx(), i);
+        self.externs.push(v);
+        self.extern_refs.push(r);
+        self.extern_ids.insert(v.bits(), i);
+        r
+    }
+
+    /// The JavaScript value an `externref` stands for.
+    fn extern_value(&mut self, r: ExternRef) -> Value {
+        let ctx = self.ctx();
+        let i = r.data(ctx.as_context()).downcast_ref::<u32>().copied();
+        i.and_then(|i| self.externs.get(i as usize).copied()).unwrap_or(Value::UNDEFINED)
+    }
+
+    /// A table element from what the layer sends: `[value, functionId]`,
+    /// the value for an `externref` table, the function for a `funcref` one.
+    fn table_element(&mut self, element: RefType, given: &[Value]) -> Op<Ref> {
+        let value = given.first().copied().unwrap_or(Value::UNDEFINED);
+        Ok(match element {
+            RefType::Extern if value.is_null() => Ref::Extern(Nullable::Null),
+            RefType::Extern => Ref::Extern(Nullable::Val(self.extern_ref(value))),
+            RefType::Func => match given.get(1).copied() {
+                Some(id) if id.is_number() => {
+                    let f = *self.funcs.get(id.as_f64() as usize).ok_or_else(|| Failure::Record("TypeError", "no such function".into()))?;
+                    Ref::Func(Nullable::Val(f))
+                }
+                _ if value.is_null() || value.is_undefined() => Ref::Func(Nullable::Null),
+                _ => {
+                    return Err(Failure::Record(
+                        "TypeError",
+                        "WebAssembly.Table: value must be null or an exported WebAssembly function".into(),
+                    ));
+                }
+            },
+        })
     }
 
     /// The buffers handed out over memories (GC roots).
@@ -291,6 +346,9 @@ impl<'p> Vm<'p> {
                 tables: Vec::new(),
                 globals: Vec::new(),
                 imports: Vec::new(),
+                externs: Vec::new(),
+                extern_refs: Vec::new(),
+                extern_ids: HashMap::new(),
                 callers: Vec::new(),
             }));
         }
@@ -451,8 +509,14 @@ impl<'p> Vm<'p> {
             }
             "tableNew" => {
                 let max = if b.is_undefined() { None } else { Some(index(b) as u32) };
-                let ty = TableType::new(RefType::Func, index(a) as u32, max);
-                let table = Table::new(rt.ctx(), ty, Ref::Func(Nullable::Null))
+                let externs = c.is_bool() && c.as_bool();
+                let (element, null) = if externs {
+                    (RefType::Extern, Ref::Extern(Nullable::Null))
+                } else {
+                    (RefType::Func, Ref::Func(Nullable::Null))
+                };
+                let ty = TableType::new(element, index(a) as u32, max);
+                let table = Table::new(rt.ctx(), ty, null)
                     .map_err(|e| Failure::Record("RangeError", format!("WebAssembly.Table: {e}")))?;
                 Value::num(rt.table_id(table) as f64)
             }
@@ -468,18 +532,20 @@ impl<'p> Vm<'p> {
                         let arity = rt.arity(f);
                         self.wasm_array(vec![Value::num(id as f64), Value::num(arity as f64)])
                     }
+                    // An `externref` table's value, alone in its array.
+                    Some(Ref::Extern(Nullable::Val(r))) => {
+                        let v = rt.extern_value(r);
+                        self.wasm_array(vec![v])
+                    }
                     Some(_) => Value::NULL,
                     None => return Err(Failure::Record("RangeError", "WebAssembly.Table.get: index out of bounds".into())),
                 }
             }
             "tableSet" => {
                 let table = self.wasm_table(rt, index(a))?;
-                let value = if c.is_null() {
-                    Ref::Func(Nullable::Null)
-                } else {
-                    let f = *rt.funcs.get(index(c)).ok_or_else(|| Failure::Record("TypeError", "no such function".into()))?;
-                    Ref::Func(Nullable::Val(f))
-                };
+                let given = self.wasm_items(c);
+                let element = table.ty(rt.ctx()).element();
+                let value = rt.table_element(element, &given)?;
                 table
                     .set(rt.ctx(), index(b) as u64, value)
                     .map_err(|_| Failure::Record("RangeError", "WebAssembly.Table.set: index out of bounds".into()))?;
@@ -487,8 +553,11 @@ impl<'p> Vm<'p> {
             }
             "tableGrow" => {
                 let table = self.wasm_table(rt, index(a))?;
+                let given = self.wasm_items(c);
+                let element = table.ty(rt.ctx()).element();
+                let init = rt.table_element(element, &given)?;
                 let old = table
-                    .grow(rt.ctx(), index(b) as u64, Ref::Func(Nullable::Null))
+                    .grow(rt.ctx(), index(b) as u64, init)
                     .map_err(|_| Failure::Record("RangeError", "WebAssembly.Table.grow: failed to grow table".into()))?;
                 Value::num(old as f64)
             }
@@ -664,6 +733,8 @@ impl<'p> Vm<'p> {
             // A function crosses as its number; the layer's wrappers are made
             // from numbers on the JavaScript side.
             Val::FuncRef(Nullable::Val(f)) => Value::num(rt.func_id(*f) as f64),
+            Val::ExternRef(Nullable::Null) => Value::NULL,
+            Val::ExternRef(Nullable::Val(r)) => rt.extern_value(*r),
             _ => return Err(Failure::Record("TypeError", "WebAssembly: this value type cannot cross to JavaScript".into())),
         })
     }
@@ -691,6 +762,8 @@ impl<'p> Vm<'p> {
                 let f = *rt.funcs.get(v.as_f64() as usize).ok_or_else(|| Failure::Record("TypeError", "not a WebAssembly function".into()))?;
                 Val::FuncRef(Nullable::Val(f))
             }
+            ValType::ExternRef if v.is_null() => Val::ExternRef(Nullable::Null),
+            ValType::ExternRef => Val::ExternRef(Nullable::Val(rt.extern_ref(v))),
             _ => return Err(Failure::Record("TypeError", "WebAssembly: this value type cannot cross from JavaScript".into())),
         })
     }

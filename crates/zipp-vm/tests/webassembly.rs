@@ -247,3 +247,71 @@ fn errors_reentry_and_promises() {
         vec!["true", "LinkError", "TypeError", "50", "rejected CompileError", "true 8"]
     );
 }
+
+/// `externref`: JavaScript values held by WebAssembly -- in tables, as
+/// parameters and results -- coming back as themselves. wasm-bindgen's
+/// reference-types output grows an exported externref table and fills it
+/// from JavaScript as it starts, which is the first half of this.
+#[test]
+fn externref_tables_and_values() {
+    let src = program(
+        &[(
+            "refs",
+            r#"(module
+                (table (export "table") 1 externref)
+                (func (export "id") (param externref) (result externref) local.get 0)
+                (func (export "isNull") (param externref) (result i32) local.get 0 ref.is_null)
+                (func (export "keep") (param i32 externref) local.get 0 local.get 1 table.set 0)
+                (func (export "fetch") (param i32) (result externref) local.get 0 table.get 0))"#,
+        )],
+        r#"
+        var e = new WebAssembly.Instance(new WebAssembly.Module(refs)).exports;
+        var t = e.table;
+        var old = t.grow(4);
+        t.set(0, undefined); t.set(old, undefined); t.set(old + 1, null); t.set(old + 2, true); t.set(old + 3, false);
+        console.log(old, t.length, t.get(0), t.get(old + 1), t.get(old + 2), t.get(old + 3));
+        var o = { name: "kept" };
+        console.log(e.id(o) === o, e.id("s"), e.id(42), e.isNull(null), e.isNull(o), e.isNull(undefined));
+        e.keep(2, o);
+        for (var i = 0; i < 2000; i++) { var junk = { i: i, pad: [i, i, i] }; }
+        if (typeof gc === "function") gc();
+        console.log(e.fetch(2) === o, e.fetch(2).name, t.get(2) === o);
+        var mine = new WebAssembly.Table({ element: "externref", initial: 2 });
+        mine.set(1, o);
+        console.log(mine.length, mine.get(0), mine.get(1) === o, mine.grow(1, "x"), mine.get(2));
+        try { new WebAssembly.Table({ element: "i32", initial: 1 }); } catch (err) { console.log(err.name); }
+        "#,
+    );
+    assert_eq!(
+        run(&src),
+        vec![
+            "1 5 undefined null true false",
+            "true s 42 1 0 0",
+            "true kept true",
+            "2 undefined true 2 x",
+            "TypeError",
+        ]
+    );
+}
+
+/// A long-running module: ten million instructions in one call must not
+/// take native stack per instruction (see the `wasmi` dependency's dispatch
+/// in Cargo.toml). Only an optimised build could show it; the line keeps the
+/// shape pinned everywhere.
+#[test]
+fn long_loops_run_in_constant_stack() {
+    let src = program(
+        &[(
+            "spin",
+            r#"(module
+                (func (export "count") (param i32) (result i32) (local i32)
+                  (block (loop
+                    local.get 1 local.get 0 i32.ge_u br_if 1
+                    local.get 1 i32.const 1 i32.add local.set 1
+                    br 0))
+                  local.get 1))"#,
+        )],
+        r#"console.log(new WebAssembly.Instance(new WebAssembly.Module(spin)).exports.count(3000000));"#,
+    );
+    assert_eq!(run(&src), vec!["3000000"]);
+}

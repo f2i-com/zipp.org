@@ -92,9 +92,17 @@
     return object;
   }
 
-  // What the runtime hands back for a funcref: null, or [id, arity].
+  // What the runtime hands back for a table element: null, [id, arity] for
+  // a function, or [value] from an externref table.
   function funcref(r) {
-    return r === null ? null : exportedFunction(r[0], r[1]);
+    return r === null ? null : r.length === 1 ? r[0] : exportedFunction(r[0], r[1]);
+  }
+  // A table element as the runtime takes it: the value, and its function id
+  // if it is an exported function (the runtime uses whichever its table's
+  // element type wants).
+  function element(value) {
+    let id = value === undefined || value === null ? undefined : funcIds.get(value);
+    return [value === undefined ? undefined : value, id === undefined ? null : id];
   }
 
   class Module {
@@ -189,16 +197,18 @@
     constructor(descriptor, value) {
       if (new.target === undefined) throw new TypeError("WebAssembly.Table must be called with new");
       if (descriptor === null || typeof descriptor !== "object") throw new TypeError("WebAssembly.Table: descriptor must be an object");
-      let element = String(descriptor.element);
-      if (element !== "anyfunc" && element !== "funcref") {
-        throw new TypeError("WebAssembly.Table: only funcref tables are supported");
+      let kind = String(descriptor.element);
+      if (kind !== "anyfunc" && kind !== "funcref" && kind !== "externref") {
+        throw new TypeError("WebAssembly.Table: element must be \"funcref\" or \"externref\"");
       }
       let initial = toIndex(descriptor.initial ?? descriptor.minimum ?? 0, "initial");
       let maximum = descriptor.maximum === undefined ? undefined : toIndex(descriptor.maximum, "maximum");
-      let id = check(op("tableNew", initial, maximum));
+      let id = check(op("tableNew", initial, maximum, kind === "externref"));
       ids.set(this, id);
       tables.set(id, this);
-      if (value !== undefined && value !== null) {
+      // An externref table without a value starts as `undefined`s; a
+      // funcref one as nulls.
+      if (kind === "externref" ? value !== null : value !== undefined && value !== null) {
         for (let i = 0; i < initial; i++) this.set(i, value);
       }
     }
@@ -210,17 +220,11 @@
     }
     set(index, value) {
       let id = idOf(this, Table, "receiver");
-      let f = value === undefined || value === null ? null : funcIds.get(value);
-      if (f === undefined) throw new TypeError("WebAssembly.Table.set: value must be null or an exported WebAssembly function");
-      check(op("tableSet", id, toIndex(index, "index"), f));
+      check(op("tableSet", id, toIndex(index, "index"), element(value)));
     }
     grow(delta, value) {
       let id = idOf(this, Table, "receiver");
-      let old = check(op("tableGrow", id, toIndex(delta, "delta")));
-      if (value !== undefined && value !== null) {
-        for (let i = old; i < old + delta; i++) this.set(i, value);
-      }
-      return old;
+      return check(op("tableGrow", id, toIndex(delta, "delta"), element(value)));
     }
   }
 

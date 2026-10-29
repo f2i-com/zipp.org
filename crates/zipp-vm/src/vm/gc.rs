@@ -569,6 +569,9 @@ impl Vm<'_> {
                 for &v in &rt.imports {
                     root_val!(v);
                 }
+                for &v in &rt.externs {
+                    root_val!(v);
+                }
                 for ab in rt.buffer_roots() {
                     root_idx!(ab);
                 }

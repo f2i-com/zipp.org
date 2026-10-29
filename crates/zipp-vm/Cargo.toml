@@ -33,7 +33,13 @@ num-traits = "0.2"
 # wasmi interpreter. Optional; on in the default features, so native embedders
 # (the CLI, browsers) have it, while the WebAssembly artifacts (zipp-wasm), which
 # build without default features, stay as they are.
-wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
+#
+# Loop dispatch, not wasmi's tail-call dispatch: that one relies on LLVM
+# turning each handler's call to the next into a jump, and where it does not,
+# every instruction executed takes native stack -- a long-running module (the
+# zipp.org playground's engine, starting up) overflowed a 512 MB thread stack
+# inside one call.
+wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "portable-dispatch"] }
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 self_cell = "1.3.0"
