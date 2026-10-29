@@ -53,7 +53,7 @@ cat > "$work/wasm.js" <<'SMOKE'
 const head = [0, 97, 115, 109, 1, 0, 0, 0];
 const count = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([...head, 1, 6, 1, 96, 1, 127, 1, 127,
   3, 2, 1, 0, 7, 9, 1, 5, 99, 111, 117, 110, 116, 0, 0, 10, 26, 1, 24, 0, 2, 64, 3, 64, 32, 0, 69, 13, 1, 32, 0,
-  65, 1, 107, 33, 0, 12, 0, 11, 11, 65, 7, 11])))).exports.count;
+  65, 1, 107, 33, 0, 12, 0, 11, 11, 65, 7, 11]))).exports.count;
 const memory = new WebAssembly.Memory({ initial: 2 });
 new Uint8Array(memory.buffer)[70000] = 9;
 console.log(`zipp-wasm-smoke ${count(1000000)} ${new Uint8Array(memory.buffer)[70000]} ${memory.buffer.byteLength}`);
