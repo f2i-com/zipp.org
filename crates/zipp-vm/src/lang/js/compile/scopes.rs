@@ -972,10 +972,19 @@ impl<'a> FnCompiler<'a> {
     /// an arrow captures from its method; minified code names both alike, and
     /// softn.com's UI parser found its document root to be its own class.
     /// The functions outside the class are `class_enclosing`; those after it in
-    /// this function's chain are inside the class element.
+    /// this function's chain are inside the class element. An inline static
+    /// initializer compiles in the function around the class, not in one of
+    /// its own, so there the element begins after that function
+    /// (`static_init_element`): its locals are outside the class, the outer
+    /// `C` of `class C { static f = () => eval("C") }` among them, which an
+    /// eval makes a cell there.
     fn bound_inside_class_element(&self, name: &str) -> bool {
+        let from = match self.cx.static_init_element {
+            Some((cid, from)) if self.super_class == Some(cid) => from,
+            _ => self.cx.class_enclosing.len(),
+        };
         self.enclosing
-            .get(self.cx.class_enclosing.len()..)
+            .get(from..)
             .is_some_and(|inner| inner.iter().any(|enc| enc.cell_locals.get(name).is_some()))
     }
 

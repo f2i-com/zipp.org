@@ -119,6 +119,7 @@ impl Compiler {
             compiling_ctor: false,
             private_names_stack: Vec::new(),
             heritage_classes: Vec::new(),
+            static_init_element: None,
             eval_visible_privates: rustc_hash::FxHashSet::default(),
             in_derived_ctor: false,
             fn_ctor_no_self_name: false,
