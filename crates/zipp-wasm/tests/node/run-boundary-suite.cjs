@@ -36,6 +36,7 @@ const CHECKS = [
   ["in-place-growth.cjs"],
   ["output-budget.cjs"],
   ["host-writeback-identity.cjs"],
+  ["batch-json-transport.cjs"],
   ["worker-deadline.cjs"],
   ["instance-recycling-soak.cjs"],
   ["audit-defaults.cjs"],
