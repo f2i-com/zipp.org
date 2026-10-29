@@ -549,7 +549,7 @@ function Playground() {
 
   // This scratchpad loads the engine's internal packaging: the wasm-bindgen glue
   // and the module as two files in public/wasm, extracted from the release's
-  // zipp-0.0.31-javascript.wasm (`package.mjs extract`) and driven by
+  // zipp-0.0.32-javascript.wasm (`package.mjs extract`) and driven by
   // playground.worker.ts. Pages that embed ZIPP use the public path instead,
   // zipp.mjs plus that one .wasm, which the Embed section (EmbedSection.tsx)
   // shows and /sandbox/playground/ runs. tests/adventure.test.mjs exercises this
@@ -777,7 +777,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.31`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.31</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.32`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.32</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
       <p className="playground-build-note">This scratchpad loads the engine’s internal two-file packaging. To put ZIPP in your own page, use <code>zipp.mjs</code> and one <code>.wasm</code>: see <a href="#embed">Embed ZIPP on your site</a>.</p>
     </section>
   )
@@ -901,7 +901,7 @@ function App() {
             </div>
             <p className="hero-embed">
               <a href="#embed">Embed it in your page</a>: one <code>.wasm</code> engine and <code>zipp.mjs</code> from
-              the <a href={`${GITHUB_URL}/releases/tag/v0.0.31`} target="_blank" rel="noreferrer">v0.0.31 release</a>, nothing to build.
+              the <a href={`${GITHUB_URL}/releases/tag/v0.0.32`} target="_blank" rel="noreferrer">v0.0.32 release</a>, nothing to build.
             </p>
 
             <div className="hero-trust" aria-label="Zipp highlights">
@@ -1082,7 +1082,7 @@ function App() {
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
               <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
-              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.31`}>Or download the v0.0.31 CLI</ExternalLink>
+              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.32`}>Or download the v0.0.32 CLI</ExternalLink>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>
