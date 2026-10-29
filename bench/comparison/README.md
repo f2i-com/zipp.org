@@ -26,6 +26,31 @@ interpreter with native regex matching, not an interpreter emitting no native
 code. They stay as recorded; `tools/test_run_native.py` checks each lane's
 child environment.
 
+## Interpreter versus interpreter, 2026-10-29
+
+The 0.0.31 engine's canonical PGO binary (`fcfb1934`, the release tag) ran in
+the strict `zipp-interp` lane (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, no native code)
+over both suites, 8 counterbalanced repetitions each:
+
+- [`interp_real13_fcfb1934_2026-10-29.json`](interp_real13_fcfb1934_2026-10-29.json):
+  the 13 normal rows. Zipp's interpreter is 0.514× Bellard's QuickJS [0.512, 0.517] (13 / 13 point wins), 0.326× QuickJS-NG [0.321, 0.327] (13 / 13 point wins), 0.698× Bun no-JIT, 0.964× Deno jitless, 1.010× Node jitless.
+- [`interp_hostile17_fcfb1934_2026-10-29.json`](interp_hostile17_fcfb1934_2026-10-29.json):
+  the 17 hostile rows. 0.625× Bellard's QuickJS [0.612, 0.627] (17 / 17 point wins), 0.327× QuickJS-NG [0.324, 0.328] (17 / 17 point wins), 0.658× Bun no-JIT, 0.733× Deno jitless, 0.843× Node jitless.
+
+Over all 30 rows that is 0.574× Bellard's QuickJS and 0.326× QuickJS-NG
+(0.683× and 0.388× for the 0.0.28 engine in the same lane;
+[`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#interpreter-versus-interpreter)
+has the tables).
+
+The same directory holds the release-build check
+([`release_real13_fcfb1934_2026-10-29.json`](release_real13_fcfb1934_2026-10-29.json), the published 0.0.31 CLI
+against Node, Bun and Deno) and the A/B of that build against the PGO one
+([`pgo_ab_real13_fcfb1934_fcfb1934_2026-10-29.json`](pgo_ab_real13_fcfb1934_fcfb1934_2026-10-29.json):
+the PGO build takes 0.996× the release build's time). Both are
+profile-guided from 0.0.31, by different recipes, and the PGO build also leaves
+out the GPU, Python and Wasmtime features and has its own CPU target and
+linker, so the ratio compares the two products, not profile guidance alone.
+
 ## Interpreter versus interpreter, 2026-10-22: the strict lane
 
 The same canonical PGO binary (`84012a2d`), rerun in the strict `zipp-interp`

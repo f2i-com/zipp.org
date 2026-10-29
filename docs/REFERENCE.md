@@ -393,17 +393,17 @@ complete, provenance-stamped capture.
 
 The canonical engine table lives in `docs/PERFORMANCE.md`, which the root
 README quotes. Its clean PGO inputs are
-`bench/real13_84012a2d_pgo_2026-10-21.json` and
-`bench/hostile/head_clean_84012a2d_pgo_2026-10-21.json`; both are complete
+`bench/real13_fcfb1934_pgo_2026-10-29.json` and
+`bench/hostile/head_clean_fcfb1934_pgo_2026-10-29.json`; both are complete
 four-engine captures with `publishable:true` and exact output throughout. The
 interpreter-versus-interpreter tables come from the diagnostics
-`bench/comparison/interp_real13_84012a2d_2026-10-21.json` and
-`bench/comparison/interp_hostile17_84012a2d_2026-10-21.json` (the same binary with
-`ZIPP_NOJIT=1` against QuickJS, QuickJS-NG and the JIT-off modes of Node, Deno
-and Bun), the Python tables from `bench/python/cpython_da0fe6b1_2026-10-21.json` and
-`bench/python/cpython_nojit_da0fe6b1_2026-10-21.json`, and the release-build check from
-`bench/comparison/release_real13_da0fe6b1_2026-10-21.json`. The previous canonical captures (`f1739644`,
-2026-10-18, and `fa8e3b86`, 2026-10-15) stay in `bench/` as prior series points;
+`bench/comparison/interp_real13_fcfb1934_2026-10-29.json` and
+`bench/comparison/interp_hostile17_fcfb1934_2026-10-29.json` (the same binary with
+no native code, `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, against QuickJS, QuickJS-NG and
+the JIT-off modes of Node, Deno and Bun), the Python tables from `bench/python/cpython_fcfb1934_2026-10-29.json` and
+`bench/python/cpython_nojit_fcfb1934_2026-10-29.json`, and the release-build check from
+`bench/comparison/release_real13_fcfb1934_2026-10-29.json`. The previous canonical captures (`84012a2d`,
+2026-10-21, `f1739644`, 2026-10-18, and `fa8e3b86`, 2026-10-15) stay in `bench/` as prior series points;
 earlier ones are rows of `bench/history`.
 
 The optional all-30 view is an explicitly derived equal-row aggregate. It does

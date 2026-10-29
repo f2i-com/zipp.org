@@ -47,7 +47,7 @@ that compiles to the shared bytecode and inherits everything below it
 | | |
 | --- | --- |
 | **One VM, many languages** | JavaScript and Python share one runtime, one object model and one garbage collector. Write the part that suits each language in that language. |
-| **Fast** | A register VM with inline caches and, on x86-64, a native JIT. In its 0.0.28 capture ZIPP runs the 30 benchmark rows in 0.65× Node's time (the 13 everyday rows in 0.55×), starts in **7.5 ms** median process launch, and as a pure interpreter takes 0.68× the time of Bellard's QuickJS. [Performance](docs/PERFORMANCE.md) |
+| **Fast** | A register VM with inline caches and, on x86-64, a native JIT. In its 0.0.31 capture ZIPP runs the 30 benchmark rows in 0.63× Node's time (the 13 everyday rows in 0.54×), starts in **9.1 ms** median process launch, and as a pure interpreter takes 0.57× the time of Bellard's QuickJS. [Performance](docs/PERFORMANCE.md) |
 | **Correct** | 99.999% of the pinned test262 corpus, unmodified; the one failure is a documented upstream expectation. [Correctness](docs/CORRECTNESS.md) |
 | **Sandboxed by default** | Embedded programs reach nothing you have not allowed: no storage, files, network or host functions until you grant each one, with step and time limits. |
 | **Portable** | Windows (x86-64), Linux (x86-64, arm64, armv7), and WebAssembly for every browser and server runtime. One `.wasm` file per engine. |
@@ -210,27 +210,27 @@ detail.
 ## Performance
 
 Ratios are ZIPP's time over the other engine's, so lower is faster. From the
-canonical capture at engine commit `84012a2d` (the 0.0.28 engine as a
+canonical capture of the release tag `fcfb1934` (the 0.0.31 engine as a
 profile-guided build; every engine with its production JIT, 15
-counterbalanced repetitions, 21 October 2026):
+counterbalanced repetitions, 29 October 2026):
 
 | JIT against JIT | ZIPP / Node |
 | --- | ---: |
-| All 30 rows | **0.652×** |
-| 13 everyday rows (JSON, regex, maps, classes, promises, parsing...) | **0.545×**, faster on every one |
-| 17 hostile stress rows | **0.748×** |
+| All 30 rows | **0.629×** |
+| 13 everyday rows (JSON, regex, maps, classes, promises, parsing...) | **0.543×**, faster on every one |
+| 17 hostile stress rows | **0.704×** |
 
-ZIPP has 23 of 30 Node point wins: all 13 everyday rows and 10 of the 17
-hostile ones. Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · ZIPP 0.0.28 canonical PGO.
+ZIPP has 25 of 30 Node point wins: all 13 everyday rows and 12 of the 17
+hostile ones. Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · ZIPP 0.0.31 canonical PGO.
 
 Measured the same day:
 
 | Comparison | Ratio |
 | --- | ---: |
-| Interpreter against interpreter: ZIPP with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) / Bellard's QuickJS, 30 rows, rerun 22 October | **0.683×** |
-| ZIPP's interpreter / QuickJS-NG, 30 rows | **0.388×** |
-| ZIPP Python / CPython 3.13.14, 36 programs, in-process work time | 1.067× (0.975× on the micro kernels) |
-| The published release build / the canonical PGO build, 13 everyday rows (the builds also differ in features, flags and linker, so this is not PGO alone) | 1.12× |
+| Interpreter against interpreter: ZIPP with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) / Bellard's QuickJS, 30 rows | **0.574×** |
+| ZIPP's interpreter / QuickJS-NG, 30 rows | **0.326×** |
+| ZIPP Python / CPython 3.13.14, 36 programs, in-process work time | 1.004× (0.916× on the micro kernels) |
+| The published release build / the canonical PGO build, 13 everyday rows (both profile-guided, by different recipes, and they also differ in features, flags and linker) | 1.00× |
 
 The full tables, confidence intervals and the remaining gaps are in
 [Performance](docs/PERFORMANCE.md) and on [zipp.org](https://www.zipp.org/benchmarks/).
