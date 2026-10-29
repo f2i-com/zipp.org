@@ -313,6 +313,12 @@ struct Compiler {
     /// (in TDZ, immutable) throughout `extends ...`, including functions
     /// created inside it.
     heritage_classes: Vec<(String, u32)>,
+    /// While a named class's INLINE static initializer compiles: the class,
+    /// and where its element begins in the enclosing chain of a function made
+    /// in it. The function compiling the initializer is the one around the
+    /// class, so its locals are outside the element
+    /// (`FnCompiler::bound_inside_class_element`).
+    static_init_element: Option<(u32, usize)>,
     /// For DIRECT eval programs: private names lexically visible at the eval
     /// call site (the caller's brand-chain names). Empty otherwise.
     eval_visible_privates: rustc_hash::FxHashSet<String>,

@@ -57,6 +57,30 @@ fn arrows_see_method_locals_named_like_their_class() {
 }
 
 #[test]
+fn static_initializer_arrows_see_the_inner_class_name_through_eval() {
+    // An inline static initializer compiles in the function around the class,
+    // whose own `C` (the outer binding, made a cell by the eval) is outside
+    // the class element: the inner name still wins, even once the outer one
+    // is reassigned (test262 staging/sm/class/fields-static-class-name-binding-eval.js).
+    // A local of the initializer's own arrows still shadows it.
+    assert_eq!(
+        output(
+            r#"
+        class C { static field = () => eval("C"); }
+        const D = C; C = null;
+        let E = class Inner { static field = () => eval("Inner"); };
+        const F = E; E = null;
+        class G { static field = () => { let G = 7; return () => eval("G"); }; }
+        class H { static field = () => () => eval("H"); }
+        const I = H; H = null;
+        console.log(D.field() === D, F.field() === F, G.field()(), I.field()() === I);
+    "#
+        ),
+        ["true true 7 true"]
+    );
+}
+
+#[test]
 fn constructor_closure_writes_share_hoisted_var_cells() {
     assert_eq!(
         output(

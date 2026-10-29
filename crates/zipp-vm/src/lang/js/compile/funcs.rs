@@ -673,6 +673,7 @@ impl<'a> FnCompiler<'a> {
                     self.super_class = Some(class_id);
                     self.super_static = true;
                     let saved_hc = self.heritage_class.take();
+                    let saved_element = self.cx.static_init_element;
                     if let Some(n) = &static_self_name {
                         self.heritage_class = Some((n.clone(), class_id));
                         // …and on the cx-level stack, so a nested function/arrow
@@ -680,6 +681,9 @@ impl<'a> FnCompiler<'a> {
                         // (class_names is popped when compile_class returns, so
                         // without this `static field = () => C` lost the binding).
                         self.cx.heritage_classes.push((n.clone(), class_id));
+                        // A function made here has this one's chain and this
+                        // one (`child_enclosing`): the element begins after.
+                        self.cx.static_init_element = Some((class_id, self.enclosing.len() + 1));
                     }
                     let v = match finit {
                         // A static initializer is a method body of its own,
@@ -705,6 +709,7 @@ impl<'a> FnCompiler<'a> {
                     if static_self_name.is_some() {
                         self.cx.heritage_classes.pop();
                     }
+                    self.cx.static_init_element = saved_element;
                     self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
@@ -789,9 +794,11 @@ impl<'a> FnCompiler<'a> {
                     self.super_class = Some(class_id);
                     self.super_static = true;
                     let saved_hc = self.heritage_class.take();
+                    let saved_element = self.cx.static_init_element;
                     if let Some(n) = &static_self_name {
                         self.heritage_class = Some((n.clone(), class_id));
                         self.cx.heritage_classes.push((n.clone(), class_id));
+                        self.cx.static_init_element = Some((class_id, self.enclosing.len() + 1));
                     }
                     let vr = match init {
                         Some(e) => self.expr(e)?,
@@ -804,6 +811,7 @@ impl<'a> FnCompiler<'a> {
                     if static_self_name.is_some() {
                         self.cx.heritage_classes.pop();
                     }
+                    self.cx.static_init_element = saved_element;
                     self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
