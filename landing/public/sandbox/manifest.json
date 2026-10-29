@@ -1,9 +1,9 @@
 {
-  "version": "0.0.31",
-  "file": "zipp-0.0.31-javascript.wasm",
-  "sha256": "5c9ae3e99b3ba7b3565165dfa79828d8911d71f9a5729a3c3c8ba41c9ea92bbe",
-  "bytes": 5602083,
-  "commit": "fcfb1934e44f160e34089621d8fbe3c0e8ef74bf",
+  "version": "0.0.32",
+  "file": "zipp-0.0.32-javascript.wasm",
+  "sha256": "907e64c9d995bc7c7d29620ee251a019ebb8f4e7bd5dfaf8ada352e27509c45a",
+  "bytes": 5612037,
+  "commit": "e312cf40afe5f02e3cdebbadcfd30c9ead889384",
   "loader": {
     "file": "zipp.mjs",
     "sha256": "737bdd169f5415ccd4c18219b9d78bef232dd5361ee8c1f1a7a0b14c08747dbc",

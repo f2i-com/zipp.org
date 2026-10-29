@@ -199,12 +199,18 @@ test('every benchmark capture the page cites is in the repository, and the data 
   assert.equal(data.jit.nodeWins, [...data.jit.normal.rows, ...data.jit.hostile.rows].filter(row => row.ratio < 1).length)
 })
 
-test('the home page release tab is the served release, and its figures are the release notes\' own', () => {
+test('the home page release tab is the latest measured release, and its figures are the release notes\' own', () => {
   // src/release-comparison.json is not a stamped capture: it restates the
-  // comparison in docs/releases/<version>.md, so the two must agree.
+  // comparison in docs/releases/<version>.md, so the two must agree. Like the
+  // captures, it may trail the release the site serves: a fix release that was
+  // not benchmarked keeps its predecessor's tab, which names that release.
   const rel = JSON.parse(readFileSync(new URL('../src/release-comparison.json', import.meta.url), 'utf8'))
   const site = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(rel.version, site.zippEngineRelease, 'the release tab names the release the site serves')
+  const parts = v => v.split('.').map(Number)
+  const [measured, served] = [parts(rel.version), parts(site.zippEngineRelease)]
+  assert.ok(measured.length === 3 && measured.every(Number.isInteger), rel.version)
+  assert.ok(measured[0] < served[0] || (measured[0] === served[0] && (measured[1] < served[1] || (measured[1] === served[1] && measured[2] <= served[2]))),
+    `the release tab's ${rel.version} is not newer than the served release ${site.zippEngineRelease}`)
   const notes = readFileSync(new URL(`../../${rel.notes}`, import.meta.url), 'utf8')
   assert.equal(rel.notes, `docs/releases/${rel.version}.md`)
   assert.ok(notes.includes(`Bellard's QuickJS ${rel.quickjs}`), 'the notes name the same QuickJS')

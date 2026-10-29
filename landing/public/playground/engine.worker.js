@@ -13,7 +13,7 @@
 // `setPythonInput`); JavaScript programs get an identical `ui` object from
 // the one-line shim below and the ordinary JavaScript ABI (`callFunction`,
 // global slots). Either way the page sees the same command arrays.
-import init, * as zipp from "../playground-runtime/zipp_wasm.js?v=2e054071ca834479";
+import init, * as zipp from "../playground-runtime/zipp_wasm.js?v=7ce439e79f6535a4";
 import { createRuntime } from "../gpu-lab/src/runtime.mjs";
 import { createPythonGPUAdapter } from "../gpu-lab/src/zipp-python-adapter.mjs";
 
@@ -43,7 +43,7 @@ const UI_SHIM =
   '}); })();';
 
 const { Engine, zippProfile } = zipp;
-const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=2e054071ca834479", import.meta.url) }).then(() => JSON.parse(zippProfile()));
+const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=7ce439e79f6535a4", import.meta.url) }).then(() => JSON.parse(zippProfile()));
 // Compile the Python runtime while the page is idle, so the first Python run
 // does not wait for it. An engine without `prewarmPython` (older releases)
 // compiles it on that first run instead.
