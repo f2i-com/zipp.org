@@ -1585,7 +1585,9 @@ impl Compiler {
             lexical_this: false, // a concise method gets its own `this`, not lexical
             super_static,        // true for static methods/getters/setters/blocks
             is_strict: true,
-            simple_params: false, // strict (class body) — never mapped anyway
+            // Strict (class body), so never a mapped `arguments`; the leaf
+            // inliners read it as "binds its arguments positionally".
+            simple_params: params_ast.map(|pa| pa.simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
             static_key_plans: fc.static_key_plans,

@@ -1450,6 +1450,9 @@ impl<'p> Vm<'p> {
                     reg_window: caller.reg_count,
                     callee_reg_count: callee.reg_count,
                     this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
+                    this_reg: None,
+                    class_guard: None,
+                    prop_shapes: FxHashMap::default(),
                     param_count: callee.param_count,
                     default_arg_mask: 0,
                     body,
@@ -2906,19 +2909,35 @@ impl<'p> Vm<'p> {
             // body never reads `this`, so the receiver it would bind is
             // unobservable; its callee is guarded by FuncProto whenever it
             // captures nothing (a callback field is a fresh closure per owner).
-            let (argc, arg_base, callee_reg, with_this) = match caller.code[ip] {
+            //
+            // A `CallMethod` site (`a.dot(b)`) has no callee register: the
+            // method is the one its class-method lane's guards name
+            // (`ic_class_method_read`), and those guards stand in for the
+            // callee check (`LeafInlinePlan::class_guard`).
+            let mut class_guard = None;
+            let (argc, arg_base, callee_reg, with_this, this_v) = match caller.code[ip] {
                 Instr::Call {
                     argc,
                     arg_base,
                     callee,
                     ..
-                } => (argc, arg_base, callee, false),
+                } => (argc, arg_base, callee, false, 0),
                 Instr::CallWithThis {
                     argc,
                     arg_base,
                     callee,
+                    this_v,
                     ..
-                } if crate::codegen::cwt_leaf_enabled() => (argc, arg_base, callee, true),
+                } if crate::codegen::cwt_leaf_enabled() => (argc, arg_base, callee, true, this_v),
+                Instr::CallMethod {
+                    argc, arg_base, obj, ..
+                } if crate::codegen::class_leaf_enabled() => {
+                    let Some(lane) = self.ic_class_method_read(func_id, ip) else {
+                        continue;
+                    };
+                    class_guard = Some(lane);
+                    (argc, arg_base, u16::MAX, true, obj)
+                }
                 _ => continue,
             };
             // Prefer the exact monomorphic entry. A bounded extension accepts a
@@ -2936,7 +2955,14 @@ impl<'p> Vm<'p> {
                     !proto.lexical_this && proto.upvalues.is_empty()
                 });
             let mono = self.ic_call_mono(func_id, ip);
-            let (resolved, same_proto) = if let Some(dynamic) = upval_rep {
+            let (resolved, same_proto) = if let Some(lane) = class_guard {
+                // The lane's method, exactly: the guard pins it.
+                let value = Value::from_bits(lane.value);
+                let exact = self.ic_plain_fn(value).map(|(fid, closure)| {
+                    (lane.value, self.heap.version_of(value.heap_index()), fid, closure)
+                });
+                (exact, false)
+            } else if let Some(dynamic) = upval_rep {
                 (Some(dynamic), true)
             } else if let Some(exact) = mono {
                 (Some(exact), false)
@@ -2959,7 +2985,7 @@ impl<'p> Vm<'p> {
                 continue;
             };
             let callee = self.func(fid as usize);
-            let same_proto = if with_this {
+            let same_proto = if with_this && class_guard.is_none() {
                 poly_on && callee.upvalues.is_empty()
             } else {
                 same_proto
@@ -3226,15 +3252,53 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             }
-            if with_this
-                && body
-                    .iter()
-                    .any(|ins| crate::codegen::instr_uses(ins).contains(&0))
+            // A method body that reads `this` (`dot(o) { return this.x * o.x
+            // + … }`) binds the receiver: for a STRICT callee (every class
+            // method), OrdinaryCallBindThis binds it as given, so the emitter
+            // copies the caller's receiver register into reg 0. A sloppy
+            // callee would box or substitute it, and an arrow's `this` is
+            // lexical: both keep the real call.
+            // A class-method site always binds it: its guard reads the
+            // receiver from `this_reg`.
+            let this_reg = if with_this
+                && (class_guard.is_some()
+                    || body
+                        .iter()
+                        .any(|ins| crate::codegen::instr_uses(ins).contains(&0)))
             {
-                if log {
-                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (reads `this`)");
+                if !crate::codegen::leaf_this_enabled() || !callee.is_strict || callee.lexical_this {
+                    if log {
+                        eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (reads `this`)");
+                    }
+                    continue;
                 }
-                continue;
+                Some(this_v)
+            } else {
+                None
+            };
+            // The callee's own cache's shape for each body `GetProp`, tried
+            // inline before the generic leaf read. Only for a body that IS the
+            // callee's code prefix, so a body index is the callee's ip.
+            let mut prop_shapes = rustc_hash::FxHashMap::default();
+            if crate::codegen::leaf_prop_shape_enabled()
+                && default_arg_mask == 0
+                && span_code_unit_pred.is_none()
+                && nested.is_empty()
+            {
+                for (i, ins) in body.iter().enumerate() {
+                    let Instr::GetProp { dst, obj, name } = *ins else {
+                        continue;
+                    };
+                    let same_op = matches!(callee.code.get(i),
+                        Some(&Instr::GetProp { dst: d, obj: o, name: n })
+                            if d == dst && o == obj && n == name);
+                    if !same_op {
+                        continue;
+                    }
+                    if let Some((shape, slot, _)) = self.ic_cell_own_pair(fid, i) {
+                        prop_shapes.insert(i, (shape, slot));
+                    }
+                }
             }
             // Pre-resolve the numeric constants the body's `LoadConst` ops read
             // (callee_leaf_ok rejected any non-numeric constant).
@@ -3390,7 +3454,11 @@ impl<'p> Vm<'p> {
             // guard. Only epoch zero is admitted: after any observable global
             // delete/redefinition, saturation cannot make a stale baked epoch
             // look current and the real call remains authoritative.
-            let typed_lane = if !crate::codegen::typed_splice_enabled() {
+            // The typed lane models reg 0 as the baked `this_bits`, so a body
+            // with a bound receiver keeps the boxed per-op expansion.
+            let typed_lane = if !crate::codegen::typed_splice_enabled() || this_reg.is_some() {
+                // (A class-method site's `this_reg` is always set, so it never
+                // takes the lane, whose miss is a plain call's helper.)
                 None
             } else {
                 match crate::codegen::build_typed_lane_guarded(
@@ -3429,7 +3497,10 @@ impl<'p> Vm<'p> {
                      (default_mask={default_arg_mask:#x})"
                 );
             }
-            if span_code_unit_pred.is_none() && !same_proto {
+            if log && class_guard.is_some() {
+                eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} CLASS-LEAF");
+            }
+            if span_code_unit_pred.is_none() && !same_proto && class_guard.is_none() {
                 span_code_unit_pred = span_code_unit_pred_plan(callee, &body, argc);
             }
             if let Some(pred) = span_code_unit_pred.as_mut() {
@@ -3465,6 +3536,9 @@ impl<'p> Vm<'p> {
                     same_proto_fid: same_proto.then_some(fid),
                     same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
                     this_bits,
+                    this_reg,
+                    class_guard,
+                    prop_shapes,
                     reg_window,
                     callee_reg_count: callee.reg_count + extra_regs,
                     param_count: callee.param_count,

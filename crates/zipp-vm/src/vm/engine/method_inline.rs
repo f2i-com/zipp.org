@@ -146,12 +146,12 @@ impl<'p> Vm<'p> {
             return None;
         }
         // No rest/`arguments` object (binding past `param_count` must not be
-        // observable). We do NOT require `simple_params`: that flag is purely
-        // about a SLOPPY function's MAPPED arguments object and is deliberately
-        // false for every (strict) class method. A default/destructuring
-        // parameter prologue would emit a `Jump`/unsupported op before the first
-        // `Return`, which the straight-line whitelist below rejects — so plain
-        // positional binding is the only param shape that survives here.
+        // observable). We do NOT require `simple_params`: for a strict method
+        // it decides nothing at run time (only a SLOPPY function's arguments
+        // object is mapped). A default/destructuring parameter prologue would
+        // emit a `Jump`/unsupported op before the first `Return`, which the
+        // straight-line whitelist below rejects — so plain positional binding
+        // is the only param shape that survives here.
         if p.rest_reg.is_some() || p.arguments_reg.is_some() {
             return None;
         }

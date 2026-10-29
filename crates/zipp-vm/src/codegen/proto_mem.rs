@@ -6403,6 +6403,41 @@ pub(crate) fn compile_proto_mem(
                     let packed_fip = ((func_id as u64) << 32) | ip as u64;
                     let packed_args =
                         ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    // A leaf class method (`dot(o) { return this.x * o.x … }`)
+                    // inlined behind its class-method lane's guards; a receiver
+                    // they do not hold for takes the route below, and a bail in
+                    // the body re-runs the call in the interpreter.
+                    let leaf_done = ops.new_dynamic_label();
+                    let class_leaf = leaf_plan.get(&ip).filter(|lp| lp.class_guard.is_some());
+                    if let Some(lp) = class_leaf {
+                        let leaf_miss = ops.new_dynamic_label();
+                        emit_inline_leaf_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            lp,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.math_unary,
+                            heap.math_two,
+                            heap.math_imul_guard,
+                            heap.get_index,
+                            heap.char_code_at,
+                            heap.strict_eq,
+                            heap.truthy,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch,
+                            None,
+                            None,
+                            Some((leaf_miss, leaf_done)),
+                        );
+                        dynasm!(ops ; => leaf_miss);
+                    }
                     // An own data property holding a function (`this.cmp(a, b)`
                     // with `cmp` set in the constructor): the memory region's
                     // CROSS3M lane, the method read through the receiver's hot
@@ -6507,6 +6542,9 @@ pub(crate) fn compile_proto_mem(
                     }
                     if own_lane.is_some() {
                         dynasm!(ops ; => own_done);
+                    }
+                    if class_leaf.is_some() {
+                        dynasm!(ops ; => leaf_done);
                     }
                     if let Some(done) = pop_done {
                         dynasm!(ops ; => done);
@@ -6669,6 +6707,7 @@ pub(crate) fn compile_proto_mem(
                         refetch,
                         None,
                         span_pair_resume,
+                        None,
                     );
                 } else {
                     emit_region_call_ic(
@@ -7190,8 +7229,9 @@ pub(crate) fn compile_proto_mem(
                         );
                     }
                 }
-                // A leaf callee that never reads `this`, inlined under its
-                // guard; a miss makes the call through the same helper.
+                // A leaf callee that never reads `this`, or a strict one that
+                // does (bound to the receiver), inlined under its guard; a
+                // miss makes the call through the same helper.
                 match leaf_plan.get(&ip).filter(|_| lane_done.is_none()) {
                     Some(lp) => emit_inline_leaf_call(
                         &mut ops,
@@ -7214,6 +7254,7 @@ pub(crate) fn compile_proto_mem(
                         packed_fip,
                         packed_args,
                         refetch,
+                        None,
                         None,
                         None,
                     ),
@@ -8293,7 +8334,7 @@ fn emit_float_unary_sqrt(
 /// frame slot at `est`, and a miss zeroes every slot in `zero` (`est`'s
 /// among them) before the probe and helpers, which may run user code.
 #[allow(clippy::too_many_arguments)]
-fn emit_prop_shape_get(
+pub(crate) fn emit_prop_shape_get(
     ops: &mut dynasmrt::x64::Assembler,
     obj: u16,
     dst: u16,
@@ -8411,7 +8452,7 @@ fn emit_class_read_get(
 /// receiver in `obj`: anything but a receiver of the lane's shape and class,
 /// with the class at the lane's version and epoch, jumps to `miss` with the
 /// receiver's bits in rax. Clobbers rcx, r9, r10 and r11.
-fn emit_class_read_guard(
+pub(crate) fn emit_class_read_guard(
     ops: &mut dynasmrt::x64::Assembler,
     obj: u16,
     lane: &crate::codegen::ClassReadLane,

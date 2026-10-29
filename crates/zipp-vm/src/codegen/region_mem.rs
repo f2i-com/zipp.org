@@ -3314,6 +3314,45 @@ pub(crate) fn compile_region_mem(
                     let packed_args =
                         ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
                     let mi = method_plan.get(&ip);
+                    // A leaf class method inlined behind its class-method lane's
+                    // guards (`LeafInlinePlan::class_guard`), ahead of every
+                    // route below, which serve a receiver the guards reject.
+                    // A Q7 plan (`mi`) for the site keeps its own inline, whose
+                    // per-receiver arms can run the body register-resident:
+                    // `o.m(s)` on one receiver ran 1.67x the instructions when
+                    // the boxed leaf body went first.
+                    if let Some(lp) = leaf_plan
+                        .get(&ip)
+                        .filter(|lp| lp.class_guard.is_some() && blocks.is_none() && mi.is_none())
+                    {
+                        let leaf_miss = ops.new_dynamic_label();
+                        emit_inline_leaf_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            lp,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.math_unary,
+                            heap.math_two,
+                            heap.math_imul_guard,
+                            heap.get_index,
+                            heap.char_code_at,
+                            heap.strict_eq,
+                            heap.truthy,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            None,
+                            None,
+                            None,
+                            Some((leaf_miss, mc_done)),
+                        );
+                        dynasm!(ops ; => leaf_miss);
+                    }
                     // The inlined body (Q7, below) makes no call; the cross lane
                     // makes a native one. With both at a site the inline's
                     // per-receiver arms go first, as a prefix whose miss tries
@@ -3587,6 +3626,7 @@ pub(crate) fn compile_region_mem(
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                         span_pair_resume,
+                        None,
                     );
                 } else {
                     emit_region_call_ic(

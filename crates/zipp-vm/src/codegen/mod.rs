@@ -1419,6 +1419,25 @@ pub struct LeafInlinePlan {
     /// per call against 3.6ns for the equivalent method — the single commonest
     /// call shape in the language taking the slowest path.
     pub this_bits: u64,
+    /// A `CallWithThis` site's receiver register, for a STRICT callee whose
+    /// body reads `this`: the receiver is copied into reg 0 instead of
+    /// `this_bits` (OrdinaryCallBindThis on a strict function binds the
+    /// value as given). `None`: `this_bits` as above.
+    pub this_reg: Option<u16>,
+    /// A `CallMethod` site's class-method lane (`ClassReadLane`): the receiver
+    /// in `this_reg` at the lane's shape and class proves the method is
+    /// `callee_bits`, so this guard replaces the callee identity check, and a
+    /// miss takes the site's own method route, which the Tier C emitter
+    /// supplies (`emit_inline_leaf_call`'s `external`). `None` for a call
+    /// through a callee register.
+    pub class_guard: Option<ClassReadLane>,
+    /// For a body `GetProp` (by body index), the receiver shape and own data
+    /// slot the callee's own interpreter cache last found its key at
+    /// (`Vm::ic_cell_own_pair`): the emitter tries that shape inline before
+    /// `prop_get`, which serves every other receiver. Empty for a body that
+    /// is not the callee's own code prefix (a specialized or flattened body
+    /// renumbers its ops).
+    pub prop_shapes: FxHashMap<usize, (u32, u32)>,
     /// Callee formal parameter count (args 0..min(argc,param_count) are copied
     /// into scratch regs `reg_window+1 ..` ; reg `reg_window+0` is `this`).
     pub param_count: u16,

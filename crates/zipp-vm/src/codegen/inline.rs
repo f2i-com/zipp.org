@@ -48,6 +48,25 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_CLASS_LEAF=1` keeps every `CallMethod` site's class method a
+    /// real call, instead of inlining a leaf one behind its class-method
+    /// lane's guards (`LeafInlinePlan::class_guard`).
+    fn class_leaf_enabled() = "ZIPP_NO_CLASS_LEAF"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_THIS=1` keeps declining a `CallWithThis` leaf whose body
+    /// reads `this`, instead of binding the receiver into its reg 0.
+    fn leaf_this_enabled() = "ZIPP_NO_LEAF_THIS"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_PROP_SHAPE=1` drops the inline known-shape read ahead of
+    /// a leaf body's `jit_get_prop_leaf` call (`LeafInlinePlan::prop_shapes`).
+    fn leaf_prop_shape_enabled() = "ZIPP_NO_LEAF_PROP_SHAPE"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_INLINE_SAME_PROTO_GUARD=1` restores the read-only
     /// `jit_leaf_same_func_proto` helper call at each polymorphic leaf site.
     /// The default emits the same proof from VM-relative mirrors and falls
@@ -455,11 +474,27 @@ pub(crate) fn emit_inline_leaf_call(
     // resumes at the pair's shared branch; helper fallback still falls through
     // to the first call's next bytecode.
     span_pair_resume: Option<dynasmrt::DynamicLabel>,
+    // `Some((fallback, done))` for a `CallMethod` site (`plan.class_guard`):
+    // a miss jumps to `fallback` and the inlined body ends with a jump to
+    // `done`, both bound by the caller around the site's own method route;
+    // `helper` and its packed operands are unused.
+    external: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)>,
 ) {
-    let fallback = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
+    let (fallback, done) =
+        external.unwrap_or_else(|| (ops.new_dynamic_label(), ops.new_dynamic_label()));
     let w = plan.reg_window;
-    if let Some(fid) = plan.same_proto_fid {
+    debug_assert!(
+        external.is_none()
+            || (plan.class_guard.is_some()
+                && plan.typed_lane.is_none()
+                && plan.span_code_unit_pred.is_none()),
+        "an external fallback serves only a class-method leaf without lanes"
+    );
+    if let (Some(lane), Some(recv)) = (plan.class_guard, plan.this_reg) {
+        // The receiver at the lane's shape and class, the class unchanged:
+        // its method is `callee_bits` (the class-method lane's own proof).
+        crate::codegen::emit_class_read_guard(ops, recv, &lane, fallback);
+    } else if let Some(fid) = plan.same_proto_fid {
         if inline_same_proto_guard_enabled() {
             use crate::vm::host_api::{
                 JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET,
@@ -735,8 +770,12 @@ pub(crate) fn emit_inline_leaf_call(
         // `arguments`); params beyond `argc` stay undefined (the slot is zeroed
         // here so a stale scratch value can't leak in).
         ; mov rax, QWORD plan.this_bits as i64
-        ; mov [rbx + dreg(w)], rax
     );
+    // A strict method's `this`: the call's receiver, as given.
+    if let Some(r) = plan.this_reg {
+        dynasm!(ops ; mov rax, [rbx + dreg(r)]);
+    }
+    dynasm!(ops ; mov [rbx + dreg(w)], rax);
     let n = argc.min(plan.param_count);
     for i in 0..plan.param_count {
         if i < n {
@@ -1209,6 +1248,13 @@ pub(crate) fn emit_inline_leaf_call(
             // reasoning as `GetIndex`.
             Instr::GetProp { dst: d, obj, name } => {
                 let bail = ops.new_dynamic_label();
+                let read = ops.new_dynamic_label();
+                // The receiver shape the callee's own cache saw: its own data
+                // slot read inline, as Tier C's known-shape lane reads it; any
+                // other receiver falls through to the helper.
+                if let Some(&(shape, slot)) = plan.prop_shapes.get(&bi) {
+                    crate::codegen::emit_prop_shape_get(ops, rg(obj), rg(d), shape, slot, read, None, &[]);
+                }
                 let packed: u64 = ((plan.callee_fid as u64) << 32) | name as u64;
                 dynasm!(ops
                     ; mov rcx, rdi                              // vm
@@ -1220,6 +1266,7 @@ pub(crate) fn emit_inline_leaf_call(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(rg(d))], rax
+                    ; => read
                 );
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
@@ -1404,10 +1451,11 @@ pub(crate) fn emit_inline_leaf_call(
             ; mov [rbx + dreg(dst)], rax
         ),
     }
-    dynasm!(ops
-        ; jmp => done
-        ; => fallback
-    );
+    dynasm!(ops ; jmp => done);
+    if external.is_some() {
+        return;
+    }
+    dynasm!(ops ; => fallback);
     // ── fallback ── the UNCHANGED per-call helper (a pure prefix). On a clean
     // return it writes `dst`; on its own deopt/throw sentinel it bails at this
     // ip via the bail label `emit_region_call_ic` creates internally.
