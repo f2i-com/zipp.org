@@ -317,3 +317,82 @@ fn long_loops_run_in_constant_stack() {
     );
     assert_eq!(run(&src), vec!["3000000"]);
 }
+
+/// A program big enough to start with its JavaScript interpreted -- 256
+/// functions or more, as any real page is -- still runs its WebAssembly on
+/// Wasmtime in a `wasm-jit` build: only a refused JIT (`ZIPP_NOJIT`, an
+/// embedder turning it off) means wasmi. 0.0.31 took the size cutoff for a
+/// refusal, and WebAssembly in a browser page or a large script ran seven
+/// times slower on wasmi. Which runtime ran shows in the exports' order:
+/// Wasmtime keeps the module's, wasmi sorts them by name.
+#[cfg(all(feature = "wasm-jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_large_program_keeps_compiled_webassembly() {
+    let wat = r#"(module
+        (func (export "zeta") (result i32) i32.const 1)
+        (func (export "alpha") (result i32) i32.const 2))"#;
+    let body = "console.log(WebAssembly.Module.exports(new WebAssembly.Module(m)).map(function (e) { return e.name; }).join());";
+    let refused = std::env::var_os("ZIPP_NOJIT").is_some() || std::env::var_os("ZIPP_WASM_INTERP").is_some();
+    let expected = if refused { "alpha,zeta" } else { "zeta,alpha" };
+    let small = program(&[("m", wat)], body);
+    assert_eq!(run(&small), vec![expected], "a small program");
+    let mut large = String::new();
+    for i in 0..300 {
+        large.push_str(&format!("function f{i}(x) {{ return x + {i}; }}
+"));
+    }
+    large.push_str(&small);
+    assert_eq!(run(&large), vec![expected], "a program of 300 functions");
+}
+
+/// The members are writable data properties, as in a browser, so a page can
+/// wrap one: before any was read, and after.
+#[test]
+fn members_can_be_replaced() {
+    let out = run(r#"
+        WebAssembly.validate = function () { return "mine"; };
+        console.log(WebAssembly.validate(), typeof WebAssembly.compile);
+        var instantiate = WebAssembly.instantiate;
+        WebAssembly.instantiate = function (b, i) { return instantiate(b, i).then(function () { return "wrapped"; }); };
+        WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])).then(function (r) { console.log(r); });
+        var d = Object.getOwnPropertyDescriptor(WebAssembly, "Module");
+        console.log(d.writable, d.enumerable, d.configurable, typeof d.value, Object.keys(WebAssembly).length);
+    "#);
+    assert_eq!(out, vec!["mine function", "true false true function 0", "wrapped"]);
+}
+
+/// A JavaScript value given to WebAssembly as an `externref` lives while
+/// WebAssembly can reach it, not for the VM's life. Every value a module was
+/// passed used to stay a root for good: one taking objects by reference, as
+/// wasm-bindgen's do, kept all it was ever given, and softn.com's apps grew by
+/// gigabytes a minute in zipp-browser. Passing ten times the objects now
+/// leaves the heap about where it was, and a value still comes back as itself.
+/// (wasmi has no collector for its references, so this is Wasmtime's.)
+#[cfg(all(feature = "wasm-jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn externref_values_are_let_go() {
+    if std::env::var_os("ZIPP_NOJIT").is_some() || std::env::var_os("ZIPP_WASM_INTERP").is_some() {
+        return;
+    }
+    let wat = r#"(module (func (export "id") (param externref) (result externref) local.get 0))"#;
+    let heap_after = |n: usize| {
+        let body = format!(
+            "var id = new WebAssembly.Instance(new WebAssembly.Module(m)).exports.id;
+             var kept = {{ kept: true }}, same = id(kept) === kept;
+             for (var i = 0; i < {n}; i++) {{
+                 var o = {{ i: i, pad: new Array(64).fill(i) }};
+                 if (id(o) !== o) same = false;
+             }}
+             console.log(same, id(kept) === kept, id(null) === null);"
+        );
+        let mut state = embed::compile_script(&program(&[("m", wat)], &body)).expect("compiles");
+        state.run_init().expect("runs");
+        state.run_microtasks();
+        assert_eq!(state.take_output(), vec!["true true true"], "{n} objects");
+        state.heap_bytes()
+    };
+    let small = heap_after(20_000);
+    let large = heap_after(200_000);
+    assert!(large < small * 3, "the heap grew with the objects passed: {small} bytes after 20,000, {large} after 200,000");
+}
+

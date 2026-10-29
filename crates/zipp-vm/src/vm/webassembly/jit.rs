@@ -6,10 +6,13 @@
 //!   for every VM: each Web Worker has a VM of its own, and the zipp.org
 //!   playground starts a fresh engine worker for every run, each compiling the
 //!   same 8.6 MB.
-//! - **`externref`s** are Wasmtime GC references. One is kept (owned) per
-//!   distinct JavaScript value for the VM's life, as wasmi's are; the
-//!   short-lived roots an operation makes to pass them are let go when it ends
-//!   (each operation runs in a `RootScope`, and an import's are let go when it
+//! - **`externref`s** are Wasmtime GC references, and a JavaScript value
+//!   given to WebAssembly as one stays alive while WebAssembly can still
+//!   reach it -- not, as wasmi's do, for the VM's life. Every reference made
+//!   for a value shares its slot (`ExternSlot`), which Wasmtime drops with the
+//!   last of them; the slot's value is then no longer a root. The short-lived
+//!   roots an operation makes to pass them are let go when it ends (each
+//!   operation runs in a `RootScope`, and an import's are let go when it
 //!   returns), so passing references does not grow the store's roots.
 //!
 //! [Wasmtime]: https://github.com/bytecodealliance/wasmtime
@@ -17,7 +20,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::heap::{ExternalBytes, HeapObj};
 use crate::value::Value;
@@ -28,7 +31,7 @@ use super::{grow, stats, table_bytes, Failure, Op};
 
 use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Engine, Extern, ExternRef, ExternType, Func, Global, GlobalType,
-    Instance, ManuallyRooted, Memory, MemoryType, Module, Mutability, Ref, RefType, ResourceLimiter, RootScope,
+    Instance, Memory, MemoryType, Module, Mutability, Ref, RefType, ResourceLimiter, RootScope,
     Rooted, Store, StoreContextMut, Table, TableType, Trap, UpdateDeadline, Val, ValType,
 };
 
@@ -160,6 +163,31 @@ enum Context {
 
 type ScopeCtx = RootScope<StoreContextMut<'static, Host>>;
 
+/// An `externref`'s claim on the JavaScript value it stands for: the host
+/// data of every reference made for that value, so dropped -- by Wasmtime,
+/// when it collects the last of them -- once WebAssembly can no longer reach
+/// the value. Dropping hands the slot back (`Runtime::reclaim_externs`).
+///
+/// Every value WebAssembly was given used to be kept for the VM's life. A
+/// module passing objects in by reference, as wasm-bindgen's do, kept every
+/// one it was ever passed: softn.com's apps grew by gigabytes a minute.
+struct ExternSlot {
+    index: u32,
+    released: Arc<Mutex<Vec<u32>>>,
+}
+
+impl Drop for ExternSlot {
+    fn drop(&mut self) {
+        if let Ok(mut released) = self.released.lock() {
+            released.push(self.index);
+        }
+    }
+}
+
+/// Live `externref` slots at which a runtime first collects the store's
+/// references itself; then again each time the count doubles.
+const EXTERN_GC_FIRST: usize = 4096;
+
 /// Everything WebAssembly in one VM: the store and what is numbered in it.
 pub(crate) struct Runtime {
     store: Store<Host>,
@@ -177,12 +205,19 @@ pub(crate) struct Runtime {
     globals: Vec<Global>,
     /// The JavaScript functions instances import (GC roots).
     pub(crate) imports: Vec<Value>,
-    /// The JavaScript values WebAssembly has been given as `externref`s (GC
-    /// roots), each with its reference, and by value, to find them again.
+    /// The JavaScript values WebAssembly can reach as `externref`s (GC roots),
+    /// by slot; a released slot holds `undefined` until it is reused.
     pub(crate) externs: Vec<Value>,
-    /// Kept for the VM's life, so never unrooted: the store's drop frees them.
-    extern_refs: Vec<ManuallyRooted<ExternRef>>,
+    /// Each slot's claim, while some reference holds it (`ExternSlot`).
+    extern_slots: Vec<Weak<ExternSlot>>,
+    /// Each value's slot, to give the same value the same slot.
     extern_ids: HashMap<u64, u32>,
+    /// Slots free for reuse, and those whose last reference Wasmtime has
+    /// collected since the runtime last looked.
+    extern_free: Vec<u32>,
+    extern_released: Arc<Mutex<Vec<u32>>>,
+    /// Live slots at which the runtime next collects the store's references.
+    extern_gc_at: usize,
     /// The contexts of the operations and imports running, innermost last: a
     /// call into WebAssembly from inside an import goes through the import's.
     contexts: Vec<Context>,
@@ -251,28 +286,69 @@ impl Runtime {
         }
     }
 
-    /// `v` as an `externref`: the same reference for the same value.
+    /// `v` as an `externref`, sharing the slot of every other reference to
+    /// the same value while one is alive.
     fn extern_ref(&mut self, v: Value) -> Op<Rooted<ExternRef>> {
-        if let Some(&i) = self.extern_ids.get(&v.bits()) {
-            // The kept root, read through the context without borrowing the
-            // runtime whole (`ctx_of`).
-            let owned = &self.extern_refs[i as usize];
-            return Ok(owned.to_rooted(ctx_of(&self.contexts, &mut self.store)));
+        self.reclaim_externs();
+        let live = self.externs.len() - self.extern_free.len();
+        if live >= self.extern_gc_at {
+            // Wasmtime collects references only when its GC heap fills, and
+            // until it does a slot it no longer needs still roots its value.
+            self.ctx().gc(None);
+            self.reclaim_externs();
+            let live = self.externs.len() - self.extern_free.len();
+            self.extern_gc_at = (live * 2).max(EXTERN_GC_FIRST);
         }
-        let i = self.externs.len() as u32;
-        let mut ctx = self.ctx();
-        let r = ExternRef::new(&mut ctx, i).map_err(|e| Failure::Record("RangeError", e.to_string()))?;
-        let owned = r.to_manually_rooted(&mut ctx).map_err(|e| Failure::Record("RangeError", e.to_string()))?;
-        self.externs.push(v);
-        self.extern_refs.push(owned);
-        self.extern_ids.insert(v.bits(), i);
-        Ok(r)
+        let slot = match self.extern_ids.get(&v.bits()).and_then(|&i| self.extern_slots[i as usize].upgrade()) {
+            Some(slot) => slot,
+            None => {
+                let i = match self.extern_free.pop() {
+                    Some(i) => {
+                        self.externs[i as usize] = v;
+                        i
+                    }
+                    None => {
+                        self.externs.push(v);
+                        self.extern_slots.push(Weak::new());
+                        (self.externs.len() - 1) as u32
+                    }
+                };
+                let slot = Arc::new(ExternSlot { index: i, released: self.extern_released.clone() });
+                self.extern_slots[i as usize] = Arc::downgrade(&slot);
+                self.extern_ids.insert(v.bits(), i);
+                slot
+            }
+        };
+        ExternRef::new(self.ctx(), slot).map_err(|e| Failure::Record("RangeError", e.to_string()))
+    }
+
+    /// Free the slots whose last reference Wasmtime has collected: their
+    /// values are roots no longer, and the slots go to new values.
+    fn reclaim_externs(&mut self) {
+        let released = match self.extern_released.lock() {
+            Ok(mut released) if !released.is_empty() => std::mem::take(&mut *released),
+            _ => return,
+        };
+        for i in released {
+            let slot = i as usize;
+            // A slot is released once, when its last claim drops; one taken
+            // again since (it cannot be, before this runs) would be live.
+            if self.extern_slots[slot].strong_count() > 0 {
+                continue;
+            }
+            let v = std::mem::replace(&mut self.externs[slot], Value::UNDEFINED);
+            if self.extern_ids.get(&v.bits()) == Some(&i) {
+                self.extern_ids.remove(&v.bits());
+            }
+            self.extern_slots[slot] = Weak::new();
+            self.extern_free.push(i);
+        }
     }
 
     /// The JavaScript value an `externref` stands for.
     fn extern_value(&mut self, r: Rooted<ExternRef>) -> Value {
         let ctx = self.ctx();
-        let i = r.data(&ctx).ok().flatten().and_then(|d| d.downcast_ref::<u32>()).copied();
+        let i = r.data(&ctx).ok().flatten().and_then(|d| d.downcast_ref::<Arc<ExternSlot>>()).map(|s| s.index);
         i.and_then(|i| self.externs.get(i as usize).copied()).unwrap_or(Value::UNDEFINED)
     }
 
@@ -398,8 +474,11 @@ impl Runtime {
             globals: Vec::new(),
             imports: Vec::new(),
             externs: Vec::new(),
-            extern_refs: Vec::new(),
+            extern_slots: Vec::new(),
             extern_ids: HashMap::new(),
+            extern_free: Vec::new(),
+            extern_released: Arc::new(Mutex::new(Vec::new())),
+            extern_gc_at: EXTERN_GC_FIRST,
             contexts: Vec::new(),
         }
     }

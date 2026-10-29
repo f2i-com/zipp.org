@@ -1130,14 +1130,53 @@ impl Engine {
             // included: nodes, bytes and inspected work (ZA-07), beside the
             // JS-side one the loop below already shared.
             let mut walk = HostValueBudget::default();
+            // The batch as one JSON text while JSON can carry it (`write_json`),
+            // charged as the conversion charges; from a value it cannot, the
+            // values read so far and the rest convert as they always have,
+            // against the budget as it was before the text began.
+            let before = budget.clone();
+            let mut json = Some(String::from("["));
+            let mut read: Vec<HostValue> = Vec::new();
             for i in indices {
                 let value = st
                     .try_get_slot_bounded(i, &mut walk)
                     .map_err(|error| engine_js_error(last_error_kind, error))?;
+                if let Some(text) = json.as_mut() {
+                    if !read.is_empty() {
+                        text.push(',');
+                    }
+                    let fits = write_json(&value, text, &mut budget);
+                    read.push(value);
+                    if fits {
+                        continue;
+                    }
+                    json = None;
+                    budget = before.clone();
+                    for value in read.drain(..) {
+                        out.push(
+                            &to_js_bounded(&value, &mut budget)
+                                .map_err(|error| engine_js_error(last_error_kind, error))?,
+                        );
+                    }
+                    continue;
+                }
                 out.push(
                     &to_js_bounded(&value, &mut budget)
                         .map_err(|error| engine_js_error(last_error_kind, error))?,
                 );
+            }
+            if let Some(mut text) = json {
+                text.push(']');
+                if let Ok(parsed) = js_sys::JSON::parse(&text) {
+                    return Ok(parsed);
+                }
+                budget = before;
+                for value in &read {
+                    out.push(
+                        &to_js_bounded(value, &mut budget)
+                            .map_err(|error| engine_js_error(last_error_kind, error))?,
+                    );
+                }
             }
         }
         Ok(out.into())
@@ -3271,6 +3310,112 @@ fn to_js(v: &HostValue) -> Result<JsValue, String> {
     to_js_bounded(v, &mut budget)
 }
 
+/// Append `v` to `out` as JSON, charging `budget` exactly as
+/// [`to_js_bounded`] would, node for node and byte for byte. `false` -- with
+/// `out` and `budget` then part-written -- for a value JSON cannot carry
+/// exactly (`undefined`, a number it has no spelling for, a lone surrogate, a
+/// `Float32Array`) or one the budget refuses, which the conversion then
+/// reports.
+///
+/// What it can carry crosses the boundary once, for `JSON.parse` to build:
+/// the same plain arrays and objects, each property an own data property as
+/// `define_own` makes it. Built property by property, a read of an app's
+/// state was a few crossings per property (every name and number made on
+/// the other side, then each property defined), thousands a read; a host
+/// mirroring the state every tick (softn.com's) spent most of its time there.
+fn write_json(v: &HostValue, out: &mut String, budget: &mut HostValueBudget) -> bool {
+    use std::fmt::Write;
+    if budget.charge_node().is_err() {
+        return false;
+    }
+    match v {
+        HostValue::Undefined | HostValue::Utf16(_) | HostValue::Float32Array(_) => false,
+        HostValue::Null | HostValue::Opaque => {
+            out.push_str("null");
+            true
+        }
+        HostValue::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            true
+        }
+        HostValue::Number(n) => {
+            if !n.is_finite() {
+                return false;
+            }
+            // Rust's shortest round-tripping digits; JSON.parse reads them
+            // back to the same double, -0 included.
+            let a = n.abs();
+            if a != 0.0 && !(1e-6..1e21).contains(&a) {
+                let _ = write!(out, "{n:e}");
+            } else {
+                let _ = write!(out, "{n}");
+            }
+            true
+        }
+        HostValue::String(s) => {
+            if budget.charge_string(s).is_err() {
+                return false;
+            }
+            write_json_string(s, out);
+            true
+        }
+        HostValue::Array(items) => {
+            if budget.ensure_nodes(items.len()).is_err() {
+                return false;
+            }
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !write_json(item, out, budget) {
+                    return false;
+                }
+            }
+            out.push(']');
+            true
+        }
+        HostValue::Object(pairs) => {
+            if budget.ensure_nodes(pairs.len()).is_err() {
+                return false;
+            }
+            out.push('{');
+            for (i, (k, val)) in pairs.iter().enumerate() {
+                if budget.charge_string(k).is_err() {
+                    return false;
+                }
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                if !write_json(val, out, budget) {
+                    return false;
+                }
+            }
+            out.push('}');
+            true
+        }
+    }
+}
+
+/// `s` as a JSON string literal.
+fn write_json_string(s: &str, out: &mut String) {
+    use std::fmt::Write;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 /// Build the largest console prefix that fits one host-value conversion.
 /// The returned count is committed only after `to_js` succeeds, so a failed
 /// conversion cannot erase output. A large backlog is paginated across calls.
@@ -3365,7 +3510,7 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
         HostValue::Number(n) => Ok(JsValue::from_f64(*n)),
         HostValue::String(s) => {
             budget.charge_string(s)?;
-            Ok(JsValue::from_str(s))
+            Ok(host_string(s))
         }
         // A guest string holding a lone surrogate: rebuilt from its exact
         // code units, so the host sees the string the guest has (the
@@ -3395,6 +3540,9 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
                 let value = to_js_bounded(val, budget)?;
                 define_own(&o, k, &value)?;
             }
+            if !pairs.is_empty() {
+                release_data_descriptor();
+            }
             Ok(o.into())
         }
     }
@@ -3423,12 +3571,48 @@ fn utf16_units_to_js_string(units: &[u16]) -> js_sys::JsString {
     out
 }
 
-/// Define an ordinary enumerable data property without invoking the legacy
-/// `__proto__` setter inherited from `Object.prototype`.
-fn define_own(target: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), String> {
+thread_local! {
+    /// `define_own`'s descriptor, `{value, writable: true, enumerable: true,
+    /// configurable: true}`, with its `"value"` key: made once, then only its
+    /// value changes. Its fields are its own properties from the start, so
+    /// setting `value` again never reaches a setter on `Object.prototype`.
+    static DATA_DESCRIPTOR: std::cell::OnceCell<(js_sys::Object, JsValue)> =
+        const { std::cell::OnceCell::new() };
+    /// Short strings already made on the host side (`host_string`).
+    static HOST_STRINGS: RefCell<std::collections::HashMap<Box<str>, JsValue>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Strings at most this long are kept once made (`host_string`), and at most
+/// this many of them: property names and the short values (a kind, a state)
+/// a UI's state repeats in every element of every read.
+const HOST_STRING_MAX_BYTES: usize = 32;
+const HOST_STRING_MAX_COUNT: usize = 4096;
+
+/// `s` as a host string. Each one made is a crossing of the wasm boundary
+/// (the bytes decoded on the other side); a short one is made once and given
+/// again, which a host cannot tell apart, strings being values.
+fn host_string(s: &str) -> JsValue {
+    if s.len() > HOST_STRING_MAX_BYTES {
+        return JsValue::from_str(s);
+    }
+    HOST_STRINGS.with(|kept| {
+        if let Some(v) = kept.borrow().get(s) {
+            return v.clone();
+        }
+        let v = JsValue::from_str(s);
+        let mut kept = kept.borrow_mut();
+        if kept.len() < HOST_STRING_MAX_COUNT {
+            kept.insert(s.into(), v.clone());
+        }
+        v
+    })
+}
+
+fn data_descriptor() -> Result<(js_sys::Object, JsValue), String> {
     let descriptor = js_sys::Object::new();
     for (name, value) in [
-        ("value", value.clone()),
+        ("value", JsValue::UNDEFINED),
         ("writable", JsValue::TRUE),
         ("enumerable", JsValue::TRUE),
         ("configurable", JsValue::TRUE),
@@ -3438,10 +3622,45 @@ fn define_own(target: &js_sys::Object, key: &str, value: &JsValue) -> Result<(),
             _ => return Err("zipp: failed to construct a host object".into()),
         }
     }
-    match js_sys::Reflect::define_property(target, &JsValue::from_str(key), &descriptor) {
-        Ok(true) => Ok(()),
-        _ => Err("zipp: failed to construct a host object".into()),
-    }
+    Ok((descriptor, JsValue::from_str("value")))
+}
+
+/// Define an ordinary enumerable data property without invoking the legacy
+/// `__proto__` setter inherited from `Object.prototype`.
+///
+/// Through the one descriptor (`DATA_DESCRIPTOR`) and the kept key strings
+/// (`host_string`): a descriptor made for each property was eleven crossings
+/// of the wasm boundary per property a read copied out -- the object, each
+/// field's name made and set, the key, the definition -- where two do. A
+/// host mirroring an app's state (softn.com's, every tick) copies thousands
+/// of properties a read.
+fn define_own(target: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), String> {
+    const FAILED: &str = "zipp: failed to construct a host object";
+    DATA_DESCRIPTOR.with(|cell| {
+        if cell.get().is_none() {
+            let _ = cell.set(data_descriptor()?);
+        }
+        let (descriptor, value_key) = cell.get().ok_or(FAILED)?;
+        match js_sys::Reflect::set(descriptor, value_key, value) {
+            Ok(true) => {}
+            _ => return Err(FAILED.into()),
+        }
+        match js_sys::Reflect::define_property(target, &host_string(key), descriptor) {
+            Ok(true) => Ok(()),
+            _ => Err(FAILED.into()),
+        }
+    })
+}
+
+/// Let `define_own`'s descriptor stop holding the last value it defined, once
+/// an object has all its properties: the descriptor lives as long as the
+/// module, and would otherwise keep that value alive.
+fn release_data_descriptor() {
+    DATA_DESCRIPTOR.with(|cell| {
+        if let Some((descriptor, value_key)) = cell.get() {
+            let _ = js_sys::Reflect::set(descriptor, value_key, &JsValue::UNDEFINED);
+        }
+    });
 }
 
 fn from_js(v: &JsValue) -> Result<HostValue, String> {

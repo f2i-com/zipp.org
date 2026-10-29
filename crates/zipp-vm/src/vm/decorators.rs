@@ -100,6 +100,8 @@ impl<'p> Vm<'p> {
         match id {
             #[cfg(feature = "webassembly")]
             native::WASM_LAZY_GET => self.wasm_lazy_get(state),
+            #[cfg(feature = "webassembly")]
+            native::WASM_LAZY_SET => self.wasm_lazy_set(state, _this, a0),
             native::DEC_ADD_INITIALIZER => {
                 let class = state[0];
                 let which = state[1].as_f64() as u8;

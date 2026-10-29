@@ -727,14 +727,11 @@ impl<'p> Vm<'p> {
                 // under `panic = "abort"` — a dead process from two lines of JS.
                 // The same wrong path made `Reflect.set(t, k, v, receiver)` call
                 // a setter inherited by the receiver where the spec defines an
-                // own property and never consults the chain.
-                let mut m = crate::heap::ObjMap::new();
-                m.set("value", value);
-                m.set("writable", Value::TRUE);
-                m.set("enumerable", Value::TRUE);
-                m.set("configurable", Value::TRUE);
-                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                self.object_define_property(receiver, &key, desc)?;
+                // own property and never consults the chain. An ordinary
+                // receiver takes the append a class field's definition does
+                // (`define_field`), not a descriptor object built to be read
+                // back.
+                self.define_field(receiver, &key, value)?;
                 Ok(true)
             }
             // A writable own data property. On an ordinary object the value is
