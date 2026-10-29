@@ -136,6 +136,35 @@ linker. The ratio compares the release product with the canonical benchmark
 product; it is not the effect of profile guidance alone, which would take a
 feature- and flag-matched pair to measure.
 
+### Release 0.0.31, as published
+
+The 0.0.31 release notes measure the published 0.0.31 and 0.0.30 Windows
+binaries against Bellard's QuickJS 2026-06-04 and Node 24.19.0 on 29 October
+2026: an otherwise idle Ryzen 9 9950X3D, address-space randomization off,
+each run pinned to one core, medians of interleaved runs. This is a release
+comparison taken with scratch scripts, not a stamped capture like the ones
+above. Ratios are 0.0.31 / the other engine.
+
+| Bundled application, cache off (7 runs) | / 0.0.30 | / QuickJS, 96 MB-L3 die | / QuickJS, 32 MB-L3 die | / Node 24 |
+|---|---:|---:|---:|---:|
+| Babel | 0.87× | 0.83× | 0.98× | 3.94× |
+| TypeScript | 0.95× | 0.84× | 0.89× | Node fails |
+| Prettier | 0.89× | 0.93× | 0.96× | 1.14× |
+| marked, lodash, acorn, terser, three.js, immer, RxJS, date-fns | 0.94× | 0.35× | 0.39× | 1.91× |
+| Vue server rendering | 0.93× | 0.93× | 0.89× | 1.08× |
+| Preact server rendering | 0.83× | 0.85× | 0.87× | 0.99× |
+| React server rendering | 0.88× | QuickJS fails | QuickJS fails | 0.96× |
+
+The canonical profile-guided build of the same source (`tools/pgo.sh`), which
+the release does not ship, takes 0.83× to 0.91× QuickJS's time on Babel,
+TypeScript, Prettier, Vue and Preact on the 96 MB-L3 die and 0.87× to 0.97×
+on the other. Over the 78 benchmark programs of the release notes (3 runs
+each, outputs identical), the interpreter (`ZIPP_NOJIT=1`, regex JIT on)
+takes 0.912× 0.0.30's time and 0.742× QuickJS's, faster than QuickJS on 62;
+the JIT lane takes 0.892× 0.0.30's time and 0.857× Node 24's. The full tables, with
+peak working sets, the TypeScript benchmarks and WebAssembly, are in
+[docs/releases/0.0.31.md](releases/0.0.31.md#performance).
+
 ### Release 0.0.30, as published
 
 The 0.0.30 release notes measure the published 0.0.30 and 0.0.29 Windows
