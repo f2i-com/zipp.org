@@ -132,18 +132,21 @@ fail closed on drift. A diagnostic override can permit measurement; it can
 never turn a noncanonical run into publishable evidence.
 
 The current canonical public artifacts, the pair the root README tabulates, are
-the 0.0.28 engine's (21 October 2026):
+the 0.0.31 engine's (29 October 2026):
 
-- [`real13_84012a2d_pgo_2026-10-21.json`](real13_84012a2d_pgo_2026-10-21.json)
-- [`hostile/head_clean_84012a2d_pgo_2026-10-21.json`](hostile/head_clean_84012a2d_pgo_2026-10-21.json)
+- [`real13_fcfb1934_pgo_2026-10-29.json`](real13_fcfb1934_pgo_2026-10-29.json)
+- [`hostile/head_clean_fcfb1934_pgo_2026-10-29.json`](hostile/head_clean_fcfb1934_pgo_2026-10-29.json)
 
 Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
 15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
-The previous canonical pair, `f1739644` (2026-10-18, the 0.0.26 engine), stays here as a
+The previous canonical pair, `84012a2d` (2026-10-21, the 0.0.28 engine), stays here as a
 prior series point:
+[`real13_84012a2d_pgo_2026-10-21.json`](real13_84012a2d_pgo_2026-10-21.json)
+and [`hostile/head_clean_84012a2d_pgo_2026-10-21.json`](hostile/head_clean_84012a2d_pgo_2026-10-21.json),
+and so do the two before it, `f1739644` (2026-10-18, the 0.0.26 engine):
 [`real13_f1739644_pgo_2026-10-18.json`](real13_f1739644_pgo_2026-10-18.json)
 and [`hostile/head_clean_f1739644_pgo_2026-10-18.json`](hostile/head_clean_f1739644_pgo_2026-10-18.json),
-and so does the one before it, `fa8e3b86` (2026-10-15):
+and `fa8e3b86` (2026-10-15):
 [`real13_fa8e3b86_pgo_2026-10-15.json`](real13_fa8e3b86_pgo_2026-10-15.json)
 and [`hostile/head_clean_fa8e3b86_pgo_2026-10-15.json`](hostile/head_clean_fa8e3b86_pgo_2026-10-15.json).
 The ones before those (`8229b3fc`, `c28781cf`, `b65aa353`, all
@@ -154,12 +157,12 @@ capture with its geomean, interval and per-row ratios. Git history keeps the
 original files.
 
 The interpreter-versus-interpreter tables come from
-[`comparison/interp_real13_84012a2d_2026-10-22.json`](comparison/interp_real13_84012a2d_2026-10-22.json)
-and [`comparison/interp_hostile17_84012a2d_2026-10-22.json`](comparison/interp_hostile17_84012a2d_2026-10-22.json),
-diagnostic `run_native.py` runs of the same PGO binary with `ZIPP_NOJIT=1`
-against interpreters and JIT-off engine modes (see
+[`comparison/interp_real13_fcfb1934_2026-10-29.json`](comparison/interp_real13_fcfb1934_2026-10-29.json)
+and [`comparison/interp_hostile17_fcfb1934_2026-10-29.json`](comparison/interp_hostile17_fcfb1934_2026-10-29.json),
+diagnostic `run_native.py` runs of the same PGO binary with no native code
+(`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) against interpreters and JIT-off engine modes (see
 [`comparison/README.md`](comparison/README.md)); the release build as downloaded
-is measured in [`comparison/release_real13_da0fe6b1_2026-10-21.json`](comparison/release_real13_da0fe6b1_2026-10-21.json).
+is measured in [`comparison/release_real13_fcfb1934_2026-10-29.json`](comparison/release_real13_fcfb1934_2026-10-29.json).
 The Python frontend's runs against CPython are in [`python/`](python/README.md).
 
 ### Explicit all-30 view
@@ -171,9 +174,10 @@ When one project-wide number is useful, the documented equal-row point is:
 G30 = exp((13 × ln(G13) + 17 × ln(G17)) / 30)
 ```
 
-For the `84012a2d` artifacts it is **0.652× Node**, **0.496× Bun** and
-**0.434× Deno** (point estimates; no interval was computed for them). The
-`f1739644` pair gave 0.634× Node, 0.503× Bun and 0.438× Deno (point estimates), the
+For the `fcfb1934` artifacts it is **0.629× Node**, **0.483× Bun** and
+**0.422× Deno** (point estimates; no interval was computed for them). The
+`84012a2d` pair gave 0.652× Node, 0.496× Bun and 0.434× Deno, the
+`f1739644` pair 0.634× Node, 0.503× Bun and 0.438× Deno (point estimates), the
 `fa8e3b86` pair 0.703× Node [0.700, 0.707], 0.548× Bun [0.544, 0.551] and
 0.473× Deno [0.470, 0.477], and the `8229b3fc` pair 0.728× Node
 [0.723, 0.730], 0.594× Bun [0.591, 0.598] and 0.460× Deno [0.458, 0.464], and
