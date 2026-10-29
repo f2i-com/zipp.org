@@ -34,12 +34,16 @@ num-traits = "0.2"
 # (the CLI, browsers) have it, while the WebAssembly artifacts (zipp-wasm), which
 # build without default features, stay as they are.
 #
-# Loop dispatch, not wasmi's tail-call dispatch: that one relies on LLVM
-# turning each handler's call to the next into a jump, and where it does not,
-# every instruction executed takes native stack -- a long-running module (the
-# zipp.org playground's engine, starting up) overflowed a 512 MB thread stack
-# inside one call.
-wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "portable-dispatch"] }
+# Tail-call dispatch, about twice as fast as the loop: the zipp.org playground's
+# engine starts in 1.5 s instead of 2.5 s, and its Game of Life sets up in 2.7 s
+# instead of 5.8. It relies on LLVM turning each handler's call to the next
+# into a jump, which an optimised build with fat LTO and one codegen unit (the
+# release profile here, and zipp-browser's) does; where it does not, every
+# instruction executed takes native stack and a long-running module overflows
+# any stack. wasmi falls back to loop dispatch below opt-level 2 by itself; for
+# an optimised build without those settings (fast incremental builds), turn on
+# `wasm-portable-dispatch`.
+wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 self_cell = "1.3.0"
@@ -86,6 +90,9 @@ python-native-gpu = ["python"]
 default = ["jit", "typescript", "webassembly"]
 # The `WebAssembly` global (see the `wasmi` dependency).
 webassembly = ["dep:wasmi"]
+# Loop dispatch for WebAssembly, whatever the build: for optimised builds that
+# do not use fat LTO and one codegen unit (see the `wasmi` dependency).
+wasm-portable-dispatch = ["webassembly", "wasmi/portable-dispatch"]
 # TypeScript (and `.jsx`/`.tsx` files), read by the JavaScript parser with
 # their types dropped (`lang/ts`). On by default; off, the language is still
 # listed (a `.ts` file is still recognised as TypeScript) and compiling it is
