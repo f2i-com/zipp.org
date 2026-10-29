@@ -292,7 +292,9 @@ export class Engine {
     }
     /**
      * [`Self::init_script`] with an explicit source language: `"javascript"`
-     * (identical to `initScript`) or `"python"` (the experimental subset
+     * (identical to `initScript`), `"typescript"` (a script whose types are
+     * dropped as it is read; requires the `typescript` Cargo feature, the
+     * `javascript-typescript` module) or `"python"` (the experimental subset
      * frontend; requires the `python` Cargo feature). A Python state has no
      * preamble, exposes no global slots, and rejects the JS-only
      * global/call/eval methods.
@@ -925,7 +927,7 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_isArray_e516792dd4c8182a: function() { return handleError(function (arg0) {
+        __wbg_isArray_900f08b44b340f62: function() { return handleError(function (arg0) {
             const ret = Array.isArray(arg0);
             return ret;
         }, arguments); },
@@ -933,7 +935,7 @@ function __wbg_get_imports() {
             const ret = ArrayBuffer.isView(arg0);
             return ret;
         },
-        __wbg_keys_ba2a6f512910cfa7: function() { return handleError(function (arg0) {
+        __wbg_keys_1d3b7c8645c57827: function() { return handleError(function (arg0) {
             const ret = Object.keys(arg0);
             return ret;
         }, arguments); },
@@ -949,14 +951,14 @@ function __wbg_get_imports() {
             const ret = new Error();
             return ret;
         },
+        __wbg_new_29d697e10ea9bfa5: function() { return handleError(function (arg0) {
+            const ret = new Float32Array(arg0);
+            return ret;
+        }, arguments); },
         __wbg_new_32b398fb48b6d94a: function() {
             const ret = new Array();
             return ret;
         },
-        __wbg_new_da10631d8662f098: function() { return handleError(function (arg0) {
-            const ret = new Float32Array(arg0);
-            return ret;
-        }, arguments); },
         __wbg_new_da52cf8fe3429cb2: function() {
             const ret = new Object();
             return ret;
