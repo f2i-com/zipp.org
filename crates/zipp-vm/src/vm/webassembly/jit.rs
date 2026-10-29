@@ -28,7 +28,7 @@ use super::{grow, stats, table_bytes, Failure, Op};
 
 use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Engine, Extern, ExternRef, ExternType, Func, Global, GlobalType,
-    Instance, Memory, MemoryType, Module, Mutability, OwnedRooted, Ref, RefType, ResourceLimiter, RootScope,
+    Instance, ManuallyRooted, Memory, MemoryType, Module, Mutability, Ref, RefType, ResourceLimiter, RootScope,
     Rooted, Store, StoreContextMut, Table, TableType, Trap, UpdateDeadline, Val, ValType,
 };
 
@@ -49,7 +49,7 @@ fn engine(metered: bool) -> &'static Engine {
         // No backtrace for a trap: a JavaScript exception thrown through
         // WebAssembly frames (Emscripten's `invoke_*` do this on purpose)
         // would pay for one every time.
-        config.wasm_backtrace_max_frames(None);
+        config.wasm_backtrace(false);
         config.consume_fuel(metered);
         config.epoch_interruption(metered);
         Engine::new(&config).expect("the WebAssembly engine's configuration is valid")
@@ -180,27 +180,34 @@ pub(crate) struct Runtime {
     /// The JavaScript values WebAssembly has been given as `externref`s (GC
     /// roots), each with its reference, and by value, to find them again.
     pub(crate) externs: Vec<Value>,
-    extern_refs: Vec<OwnedRooted<ExternRef>>,
+    /// Kept for the VM's life, so never unrooted: the store's drop frees them.
+    extern_refs: Vec<ManuallyRooted<ExternRef>>,
     extern_ids: HashMap<u64, u32>,
     /// The contexts of the operations and imports running, innermost last: a
     /// call into WebAssembly from inside an import goes through the import's.
     contexts: Vec<Context>,
 }
 
+/// The store context for the next operation: the innermost running import's
+/// or operation's (`contexts`), else `store`'s. Over the two fields, so a
+/// caller can hold another field of the runtime meanwhile.
+fn ctx_of<'a>(contexts: &[Context], store: &'a mut Store<Host>) -> StoreContextMut<'a, Host> {
+    match contexts.last() {
+        // SAFETY: the address is of a `Caller` that `js_import` pushed and
+        // pops before returning; while it is on the stack that frame is
+        // suspended, so nothing else uses the caller.
+        Some(&Context::Caller(caller)) => unsafe { (*(caller as *mut Caller<'static, Host>)).as_context_mut() },
+        // SAFETY: as for a caller: the scope is `wasmtime_op`'s, popped before
+        // it is dropped.
+        Some(&Context::Scope(scope)) => unsafe { (*(scope as *mut ScopeCtx)).as_context_mut() },
+        None => store.as_context_mut(),
+    }
+}
+
 impl Runtime {
-    /// The store context for the next operation: the innermost running
-    /// import's or operation's, else the store's.
+    /// The store context for the next operation (`ctx_of`).
     fn ctx(&mut self) -> StoreContextMut<'_, Host> {
-        match self.contexts.last() {
-            // SAFETY: the address is of a `Caller` that `js_import` pushed and
-            // pops before returning; while it is on the stack that frame is
-            // suspended, so nothing else uses the caller.
-            Some(&Context::Caller(caller)) => unsafe { (*(caller as *mut Caller<'static, Host>)).as_context_mut() },
-            // SAFETY: as for a caller: the scope is `wasmtime_op`'s, popped before
-            // it is dropped.
-            Some(&Context::Scope(scope)) => unsafe { (*(scope as *mut ScopeCtx)).as_context_mut() },
-            None => self.store.as_context_mut(),
-        }
+        ctx_of(&self.contexts, &mut self.store)
     }
 
     fn func_id(&mut self, f: Func) -> u32 {
@@ -247,13 +254,15 @@ impl Runtime {
     /// `v` as an `externref`: the same reference for the same value.
     fn extern_ref(&mut self, v: Value) -> Op<Rooted<ExternRef>> {
         if let Some(&i) = self.extern_ids.get(&v.bits()) {
-            let owned = self.extern_refs[i as usize].clone();
-            return Ok(owned.to_rooted(self.ctx()));
+            // The kept root, read through the context without borrowing the
+            // runtime whole (`ctx_of`).
+            let owned = &self.extern_refs[i as usize];
+            return Ok(owned.to_rooted(ctx_of(&self.contexts, &mut self.store)));
         }
         let i = self.externs.len() as u32;
         let mut ctx = self.ctx();
         let r = ExternRef::new(&mut ctx, i).map_err(|e| Failure::Record("RangeError", e.to_string()))?;
-        let owned = r.to_owned_rooted(&mut ctx).map_err(|e| Failure::Record("RangeError", e.to_string()))?;
+        let owned = r.to_manually_rooted(&mut ctx).map_err(|e| Failure::Record("RangeError", e.to_string()))?;
         self.externs.push(v);
         self.extern_refs.push(owned);
         self.extern_ids.insert(v.bits(), i);
