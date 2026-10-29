@@ -6188,41 +6188,72 @@ pub struct GeneratorData {
     pub callee: Value,
 }
 
-/// Payload of `HeapObj::RegExp`: a JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);
-/// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
-/// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
-/// coerced offset) so an assigned object survives until `exec`/the @@-methods
-/// apply ToLength, invoking its `valueOf` at the spec-mandated time.
-///
-/// `ascii_twin` is the lazily-built BYTE-OPTIMIZED twin compile (regress
-/// `from_unicode_byteopt`) used by the ASCII-subject fast path, cached
-/// inline so a hot exec reads it with one `heap.get` instead of a per-exec
-/// side-table probe: `None` = not yet computed, `Some(None)` = compile
-/// failed (fall back to `regex`), `Some(Some(arc))` = the twin. Reset to
-/// `None` by `RegExp.prototype.compile`. Holds no `Value`s (an
-/// `Arc<regress::Regex>` is a pure compiled program), so GC need not trace it.
+/// Payload of `HeapObj::RegExp`: a JS `RegExp`, its [`RegExpCore`] (reached
+/// through `Deref`: `re.regex`, `re.source`, `re.flags`, `re.ascii_twin`) and
+/// its `last_index`, the writable `lastIndex` own data property — stored as a
+/// raw `Value` (not a coerced offset) so an assigned object survives until
+/// `exec`/the @@-methods apply ToLength, invoking its `valueOf` at the
+/// spec-mandated time.
 #[derive(Clone, Debug)]
 pub struct RegExpData {
+    /// Shared by every object made from the same program: each evaluation of
+    /// a regex literal, and the matcher `matchAll` clones per call (the
+    /// iterator has to advance a `lastIndex` independently of the source
+    /// regex, and that object is observable to a user `exec` as its receiver,
+    /// so the clone cannot be elided). One reference count for the lot: with
+    /// a count of their own, the four parts cost every literal evaluation
+    /// four atomic increments, and four decrements when it died.
+    pub core: std::sync::Arc<RegExpCore>,
+    pub last_index: Value,
+}
+
+impl std::ops::Deref for RegExpData {
+    type Target = RegExpCore;
+
+    #[inline(always)]
+    fn deref(&self) -> &RegExpCore {
+        &self.core
+    }
+}
+
+/// What a RegExp is apart from its `lastIndex`. `regex` is the compiled
+/// `regress` engine (ECMAScript regex); `source` is the pattern text, `flags`
+/// the JS flag string (`"gi"`). `RegExp.prototype.compile` gives its receiver
+/// a new core; a core itself never changes but for `ascii_twin`.
+///
+/// `source` and `flags` are `Arc<str>`, not `String`, so that a new core for
+/// the same pattern (`RegExp(re)`, a species clone) shares its text instead of
+/// copying it. MEASURED: −2.0pp of `regex-log-scan` (B70).
+///
+/// `ascii_twin` is the lazily-built BYTE-OPTIMIZED twin compile (regress
+/// `from_unicode_byteopt`) used by the ASCII-subject fast path, cached here
+/// so a hot exec reads it with one `heap.get` instead of a per-exec
+/// side-table probe, and built once for every object sharing the core:
+/// unset = not yet computed, `None` = compile failed (fall back to `regex`),
+/// `Some(arc)` = the twin. Holds no `Value`s (an `Arc<regress::Regex>` is a
+/// pure compiled program), so GC need not trace it.
+#[derive(Debug)]
+pub struct RegExpCore {
     pub regex: std::sync::Arc<regress::Regex>,
-    /// `Arc<str>`, not `String`, so that cloning a RegExp shares its text instead
-    /// of copying it. `matchAll` clones a matcher per call — the iterator has to
-    /// advance a `lastIndex` independently of the source regex, and that object is
-    /// observable to a user `exec` as its receiver, so the clone cannot be elided —
-    /// which meant two heap `String` allocations on a path measured at 480ns
-    /// against node's 53. Sharing makes it two atomic increments.
-    ///
-    /// MEASURED: −2.0pp of `regex-log-scan` (the row went −0.9% with only the
-    /// `flags` shortcut below, −2.9% with both; B70). Larger than it looks because
-    /// `source`/`flags` are cloned on several regex paths, not just `matchAll`.
-    ///
-    /// (Size is the box's business now: with `Generator`, `IterHelper` and
-    /// `FinalizationRegistry` boxed too, `HeapObj` went from 80 bytes to 64: the
-    /// largest payloads left are 48 bytes, and `BigInt`'s `i128` aligns the
-    /// enum to 16.)
     pub source: std::sync::Arc<str>,
     pub flags: std::sync::Arc<str>,
-    pub last_index: Value,
-    pub ascii_twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+    pub ascii_twin: std::sync::OnceLock<Option<std::sync::Arc<regress::Regex>>>,
+}
+
+impl RegExpCore {
+    /// A core without its twin.
+    pub fn new(
+        regex: std::sync::Arc<regress::Regex>,
+        source: std::sync::Arc<str>,
+        flags: std::sync::Arc<str>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            regex,
+            source,
+            flags,
+            ascii_twin: std::sync::OnceLock::new(),
+        })
+    }
 }
 
 /// Payload of `HeapObj::IterHelper`: a lazy Iterator Helper (the result of
@@ -6967,9 +6998,10 @@ pub enum HeapObj {
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
     /// the value; the kind's prototype provides the methods.
     Boxed { kind: u8, value: Value },
-    /// A JS `RegExp`, boxed ([`RegExpData`]): its 64 bytes made every heap
-    /// slot 80.
-    RegExp(Box<RegExpData>),
+    /// A JS `RegExp` ([`RegExpData`]): its shared core and its `lastIndex`,
+    /// 16 bytes, in the slot. (Boxed while the core's parts were its own: 64
+    /// bytes, which made every heap slot 80.)
+    RegExp(RegExpData),
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
     /// `detached` is set by transfer (we never detach via GC); `data` is the bytes
     /// ([`AbData`]: per-VM `Local` for ArrayBuffers, `Shared` for SharedArrayBuffers).
@@ -7160,11 +7192,10 @@ impl HeapObj {
                 .saturating_add(vec_capacity_bytes(&fr.cells))
                 .saturating_add(vec_capacity_bytes(&fr.cleared)),
             HeapObj::RegExp(re) => {
-                let crate::heap::RegExpData { source, flags, .. } = &**re;
                 // Compiled programs (including the ASCII twin) are measured
                 // through Regex::resident_bytes and Arc-deduplicated by the
                 // VM audit. Keep the observable source/flag text charged here.
-                source.len().saturating_add(flags.len())
+                re.source.len().saturating_add(re.flags.len())
             }
             HeapObj::ArrayBuffer { data, .. } => data.resident_bytes(),
             HeapObj::Temporal { fields, .. } => vec_capacity_bytes(fields),
@@ -11558,9 +11589,8 @@ impl Heap {
     ) {
         for obj in &self.objs {
             if let HeapObj::RegExp(re) = obj {
-                let crate::heap::RegExpData { regex, ascii_twin, .. } = &**re;
-                visit(regex);
-                if let Some(Some(twin)) = ascii_twin {
+                visit(&re.regex);
+                if let Some(Some(twin)) = re.ascii_twin.get() {
                     visit(twin);
                 }
             }

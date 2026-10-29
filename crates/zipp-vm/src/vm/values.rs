@@ -3167,13 +3167,10 @@ impl<'p> Vm<'p> {
                 rc
             }
         };
-        let idx = self.heap.alloc(HeapObj::RegExp(Box::new(crate::heap::RegExpData {
-            regex,
-            source: source.into(),
-            flags: flags.into(),
+        let idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+            core: crate::heap::RegExpCore::new(regex, source.into(), flags.into()),
             last_index: Value::int(0),
-            ascii_twin: None,
-        })));
+        }));
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap
@@ -3189,10 +3186,10 @@ impl<'p> Vm<'p> {
     /// pattern and flags are the site's string constants). Each evaluation
     /// is a new object, as the spec requires, but everything about it but
     /// `lastIndex` is the same every time: the first builds it through the
-    /// constructor's path and keeps its program, source and flags for the
-    /// site, and the rest share them (three reference counts, no parse of
-    /// the flags, no string copies, no cache lookup). After a few evaluations
-    /// the site builds the byte-optimized twin once, which a fresh object
+    /// constructor's path and keeps its core for the site, and the rest
+    /// share it (one reference count, no parse of the flags, no string
+    /// copies, no cache lookup). After a few evaluations the site builds the
+    /// byte-optimized twin once, in the shared core, which a fresh object
     /// per evaluation would never live long enough to earn.
     pub(crate) fn new_regexp_literal(
         &mut self,
@@ -3204,25 +3201,15 @@ impl<'p> Vm<'p> {
         if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
             if t.pattern_bits == p.bits() && t.flags_bits == f.bits() {
                 t.uses = t.uses.saturating_add(1);
-                let want_twin = t.twin.is_none() && t.uses >= TWIN_AFTER;
+                let want_twin = t.uses == TWIN_AFTER;
                 let data = crate::heap::RegExpData {
-                    regex: t.regex.clone(),
-                    source: t.source.clone(),
-                    flags: t.flags.clone(),
+                    core: t.core.clone(),
                     last_index: Value::int(0),
-                    ascii_twin: t.twin.clone(),
                 };
-                let idx = self.heap.alloc(HeapObj::RegExp(Box::new(data)));
+                let idx = self.heap.alloc(HeapObj::RegExp(data));
                 self.install_regexp_proto(idx);
                 if want_twin {
                     self.ensure_regexp_ascii_twin(idx);
-                    let twin = match self.heap.get(idx) {
-                        HeapObj::RegExp(re) => re.ascii_twin.clone(),
-                        _ => None,
-                    };
-                    if let Some(t) = self.regexp_literal_sites.get_mut(&site) {
-                        t.twin = twin;
-                    }
                 }
                 return Ok(Value::heap(idx));
             }
@@ -3236,10 +3223,7 @@ impl<'p> Vm<'p> {
                 let site_data = RegExpLiteralSite {
                     pattern_bits: p.bits(),
                     flags_bits: f.bits(),
-                    regex: re.regex.clone(),
-                    source: re.source.clone(),
-                    flags: re.flags.clone(),
-                    twin: None,
+                    core: re.core.clone(),
                     uses: 1,
                 };
                 if self.regexp_literal_sites.len() >= 4096 {

@@ -1750,12 +1750,11 @@ impl<'p> Vm<'p> {
             // an integer. `re.flags` read nine such properties, so it cost 227ns
             // against node's 3ns.
             if let HeapObj::RegExp(re) = self.heap.get(obj.heap_index()) {
-                let crate::heap::RegExpData { flags, last_index, .. } = &**re;
                 if key == "lastIndex" {
-                    return Ok(*last_index);
+                    return Ok(re.last_index);
                 }
                 if let Some(c) = regexp_flag_char(key) {
-                    return Ok(Value::bool(flags.contains(c)));
+                    return Ok(Value::bool(re.flags.contains(c)));
                 }
             }
             let eff = self

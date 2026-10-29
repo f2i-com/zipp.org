@@ -843,7 +843,7 @@ impl<'p> Vm<'p> {
             key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp(_));
         if regexp_last_index {
             if let HeapObj::RegExp(re) = self.heap.get(idx) {
-                let crate::heap::RegExpData { last_index, .. } = &**re;
+                let crate::heap::RegExpData { last_index, .. } = re;
                 let li = *last_index;
                 let attrs = existing.map(|(a, _)| a).unwrap_or(PropAttr {
                     writable: true,

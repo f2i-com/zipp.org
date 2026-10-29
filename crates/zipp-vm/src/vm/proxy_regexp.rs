@@ -3037,7 +3037,7 @@ impl<'p> Vm<'p> {
             }
             None => match self.heap.get(re_idx) {
                 HeapObj::RegExp(re) => {
-                    let crate::heap::RegExpData { flags, .. } = &**re;
+                    let crate::heap::RegExpCore { flags, .. } = &*re.core;
                     if slim_exec_enabled() {
                         // B124: one pass over the ≤8-byte flag string instead
                         // of four `contains` scans. Same heap.get, same spec
@@ -3172,7 +3172,7 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let (found, usage) = match self.heap.get(re_idx) {
-                    HeapObj::RegExp(re) => match &re.ascii_twin {
+                    HeapObj::RegExp(re) => match re.ascii_twin.get() {
                         Some(Some(twin)) => search(twin),
                         _ => search(&re.regex),
                     },
@@ -3185,7 +3185,7 @@ impl<'p> Vm<'p> {
             #[cfg(not(feature = "safe-sandbox"))]
             {
                 match self.heap.get(re_idx) {
-                    HeapObj::RegExp(re) => match &re.ascii_twin {
+                    HeapObj::RegExp(re) => match re.ascii_twin.get() {
                         Some(Some(twin)) => regex_first_match_ascii(twin, subj, start, sticky),
                         _ => regex_first_match_ascii(&re.regex, subj, start, sticky),
                     },
@@ -3734,7 +3734,7 @@ impl<'p> Vm<'p> {
                 }
                 // Sticky (`/gy`): one anchored attempt, as in the shared impl.
                 match self.heap.get(re_idx) {
-                    HeapObj::RegExp(re) => match &re.ascii_twin {
+                    HeapObj::RegExp(re) => match re.ascii_twin.get() {
                         Some(Some(twin)) => {
                             break regex_first_match_ascii(twin, subj, start, sticky);
                         }
@@ -4281,7 +4281,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn ensure_regexp_ascii_twin_deferred(&mut self, re_idx: u32, subject_len: usize) {
         if subject_len < TWIN_DEFER_MAX_SUBJECT
             && matches!(self.heap.get(re_idx), HeapObj::RegExp(re)
-                if re.ascii_twin.is_none() && twin_deferrable(re.source.as_bytes(), re.flags.as_bytes()))
+                if re.ascii_twin.get().is_none() && twin_deferrable(re.source.as_bytes(), re.flags.as_bytes()))
             && (self.regexp_exact_source.is_empty() || !self.regexp_exact_source.contains_key(&re_idx))
         {
             if self.regex_twin_defer.len() >= TWIN_DEFER_TABLE_CAP {
@@ -4297,16 +4297,16 @@ impl<'p> Vm<'p> {
         self.ensure_regexp_ascii_twin(re_idx);
     }
 
-    /// Ensure the BYTE-OPTIMIZED twin compile (`HeapObj::RegExp::ascii_twin`)
+    /// Ensure the BYTE-OPTIMIZED twin compile (`RegExpCore::ascii_twin`)
     /// for the RegExp at `re_idx` exists — built once, lazily, from the SAME
     /// pattern characters and flags as the heap regex (mirrors
     /// `build_regexp`, incl. the exact-bytes lone-surrogate form). A failed
-    /// compile is recorded as `Some(None)` so it isn't retried; callers fall
+    /// compile is recorded as `None` so it isn't retried; callers fall
     /// back to `find_from_ascii` on the unoptimized program (also byte-safe).
     pub(crate) fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
         let (source, flags) = match self.heap.get(re_idx) {
             // Already computed (twin or recorded failure): nothing to do.
-            HeapObj::RegExp(re) if re.ascii_twin.is_some() => return,
+            HeapObj::RegExp(re) if re.ascii_twin.get().is_some() => return,
             HeapObj::RegExp(re) => (re.source.clone(), re.flags.clone()),
             _ => return,
         };
@@ -4367,8 +4367,8 @@ impl<'p> Vm<'p> {
                 compiled
             }
         };
-        if let HeapObj::RegExp(re) = self.heap.get_mut(re_idx) {
-            re.ascii_twin = Some(twin);
+        if let HeapObj::RegExp(re) = self.heap.get(re_idx) {
+            let _ = re.ascii_twin.set(twin);
         }
     }
 
@@ -4998,11 +4998,11 @@ impl<'p> Vm<'p> {
                         .bytes()
                         .any(|b| matches!(b, b'd' | b'u' | b'v' | b'y')) =>
             {
-                let crate::heap::RegExpData { regex, flags, last_index, ascii_twin, .. } = &**re;
-                let d = last_index.as_f64().trunc();
+                let crate::heap::RegExpCore { regex, flags, ascii_twin, .. } = &*re.core;
+                let d = re.last_index.as_f64().trunc();
                 let d = if d.is_nan() { 0.0 } else { d };
                 let start = d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize;
-                let scan = match ascii_twin {
+                let scan = match ascii_twin.get() {
                     Some(Some(twin)) => twin.clone(),
                     Some(None) => regex.clone(),
                     None => return None,
@@ -5256,7 +5256,7 @@ impl<'p> Vm<'p> {
                     .any(|b| matches!(b, b'g' | b'y' | b'u' | b'v' | b'd')),
                 re.last_index.is_number(),
                 !re.regex.has_named_groups(),
-                re.ascii_twin.is_some(),
+                re.ascii_twin.get().is_some(),
             ),
             _ => return RegexpScalarExecStep::Decline,
         };
@@ -5289,7 +5289,7 @@ impl<'p> Vm<'p> {
                 _ => return RegexpScalarExecStep::Decline,
             };
             let regex: &regress::Regex = match self.heap.get(re_idx) {
-                HeapObj::RegExp(re) => match &re.ascii_twin {
+                HeapObj::RegExp(re) => match re.ascii_twin.get() {
                     Some(Some(twin)) => twin,
                     Some(None) => &re.regex,
                     None => return RegexpScalarExecStep::Decline,
@@ -5701,7 +5701,7 @@ impl<'p> Vm<'p> {
     ) -> bool {
         match self.heap.get(regexp) {
             HeapObj::RegExp(re) => {
-                let crate::heap::RegExpData { regex, .. } = &**re;
+                let crate::heap::RegExpCore { regex, .. } = &*re.core;
                 if regex.has_named_groups() {
                     return false;
                 }
@@ -5732,7 +5732,7 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             let re = match self.heap.get(regexp) {
-                HeapObj::RegExp(re) => match &re.ascii_twin {
+                HeapObj::RegExp(re) => match re.ascii_twin.get() {
                     Some(Some(twin)) => &**twin,
                     // Twin compile failed once: the base program is byte-safe too.
                     _ => &*re.regex,
@@ -5929,7 +5929,7 @@ impl<'p> Vm<'p> {
             let max_items = if global { usize::MAX } else { 1 };
             let (collected, mut usage) = match self.heap.get(re) {
                 HeapObj::RegExp(re) => {
-                    let crate::heap::RegExpData { regex, flags, .. } = &**re;
+                    let crate::heap::RegExpCore { regex, flags, .. } = &*re.core;
                     let unicode = flags.contains('u') || flags.contains('v');
                     if unicode {
                         let mut iter = regex.find_from_utf16_with_limits(&u16s, 0, limits);
@@ -5956,7 +5956,7 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "safe-sandbox"))]
         let matches: Vec<regress::Match> = match self.heap.get(re) {
             HeapObj::RegExp(re) => {
-                let crate::heap::RegExpData { regex, flags, .. } = &**re;
+                let crate::heap::RegExpCore { regex, flags, .. } = &*re.core;
                 let unicode = flags.contains('u') || flags.contains('v');
                 match (unicode, global) {
                     (true, true) => regex.find_from_utf16(&u16s, 0).collect(),
@@ -6249,7 +6249,7 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             let regex: Option<&regress::Regex> = match self.heap.get(re) {
-                HeapObj::RegExp(re) => match &re.ascii_twin {
+                HeapObj::RegExp(re) => match re.ascii_twin.get() {
                     Some(Some(twin)) => Some(twin),
                     _ => Some(&re.regex),
                 },
@@ -6280,7 +6280,7 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             let regex: Option<&regress::Regex> = match self.heap.get(re) {
-                HeapObj::RegExp(re) => match &re.ascii_twin {
+                HeapObj::RegExp(re) => match re.ascii_twin.get() {
                     Some(Some(twin)) => Some(twin),
                     _ => Some(&re.regex),
                 },

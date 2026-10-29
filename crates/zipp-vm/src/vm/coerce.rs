@@ -3276,7 +3276,7 @@ impl<'p> Vm<'p> {
                     let _ = write!(out, "{number}");
                 }
                 HeapObj::RegExp(re) => {
-                    let crate::heap::RegExpData { source, flags, .. } = &**re;
+                    let crate::heap::RegExpCore { source, flags, .. } = &*re.core;
                     out.push_str("/");
                     out.push_str(if source.is_empty() { "(?:)" } else { source });
                     let _ = write!(out, "/{flags}");
@@ -3702,7 +3702,7 @@ impl<'p> Vm<'p> {
                 let _ = write!(out, "{big}n");
             }
             HeapObj::RegExp(re) => {
-                let crate::heap::RegExpData { source, flags, .. } = &**re;
+                let crate::heap::RegExpCore { source, flags, .. } = &*re.core;
                 out.push_char('/');
                 out.push_str(if source.is_empty() { "(?:)" } else { source });
                 out.push_char('/');

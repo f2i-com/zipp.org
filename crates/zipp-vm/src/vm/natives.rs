@@ -2622,12 +2622,14 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 // Reuse the constructor path (validates flags, builds and
-                // preflights the matcher), then move the freshly built fields
-                // into the receiver. Sharing this Arc also avoids compiling and
-                // retaining an un-preflighted duplicate program.
+                // preflights the matcher), then give the receiver the freshly
+                // built core. Sharing it also avoids compiling and retaining
+                // an un-preflighted duplicate program; it has no twin yet, as
+                // the old one compiled the OLD pattern (rebuilt lazily on the
+                // next ASCII-subject exec).
                 let built = self.build_regexp(a0, a1)?;
-                let (regex, source, flags) = match self.heap.get(built.heap_index()) {
-                    HeapObj::RegExp(re) => (re.regex.clone(), re.source.clone(), re.flags.clone()),
+                let core = match self.heap.get(built.heap_index()) {
+                    HeapObj::RegExp(re) => re.core.clone(),
                     _ => unreachable!(),
                 };
                 // EXACT pattern bytes (lone surrogates): `build_regexp` recorded
@@ -2635,12 +2637,7 @@ impl<'p> Vm<'p> {
                 // to the receiver below (the struct's `source` is lossy).
                 let exact = self.regexp_exact_source.remove(&built.heap_index());
                 if let HeapObj::RegExp(re) = self.heap.get_mut(this.heap_index()) {
-                    re.regex = regex;
-                    re.source = source;
-                    re.flags = flags;
-                    // The byte-optimized ASCII twin compiled the OLD pattern —
-                    // drop it (rebuilt lazily on the next ASCII-subject exec).
-                    re.ascii_twin = None;
+                    re.core = core;
                 }
                 // Move the exact-source entry onto the receiver — or clear a
                 // stale one when the new pattern is well-formed.
@@ -2753,7 +2750,7 @@ impl<'p> Vm<'p> {
                 if idx == self.native_home(self.regexp_proto) {
                     self.alloc_str("(?:)".to_string())
                 } else if let HeapObj::RegExp(re) = self.heap.get(idx) {
-                    let crate::heap::RegExpData { source, .. } = &**re;
+                    let crate::heap::RegExpCore { source, .. } = &*re.core;
                     let s = source.clone();
                     // Exact-WTF-8 when the side table has the pattern's exact
                     // bytes (lone surrogates round-trip), else lossy.
@@ -2871,16 +2868,11 @@ impl<'p> Vm<'p> {
                         HeapObj::RegExp(re) if re.last_index.is_number()
                     );
                     if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
-                        let (regex, source, flags, li_raw, twin) = match self.heap.get(re_idx) {
-                            HeapObj::RegExp(re) => (
-                                re.regex.clone(),
-                                re.source.clone(),
-                                re.flags.clone(),
-                                re.last_index,
-                                re.ascii_twin.clone(),
-                            ),
+                        let (core, li_raw) = match self.heap.get(re_idx) {
+                            HeapObj::RegExp(re) => (re.core.clone(), re.last_index),
                             _ => unreachable!("as_regexp checked the tag"),
                         };
+                        let flags = &core.flags;
                         // Still needs the same ToLength clamp the slow path
                         // applies: truncate toward zero, floor at 0, cap 2^53-1.
                         let li = {
@@ -2914,51 +2906,36 @@ impl<'p> Vm<'p> {
                             }
                         }
                         // A fused-eligible source with no twin yet gets it built
-                        // HERE, on the SOURCE, so every matcher clone carries
-                        // `Some` from creation: a regex only ever used via
-                        // matchAll is never `exec`'d, so nothing else ensures
-                        // its twin, and the slim step's cold build lands on the
-                        // per-call matcher — which dies with the iteration, so
-                        // every creation re-paid the full ensure (~136ns
-                        // measured: compile-cps vec builds, cache-key
-                        // materialisation, SipHash probe). `is_none()`
-                        // deliberately skips `Some(None)` (a recorded compile
-                        // failure): the clone carries the failure and the slim
-                        // step's base-program arm handles it, unchanged. The
-                        // ensure writes only engine-internal state — exactly
-                        // what the first pristine `exec` on an ASCII subject
-                        // does today — so nothing observable moves.
-                        let twin = if extra_bits & ITFB_FUSED != 0
-                            && twin.is_none()
+                        // HERE, on the SOURCE's core, which the matcher clone
+                        // shares: a regex only ever used via matchAll is never
+                        // `exec`'d, so nothing else ensures its twin, and the
+                        // slim step's cold build would land on the per-call
+                        // matcher's first step instead (~136ns measured:
+                        // compile-cps vec builds, cache-key materialisation,
+                        // SipHash probe). An unset twin only: a recorded compile
+                        // failure (`None`) stays, and the slim step's
+                        // base-program arm handles it. The ensure writes only
+                        // engine-internal state — exactly what the first
+                        // pristine `exec` on an ASCII subject does — so nothing
+                        // observable moves.
+                        if extra_bits & ITFB_FUSED != 0
+                            && core.ascii_twin.get().is_none()
                             && crate::vm::proxy_regexp::twin_at_create_enabled()
                         {
                             self.ensure_regexp_ascii_twin(re_idx);
-                            match self.heap.get(re_idx) {
-                                HeapObj::RegExp(re) => re.ascii_twin.clone(),
-                                _ => twin,
-                            }
-                        } else {
-                            twin
-                        };
+                        }
                         // The matcher is a SEPARATE object: the iterator advances
-                        // its lastIndex independently of the source regex.
-                        // Carry the byte-optimized twin over. It is derived from
-                        // `source` + `flags`, which the clone copies verbatim, so
-                        // it is provably the same program — and dropping it made
-                        // the first `exec` on the matcher rebuild the pattern's
-                        // code-point vector and hash a two-String cache key. On a
-                        // 2,000-char pattern that cost 3.2us per matchAll, against
-                        // a flat 13ns for the same work on the ORIGINAL object,
-                        // whose twin caching already worked.
-                        let matcher_idx = self.heap.alloc(HeapObj::RegExp(Box::new(
-                            crate::heap::RegExpData {
-                                regex,
-                                source,
-                                flags,
-                                last_index: Value::num(li as f64),
-                                ascii_twin: twin,
-                            },
-                        )));
+                        // its lastIndex independently of the source regex. It
+                        // shares the source's core, twin included (derived from
+                        // the same `source` + `flags`, so provably the same
+                        // program): rebuilding it made the first `exec` on the
+                        // matcher rebuild the pattern's code-point vector and
+                        // hash a two-String cache key, 3.2us per matchAll on a
+                        // 2,000-char pattern.
+                        let matcher_idx = self.heap.alloc(HeapObj::RegExp(crate::heap::RegExpData {
+                            core,
+                            last_index: Value::num(li as f64),
+                        }));
                         // A lone-surrogate pattern keeps its exact source bytes.
                         // `regexp_exact_source` is a SipHash `HashMap` that only ever
                         // holds lone-surrogate patterns, so for every ordinary regex
@@ -3119,7 +3096,7 @@ impl<'p> Vm<'p> {
                 if idx == self.native_home(self.regexp_proto) {
                     Value::UNDEFINED
                 } else if let HeapObj::RegExp(re) = self.heap.get(idx) {
-                    let crate::heap::RegExpData { flags, .. } = &**re;
+                    let crate::heap::RegExpCore { flags, .. } = &*re.core;
                     Value::bool(flags.contains(ch))
                 } else {
                     return Err(Thrown::from_static(

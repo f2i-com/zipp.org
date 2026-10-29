@@ -1550,16 +1550,13 @@ pub enum ConsoleStream {
     Stderr,
 }
 
-/// What every object a regex literal makes shares: its compiled program,
-/// source and flags (all `Arc`s), and its byte-optimized twin once one is
-/// built. Keyed by the constants the site loads, compared by their bits.
+/// What every object a regex literal makes shares: its core (compiled
+/// program, source, flags, and the byte-optimized twin once one is built).
+/// Keyed by the constants the site loads, compared by their bits.
 pub(crate) struct RegExpLiteralSite {
     pattern_bits: u64,
     flags_bits: u64,
-    regex: std::sync::Arc<regress::Regex>,
-    source: std::sync::Arc<str>,
-    flags: std::sync::Arc<str>,
-    twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+    core: std::sync::Arc<crate::heap::RegExpCore>,
     uses: u32,
 }
 

@@ -263,7 +263,7 @@ impl<'p> Vm<'p> {
         // its writable flag).
         if key == "lastIndex" {
             if let HeapObj::RegExp(re) = self.heap.get(idx) {
-                let crate::heap::RegExpData { last_index, .. } = &**re;
+                let crate::heap::RegExpData { last_index, .. } = re;
                 let v = *last_index;
                 let writable = self.regexp_last_index_writable(idx);
                 return self.make_data_descriptor(v, writable, false, false);
