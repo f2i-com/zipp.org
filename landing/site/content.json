@@ -4028,11 +4028,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A JavaScript Engine in Rust in 146 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 21 October 2026, mistakes included.",
+      "title": "The Zipp Story: A JavaScript Engine in Rust in 154 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled JavaScript and Python engine by 29 October 2026, mistakes included.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 2,780 commits over 146 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in eight acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "Zipp's repository has 3,034 commits over 154 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -4051,9 +4051,9 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "2,780",
-                  "label": "Commits from 29 May to 21 October 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 645 in October"
+                  "value": "3,034",
+                  "label": "Commits from 29 May to 29 October 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 899 in October"
                 },
                 {
                   "value": "31",
@@ -4191,6 +4191,27 @@
           ]
         },
         {
+          "heading": "Act nine: smaller code, Node's programs and WebAssembly (22 to 29 October)",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The day after v0.0.28 began with reports again. An embedder's error positions were off by the lines of its own preamble; a script's positions now come from its own text, and a syntax error says where it is (`2183f7e2`). An external review of that commit raised ten findings, from Python's `int / int` rounding wrongly at large sizes and a substring test that grew quadratically to a `TextDecoder` that lost its stream state. Every one that could be run reproduced; nine were fixed or documented the same day (`e00f88a0`, `80417dc5`, `f853904b`, `1aecb40b`), and the tenth, how Python's NaN compares with itself, stays a documented limitation. That evening each function's source text became a range of one shared copy of its script (`176832e7`), and `zipp js` began keeping a large script's compiled code between runs (`63f2e776`). v0.0.29 followed on 23 October, for a VM that its heap ceiling convicted over garbage it had not yet collected (`60cdf143`), and on 24 October a pass over the JIT, the sandbox and the site's boundaries hardened each (`35d0671f`)."
+            },
+            {
+              "type": "p",
+              "text": "From 25 October the work went to size. A program of 256 functions or more now compiles each body at its first call (`dcefa81d`); TypeScript's compiler bundle defers 10,082 bodies and a run compiles 2,219. A heap slot went from 80 bytes to 64 (`2664dea9`), an instruction from 32 to 16, four to a cache line (`13b0af6d`), identifiers were interned in the lexer (`58ad07c0`), and the syntax tree after a parse took about half the memory (`a509ec5c`). Trained on an application-scale program as well (`1a587022`), the profile-guided build ran every bundle that Bellard's QuickJS can run faster than QuickJS did, on both dies of the test machine. v0.0.30 shipped on 27 October with those changes, Unicode 18 normalization and the newest Test262, whose DataView change took one fix (`759c05fe`)."
+            },
+            {
+              "type": "p",
+              "text": "On 28 October a branch of its own came home: TypeScript and TSX read by the JavaScript parser with their types dropped, JSX lowered as tsc lowers it (`10847ade`), and Node programs, with Node's globals, CommonJS, npm packages and the core modules most packages use (`768018a6`), merged as one (`2b8b8b1a`). `zipp app.ts` and `zipp app.js` now run as their names say. The JIT's work followed Node rather than QuickJS: arithmetic on doubles compiled as double operations (`49be5f15`), `JSON.parse` building objects from shared key plans (`57bbb00f`), and a builtin's callback holding a `finally` given its own frame, a fix for code the JIT had skipped (`f39faf40`)."
+            },
+            {
+              "type": "p",
+              "text": "WebAssembly came last: the JS API on the wasmi interpreter on 28 October (`67c770a4`), then on 29 October Wasmtime's compiler behind a feature (`cdce552a`), which the next commit, an unrelated change to object-literal spread, overwrote; the commit after it restored it by name (`df66cffa`). Each VM now picks its runtime, Wasmtime while its JIT is on, and both are held to a sandbox's step budget, heap limit and abort (`f539d27e`); a class method called on an instance is inlined at its call site (`b49cf737`). The release's own gates then found four faults: the dependency audit refused Wasmtime 44 for eight advisories, so the release ships Wasmtime 36, the long-term support line (`051577de`); its smoke test had an extra parenthesis and its 32-bit Arm build dead code (`1a0098b0`, `85fb9d3e`); and the publish step refused notes that still read as pre-release. v0.0.31 was published from the commit that reworded them, `fcfb1934`, the first release whose command lines are profile-guided (`7ee15ed3`). Measured on the published binaries, its JIT runs the 78 benchmark programs in 0.892× v0.0.30's time and 0.857× Node 24's, and its interpreter in 0.742× QuickJS's; the canonical capture of the 0.0.31 engine puts its JIT at 0.629× Node's time over the 30 benchmark rows and its interpreter at 0.574× Bellard's QuickJS's ([benchmarks](/benchmarks/))."
+            }
+          ]
+        },
+        {
           "heading": "How the work was done",
           "blocks": [
             {
@@ -4208,7 +4229,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "What makes this history unusual is that the corrections are in the subjects, not buried in bodies. \"RETRACT the false perf claims.\" \"Real pass rate is 96.97%, not 100%.\" \"The INT tier was silently returning wrong answers on ordinary loops.\" \"It is the COLLECTOR, not the allocator — pool built, measured zero, reverted.\" \"The profiler was lying about a quarter of json-large.\" \"B95 shipped a 19x pathology and the benchmarks could not see it.\" \"The harness could name a commit it had never measured.\" \"Correct the expansion record: its build was trained on the rows it measured.\" Every one of those is a commit you can open."
+              "text": "What makes this history unusual is that the corrections are in the subjects, not buried in bodies. \"RETRACT the false perf claims.\" \"Real pass rate is 96.97%, not 100%.\" \"The INT tier was silently returning wrong answers on ordinary loops.\" \"It is the COLLECTOR, not the allocator — pool built, measured zero, reverted.\" \"The profiler was lying about a quarter of json-large.\" \"B95 shipped a 19x pathology and the benchmarks could not see it.\" \"The harness could name a commit it had never measured.\" \"Correct the expansion record: its build was trained on the rows it measured.\" \"Restore the Wasmtime WebAssembly JIT that the previous commit overwrote.\" \"The release smoke test's WebAssembly program closes one parenthesis too many.\" Every one of those is a commit you can open."
             },
             {
               "type": "timeline",
@@ -4327,6 +4348,41 @@
                   "date": "2026-10-21",
                   "title": "Large programs run interpreted; `Error.stack`; v0.0.28",
                   "text": "`2e83f5e0`, `130640b0`, `79ddfd28`, `ca511f54`, `fced020a`, `da0fe6b1`."
+                },
+                {
+                  "date": "2026-10-22",
+                  "title": "Embedded positions; nine of ten review findings fixed; source text shared; a code cache",
+                  "text": "`2183f7e2`, `e00f88a0`, `1aecb40b`, `176832e7`, `63f2e776`."
+                },
+                {
+                  "date": "2026-10-23",
+                  "title": "A heap ceiling that counted garbage; v0.0.29",
+                  "text": "`60cdf143`, `58c92a59`."
+                },
+                {
+                  "date": "2026-10-25",
+                  "title": "Bodies compiled at first call, 64-byte heap slots, interned identifiers",
+                  "text": "`dcefa81d`, `2664dea9`, `58ad07c0`, `a509ec5c`."
+                },
+                {
+                  "date": "2026-10-26",
+                  "title": "16-byte instructions; the PGO profile trained on an application",
+                  "text": "`13b0af6d`, `1a587022`."
+                },
+                {
+                  "date": "2026-10-27",
+                  "title": "Unicode 18 and the newest Test262; v0.0.30",
+                  "text": "`6dc30e18`, `759c05fe`, `fd6b48a5`."
+                },
+                {
+                  "date": "2026-10-28",
+                  "title": "TypeScript, JSX and Node programs merged; the WebAssembly JS API on wasmi",
+                  "text": "`10847ade`, `768018a6`, `2b8b8b1a`, `67c770a4`."
+                },
+                {
+                  "date": "2026-10-29",
+                  "title": "Wasmtime, overwritten and restored; both runtimes metered; class methods inlined; v0.0.31",
+                  "text": "`cdce552a`, `df66cffa`, `f539d27e`, `b49cf737`, `051577de`, `fcfb1934`."
                 }
               ]
             }
@@ -7118,6 +7174,39 @@
           {
             "type": "p",
             "text": "Measured on the published binaries, Babel, TypeScript, Prettier and the server renderers take 0.77× to 0.95× v0.0.29's time, TypeScript's peak working set falls from 318 to 225 MiB, and the interpreter runs the 78 benchmark programs in 0.917× v0.0.29's time and 0.818× QuickJS's. The profile-guided build, trained on an application-scale program too (`1a587022`), is ahead of QuickJS on every bundle. The sandbox loader, 1.4.0, reads only an options object's own properties and counts seeded data against its quotas (`35d0671f`), and a DataView's `byteLength` and `byteOffset` read 0 out of bounds, as the newest Test262 expects (`759c05fe`). [v0.0.30](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.30) was published on 27 October from `fd6b48a5`."
+          }
+        ]
+      },
+      {
+        "slug": "typescript-node-programs-webassembly-and-v0-0-31",
+        "date": "2026-10-29",
+        "title": "TypeScript, Node programs, WebAssembly, and v0.0.31",
+        "summary": "TypeScript and TSX run directly, `zipp app.js` runs a program as Node does, WebAssembly runs on Wasmtime or wasmi under the sandbox's limits, and the JIT inlines class methods at their call sites.",
+        "tags": [
+          "javascript",
+          "typescript",
+          "webassembly",
+          "release"
+        ],
+        "commits": [
+          "10847ade",
+          "768018a6",
+          "2b8b8b1a",
+          "67c770a4",
+          "f539d27e",
+          "b49cf737",
+          "a467c9cb",
+          "051577de",
+          "fcfb1934"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Zipp's parser now reads TypeScript. A `.ts`, `.mts`, `.cts` or `.tsx` file is parsed with its types and they are dropped there: no transpile step and no JavaScript text in between, and the compiler, interpreter and JIT run it as JavaScript. What has a run-time meaning is lowered as tsc emits it: `enum`, `namespace`, parameter properties, legacy decorators and JSX (`10847ade`). `zipp app.js` runs a program the way `node` does, with `process`, `Buffer`, timers, CommonJS, npm packages from `node_modules` and the core modules most packages use (`768018a6`); the two arrived together from their own branch (`2b8b8b1a`), and a sixth WebAssembly module carries TypeScript for the browser (`a467c9cb`)."
+          },
+          {
+            "type": "p",
+            "text": "`WebAssembly` is a global in the command line: the JS API, with modules compiled by Wasmtime while the JIT is on and interpreted by wasmi otherwise, each instruction charged to a sandbox's step budget and each memory to its heap limit, and a host's abort honoured within milliseconds (`67c770a4`, `f539d27e`). A loop of 200 million iterations takes 36 ms on Wasmtime, 289 on wasmi and 73 in Node 24. The JIT inlines a class method at its call site, `this` bound to the receiver (`b49cf737`), and the release's command lines are the first built with profile-guided optimization (`7ee15ed3`). Measured on the published binaries, the bundled applications take 0.83× to 0.97× v0.0.30's time, most of it the profile, and the 78 benchmark programs 0.892× with the JIT, 0.912× interpreted and 0.742× QuickJS's. The dependency audit refused the Wasmtime the work began on, and the release ships the long-term support line, 36.0.19 (`051577de`). [v0.0.31](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.31) was published on 29 October from `fcfb1934`."
           }
         ]
       }
