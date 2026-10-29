@@ -220,11 +220,13 @@ impl<'p> Vm<'p> {
             return None;
         }
         // The constructor this served last, while its proof still holds:
-        // the instance without the table lookup and the two counted clones
-        // (the pair is moved out and back).
+        // the instance without the table lookup. Held by two uncounted
+        // (`Rc`, not `Arc`) clones across the make: moving the pair out and
+        // back dropped the placeholder tuple every time, its drop glue 4% of
+        // a construction loop.
         if self.ctor_store_last.0 == fid {
-            let last = std::mem::take(&mut self.ctor_store_last);
-            if let (Some(keys), Some(proof)) = (&last.1, &last.2) {
+            if let (Some(keys), Some(proof)) = (&self.ctor_store_last.1, &self.ctor_store_last.2) {
+                let (keys, proof) = (keys.clone(), proof.clone());
                 let proto_idx = if class != u32::MAX {
                     u32::MAX
                 } else if proto.is_heap() {
@@ -232,13 +234,10 @@ impl<'p> Vm<'p> {
                 } else {
                     u32::MAX - 1 // no proof is for this
                 };
-                if proto_idx != u32::MAX - 1 && self.store_proof_holds(proof, class, proto_idx) {
-                    let made = self.ctor_store_make(keys, proof, class, proto, base, arg_base, argc);
-                    self.ctor_store_last = last;
-                    return Some(made);
+                if proto_idx != u32::MAX - 1 && self.store_proof_holds(&proof, class, proto_idx) {
+                    return Some(self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc));
                 }
             }
-            self.ctor_store_last = last;
         }
         let (keys, proof) = match self.ctor_stores.get(&fid) {
             Some(e) => (e.keys.clone(), e.proof.clone()),
