@@ -345,6 +345,22 @@ fn a_large_program_keeps_compiled_webassembly() {
     assert_eq!(run(&large), vec![expected], "a program of 300 functions");
 }
 
+/// The members are writable data properties, as in a browser, so a page can
+/// wrap one: before any was read, and after.
+#[test]
+fn members_can_be_replaced() {
+    let out = run(r#"
+        WebAssembly.validate = function () { return "mine"; };
+        console.log(WebAssembly.validate(), typeof WebAssembly.compile);
+        var instantiate = WebAssembly.instantiate;
+        WebAssembly.instantiate = function (b, i) { return instantiate(b, i).then(function () { return "wrapped"; }); };
+        WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])).then(function (r) { console.log(r); });
+        var d = Object.getOwnPropertyDescriptor(WebAssembly, "Module");
+        console.log(d.writable, d.enumerable, d.configurable, typeof d.value, Object.keys(WebAssembly).length);
+    "#);
+    assert_eq!(out, vec!["mine function", "true false true function 0", "wrapped"]);
+}
+
 /// A JavaScript value given to WebAssembly as an `externref` lives while
 /// WebAssembly can reach it, not for the VM's life. Every value a module was
 /// passed used to stay a root for good: one taking objects by reference, as

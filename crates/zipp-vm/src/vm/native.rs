@@ -187,6 +187,9 @@ pub const WASM_HOST_OP: u16 = 2121;
 /// A `WebAssembly` member's lazy accessor (a `NativeClosure` over its name).
 #[cfg(feature = "webassembly")]
 pub const WASM_LAZY_GET: u16 = 2122;
+/// Its setter: an assignment before the first read.
+#[cfg(feature = "webassembly")]
+pub const WASM_LAZY_SET: u16 = 2123;
 pub const FR_REGISTER: u16 = 298;
 pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.

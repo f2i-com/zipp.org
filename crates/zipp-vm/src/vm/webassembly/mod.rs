@@ -47,7 +47,7 @@ use std::fmt;
 use crate::heap::{AbData, ExternalBytes, HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
 use crate::vm::helpers_num2::to_int32;
-use crate::vm::native::{self, WASM_HOST_OP, WASM_LAZY_GET};
+use crate::vm::native::{self, WASM_HOST_OP, WASM_LAZY_GET, WASM_LAZY_SET};
 use crate::vm::{Thrown, Vm};
 
 /// `ZIPP_WASM_STATS=1`: where the time goes, reported every half second --
@@ -125,7 +125,8 @@ mod stats {
 /// The layer: a function of the native `op`, returning the members.
 const LAYER: &str = include_str!("webassembly.js");
 
-/// The namespace's members, each an accessor that loads the layer.
+/// The namespace's members, each an accessor that loads the layer and
+/// becomes a data property (`Vm::wasm_load_layer`).
 pub(crate) const MEMBERS: &[&str] = &[
     "Module",
     "Instance",
@@ -378,6 +379,12 @@ impl<'p> Vm<'p> {
                 name: "get",
                 length: 0,
             }));
+            let setter = Value::heap(self.heap.alloc(HeapObj::NativeClosure {
+                id: WASM_LAZY_SET,
+                state: vec![key],
+                name: "set",
+                length: 1,
+            }));
             m.define(
                 name,
                 getter,
@@ -386,7 +393,7 @@ impl<'p> Vm<'p> {
                     enumerable: false,
                     configurable: true,
                     accessor: true,
-                    setter: Value::UNDEFINED,
+                    setter,
                 },
             );
         }
@@ -400,19 +407,77 @@ impl<'p> Vm<'p> {
     /// member.
     pub(crate) fn wasm_lazy_get(&mut self, state: &[Value]) -> Result<Value, Thrown> {
         let name = self.display(state.first().copied().unwrap_or(Value::UNDEFINED));
-        if self.wasm_layer.is_undefined() {
-            let install = self.eval_script(LAYER)?;
-            let op = Value::heap(self.heap.alloc(HeapObj::Native(WASM_HOST_OP)));
-            self.wasm_layer = self.call_value(install, Value::UNDEFINED, &[op])?;
-        }
-        Ok(match self.heap.get(self.wasm_layer.heap_index()) {
+        self.wasm_load_layer()?;
+        Ok(self.wasm_member(&name))
+    }
+
+    /// A member's setter: an assignment before any member was read loads the
+    /// layer too, then assigns to the data property the member now is.
+    pub(crate) fn wasm_lazy_set(&mut self, state: &[Value], this: Value, value: Value) -> Result<Value, Thrown> {
+        let name = self.display(state.first().copied().unwrap_or(Value::UNDEFINED));
+        self.wasm_load_layer()?;
+        self.set_prop(this, &name, value, false)?;
+        Ok(Value::UNDEFINED)
+    }
+
+    /// The layer's member `name`.
+    fn wasm_member(&self, name: &str) -> Value {
+        match self.heap.get(self.wasm_layer.heap_index()) {
             HeapObj::Object(m) => m
                 .iter()
                 .find(|(k, _, _)| *k == name)
                 .map(|(_, v, _)| v)
                 .unwrap_or(Value::UNDEFINED),
             _ => Value::UNDEFINED,
-        })
+        }
+    }
+
+    /// Load the layer, once, and make each member still the namespace's lazy
+    /// accessor the data property a browser's is: writable, configurable, not
+    /// enumerable. An accessor with no setter dropped an assignment without a
+    /// word, so a page wrapping `WebAssembly.instantiate` -- to instrument it,
+    /// or a polyfill's -- went on calling the original.
+    fn wasm_load_layer(&mut self) -> Result<(), Thrown> {
+        if !self.wasm_layer.is_undefined() {
+            return Ok(());
+        }
+        let install = self.eval_script(LAYER)?;
+        let op = Value::heap(self.heap.alloc(HeapObj::Native(WASM_HOST_OP)));
+        self.wasm_layer = self.call_value(install, Value::UNDEFINED, &[op])?;
+        let ns = self.wasm_ns;
+        if !ns.is_heap() || !self.wasm_layer.is_heap() {
+            return Ok(());
+        }
+        let data = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        for name in MEMBERS {
+            // Unless the page has redefined it already.
+            let lazy = match self.heap.get(ns.heap_index()) {
+                HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
+                    let getter = m.val_at(i);
+                    m.attr_at(i).accessor
+                        && getter.is_heap()
+                        && matches!(self.heap.get(getter.heap_index()), HeapObj::NativeClosure { id: WASM_LAZY_GET, .. })
+                }),
+                _ => false,
+            };
+            if !lazy {
+                continue;
+            }
+            let value = self.wasm_member(name);
+            self.store_barrier_v(crate::heap::gcoracle::SET_PROP, ns, value);
+            if let HeapObj::Object(m) = self.heap.get_mut(ns.heap_index()) {
+                m.define(name, value, data);
+            }
+        }
+        // Reads of the members cached the accessors.
+        self.heap.bump_version(ns.heap_index());
+        Ok(())
     }
 
     /// `op(name, ...args)`, the layer's one native.
