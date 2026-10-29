@@ -26,7 +26,7 @@
 // Node from a `data:` URL; a Content-Security-Policy must allow one of them
 // in `script-src`. One file, no dependencies: copy it anywhere.
 
-export const ZIPP_LOADER_VERSION = "1.4.0";
+export const ZIPP_LOADER_VERSION = "1.5.0";
 
 const GLUE_SECTION = "zipp.glue";
 const META_SECTION = "zipp.meta";
@@ -438,6 +438,11 @@ function plainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// A TypeScript program is a JavaScript program to a sandbox: the engine
+// reads its types and drops them, and it gets JavaScript's bridges, host
+// calls and functions. Python is the other kind.
+const scriptLanguage = language => language === "javascript" || language === "typescript";
+
 // Paths in a sandbox's file map: "/" separated, relative, no "." or ".."
 // segments, so "./a/b.txt" and "a/b.txt" name one file and nothing escapes.
 function filePath(path) {
@@ -555,10 +560,10 @@ function normalize(zipp, options) {
     local.host.set(kind, fn);
   }
 
-  if (language !== "javascript" && (storage || network || local.host.size)) {
+  if (!scriptLanguage(language) && (storage || network || local.host.size)) {
     throw new TypeError("zipp: a Python program reaches no storage, network or host functions; it may only be given files (as its importable modules)");
   }
-  if (language !== "javascript" && files && (files.writable || files.entries.some(([p]) => !/^[A-Za-z_][A-Za-z0-9_]*\.py$/.test(p)))) {
+  if (!scriptLanguage(language) && files && (files.writable || files.entries.some(([p]) => !/^[A-Za-z_][A-Za-z0-9_]*\.py$/.test(p)))) {
     throw new TypeError("zipp: a Python program's files are its modules: read-only `name.py` entries");
   }
 
@@ -709,7 +714,7 @@ function sandboxCore(bindings, spec, dispatch, backend) {
   const outstanding = new Set();
   const wakers = new Set();
 
-  if (spec.language === "javascript") {
+  if (scriptLanguage(spec.language)) {
     const grants = [];
     if (storage) {
       engine.setLocalStorageBridge(storage.bridge);
@@ -825,11 +830,11 @@ function sandboxCore(bindings, spec, dispatch, backend) {
       const deadline = Date.now() + spec.timeoutMs;
       let symbols = null;
       try {
-        if (spec.language === "javascript") {
+        if (scriptLanguage(spec.language)) {
           let source = String(code);
           // A program that declares its own `fetch` keeps it.
           if (spec.network && !/\b(?:let|const|class|var|function)\s+fetch\b/.test(source)) source += FETCH_HELPER;
-          symbols = engine.initScript(source);
+          symbols = spec.language === "javascript" ? engine.initScript(source) : engine.initSource(source, spec.language);
         } else if (spec.files && spec.files.entries.length) {
           const modules = { __main__: String(code) };
           for (const [p, text] of spec.files.entries) modules[p.slice(0, -3)] = text;
@@ -850,7 +855,7 @@ function sandboxCore(bindings, spec, dispatch, backend) {
       const deadline = Date.now() + spec.timeoutMs;
       let value;
       try {
-        value = spec.language === "javascript" ? engine.callFunction(String(name), args) : engine.pythonCall(String(name), args);
+        value = scriptLanguage(spec.language) ? engine.callFunction(String(name), args) : engine.pythonCall(String(name), args);
       } catch (thrown) {
         const error = failure(engine, thrown, "call");
         if (error.terminal) throw kill(error);
