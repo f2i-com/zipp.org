@@ -425,6 +425,14 @@ pub(crate) struct MatchAttempter<'a, Input: InputIndexer> {
 }
 
 impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
+    // PATCH (see FORK.md, "Searches build their executor in place"): these
+    // constructors and the executor's are inlined. Out of line, each
+    // returned its ~100-byte value through a stack temporary, which the
+    // caller copied on with 16-byte loads over the callee's 8-byte stores:
+    // a store-forwarding stall on every search. Inlining only these two
+    // moved the copy up a level and was slower; all of them: 5.7% fewer
+    // cycles for a one-character `re.test(ch)`, 1% for expr-compiler.
+    #[inline(always)]
     pub(crate) fn new(re: &'a CompiledRegex, entry: Input::Position) -> Self {
         #[cfg(feature = "bounded-backtracking")]
         let limits = MatchLimits::SANDBOX;
@@ -433,6 +441,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         Self::new_with_limits(re, entry, limits)
     }
 
+    #[inline(always)]
     pub(crate) fn new_with_limits(
         re: &'a CompiledRegex,
         entry: Input::Position,
@@ -1822,11 +1831,14 @@ pub struct BacktrackExecutor<'r, Input: InputIndexer> {
 
 #[cfg(feature = "utf16")]
 impl<'r, Input: InputIndexer> BacktrackExecutor<'r, Input> {
+    // PATCH: inlined, as `MatchAttempter`'s constructors are (see there).
+    #[inline(always)]
     pub(crate) fn new(input: Input, matcher: MatchAttempter<'r, Input>) -> Self {
         Self { input, matcher }
     }
 
     #[cfg(feature = "bounded-backtracking")]
+    #[inline(always)]
     pub(crate) fn new_with_limits(
         input: Input,
         re: &'r CompiledRegex,
@@ -2666,6 +2678,8 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
 impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, Utf8Input<'t>> {
     type AsAscii = BacktrackExecutor<'r, AsciiInput<'t>>;
 
+    // PATCH: inlined, as MatchAttempter's constructors are (see there).
+    #[inline(always)]
     fn new(re: &'r CompiledRegex, text: &'t str) -> Self {
         let input = Utf8Input::new(text, re.flags.unicode_mode());
         Self {
@@ -2677,6 +2691,7 @@ impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, Utf8Input<'t>> {
 
 #[cfg(feature = "bounded-backtracking")]
 impl<'r, 't> BacktrackExecutor<'r, Utf8Input<'t>> {
+    #[inline(always)]
     pub(crate) fn with_limits(re: &'r CompiledRegex, text: &'t str, limits: MatchLimits) -> Self {
         let input = Utf8Input::new(text, re.flags.unicode_mode());
         Self {
@@ -2689,6 +2704,8 @@ impl<'r, 't> BacktrackExecutor<'r, Utf8Input<'t>> {
 impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, AsciiInput<'t>> {
     type AsAscii = BacktrackExecutor<'r, AsciiInput<'t>>;
 
+    // PATCH: inlined, as MatchAttempter's constructors are (see there).
+    #[inline(always)]
     fn new(re: &'r CompiledRegex, text: &'t str) -> Self {
         let input = AsciiInput::new(text, re.flags.unicode_mode());
         Self {
@@ -2700,6 +2717,7 @@ impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, AsciiInput<'t>> {
 
 #[cfg(feature = "bounded-backtracking")]
 impl<'r, 't> BacktrackExecutor<'r, AsciiInput<'t>> {
+    #[inline(always)]
     pub(crate) fn with_limits(re: &'r CompiledRegex, text: &'t str, limits: MatchLimits) -> Self {
         let input = AsciiInput::new(text, re.flags.unicode_mode());
         Self {

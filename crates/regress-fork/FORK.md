@@ -445,3 +445,16 @@ and `is_id_continue_cp` (behind `regress::is_id_start` for the engine's
 lexer, and a named group's name) decode them once per process and binary
 search the result. `tools/derive_property_tables.py` makes both changes to
 the generator's output, after `pack_property_names.py`.
+
+## Searches build their executor in place
+
+`MatchAttempter::new`/`new_with_limits`, `BacktrackExecutor::new`/
+`new_with_limits`, and the ASCII and UTF-8 executors' `Executor::new` and
+`with_limits` are `#[inline(always)]`. Out of line, each returned its value
+(the attempter is about 100 bytes) through a stack temporary that the caller
+then copied into place with 16-byte loads over the callee's 8-byte stores,
+which the CPU cannot forward from the store buffer: a stall on every search,
+the largest single cost of a one-character `re.test(ch)`. Inlining only the
+attempter's constructors moved the copy up a level and was slower. With all
+of them inlined, `re.test(ch)` on a shared regex takes 5.7% fewer cycles (a
+fresh literal each time 2%) and the expr-compiler benchmark 1%.
