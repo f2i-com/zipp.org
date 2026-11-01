@@ -57,6 +57,8 @@ function
 5
 2
 3
+200109998
+100000
 3"####;
 
 #[test]
@@ -224,4 +226,20 @@ function viaNamedFn() { return (function arguments() { return arguments.length; 
 console.log(viaNamedFn());
 var named = function arguments() { return arguments.length; };
 console.log(named(1, 2, 3));
+
+// Inlined at sites that each know their own count.
+function clamp(a, b) { if (arguments.length < 2) return a; return a < b ? a : b; }
+function hotSites(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) { s += clamp(i); s += clamp(i, 1); s += clamp(i, 1, 2); s += count(); s += count(i, i, i, i); }
+  return s;
+}
+console.log(hotSites(20000));
+var om = { m(a) { return arguments.length + (a | 0); } };
+function hotMethod(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) { s += om.m(); s += om.m(1); s += om.m(1, 2); }
+  return s;
+}
+console.log(hotMethod(20000));
 "####;

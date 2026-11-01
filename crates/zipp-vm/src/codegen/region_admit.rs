@@ -1082,6 +1082,9 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
 /// residual binding opcode remains in the specialized suffix and is rejected by
 /// `leaf_ok_impl`, while rest/`arguments` are rejected before the scan.
 pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Instr>, u64)> {
+    if callee.args_count_only {
+        return callee_leaf_ok_for_call(&with_known_count(callee, argc)?, argc);
+    }
     if callee.simple_params {
         return callee_leaf_ok(callee).map(|body| (body, 0));
     }
@@ -1154,6 +1157,32 @@ pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Ins
         *target -= at as u32;
     }
     leaf_ok_impl(&specialized, false).map(|(body, _)| (body, arg_mask))
+}
+
+/// A body whose `arguments` is only ever counted, at a call that knows the
+/// count: its register is a constant, and the body is an ordinary function.
+fn with_known_count(callee: &FuncProto, argc: u16) -> Option<FuncProto> {
+    let mut known = callee.clone();
+    let dst = known.arguments_reg.take()?;
+    known.args_count_only = false;
+    for instr in &mut known.code {
+        if let Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. } = instr
+        {
+            *target += 1;
+        }
+    }
+    known.code.insert(
+        0,
+        Instr::LoadInt {
+            dst,
+            val: i32::from(argc),
+        },
+    );
+    Some(known)
 }
 
 /// Like `callee_leaf_ok`, but admits ONE `Call` in the body and reports its
