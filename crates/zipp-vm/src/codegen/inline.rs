@@ -1205,18 +1205,19 @@ pub(crate) fn emit_inline_leaf_call(
                     dynasm!(ops ; jnz => t);
                 }
             }
-            // ── fused compare-and-branch ── same number guard as the `Lt`/`Le`
-            // dcmp arms below (a non-numeric operand bails, re-running the whole
-            // call), no boolean materialised. Mirrors the region_mem arm.
+            // ── fused compare-and-branch ── same guard as the `Lt`/`Le` dcmp
+            // arms below (two strings compare in a helper, and anything else
+            // bails, re-running the whole call), no boolean materialised.
+            // Mirrors the region_mem arm.
             Instr::JumpIfNotLt { a, b, target } => {
                 let bail = ops.new_dynamic_label();
                 let t = blabels[target as usize];
-                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Lt, t);
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Lt, t, true);
             }
             Instr::JumpIfNotLe { a, b, target } => {
                 let bail = ops.new_dynamic_label();
                 let t = blabels[target as usize];
-                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Le, t);
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Le, t, true);
             }
             // ── dense-array / string element read `a[i]` ── generic win64 helper
             // (read-only, no alloc, no user code → no r13/r14/TA refetch; matches
@@ -1395,19 +1396,19 @@ pub(crate) fn emit_inline_leaf_call(
             }
             Instr::Lt { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Lt);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Lt, true);
             }
             Instr::Le { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Le);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Le, true);
             }
             Instr::Gt { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Gt);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Gt, true);
             }
             Instr::Ge { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge, true);
             }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));

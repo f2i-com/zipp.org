@@ -1540,6 +1540,81 @@ pub(crate) fn region_poly_eq(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_STR_CMP=1`: a relational op on anything but numbers bails
+    /// (the same-binary A/B for `dcmp`'s string arm).
+    fn jit_str_cmp_enabled() = "ZIPP_NO_JIT_STR_CMP"
+}
+
+/// Where `dcmp` and `djump_if_not_cmp` send a non-number: their string arm, or
+/// `bail` when the caller's code around them cannot take a call.
+fn not_number_label(
+    ops: &mut dynasmrt::x64::Assembler,
+    strings: bool,
+    bail: dynasmrt::DynamicLabel,
+) -> dynasmrt::DynamicLabel {
+    if strings && jit_str_cmp_enabled() {
+        ops.new_dynamic_label()
+    } else {
+        bail
+    }
+}
+
+/// The end of a relational op: a jump over its cold arms, then those. Two
+/// strings get their answer from `jit_str_relational` (0/1 in rax, which
+/// `answer` takes); it reads the heap and allocates nothing on it, so there is
+/// nothing to refetch. Anything else, with a user `valueOf` or a BigInt to
+/// consider, goes to the interpreter from `bail`. `a < b` on strings used to
+/// bail on every run, and a function comparing strings stayed interpreted, with
+/// its caller resuming in the interpreter after each call.
+#[allow(clippy::too_many_arguments)]
+fn emit_relational_tail(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    not_number: dynasmrt::DynamicLabel,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+    answer: impl FnOnce(&mut dynasmrt::x64::Assembler),
+) {
+    if not_number == bail {
+        emit_region_bail(ops, ip, bail, epilogue);
+        return;
+    }
+    let done = ops.new_dynamic_label();
+    let op = match cmp {
+        Cmp::Lt => 0,
+        Cmp::Le => 1,
+        Cmp::Gt => 2,
+        _ => 3,
+    };
+    dynasm!(ops
+        ; jmp => done
+        ; => not_number
+        ; mov rcx, rdi                        // vm
+        ; mov rdx, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
+        ; mov r9d, op
+        ; mov rax, QWORD crate::vm::jit_str_relational as *const () as i64
+        ; call rax
+        ; cmp eax, 2
+        ; je => bail
+    );
+    answer(ops);
+    dynasm!(ops
+        ; jmp => done
+        ; => bail
+        ; mov DWORD [rsi], ip as i32
+        ; jmp => epilogue
+        ; => done
+    );
+}
+
+/// `dst = regs[a] <cmp> regs[b]` for the four relational ops. `strings`: the
+/// emitter around it can take a helper call in the cold arm.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dcmp(
     ops: &mut dynasmrt::x64::Assembler,
     ip: usize,
@@ -1549,28 +1624,18 @@ pub(crate) fn dcmp(
     a: u16,
     b: u16,
     cmp: Cmp,
+    strings: bool,
 ) {
-    load_num_xmm(ops, a, 0, bail);
-    load_num_xmm(ops, b, 1, bail);
+    let not_number = not_number_label(ops, strings, bail);
+    load_num_xmm(ops, a, 0, not_number);
+    load_num_xmm(ops, b, 1, not_number);
     // Compute the boolean into al. ucomisd sets CF/ZF/PF; ordering tricks below
     // keep NaN-false semantics (see jump variant for the rationale).
     match cmp {
         Cmp::Lt => dynasm!(ops ; ucomisd xmm1, xmm0 ; seta al), // a<b  ⇔ b>a ordered
         Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; setae al), // a<=b ⇔ b>=a ordered
         Cmp::Gt => dynasm!(ops ; ucomisd xmm0, xmm1 ; seta al), // a>b
-        Cmp::Ge => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al), // a>=b
-        Cmp::Eq => dynasm!(ops
-            ; ucomisd xmm0, xmm1
-            ; sete al            // ZF=1 (equal OR unordered)
-            ; setnp cl           // PF=0 (ordered)
-            ; and al, cl         // equal AND ordered
-        ),
-        Cmp::Ne => dynasm!(ops
-            ; ucomisd xmm0, xmm1
-            ; setne al           // ZF=0 (a≠b)
-            ; setp cl            // PF=1 (unordered)
-            ; or al, cl          // a≠b OR NaN
-        ),
+        _ => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al), // a>=b
     }
     dynasm!(ops
         ; movzx rax, al
@@ -1578,7 +1643,13 @@ pub(crate) fn dcmp(
         ; or rax, r8
         ; mov [rbx + dreg(dst)], rax
     );
-    emit_region_bail(ops, ip, bail, epilogue);
+    emit_relational_tail(ops, ip, bail, epilogue, not_number, a, b, cmp, |ops| {
+        dynasm!(ops
+            ; mov r8, QWORD BOOL_TAG as i64
+            ; or rax, r8
+            ; mov [rbx + dreg(dst)], rax
+        );
+    });
 }
 
 /// Fused `if !(regs[a] <cmp> regs[b]) goto target` in f64. Guards both numbers.
@@ -1593,6 +1664,7 @@ pub(crate) fn djump_if_not_cmp(
     b: u16,
     cmp: Cmp,
     target: dynasmrt::DynamicLabel,
+    strings: bool,
 ) {
     let generic = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -1628,8 +1700,9 @@ pub(crate) fn djump_if_not_cmp(
         // or any fast-head instructions.
         dynasm!(ops ; => generic);
     }
-    load_num_xmm(ops, a, 0, bail);
-    load_num_xmm(ops, b, 1, bail);
+    let not_number = not_number_label(ops, strings, bail);
+    load_num_xmm(ops, a, 0, not_number);
+    load_num_xmm(ops, b, 1, not_number);
     // Jump when the comparison is FALSE. ucomisd(b,a): CF=1 ⇔ b<a OR unordered.
     match cmp {
         // !(a<b): b<=a or NaN. ucomisd(b,a) then jbe (CF|ZF). NaN sets CF ⇒ jumps.
@@ -1639,7 +1712,12 @@ pub(crate) fn djump_if_not_cmp(
         _ => {}
     }
     dynasm!(ops ; => done);
-    emit_region_bail(ops, ip, bail, epilogue);
+    emit_relational_tail(ops, ip, bail, epilogue, not_number, a, b, cmp, |ops| {
+        dynasm!(ops
+            ; test eax, eax
+            ; jz => target
+        );
+    });
 }
 
 /// `dst = obj[key]` for a present element of a dense Array at an int key,

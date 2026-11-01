@@ -2518,11 +2518,19 @@ impl<'p> Vm<'p> {
             && self.heap.is_str_like(va.heap_index())
             && self.heap.is_str_like(vb.heap_index())
         {
+            // Two flat strings of known ASCII, the common case: their flags say
+            // so, and byte order is UTF-16 code-unit order.
+            if let (HeapObj::Str(a), HeapObj::Str(b)) =
+                (self.heap.get(va.heap_index()), self.heap.get(vb.heap_index()))
+            {
+                if a.is_ascii() && b.is_ascii() {
+                    return Some(a.as_bytes().cmp(b.as_bytes()));
+                }
+            }
             let sa = self.heap.str_wtf8_cow(va.heap_index())?;
             let sb = self.heap.str_wtf8_cow(vb.heap_index())?;
             let (a, b) = (sa.as_ref(), sb.as_ref());
-            // Fast path: ASCII byte order == UTF-16 code-unit order (and
-            // `is_ascii` is vectorised), so the hot common case stays a byte cmp.
+            // A rope, or a flat string its flag does not vouch for.
             if a.is_ascii() && b.is_ascii() {
                 return Some(a.cmp(b));
             }

@@ -5685,7 +5685,8 @@ pub(crate) fn compile_proto_mem(
                         true,
                         heap.strict_eq,
                     ),
-                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
+                    // The append cursor's proof is of a body with no helper call.
+                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp, str_append_cursor.is_none()),
                 }
             }
             Instr::Jump { target } => {
@@ -5728,6 +5729,7 @@ pub(crate) fn compile_proto_mem(
                     b,
                     Cmp::Lt,
                     labels[target as usize],
+                    str_append_cursor.is_none(),
                 );
             }
             Instr::JumpIfNotLe { a, b, target } => {
@@ -5740,6 +5742,7 @@ pub(crate) fn compile_proto_mem(
                     b,
                     Cmp::Le,
                     labels[target as usize],
+                    str_append_cursor.is_none(),
                 );
             }
             Instr::GetIndex { dst, obj, key } => {

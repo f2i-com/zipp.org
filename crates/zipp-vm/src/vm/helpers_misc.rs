@@ -1960,6 +1960,33 @@ pub(crate) extern "win64" fn jit_strict_eq(
         as u64
 }
 
+/// Win64 helper: a relational op on two strings, `op` 0 to 3 for `<`, `<=`,
+/// `>`, `>=`. Returns 0/1, or 2 when they are not both strings, which the
+/// interpreter owns (ToPrimitive and the rest). Reads the heap, and never
+/// allocates on it or runs user code.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_relational(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    op: u32,
+) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let Some(order) = vm.str_relational(Value::from_bits(a_bits), Value::from_bits(b_bits)) else {
+        return 2;
+    };
+    let answer = match op {
+        0 => order.is_lt(),
+        1 => order.is_le(),
+        2 => order.is_gt(),
+        _ => order.is_ge(),
+    };
+    answer as u64
+}
+
 /// Win64 helper: full JS truthiness for a region `Not` / `JumpIfFalse/True`
 /// whose operand isn't Int/Bool (doubles incl. NaN/±0, heap values incl. empty
 /// strings and [[IsHTMLDDA]], null/undefined). Read-only; returns 0/1.

@@ -1843,7 +1843,7 @@ pub(crate) fn compile_region_mem(
                         true,
                         heap.strict_eq,
                     ),
-                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
+                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp, true),
                 }
             }
             Instr::Jump { target } => {
@@ -1881,11 +1881,11 @@ pub(crate) fn compile_region_mem(
             }
             Instr::JumpIfNotLt { a, b, target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Lt, t);
+                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Lt, t, true);
             }
             Instr::JumpIfNotLe { a, b, target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, t);
+                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, t, true);
             }
             Instr::GetProp { dst, obj, name } => {
                 // ── 8-way inline cache (CALL-FREE on hit) ── see `emit_ic_probe`
