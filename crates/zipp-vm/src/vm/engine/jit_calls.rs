@@ -1523,14 +1523,17 @@ impl<'p> Vm<'p> {
         let callee = (packed_args & 0xFFFF) as u16;
         let arg_base = ((packed_args >> 16) & 0xFFFF) as u16;
         let argc = ((packed_args >> 32) & 0xFFFF) as u16;
-        // A replaced global is the interpreter's call: declined before any
-        // effect.
+        // A number's string allocates: the safe point precedes the operand
+        // reads (the window's Values are roots).
+        self.maybe_gc();
         let live = self.get(base, callee);
-        if !self.global_fn_is_intrinsic(op, live) {
-            return SELF_CALL_DEOPT;
-        }
         self.jit_call_depth += 1;
-        let r = self.global_fn_value(op, base, arg_base, argc);
+        let r = if self.global_fn_is_intrinsic(op, live) {
+            self.global_fn_value(op, base, arg_base, argc)
+        } else {
+            let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+            self.call_value(live, Value::UNDEFINED, &args)
+        };
         self.jit_call_depth -= 1;
         match r {
             Ok(v) => v.bits(),

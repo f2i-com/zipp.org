@@ -4759,6 +4759,31 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
+            Instr::GlobalFn {
+                dst,
+                op,
+                callee,
+                arg_base,
+                argc,
+            } => {
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_global_fn_ic as *const () as usize,
+                    packed_fip,
+                    callee as u64
+                        | (arg_base as u64) << 16
+                        | (argc as u64) << 32
+                        | (op as u8 as u64) << 48,
+                    0,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+            }
             Instr::StaticFn { dst, op, argc, .. }
                 if !crate::codegen::static_fn_region_inline(op, argc) =>
             {

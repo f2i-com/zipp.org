@@ -5744,6 +5744,35 @@ impl<'p> Vm<'p> {
     /// and Tier C whole-function path). All entries are fixed `extern "win64" fn`
     /// addresses — independent of `self` — so this is a pure constructor.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_math_imul_data_slot(&self, receiver_idx: u32) -> Option<(Value, u64, u32)> {
+        let HeapObj::Object(map) = self.heap.get(receiver_idx) else {
+            return None;
+        };
+        let slot = map.pos("imul")?;
+        if map.attr_at(slot).accessor {
+            return None;
+        }
+        let callee = map.val_at(slot);
+        let native_id = native::MATH_METHOD_BASE + crate::bytecode::MathFn::Imul as u16;
+        self.static_builtin_is_intrinsic("Math", native_id, callee, Value::heap(receiver_idx))
+            .then_some((callee, map.vals_ptr() as u64, slot as u32))
+    }
+
+    /// The live `Math` and its `imul`, while it is the intrinsic data property:
+    /// what `jit_math_imul_guard` bakes, for a guard that runs on every region
+    /// entry. Rebuilding the whole guard there looked up every `Math` method, a
+    /// fifth of `numbers-format-parse`, whose `fnv` enters its loop per string.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_math_imul_live(&self) -> Option<(u64, u64)> {
+        let receiver_idx = self.builtin_ns_slots[0];
+        if receiver_idx == u32::MAX {
+            return None;
+        }
+        let (callee, ..) = self.jit_math_imul_data_slot(receiver_idx)?;
+        Some((Value::heap(receiver_idx).bits(), callee.bits()))
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_math_imul_guard(&self) -> Option<crate::codegen::MathIntrinsicGuard> {
         // The generated Math.imul path can replace its per-call Rust identity
         // helper with local comparisons. In addition to the captured reference
@@ -5760,20 +5789,8 @@ impl<'p> Vm<'p> {
             .copied()
             .and_then(|receiver_idx| {
                 let receiver = Value::heap(receiver_idx);
-                let (callee, receiver_vals, receiver_slot) = match self.heap.get(receiver_idx) {
-                    HeapObj::Object(map) => {
-                        let slot = map.pos("imul")?;
-                        if map.attr_at(slot).accessor {
-                            return None;
-                        }
-                        (map.val_at(slot), map.vals_ptr() as u64, slot as u32)
-                    }
-                    _ => return None,
-                };
-                let native_id = native::MATH_METHOD_BASE + crate::bytecode::MathFn::Imul as u16;
-                if !self.static_builtin_is_intrinsic("Math", native_id, callee, receiver) {
-                    return None;
-                }
+                let (callee, receiver_vals, receiver_slot) =
+                    self.jit_math_imul_data_slot(receiver_idx)?;
                 // Bake every other Math.* intrinsic the same way, so the
                 // emitted per-op guard is three compares rather than a helper
                 // call (`emit_math_identity_guard`). An op whose property is

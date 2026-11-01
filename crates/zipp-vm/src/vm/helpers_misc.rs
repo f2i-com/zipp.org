@@ -8589,10 +8589,7 @@ pub(crate) extern "win64" fn jit_math_imul_prefix_is_intrinsic(
     if live_receiver.bits() != receiver_bits {
         return 0;
     }
-    let Some(live) = vm.jit_math_imul_guard() else {
-        return 0;
-    };
-    (live.receiver_bits == receiver_bits && live.callee_bits == callee_bits) as u64
+    (vm.jit_math_imul_live() == Some((receiver_bits, callee_bits))) as u64
 }
 
 /// Number of entries in `Vm::builtin_ns_slots`.

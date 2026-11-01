@@ -839,6 +839,11 @@ pub(crate) fn region_op_admitted(
         // helper handles the non-heap-argument fast path (no user code, no
         // microtask) and deopts a heap argument to the interpreter's
         // identity/thenable protocol. Every other StaticFn keeps declining.
+        // `Number(x)`, `String(x)`, `parseInt(s)`, `isNaN(x)` and their
+        // siblings: `jit_global_fn_ic`, with the call protocol (a replaced
+        // global or an object's `valueOf` is user code). MEM path only. Each
+        // one kept the loop around it interpreted.
+        Instr::GlobalFn { .. } if const_strs.is_some() => {}
         Instr::StaticFn { op, argc, .. } => {
             let inline = static_fn_region_inline(op, argc);
             // Every other static (`Object.assign`, `String.fromCharCode`, …)
