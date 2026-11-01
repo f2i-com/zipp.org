@@ -4194,7 +4194,7 @@ fn emit_typed_lane(
                 let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
                 dynasm!(ops
                     ; mov eax, [rdi + depth_off]
-                    ; cmp eax, crate::vm::JIT_REGION_CALL_MAX as i32
+                    ; cmp eax, crate::vm::native_call_cap() as i32
                     ; jae => fallback
                 );
             }

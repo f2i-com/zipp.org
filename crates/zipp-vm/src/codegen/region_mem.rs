@@ -5787,7 +5787,7 @@ fn emit_cross3_invoke(
         ; jne => fb
         ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
         ; jne => fb
-        ; cmp DWORD [rdi + depth], crate::vm::JIT_REGION_CALL_MAX as i32
+        ; cmp DWORD [rdi + depth], crate::vm::native_call_cap() as i32
         ; jae => fb
         // B199: the live entry table replaces the baked-entry/global-epoch
         // pair — a null entry routes to the helper (and RESUMES if a
@@ -5847,7 +5847,7 @@ fn emit_cross3_invoke(
             ; cmp WORD [rdi + act], 0x0101
             ; jne => inline_noroot
             ; cmp DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32],
-                crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX as i32
+                crate::vm::native_call_cap() as i32 - 2
             ; jae => fb
             ; or BYTE [rsp + c3 + 24], 2
             ; => inline_noroot

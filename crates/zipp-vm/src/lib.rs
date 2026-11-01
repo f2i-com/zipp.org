@@ -167,6 +167,14 @@ pub fn set_unhandled_rejections_fatal(on: bool) {
     UNHANDLED_REJECTIONS_FATAL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// This thread's stack holds at least `bytes`, so compiled code in a VM made on
+/// it may recurse deeper before it falls back to interpreted frames. A thread
+/// that says nothing, an agent's worker among them, keeps a depth any default
+/// stack holds.
+pub fn set_native_stack_bytes(bytes: usize) {
+    vm::set_native_stack_bytes(bytes);
+}
+
 pub(crate) fn unhandled_rejections_fatal() -> bool {
     UNHANDLED_REJECTIONS_FATAL.load(std::sync::atomic::Ordering::Relaxed)
 }

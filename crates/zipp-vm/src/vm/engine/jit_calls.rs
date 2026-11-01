@@ -330,7 +330,7 @@ impl<'p> Vm<'p> {
         // specialized instantiation instead resolves its immutable descriptor
         // first, so a later different-fid value declines without even the
         // internal `osr_deopt_exempt` mutation.
-        if !SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if !SAME_PROTO_ARROW2 && self.at_call_cap() {
             crate::vm::helpers_misc::crossstats::decline(
                 crate::vm::helpers_misc::crossstats::DECL_DEPTH,
             );
@@ -403,7 +403,7 @@ impl<'p> Vm<'p> {
             );
             return SELF_CALL_DEOPT;
         }
-        if SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if SAME_PROTO_ARROW2 && self.at_call_cap() {
             crate::vm::helpers_misc::crossstats::decline(
                 crate::vm::helpers_misc::crossstats::DECL_DEPTH,
             );
@@ -1110,7 +1110,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1205,7 +1205,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1249,7 +1249,7 @@ impl<'p> Vm<'p> {
         if op > 4 {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1333,7 +1333,7 @@ impl<'p> Vm<'p> {
         else {
             return SELF_CALL_DEOPT;
         };
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1370,7 +1370,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1438,7 +1438,7 @@ impl<'p> Vm<'p> {
         if op > 1 || func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1503,7 +1503,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1557,7 +1557,7 @@ impl<'p> Vm<'p> {
         if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1640,7 +1640,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1679,7 +1679,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1713,7 +1713,7 @@ impl<'p> Vm<'p> {
         if op > 4 {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1790,7 +1790,7 @@ impl<'p> Vm<'p> {
         packed_args: u64,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1876,7 +1876,7 @@ impl<'p> Vm<'p> {
             }
             return self.int_str_value(n).bits();
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1898,7 +1898,7 @@ impl<'p> Vm<'p> {
         packed_args: u64,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -2146,7 +2146,7 @@ impl<'p> Vm<'p> {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
         let is_method = call_kind == 1;
         let has_explicit_this = call_kind == 2;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             // Legal-but-deep recursion: not a region-quality signal — don't
             // count it toward eviction.
             self.osr_deopt_exempt = true;

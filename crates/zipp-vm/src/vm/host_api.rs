@@ -323,7 +323,7 @@ const _: () = {
     assert!(core::mem::offset_of!(R, depth) == 0);
     assert!(core::mem::offset_of!(R, slots) == 8);
     assert!(core::mem::size_of::<R>() == 8 + 24 * crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX);
-    assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 62);
+    assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 2046);
 };
 /// B189b native GC-due guard: the emitted lane calls only when NO collection
 /// is pending (`maybe_gc` would be a no-op); a pending request routes to the

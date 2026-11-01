@@ -171,10 +171,47 @@ pub(crate) extern "win64" fn jit_self_call_at(
 /// recursion THROUGH region call sites must be bounded well below what the OS
 /// stack holds. Past the cap the helper deopts: the interpreter executes the
 /// call as a flat frame (correct, just not region-accelerated at that depth).
-/// 64 is comfortably safe (each level is a few KB) and deeper-than-64 recursion
-/// through a hot loop's call site is rare.
+/// The most any host can ask for, which sizes the activation root stack; what
+/// a run gets is [`native_call_cap`].
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_REGION_CALL_MAX: u32 = 64;
+pub(crate) const JIT_REGION_CALL_MAX: u32 = 2048;
+
+/// The cap with no word from the host: each level is a few KB, so a thread's
+/// default stack holds it. Plain recursion in the interpreter is flat frames
+/// and needs no stack of its own, so a smaller host must not crash for it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const JIT_CALL_CAP_DEFAULT: u32 = 64;
+
+/// What one level of native calls may take of a stack the host has declared.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const JIT_STACK_PER_CALL: usize = 64 * 1024;
+
+// A stack is a thread's: an agent's worker runs on the default one, whatever
+// the thread that started it declared.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+thread_local! {
+    static JIT_CALL_CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(JIT_CALL_CAP_DEFAULT) };
+}
+
+/// This thread's stack holds at least `bytes`: compiled code in a VM made on it
+/// may recurse that much deeper before it falls back to interpreted frames.
+/// Recursion past 64 levels ran interpreted, whatever the program, without
+/// this.
+pub fn set_native_stack_bytes(bytes: usize) {
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    {
+        let cap = (bytes / JIT_STACK_PER_CALL).clamp(JIT_CALL_CAP_DEFAULT as usize, JIT_REGION_CALL_MAX as usize);
+        JIT_CALL_CAP.with(|c| c.set(cap as u32));
+    }
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    let _ = bytes;
+}
+
+/// How deep native calls go in a VM made on this thread now.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn native_call_cap() -> u32 {
+    JIT_CALL_CAP.with(|c| c.get())
+}
 
 /// Win64 helper for a generic `obj.m(args…)` (`CallMethod`) inside a compiled
 /// OSR region. Consults the SAME per-site inline cache the interpreter uses
@@ -7290,6 +7327,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether one more native call level would pass this VM's cap.
+    #[inline(always)]
+    pub(crate) fn at_call_cap(&self) -> bool {
+        let at = self.jit_call_depth >= self.jit_call_cap;
+        if at && crate::jitlog_enabled() {
+            eprintln!("[jit] native call cap depth={}", self.jit_call_depth);
+        }
+        at
+    }
+
+    /// Duplicate a suspended frame-free activation as a GC root, leaving two
+    /// levels under this VM's call cap. `false`, with nothing done, when full.
+    #[inline(always)]
+    fn root_activation(&mut self, prior: TiercActivationState) -> bool {
+        self.jit_tierc_activation_stack.len() + 2 < self.jit_call_cap as usize
+            && self.jit_tierc_activation_stack.push(prior)
+    }
+
     #[inline(always)]
     pub(crate) fn enter_tierc_activation(
         &mut self,
@@ -7310,7 +7365,7 @@ impl<'p> Vm<'p> {
             // only a suspended frame-free state here; a frame-backed prior is
             // already rooted by its still-live interpreter Frame. B243: the
             // stack is a fixed array; a full stack declines before entry.
-            if !self.jit_tierc_activation_stack.push(prior) {
+            if !self.root_activation(prior) {
                 if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier-C activation-root stack full depth={} frame_free={frame_free}",
@@ -7416,22 +7471,20 @@ mod tierc_activation_root_tests {
     fn frame_free_root_cap_declines_without_mutating_state() {
         let program = fixture();
         let mut vm = Vm::new(&program);
-        let mut tokens = Vec::with_capacity(TIER_C_ACTIVATION_ROOT_STACK_MAX + 1);
+        let cap = vm.jit_call_cap as usize - 2;
+        let mut tokens = Vec::with_capacity(cap + 1);
 
         tokens.push(
             vm.enter_tierc_activation(100, 101, true, 0)
                 .expect("first frame-free entry"),
         );
-        for depth in 0..TIER_C_ACTIVATION_ROOT_STACK_MAX {
+        for depth in 0..cap {
             tokens.push(
                 vm.enter_tierc_activation(200 + depth as u32, 300 + depth as u32, true, 0)
                     .unwrap_or_else(|| panic!("entry {depth} reached the cap too early")),
             );
         }
-        assert_eq!(
-            vm.jit_tierc_activation_stack.len(),
-            TIER_C_ACTIVATION_ROOT_STACK_MAX
-        );
+        assert_eq!(vm.jit_tierc_activation_stack.len(), cap);
         let current = vm.jit_tierc_activation;
         let rooted = vm.jit_tierc_activation_stack.clone();
         assert!(
@@ -7537,7 +7590,7 @@ pub(crate) extern "win64" fn jit_cross3_enter(
     let prior = vm.jit_tierc_activation;
     let rooted = prior.active && prior.frame_free;
     if rooted {
-        if !vm.jit_tierc_activation_stack.push(prior) {
+        if !vm.root_activation(prior) {
             return 0;
         }
         activationrootstats::nested_under_frame_free();

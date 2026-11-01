@@ -3428,6 +3428,9 @@ pub struct Vm<'p> {
     /// pointers after every call helper).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_call_depth: u32,
+    /// How deep `jit_call_depth` may go in this VM (`native_call_cap`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_call_cap: u32,
     /// Exact root identities for the current Tier-C native activation. Every
     /// nested activation saves the complete prior state below: frame-free
     /// callable identity must survive GC while native callers are suspended.

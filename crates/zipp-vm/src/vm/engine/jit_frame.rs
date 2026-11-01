@@ -146,7 +146,7 @@ impl<'p> Vm<'p> {
     ) -> u64 {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
         use crate::vm::ic::{GetAct, SetAct};
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -288,7 +288,7 @@ impl<'p> Vm<'p> {
         // SAFETY: `entry` is the probe's way cursor — a live element of
         // `self.jit.ic_table` at call time.
         let e = unsafe { *entry };
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }

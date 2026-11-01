@@ -68,7 +68,7 @@ impl<'p> Vm<'p> {
             _ => false,
         };
         if guest {
-            if vm.jit_call_depth >= JIT_REGION_CALL_MAX {
+            if vm.at_call_cap() {
                 vm.osr_deopt_exempt = true;
                 return PY_BAIL;
             }
@@ -142,7 +142,7 @@ impl<'p> Vm<'p> {
                 let fv = v.get(base, f);
                 let e = v.py_ic((packed >> 32) as u32, ip);
                 if let Some(at) = v.py_strm_hit(&e, fv) {
-                    if v.jit_call_depth >= JIT_REGION_CALL_MAX {
+                    if v.at_call_cap() {
                         v.osr_deopt_exempt = true;
                         return PY_BAIL;
                     }
@@ -618,7 +618,7 @@ impl<'p> Vm<'p> {
     pub(crate) extern "win64" fn jit_py_gen_next(vm: *mut core::ffi::c_void, next: u64, this: u64, ip: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
-        if vm.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if vm.at_call_cap() {
             vm.osr_deopt_exempt = true;
             return crate::codegen::CALL_THREW;
         }

@@ -761,6 +761,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_call_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_call_cap: super::super::native_call_cap(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_tierc_activation: TiercActivationState::EMPTY,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_tierc_activation_stack: ActivationRootStack::EMPTY,

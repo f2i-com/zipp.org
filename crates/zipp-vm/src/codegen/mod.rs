@@ -3965,6 +3965,12 @@ pub struct Jit {
     /// to the helper; the same-mask re-set resumes dependents), so the
     /// retry converges without stranding.
     cross_pending: FxHashMap<u32, Vec<u32>>,
+    /// Functions a retry has evicted, until their recompile sets their entry
+    /// again. A retry only reheats a body, so its entry is coming back with the
+    /// same analysis: a caller planned meanwhile bakes its lane against the mask
+    /// the entry had. Calling that missing instead left three functions calling
+    /// each other in a cycle evicting one another for ever.
+    cross_parked: FxHashSet<u32>,
     /// B229: callee fid -> callers that have BAKED a cross lane against its
     /// entry. `cross_pending` covers a caller that planned while the entry was
     /// MISSING; this covers the opposite and more damaging case — the caller
@@ -4626,6 +4632,7 @@ impl Jit {
         // and every lane baked against the fid keeps routing to the helper.
         self.cross_table[i].entry = if needs_frame { 0 } else { entry as u64 };
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
+        self.cross_parked.remove(&func_id);
         if let Some(callers) = self.cross_pending.remove(&func_id) {
             for caller in callers {
                 self.evict_for_cross_retry(caller);
@@ -4722,10 +4729,19 @@ impl Jit {
             self.counts.remove(&fid);
             self.set_fn_state(fid, FN_COLD);
             self.clear_cross_entry(fid);
+            self.cross_parked.insert(fid);
             if self.self_cache.is_some_and(|(id, _)| id == fid) {
                 self.self_cache = None;
             }
         }
+    }
+
+    /// The mask `fid`'s entry had, while a retry has it parked.
+    pub fn cross_parked_mask(&self, fid: u32) -> Option<u64> {
+        if !self.cross_parked.contains(&fid) {
+            return None;
+        }
+        self.cross_entries.get(fid as usize).map(|entry| entry.1)
     }
 
     /// B199: the live mask generation for `fid` (0 for a fid the table has

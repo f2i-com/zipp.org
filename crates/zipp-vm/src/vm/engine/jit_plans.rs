@@ -2053,6 +2053,7 @@ impl<'p> Vm<'p> {
                     .iter()
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
+        let parked = self.jit.cross_parked_mask(fid);
         let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry(fid)
         {
             Some((_entry, mask, json, markdown)) => {
@@ -2070,6 +2071,11 @@ impl<'p> Vm<'p> {
                     );
                 }
                 (mask, None, None, self.jit.cross_mask_gen_after_set(fid, mask))
+            }
+            // Evicted for its own retry: its entry returns at its recompile,
+            // and the null entry routes to the helper until then.
+            None if parked.is_some() => {
+                (parked.unwrap_or(u64::MAX), None, None, self.jit.cross_mask_gen(fid))
             }
             None => {
                 if crate::jitlog_enabled() {
