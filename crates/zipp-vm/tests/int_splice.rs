@@ -661,19 +661,23 @@ fn intsplice_mechanism_one_entry_guard_per_callee() {
 /// answer, this proves they are testing the path they claim to.
 #[test]
 fn intsplice_mechanism_declines_are_named_and_fall_back() {
+    // A captured cell lives in a pool global for the run, and a callee with no
+    // slot generation is compared by value at entry: both flatten.
+    for name in [
+        "intsplice_parity_callee_with_an_upvalue",
+        "intsplice_parity_callee_slot_is_bytecode_stored",
+    ] {
+        let log = jitlog_of(name, &[]);
+        assert!(
+            log.contains("INT splice [") && log.contains("INT region fn"),
+            "{name}: expected the flattened tier:\n{log}"
+        );
+    }
     for (name, reason) in [
-        (
-            "intsplice_parity_callee_with_an_upvalue",
-            "callee reads upvalues",
-        ),
         ("intsplice_parity_callee_with_a_div", "is not flattenable"),
         (
             "intsplice_parity_argc_below_param_count",
-            "argc 1 != param_count 2",
-        ),
-        (
-            "intsplice_parity_callee_slot_is_bytecode_stored",
-            "no slot_guard",
+            "argc 1 < param_count 2",
         ),
     ] {
         let log = jitlog_of(name, &[]);

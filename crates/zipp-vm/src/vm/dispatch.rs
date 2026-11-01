@@ -6439,7 +6439,7 @@ impl<'p> Vm<'p> {
         // which may compile NEW regions (rehashing `jit.regions` — any &Region
         // would dangle) or even evict THIS region (parked in `Jit::retired`,
         // so the mmap'd code stays alive for the in-flight run).
-        let (entry, field_plan, local_sroa, bounds, is_mem) = {
+        let (entry, field_plan, local_sroa, bounds, is_mem, cells) = {
             let region = self.jit.get_region(func_id, entry_ip)?;
             (
                 region.entry(),
@@ -6447,8 +6447,19 @@ impl<'p> Vm<'p> {
                 region.local_sroa_plan().cloned(),
                 region.bounds(),
                 region.is_mem(),
+                region.cells().to_vec(),
             )
         };
+        // A flattened region reads a captured variable from a pool global. A
+        // cell in its temporal dead zone throws on the read: not this run's.
+        for c in &cells {
+            let v = self.heap.cell_get(c.cell);
+            if v.is_uninitialized() {
+                self.jit.note_region_entry_refused(func_id, entry_ip);
+                return None;
+            }
+            self.globals[c.slot as usize] = v;
+        }
 
         // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
         // pool globals the native code reads as ordinary globals.
@@ -6682,6 +6693,9 @@ impl<'p> Vm<'p> {
                 let v = self.globals[slot as usize];
                 let _ = self.set_prop(obj, &key, v, false);
             }
+        }
+        for c in cells.iter().filter(|c| c.written) {
+            self.heap.cell_set(c.cell, self.globals[c.slot as usize]);
         }
         // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.
         // A call helper may have flagged this exit as exempt (depth-cap deopt /

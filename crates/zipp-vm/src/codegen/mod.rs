@@ -3431,12 +3431,23 @@ pub struct Region {
     /// On an internal guard bail the interpreter materializes the allocations
     /// that have logically executed before resuming original bytecode.
     local_sroa: Option<LocalSroaPlan>,
+    /// Captured cells a flattened region keeps in pool globals for its run.
+    cells: Vec<CellSync>,
     /// W20: the register-tier compile engaged the BOXREF arms (a boxed heap value
     /// and an inline-cache probe inside a register-homed region). On eviction such
     /// a region RETRIES without them instead of being blacklisted — a blacklisted
     /// DOUBLE region leaves the loop INTERPRETED (B102 measured that shape at 11x),
     /// and the memory tier that was working is exactly what the retry lands on.
     is_boxref: bool,
+}
+
+/// A captured cell whose value lives in pool global `slot` during a native run:
+/// the interpreter loads it first, and stores it back if the run may write it.
+#[derive(Clone, Copy)]
+pub struct CellSync {
+    pub cell: u32,
+    pub slot: u32,
+    pub written: bool,
 }
 
 /// How the interpreter syncs a scalar-replaced object around a native region run:
@@ -5572,6 +5583,7 @@ impl Jit {
                             is_mem,
                             field_plan: None,
                             local_sroa: Some(local.runtime),
+                            cells: Vec::new(),
                             is_boxref,
                         },
                     );
@@ -5648,6 +5660,7 @@ impl Jit {
                                 is_mem: false,
                                 field_plan: Some(plan),
                                 local_sroa: None,
+                                cells: Vec::new(),
                                 is_boxref: false,
                             },
                         );
@@ -5677,6 +5690,7 @@ impl Jit {
                 computed_leaf_plan,
                 heap_helpers.regs_fits,
                 meter.is_some(),
+                (field_pool_base, field_pool_size),
             );
             let (iproto, istart, iend, ita) = match &splice {
                 Some(sp) => (&sp.proto, sp.start, sp.end, &sp.ta_plan),
@@ -5720,6 +5734,7 @@ impl Jit {
                         is_mem: false,
                         field_plan: None,
                         local_sroa: None,
+                        cells: splice.as_ref().map(|sp| sp.cells.clone()).unwrap_or_default(),
                         is_boxref: false,
                     },
                 );
@@ -5793,6 +5808,7 @@ impl Jit {
                         is_mem,
                         field_plan: None,
                         local_sroa: None,
+                        cells: Vec::new(),
                         is_boxref,
                     },
                 );
@@ -6461,6 +6477,10 @@ impl Region {
 
     /// The local aggregate materialization plan, if this region elides fresh
     /// object/array literals.
+    pub fn cells(&self) -> &[CellSync] {
+        &self.cells
+    }
+
     pub fn local_sroa_plan(&self) -> Option<&LocalSroaPlan> {
         self.local_sroa.as_ref()
     }

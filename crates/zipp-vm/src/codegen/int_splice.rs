@@ -66,6 +66,7 @@ pub(crate) struct IntSplice {
     pub(crate) computed_guards: Vec<DenseComputedEntryGuard>,
     pub(crate) values: Vec<EntryValueGuard>,
     pub(crate) lanes: Vec<&'static NewLanePlan>,
+    pub(crate) cells: Vec<CellSync>,
     pub(crate) regs_fits: (usize, u64),
     pub(crate) scratch_base: Option<u16>,
 }
@@ -125,6 +126,8 @@ struct Site<'a> {
     /// For a `new`: each read of the instance, which is never made, as the op
     /// and the value it finds.
     reads: Vec<(usize, u16, NewLaneVal)>,
+    /// The pool global holding each upvalue the body touches.
+    cell_slots: Vec<(u16, u32)>,
     /// Callee-local registers that take a DEDICATED caller slot instead of
     /// `win + reg`: the captured `Math` receiver/callee pairs of a computed
     /// arm. The pair holds boxed identities that the region planner keeps out
@@ -274,6 +277,8 @@ pub(crate) fn plan_int_splice(
     computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
     regs_fits_helper: usize,
     metered: bool,
+    // The pool globals a captured variable may live in: `(base, count)`.
+    pool: (u32, u32),
 ) -> Option<IntSplice> {
     if !int_splice_enabled() {
         return None;
@@ -323,6 +328,7 @@ pub(crate) fn plan_int_splice(
     let mut guards: Vec<(u64, u32)> = Vec::new();
     let mut values: Vec<EntryValueGuard> = Vec::new();
     let mut lanes: Vec<&'static NewLanePlan> = Vec::new();
+    let mut cells: Vec<CellSync> = Vec::new();
     let mut route_epoch: Option<u32> = None;
     let mut prev_end = s; // spans must not overlap
     for &c in &calls {
@@ -347,10 +353,37 @@ pub(crate) fn plan_int_splice(
         if matches!(proto.code[c], Instr::New { .. }) != lp.new_lane.is_some() {
             decline!("@{c} a `new` without its lane");
         }
-        if !lp.upvals.is_empty() {
-            // An upvalue read is `jit_cell_get`, an FFI call the INT emitters
-            // have no arm for.
-            decline!("@{c} callee reads upvalues");
+        // A flattened region runs nothing else, so nothing else can touch a
+        // captured cell while it does: the cell's value lives in a pool global
+        // for the run, an integer home like any other.
+        let mut cell_slots: Vec<(u16, u32)> = Vec::new();
+        for ins in &lp.body {
+            let (idx, written) = match *ins {
+                Instr::UpvalGet { idx, .. } => (idx, false),
+                Instr::UpvalSet { idx, .. } => (idx, true),
+                _ => continue,
+            };
+            let Some(&bits) = lp.upvals.get(&idx) else {
+                decline!("@{c} upvalue {idx} has no cell");
+            };
+            let cell = Value::from_bits(bits).heap_index();
+            let slot = match cells.iter_mut().find(|known| known.cell == cell) {
+                Some(known) => {
+                    known.written |= written;
+                    known.slot
+                }
+                None => {
+                    if cells.len() as u32 == pool.1 {
+                        decline!("@{c} more captured cells than pool globals");
+                    }
+                    let slot = pool.0 + cells.len() as u32;
+                    cells.push(CellSync { cell, slot, written });
+                    slot
+                }
+            };
+            if !cell_slots.iter().any(|&(known, _)| known == idx) {
+                cell_slots.push((idx, slot));
+            }
         }
         if !lp.nested.is_empty() {
             decline!("@{c} nested (wrapper) splice");
@@ -392,9 +425,8 @@ pub(crate) fn plan_int_splice(
                 Some(_) => {}
             }
         }
-        let Some(def_ip) = def_ip else {
-            decline!("@{c} callee register r{callee} is a region live-in");
-        };
+        // A callee the region never loads is its own span: nothing to drop.
+        let def_ip = def_ip.unwrap_or(c);
         // What the flatten drops, and the once-only check that stands for it.
         // A slot generation answers for a global; failing that, the value
         // itself, in a place the region never writes.
@@ -408,6 +440,7 @@ pub(crate) fn plan_int_splice(
             })
         };
         let by_value = match proto.code[def_ip] {
+            _ if def_ip == c => Some(TaPinSrc::Reg(callee)),
             Instr::LoadGlobal { dst: d, .. } if d == callee && lp.slot_guard.is_some() => None,
             Instr::LoadGlobal { dst: d, idx } if d == callee => Some(TaPinSrc::Global(idx)),
             Instr::Move { dst: d, src } if d == callee => Some(TaPinSrc::Reg(src)),
@@ -491,6 +524,7 @@ pub(crate) fn plan_int_splice(
             win: win as u16,
             last,
             reads,
+            cell_slots,
             pair_map: Vec::new(),
             plan: lp,
         });
@@ -505,16 +539,15 @@ pub(crate) fn plan_int_splice(
     let reads_outside = reads_outside_region(proto, s, e)?;
     let live_out = region_live_out(proto, s, e, &sites, &reads_outside)?;
     for site in &sites {
-        let (Instr::LoadGlobal { dst: callee, .. } | Instr::Move { dst: callee, .. }) =
+        if let Instr::LoadGlobal { dst: callee, .. } | Instr::Move { dst: callee, .. } =
             proto.code[site.def_ip]
-        else {
-            unreachable!()
-        };
-        if live_out[site.def_ip - s].contains(&callee) {
-            decline!(
-                "@{} callee register r{callee} is live past its def",
-                site.call_ip
-            );
+        {
+            if live_out[site.def_ip - s].contains(&callee) {
+                decline!(
+                    "@{} callee register r{callee} is live past its def",
+                    site.call_ip
+                );
+            }
         }
         if matches!(site.plan.body.last(), Some(Instr::ReturnUndefined))
             && live_out[site.call_ip - s].contains(&site.dst)
@@ -671,6 +704,7 @@ pub(crate) fn plan_int_splice(
         computed_guards: Vec::new(),
         values,
         lanes,
+        cells,
         regs_fits: (regs_fits_helper, win_top),
         scratch_base: None,
     })
@@ -886,6 +920,7 @@ fn plan_int_computed_splice(
                 win,
                 last: call_ip,
                 reads: Vec::new(),
+                cell_slots: Vec::new(),
                 pair_map: pair_maps[index].clone(),
                 plan: lp,
             };
@@ -1012,6 +1047,7 @@ fn plan_int_computed_splice(
         computed_guards: vec![computed_guard],
         values: Vec::new(),
         lanes: Vec::new(),
+        cells: Vec::new(),
         regs_fits: (regs_fits_helper, win_top),
         scratch_base: Some(proto.reg_count),
     })
@@ -1064,6 +1100,7 @@ fn emit_splice(
             Instr::StoreGlobal { .. }
                 | Instr::StoreGlobalStrict { .. }
                 | Instr::StoreGlobalResolved { .. }
+                | Instr::UpvalSet { .. }
         )
     });
     if let Some(k) = effect_at {
@@ -1071,8 +1108,14 @@ fn emit_splice(
             decline!("@{} body can exit after a StoreGlobal", site.call_ip);
         }
     }
+    let slot = |idx: u16| site.cell_slots.iter().find(|(known, _)| *known == idx).map(|c| c.1);
     for ins in body {
-        let Some(m) = map_body_instr(ins, &map, constants, string_constants, lp) else {
+        let mapped = match *ins {
+            Instr::UpvalGet { dst, idx } => slot(idx).map(|idx| Instr::LoadGlobal { dst: map(dst), idx }),
+            Instr::UpvalSet { idx, src } => slot(idx).map(|idx| Instr::StoreGlobal { idx, src: map(src) }),
+            _ => map_body_instr(ins, &map, constants, string_constants, lp),
+        };
+        let Some(m) = mapped else {
             decline!("@{} body op {ins:?} is not flattenable", site.call_ip);
         };
         flat.push(m);
@@ -1250,6 +1293,7 @@ fn int_op_can_exit(i: &Instr) -> bool {
             | Instr::LoadInt { .. }
             | Instr::LoadConst { .. }
             | Instr::LoadGlobal { .. }
+            | Instr::UpvalGet { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
@@ -1528,6 +1572,8 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::LoadGlobalOrUndefined { dst, .. } => r(vec![], Some(dst)),
         Instr::Move { dst, src } => r(vec![src], Some(dst)),
         Instr::MakeClass { dst, parent, .. } => r(parent.into_iter().collect(), Some(dst)),
+        Instr::MakeCell { reg } => r(vec![reg], Some(reg)),
+        Instr::MakeCellTdz { reg } => r(vec![], Some(reg)),
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
         | Instr::StoreGlobalResolved { src, .. } => r(vec![src], None),
