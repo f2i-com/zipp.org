@@ -1069,6 +1069,11 @@ impl Compiler {
             for s in body {
                 collect_hoisted_vars(s, &mut hv);
             }
+        // A `var arguments` shares the binding's register and is written in
+        // place, past `resolve`: the object stays, whatever reads it.
+        if hv.contains("arguments") && fc.arguments_reg.is_some() {
+            fc.uses_arguments = true;
+        }
             // Pre-declare EVERY hoisted var at entry (not just captured ones):
             // (1) a `var` declared inside a BLOCK must occupy a register BELOW
             // the block scope's, or the block's pop reclaims register space
@@ -1204,6 +1209,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1213,11 +1219,8 @@ impl Compiler {
                 .map(expected_arg_count)
                 .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator,
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
@@ -1562,6 +1565,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1571,11 +1575,8 @@ impl Compiler {
                 .map(expected_arg_count)
                 .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator,
             is_async,
             // A class method/getter/setter is non-constructable. The class
@@ -1856,6 +1857,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -1863,11 +1865,8 @@ impl Compiler {
             param_count: params.len() as u16,
             length: expected_arg_count(&a.params),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator: false,
             is_async: a.is_async,
             non_constructable: true, // arrow functions have no [[Construct]]

@@ -3040,6 +3040,10 @@ pub struct FuncProto {
     /// built at call setup, when the (non-arrow) function references `arguments`.
     /// `None` if unused.
     pub arguments_reg: Option<u16>,
+    /// The function reads `arguments` only as `arguments.length`: register
+    /// `arguments_reg` receives the argument count instead of an object, and
+    /// those reads are `Move`s of it.
+    pub args_count_only: bool,
     /// True for a `function*` generator body: calling it builds a suspended
     /// Generator object instead of running, and it is never whole-function JITed.
     pub is_generator: bool,

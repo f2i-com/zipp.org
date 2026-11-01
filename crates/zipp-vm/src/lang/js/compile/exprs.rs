@@ -1000,6 +1000,50 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// The register of this function's own `arguments`, when `m` reads its
+    /// `.length`: the name is not shadowed, and `resolve`, which would ask for
+    /// the object, has not been called for this read.
+    fn own_arguments_length(&self, m: &ast::Member, prop: &str) -> Option<Reg> {
+        let ast::Expr::Ident(name, ..) = &m.object else {
+            return None;
+        };
+        let name: &str = name;
+        if prop != "length" || name != "arguments" || m.optional || self.in_generator || self.in_async {
+            return None;
+        }
+        let r = self.arguments_reg?;
+        if self.cell_regs.contains(&r) || !self.with_objs_for(name).is_empty() {
+            return None;
+        }
+        let slot = self.scopes.iter().rev().find_map(|scope| scope.slot_of(name))?;
+        (slot.reg() == Some(r)).then_some(r)
+    }
+
+    /// Decide `arguments` as the function ends: the register its proto
+    /// records, and whether the call stores only the argument count there.
+    /// A read of `arguments.length` was emitted as a `GetProp` of the register
+    /// without asking for the object. If nothing else asked (no other mention,
+    /// no capture, no direct eval), those are the register's only reads, and
+    /// become `Move`s of the count: no object per call. If something did, they
+    /// stay what they are, reads of the real object's `length`, which a
+    /// program may have changed.
+    pub(crate) fn settle_arguments(&mut self) -> (Option<Reg>, bool) {
+        if self.uses_arguments {
+            return (self.arguments_reg, false);
+        }
+        let Some(r) = self.arguments_reg.filter(|_| self.arguments_lengths) else {
+            return (None, false);
+        };
+        for ins in &mut self.code {
+            if let Instr::GetProp { dst, obj, .. } = *ins {
+                if obj == r {
+                    *ins = Instr::Move { dst, src: r };
+                }
+            }
+        }
+        (Some(r), true)
+    }
+
     pub(crate) fn static_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
         // Namespace constants (notably Math.PI/E/…) are ordinary property reads.
         // Folding them by identifier spelling ignored lexical shadowing, a
@@ -1022,6 +1066,12 @@ impl<'a> FnCompiler<'a> {
             } else {
                 return Err("`super.x` is only valid in a method".into());
             }
+            return Ok(dst);
+        }
+        if let Some(r) = self.own_arguments_length(m, prop) {
+            self.arguments_lengths = true;
+            let name = self.string_name(prop);
+            self.emit(Instr::GetProp { dst, obj: r, name });
             return Ok(dst);
         }
         // `(x = v).p` with `x` a plain local: assign in place and read the

@@ -1239,18 +1239,22 @@ impl<'p> Vm<'p> {
         // `arguments[2]`) sees every argument — matching the direct Call op.
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let (is_strict, simple) = {
+            let (is_strict, simple, count_only) = {
                 let p = self.func(func_id as usize);
-                (p.is_strict, p.simple_params)
+                (p.is_strict, p.simple_params, p.args_count_only)
             };
-            // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
-            // the frame about to be pushed (frames.len() is its index).
-            let mapinfo =
-                (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
-            let arr = self.build_arguments_object(args.to_vec(), callee, is_strict, mapinfo);
-            self.regs[new_base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if count_only {
+                self.regs[new_base + areg as usize] = Value::int(args.len() as i32);
+            } else {
+                // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
+                // the frame about to be pushed (frames.len() is its index).
+                let mapinfo =
+                    (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+                let arr = self.build_arguments_object(args.to_vec(), callee, is_strict, mapinfo);
+                self.regs[new_base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
 

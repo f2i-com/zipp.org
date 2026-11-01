@@ -403,6 +403,7 @@ impl FnCompiler<'_> {
             length: if run { expected_arg_count(params) } else { 0 },
             rest_reg,
             arguments_reg: None,
+            args_count_only: false,
             is_generator: false,
             is_async: false,
             non_constructable: is_arrow,

@@ -179,6 +179,7 @@ impl<'a> FnCompiler<'a> {
             rest_reg: None,
             arguments_reg: None,
             uses_arguments: false,
+            arguments_lengths: false,
             super_class: None,
             super_home_obj: false,
             super_static: false,

@@ -5918,12 +5918,16 @@ impl<'p> Vm<'p> {
         }
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let mapinfo =
-                (!p_strict && simple).then(|| (self.frames.len() - 1, base, callee_params));
-            let arr = self.build_arguments_object(argv.to_vec(), callee_v, p_strict, mapinfo);
-            self.regs[base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(fid as usize).args_count_only {
+                self.regs[base + areg as usize] = Value::int(argv.len() as i32);
+            } else {
+                let mapinfo =
+                    (!p_strict && simple).then(|| (self.frames.len() - 1, base, callee_params));
+                let arr = self.build_arguments_object(argv.to_vec(), callee_v, p_strict, mapinfo);
+                self.regs[base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
         let fr = self.frames.last_mut().unwrap();
@@ -7819,17 +7823,21 @@ impl<'p> Vm<'p> {
         // `arguments`: an array of ALL actual args (a function that references it).
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let argsv: Vec<Value> = (0..argc as usize)
-                .map(|i| self.regs[caller_base + arg_base as usize + i])
-                .collect();
-            // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
-            // the frame about to be pushed (frames.len() is its index).
-            let mapinfo =
-                (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
-            let arr = self.build_arguments_object(argsv, callee_val, is_strict, mapinfo);
-            self.regs[new_base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(func_id as usize).args_count_only {
+                self.regs[new_base + areg as usize] = Value::int(argc as i32);
+            } else {
+                let argsv: Vec<Value> = (0..argc as usize)
+                    .map(|i| self.regs[caller_base + arg_base as usize + i])
+                    .collect();
+                // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
+                // the frame about to be pushed (frames.len() is its index).
+                let mapinfo =
+                    (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+                let arr = self.build_arguments_object(argsv, callee_val, is_strict, mapinfo);
+                self.regs[new_base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
 
@@ -7928,11 +7936,15 @@ impl<'p> Vm<'p> {
         }
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let mapinfo = (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
-            let arr = self.build_arguments_object(args.to_vec(), callee_val, is_strict, mapinfo);
-            self.regs[new_base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(func_id as usize).args_count_only {
+                self.regs[new_base + areg as usize] = Value::int(args.len() as i32);
+            } else {
+                let mapinfo = (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+                let arr = self.build_arguments_object(args.to_vec(), callee_val, is_strict, mapinfo);
+                self.regs[new_base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
         let last = self.frames.len() - 1;

@@ -476,6 +476,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         length: 0,
         rest_reg: None,
         arguments_reg: None,
+        args_count_only: false,
         is_generator: false,
         is_async: false,
         non_constructable: false,
@@ -602,6 +603,8 @@ struct FnCompiler<'a> {
     /// whether the body actually referenced `arguments` (gates building it).
     arguments_reg: Option<Reg>,
     uses_arguments: bool,
+    /// The body reads `arguments.length` (see `settle_arguments`).
+    arguments_lengths: bool,
     /// When compiling a class method/constructor, THIS class's class_id — the home
     /// for `super.x`/`super.m()`, which resolve at runtime via the home prototype's
     /// [[Prototype]] (so they work in base classes too, reaching %Object.prototype%).
