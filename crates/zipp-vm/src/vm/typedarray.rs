@@ -1645,7 +1645,13 @@ impl<'p> Vm<'p> {
             3 => Value::int(i16::from_le_bytes(ta_bytes(data, off)?) as i32),
             4 => Value::int(u16::from_le_bytes(ta_bytes(data, off)?) as i32),
             5 => Value::int(i32::from_le_bytes(ta_bytes(data, off)?)),
-            6 => Value::num(u32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            6 => {
+                let u = u32::from_le_bytes(ta_bytes(data, off)?);
+                match i32::try_from(u) {
+                    Ok(n) => Value::int(n),
+                    Err(_) => Value::num(u as f64),
+                }
+            }
             7 => Value::num(f32::from_le_bytes(ta_bytes(data, off)?) as f64),
             8 => Value::num(f64::from_le_bytes(ta_bytes(data, off)?)),
             11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(ta_bytes(

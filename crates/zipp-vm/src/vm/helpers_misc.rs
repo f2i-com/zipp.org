@@ -2239,7 +2239,29 @@ pub(crate) extern "win64" fn jit_get_index(
         // SAFETY: read-only view; the running code holds no conflicting borrow.
         let vm = unsafe { &*(raw as *const Vm) };
         let aidx = arr.heap_index();
-        if let HeapObj::Array(items) = vm.heap.get(aidx) {
+        // A typed array's element, ahead of the tests below, which are all for
+        // other receivers: they were two thirds of a read's 137 instructions.
+        if let HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            length,
+        } = vm.heap.get(aidx)
+        {
+            let i = key.as_int();
+            if i >= 0 && !native::TA_KINDS[*kind as usize].2 {
+                let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                    aidx,
+                    *buffer,
+                    *kind,
+                    *byte_offset,
+                    *length,
+                );
+                return vm
+                    .ta_interp_numeric_get_view(view, i as usize)
+                    .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits);
+            }
+        } else if let HeapObj::Array(items) = vm.heap.get(aidx) {
             if let Some(&v) = usize::try_from(key.as_int()).ok().and_then(|i| items.get(i)) {
                 if !v.is_hole()
                     && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
