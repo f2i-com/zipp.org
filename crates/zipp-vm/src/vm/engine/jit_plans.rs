@@ -3286,6 +3286,7 @@ impl<'p> Vm<'p> {
                 && default_arg_mask == 0
                 && span_code_unit_pred.is_none()
                 && nested.is_empty()
+                && !callee.args_count_only
             {
                 for (i, ins) in body.iter().enumerate() {
                     let Instr::GetProp { dst, obj, name } = *ins else {

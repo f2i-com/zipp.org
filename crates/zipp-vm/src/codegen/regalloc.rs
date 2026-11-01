@@ -945,6 +945,39 @@ pub(crate) fn compile_region_regalloc(
                 copy_clobber(&mut lc, d);
                 let bw_bail = ops.new_dynamic_label();
                 let bw_done = ops.new_dynamic_label();
+                // `x | 0` of an x already an int32 is x, so a loop's
+                // `s = (s + v) | 0` need not take its running total through
+                // two conversions: 17 of an iteration's 19 cycles, carried
+                // from one iteration to the next. The round trip here only
+                // decides a branch, which the core predicts past.
+                if op == B::Or
+                    && ip > s
+                    && !plan.jump_targets.contains(&ip)
+                    && matches!(proto.code[ip - 1], Instr::LoadInt { dst: z, val: 0 } if z == b)
+                {
+                    let full = ops.new_dynamic_label();
+                    let zero = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; cvttsd2si eax, Rx(ax)
+                        ; xorps xmm0, xmm0
+                        ; cvtsi2sd xmm0, eax
+                        ; ucomisd xmm0, Rx(ax)
+                        ; jne => full
+                        ; jp => full
+                        ; test eax, eax
+                        ; jz => zero              // either zero is +0 after `| 0`
+                    );
+                    if d != ax {
+                        dynasm!(ops ; movaps Rx(d), Rx(ax));
+                    }
+                    dynasm!(ops
+                        ; jmp => bw_done
+                        ; => zero
+                        ; xorps Rx(d), Rx(d)
+                        ; jmp => bw_done
+                        ; => full
+                    );
+                }
                 dynasm!(ops
                     ; cvttsd2si rax, Rx(ax)
                     ; mov rdx, QWORD i64::MIN
