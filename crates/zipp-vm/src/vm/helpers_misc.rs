@@ -8406,13 +8406,17 @@ pub(crate) extern "win64" fn jit_iter_next(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let (value_dst, done_dst) = (value_dst as u16, done_dst as u16);
-    match vm.iter_next_step(base, it, value_dst, done_dst, idx_reg as u16, next_reg as u16) {
-        Ok(()) => {
-            iterstats::native_step();
-            0
+    // A user `next` runs here: past this point a Rust unwind must not reach the
+    // native frames, and the step must not replay.
+    catch_effectful_jit_u64(|| {
+        match vm.iter_next_step(base, it, value_dst, done_dst, idx_reg as u16, next_reg as u16) {
+            Ok(()) => {
+                iterstats::native_step();
+                0
+            }
+            Err(t) => vm.jit_thrown_to_sentinel(t),
         }
-        Err(t) => vm.jit_thrown_to_sentinel(t),
-    }
+    })
 }
 
 /// Win64 helper for a region `ToNum` (`+x`) whose operand is not already a
