@@ -4200,7 +4200,7 @@ impl<'p> Vm<'p> {
                 // Tier-C leaf-inline plan for the whole function (from the live
                 // ICs). Built BEFORE the &mut self.jit borrow. Opt out with
                 // ZIPP_NO_TIERC_LEAF (region leaf inlining is unaffected).
-                let leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+                let mut leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
                     self.build_leaf_inline_plan(
                         func_id,
                         0,
@@ -4223,7 +4223,7 @@ impl<'p> Vm<'p> {
                 // Tier-C cross-call plan (B83) — also built before &mut self.jit.
                 let (mut cross_plan, cross_pending, cross_baked) =
                     self.build_cross_call_plan(func_id, Some(base), true);
-                self.plan_new_lanes(func_id, &mut cross_plan);
+                self.plan_new_lanes(func_id, &mut cross_plan, &mut leaf_plan);
                 self.jit.note_cross_pending(func_id, &cross_pending);
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));

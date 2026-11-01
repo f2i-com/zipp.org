@@ -191,6 +191,106 @@ fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreS
     None
 }
 
+/// A straight constructor body that computes what it stores, rewritten for an
+/// inline at the `new`: its stores into `this` become moves to registers past
+/// its own, one per name, and `this` is otherwise not touched. Nothing it does
+/// is then visible until the instance is made at the end, so a bail anywhere
+/// can run the whole `new` again. The names, and where each value is. A read
+/// of a name already stored is that store's register; any other read of
+/// `this`, a branch (the instance's shape would depend on it) or a capture
+/// (the plan bakes no cells) keeps the body's path.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn scan_compute_body(
+    p: &crate::bytecode::FuncProto,
+) -> Option<(Vec<Instr>, Vec<String>, Vec<crate::codegen::NewLaneVal>)> {
+    use crate::codegen::NewLaneVal;
+    if p.is_generator
+        || p.is_async
+        || p.lexical_this
+        || p.rest_reg.is_some()
+        || p.arguments_reg.is_some()
+        || !p.upvalues.is_empty()
+        || !p.simple_params
+    {
+        return None;
+    }
+    let term = p.code.iter().position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    if !matches!(p.code[term], Instr::ReturnUndefined) {
+        return None;
+    }
+    let mut code = Vec::with_capacity(term + 1);
+    let mut keys: Vec<String> = Vec::new();
+    let mut vals: Vec<NewLaneVal> = Vec::new();
+    // Registers holding a constant the leaf subset has no op for.
+    let mut known: rustc_hash::FxHashMap<u16, u64> = rustc_hash::FxHashMap::default();
+    for ins in &p.code[..term] {
+        match *ins {
+            Instr::LoadNull { dst } => {
+                known.insert(dst, Value::NULL.bits());
+            }
+            Instr::LoadUndefined { dst } => {
+                known.insert(dst, Value::UNDEFINED.bits());
+            }
+            Instr::Move { dst, src } if known.contains_key(&src) => {
+                known.insert(dst, known[&src]);
+            }
+            Instr::SetProp { obj: 0, name, val, .. } | Instr::DefineField { obj: 0, name, val } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = match keys.iter().position(|k| k == key) {
+                    Some(at) => at,
+                    None => {
+                        if !store_key_ok(key) || keys.len() == STORE_MAX {
+                            return None;
+                        }
+                        keys.push(key.clone());
+                        vals.push(NewLaneVal::Bits(Value::UNDEFINED.bits()));
+                        keys.len() - 1
+                    }
+                };
+                vals[at] = match known.get(&val) {
+                    Some(&bits) => NewLaneVal::Bits(bits),
+                    None => {
+                        let stage = p.reg_count + at as u16;
+                        code.push(Instr::Move { dst: stage, src: val });
+                        NewLaneVal::Reg(stage)
+                    }
+                };
+            }
+            Instr::GetProp { dst, obj: 0, name } => {
+                let key = p.string_constants.get(name as usize)?;
+                match vals[keys.iter().position(|k| k == key)?] {
+                    NewLaneVal::Reg(src) => {
+                        code.push(Instr::Move { dst, src });
+                        known.remove(&dst);
+                    }
+                    NewLaneVal::Bits(bits) => {
+                        known.insert(dst, bits);
+                    }
+                    NewLaneVal::Arg(_) => return None,
+                }
+            }
+            Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. } => return None,
+            other => {
+                if crate::codegen::instr_uses(&other).iter().any(|r| *r == 0 || known.contains_key(r)) {
+                    return None;
+                }
+                let defs = crate::codegen::splice_body_defs(std::slice::from_ref(&other))?;
+                known.retain(|r, _| *r >= 64 || defs & (1u64 << r) == 0);
+                code.push(other);
+            }
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    code.push(Instr::ReturnUndefined);
+    Some((code, keys, vals))
+}
+
 /// No heap index is ever `u32::MAX`, so a lookup of it in `proto_of` misses,
 /// as one for an instance not yet made does.
 const NO_INSTANCE: u32 = u32::MAX;
@@ -228,7 +328,12 @@ impl<'p> Vm<'p> {
     /// Plan a lane for each `New` site of `func_id` whose constructor, as last
     /// seen there, only stores its arguments (see [`crate::codegen::NewLanePlan`]).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn plan_new_lanes(&mut self, func_id: u32, plan: &mut crate::codegen::CrossCallPlan) {
+    pub(crate) fn plan_new_lanes(
+        &mut self,
+        func_id: u32,
+        plan: &mut crate::codegen::CrossCallPlan,
+        leaf: &mut rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan>,
+    ) {
         if !ctor_store_enabled() || !crate::heap::ready_objects_enabled() || self.new_sites.is_empty() {
             return;
         }
@@ -256,49 +361,58 @@ impl<'p> Vm<'p> {
                     eprintln!("[new] fn{func_id}@{ip} NEW-LANE {} stores, class {:?}", lane.vals.len(), lane.class);
                 }
                 plan.entry(ip).or_default().new_lane = Some(Box::leak(Box::new(lane)));
+            } else if let Some(body) = self.plan_new_leaf(func_id, bits, ver, argc) {
+                if crate::jitlog_enabled() {
+                    eprintln!("[new] fn{func_id}@{ip} NEW-LEAF {} ops", body.body.len());
+                }
+                leaf.insert(ip, body);
             }
         }
     }
 
-    /// [`Self::plan_new_lanes`] for one callee: the constructor's stores, and
-    /// the proof `ctor_store_new` would make for them now.
+    /// What `new` of the callee `bits` makes: the constructor's fid, the
+    /// instance's class (`u32::MAX` for a plain function's) and its
+    /// [[Prototype]] if it is a plain function's.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn plan_new_lane(&mut self, bits: u64, callee_ver: u32, argc: u16) -> Option<crate::codegen::NewLanePlan> {
-        use crate::codegen::{NewLanePlan, NewLaneVal};
+    fn new_target(&mut self, bits: u64) -> Option<(u32, u32, Option<u32>)> {
         let cv = Value::from_bits(bits);
         let ci = cv.heap_index();
-        let (fid, class, proto) = if matches!(self.heap.get(ci), HeapObj::Class(_)) {
-            (self.flat_new_class_target(cv)?.0, ci, None)
-        } else {
-            let (fid, _closure) = self.ic_plain_fn(cv)?;
-            let p = self.func(fid as usize);
-            if p.non_constructable
-                || p.lexical_this
-                || !self.obj_realm.is_empty()
-                || !self.realm_global_objs.is_empty()
-                || self.get_function_realm(cv) != 0
-            {
-                return None;
-            }
-            let proto = self.prototype_of(cv).filter(|&p| self.is_object_value(p))?;
-            (fid, u32::MAX, Some(proto.heap_index()))
-        };
-        let keys = scan_store_body(self.func(fid as usize))?;
-        let proof = self.prove_stores(class, proto.unwrap_or(u32::MAX), &keys)?;
+        if matches!(self.heap.get(ci), HeapObj::Class(_)) {
+            return Some((self.flat_new_class_target(cv)?.0, ci, None));
+        }
+        let (fid, _closure) = self.ic_plain_fn(cv)?;
+        let p = self.func(fid as usize);
+        if p.non_constructable
+            || p.lexical_this
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let proto = self.prototype_of(cv).filter(|&p| self.is_object_value(p))?;
+        Some((fid, u32::MAX, Some(proto.heap_index())))
+    }
+
+    /// The lane for `new` of `bits`, given the `vals` its instance holds under
+    /// `keys`: the proof `ctor_store_new` would make for those names now.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn new_lane_proved(
+        &mut self,
+        bits: u64,
+        callee_ver: u32,
+        class: u32,
+        proto: Option<u32>,
+        keys: &[(String, StoreSrc)],
+        vals: Vec<crate::codegen::NewLaneVal>,
+    ) -> Option<crate::codegen::NewLanePlan> {
+        let proof = self.prove_stores(class, proto.unwrap_or(u32::MAX), keys)?;
         crate::heap::val_slab_class(keys.len())?;
-        let vals = keys
-            .iter()
-            .map(|(_, src)| match *src {
-                StoreSrc::Arg(a) if a < argc => NewLaneVal::Arg(a),
-                StoreSrc::Arg(_) => NewLaneVal::Bits(Value::UNDEFINED.bits()),
-                StoreSrc::Bits(b) => NewLaneVal::Bits(b),
-            })
-            .collect();
         let mut hops = proof.hops.clone();
         if class != u32::MAX {
             hops.push((class, proof.class_ver));
         }
-        Some(NewLanePlan {
+        Some(crate::codegen::NewLanePlan {
             callee_bits: bits,
             callee_ver,
             epoch: proof.epoch,
@@ -308,6 +422,108 @@ impl<'p> Vm<'p> {
             shape: proof.shape,
             keys: crate::bytecode::PlanHandle::borrowed_bits(&proof.plan),
             vals,
+        })
+    }
+
+    /// [`Self::plan_new_lanes`] for a callee whose body only stores.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plan_new_lane(&mut self, bits: u64, callee_ver: u32, argc: u16) -> Option<crate::codegen::NewLanePlan> {
+        use crate::codegen::NewLaneVal;
+        let (fid, class, proto) = self.new_target(bits)?;
+        let keys = scan_store_body(self.func(fid as usize))?;
+        let vals = keys
+            .iter()
+            .map(|(_, src)| match *src {
+                StoreSrc::Arg(a) if a < argc => NewLaneVal::Arg(a),
+                StoreSrc::Arg(_) => NewLaneVal::Bits(Value::UNDEFINED.bits()),
+                StoreSrc::Bits(b) => NewLaneVal::Bits(b),
+            })
+            .collect();
+        self.new_lane_proved(bits, callee_ver, class, proto, &keys, vals)
+    }
+
+    /// [`Self::plan_new_lanes`] for a callee whose body computes what it
+    /// stores: a leaf inline of the body with the stores staged in registers
+    /// past its own, around the lane that makes the instance from them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plan_new_leaf(
+        &mut self,
+        func_id: u32,
+        bits: u64,
+        callee_ver: u32,
+        argc: u16,
+    ) -> Option<crate::codegen::LeafInlinePlan> {
+        let (fid, class, proto) = self.new_target(bits)?;
+        let (code, keys, vals) = scan_compute_body(self.func(fid as usize))?;
+        let mut spliced = self.func(fid as usize).clone();
+        spliced.code = code;
+        spliced.reg_count += keys.len() as u16;
+        let (body, mask) = crate::codegen::callee_leaf_ok_for_call(&spliced, argc)?;
+        if mask != 0
+            || body.iter().any(|i| {
+                matches!(
+                    i,
+                    Instr::LoadGlobal { .. }
+                        | Instr::LoadGlobalOrUndefined { .. }
+                        | Instr::StoreGlobal { .. }
+                        | Instr::StoreGlobalStrict { .. }
+                        | Instr::StoreGlobalResolved { .. }
+                )
+            })
+        {
+            return None;
+        }
+        let stores: Vec<(String, StoreSrc)> = keys.into_iter().map(|k| (k, StoreSrc::Arg(0))).collect();
+        let lane = self.new_lane_proved(bits, callee_ver, class, proto, &stores, vals)?;
+        let reg_window = self.func(func_id as usize).reg_count;
+        let mut consts = rustc_hash::FxHashMap::default();
+        for ins in &body {
+            if let Instr::LoadConst { idx, .. } = *ins {
+                if let Some(c) = spliced.constants.get(idx as usize) {
+                    consts.insert(idx, c.bits());
+                }
+            }
+        }
+        let uninit_mask = if crate::codegen::splice_fill_enabled() {
+            crate::codegen::splice_uninit_mask(&body, spliced.reg_count as usize, spliced.param_count as usize)
+        } else {
+            u64::MAX
+        };
+        let alias_params = match crate::codegen::splice_body_defs(&body) {
+            Some(defs) if crate::codegen::splice_alias_enabled() => (0..(argc.min(spliced.param_count) as u64).min(63))
+                .filter(|i| defs & (1u64 << (1 + i)) == 0)
+                .fold(0u64, |m, i| m | (1u64 << i)),
+            _ => 0,
+        };
+        Some(crate::codegen::LeafInlinePlan {
+            callee_bits: bits,
+            callee_ver,
+            same_proto_fid: None,
+            same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
+            this_bits: Value::UNDEFINED.bits(),
+            this_reg: None,
+            new_lane: Some(Box::leak(Box::new(lane))),
+            class_guard: None,
+            prop_shapes: rustc_hash::FxHashMap::default(),
+            reg_window,
+            callee_reg_count: spliced.reg_count,
+            param_count: spliced.param_count,
+            default_arg_mask: 0,
+            body,
+            consts,
+            string_constants: spliced.string_constants.clone(),
+            nested: rustc_hash::FxHashMap::default(),
+            upvals: rustc_hash::FxHashMap::default(),
+            cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
+            cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
+            prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,
+            callee_fid: fid,
+            uninit_mask,
+            alias_params,
+            slot_guard: None,
+            direct_global_route_epoch: None,
+            typed_lane: None,
+            span_code_unit_pred: None,
         })
     }
 

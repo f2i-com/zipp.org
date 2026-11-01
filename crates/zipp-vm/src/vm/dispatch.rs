@@ -2852,7 +2852,7 @@ impl<'p> Vm<'p> {
                                 // Q4 leaf-call inline plan: monomorphic plain-leaf
                                 // callees at this region's Call sites (read-only —
                                 // built before the &proto borrow below).
-                                let leaf_plan = self.build_leaf_inline_plan(
+                                let mut leaf_plan = self.build_leaf_inline_plan(
                                     func_id,
                                     t as u32,
                                     region_end as u32,
@@ -2944,7 +2944,7 @@ impl<'p> Vm<'p> {
                                 // sites get the native→native attempt too.
                                 let (mut cross_plan, cross_pending, cross_baked) =
                                     self.build_cross_call_plan(func_id, Some(base), false);
-                                self.plan_new_lanes(func_id, &mut cross_plan);
+                                self.plan_new_lanes(func_id, &mut cross_plan, &mut leaf_plan);
                                 self.jit.note_cross_baked(func_id, &cross_baked);
                                 // B199: a "no entry yet" decline at a REGION is
                                 // deferred (capped) instead of baked — the callee

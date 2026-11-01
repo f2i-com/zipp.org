@@ -606,6 +606,9 @@ pub(crate) fn emit_inline_leaf_call(
             ; jne => fallback
         );
     }
+    if let Some(lane) = plan.new_lane {
+        emit_new_guards(ops, lane, fallback);
+    }
     let body_has_direct_global = plan.body.iter().any(|ins| {
         matches!(
             ins,
@@ -1440,13 +1443,15 @@ pub(crate) fn emit_inline_leaf_call(
             );
         }
     }
-    // ── store the return value into the caller's `dst` ──
-    match ret_reg {
-        Some(r) => dynasm!(ops
+    // ── store the return value into the caller's `dst` ── or at a `New`
+    // site, make the instance from the body's stores.
+    match (plan.new_lane, ret_reg) {
+        (Some(lane), _) => emit_new_instance(ops, lane, arg_base, rg, dst, fallback),
+        (None, Some(r)) => dynasm!(ops
             ; mov rax, [rbx + dreg(r)]
             ; mov [rbx + dreg(dst)], rax
         ),
-        None => dynasm!(ops
+        (None, None) => dynasm!(ops
             ; mov rax, QWORD Value::UNDEFINED.bits() as i64
             ; mov [rbx + dreg(dst)], rax
         ),

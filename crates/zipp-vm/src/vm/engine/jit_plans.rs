@@ -1451,6 +1451,7 @@ impl<'p> Vm<'p> {
                     callee_reg_count: callee.reg_count,
                     this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
                     this_reg: None,
+                    new_lane: None,
                     class_guard: None,
                     prop_shapes: FxHashMap::default(),
                     param_count: callee.param_count,
@@ -3538,6 +3539,7 @@ impl<'p> Vm<'p> {
                     same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
                     this_bits,
                     this_reg,
+                    new_lane: None,
                     class_guard,
                     prop_shapes,
                     reg_window,

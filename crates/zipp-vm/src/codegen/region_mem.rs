@@ -3663,19 +3663,47 @@ pub(crate) fn compile_region_mem(
                     .map(|lane| emit_new_lane(&mut ops, lane, callee, arg_base, dst));
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    crate::vm::jit_new_ic as *const () as usize,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
-                    ta_refetch,
-                );
+                let refetch = refetch_pinned.then_some((heap.versions_base, heap.ic_base));
+                match leaf_plan.get(&ip) {
+                    Some(lp) => emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        heap.math_imul_guard,
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
+                        crate::vm::jit_new_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        refetch,
+                        ta_refetch,
+                        None,
+                        None,
+                    ),
+                    None => emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        crate::vm::jit_new_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch,
+                        ta_refetch,
+                    ),
+                }
                 if let Some(done) = lane_done {
                     dynasm!(ops ; =>done);
                 }

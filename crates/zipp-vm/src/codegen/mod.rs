@@ -1216,6 +1216,8 @@ pub enum NewLaneVal {
     Arg(u16),
     /// A value known at compile time, not a heap one.
     Bits(u64),
+    /// A register of the constructor's inlined body (`LeafInlinePlan::new_lane`).
+    Reg(u16),
 }
 
 /// `new C(...)` of a constructor whose body only stores its arguments and
@@ -1457,6 +1459,11 @@ pub struct LeafInlinePlan {
     /// `this_bits` (OrdinaryCallBindThis on a strict function binds the
     /// value as given). `None`: `this_bits` as above.
     pub this_reg: Option<u16>,
+    /// A `New` site: `body` is the constructor's, its stores into `this` moved
+    /// to registers past its own, and this lane's guards and finished instance
+    /// wrap it. Nothing is committed until the instance is made, so a bail
+    /// runs the whole `new` again, as a call's does.
+    pub new_lane: Option<&'static NewLanePlan>,
     /// A `CallMethod` site's class-method lane (`ClassReadLane`): the receiver
     /// in `this_reg` at the lane's shape and class proves the method is
     /// `callee_bits`, so this guard replaces the callee identity check, and a

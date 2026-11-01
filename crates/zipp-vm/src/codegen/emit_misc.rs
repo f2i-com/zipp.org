@@ -151,10 +151,7 @@ pub(crate) fn emit_new_lane(
     arg_base: u16,
     dst: u16,
 ) -> dynasmrt::DynamicLabel {
-    use crate::vm::host_api::{
-        JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_GEN_RAW_OFFSET, JIT_PROTO_COUNT_OFFSET, JIT_PROTO_LEN_OFFSET,
-        JIT_PROTO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
-    };
+    use crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET;
     let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
     dynasm!(ops
         ; mov rax, [rbx + dreg(callee)]
@@ -165,6 +162,26 @@ pub(crate) fn emit_new_lane(
         ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
         ; cmp DWORD [r11 + rcx * 4], lane.callee_ver as i32
         ; jne =>miss
+    );
+    emit_new_guards(ops, lane, miss);
+    emit_new_instance(ops, lane, arg_base, |r| r, dst, miss);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    done
+}
+
+/// `lane`'s proof, or a jump to `miss`: nothing on the chain the proof read
+/// has moved, and its prototype is one a collection has seen.
+pub(crate) fn emit_new_guards(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_GEN_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET};
+    dynasm!(ops
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
         ; cmp DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32], lane.epoch as i32
         ; jne =>miss
     );
@@ -183,6 +200,20 @@ pub(crate) fn emit_new_lane(
             ; jz =>miss
         );
     }
+}
+
+/// Take a ready object for `lane` and fill it, or jump to `miss` with nothing
+/// done: the finished instance in `dst`. `rg` maps a body register to the
+/// caller's window.
+pub(crate) fn emit_new_instance(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    arg_base: u16,
+    rg: impl Fn(u16) -> u16,
+    dst: u16,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_PROTO_COUNT_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET};
     let n = lane.vals.len();
     let Some(class) = crate::heap::val_slab_class(n) else {
         unreachable!("the planner took a slab class's worth of stores")
@@ -202,15 +233,11 @@ pub(crate) fn emit_new_lane(
         match *v {
             NewLaneVal::Arg(a) => dynasm!(ops ; mov r8, [rbx + dreg(arg_base + a)]),
             NewLaneVal::Bits(b) => dynasm!(ops ; mov r8, QWORD b as i64),
+            NewLaneVal::Reg(r) => dynasm!(ops ; mov r8, [rbx + dreg(rg(r))]),
         }
         dynasm!(ops ; mov [rcx + i as i32 * 8], r8);
     }
     emit_ready_fill(ops, lane.keys, lane.shape, n as i32, lane.class, dst);
-    dynasm!(ops
-        ; jmp =>done
-        ; =>miss
-    );
-    done
 }
 
 /// `TypeOfIs { dst, a, code, neg }` — `dst = (typeof a === TYPEOF_NAMES[code])
