@@ -2973,20 +2973,16 @@ fn do_wide_mask_passes(
     Some(mask.into_boxed_slice())
 }
 
-/// Compile the WHOLE body of `proto` to native code via the memory-path op
-/// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
-/// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/
-/// strict_eq/truthy). Returns a `JitFn` with the standard ABI, or `None` if the
-/// body is ineligible. v1 uses NO inline caches / TA pins / inline plans, so
-/// r13/r14 are saved-but-unused and no post-call re-fetch is emitted (the
-/// globals pin r12 stays valid across calls — `self.globals` never reallocates).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-/// A `try` whose body compiled code runs with no handler pushed.
+/// A `try` or a `finally` bracket whose body compiled code runs with no
+/// handler pushed.
 struct LazyTry {
     push: usize,
     pop: usize,
-    catch_target: u32,
-    catch_reg: u16,
+    /// The push the exit stub makes: `jit_push_catch`'s argument, or the
+    /// `finally` bracket's.
+    packed: u64,
+    /// A `finally` bracket's target and completion registers.
+    finally: Option<(u32, u16, u16)>,
 }
 
 env_off_switch! {
@@ -2998,6 +2994,12 @@ env_off_switch! {
     fn lazy_try_enabled() = "ZIPP_NO_LAZY_TRY"
 }
 
+/// The `finally` bracket `ip` is in the body of with no handler pushed: where a
+/// return there goes, and the completion registers it fills.
+fn lazy_finally(lazy: &[LazyTry], ip: usize) -> Option<(u32, u16, u16)> {
+    lazy.iter().find(|t| t.push < ip && ip < t.pop).and_then(|t| t.finally)
+}
+
 /// The handler of a `try` is only ever read by what happens after the body is
 /// left some way other than its `PopHandler`: a throw unwinding this frame, or
 /// a bail, whose interpreter must find the frame as it would have left it. Both
@@ -3006,24 +3008,43 @@ env_off_switch! {
 ///
 /// That takes a body with one way in and one way out: nothing outside jumps into
 /// it, every branch in it stays in it and runs forward (a loop head is an entry
-/// from the interpreter, which has pushed), and no return, `finally` or nested
-/// handler, whose exits read the frame's handlers on the way through.
+/// from the interpreter, which has pushed), and no nested handler or `finally`
+/// routing, whose exits read the frame's handlers on the way through.
+///
+/// A `finally` bracket (`try ... finally`, a for-of's body, which paid a push and
+/// a pop per iteration) is the same, and may also return: the bracket is the
+/// innermost one, so the return is a jump to its `finally` with the completion
+/// the routing would deposit.
 fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
     let mut out = Vec::new();
     for (push, ins) in code.iter().enumerate() {
-        let Instr::PushHandler { catch_target, catch_reg } = *ins else {
-            continue;
+        let (packed, finally) = match *ins {
+            Instr::PushHandler { catch_target, catch_reg } => {
+                (((catch_target as u64) << 16) | catch_reg as u64, None)
+            }
+            Instr::PushFinally { target, kind_reg, val_reg } => (
+                ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64,
+                Some((target, kind_reg, val_reg)),
+            ),
+            _ => continue,
         };
-        let Some(pop) = (push + 1..code.len()).find(|&i| matches!(code[i], Instr::PopHandler)) else {
+        let pops = |i: &Instr| {
+            if finally.is_some() {
+                matches!(i, Instr::PopFinally)
+            } else {
+                matches!(i, Instr::PopHandler)
+            }
+        };
+        let Some(pop) = (push + 1..code.len()).find(|&i| pops(&code[i])) else {
             continue;
         };
         let body = &code[push + 1..pop];
         let closed = body.iter().all(|i| {
-            !matches!(
+            let returns = matches!(i, Instr::Return { .. } | Instr::ReturnUndefined);
+            !(returns && finally.is_none())
+                && !matches!(
                 i,
-                Instr::Return { .. }
-                    | Instr::ReturnUndefined
-                    | Instr::TailCall { .. }
+                Instr::TailCall { .. }
                     | Instr::PushHandler { .. }
                     | Instr::PushFinally { .. }
                     | Instr::PopFinally
@@ -3042,12 +3063,20 @@ fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
             })
         });
         if closed {
-            out.push(LazyTry { push, pop, catch_target, catch_reg });
+            out.push(LazyTry { push, pop, packed, finally });
         }
     }
     out
 }
 
+/// Compile the WHOLE body of `proto` to native code via the memory-path op
+/// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
+/// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/
+/// strict_eq/truthy). Returns a `JitFn` with the standard ABI, or `None` if the
+/// body is ineligible. v1 uses NO inline caches / TA pins / inline plans, so
+/// r13/r14 are saved-but-unused and no post-call re-fetch is emitted (the
+/// globals pin r12 stays valid across calls — `self.globals` never reallocates).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn compile_proto_mem(
     proto: &FuncProto,
     func_id: u32,
@@ -3657,7 +3686,9 @@ pub(crate) fn compile_proto_mem(
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
     // Each lazy `try`, the exit its body takes, and for each ip the one it is
     // in. The metered exits are out of line, on the real epilogue.
-    let lazy_try = if py || meter.is_some() || !lazy_try_enabled() {
+    // (A suspension leaves a body in a generator or an async function and comes
+    // back into it, with the handler pushed and no pop to come.)
+    let lazy_try = if py || meter.is_some() || proto.is_generator || proto.is_async || !lazy_try_enabled() {
         Vec::new()
     } else {
         lazy_tries(&proto.code)
@@ -7792,7 +7823,15 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Return { src } => {
-                if protected_returns[ip] && route_returns {
+                if let Some((target, kind_reg, val_reg)) = lazy_finally(&lazy_try, ip) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov [rbx + dreg(val_reg)], rax
+                        ; mov rax, QWORD Value::int(1).bits() as i64
+                        ; mov [rbx + dreg(kind_reg)], rax
+                        ; jmp => labels[target as usize]
+                    );
+                } else if protected_returns[ip] && route_returns {
                     // A return completion must traverse every still-active
                     // for-of/user finally: `jit_return_finally` deposits it and
                     // answers the first one, or that none is left.
@@ -7830,7 +7869,15 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::ReturnUndefined => {
-                if protected_returns[ip] && route_returns {
+                if let Some((target, kind_reg, val_reg)) = lazy_finally(&lazy_try, ip) {
+                    dynasm!(ops
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; mov [rbx + dreg(val_reg)], rax
+                        ; mov rax, QWORD Value::int(1).bits() as i64
+                        ; mov [rbx + dreg(kind_reg)], rax
+                        ; jmp => labels[target as usize]
+                    );
+                } else if protected_returns[ip] && route_returns {
                     let returns = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi
@@ -7907,14 +7954,18 @@ pub(crate) fn compile_proto_mem(
     // ── lazy `try` exits ── the push the body skipped, for whoever reads the
     // frame next: the interpreter resuming inside the body, or unwinding from it.
     for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
-        let packed = ((t.catch_target as u64) << 16) | t.catch_reg as u64;
+        let helper = if t.finally.is_some() {
+            heap.push_finally as i64
+        } else {
+            crate::vm::jit_push_catch as *const () as i64
+        };
         dynasm!(ops
             ; => exit
             ; sub rsp, 48
             ; mov [rsp + 32], rax
             ; mov rcx, rdi
-            ; mov rdx, QWORD packed as i64
-            ; mov rax, QWORD crate::vm::jit_push_catch as *const () as i64
+            ; mov rdx, QWORD t.packed as i64
+            ; mov rax, QWORD helper
             ; call rax
             ; mov rax, [rsp + 32]
             ; add rsp, 48
