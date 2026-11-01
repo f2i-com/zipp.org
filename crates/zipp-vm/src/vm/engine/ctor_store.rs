@@ -421,6 +421,7 @@ impl<'p> Vm<'p> {
             proto,
             shape: proof.shape,
             keys: crate::bytecode::PlanHandle::borrowed_bits(&proof.plan),
+            names: keys.iter().map(|(k, _)| k.clone()).collect(),
             vals,
         })
     }

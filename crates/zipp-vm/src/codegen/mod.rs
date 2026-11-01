@@ -1237,6 +1237,8 @@ pub struct NewLanePlan {
     pub shape: u32,
     /// A borrowed handle on the shape's key list.
     pub keys: u64,
+    /// The same keys, for the planner of a region that never makes the instance.
+    pub names: Vec<String>,
     pub vals: Vec<NewLaneVal>,
 }
 
