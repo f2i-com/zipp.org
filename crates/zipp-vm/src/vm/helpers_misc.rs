@@ -8387,8 +8387,8 @@ pub(crate) extern "win64" fn jit_iter_next(
             None => {}
         }
     }
-    // Everything else, a user `next` and a generator's included: the
-    // interpreter's own step, run to completion (`at_call_cap`: the frames its
+    // Everything else, a user `next` included: the interpreter's own step, run
+    // to completion (`at_call_cap`: the frames its
     // calls would need).
     if vm.jit_complete_declines() || vm.at_call_cap() {
         vm.osr_deopt_exempt = true;
@@ -8397,6 +8397,14 @@ pub(crate) extern "win64" fn jit_iter_next(
     }
     // SAFETY: `regs` is this activation's window, inside `vm.regs`' buffer.
     let base = unsafe { (regs as *const u64).offset_from(vm.regs.as_ptr() as *const u64) } as usize;
+    // A generator is the exception: the interpreter steps one as a frame of its
+    // own loop (`gen_enter_inline`), and from here each step copies its window
+    // in and out, which cost a loop more than compiling it saved (11% of
+    // class-features' cycles). Such a loop bails and stays interpreted.
+    if vm.iter_generator_direct(base, it, next_reg as u16) {
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let (value_dst, done_dst) = (value_dst as u16, done_dst as u16);
     match vm.iter_next_step(base, it, value_dst, done_dst, idx_reg as u16, next_reg as u16) {
         Ok(()) => {

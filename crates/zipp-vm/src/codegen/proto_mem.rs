@@ -2990,6 +2990,10 @@ struct LazyTry {
 }
 
 env_off_switch! {
+    fn return_route_enabled() = "ZIPP_NO_RETURN_ROUTE"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_LAZY_TRY=1` pushes every handler (the same-binary A/B).
     fn lazy_try_enabled() = "ZIPP_NO_LAZY_TRY"
 }
@@ -3118,6 +3122,9 @@ pub(crate) fn compile_proto_mem(
     // A Python body (see `codegen::py`).
     let py = has_py_ops(&proto.code);
     let protected_returns = tierc_protected_return_map(&proto.code);
+    // `ZIPP_NO_RETURN_ROUTE=1`: a `return` inside `try … finally` bails (the
+    // same-binary A/B).
+    let route_returns = meter.is_none() && !py && return_route_enabled();
     let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
     if method_own_slot_direct && crate::jitlog_enabled() {
         let sites = proto
@@ -4561,11 +4568,16 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::EndFinally { kind_reg, val_reg } => {
-                // A normal completion goes on to the next op and a
-                // `break`/`continue` jump goes on routing toward its target
-                // (`jit_end_finally_route`); a return or a throw declines into
-                // the interpreter's unwinding.
-                let helper = crate::vm::jit_end_finally_route as *const () as usize;
+                // A normal completion goes on to the next op, a `break` or
+                // `continue` jump and a return go on routing toward their
+                // target (`jit_end_finally_route`, `jit_end_finally_returns`);
+                // a throw declines into the interpreter's unwinding.
+                let helper = if route_returns {
+                    crate::vm::jit_end_finally_returns as *const () as usize
+                } else {
+                    crate::vm::jit_end_finally_route as *const () as usize
+                };
+                let returns = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]
@@ -4578,7 +4590,19 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, -1                         // END_FINALLY_NEXT
                     ; je => labels[ip + 1]
                 );
+                if route_returns {
+                    dynasm!(ops
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                }
                 emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                dynasm!(ops
+                    ; => returns
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                    ; mov rax, [rbx + dreg(val_reg)]
+                    ; jmp => epilogue
+                );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::JumpFinally { target, floor } => {
@@ -7768,10 +7792,29 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Return { src } => {
-                if protected_returns[ip] {
+                if protected_returns[ip] && route_returns {
                     // A return completion must traverse every still-active
-                    // for-of/user finally. Resume on the untouched Return so
-                    // `route_through_finally` deposits and propagates it.
+                    // for-of/user finally: `jit_return_finally` deposits it and
+                    // answers the first one, or that none is left.
+                    let returns = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(src)]
+                        ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                        ; call rax
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                    emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                    dynasm!(ops
+                        ; => returns
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, [rbx + dreg(src)]
+                        ; jmp => epilogue
+                    );
+                } else if protected_returns[ip] {
+                    // Resume on the untouched Return: a metered run's charges
+                    // and a Python body's completions stay the interpreter's.
                     dynasm!(ops
                         ; mov DWORD [rsi], ip as i32
                         ; jmp => epilogue
@@ -7787,7 +7830,24 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::ReturnUndefined => {
-                if protected_returns[ip] {
+                if protected_returns[ip] && route_returns {
+                    let returns = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
+                        ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                        ; call rax
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                    emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                    dynasm!(ops
+                        ; => returns
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; jmp => epilogue
+                    );
+                } else if protected_returns[ip] {
                     dynasm!(ops
                         ; mov DWORD [rsi], ip as i32
                         ; jmp => epilogue
