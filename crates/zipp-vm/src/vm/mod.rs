@@ -3527,15 +3527,22 @@ pub struct Vm<'p> {
     /// Node's globals (`lang/js/node`): installed for this run, the partial
     /// lines `process.stdout`/`stderr.write` left, and the function the
     /// run's end calls (a root).
+    #[cfg(feature = "node")]
     pub(crate) node_installed: bool,
+    #[cfg(feature = "node")]
     pub(crate) node_partial: [String; 2],
+    #[cfg(feature = "node")]
     pub(crate) node_exit_hook: Value,
     /// `process.nextTick`'s queue runner (a root), and whether it has work:
     /// ticks run before the microtasks at each checkpoint.
+    #[cfg(feature = "node")]
     pub(crate) node_tick_hook: Value,
+    #[cfg(feature = "node")]
     pub(crate) node_tick_pending: bool,
     /// The host object, and the CommonJS loader (both roots).
+    #[cfg(feature = "node")]
     pub(crate) node_host: Value,
+    #[cfg(feature = "node")]
     pub(crate) node_cjs: Value,
     /// `WebAssembly`'s runtime, made on first use (vm/webassembly).
     #[cfg(feature = "webassembly")]
@@ -3847,11 +3854,14 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
         // A partial line `process.stdout.write` left begins this one.
-        let partial = &mut self.node_partial[to_stderr as usize];
-        if !partial.is_empty() {
-            let mut joined = std::mem::take(partial);
-            joined.push_str(&line);
-            return self.push_console_line_raw(joined, to_stderr);
+        #[cfg(feature = "node")]
+        {
+            let partial = &mut self.node_partial[to_stderr as usize];
+            if !partial.is_empty() {
+                let mut joined = std::mem::take(partial);
+                joined.push_str(&line);
+                return self.push_console_line_raw(joined, to_stderr);
+            }
         }
         self.push_console_line_raw(line, to_stderr)
     }

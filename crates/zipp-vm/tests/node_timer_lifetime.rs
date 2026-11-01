@@ -4,6 +4,7 @@
 //! an unref'd timeout still runs while something else keeps the loop going,
 //! and `ref()` after `unref()` counts again. Node exits such a program at
 //! once; zipp used to wait out every cleared or unref'd timer.
+#![cfg(feature = "node")]
 
 const PROGRAM: &str = r#"
 const log = [];

@@ -607,6 +607,7 @@ impl<'p> Vm<'p> {
         }
         // Node's builtins and CommonJS files, for a program run with Node's
         // globals: a namespace over what they export.
+        #[cfg(feature = "node")]
         if self.node_installed {
             if let Some(ns) = self.node_import_special(&path)? {
                 return Ok(ns);

@@ -790,12 +790,19 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            #[cfg(feature = "node")]
             node_installed: false,
+            #[cfg(feature = "node")]
             node_partial: [String::new(), String::new()],
+            #[cfg(feature = "node")]
             node_exit_hook: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_tick_hook: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_tick_pending: false,
+            #[cfg(feature = "node")]
             node_host: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_cjs: Value::UNDEFINED,
             #[cfg(feature = "webassembly")]
             wasm: None,

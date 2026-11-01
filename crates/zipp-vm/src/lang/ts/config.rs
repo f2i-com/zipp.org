@@ -264,6 +264,7 @@ fn locate_base(from: &Path, spec: &str) -> Option<PathBuf> {
 
 /// JSON with comments and trailing commas (a `tsconfig.json`, a
 /// `package.json`), or `None` when it is not that.
+#[cfg(feature = "node")]
 pub(crate) fn parse_json(text: &str) -> Option<Value> {
     Jsonc::new(text).parse().ok()
 }

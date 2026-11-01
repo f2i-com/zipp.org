@@ -559,10 +559,13 @@ impl Vm<'_> {
         if self.regexp_vehicle != 0 {
             root_idx!(self.regexp_vehicle);
         }
-        root_val!(self.node_exit_hook);
-        root_val!(self.node_tick_hook);
-        root_val!(self.node_host);
-        root_val!(self.node_cjs);
+        #[cfg(feature = "node")]
+        {
+            root_val!(self.node_exit_hook);
+            root_val!(self.node_tick_hook);
+            root_val!(self.node_host);
+            root_val!(self.node_cjs);
+        }
         // WebAssembly: the namespace, its members, the JavaScript functions
         // instances import, and the buffers handed out over memories.
         #[cfg(feature = "webassembly")]

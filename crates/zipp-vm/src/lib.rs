@@ -734,6 +734,7 @@ pub fn run_file_then_exit(
 /// can be cleared), with `argv` as `process.argv`: for a host that runs a
 /// program as `node` would, such as the `zipp` command. A run with a harness
 /// prelude never has them.
+#[cfg(feature = "node")]
 pub fn set_node_runtime(on: bool, argv: Vec<String>) {
     vm::node::set_enabled(on, argv);
 }
@@ -741,12 +742,14 @@ pub fn set_node_runtime(on: bool, argv: Vec<String>) {
 /// Write what a program run with Node's globals prints as it prints it, to
 /// this process's stdout and stderr, instead of into its `Outcome` (the
 /// command's runs; see `set_node_runtime`).
+#[cfg(feature = "node")]
 pub fn set_node_live_output(on: bool) {
     vm::node::set_live_output(on);
 }
 
 /// The exit status a program run with Node's globals asked for
 /// (`process.exitCode`), 0 when it set none.
+#[cfg(feature = "node")]
 pub fn node_exit_code() -> i32 {
     vm::node::exit_code()
 }

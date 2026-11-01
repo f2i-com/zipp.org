@@ -99,7 +99,11 @@ python-native-gpu = ["python"]
 # Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
 # `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
 # build is a pure interpreter with no unsafe codegen.
-default = ["jit", "typescript", "webassembly"]
+default = ["jit", "typescript", "webassembly", "node"]
+# Node's globals and core modules (`lang/js/node`) for a program the `zipp`
+# command runs from a file: about 400 KB of embedded JavaScript. Off in the
+# WebAssembly engines and the hardened sandbox, which never run the layer.
+node = []
 # The `WebAssembly` global (see the `wasmi` dependency).
 webassembly = ["dep:wasmi", "dep:wasmi_core"]
 # Loop dispatch for WebAssembly, whatever the build: for optimised builds that

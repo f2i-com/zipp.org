@@ -7,6 +7,7 @@
 //! reads and edits a URL and its search parameters, and sets
 //! `process.exitCode` with an `exit` listener. The expected lines
 //! are Node 24's (`node app.js a b`).
+#![cfg(feature = "node")]
 
 #[test]
 fn node_globals_behave_as_node() {

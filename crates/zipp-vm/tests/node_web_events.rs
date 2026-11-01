@@ -7,6 +7,7 @@
 //! an fs write stream read back through a read stream in 4-byte slices,
 //! and Buffer's `indexOf`/`lastIndexOf`/`includes` with string needles.
 //! The expected lines are Node 24's.
+#![cfg(feature = "node")]
 
 #[test]
 fn node_web_events_and_fs_streams_behave_as_node() {

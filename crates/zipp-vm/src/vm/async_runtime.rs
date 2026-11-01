@@ -4507,6 +4507,7 @@ impl<'p> Vm<'p> {
     pub fn drain_microtasks(&mut self) {
         // `process.nextTick`'s callbacks run first at a checkpoint, and again
         // after the microtasks while those queued more (Node's order).
+        #[cfg(feature = "node")]
         loop {
             if self.node_tick_pending {
                 self.node_run_ticks();
@@ -4516,6 +4517,8 @@ impl<'p> Vm<'p> {
                 break;
             }
         }
+        #[cfg(not(feature = "node"))]
+        self.drain_microtasks_queue();
     }
 
     /// [`Self::drain_microtasks`]'s promise jobs.

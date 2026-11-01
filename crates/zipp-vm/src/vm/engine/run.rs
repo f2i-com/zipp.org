@@ -212,6 +212,7 @@ impl<'p> Vm<'p> {
         let has_prelude = prelude.is_some();
         // Node's globals, for a program the command runs from a file (a
         // harness run never has them).
+        #[cfg(feature = "node")]
         if !has_prelude {
             self.install_node_runtime(true)?;
         }
@@ -294,6 +295,7 @@ impl<'p> Vm<'p> {
         // before the embedding caller has a chance to marshal it.
         let root = main.as_ref().copied().unwrap_or(Value::UNDEFINED);
         self.with_host_roots(&[root], Self::run_event_loop);
+        #[cfg(feature = "node")]
         self.with_host_roots(&[root], Self::node_run_ended);
         if main.is_ok() {
             if let Some(t) = self.take_uncaught_timer_throw() {
@@ -467,6 +469,7 @@ impl<'p> Vm<'p> {
     pub fn run_module(&mut self) -> Result<Value, Thrown> {
         use crate::heap::PromiseState;
         self.setup_globals();
+        #[cfg(feature = "node")]
         self.install_node_runtime(false)?;
         self.hoist_functions();
         self.set_gc_floor();
@@ -481,6 +484,7 @@ impl<'p> Vm<'p> {
         // Its rejection is the program's error below, never an unhandled one.
         self.mark_promise_handled(p);
         self.run_event_loop();
+        #[cfg(feature = "node")]
         self.with_host_roots(&[p], Self::node_run_ended);
         if p.is_heap() {
             if let HeapObj::Promise {
