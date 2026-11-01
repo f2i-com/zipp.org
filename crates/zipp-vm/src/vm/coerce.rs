@@ -3326,7 +3326,7 @@ impl<'p> Vm<'p> {
     /// INSPECT (`console.log` rendering). Strings are quoted only when nested;
     /// arrays/objects use node's spaced bracket style (`[ 1, 2, 3 ]`,
     /// `{ a: 1 }`). Unlike a serializer this is deliberately bounded: hostile
-    /// graphs must not turn one Print instruction into unbounded native work.
+    /// graphs must not turn one console call into unbounded native work.
     /// Render a complete console line into one bounded buffer. A per-argument
     /// cap is insufficient: thousands of individually small arguments followed
     /// by `Vec<String>::join` can otherwise allocate far beyond the output

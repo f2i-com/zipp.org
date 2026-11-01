@@ -248,7 +248,6 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::CallMethodComputedSpread { dst: r0, obj: r1, key: r2, args: r3, .. }
         | Instr::MathOp { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::StaticFn { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
-        | Instr::Print { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::MathSpread { dst: r0, callee: r1, this_v: r2, args: r3, .. }
         | Instr::ObjectKeys { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
         | Instr::ObjectValues { dst: r0, obj: r1, callee: r2, this_v: r3, .. }

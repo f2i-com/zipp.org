@@ -1815,7 +1815,7 @@ pub struct Vm<'p> {
     /// memory operand rather than a pointer chase.
     #[cfg(feature = "instrument")]
     pub(crate) jit_steps: i64,
-    /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
+    /// Lines produced by console.log/info/debug (stdout), in order.
     pub output: Vec<String>,
     /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
     pub errput: Vec<String>,

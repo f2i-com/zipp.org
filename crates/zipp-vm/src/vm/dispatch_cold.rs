@@ -1208,36 +1208,6 @@ impl<'p> Vm<'p> {
                 ip += 1;
             }
 
-            Instr::Print {
-                dst,
-                callee,
-                this_v,
-                arg_base,
-                argc,
-            } => {
-                let f = self.get(base, callee);
-                let v = match self.console_print_stream(f) {
-                    Some(to_stderr) => {
-                        let line = self.inspect_line(argc as usize, |i| {
-                            self.get(base, arg_base + i as u16)
-                        });
-                        #[cfg(feature = "instrument")]
-                        self.instrument_output_line(&line)
-                            .map_err(|msg| Thrown(msg.into()))?;
-                        self.push_console_line(line, to_stderr);
-                        Value::UNDEFINED
-                    }
-                    None => {
-                        let this_v = self.get(base, this_v);
-                        let args: Vec<Value> =
-                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        self.call_value(f, this_v, &args)?
-                    }
-                };
-                self.set(base, dst, v);
-                ip += 1;
-            }
-
             Instr::NewError {
                 dst,
                 kind,

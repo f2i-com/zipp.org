@@ -2132,20 +2132,6 @@ pub enum Instr {
     /// Return undefined.
     ReturnUndefined,
 
-    /// `console.log(...)` and its siblings: `callee` and `this_v` hold the
-    /// method and receiver read before the arguments. When `callee` is one of
-    /// the intrinsic console methods, print the `argc` values at `arg_base`
-    /// (to stderr for `error`/`warn`, as node does) and set `dst` to
-    /// undefined; otherwise call it, as the program replaced it, and set
-    /// `dst` to its result.
-    Print {
-        dst: Reg,
-        callee: Reg,
-        this_v: Reg,
-        arg_base: Reg,
-        argc: u16,
-    },
-
     // ---- Python frontend fast paths ---------------------------------------
     // Emitted only by `lang::python::frontend`. Each is the fused form of a guarded
     // inline sequence the Python emitter used to spell out (`typeof` tests,

@@ -3041,13 +3041,6 @@ fn plan_region_cold_inner(
                             arg_base,
                             argc,
                             ..
-                        }
-                        | Instr::Print {
-                            callee,
-                            this_v,
-                            arg_base,
-                            argc,
-                            ..
                         } => r == callee || r == this_v || (r >= arg_base && (r - arg_base) < argc),
                         Instr::NewArray { arg_base, argc, .. }
                         | Instr::ArrayCtor { arg_base, argc, .. }
@@ -3065,7 +3058,6 @@ fn plan_region_cold_inner(
                             | Instr::ArrayCtor { .. }
                             | Instr::GlobalFn { .. }
                             | Instr::StaticFn { .. }
-                            | Instr::Print { .. }
                     );
                     if call_family {
                         if !win_use {
@@ -3087,8 +3079,7 @@ fn plan_region_cold_inner(
                             | Instr::NewArray { dst, .. }
                             | Instr::ArrayCtor { dst, .. }
                             | Instr::GlobalFn { dst, .. }
-                            | Instr::StaticFn { dst, .. }
-                            | Instr::Print { dst, .. } if dst == r)
+                            | Instr::StaticFn { dst, .. } if dst == r)
                     };
                     let Some(d) = ((e + 1)..uip).rev().find(|&j| defines(j)) else {
                         if grdbg {
@@ -5512,13 +5503,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::NewArray { arg_base, argc, .. }
         | Instr::DateNew { arg_base, argc, .. }
         | Instr::DateUTC { arg_base, argc, .. } => win(&[], arg_base, argc),
-        Instr::Print {
-            callee,
-            this_v,
-            arg_base,
-            argc,
-            ..
-        } => win(&[callee, this_v], arg_base, argc),
         // Python-only fast paths; no JIT tier admits them.
         Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => vec![a, b],
         Instr::PyAddImm { a, .. } => vec![a],
@@ -5887,7 +5871,7 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::FinalizeObject { dst, .. }
         | Instr::NewArray { dst, .. }
         | Instr::LoadGlobal { dst, .. }
-        | Instr::Print { dst, .. } => Some(dst),
+        | Instr::CallMethod { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -5916,10 +5900,10 @@ fn local_sroa_supported_instr(i: &Instr) -> bool {
             | Instr::GetProp { .. }
             | Instr::NewArray { .. }
             | Instr::GetIndex { .. }
-            // `console.log(...)` reads `console` (a global) and its method
-            // before the print.
+            // `console.log(...)` after the loop. The proof below never
+            // admits a call inside the region.
             | Instr::LoadGlobal { .. }
-            | Instr::Print { .. }
+            | Instr::CallMethod { .. }
             | Instr::ReturnUndefined
     )
 }
@@ -5991,7 +5975,9 @@ pub(crate) fn plan_local_sroa(
     if e <= s || e >= code.len() {
         return None;
     }
-    match code[s] {
+    // The test, after the reload of a literal bound when it has one.
+    let head = if matches!(code[s], Instr::LoadInt { .. }) { s + 1 } else { s };
+    match code[head] {
         Instr::JumpIfNotLt { target, .. } if target as usize == e + 1 => {}
         _ => return None,
     }
@@ -5999,7 +5985,7 @@ pub(crate) fn plan_local_sroa(
         Instr::Jump { target } if target == start => {}
         _ => return None,
     }
-    if code[s + 1..e].iter().any(|i| {
+    if code[head + 1..e].iter().any(|i| {
         matches!(
             i,
             Instr::Jump { .. }

@@ -8574,24 +8574,6 @@ pub(crate) fn builtin_ns_index(namespace: &str) -> Option<usize> {
 }
 
 impl<'p> Vm<'p> {
-    /// For `Instr::Print`: `Some(to_stderr)` when `f` is one of the intrinsic
-    /// console methods (`error`/`warn` write to stderr, as in node), which
-    /// print their arguments whatever their receiver; `None` for anything
-    /// else, which the instruction calls as the program made it.
-    #[inline]
-    pub(crate) fn console_print_stream(&self, f: Value) -> Option<bool> {
-        if !f.is_heap() {
-            return None;
-        }
-        match self.heap.get(f.heap_index()) {
-            HeapObj::Native(native::CONSOLE_LOG | native::CONSOLE_INFO | native::CONSOLE_DEBUG) => {
-                Some(false)
-            }
-            HeapObj::Native(native::CONSOLE_WARN | native::CONSOLE_ERROR) => Some(true),
-            _ => None,
-        }
-    }
-
     // Inlined so that a constant namespace (every caller's `"Math"`) folds
     // to its slot.
     #[inline]

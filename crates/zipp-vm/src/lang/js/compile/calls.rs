@@ -1456,62 +1456,6 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // console.log(...) → Print opcode. The method is read before the
-        // arguments, as for any call, so a replaced one is what runs.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    if &**obj == "console"
-                        && matches!(&**prop, "log" | "info" | "warn" | "error" | "debug")
-                        && self.builtin_unshadowed("console")
-                        && !c.args.iter().any(|a| matches!(a, Arg::Spread(_)))
-                    {
-                        let save = self.next_reg;
-                        if dst >= self.next_reg {
-                            self.set_next_reg(dst.saturating_add(1));
-                        }
-                        let this_v = self.alloc_reg();
-                        let receiver = self.expr_into(&m.object, this_v)?;
-                        if receiver != this_v {
-                            self.emit(Instr::Move {
-                                dst: this_v,
-                                src: receiver,
-                            });
-                        }
-                        // The method goes in the call's own result register
-                        // when that is a temporary no argument reads, so the
-                        // call takes one frame register more than the print
-                        // it replaced, not two: the local-SROA lane keeps its
-                        // scalars in the registers a function never names.
-                        let named = dst < 2
-                            || self
-                                .scopes
-                                .iter()
-                                .flatten()
-                                .any(|(_, r)| *r == Slot::Reg(dst))
-                            || self.self_name.as_ref().is_some_and(|(_, r)| *r == dst);
-                        let callee = if named { self.alloc_reg() } else { dst };
-                        let name = self.string_name(prop);
-                        self.emit(Instr::GetProp {
-                            dst: callee,
-                            obj: this_v,
-                            name,
-                        });
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Print {
-                            dst,
-                            callee,
-                            this_v,
-                            arg_base,
-                            argc,
-                        });
-                        self.set_next_reg(save.max(dst.saturating_add(1)));
-                        return Ok(dst);
-                    }
-                }
-            }
-        }
-
         // `JSON.parse(text)` / `JSON.stringify(value)` → fast ops. The forms with
         // a reviver / replacer (2+ args) fall through to the generic call so the
         // `JSON_PARSE` / `JSON_STRINGIFY` natives can honour them.
@@ -2348,7 +2292,7 @@ impl<'a> FnCompiler<'a> {
 
     /// Evaluate call arguments into a contiguous run of registers and return
     /// (first register, count). The run MUST be contiguous because the
-    /// `Call`/`Print`/`NewArray` opcodes address args as
+    /// `Call`/`NewArray` opcodes address args as
     /// `[arg_base, arg_base+argc)`.
     ///
     /// Correctness subtlety: evaluating one argument may itself allocate scratch

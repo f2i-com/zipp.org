@@ -3657,7 +3657,7 @@ impl<'p> Vm<'p> {
                 ))
             }
             GLOBAL_PRINT => {
-                // Mirrors the Print instruction (console.log): inspect each
+                // As console.log: inspect each
                 // argument into one bounded buffer, append one stdout line.
                 let line = self.inspect_line(args.len(), |i| args[i]);
                 #[cfg(feature = "instrument")]

@@ -2783,12 +2783,8 @@ impl<'p> Vm<'p> {
             .alloc(HeapObj::Native(GLOBAL_DECODE_URI_COMPONENT));
         let escape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ESCAPE));
         let unescape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_UNESCAPE));
-        // Host `print` as a first-class value (shells + the test262 harness
-        // expect a global; the bare call form compiles to the Print instr).
+        // Host `print` (shells and the test262 harness expect a global).
         let print_fn = self.heap.alloc(HeapObj::Native(native::GLOBAL_PRINT));
-        // `console` is usually compiled straight to `Print`, but it still has
-        // to exist as a real namespace whenever lexical/with resolution or a
-        // first-class method reference makes that shortcut inapplicable.
         let console_obj = build(
             self,
             &[

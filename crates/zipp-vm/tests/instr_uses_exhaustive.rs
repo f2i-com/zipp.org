@@ -150,7 +150,6 @@ const CASES: &[Case] = &[
         "String.prototype.concat.call(x, x.length)",
     ),
     c("RegExpMethod", "\"keep\"", "/keep/.test(x, x.length)"),
-    c("Print", "\"keep\"", "(console.log(x), 0)"),
     c("NewArray", "\"keep\"", "JSON.stringify([x])"),
     Case {
         tag: "New",
