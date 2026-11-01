@@ -239,6 +239,7 @@ impl<'p> Vm<'p> {
             }
             // The last class a compiled `new` resolved may have this body.
             self.new_class_memo = (0, 0, 0, 0, 0);
+            self.new_stored_memo = (0, 0, 0, 0, 0);
             if let Some(c) = self.ctor_framefree.get_mut(f) {
                 *c = 0;
             }

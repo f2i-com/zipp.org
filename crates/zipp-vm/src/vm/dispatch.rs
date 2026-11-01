@@ -1996,29 +1996,38 @@ impl<'p> Vm<'p> {
                         if self.jit_enabled {
                             self.note_new_site(ip, cv);
                         }
-                        // A plain constructor function: its frame is pushed
-                        // here, in this loop, as a call's is, and its pop
-                        // hands back the instance (`construct_this`).
-                        let flat = match self.flat_new_instance(cv) {
-                            Some((fid, closure, obj)) => Some((fid, closure, obj, cv)),
-                            None => self.flat_new_class_instance(cv)?,
-                        };
-                        if let Some((fid, closure, obj, callee_v)) = flat {
-                            let rooted = self.host_result_roots.len();
-                            self.host_result_roots.push(obj);
-                            self.pending_new_target = cv;
-                            let pushed = self.setup_call(
-                                fid, closure, obj, base, arg_base, argc, dst, ip + 1, callee_v,
-                            );
-                            self.pending_new_target = Value::UNDEFINED;
-                            self.host_result_roots.truncate(rooted);
-                            pushed?;
-                            if let Some(f) = self.frames.last_mut() {
-                                f.construct_this = true;
+                        // A body that only stores: the finished instance.
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        let stored = self.new_stored(cv, base, arg_base, argc);
+                        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                        let stored: Option<Value> = None;
+                        if let Some(v) = stored {
+                            self.set(base, dst, v);
+                        } else {
+                            // A plain constructor function: its frame is pushed
+                            // here, in this loop, as a call's is, and its pop
+                            // hands back the instance (`construct_this`).
+                            let flat = match self.flat_new_instance(cv) {
+                                Some((fid, closure, obj)) => Some((fid, closure, obj, cv)),
+                                None => self.flat_new_class_instance(cv)?,
+                            };
+                            if let Some((fid, closure, obj, callee_v)) = flat {
+                                let rooted = self.host_result_roots.len();
+                                self.host_result_roots.push(obj);
+                                self.pending_new_target = cv;
+                                let pushed = self.setup_call(
+                                    fid, closure, obj, base, arg_base, argc, dst, ip + 1, callee_v,
+                                );
+                                self.pending_new_target = Value::UNDEFINED;
+                                self.host_result_roots.truncate(rooted);
+                                pushed?;
+                                if let Some(f) = self.frames.last_mut() {
+                                    f.construct_this = true;
+                                }
+                                break;
                             }
-                            break;
+                            self.new_construct(base, ip, dst, cv, arg_base, argc)?;
                         }
-                        self.new_construct(base, ip, dst, cv, arg_base, argc)?;
                         ip += 1;
                     }
                     Instr::FieldInit {

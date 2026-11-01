@@ -2750,6 +2750,9 @@ pub struct Vm<'p> {
     /// closure and Value bits. All-zero (no class has bits 0) until set.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) new_class_memo: (u64, u32, u32, u32, u64),
+    /// The callee of the last `new` the interpreter asked `new_stored` about.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) new_stored_memo: engine::ctor_store::NewStoredMemo,
     /// Set by the module loader just before executing a MODULE BODY: the
     /// next alloc_async (the body's own activation) marks its result promise
     /// in module_body_results. Consumed (mem::take) at alloc_async entry.

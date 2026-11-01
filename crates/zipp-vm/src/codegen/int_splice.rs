@@ -1572,8 +1572,12 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::LoadGlobalOrUndefined { dst, .. } => r(vec![], Some(dst)),
         Instr::Move { dst, src } => r(vec![src], Some(dst)),
         Instr::MakeClass { dst, parent, .. } => r(parent.into_iter().collect(), Some(dst)),
-        Instr::MakeCell { reg } => r(vec![reg], Some(reg)),
-        Instr::MakeCellTdz { reg } => r(vec![], Some(reg)),
+        // A closure reads the cells it captures, and each of those registers
+        // is a use here, at the `MakeCell` that made it one.
+        Instr::MakeCell { reg } | Instr::MakeCellTdz { reg } => r(vec![reg], Some(reg)),
+        Instr::MakeClosure { dst, .. } => r(vec![], Some(dst)),
+        Instr::CellGet { dst, cell } => r(vec![cell], Some(dst)),
+        Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => r(vec![cell, src], None),
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
         | Instr::StoreGlobalResolved { src, .. } => r(vec![src], None),

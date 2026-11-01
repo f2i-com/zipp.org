@@ -32,6 +32,180 @@ pub(crate) enum StoreSrc {
     /// A constant that is not a heap value (a number, a boolean, `null`,
     /// `undefined`).
     Bits(u64),
+    /// A register of a body [`eval_store_body`] runs.
+    Reg(u16),
+}
+
+/// The registers a body may name there, its own and one per stored name.
+const EVAL_REGS: usize = 24;
+
+/// One step of a constructor body evaluated with no frame: arithmetic on
+/// numbers, which runs no user code, and moves. Its stores into `this` are
+/// moves to registers past the body's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StoreOp {
+    Move { dst: u16, src: u16 },
+    Bits { dst: u16, bits: u64 },
+    Add { dst: u16, a: u16, b: u16 },
+    Sub { dst: u16, a: u16, b: u16 },
+    Mul { dst: u16, a: u16, b: u16 },
+    Div { dst: u16, a: u16, b: u16 },
+    AddInt { dst: u16, a: u16, imm: i32 },
+    Bit { dst: u16, a: u16, b: u16, op: crate::bytecode::BitwiseOp },
+}
+
+/// A body [`eval_store_body`] runs, and how many of the call's arguments it
+/// binds.
+#[derive(Debug)]
+pub(crate) struct StoreBody {
+    params: u16,
+    ops: Box<[StoreOp]>,
+}
+
+/// A constructor body that computes what it stores, for [`eval_store_body`]:
+/// its steps and its stores. Any op that could run user code, any other read
+/// of `this` and any branch or capture finds nothing.
+fn scan_eval_body(p: &crate::bytecode::FuncProto) -> Option<(StoreBody, Vec<(String, StoreSrc)>)> {
+    if p.is_generator
+        || p.is_async
+        || p.lexical_this
+        || p.rest_reg.is_some()
+        || p.arguments_reg.is_some()
+        || !p.upvalues.is_empty()
+        || !p.simple_params
+    {
+        return None;
+    }
+    let term = p.code.iter().position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    if !matches!(p.code[term], Instr::ReturnUndefined) {
+        return None;
+    }
+    let read = |r: u16| (r != 0).then_some(r);
+    let mut keys: Vec<(String, StoreSrc)> = Vec::new();
+    let mut ops = Vec::with_capacity(term);
+    for ins in &p.code[..term] {
+        ops.push(match *ins {
+            Instr::Move { dst, src } => StoreOp::Move { dst, src: read(src)? },
+            Instr::LoadInt { dst, val } => StoreOp::Bits { dst, bits: Value::int(val).bits() },
+            Instr::LoadNull { dst } => StoreOp::Bits { dst, bits: Value::NULL.bits() },
+            Instr::LoadUndefined { dst } => StoreOp::Bits { dst, bits: Value::UNDEFINED.bits() },
+            Instr::LoadBool { dst, val } => StoreOp::Bits { dst, bits: Value::bool(val).bits() },
+            Instr::LoadConst { dst, idx } => {
+                let c = *p.constants.get(idx as usize)?;
+                if c.is_heap() {
+                    return None; // a string (an interning sentinel) or a heap constant
+                }
+                StoreOp::Bits { dst, bits: c.bits() }
+            }
+            Instr::Add { dst, a, b } => StoreOp::Add { dst, a: read(a)?, b: read(b)? },
+            Instr::Sub { dst, a, b } => StoreOp::Sub { dst, a: read(a)?, b: read(b)? },
+            Instr::Mul { dst, a, b } => StoreOp::Mul { dst, a: read(a)?, b: read(b)? },
+            Instr::Div { dst, a, b } => StoreOp::Div { dst, a: read(a)?, b: read(b)? },
+            Instr::AddInt { dst, a, imm, .. } => StoreOp::AddInt { dst, a: read(a)?, imm },
+            Instr::Bitwise { dst, a, b, op } => StoreOp::Bit { dst, a: read(a)?, b: read(b)?, op },
+            Instr::SetProp { obj: 0, name, val, .. } | Instr::DefineField { obj: 0, name, val } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = match keys.iter().position(|(k, _)| k == key) {
+                    Some(at) => at,
+                    None => {
+                        if !store_key_ok(key) || keys.len() == STORE_MAX {
+                            return None;
+                        }
+                        keys.push((key.clone(), StoreSrc::Reg(p.reg_count + keys.len() as u16)));
+                        keys.len() - 1
+                    }
+                };
+                StoreOp::Move { dst: p.reg_count + at as u16, src: read(val)? }
+            }
+            Instr::GetProp { dst, obj: 0, name } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = keys.iter().position(|(k, _)| k == key)?;
+                StoreOp::Move { dst, src: p.reg_count + at as u16 }
+            }
+            _ => return None,
+        });
+    }
+    if keys.is_empty() || p.reg_count as usize + keys.len() > EVAL_REGS {
+        return None;
+    }
+    Some((StoreBody { params: p.param_count, ops: ops.into_boxed_slice() }, keys))
+}
+
+/// Run `ops` over `regs`. `false`: an operand was not a number, nothing outside
+/// `regs` has changed, and the body must run for real to say what it does. The
+/// arithmetic is the interpreter's, to the bit.
+#[inline]
+fn eval_store_body(ops: &[StoreOp], regs: &mut [Value; EVAL_REGS]) -> bool {
+    use crate::bytecode::BitwiseOp as B;
+    for op in ops {
+        match *op {
+            StoreOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+            StoreOp::Bits { dst, bits } => regs[dst as usize] = Value::from_bits(bits),
+            StoreOp::Add { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_int() && y.is_int() {
+                    match x.as_int().checked_add(y.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(x.as_int() as f64 + y.as_int() as f64),
+                    }
+                } else if x.is_number() && y.is_number() {
+                    Value::num(x.as_f64() + y.as_f64())
+                } else {
+                    return false;
+                };
+            }
+            StoreOp::Sub { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_int() && y.is_int() {
+                    match x.as_int().checked_sub(y.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(x.as_int() as f64 - y.as_int() as f64),
+                    }
+                } else if x.is_number() && y.is_number() {
+                    Value::num(x.as_f64() - y.as_f64())
+                } else {
+                    return false;
+                };
+            }
+            StoreOp::Mul { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_number() || !y.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() * y.as_f64());
+            }
+            StoreOp::Div { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_number() || !y.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() / y.as_f64());
+            }
+            StoreOp::AddInt { dst, a, imm } => {
+                let x = regs[a as usize];
+                if !x.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() + imm as f64);
+            }
+            StoreOp::Bit { dst, a, b, op } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_int() || !y.is_int() {
+                    return false;
+                }
+                let (i, j) = (x.as_int(), y.as_int());
+                regs[dst as usize] = match op {
+                    B::And => Value::int(i & j),
+                    B::Or => Value::int(i | j),
+                    B::Xor => Value::int(i ^ j),
+                    B::Shl => Value::int(i.wrapping_shl(j as u32 & 31)),
+                    B::Shr => Value::int(i >> (j as u32 & 31)),
+                    B::Ushr => Value::num(((i as u32) >> (j as u32 & 31)) as f64),
+                };
+            }
+        }
+    }
+    true
 }
 
 /// What the scan found for one constructor body, and the proof of the chain
@@ -40,6 +214,8 @@ pub(crate) enum StoreSrc {
 pub(crate) struct CtorStore {
     /// `None`: the body is not store-only.
     keys: Option<std::rc::Rc<[(String, StoreSrc)]>>,
+    /// The body, when its stores are of values it computes.
+    body: Option<std::rc::Rc<StoreBody>>,
     proof: Option<std::rc::Rc<StoreProof>>,
     /// The last receiver kind the proof failed for — its class (or
     /// [[Prototype]]), the class's version and `class_proto_epoch` — so a
@@ -72,7 +248,13 @@ pub(crate) type CtorStoreLast = (
     u32,
     Option<std::rc::Rc<[(String, StoreSrc)]>>,
     Option<std::rc::Rc<StoreProof>>,
+    Option<std::rc::Rc<StoreBody>>,
 );
+
+/// `Vm::new_stored_memo`: the callee last seen at a `new`, its slot's version,
+/// its constructor's fid (`u32::MAX`: not one this path answers), the class
+/// (`u32::MAX` for a plain function) and the instance's [[Prototype]] bits.
+pub(crate) type NewStoredMemo = (u64, u32, u32, u32, u64);
 
 /// The most stores a body may make here: the shared key lists stop at 16.
 const STORE_MAX: usize = 16;
@@ -438,6 +620,7 @@ impl<'p> Vm<'p> {
                 StoreSrc::Arg(a) if a < argc => NewLaneVal::Arg(a),
                 StoreSrc::Arg(_) => NewLaneVal::Bits(Value::UNDEFINED.bits()),
                 StoreSrc::Bits(b) => NewLaneVal::Bits(b),
+                StoreSrc::Reg(r) => NewLaneVal::Reg(r),
             })
             .collect();
         self.new_lane_proved(bits, callee_ver, class, proto, &keys, vals)
@@ -528,6 +711,44 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// The interpreter's `new cv(...)` when its constructor's body is one
+    /// [`Self::ctor_store_new`] answers, with no frame and no add per field.
+    /// `None`, with nothing done, for anything else.
+    #[inline]
+    pub(crate) fn new_stored(&mut self, cv: Value, base: usize, arg_base: u16, argc: u16) -> Option<Value> {
+        if !cv.is_heap() {
+            return None;
+        }
+        let memo = self.new_stored_memo;
+        let (fid, class, proto) = if memo.0 == cv.bits()
+            && memo.1 == self.heap.version_of(cv.heap_index())
+            && self.obj_realm.is_empty()
+            && self.realm_global_objs.is_empty()
+        {
+            (memo.2, memo.3, Value::from_bits(memo.4))
+        } else {
+            self.new_stored_target(cv)?
+        };
+        if fid == u32::MAX {
+            return None;
+        }
+        let made = self.ctor_store_new(fid, class, proto, base, arg_base, argc);
+        if made.is_none() && self.ctor_stores.get(&fid).is_some_and(|e| e.keys.is_none()) {
+            self.new_stored_memo.2 = u32::MAX;
+        }
+        made
+    }
+
+    /// What [`Self::new_stored`] needs of `cv`, remembered for the next `new`:
+    /// a write of `F.prototype` moves `F`'s version.
+    #[inline(never)]
+    fn new_stored_target(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        let (fid, class, proto) = self.new_target(cv.bits())?;
+        let proto = proto.map_or(Value::UNDEFINED, Value::heap);
+        self.new_stored_memo = (cv.bits(), self.heap.version_of(cv.heap_index()), fid, class, proto.bits());
+        Some((fid, class, proto))
+    }
+
     /// `new` of the store-only constructor body `fid` from compiled code,
     /// for an instance of the class `class` (a base class with no instance
     /// fields) or, for a plain function (`class` = `u32::MAX`), with the
@@ -558,7 +779,7 @@ impl<'p> Vm<'p> {
         // a construction loop.
         if self.ctor_store_last.0 == fid {
             if let (Some(keys), Some(proof)) = (&self.ctor_store_last.1, &self.ctor_store_last.2) {
-                let (keys, proof) = (keys.clone(), proof.clone());
+                let (keys, proof, body) = (keys.clone(), proof.clone(), self.ctor_store_last.3.clone());
                 let proto_idx = if class != u32::MAX {
                     u32::MAX
                 } else if proto.is_heap() {
@@ -567,17 +788,27 @@ impl<'p> Vm<'p> {
                     u32::MAX - 1 // no proof is for this
                 };
                 if proto_idx != u32::MAX - 1 && self.store_proof_holds(&proof, class, proto_idx) {
-                    return Some(self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc));
+                    return self.ctor_store_make(&keys, body.as_deref(), &proof, class, proto, base, arg_base, argc);
                 }
             }
         }
-        let (keys, proof) = match self.ctor_stores.get(&fid) {
-            Some(e) => (e.keys.clone(), e.proof.clone()),
+        let (keys, body, proof) = match self.ctor_stores.get(&fid) {
+            Some(e) => (e.keys.clone(), e.body.clone(), e.proof.clone()),
             None => {
-                let keys: Option<std::rc::Rc<[(String, StoreSrc)]>> =
-                    scan_store_body(self.func(fid as usize)).map(std::rc::Rc::from);
-                self.ctor_stores.insert(fid, CtorStore { keys: keys.clone(), ..CtorStore::default() });
-                (keys, None)
+                let p = self.func(fid as usize);
+                let (keys, body) = match scan_store_body(p) {
+                    Some(keys) => (Some(keys), None),
+                    None => match scan_eval_body(p) {
+                        Some((body, keys)) => (Some(keys), Some(std::rc::Rc::new(body))),
+                        None => (None, None),
+                    },
+                };
+                let keys: Option<std::rc::Rc<[(String, StoreSrc)]>> = keys.map(std::rc::Rc::from);
+                self.ctor_stores.insert(
+                    fid,
+                    CtorStore { keys: keys.clone(), body: body.clone(), ..CtorStore::default() },
+                );
+                (keys, body, None)
             }
         };
         let keys = keys?;
@@ -611,35 +842,47 @@ impl<'p> Vm<'p> {
                 p
             }
         };
-        let made = self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc);
-        self.ctor_store_last = (fid, Some(keys), Some(proof));
-        Some(made)
+        let made = self.ctor_store_make(&keys, body.as_deref(), &proof, class, proto, base, arg_base, argc);
+        self.ctor_store_last = (fid, Some(keys), Some(proof), body);
+        made
     }
 
     /// The instance `ctor_store_new` makes once `proof` holds: the stores'
     /// values from the caller's window, born finished, then given its class
-    /// or its [[Prototype]].
+    /// or its [[Prototype]]. `None`, with nothing made, when a computing
+    /// body meets an operand it cannot evaluate.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn ctor_store_make(
         &mut self,
         keys: &[(String, StoreSrc)],
+        body: Option<&StoreBody>,
         proof: &StoreProof,
         class: u32,
         proto: Value,
         base: usize,
         arg_base: u16,
         argc: u16,
-    ) -> Value {
+    ) -> Option<Value> {
         // The construction the body's call was: a safe point, before the
         // allocation (the arguments are in the caller's window, a root).
         self.maybe_gc();
         let mut vals = [Value::UNDEFINED; STORE_MAX];
+        let mut regs = [Value::UNDEFINED; EVAL_REGS];
+        if let Some(body) = body {
+            for a in 0..body.params.min(argc) {
+                regs[a as usize + 1] = self.get(base, arg_base + a);
+            }
+            if !eval_store_body(&body.ops, &mut regs) {
+                return None;
+            }
+        }
         for (i, (_, src)) in keys.iter().enumerate() {
             vals[i] = match *src {
                 StoreSrc::Arg(a) if a < argc => self.get(base, arg_base + a),
                 StoreSrc::Arg(_) => Value::UNDEFINED,
                 StoreSrc::Bits(b) => Value::from_bits(b),
+                StoreSrc::Reg(r) => regs[r as usize],
             };
         }
         // SAFETY: the proof's plan is the VM's own for that shape
@@ -658,7 +901,7 @@ impl<'p> Vm<'p> {
         } else if proto.is_heap() {
             self.proto_of.insert(idx, proto);
         }
-        Value::heap(idx)
+        Some(Value::heap(idx))
     }
 
     /// Whether `p` still proves the stores for a fresh instance of `class`
