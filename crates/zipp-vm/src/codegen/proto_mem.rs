@@ -2981,6 +2981,69 @@ fn do_wide_mask_passes(
 /// r13/r14 are saved-but-unused and no post-call re-fetch is emitted (the
 /// globals pin r12 stays valid across calls — `self.globals` never reallocates).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// A `try` whose body compiled code runs with no handler pushed.
+struct LazyTry {
+    push: usize,
+    pop: usize,
+    catch_target: u32,
+    catch_reg: u16,
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_TRY=1` pushes every handler (the same-binary A/B).
+    fn lazy_try_enabled() = "ZIPP_NO_LAZY_TRY"
+}
+
+/// The handler of a `try` is only ever read by what happens after the body is
+/// left some way other than its `PopHandler`: a throw unwinding this frame, or
+/// a bail, whose interpreter must find the frame as it would have left it. Both
+/// leave compiled code through the epilogue, so the push can wait there and a
+/// body that finishes costs nothing.
+///
+/// That takes a body with one way in and one way out: nothing outside jumps into
+/// it, every branch in it stays in it and runs forward (a loop head is an entry
+/// from the interpreter, which has pushed), and no return, `finally` or nested
+/// handler, whose exits read the frame's handlers on the way through.
+fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
+    let mut out = Vec::new();
+    for (push, ins) in code.iter().enumerate() {
+        let Instr::PushHandler { catch_target, catch_reg } = *ins else {
+            continue;
+        };
+        let Some(pop) = (push + 1..code.len()).find(|&i| matches!(code[i], Instr::PopHandler)) else {
+            continue;
+        };
+        let body = &code[push + 1..pop];
+        let closed = body.iter().all(|i| {
+            !matches!(
+                i,
+                Instr::Return { .. }
+                    | Instr::ReturnUndefined
+                    | Instr::TailCall { .. }
+                    | Instr::PushHandler { .. }
+                    | Instr::PushFinally { .. }
+                    | Instr::PopFinally
+                    | Instr::JumpFinally { .. }
+                    | Instr::EndFinally { .. }
+            )
+        }) && code.iter().enumerate().all(|(at, i)| {
+            control_targets(i).into_iter().flatten().all(|target| {
+                let target = target as usize;
+                let inside = at > push && at < pop;
+                if inside {
+                    target > at && target <= pop
+                } else {
+                    at == push || target <= push || target > pop
+                }
+            })
+        });
+        if closed {
+            out.push(LazyTry { push, pop, catch_target, catch_reg });
+        }
+    }
+    out
+}
+
 pub(crate) fn compile_proto_mem(
     proto: &FuncProto,
     func_id: u32,
@@ -3585,6 +3648,18 @@ pub(crate) fn compile_proto_mem(
         v
     };
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
+    // Each lazy `try`, the exit its body takes, and for each ip the one it is
+    // in. The metered exits are out of line, on the real epilogue.
+    let lazy_try = if py || meter.is_some() || !lazy_try_enabled() {
+        Vec::new()
+    } else {
+        lazy_tries(&proto.code)
+    };
+    let lazy_exit: Vec<dynasmrt::DynamicLabel> = lazy_try.iter().map(|_| ops.new_dynamic_label()).collect();
+    let mut lazy_at: Vec<Option<dynasmrt::DynamicLabel>> = vec![None; n];
+    for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
+        lazy_at[t.push + 1..t.pop].fill(Some(exit));
+    }
     // B118 fused compare→branch (the region rule, Tier-C shape): `cmp {dst} ;
     // JumpIfTrue/False{cond: dst}` at the very next ip fuses (see
     // `emit_fused_cmp_branch_head`). Detection only — the JumpIf stays emitted
@@ -3718,6 +3793,8 @@ pub(crate) fn compile_proto_mem(
     }
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
+        // Every way out of a lazy `try`'s body, for this op's arms below.
+        let epilogue = lazy_at[ip].unwrap_or(epilogue);
         if fc_slots != 0 {
             // What the previous op did to the registers the cache holds, then
             // this op's entry: a jump target starts with nothing cached.
@@ -3754,6 +3831,9 @@ pub(crate) fn compile_proto_mem(
                 ; mov DWORD [rsi], ip as i32
                 ; jmp => epilogue
             );
+        }
+        if lazy_try.iter().any(|t| t.push == ip || t.pop == ip) {
+            continue;
         }
         // These bytecodes were materialized exactly by the fused captured-int
         // helper at their only predecessor. No internal jump may target them
@@ -7759,6 +7839,24 @@ pub(crate) fn compile_proto_mem(
             ; => stub
             ; mov DWORD [rsi], ip as i32
             ; xor rax, rax
+            ; jmp => epilogue
+        );
+    }
+
+    // ── lazy `try` exits ── the push the body skipped, for whoever reads the
+    // frame next: the interpreter resuming inside the body, or unwinding from it.
+    for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
+        let packed = ((t.catch_target as u64) << 16) | t.catch_reg as u64;
+        dynasm!(ops
+            ; => exit
+            ; sub rsp, 48
+            ; mov [rsp + 32], rax
+            ; mov rcx, rdi
+            ; mov rdx, QWORD packed as i64
+            ; mov rax, QWORD crate::vm::jit_push_catch as *const () as i64
+            ; call rax
+            ; mov rax, [rsp + 32]
+            ; add rsp, 48
             ; jmp => epilogue
         );
     }
