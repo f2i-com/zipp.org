@@ -209,7 +209,7 @@ impl<'p> Vm<'p> {
                         0 // the setter's return value is discarded
                     }
                 }
-                SetAct::None => SELF_CALL_DEOPT,
+                SetAct::None => self.jit_set_prop_complete(func_id, ip, recv, key, val),
             }
         } else {
             let obj_reg = (packed2 & 0xFFFF) as u16;
@@ -247,8 +247,80 @@ impl<'p> Vm<'p> {
                     }
                     self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
                 }
-                GetAct::None => SELF_CALL_DEOPT,
+                GetAct::None => self.jit_get_prop_complete(func_id, recv, key),
             }
+        }
+    }
+
+    /// A private name's brand check and a namespace still materialising read
+    /// the interpreter's frame; a metered run charges as it goes. Everything
+    /// else a compiled op can finish itself.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_complete_declines(&self) -> bool {
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return true;
+        }
+        !self.deferred_ns_state.is_empty() || !crate::codegen::jit_complete_enabled()
+    }
+
+    /// The end of the interpreter's `GetProp` for what no cache answered: any
+    /// receiver, a getter or a proxy trap run to completion, a throw left
+    /// pending. A method read off a primitive number or a typed array, a
+    /// match's `.groups` and a regexp's `.lastIndex` bailed here on every
+    /// iteration, and 64 bails evicted the region around them: the whole loop
+    /// stayed interpreted for those reads.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_get_prop_complete(&mut self, func_id: u32, o: Value, key: &str) -> u64 {
+        if crate::vm::is_private_key(key) || self.jit_complete_declines() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        // The interpreter's lanes for these, ahead of the member walk.
+        if o.is_heap() {
+            let idx = o.heap_index();
+            if !matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                if self.proxy_parts(idx).is_none() {
+                    if let Some(v) = self.shapeless_read(o, key) {
+                        return v.bits();
+                    }
+                }
+            } else if let Some(v) = self.ctor_own_data_read(o, key) {
+                return v.bits();
+            }
+        }
+        match self.get_prop(o, key) {
+            Ok(v) => v.bits(),
+            Err(Thrown(msg)) => {
+                let f = self.func(func_id as usize);
+                let name: &str = if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                let msg = format!("{msg} (in {name})");
+                self.jit_thrown_to_sentinel(Thrown(msg))
+            }
+        }
+    }
+
+    /// The end of the interpreter's `SetProp` for what no cache answered:
+    /// `arr.length = n`, `re.lastIndex = 0`, a setter on the chain, a proxy, a
+    /// non-writable slot. As [`Self::jit_get_prop_complete`].
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_set_prop_complete(&mut self, func_id: u32, ip: usize, o: Value, key: &str, v: Value) -> u64 {
+        let f = self.func(func_id as usize);
+        let Some(crate::bytecode::Instr::SetProp { strict: site_strict, .. }) = f.code.get(ip) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        let strict = f.is_strict || *site_strict;
+        if crate::vm::is_private_key(key) || self.jit_complete_declines() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let proxy = o.is_heap() && matches!(self.heap.get(o.heap_index()), HeapObj::Proxy { .. });
+        let stored = if proxy {
+            self.set_prop_proxy(o, key, v, strict).map(|_| ())
+        } else {
+            self.set_prop(o, key, v, strict).map(|_| ())
+        };
+        match stored {
+            Ok(()) => 0,
+            Err(t) => self.jit_thrown_to_sentinel(t),
         }
     }
 

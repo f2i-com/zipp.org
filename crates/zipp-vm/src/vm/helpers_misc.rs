@@ -5293,8 +5293,9 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     packed: u64,
 ) -> u64 {
     let obj = Value::from_bits(obj_bits);
+    // No cache holds a primitive: `n.toFixed`, and the TypeError of `null.x`.
     if !obj.is_heap() {
-        return crate::codegen::SELF_CALL_DEOPT;
+        return crate::codegen::PROP_VIA_IC;
     }
     // SAFETY: exclusive view (updates the IC table); the running region holds no
     // conflicting borrow (the IC table and the region live in different fields).
@@ -5398,7 +5399,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // the ObjMap (the global object, %Array.prototype%, realm globals) keep the
     // same interpreter-only exclusion as the ordinary IC path.
     if !vm.ic_obj_ok(idx) {
-        return crate::codegen::SELF_CALL_DEOPT;
+        return crate::codegen::PROP_VIA_IC;
     }
     // ── shape memo ──────────────────────────────────────────────────────────
     // Before the key scan: if this site has already resolved this SHAPE, the slot
@@ -5530,7 +5531,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // (Hop maps are already `!is_ctor`-guarded; this closes the
             // receiver side. Found when B189 first compiled `() =>
             // f.arguments` bodies: `Function.arguments` answered undefined.)
-            None if map.is_ctor => return crate::codegen::SELF_CALL_DEOPT,
+            None if map.is_ctor => return crate::codegen::PROP_VIA_IC,
             None => {
                 const MAX: usize = crate::codegen::JIT_IC_MAX_HOPS;
                 let mut cur = idx;
@@ -5549,7 +5550,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         }
                     };
                     if n_hops >= 64 || !vm.ic_obj_ok(next) {
-                        return crate::codegen::SELF_CALL_DEOPT;
+                        return crate::codegen::PROP_VIA_IC;
                     }
                     match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
@@ -5621,7 +5622,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                 return v.bits();
                             }
                         }
-                        _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                        _ => return crate::codegen::PROP_VIA_IC, // exotic link
                     }
                     if n_hops < MAX {
                         hops[n_hops] = (next, vm.heap.version_of(next));
@@ -5641,7 +5642,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // An arguments object's `length` is an ORDINARY (writable) prop in
             // arr_props — defer to the interpreter.
             if vm.arguments_objs.contains_key(&idx) {
-                return crate::codegen::SELF_CALL_DEOPT;
+                return crate::codegen::PROP_VIA_IC;
             }
             // A SPARSE array's JS length lives in the virtual-length side
             // table (still uncached — correct value, plain helper miss).
@@ -5669,7 +5670,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // shared grow are observed on the next source-level property read.
             return match vm.ta_length_fast(idx) {
                 Some(n) => len_value(n).bits(),
-                None => crate::codegen::SELF_CALL_DEOPT,
+                None => crate::codegen::PROP_VIA_IC,
             };
         }
         HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
@@ -5706,7 +5707,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             }
             return match jit_proto_named_get(vm, idx, key) {
                 Some(v) => v.bits(),
-                None => crate::codegen::SELF_CALL_DEOPT,
+                None => crate::codegen::PROP_VIA_IC,
             };
         }
         // The same split-member-call Get on a collection / Date / Promise
@@ -5747,7 +5748,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             }
             return match jit_proto_named_get(vm, idx, key) {
                 Some(v) => v.bits(),
-                None => crate::codegen::SELF_CALL_DEOPT,
+                None => crate::codegen::PROP_VIA_IC,
             };
         }
         // `f.call` / `f.apply` / `f.bind` on an ordinary callable: the same
@@ -5763,10 +5764,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         {
             return match vm.fn_call_apply_bits(obj, key) {
                 Some(bits) => bits,
-                None => crate::codegen::SELF_CALL_DEOPT,
+                None => crate::codegen::PROP_VIA_IC,
             };
         }
-        _ => return crate::codegen::SELF_CALL_DEOPT, // other exotic receivers → interpreter
+        _ => return crate::codegen::PROP_VIA_IC, // no cache holds these
     };
     let version = vm.heap.version_of(idx);
     if !vm.jit.direct_miss_active(site_idx) {
@@ -6343,7 +6344,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
 ) -> u64 {
     let obj = Value::from_bits(obj_bits);
     if !obj.is_heap() {
-        return crate::codegen::SELF_CALL_DEOPT;
+        return crate::codegen::PROP_VIA_IC;
     }
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let func_id = (packed >> 32) as u32;
@@ -6367,7 +6368,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
-    // receivers — same exclusions as the interpreter's SetProp IC: defer.
+    // receivers: the same exclusions as the interpreter's SetProp IC.
     if key == "__proto__"
         || key == "caller"
         || key == "arguments"
@@ -6378,7 +6379,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         || !vm.deferred_ns_state.is_empty()
         || !vm.ic_obj_ok(idx)
     {
-        return crate::codegen::SELF_CALL_DEOPT;
+        return crate::codegen::PROP_VIA_IC;
     }
     if icstats::enabled() && !vm.jit.direct_miss_active(site_idx) {
         let guardable = matches!(vm.heap.get(idx), HeapObj::Object(m) if m.shape_guardable());
@@ -6495,9 +6496,8 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 }
                 return crate::codegen::PROP_VIA_IC;
             }
-            // A non-writable own data prop: sloppy no-op / strict throw —
-            // the interpreter applies the right one.
-            Some(s) if !map.attr_at(s).writable => return crate::codegen::SELF_CALL_DEOPT,
+            // A non-writable own data prop: sloppy no-op / strict throw.
+            Some(s) if !map.attr_at(s).writable => return crate::codegen::PROP_VIA_IC,
             Some(s) => Some(s),
             None => 'own_miss: {
                 // Own miss. A class-instance receiver may resolve a chain
@@ -6523,11 +6523,11 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     // Ctor maps do not default to %Object.prototype% (see the
                     // matching guard in `jit_get_prop_miss`), and their chain
                     // carries the throwing `caller`/`arguments` accessors an
-                    // append would have to consult. Interpreter cases.
-                    return crate::codegen::SELF_CALL_DEOPT;
+                    // append would have to consult.
+                    return crate::codegen::PROP_VIA_IC;
                 }
                 if !map.extensible {
-                    return crate::codegen::SELF_CALL_DEOPT;
+                    return crate::codegen::PROP_VIA_IC;
                 }
                 add_way.before = map.shape();
                 let mut cur = idx;
@@ -6545,7 +6545,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     };
                     hops += 1;
                     if hops > 64 || !vm.ic_obj_ok(next) {
-                        return crate::codegen::SELF_CALL_DEOPT;
+                        return crate::codegen::PROP_VIA_IC;
                     }
                     if hops == 1 {
                         add_way.proto = next;
@@ -6565,23 +6565,21 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                                     return crate::codegen::PROP_VIA_IC;
                                 }
                                 if !m2.attr_at(i).writable {
-                                    return crate::codegen::SELF_CALL_DEOPT;
+                                    return crate::codegen::PROP_VIA_IC;
                                 }
                                 break; // writable chain data: the own add shadows it
                             }
                         }
-                        _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                        _ => return crate::codegen::PROP_VIA_IC, // exotic link
                     }
                     cur = next;
                 }
                 None
             }
         },
-        // `arr.length = n` truncates/grows — deopt so the interpreter's set_prop
-        // applies it (no-op here would diverge from the interpreter).
-        HeapObj::Array(_) if key == "length" => return crate::codegen::SELF_CALL_DEOPT,
-        // Any other heap receiver — Array, Proxy, Func, Closure, Date, Map, Set,
-        // Promise, RegExp, Boxed, TypedArray — must DEOPT, not no-op.
+        // Any other heap receiver (`arr.length = n`, `re.lastIndex = 0`, an
+        // Array, Proxy, Func, Closure, Date, Map, Set, Promise, RegExp, Boxed or
+        // TypedArray) stores through `set_prop`, in the slow helper, not no-op.
         //
         // This used to `return 0`, which is the helper's SUCCESS code, on the
         // premise that the interpreter also no-ops. It does not: it performs the
@@ -6589,7 +6587,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // it held when the region compiled, and a Proxy's `set` trap simply
         // stopped firing once the loop got hot — silent data loss, and skipped
         // observable side effects.
-        _ => return crate::codegen::SELF_CALL_DEOPT,
+        _ => return crate::codegen::PROP_VIA_IC,
     };
     let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
         HeapObj::Object(map) => match own {
@@ -8364,55 +8362,22 @@ pub(crate) extern "win64" fn jit_iter_next(
                 iterstats::native_step();
                 return 0;
             }
-            None => {
-                if matches!(vm.heap.get(it_heap_idx), HeapObj::Array(_)) {
-                    // A holey dense array: the element's value comes from the
-                    // prototype chain — interpreter only.
-                    iterstats::deopt();
-                    return crate::codegen::SELF_CALL_DEOPT;
-                }
-            }
+            None => {}
         }
     }
-    let next = Value::from_bits(unsafe { *regs.add(next_reg) });
-    // The primed `next` must be the PRISTINE intrinsic — a user `next`
-    // (function or otherwise) runs arbitrary code and builds an observable
-    // result object; the interpreter owns that protocol.
-    if !it.is_heap()
-        || !next.is_heap()
-        || !matches!(vm.heap.get(next.heap_index()),
-                     HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
-    {
+    // Everything else, a user `next` and a generator's included: the
+    // interpreter's own step, run to completion (`at_call_cap`: the frames its
+    // calls would need).
+    if vm.jit_complete_declines() || vm.at_call_cap() {
+        vm.osr_deopt_exempt = true;
         iterstats::deopt();
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let it_idx = it.heap_index();
-    // Same receiver-kind gate as the interpreter fast path (dispatch.rs): the
-    // three step probes below key off identity side tables / Iterator
-    // internals, and each returns `None` WITHOUT mutating when it_idx is not
-    // its kind — so probing in the interpreter's exact order and deopting on
-    // triple-None is state-identical to the interpreter arm.
-    let step = if let Some(s) = vm.regexp_string_iter_step(it_idx) {
-        s
-    } else if let Some(s) = vm.array_iter_step(it_idx) {
-        s
-    } else if let Some(p) = match vm.collection_iter_step(it_idx) {
-        Ok(step) => step,
-        Err(t) => return vm.jit_thrown_to_sentinel(t),
-    } {
-        Ok(p)
-    } else {
-        // TypedArray-backed (per-step bounds check can throw) and every other
-        // shape stay on the interpreter's general path.
-        iterstats::deopt();
-        return crate::codegen::SELF_CALL_DEOPT;
-    };
-    match step {
-        Ok((v, d)) => {
-            unsafe {
-                *regs.add(value_dst) = v.bits();
-                *regs.add(done_dst) = Value::bool(d).bits();
-            }
+    // SAFETY: `regs` is this activation's window, inside `vm.regs`' buffer.
+    let base = unsafe { (regs as *const u64).offset_from(vm.regs.as_ptr() as *const u64) } as usize;
+    let (value_dst, done_dst) = (value_dst as u16, done_dst as u16);
+    match vm.iter_next_step(base, it, value_dst, done_dst, idx_reg as u16, next_reg as u16) {
+        Ok(()) => {
             iterstats::native_step();
             0
         }

@@ -40,6 +40,246 @@ const DIRECT_EVAL_CACHE_MAX_SOURCE: usize = 1024;
 const DIRECT_EVAL_CACHE_MAX_ENTRIES: usize = 4096;
 
 impl<'p> Vm<'p> {
+    /// Whether `it` is a generator whose `next` is the intrinsic: a primed
+    /// loop decided at `IterPrime` (its record's [[NextMethod]] is read once:
+    /// undefined there means the intrinsic), an unprimed step asks now.
+    #[inline]
+    pub(crate) fn iter_generator_direct(&self, base: usize, it: Value, next: u16) -> bool {
+        matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
+            && if next != u16::MAX {
+                self.get(base, next).is_undefined()
+            } else {
+                self.gen_method_pristine(it.heap_index(), "next")
+            }
+    }
+
+    /// One `IterNext` past the dense Array read, for the interpreter and for
+    /// compiled code (`jit_iter_next`) alike: a generator or a user iterator
+    /// driven by `.next()`, an intrinsic one stepped without its result
+    /// object, and the positional walk of a string, a Set, a Map, a typed
+    /// array or a holey Array. `it` is a heap value. Writes `value_dst`,
+    /// `done_dst` and the cursor `idx` of the window at `base`.
+    #[inline(never)]
+    pub(crate) fn iter_next_step(
+        &mut self,
+        base: usize,
+        it: Value,
+        value_dst: u16,
+        done_dst: u16,
+        idx: u16,
+        next: u16,
+    ) -> Result<(), Thrown> {
+        // A generator is driven by `.next()`; the cursor is unused.
+        // The step is taken without its `{value, done}` result
+        // object, which nothing could see: built, read back and
+        // dropped, it was a third of a generator-driven loop.
+        // A `yield*` step still hands over the inner result
+        // object itself, which is read below as before.
+        if self.iter_generator_direct(base, it, next) {
+            let res = match self.generator_next_step(it.heap_index())? {
+                Some(super::async_runtime::GenStep::Yield(v)) => {
+                    self.set(base, value_dst, v);
+                    self.set(base, done_dst, Value::FALSE);
+                    return Ok(());
+                }
+                Some(super::async_runtime::GenStep::Done(v)) => {
+                    self.set(base, value_dst, v);
+                    self.set(base, done_dst, Value::TRUE);
+                    return Ok(());
+                }
+                Some(super::async_runtime::GenStep::Raw(r)) => r,
+                None => Value::UNDEFINED,
+            };
+            // `iter_result` builds `{value, done}` in that order
+            // and nothing else, so when the result is exactly
+            // that shape its slots can be read directly instead
+            // of through two full `get_prop`s. Verified against
+            // the map rather than assumed, because `yield*`
+            // returns the INNER result verbatim and that may be
+            // any user object.
+            if let Some((val, done)) = self.iter_result_unwrap(res) {
+                self.set(base, value_dst, val);
+                self.set(base, done_dst, done);
+                return Ok(());
+            }
+            let done = self.get_prop(res, "done")?;
+            let val = self.get_prop(res, "value")?;
+            self.set(base, value_dst, val);
+            self.set(base, done_dst, done);
+            return Ok(());
+        }
+        // A user iterator object (`@@iterator` already resolved by
+        // GetIterator): pull the next result via `.next()`. Lazy:
+        // a `break` simply stops calling it. The cached prologue
+        // [[NextMethod]] (IterPrime) is used when present; the
+        // uncached (destructuring) sites re-fetch per step.
+        // `HeapObj::Intl` is in the list for %SegmentIterator%:
+        // it is an ordinary object with a `next` method, and
+        // without it `for (v of segmenter.segment(s))` fell
+        // through to the positional walk below and reported the
+        // iterator itself as "not iterable".
+        // A generator lands here when its `next` was replaced
+        // (the arm above runs it directly only while it is the
+        // intrinsic).
+        if matches!(
+            self.heap.get(it.heap_index()),
+            HeapObj::Object(_)
+                | HeapObj::Proxy { .. }
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper(_)
+                | HeapObj::Intl { .. }
+                | HeapObj::Generator(_)
+        ) {
+            let next = if next != u16::MAX {
+                self.get(base, next)
+            } else {
+                self.get_prop(it, "next")?
+            };
+            if self.is_callable(next) {
+                // A %RegExpStringIterator% stepped by the PRISTINE
+                // intrinsic `next`: run the step inline. The
+                // {value, done} result object the intrinsic would
+                // build is engine-internal and its `done`/`value`
+                // Gets are unobservable — skip both.
+                if next.is_heap()
+                    && matches!(self.heap.get(next.heap_index()),
+                                HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
+                {
+                    if let Some(step) =
+                        self.regexp_string_iter_step(it.heap_index())
+                    {
+                        let (val, done) = step?;
+                        self.set(base, value_dst, val);
+                        self.set(base, done_dst, Value::bool(done));
+                        return Ok(());
+                    }
+                    // Same argument, same intrinsic `next`: a
+                    // live %ArrayIteratorPrototype% iterator
+                    // (`a.values()`, `a.keys()`, `a.entries()`,
+                    // and every iterator-helper chain over an
+                    // array) is stepped inline, and the
+                    // {value, done} object it would have built
+                    // — 90ns of a 143ns step — is never made.
+                    if let Some(step) = self.array_iter_step(it.heap_index()) {
+                        let (val, done) = step?;
+                        self.set(base, value_dst, val);
+                        self.set(base, done_dst, Value::bool(done));
+                        return Ok(());
+                    }
+                    // Map/Set (`map.keys()`, `set.values()`,
+                    // `map.entries()`) and snapshot iterators.
+                    // `None` leaves the TypedArray-backed case,
+                    // whose per-step bounds check can throw, on
+                    // the general path below.
+                    if let Some((val, done)) =
+                        self.collection_iter_step(it.heap_index())?
+                    {
+                        self.set(base, value_dst, val);
+                        self.set(base, done_dst, Value::bool(done));
+                        return Ok(());
+                    }
+                }
+                let res = self.call_value(next, it, &[])?;
+                // IteratorNext step 3: a non-Object result is a TypeError.
+                if !self.is_object_value(res) {
+                    return Err(Thrown(
+                        "TypeError: iterator result is not an object".into(),
+                    ));
+                }
+                // IteratorStep reads only `done`; IteratorValue (the
+                // `value` Get — observable via a getter) happens ONLY
+                // when the iterator is not done.
+                let done = self.get_prop(res, "done")?;
+                let val = if self.truthy(done) {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(res, "value")?
+                };
+                self.set(base, value_dst, val);
+                self.set(base, done_dst, done);
+                return Ok(());
+            }
+        }
+        // Array/Set element, string char, or Map [k,v] at the cursor.
+        let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
+        // A Set's / Map's tombstoned (deleted) slots are skipped.
+        while match self.heap.get(it.heap_index()) {
+            HeapObj::Set(items) => cursor < items.len() && items[cursor].is_hole(),
+            HeapObj::Map { keys, .. } => {
+                cursor < keys.len() && keys[cursor].is_hole()
+            }
+            _ => false,
+        } {
+            cursor += 1;
+        }
+        // A STRING iterates by CODE POINT (one step per scalar; an
+        // astral char is ONE step) while the cursor advances in
+        // UTF-16 units (matching `.length`). Flatten a rope first
+        // (no-op tag check for everything else).
+        self.heap.flatten(it.heap_index());
+        let str_step = match self.heap.get(it.heap_index()) {
+            HeapObj::Str(s) => Some(s.cp_step(cursor)),
+            _ => None,
+        };
+        if let Some(step) = str_step {
+            match step {
+                Some((cp, next)) => {
+                    // `cp` may be a lone surrogate — a real 1-unit
+                    // surrogate string, not U+FFFD.
+                    let val = self.str_from_cp(cp);
+                    self.set(base, value_dst, val);
+                    self.set(base, done_dst, Value::bool(false));
+                    self.set(base, idx, Value::int(next as i32));
+                }
+                None => self.set(base, done_dst, Value::bool(true)),
+            }
+            return Ok(());
+        }
+        // `coll`: a Map/Set step reads its entry positionally
+        // (`collection_entry_at`); everything else is an ordinary index.
+        let (len, coll) = match self.heap.get(it.heap_index()) {
+            // The JS length: past the dense store for a
+            // virtual array (the fast path above declined it).
+            HeapObj::Array(_) => (self.js_array_len(it.heap_index()), false),
+            HeapObj::Set(items) => (items.len(), true),
+            HeapObj::Str(s) => (s.units(), false),
+            HeapObj::Cons { len, .. } => (*len, false),
+            HeapObj::Map { keys, .. } => (keys.len(), true),
+            // The LIVE length each step: a tracking view follows its
+            // resizable buffer (shrink ends early, grow yields more);
+            // a detached/out-of-bounds view mid-iteration throws.
+            HeapObj::TypedArray { .. } => {
+                match self.ta_effective_len(it.heap_index()) {
+                    Some(n) => (n, false),
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: TypedArray iterator: the viewed buffer is detached or out of bounds".into(),
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(Thrown(format!(
+                    "TypeError: {} is not iterable",
+                    self.display(it)
+                )));
+            }
+        };
+        if cursor < len {
+            let val = if coll {
+                self.collection_entry_at(it, cursor)
+            } else {
+                self.get_index(it, Value::int(cursor as i32))?
+            };
+            self.set(base, value_dst, val);
+            self.set(base, done_dst, Value::bool(false));
+            self.set(base, idx, len_value(cursor + 1));
+        } else {
+            self.set(base, done_dst, Value::bool(true));
+        }
+        Ok(())
+    }
+
     /// The cell of a direct-eval site's caller binding `(kind, idx)` (see
     /// `FuncProto::eval_sites`): kind 0 is a cell of this frame in register
     /// `idx`, and so is kind 3, a catch parameter (an eval'd `var` of its name

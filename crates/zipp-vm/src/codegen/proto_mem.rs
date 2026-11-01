@@ -4402,11 +4402,9 @@ pub(crate) fn compile_proto_mem(
                 idx,
                 next,
             } => {
-                // The REGION path's `jit_iter_next` verbatim: the dense-array
-                // positional walk plus the intrinsic array/collection/regexp
-                // iterator steps; everything else deopts before state moves.
-                // The helper runs the loop safe point and can allocate, so
-                // pinned tables re-derive afterwards.
+                // The REGION path's `jit_iter_next` verbatim. The helper runs
+                // the loop safe point, can allocate, and a user `next` runs
+                // anything, so pinned tables re-derive afterwards.
                 let packed = ((iter as u64) << 48)
                     | ((next as u64) << 32)
                     | ((value_dst as u64) << 16)

@@ -5047,21 +5047,18 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
                 }
-                // The for-of step via `jit_iter_next` — serves the intrinsic
-                // iterator kinds only (see the helper); anything else deopts
-                // BEFORE state moves, so the interpreter re-executes this op
-                // with full semantics (a persistent deopt evicts the region,
-                // restoring the interpreted loop). The helper writes value/
+                // The for-of step via `jit_iter_next`, whatever the iterator
+                // (see the helper). The helper writes value/
                 // done straight into the frame window (two outputs), so only
                 // the status comes back in rax. `idx` (r9) is the dense-Array
                 // positional cursor, advanced by the helper's plain-Array walk
                 // and untouched on the intrinsic-iterator paths — exactly the
                 // interpreter arm's behaviour.
                 //
-                // A match step ALLOCATES (result array + capture slices) and
-                // runs `maybe_gc` (the loop's safe point), so re-derive the
-                // pinned r13/r14 and TypedArray snapshots afterward — the
-                // StrConcat discipline. No user code runs on the served paths.
+                // A match step ALLOCATES (result array + capture slices), a
+                // user `next` runs anything, and the helper runs `maybe_gc`
+                // (the loop's safe point), so re-derive the pinned r13/r14 and
+                // TypedArray snapshots afterward: the StrConcat discipline.
                 let packed = ((iter as u64) << 48)
                     | ((next as u64) << 32)
                     | ((value_dst as u64) << 16)

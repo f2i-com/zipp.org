@@ -88,6 +88,12 @@ macro_rules! env_off_switch {
 // into the codegen submodules; moving it below them is a hard compile error,
 // not a silent regression.
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_COMPLETE=1`: a read, a write or a for-of step no cache and
+    /// no lane answers bails to the interpreter (the same-binary A/B).
+    fn jit_complete_enabled() = "ZIPP_NO_JIT_COMPLETE"
+}
+
 /// Number of interpreter calls before a function is offered to the JIT.
 pub const JIT_THRESHOLD: u32 = 8;
 
