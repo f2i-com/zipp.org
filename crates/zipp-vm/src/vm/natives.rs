@@ -1349,6 +1349,8 @@ impl<'p> Vm<'p> {
         // (active_realm / realm_globals) and the get/set interception that makes
         // `other.x` read/write the same binding a bare `x` sees inside the realm.
         self.realm_global_objs.insert(g_idx, r);
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.ready_disable();
         // Excluded receiver (ic_obj_ok): defines continue on this map after
         // alloc with no version bump, so its mirror must never be guardable.
         self.heap.pin_mirror_dict(g_idx);

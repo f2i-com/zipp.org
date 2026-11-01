@@ -790,6 +790,8 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            new_sites: Vec::new(),
             #[cfg(feature = "node")]
             node_installed: false,
             #[cfg(feature = "node")]

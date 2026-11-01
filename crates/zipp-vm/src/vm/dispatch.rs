@@ -1992,6 +1992,10 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let cv = self.get(base, callee);
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if self.jit_enabled {
+                            self.note_new_site(ip, cv);
+                        }
                         // A plain constructor function: its frame is pushed
                         // here, in this loop, as a call's is, and its pop
                         // hands back the instance (`construct_this`).
@@ -2938,8 +2942,9 @@ impl<'p> Vm<'p> {
                                 // copy of a cross-tier fact is the whole point of B66.
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
-                                let (cross_plan, cross_pending, cross_baked) =
+                                let (mut cross_plan, cross_pending, cross_baked) =
                                     self.build_cross_call_plan(func_id, Some(base), false);
+                                self.plan_new_lanes(func_id, &mut cross_plan);
                                 self.jit.note_cross_baked(func_id, &cross_baked);
                                 // B199: a "no entry yet" decline at a REGION is
                                 // deferred (capped) instead of baked — the callee

@@ -160,6 +160,22 @@ const _: () = {
     assert!(JIT_IC_TABLE_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 };
 
+/// The heap's ready objects (`Heap::ready`): each class's `next` and `end`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_READY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, ready);
+
+/// `proto_of`'s values (`ProtoTable::raw`), for an instance's entry.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, raw_len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, count);
+
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
 /// on EVERY access — the mirror vectors grow when helpers allocate, and

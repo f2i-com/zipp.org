@@ -3524,6 +3524,9 @@ pub struct Vm<'p> {
     /// results collected across later guest re-entry — spread, rest,
     /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
     host_result_roots: Vec<Value>,
+    /// What the interpreter last ran `new` of, by site (`Vm::note_new_site`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) new_sites: Vec<engine::ctor_store::NewSite>,
     /// Node's globals (`lang/js/node`): installed for this run, the partial
     /// lines `process.stdout`/`stderr.write` left, and the function the
     /// run's end calls (a root).

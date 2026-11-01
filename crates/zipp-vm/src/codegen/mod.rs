@@ -1203,6 +1203,39 @@ pub struct CrossCallSitePlan {
     /// with the receiver as `this` once `jit_getter_callee` has looked the
     /// getter up.
     pub class_getter: bool,
+    /// A `New` site whose constructor only stores its arguments
+    /// (`Vm::plan_new_lanes`). Leaked: a plan is a few words a compile, and
+    /// these maps are copied by value.
+    pub new_lane: Option<&'static NewLanePlan>,
+}
+
+/// One value of a [`NewLanePlan`]'s instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewLaneVal {
+    /// The `i`th argument of the call.
+    Arg(u16),
+    /// A value known at compile time, not a heap one.
+    Bits(u64),
+}
+
+/// `new C(...)` of a constructor whose body only stores its arguments and
+/// constants into `this`, answered in compiled code (`emit_new_lane`): the
+/// finished instance, in a ready object, with no call. The guards are the
+/// helper's (`Vm::store_proof_holds`), and any miss takes that helper.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NewLanePlan {
+    pub callee_bits: u64,
+    pub callee_ver: u32,
+    pub epoch: u32,
+    /// Heap slots and versions the proof read.
+    pub hops: Vec<(u32, u32)>,
+    /// The instance's class, or for a plain function's its [[Prototype]].
+    pub class: Option<u32>,
+    pub proto: Option<u32>,
+    pub shape: u32,
+    /// A borrowed handle on the shape's key list.
+    pub keys: u64,
+    pub vals: Vec<NewLaneVal>,
 }
 
 /// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the

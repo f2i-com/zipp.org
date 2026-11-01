@@ -195,7 +195,122 @@ fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreS
 /// as one for an instance not yet made does.
 const NO_INSTANCE: u32 = u32::MAX;
 
+/// Sites [`Vm::note_new_site`] remembers. Direct-mapped: the sites a program
+/// compiles with are the ones running now.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const NEW_SITES: usize = 64;
+
+/// One remembered `new` site: `(func << 32) | ip`, the callee's bits and its
+/// slot's version.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) type NewSite = (u64, u64, u32);
+
 impl<'p> Vm<'p> {
+    /// The interpreter ran `new` at this ip of the running function with the
+    /// callee `cv`: what a compile of the site plans against.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(never)]
+    pub(crate) fn note_new_site(&mut self, ip: usize, cv: Value) {
+        if !cv.is_heap() {
+            return;
+        }
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        let key = ((frame.func as u64) << 32) | ip as u64;
+        if self.new_sites.is_empty() {
+            self.new_sites = vec![(u64::MAX, 0, 0); NEW_SITES];
+        }
+        let at = (key ^ (key >> 32)) as usize % NEW_SITES;
+        self.new_sites[at] = (key, cv.bits(), self.heap.version_of(cv.heap_index()));
+    }
+
+    /// Plan a lane for each `New` site of `func_id` whose constructor, as last
+    /// seen there, only stores its arguments (see [`crate::codegen::NewLanePlan`]).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn plan_new_lanes(&mut self, func_id: u32, plan: &mut crate::codegen::CrossCallPlan) {
+        if !ctor_store_enabled() || !crate::heap::ready_objects_enabled() || self.new_sites.is_empty() {
+            return;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return;
+        }
+        let code = &self.func(func_id as usize).code;
+        let sites: Vec<(usize, u16)> = code
+            .iter()
+            .enumerate()
+            .filter_map(|(ip, i)| match *i {
+                Instr::New { argc, .. } => Some((ip, argc)),
+                _ => None,
+            })
+            .collect();
+        for (ip, argc) in sites {
+            let key = ((func_id as u64) << 32) | ip as u64;
+            let (site, bits, ver) = self.new_sites[(key ^ (key >> 32)) as usize % NEW_SITES];
+            if site != key || self.heap.version_of(Value::from_bits(bits).heap_index()) != ver {
+                continue;
+            }
+            if let Some(lane) = self.plan_new_lane(bits, ver, argc) {
+                if crate::jitlog_enabled() {
+                    eprintln!("[new] fn{func_id}@{ip} NEW-LANE {} stores, class {:?}", lane.vals.len(), lane.class);
+                }
+                plan.entry(ip).or_default().new_lane = Some(Box::leak(Box::new(lane)));
+            }
+        }
+    }
+
+    /// [`Self::plan_new_lanes`] for one callee: the constructor's stores, and
+    /// the proof `ctor_store_new` would make for them now.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plan_new_lane(&mut self, bits: u64, callee_ver: u32, argc: u16) -> Option<crate::codegen::NewLanePlan> {
+        use crate::codegen::{NewLanePlan, NewLaneVal};
+        let cv = Value::from_bits(bits);
+        let ci = cv.heap_index();
+        let (fid, class, proto) = if matches!(self.heap.get(ci), HeapObj::Class(_)) {
+            (self.flat_new_class_target(cv)?.0, ci, None)
+        } else {
+            let (fid, _closure) = self.ic_plain_fn(cv)?;
+            let p = self.func(fid as usize);
+            if p.non_constructable
+                || p.lexical_this
+                || !self.obj_realm.is_empty()
+                || !self.realm_global_objs.is_empty()
+                || self.get_function_realm(cv) != 0
+            {
+                return None;
+            }
+            let proto = self.prototype_of(cv).filter(|&p| self.is_object_value(p))?;
+            (fid, u32::MAX, Some(proto.heap_index()))
+        };
+        let keys = scan_store_body(self.func(fid as usize))?;
+        let proof = self.prove_stores(class, proto.unwrap_or(u32::MAX), &keys)?;
+        crate::heap::val_slab_class(keys.len())?;
+        let vals = keys
+            .iter()
+            .map(|(_, src)| match *src {
+                StoreSrc::Arg(a) if a < argc => NewLaneVal::Arg(a),
+                StoreSrc::Arg(_) => NewLaneVal::Bits(Value::UNDEFINED.bits()),
+                StoreSrc::Bits(b) => NewLaneVal::Bits(b),
+            })
+            .collect();
+        let mut hops = proof.hops.clone();
+        if class != u32::MAX {
+            hops.push((class, proof.class_ver));
+        }
+        Some(NewLanePlan {
+            callee_bits: bits,
+            callee_ver,
+            epoch: proof.epoch,
+            hops,
+            class: (class != u32::MAX).then_some(class),
+            proto,
+            shape: proof.shape,
+            keys: crate::bytecode::PlanHandle::borrowed_bits(&proof.plan),
+            vals,
+        })
+    }
+
     /// `new` of the store-only constructor body `fid` from compiled code,
     /// for an instance of the class `class` (a base class with no instance
     /// fields) or, for a plain function (`class` = `u32::MAX`), with the
@@ -310,6 +425,12 @@ impl<'p> Vm<'p> {
                 StoreSrc::Bits(b) => Value::from_bits(b),
             };
         }
+        // SAFETY: the proof's plan is the VM's own for that shape
+        // (`shape_key_plans`), never removed or replaced, and its heap's maps
+        // die with it.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let idx = unsafe { self.heap.alloc_finalized_borrowed(&proof.plan, &vals[..keys.len()], proof.shape) };
+        #[cfg(feature = "safe-sandbox")]
         let idx = self.heap.alloc_finalized(&proof.plan, &vals[..keys.len()], proof.shape);
         if class != u32::MAX {
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {

@@ -6249,14 +6249,20 @@ fn jit_add_way_hit(
     }
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     let plan = if w.planned {
-        vm.shape_key_plans.get(w.after as usize).cloned().flatten()
+        vm.shape_key_plans.get(w.after as usize).and_then(Option::as_ref)
     } else {
         None
     };
+    let borrow = crate::bytecode::plan_borrow_enabled();
     match vm.heap.get_mut(idx) {
-        HeapObj::Object(map) => {
-            map.append_data_shaped(key, Value::from_bits(val_bits), w.after, plan)
-        }
+        HeapObj::Object(map) => match plan {
+            // SAFETY: the VM's shape plans are never removed or replaced, and
+            // its heap's maps die with it.
+            Some(p) if p.len() == map.slot_len() + 1 => unsafe {
+                map.append_data_planned(key, Value::from_bits(val_bits), w.after, p, borrow)
+            },
+            _ => map.append_data_shaped(key, Value::from_bits(val_bits), w.after, None),
+        },
         _ => return false,
     }
     vm.heap.bump_version(idx);

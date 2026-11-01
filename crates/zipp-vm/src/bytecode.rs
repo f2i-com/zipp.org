@@ -4431,6 +4431,12 @@ impl PlanHandle {
         }
     }
 
+    /// The word a borrowed handle on `plan` is, for compiled code to store.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn borrowed_bits(plan: &StaticKeyPlan) -> u64 {
+        std::sync::Arc::as_ptr(&plan.0).expose_provenance() as u64 | Self::BORROWED as u64
+    }
+
     #[inline]
     fn ptr(&self) -> *const StaticKeyPlanData {
         self.tagged.as_ptr().map_addr(|a| a & !Self::BORROWED).cast_const()

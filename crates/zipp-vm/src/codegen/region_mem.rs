@@ -3657,6 +3657,10 @@ pub(crate) fn compile_region_mem(
                 // `jit_new_ic`, with the call protocol (a throw bails, the
                 // constructor ran user code so everything is refetched).
                 // Without it a loop that constructed was not compiled at all.
+                let lane_done = cross_plan
+                    .get(&ip)
+                    .and_then(|site| site.new_lane)
+                    .map(|lane| emit_new_lane(&mut ops, lane, callee, arg_base, dst));
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
                 emit_region_call_ic(
@@ -3672,6 +3676,9 @@ pub(crate) fn compile_region_mem(
                     refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                     ta_refetch,
                 );
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; =>done);
+                }
             }
             // Literal building, as Tier C emits it (`compile_proto_mem`):
             // one helper call each, with the region's refetch after an
@@ -3797,6 +3804,7 @@ pub(crate) fn compile_region_mem(
                 // (same fold, same thread-local transition tree), so the two
                 // forms are observably identical; the baked helper keeps only
                 // the checks a compile cannot freeze (window bounds, GC poll).
+                let mut ready_done = None;
                 let baked = if super::finalize_baked_enabled() {
                     proto
                         .static_key_plans
@@ -3828,6 +3836,7 @@ pub(crate) fn compile_region_mem(
                     let thin = crate::heap::thin_alloc_enabled()
                         && (val_base as usize + count as usize) <= proto.reg_count as usize;
                     if thin {
+                        ready_done = emit_ready_literal(&mut ops, proto, plan, shape, val_base, count, dst);
                         let helper = crate::vm::jit_finalize_object_thin as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
@@ -3880,6 +3889,9 @@ pub(crate) fn compile_region_mem(
                 }
                 if let Some((snap, tplan, cache)) = ta_refetch {
                     emit_cross_refetch_ta(&mut ops, snap, tplan, cache);
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; =>done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }

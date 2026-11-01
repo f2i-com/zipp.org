@@ -2390,6 +2390,7 @@ impl<'p> Vm<'p> {
                     cross3m: None,
                     class_method: false,
                     class_getter: false,
+                    new_lane: None,
                 },
             );
         }

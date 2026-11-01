@@ -804,6 +804,7 @@ impl<'p> Vm<'p> {
                     if v.is_heap() {
                         self.prototypes.insert(idx, v.heap_index());
                     }
+                    self.heap.bump_version(idx);
                 }
             }
             if !is_class && wr == Some(false) {

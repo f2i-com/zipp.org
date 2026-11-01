@@ -4720,6 +4720,7 @@ pub(crate) fn compile_proto_mem(
                 // (same fold, same thread-local transition tree), so the two
                 // forms are observably identical; the baked helper keeps only
                 // the checks a compile cannot freeze (window bounds, GC poll).
+                let mut ready_done = None;
                 let baked = if super::finalize_baked_enabled() {
                     proto
                         .static_key_plans
@@ -4751,6 +4752,7 @@ pub(crate) fn compile_proto_mem(
                     let thin = crate::heap::thin_alloc_enabled()
                         && (val_base as usize + count as usize) <= proto.reg_count as usize;
                     if thin {
+                        ready_done = emit_ready_literal(&mut ops, proto, plan, shape, val_base, count, dst);
                         let helper = crate::vm::jit_finalize_object_thin as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
@@ -4800,6 +4802,9 @@ pub(crate) fn compile_proto_mem(
                 }
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; =>done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -7064,6 +7069,10 @@ pub(crate) fn compile_proto_mem(
             } => {
                 // `new F(args…)` through `jit_new_ic`, with the call
                 // protocol; see the region arm.
+                let lane_done = cross_plan
+                    .get(&ip)
+                    .and_then(|site| site.new_lane)
+                    .map(|lane| emit_new_lane(&mut ops, lane, callee, arg_base, dst));
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
                 emit_region_call_ic(
@@ -7079,6 +7088,9 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; =>done);
+                }
             }
             Instr::RegExpMethod {
                 dst,

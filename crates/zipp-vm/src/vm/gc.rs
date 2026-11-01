@@ -211,7 +211,7 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
     }
 }
 
-/// `proto_of`: the table's own walks, with its link copy kept in step.
+/// `proto_of`: one store a slot, so the freed list is always the walk.
 impl SlotKeyed for crate::slot_table::ProtoTable {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
@@ -219,16 +219,12 @@ impl SlotKeyed for crate::slot_table::ProtoTable {
     }
 
     #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
         if self.is_empty() {
             return;
         }
-        if self.len() <= freed.len() {
-            self.retain(|&k| live[k as usize]);
-        } else {
-            for &i in freed {
-                self.forget(i);
-            }
+        for &i in freed {
+            self.forget(i);
         }
     }
 }
@@ -459,6 +455,8 @@ impl Vm<'_> {
 
     fn gc(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.ready_abandon();
         let n = self.heap.len();
         let floor = self.gc_floor as usize;
         if floor == 0 || n <= floor {
@@ -1299,27 +1297,41 @@ impl Vm<'_> {
         }
         self.process_weak_references(&marks, n);
         let log_len = self.heap.young_log().len();
+        let allocated = self.heap.young_allocated();
         // `free_slot` appends every reclaimed young slot to `Heap::free`.
         // No heap slot can be allocated or reused during this collector-only
         // window, so the appended suffix is the exact freed set in sweep order.
         // Reuse it rather than allocating and filling a duplicate `Vec<u32>`.
         let free_before = self.heap.free_indices().len();
         let swept = self.heap.sweep_young(&marks);
-        debug_assert_eq!(self.heap.free_indices().len() - free_before, swept);
+        // The young log now lists what the sweep made ready, dead like the
+        // freed slots and in the same tables.
+        let recycled = self.heap.young_log().len();
+        debug_assert_eq!(self.heap.free_indices().len() - free_before + recycled, swept);
         let t_sweep = gcstats::now(stats);
         // W10 survival-adaptive budget (B123) — before note_minor_done reads
         // it for the next threshold. Skipped under stress: epochs of ~1 alloc
         // make the ratio noise, and stress ignores gc_threshold anyway.
         if !self.gc_stress {
-            self.heap.adapt_young_budget(log_len - swept, log_len);
+            self.heap.adapt_young_budget(log_len - swept, allocated);
         }
         // A minor prunes only what it FREED (see `prune_freed`); the
         // whole-table retains are the major's.
-        self.prune_freed(free_before, &marks);
+        let freed = self.heap.take_free();
+        self.prune_freed(&freed[free_before..], &marks);
+        self.heap.restore_free(freed);
+        let ready = self.heap.take_young();
+        self.prune_freed(&ready, &marks);
+        self.heap.restore_young(ready);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
         // all-true again: exactly the next minor's base. Stash it for reuse.
+        // A ready object's slot goes back to true too: the next minor finds
+        // it in the young log, as it finds every young slot.
         for &i in &self.heap.free_indices()[free_before..] {
+            marks[i as usize] = true;
+        }
+        for &i in self.heap.young_log() {
             marks[i as usize] = true;
         }
         self.heap.stash_nonyoung_marks(marks);
@@ -1341,7 +1353,7 @@ impl Vm<'_> {
         );
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
-        self.heap.note_minor_done(n - free_after);
+        self.heap.note_minor_done(n - free_after - recycled);
         // Every queued job's Values were roots of this collection and are
         // old now (survivors are promoted).
         self.microtasks_old = self.microtasks.len();
@@ -1398,11 +1410,7 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
-    fn prune_freed(&mut self, free_before: usize, live_bits: &[bool]) {
-        // `sweep_young` is the only operation between `free_before`'s capture
-        // and this call. It only appends to the free list, so this suffix is
-        // stable and contains each slot reclaimed by this minor exactly once.
-        let freed = &self.heap.free_indices()[free_before..];
+    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
         if freed.is_empty() {
             return;
         }

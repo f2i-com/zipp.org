@@ -1910,6 +1910,9 @@ impl<'p> Vm<'p> {
                 if val.is_heap() {
                     self.prototypes.insert(idx, val.heap_index());
                 }
+                // A compiled `new` of this function guards its version
+                // (`NewLanePlan`), with its prototype baked.
+                self.heap.bump_version(idx);
             } else {
                 // An existing NON-WRITABLE own data property (e.g. a function `name`
                 // set by NamedEvaluation/SetFunctionName) rejects assignment, and

@@ -48,6 +48,171 @@ env_off_switch! {
     fn typeof_small_bigint_enabled() = "ZIPP_NO_TYPEOF_SMALL_BIGINT"
 }
 
+/// A baked literal's allocation without a call: take the next ready object of
+/// its slab class (`Heap::ready`) and fill it, as `ObjMap::ready_fill` does.
+/// There is no safe point, so no value moves and nothing needs refetching.
+/// Falls through to the helper the caller emits next when the class has none
+/// ready, and the helper's refill and poll are what make a loop of these
+/// collect; the caller binds the returned label after that helper's tail.
+/// `None`: the caller emits the helper alone.
+pub(crate) fn emit_ready_literal(
+    ops: &mut dynasmrt::x64::Assembler,
+    proto: &crate::bytecode::FuncProto,
+    plan: u16,
+    shape: u32,
+    val_base: u16,
+    count: u16,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    let class = crate::heap::val_slab_class(count as usize)? as usize;
+    let plan = proto.static_key_plans.get(plan as usize)?;
+    let handle = crate::bytecode::PlanHandle::borrowed_bits(plan);
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    emit_ready_take(ops, class, miss);
+    for i in 0..count {
+        dynasm!(ops
+            ; mov r8, [rbx + dreg(val_base + i)]
+            ; mov [rcx + i as i32 * 8], r8
+        );
+    }
+    emit_ready_fill(ops, handle, shape, count as i32, None, dst);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
+}
+
+/// Take the next ready object of slab class `class`, or jump to `miss`:
+/// rdx = its map, rcx = its value cell, rax = its slot.
+fn emit_ready_take(ops: &mut dynasmrt::x64::Assembler, class: usize, miss: dynasmrt::DynamicLabel) {
+    use crate::heap::{ReadyClass, ReadyObj};
+    let next = (crate::vm::host_api::JIT_READY_OFFSET + class * std::mem::size_of::<ReadyClass>()) as i32;
+    dynasm!(ops
+        ; mov rax, [rdi + next]
+        ; cmp rax, [rdi + next + 8]
+        ; je =>miss
+        ; lea rcx, [rax + std::mem::size_of::<ReadyObj>() as i32]
+        ; mov [rdi + next], rcx
+        ; mov rdx, [rax]
+        ; mov rcx, [rax + 8]
+        ; mov eax, [rax + 16]
+    );
+}
+
+/// Finish the object [`emit_ready_take`] took, `n` values in its cell, with
+/// the key list `handle` and `shape`, and put it in `dst`. `class`: the
+/// instance's class, for its map and its hot record.
+fn emit_ready_fill(
+    ops: &mut dynasmrt::x64::Assembler,
+    handle: u64,
+    shape: u32,
+    n: i32,
+    class: Option<u32>,
+    dst: u16,
+) {
+    let l = crate::heap::ready_layout();
+    dynasm!(ops
+        ; mov DWORD [rdx + l.shape], shape as i32
+        ; mov r8, QWORD handle as i64
+        ; mov [rdx + l.keys_all], r8
+        ; mov QWORD [rdx + l.keys_len], n
+        ; mov DWORD [rdx + l.attrs_len], n
+        ; add QWORD [rdx + l.vals_owner_len], n
+        ; mov r8, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; mov rcx, rax
+        ; shl rcx, 4
+        ; mov DWORD [r8 + rcx], shape as i32
+    );
+    if let Some(class) = class {
+        let (word, fid) = crate::heap::class_words(class);
+        dynasm!(ops
+            ; mov DWORD [r8 + rcx + crate::vm::host_api::JIT_HOT_FID_OFF as i32], fid as i32
+            ; mov r8, QWORD word as i64
+            ; mov [rdx + l.class], r8
+        );
+    }
+    dynasm!(ops
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
+/// `lane`'s instance in `dst`, or a fall through to the helper the caller
+/// emits next, nothing done; the caller binds the returned label after it.
+pub(crate) fn emit_new_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    callee: u16,
+    arg_base: u16,
+    dst: u16,
+) -> dynasmrt::DynamicLabel {
+    use crate::vm::host_api::{
+        JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_GEN_RAW_OFFSET, JIT_PROTO_COUNT_OFFSET, JIT_PROTO_LEN_OFFSET,
+        JIT_PROTO_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]
+        ; mov r10, QWORD lane.callee_bits as i64
+        ; cmp rax, r10
+        ; jne =>miss
+        ; mov ecx, eax
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + rcx * 4], lane.callee_ver as i32
+        ; jne =>miss
+        ; cmp DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32], lane.epoch as i32
+        ; jne =>miss
+    );
+    for &(slot, ver) in &lane.hops {
+        dynasm!(ops
+            ; cmp DWORD [r11 + slot as i32 * 4], ver as i32
+            ; jne =>miss
+        );
+    }
+    // A prototype no collection has seen must be logged for the next one
+    // (`ProtoTable::fresh`): the helper's store does that, once.
+    if let Some(proto) = lane.proto {
+        dynasm!(ops
+            ; mov r8, [rdi + JIT_GEN_RAW_OFFSET as i32]
+            ; test BYTE [r8 + proto as i32], crate::heap::GEN_STATE as i8
+            ; jz =>miss
+        );
+    }
+    let n = lane.vals.len();
+    let Some(class) = crate::heap::val_slab_class(n) else {
+        unreachable!("the planner took a slab class's worth of stores")
+    };
+    emit_ready_take(ops, class as usize, miss);
+    if let Some(proto) = lane.proto {
+        dynasm!(ops
+            ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae =>miss
+            ; mov r8, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; mov r9, QWORD crate::value::Value::heap(proto).bits() as i64
+            ; mov [r8 + rax * 8], r9
+            ; inc QWORD [rdi + JIT_PROTO_COUNT_OFFSET as i32]
+        );
+    }
+    for (i, v) in lane.vals.iter().enumerate() {
+        match *v {
+            NewLaneVal::Arg(a) => dynasm!(ops ; mov r8, [rbx + dreg(arg_base + a)]),
+            NewLaneVal::Bits(b) => dynasm!(ops ; mov r8, QWORD b as i64),
+        }
+        dynasm!(ops ; mov [rcx + i as i32 * 8], r8);
+    }
+    emit_ready_fill(ops, lane.keys, lane.shape, n as i32, lane.class, dst);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    done
+}
+
 /// `TypeOfIs { dst, a, code, neg }` — `dst = (typeof a === TYPEOF_NAMES[code])
 /// != neg` as Bool bits — shared by the Tier-C and region emitters.
 ///

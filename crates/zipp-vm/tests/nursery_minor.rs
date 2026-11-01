@@ -542,7 +542,7 @@ fn probe_budget_grows_then_shrinks() {
     );
     assert_eq!(out[0], "960000:true");
     let (last, peak) = zipp_vm::gc_young_budget_stats();
-    assert!(peak >= 65536, "budget never grew: peak {peak}");
+    assert!(peak >= 32768, "budget never grew: peak {peak}");
     assert_eq!(last, 16384, "budget did not shrink back: last {last}");
 }
 

@@ -2234,7 +2234,7 @@ const VAL_SLAB_CLASS_COUNT: usize = 5;
 /// that boundary penalty without changing the allocation/copy path.
 #[cfg(not(feature = "safe-sandbox"))]
 #[inline]
-fn val_slab_class(count: usize) -> Option<u8> {
+pub(crate) fn val_slab_class(count: usize) -> Option<u8> {
     match count {
         1..=4 => Some(0),
         5 => Some(1),
@@ -2339,6 +2339,156 @@ impl ValSlabClass {
             + vec_capacity_bytes(&self.chunks)
             + vec_capacity_bytes(&self.free)
     }
+}
+
+/// An empty plain object, made and installed ahead of its use, for a literal
+/// or a constructor to take without a call: its slot is a young
+/// `HeapObj::Object`, its map holds an empty planned key list and an empty
+/// slab cell, and nothing refers to it. Taking one is filling these fields.
+///
+/// Compiled code reads `map` at +0, `vals` at +8 and `idx` at +16.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ReadyObj {
+    /// The `ObjMap`, its box owned by the object's slot.
+    map: usize,
+    /// The first slot of its value cell.
+    vals: usize,
+    idx: u32,
+}
+
+/// The ready objects of one slab class, `next..end` of `buf`. Compiled code
+/// takes from the front through `next`, and falls to a helper at `end`.
+///
+/// A ready object is an ordinary garbage object until it is taken, so the
+/// collector needs nothing for them: a collection just empties the window
+/// (`Heap::ready_abandon`), and the sweep frees those left like any others.
+///
+/// They come from two places. A minor sweep turns the plain objects it finds
+/// dead straight into ready ones, up to what the class took in the last
+/// epoch (`Heap::ready_recycle`): a short-lived object's slot, map and cell
+/// stay together, and tearing them apart to build them again was most of what
+/// it cost. Past that, `Heap::ready_refill` makes a batch by the allocating
+/// path. An object the sweep made was not counted live until the window that
+/// holds it runs out (`uncounted`), which is when the collection trigger looks.
+///
+/// Compiled code reads `next` at +0 and `end` at +8.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+pub(crate) struct ReadyClass {
+    next: usize,
+    end: usize,
+    /// The first of this window.
+    start: usize,
+    buf: Vec<ReadyObj>,
+    /// How many the next refill makes.
+    batch: usize,
+    /// Taken this epoch, before this window.
+    taken: usize,
+    /// How many the next sweep keeps ready.
+    demand: usize,
+    /// The window's objects are not in `Heap::live` yet.
+    uncounted: bool,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ReadyClass {
+    /// Take from the whole of `buf`.
+    fn open(&mut self) {
+        self.start = self.buf.as_ptr().expose_provenance();
+        self.next = self.start;
+        self.end = self.start + self.buf.len() * std::mem::size_of::<ReadyObj>();
+    }
+}
+
+/// A program that allocates a little pays for few; one that keeps allocating
+/// reaches this many a refill.
+#[cfg(not(feature = "safe-sandbox"))]
+const READY_BATCH_MIN: usize = 8;
+#[cfg(not(feature = "safe-sandbox"))]
+const READY_BATCH_MAX: usize = 256;
+
+/// The key plan of no keys, a ready object's until it is filled.
+#[cfg(not(feature = "safe-sandbox"))]
+fn empty_key_plan() -> &'static StaticKeyPlan {
+    static EMPTY: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| StaticKeyPlan::new(Vec::new()))
+}
+
+/// [`ReadyLayout`], from a map in the form a ready object has.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn ready_layout() -> ReadyLayout {
+    let mut m = ObjMap::new();
+    m.ready_keys();
+    m.vals = ValStore::Slab {
+        base: 0,
+        owner_and_len: 0,
+    };
+    m.attrs = PropAttrs::AllData { len: 0 };
+    let at = |p: *const u8, m: &ObjMap| {
+        (p.expose_provenance() - std::ptr::from_ref(m).cast::<u8>().expose_provenance()) as i32
+    };
+    let (mut keys_all, mut keys_len, mut attrs_len, mut vals_owner_len) = (0, 0, 0, 0);
+    if let PropKeys::Planned { all, visible_len } = &m.keys {
+        keys_all = at(std::ptr::from_ref(all).cast(), &m);
+        keys_len = at(std::ptr::from_ref(visible_len).cast(), &m);
+    }
+    if let PropAttrs::AllData { len } = &m.attrs {
+        attrs_len = at(std::ptr::from_ref(len).cast(), &m);
+    }
+    if let ValStore::Slab { owner_and_len, .. } = &m.vals {
+        vals_owner_len = at(std::ptr::from_ref(owner_and_len).cast(), &m);
+    }
+    let shape = at(std::ptr::from_ref(&m.shape).cast(), &m);
+    let class = at(std::ptr::from_ref(&m.class).cast(), &m);
+    // The form was written just above: nothing here is left at zero but the
+    // shape, the map's first field.
+    assert!(shape == 0 && keys_all != 0 && keys_len != 0 && attrs_len != 0 && vals_owner_len != 0);
+    assert!(std::mem::size_of::<Option<u32>>() == 8);
+    ReadyLayout { shape, keys_all, keys_len, attrs_len, vals_owner_len, class }
+}
+
+/// `ZIPP_NO_READY_OBJECTS=1`: every object takes the allocating path (the
+/// same-binary A/B).
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) fn ready_objects_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_READY_OBJECTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Where compiled code writes in a ready object's map. Enum payloads have no
+/// `offset_of!`, so these are read off a real map once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct ReadyLayout {
+    pub(crate) shape: i32,
+    pub(crate) keys_all: i32,
+    pub(crate) keys_len: i32,
+    pub(crate) attrs_len: i32,
+    pub(crate) vals_owner_len: i32,
+    pub(crate) class: i32,
+}
+
+/// The `ObjMap::class` word and the hot record's fid word of an instance of
+/// `class`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn class_words(class: u32) -> (u64, u32) {
+    let mut m = ObjMap::new();
+    m.class = Some(class);
+    // `Option<u32>` is two initialized `u32`s when `Some`.
+    // SAFETY: it is 8 bytes, 4-aligned; read unaligned, with no bit invalid.
+    let word = unsafe { std::ptr::read_unaligned(std::ptr::from_ref(&m.class).cast::<u64>()) };
+    (word, object_mirror_fid(&m))
 }
 
 /// The attribute column of an [`ObjMap`], with the all-default case elided.
@@ -2575,6 +2725,74 @@ impl ObjMap {
         let (keys, cloned) = self.keys.make_owned();
         keys.reserve_exact(additional);
         key_bytes_add(&mut self.key_bytes, cloned);
+    }
+
+    /// Make a new empty map's key list the empty plan, the form a ready
+    /// object is filled from (see [`ReadyClass`]).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_keys(&mut self) {
+        self.keys = PropKeys::Planned {
+            all: PlanHandle::of_static(empty_key_plan()),
+            visible_len: 0,
+        };
+    }
+
+    /// Empty a dead map into the form a ready object has, and say so: `false`,
+    /// with nothing changed, for one that holds more than a plain object's
+    /// planned keys and slab cell.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_reset(&mut self, empty: &'static StaticKeyPlan) -> bool {
+        if self.shape == crate::shape::DICT
+            || !self.extensible
+            || self.is_ctor
+            || self.class_proto
+            || self.frozen
+            || self.sealed
+            || self.is_raw_json
+            || self.has_element_key
+            || self.planned_append_failed
+            || self.index.is_some()
+            || self.numeric_index.is_some()
+        {
+            return false;
+        }
+        let (PropKeys::Planned { all, visible_len }, ValStore::Slab { owner_and_len, .. }, PropAttrs::AllData { len }) =
+            (&mut self.keys, &mut self.vals, &mut self.attrs)
+        else {
+            return false;
+        };
+        *all = PlanHandle::of_static(empty);
+        *visible_len = 0;
+        *owner_and_len &= !VAL_SLAB_OWNER_LEN_MASK;
+        *len = 0;
+        self.shape = crate::shape::EMPTY;
+        self.class = None;
+        self.key_bytes = 0;
+        true
+    }
+
+    /// Fill a ready object's map with `n` values, already in its cell, as
+    /// `plan`'s literal.
+    ///
+    /// # Safety
+    ///
+    /// As [`PlanHandle::borrowed`], for `plan`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    unsafe fn ready_fill(&mut self, plan: &StaticKeyPlan, n: usize, shape: u32) {
+        if let PropKeys::Planned { all, visible_len } = &mut self.keys {
+            // The handle replaced is the empty plan's, borrowed: no count to
+            // give back.
+            // SAFETY: this function's contract.
+            unsafe { std::ptr::write(all, PlanHandle::borrowed(plan)) };
+            *visible_len = n;
+        }
+        if let ValStore::Slab { owner_and_len, .. } = &mut self.vals {
+            *owner_and_len |= n;
+        }
+        self.attrs = PropAttrs::AllData { len: n as u32 };
+        self.shape = shape;
     }
 
     /// Replace the whole key list, counting what the new one owns.
@@ -7423,6 +7641,15 @@ pub struct Heap {
     pub(crate) arr_mirror_len: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
+    /// Objects a literal can take without a call, by slab class.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ready: [ReadyClass; VAL_SLAB_CLASS_COUNT],
+    #[cfg(not(feature = "safe-sandbox"))]
+    ready_on: bool,
+    /// Ready objects the last abandon found untaken: in the young log, but
+    /// nothing the program allocated.
+    #[cfg(not(feature = "safe-sandbox"))]
+    ready_untaken: usize,
     /// Raw base of `gen` (B264): the inline dense-array store lane tests the
     /// holder's generation byte through it -- a YOUNG holder (state bits 0)
     /// needs no barrier in either barrier mode. Refreshed wherever `gen` can
@@ -7831,7 +8058,7 @@ const GEN_OLD: u8 = 1;
 /// `GEN_DIRTY`: old AND in the remembered set (the dedup bit of the barrier).
 const GEN_DIRTY: u8 = 2;
 /// Mask selecting the state bits out of a `Heap::gen` byte.
-const GEN_STATE: u8 = 0b11;
+pub(crate) const GEN_STATE: u8 = 0b11;
 /// `GEN_STATE` for the emitted store lane's `test byte` (a holder whose
 /// state bits are zero is YOUNG and needs no barrier).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8336,6 +8563,24 @@ impl Heap {
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready: std::array::from_fn(|_| ReadyClass {
+                next: 0,
+                end: 0,
+                start: 0,
+                buf: Vec::new(),
+                batch: READY_BATCH_MIN,
+                taken: 0,
+                demand: 0,
+                uncounted: false,
+            }),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_untaken: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_on: ready_objects_enabled()
+                && thin_alloc_default()
+                && attrs_elide_enabled()
+                && crate::bytecode::plan_borrow_enabled(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             gen_raw: 0,
             versions,
@@ -8772,6 +9017,27 @@ impl Heap {
     ) -> u32 {
         debug_assert!(self.thin_alloc);
         let class = val_slab_class(vals.len());
+        if borrow && !plan.has_element_key() && vals.len() < PLANNED_INDEX_THRESHOLD {
+            if let Some(ready) = class.and_then(|c| self.ready_take(c as usize)) {
+                // SAFETY: the cell has room for this class, and is unaliased
+                // (its object is unreachable); `vals` may be the register
+                // window, which is not the cell. The plan: this function's
+                // contract.
+                unsafe {
+                    copy_vals_by_word(
+                        vals.as_ptr(),
+                        std::ptr::with_exposed_provenance_mut::<Value>(ready.vals),
+                        vals.len(),
+                    );
+                    (*std::ptr::with_exposed_provenance_mut::<ObjMap>(ready.map)).ready_fill(plan, vals.len(), shape);
+                }
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[ready.idx as usize].shape = shape;
+                }
+                return ready.idx;
+            }
+        }
         // B258: the pooled shell is popped FIRST so the slab cell it may
         // still carry (see `free_slot`'s pool arm) can hold THIS literal's
         // values: same class means `cap >= vals.len()`, and the copy below
@@ -8906,6 +9172,160 @@ impl Heap {
         self.alloc_object_settled_thin(boxed, shape)
     }
 
+    /// The next ready object of slab class `class`, refilling the buffer when
+    /// it is out. `None`: this heap is not using them.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_take(&mut self, class: usize) -> Option<ReadyObj> {
+        let r = &mut self.ready[class];
+        if r.next == r.end && !self.ready_refill(class) {
+            return None;
+        }
+        let r = &mut self.ready[class];
+        // SAFETY: `next` is inside `buf`, below `end` (the refill above left
+        // at least one).
+        let e = unsafe { *std::ptr::with_exposed_provenance::<ReadyObj>(r.next) };
+        r.next += std::mem::size_of::<ReadyObj>();
+        Some(e)
+    }
+
+    /// Make the next batch of ready objects of `class`. The allocating path
+    /// makes each, so its accounting, its collection trigger and its growth
+    /// are the ordinary ones; `false` when a heap is in a mode that must see
+    /// every value stored (an audit, an oracle) or a young object would not
+    /// be young (a pretenure scope), whose inline stores have no barrier.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn ready_refill(&mut self, class: usize) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        let cap = val_slab_class_cap(class as u8);
+        let r = &mut self.ready[class];
+        let used = r.buf.len();
+        r.taken += used;
+        if std::mem::take(&mut r.uncounted) {
+            self.live += used;
+            if self.live >= self.gc_threshold {
+                self.gc_requested = true;
+            }
+        }
+        let r = &mut self.ready[class];
+        let want = r.batch;
+        r.batch = (want * 2).min(READY_BATCH_MAX);
+        let mut buf = std::mem::take(&mut r.buf);
+        buf.clear();
+        buf.reserve(want);
+        for _ in 0..want {
+            let idx = self.alloc_ctor_object_new(cap, None);
+            let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
+                unreachable!("alloc_ctor_object_new made an object")
+            };
+            m.ready_keys();
+            buf.push(ReadyObj {
+                map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
+                vals: m.vals.as_ptr().expose_provenance(),
+                idx,
+            });
+        }
+        self.ready[class].buf = buf;
+        self.ready[class].open();
+        true
+    }
+
+    /// Before a minor's sweep: whether it may make ready objects, the
+    /// classes' buffers emptied for it if so.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_recycle_begin(&mut self) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        // A window longer than the young budget would put the next collection
+        // past it, where the budget's own controller cannot see survival.
+        let budget = self.young_budget;
+        for r in &mut self.ready {
+            r.demand = r.demand.min(budget);
+            r.buf.clear();
+            r.buf.reserve(r.demand);
+        }
+        true
+    }
+
+    /// Slot `idx`'s occupant is dead: make it a ready object again if it is a
+    /// plain object its class wants. It stays where it is, an empty young
+    /// object: its slot gets a new version as a freed one does, so no cache
+    /// that knew it can hit, and it stays in the young log, whose reader is
+    /// the sweep that just found it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_recycle(&mut self, idx: u32, empty: &'static StaticKeyPlan) -> bool {
+        let slab = self.val_slab.as_ptr().expose_provenance();
+        let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
+            return false;
+        };
+        let (base, owner) = match &m.vals {
+            ValStore::Slab { base, owner_and_len } => (*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK),
+            ValStore::Vec(_) => return false,
+        };
+        let class = (owner - slab) / std::mem::size_of::<ValSlabClass>();
+        let r = &mut self.ready[class];
+        if r.buf.len() >= r.demand || !m.ready_reset(empty) {
+            return false;
+        }
+        r.buf.push(ReadyObj {
+            map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
+            vals: base,
+            idx,
+        });
+        #[cfg(feature = "jit")]
+        {
+            self.hot_mirror[idx as usize] = HotMirror {
+                shape: crate::shape::EMPTY,
+                fid: FID_MIRROR_NONE,
+                vals: base as u64,
+            };
+        }
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.gen[idx as usize] = GEN_YOUNG;
+        true
+    }
+
+    /// After a minor's sweep: open the windows it filled.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_recycle_end(&mut self) {
+        for r in &mut self.ready {
+            r.open();
+            r.uncounted = !r.buf.is_empty();
+        }
+    }
+
+    /// Forget the ready objects not taken: a collection is about to run, and
+    /// they are garbage like any other (see [`ReadyClass`]).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn ready_abandon(&mut self) {
+        self.ready_untaken = 0;
+        for r in &mut self.ready {
+            self.ready_untaken += (r.end - r.next) / std::mem::size_of::<ReadyObj>();
+            let used = (r.next - r.start) / std::mem::size_of::<ReadyObj>();
+            r.demand = (r.taken + used) * 5 / 4;
+            r.taken = 0;
+            r.start = r.end;
+            r.next = r.end;
+            r.buf.clear();
+            r.uncounted = false;
+        }
+    }
+
+    /// No more ready objects: a second realm exists, whose objects need more
+    /// than a shape at birth (`Vm::realm_born`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ready_disable(&mut self) {
+        self.ready_on = false;
+        self.ready_abandon();
+    }
+
     /// A constructor's new instance: an empty object of class `class` (none
     /// for a function's) whose values go in a slab cell of the class for
     /// `hint` properties, what the constructor's last instance ended up
@@ -8918,6 +9338,25 @@ impl Heap {
     /// slab off, takes the vector.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {
+        if let Some(ready) = val_slab_class(hint.max(1)).and_then(|c| self.ready_take(c as usize)) {
+            // SAFETY: the map is the box in the ready object's slot, which
+            // nothing else refers to.
+            let m = unsafe { &mut *std::ptr::with_exposed_provenance_mut::<ObjMap>(ready.map) };
+            // An instance's keys are appended one by one, as a new map's are.
+            m.keys = PropKeys::default();
+            m.class = class;
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[ready.idx as usize].fid = object_mirror_fid(m);
+            }
+            return ready.idx;
+        }
+        self.alloc_ctor_object_new(hint, class)
+    }
+
+    /// [`Heap::alloc_ctor_object`] with no ready object to take.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn alloc_ctor_object_new(&mut self, hint: usize, class: Option<u32>) -> u32 {
         let Some(sc) = val_slab_class(hint).filter(|_| self.thin_alloc) else {
             let mut m = ObjMap::with_value_capacity(hint);
             m.class = class;
@@ -10177,6 +10616,34 @@ impl Heap {
         &self.young
     }
 
+    /// How many of the young log's slots the program really allocated.
+    #[inline]
+    pub(crate) fn young_allocated(&self) -> usize {
+        #[cfg(not(feature = "safe-sandbox"))]
+        return self.young.len() - self.ready_untaken;
+        #[cfg(feature = "safe-sandbox")]
+        self.young.len()
+    }
+
+    /// The free list, out of the heap while a sweep's side tables are pruned
+    /// against it; [`Self::restore_free`] puts it back.
+    pub(crate) fn take_free(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.free)
+    }
+
+    pub(crate) fn restore_free(&mut self, free: Vec<u32>) {
+        self.free = free;
+    }
+
+    /// [`Self::take_free`] for the young log.
+    pub(crate) fn take_young(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.young)
+    }
+
+    pub(crate) fn restore_young(&mut self, young: Vec<u32>) {
+        self.young = young;
+    }
+
     /// Promote everything logged so far and drop the log (called from
     /// `set_gc_floor`: the boot allocations are pinned forever, so they are
     /// OLD from the floor on and the first minor never walks them).
@@ -10228,6 +10695,11 @@ impl Heap {
         {
             self.obj_pool_refill_scope(true);
         }
+        // What became a ready object stays in the log, moved to its front.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let recycle = self.ready_recycle_begin().then(empty_key_plan);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut kept = 0;
         // The log is in allocation order, which recycled slots scatter, so
         // each dead entry's slot is a cold line, and an ordinary object's map
         // behind its Box a second one (the two hottest lines of `free_slot`).
@@ -10235,7 +10707,8 @@ impl Heap {
         // arrive, a dead object's map four ahead.
         const SLOT_AHEAD: usize = 8;
         const MAP_AHEAD: usize = 4;
-        for (j, &idx) in log.iter().enumerate() {
+        for j in 0..log.len() {
+            let idx = log[j];
             if let Some(&ahead) = log.get(j + SLOT_AHEAD) {
                 prefetch_line(self.objs.as_ptr().wrapping_add(ahead as usize));
             }
@@ -10247,6 +10720,15 @@ impl Heap {
                 }
             }
             if !marks[idx as usize] {
+                #[cfg(not(feature = "safe-sandbox"))]
+                if let Some(empty) = recycle {
+                    if self.ready_recycle(idx, empty) {
+                        log[kept] = idx;
+                        kept += 1;
+                        swept += 1;
+                        continue;
+                    }
+                }
                 self.free_slot(idx);
                 swept += 1;
             } else {
@@ -10259,7 +10741,12 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         {
             self.obj_pool_refill_scope(false);
+            if recycle.is_some() {
+                self.ready_recycle_end();
+            }
+            log.truncate(kept);
         }
+        #[cfg(feature = "safe-sandbox")]
         log.clear();
         self.young = log;
         swept
@@ -11367,7 +11854,6 @@ impl Heap {
         self.gc_threshold = live.saturating_add(self.young_budget);
         self.gc_requested = false;
         self.minors_since_major += 1;
-        self.young.clear();
     }
 
     /// Invalidate every emitted dense-Array raw snapshot. Saturation is an

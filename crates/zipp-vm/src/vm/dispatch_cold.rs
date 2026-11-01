@@ -4221,8 +4221,9 @@ impl<'p> Vm<'p> {
                         rustc_hash::FxHashMap::default()
                     };
                 // Tier-C cross-call plan (B83) — also built before &mut self.jit.
-                let (cross_plan, cross_pending, cross_baked) =
+                let (mut cross_plan, cross_pending, cross_baked) =
                     self.build_cross_call_plan(func_id, Some(base), true);
+                self.plan_new_lanes(func_id, &mut cross_plan);
                 self.jit.note_cross_pending(func_id, &cross_pending);
                 self.jit.note_cross_baked(func_id, &cross_baked);
                 let random_fuse = self.build_random_fuse_plan(func_id, Some(base));

@@ -422,34 +422,35 @@ impl SlotSet {
     }
 }
 
-/// `Vm::proto_of`: an object's explicit [[Prototype]], for the objects that
-/// have one (`Object.create(p)`, `new F()`, `setPrototypeOf`), with a dense
-/// copy of each entry's link beside it.
+/// `Vm::proto_of`: each object's [[Prototype]] when it is not the default, by
+/// heap slot. One flat array: it is read at every prototype-chain hop, where
+/// a paged index and a dense table cost five loads for an entry, and written
+/// once per `new F()` object. Sized to the highest slot that ever had an
+/// entry, eight bytes each.
 ///
-/// The property caches ask on every inherited read whether the receiver has
-/// an entry, and which object it names (`Vm::ic_chain_ok`), and the answer is
-/// almost always "none". The table's paged index answered in three dependent
-/// loads for "none" and five for an entry; the link copy answers both in two.
-/// It is a copy only: the table stays the authority for the value itself,
-/// and every way an entry comes or goes runs through `insert` or the
-/// collector's two prunes (`SlotKeyed`), which keep it in step. The table
-/// has no `remove` and hands out no `&mut` to a value: nothing else changes
-/// an entry. An inherited-read loop over `Object.create(p)` objects ran 5%
-/// faster with the check gone altogether.
-///
-/// Four bytes for each slot up to the highest that ever had an entry.
+/// Every way an entry comes or goes runs through `insert` or the collector's
+/// two prunes (`SlotKeyed`); nothing hands out a `&mut` to a value.
 #[derive(Default)]
 pub(crate) struct ProtoTable {
-    table: SlotTable<crate::value::Value>,
-    /// Per slot: [`ProtoTable::NONE`], [`ProtoTable::NON_HEAP`] (an entry
-    /// that is not a heap object: `null`), or the heap index plus
-    /// [`ProtoTable::HEAP_BASE`].
-    link: Vec<u32>,
+    /// Per slot, `vals[k]` is its entry's value, or [`ProtoTable::NO_ENTRY_BITS`]
+    /// (the double `+0.0`, which no [[Prototype]] is) for none. One
+    /// store to add an entry and one to drop it: the table has one for every
+    /// `new F()` object, and adding and removing them was a tenth of what
+    /// such an object cost.
+    vals: Vec<crate::value::Value>,
+    /// `vals`'s base and length, for compiled code to store an instance's
+    /// entry (`emit_new_lane`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) raw: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) raw_len: u64,
+    /// Entries in `vals`.
+    pub(crate) count: usize,
     /// The heap prototypes stored since the last collection's root walk
-    /// ([`Self::clear_fresh`]), in store order, duplicates kept: the only
-    /// values a minor collection has to root. Every value stored before that
-    /// walk was rooted by it, survived and was promoted, and `insert` is the
-    /// one way a value changes.
+    /// ([`Self::clear_fresh`]), in store order, a run of one value kept once:
+    /// the only values a minor collection has to root. Every value stored
+    /// before that walk was rooted by it, survived and was promoted, and
+    /// `insert` is the one way a value changes.
     fresh: Vec<u32>,
     /// The log stopped at [`FRESH_MAX`] (a loop re-prototyping old objects
     /// without allocating): the next minor walks the whole table instead.
@@ -464,53 +465,37 @@ impl ProtoTable {
     pub(crate) const NONE: u32 = 0;
     pub(crate) const NON_HEAP: u32 = 1;
     pub(crate) const HEAP_BASE: u32 = 2;
-
-    #[inline]
-    fn encode(v: crate::value::Value) -> u32 {
-        if v.is_heap() {
-            v.heap_index() + Self::HEAP_BASE
-        } else {
-            Self::NON_HEAP
-        }
-    }
+    const NO_ENTRY_BITS: u64 = 0;
 
     /// Slot `k`'s link: `NONE`, `NON_HEAP`, or `HEAP_BASE` plus the index.
     #[inline(always)]
     pub(crate) fn link(&self, k: u32) -> u32 {
-        self.link.get(k as usize).copied().unwrap_or(Self::NONE)
+        match self.vals.get(k as usize) {
+            Some(v) if v.is_heap() => v.heap_index() + Self::HEAP_BASE,
+            Some(v) if v.bits() != Self::NO_ENTRY_BITS => Self::NON_HEAP,
+            _ => Self::NONE,
+        }
     }
 
     pub(crate) fn resident_bytes(&self) -> usize {
-        self.table.resident_bytes().saturating_add(
-            self.link
-                .capacity()
-                .saturating_add(self.fresh.capacity())
-                .saturating_mul(std::mem::size_of::<u32>()),
-        )
+        (self.vals.capacity().saturating_mul(std::mem::size_of::<crate::value::Value>()))
+            .saturating_add(self.fresh.capacity().saturating_mul(std::mem::size_of::<u32>()))
     }
 
     #[inline]
     pub(crate) fn get(&self, k: &u32) -> Option<&crate::value::Value> {
-        if self.link(*k) == Self::NONE {
-            return None;
-        }
-        self.table.get(k)
+        self.vals.get(*k as usize).filter(|v| v.bits() != Self::NO_ENTRY_BITS)
     }
 
-    /// [`Self::get`] by value: a heap prototype, the case nearly every entry
-    /// is, is the link's index itself, so only a `null` one reads the table.
+    /// [`Self::get`] by value.
     #[inline]
     pub(crate) fn get_copied(&self, k: u32) -> Option<crate::value::Value> {
-        match self.link(k) {
-            Self::NONE => None,
-            Self::NON_HEAP => self.table.get(&k).copied(),
-            l => Some(crate::value::Value::heap(l - Self::HEAP_BASE)),
-        }
+        self.get(&k).copied()
     }
 
     #[inline(always)]
     pub(crate) fn has(&self, k: u32) -> bool {
-        self.link(k) != Self::NONE
+        self.get(&k).is_some()
     }
 
     #[inline]
@@ -520,16 +505,22 @@ impl ProtoTable {
 
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        self.count == 0
     }
 
     pub(crate) fn insert(&mut self, k: u32, v: crate::value::Value) -> Option<crate::value::Value> {
         let at = k as usize;
-        if at >= self.link.len() {
-            self.link.resize(at + 1, Self::NONE);
+        if at >= self.vals.len() {
+            // Amortized: a table with an entry per object would otherwise
+            // move at every doubling of nothing but `resize`'s own growth.
+            self.vals.resize(at + 1, crate::value::Value::from_bits(Self::NO_ENTRY_BITS));
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.raw = self.vals.as_ptr() as u64;
+                self.raw_len = self.vals.len() as u64;
+            }
         }
-        self.link[at] = Self::encode(v);
-        if v.is_heap() && !self.fresh_overflow {
+        if v.is_heap() && !self.fresh_overflow && self.fresh.last() != Some(&v.heap_index()) {
             if self.fresh.len() < FRESH_MAX {
                 self.fresh.push(v.heap_index());
             } else {
@@ -537,7 +528,12 @@ impl ProtoTable {
                 self.fresh = Vec::new();
             }
         }
-        self.table.insert(k, v)
+        let old = std::mem::replace(&mut self.vals[at], v);
+        if old.bits() == Self::NO_ENTRY_BITS {
+            self.count += 1;
+            return None;
+        }
+        Some(old)
     }
 
     /// The heap prototypes stored since [`Self::clear_fresh`], or `None` when
@@ -554,36 +550,30 @@ impl ProtoTable {
         self.fresh_overflow = false;
     }
 
-    /// Dense walk of the live values. Order is unspecified.
+    /// Walk of the live values. Order is unspecified.
     #[inline]
-    pub(crate) fn values(&self) -> std::slice::Iter<'_, crate::value::Value> {
-        self.table.values()
+    pub(crate) fn values(&self) -> impl Iterator<Item = &crate::value::Value> {
+        self.vals.iter().filter(|v| v.bits() != Self::NO_ENTRY_BITS)
     }
 
-    /// The table's `retain`, clearing the link of each entry it drops.
+    /// Keep the entries of the slots `keep` answers true for.
     pub(crate) fn retain<F: FnMut(&u32) -> bool>(&mut self, mut keep: F) {
-        let link = &mut self.link;
-        self.table.retain(|k, _| {
-            let kept = keep(k);
-            if !kept {
-                if let Some(l) = link.get_mut(*k as usize) {
-                    *l = Self::NONE;
-                }
+        for (k, v) in self.vals.iter_mut().enumerate() {
+            if v.bits() != Self::NO_ENTRY_BITS && !keep(&(k as u32)) {
+                *v = crate::value::Value::from_bits(Self::NO_ENTRY_BITS);
+                self.count -= 1;
             }
-            kept
-        });
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.table.len()
+        }
     }
 
     /// Drop `k`'s entry, if any (the collector's prune of a freed slot).
+    #[inline]
     pub(crate) fn forget(&mut self, k: u32) {
-        if self.link(k) != Self::NONE {
-            self.link[k as usize] = Self::NONE;
-            self.table.remove(&k);
+        if let Some(v) = self.vals.get_mut(k as usize) {
+            if v.bits() != Self::NO_ENTRY_BITS {
+                *v = crate::value::Value::from_bits(Self::NO_ENTRY_BITS);
+                self.count -= 1;
+            }
         }
     }
 }
@@ -601,6 +591,8 @@ mod proto_table_tests {
         t.insert(6, Value::NULL);
         t.insert(5, Value::heap(11));
         assert_eq!(t.fresh(), Some(&[9, 11][..]), "heap values only, in store order");
+        t.insert(8, Value::heap(11));
+        assert_eq!(t.fresh(), Some(&[9, 11][..]), "a run of one value is logged once");
         t.clear_fresh();
         assert_eq!(t.fresh(), Some(&[][..]));
         t.insert(7, Value::heap(3));
@@ -632,7 +624,7 @@ mod proto_table_tests {
         assert!(!t.has(5) && t.get(&5).is_none() && t.has(70_000));
         t.forget(70_000);
         t.forget(70_000);
-        assert!(t.is_empty() && !t.has(70_000) && t.len() == 0);
+        assert!(t.is_empty() && !t.has(70_000));
     }
 }
 
