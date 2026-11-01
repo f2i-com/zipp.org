@@ -2855,21 +2855,27 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; => hasown_done);
                     continue;
                 }
+                // Where a name-chosen lane below ends when its helper answered.
+                // A helper declines what it does not serve (`arr.slice`, a
+                // class's own `get`, a non-ASCII string), which then takes the
+                // general route at the end of this arm, cross lanes included.
+                // It used to bail, and 64 of those evicted the loop.
+                let mut lane_done = None;
                 // ── `s.indexOf(t)` intrinsic ──
                 // A direct call to the search, skipping the whole builtin call
                 // chain (jit_call_method_ic -> jit_region_call_impl ->
                 // try_builtin_method -> dispatch_builtin_method -> string_method)
                 // that costs ~47ns to reach ~5ns of work. This is the shape that
                 // already puts `charCodeAt` and `.length` at node parity. The
-                // helper deopts for anything but ASCII/ASCII, so the interpreter
-                // runs the full method (fromIndex forms, non-ASCII, coercible
-                // arguments, a non-string receiver) at this ip unchanged.
+                // helper declines anything but ASCII/ASCII: the full method
+                // (fromIndex forms, non-ASCII, coercible arguments, a non-string
+                // receiver) takes the general route.
                 // `s.substring(a[,b])` / `s.slice(a[,b])` intrinsic — same
                 // shape as indexOf below. Args are read from the contiguous
                 // window; mode bit 1 tells the helper not to read an absent end.
                 let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
                 if substring_arity_ok && (key == "substring" || key == "slice") {
-                    let bail = ops.new_dynamic_label();
+                    let general = ops.new_dynamic_label();
                     let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
                     dynasm!(ops
                         ; mov rcx, rdi                          // vm
@@ -2880,7 +2886,7 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // A non-empty result allocates a Heap slot, whose parallel
@@ -2889,8 +2895,9 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
-                    continue;
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => done ; => general);
+                    lane_done = Some(done);
                 }
                 // `m.set(k, v)` / `m.clear()` intrinsic (B183): the region
                 // twin of the Tier-C arm — same helper, same live proof (now
@@ -2902,7 +2909,7 @@ pub(crate) fn compile_region_mem(
                         ("set", 2) | ("clear", 0) | ("add", 1) | ("delete", 1)
                     )
                 {
-                    let bail = ops.new_dynamic_label();
+                    let general = ops.new_dynamic_label();
                     // 0 = Map.set, 1 = Map.clear, 2 = Set.add, 3 = Map.delete,
                     // 4 = Set.delete. `add` is Set-only; `delete` tries Map
                     // first and the helper's kind proof rejects the mismatch,
@@ -2955,23 +2962,25 @@ pub(crate) fn compile_region_mem(
                             ; call rax
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
-                            ; je => bail
+                            ; je => general
                         );
                     } else {
-                        dynasm!(ops ; jmp => bail);
+                        dynasm!(ops ; jmp => general);
                     }
+                    let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; => mutate_done
                         ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => general
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
-                    continue;
+                    lane_done = Some(done);
                 }
                 // `m.get(k)` / `m.has(k)` / `s.has(v)` intrinsic. The receiver
-                // kind is checked in the helper (a wrong kind deopts), so a
-                // same-named method on any other object is unaffected.
+                // kind is checked in the helper, so a same-named method on any
+                // other object takes the general route.
                 if argc == 1 && matches!(key, "get" | "has") {
-                    let bail = ops.new_dynamic_label();
+                    let general = ops.new_dynamic_label();
                     // 0 = Map.get, 1 = Map.has, 2 = Set.has. Map and Set are
                     // distinguished at runtime, so `has` tries Map first and the
                     // helper falls through to Set on a kind mismatch.
@@ -3001,20 +3010,22 @@ pub(crate) fn compile_region_mem(
                             ; call rax
                             ; mov r10, QWORD SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
-                            ; je => bail
+                            ; je => general
                         );
                     } else {
-                        dynasm!(ops ; => set_try ; jmp => bail);
+                        dynasm!(ops ; => set_try ; jmp => general);
                     }
+                    let done = ops.new_dynamic_label();
                     dynasm!(ops
                         ; => coll_done
                         ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => general
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
-                    continue;
+                    lane_done = Some(done);
                 }
                 if argc == 1 && key == "indexOf" {
-                    let bail = ops.new_dynamic_label();
+                    let general = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                          // vm
                         ; mov rdx, [rbx + dreg(obj)]            // receiver bits
@@ -3023,11 +3034,12 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
-                    continue;
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => done ; => general);
+                    lane_done = Some(done);
                 }
                 if (argc == 1 || argc == 2) && dv_get_kind(key).is_some() {
                     // Whitelisted DataView `get*(pos[, littleEndian])`.
@@ -3134,10 +3146,11 @@ pub(crate) fn compile_region_mem(
                     }
                     // Generic path: the dedicated win64 helper (receiver + pos
                     // + le bits in, element kind via the 5th-arg slot; result
-                    // bits out, deopt sentinel → bail). It repeats the live
-                    // method-identity proof, so a snapshot zeroed by a
+                    // bits out, deopt sentinel → the general route). It repeats
+                    // the live method-identity proof, so a snapshot zeroed by a
                     // prototype replacement resumes at ordinary Get+Call.
                     // No alloc/user code on success — no re-fetch.
+                    let general = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -3154,13 +3167,29 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => bail
+                        ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
                     if pinned.is_some() {
                         dynasm!(ops ; => dv_done);
                     }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    let lane_end = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => lane_end ; => general);
+                    emit_region_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        &heap,
+                        name,
+                        obj,
+                        arg_base,
+                        argc,
+                        dst,
+                        refetch_pinned,
+                        ta_refetch,
+                    );
+                    dynasm!(ops ; => lane_end);
                 } else if argc == 0 && key == "pop" {
                     // `arr.pop()`: `jit_array_pop` serves a plain dense Array
                     // in place and declines anything else before any effect,
@@ -3498,6 +3527,9 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                     dynasm!(ops ; => mc_done);
+                }
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; => done);
                 }
             }
             Instr::Call {
