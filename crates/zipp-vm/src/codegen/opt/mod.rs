@@ -33,16 +33,43 @@ use rustc_hash::FxHashMap;
 
 use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, PropShapePlan};
 
-/// The bodies Tier O may inline, by function id, each with its own property
-/// plan (built by the VM, which has the callees' caches).
-pub(crate) type OptCallees<'a> = FxHashMap<u32, (&'a FuncProto, PropShapePlan)>;
+/// What the VM supplies for Tier O's inlining, from the caches.
+#[derive(Default)]
+pub(crate) struct OptCallees<'a> {
+    /// The bodies Tier O may inline, by function id, each with its own
+    /// property plan.
+    pub(crate) bodies: FxHashMap<u32, (&'a FuncProto, PropShapePlan)>,
+    /// The `GetProp` sites whose cache found a class getter
+    /// (`Vm::ic_class_getter_read`), by position.
+    pub(crate) getters: ClassReadPlan,
+}
 
 /// The call sites with one plain user-function callee: a `CallMethod`
 /// site's class method (the class-method lane's plan), else its own data
-/// method by shape, and a `Call` site's single cross-call arm.
-pub(crate) fn plan_sites(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan) -> FxHashMap<usize, build::Site> {
+/// method by shape, a `Call` site's single cross-call arm, and a `GetProp`
+/// site's class getter.
+pub(crate) fn plan_sites(
+    cross_plan: &CrossCallPlan,
+    class_read: &ClassReadPlan,
+    getters: &ClassReadPlan,
+) -> FxHashMap<usize, build::Site> {
     let mut sites = FxHashMap::default();
+    for (&ip, lane) in getters {
+        sites.insert(
+            ip,
+            build::Site::ClassGetter {
+                recv_shape: lane.recv_shape,
+                class: lane.class,
+                ver: lane.ver,
+                epoch: lane.epoch,
+                fid: lane.fid,
+            },
+        );
+    }
     for (&ip, lane) in class_read {
+        if sites.contains_key(&ip) {
+            continue;
+        }
         sites.insert(
             ip,
             build::Site::ClassMethod {
@@ -77,8 +104,8 @@ pub(crate) fn plan_sites(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan)
 }
 
 /// The callees `plan_sites` names, for the VM to supply (`OptCallees`).
-pub(crate) fn plan_callee_ids(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan) -> Vec<u32> {
-    let mut ids: Vec<u32> = plan_sites(cross_plan, class_read).values().map(|s| s.fid()).collect();
+pub(crate) fn plan_callee_ids(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan, getters: &ClassReadPlan) -> Vec<u32> {
+    let mut ids: Vec<u32> = plan_sites(cross_plan, class_read, getters).values().map(|s| s.fid()).collect();
     ids.sort_unstable();
     ids.dedup();
     ids
@@ -118,6 +145,8 @@ pub(crate) struct Env<'a> {
     pub(crate) gen_lane: bool,
     /// The sites earlier bodies deopted at (`OptFeedback::generic`).
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
+    /// The helpers Tier C's emitted cross-call lanes call.
+    pub(crate) heap: super::HeapHelpers,
 }
 
 /// What a function's Tier O bodies learned by deopting.
@@ -152,17 +181,26 @@ pub(crate) fn compile(
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
     }
-    let sites = plan_sites(cross_plan, class_read);
+    let sites = plan_sites(cross_plan, class_read, &callees.getters);
+    let new_lanes: FxHashMap<usize, &'static super::NewLanePlan> =
+        cross_plan.iter().filter_map(|(&ip, s)| s.new_lane.map(|l| (ip, l))).collect();
     let inputs = build::Inputs {
+        new_lanes: &new_lanes,
         prop_shape,
         sites: &sites,
-        callees,
+        callees: &callees.bodies,
         const_strs: env.const_strs,
         math: env.math,
         generic: env.generic,
     };
     let mut func = build::build(proto, func_id, &inputs)?;
     func.gen_lane = env.gen_lane;
+    func.heap = Some(env.heap);
+    func.cross = cross_plan
+        .iter()
+        .filter(|(_, s)| !s.cross3.is_empty() || s.cross3m.is_some())
+        .map(|(&ip, &s)| (ip as u32, s))
+        .collect();
     let alloc = alloc::allocate(&func);
     let f = emit::emit(&func, &alloc)?;
     if crate::jitlog_enabled() {

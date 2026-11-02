@@ -4443,10 +4443,17 @@ impl<'p> Vm<'p> {
                 // Tier O's inlinable callees, with their own property plans.
                 let mut opt_callees = crate::codegen::OptCallees::default();
                 if self.jit.opt_may_compile(func_id) {
-                    for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read) {
+                    for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+                        if matches!(instr, Instr::GetProp { .. }) {
+                            if let Some(lane) = self.ic_class_getter_read(func_id, ip) {
+                                opt_callees.getters.insert(ip, lane);
+                            }
+                        }
+                    }
+                    for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
                         if (fid as usize) < self.main_func_count {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
-                            opt_callees.insert(fid, (callee, self.build_prop_shape_plan(fid)));
+                            opt_callees.bodies.insert(fid, (callee, self.build_prop_shape_plan(fid)));
                         }
                     }
                 }

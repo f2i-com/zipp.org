@@ -14,7 +14,7 @@
 use dynasmrt::{dynasm, DynamicLabel, DynasmApi, DynasmLabelApi};
 
 use super::alloc::{Alloc, Loc};
-use super::build::{Cmp, Func, Op, Rep, Term, V};
+use super::build::{CallLane, Cmp, Func, Op, Rep, Term, V};
 use crate::bytecode::{BitwiseOp, MathFn};
 use crate::codegen::JitFn;
 use crate::value::Value;
@@ -49,7 +49,21 @@ struct Em<'a> {
     stubs: Vec<DynamicLabel>,
     epilogue: DynamicLabel,
     stress: bool,
+    /// The frame offset of the first typed-array record (`Func::ta_records`,
+    /// 40 bytes each), and Tier C's element stubs that read and write
+    /// through one.
+    ta_base: i32,
+    ta_read: DynamicLabel,
+    ta_write: DynamicLabel,
+    /// The 64-byte scratch of Tier C's cross-call lanes (`emit_cross3_invoke`).
+    c3: i32,
 }
+
+/// The cross-call lanes' scratch bytes.
+const C3_SCRATCH: i32 = 64;
+
+/// A typed-array record's bytes (`jit_get_index_ta_fill`).
+const TA_RECORD: i32 = 40;
 
 impl Em<'_> {
     fn slot(&self, s: u32) -> i32 {
@@ -121,6 +135,127 @@ impl Em<'_> {
     /// leaves the body at `ip`, the window already holding the state.
     fn call_out(&mut self, s: u32, helper: u64, ip: u32, packed: u64, argc: u16) {
         self.write_state(s);
+        self.call_written(helper, ip, packed, argc);
+    }
+
+    /// Tier C's emitted cross-call lanes for the call at `ip` (`CallLane`,
+    /// `Func::cross`), the frame state already in the window they read:
+    /// a lane that makes the call leaves its result in the window's `dst`
+    /// register and jumps to the returned label; every miss falls through to
+    /// the call-out's helper after them. A throw leaves the body at `ip`.
+    fn cross_lanes(&mut self, lane: CallLane, ip: u32) -> Option<(DynamicLabel, u16)> {
+        use super::super::{emit_cross3_call, emit_cross3_method_call, Cross3Callee};
+        let f = self.f;
+        let site = *f.cross.get(&ip)?;
+        let heap = f.heap.as_ref()?;
+        let arms = !site.cross3.is_empty();
+        let own = site.cross3m.filter(|_| super::super::tierc_cross3m_enabled());
+        let dst = match lane {
+            CallLane::None => return None,
+            CallLane::Plain { dst, .. } if arms => dst,
+            CallLane::Method { dst, .. } if own.is_some() || (site.class_method && arms) => dst,
+            _ => return None,
+        };
+        let (cross_done, bail, over) = (
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+        );
+        let epilogue = self.epilogue;
+        dynasm!(self.ops
+            ; jmp => over
+            ; => bail
+            ; mov DWORD [rsi], ip as i32
+            ; xor eax, eax
+            ; jmp => epilogue
+            ; => over
+        );
+        let (regs, c3) = (f.reg_count, self.c3);
+        match lane {
+            CallLane::Plain {
+                callee,
+                this,
+                arg_base,
+                dst,
+            } => {
+                for arm in site.cross3.iter() {
+                    emit_cross3_call(
+                        &mut self.ops,
+                        arm,
+                        Cross3Callee::Reg(callee),
+                        this,
+                        arg_base,
+                        dst,
+                        regs,
+                        c3,
+                        heap,
+                        bail,
+                        cross_done,
+                        false,
+                        None,
+                    );
+                }
+            }
+            CallLane::Method { obj, arg_base, dst } => {
+                if let Some(mp) = own {
+                    emit_cross3_method_call(
+                        &mut self.ops,
+                        mp,
+                        obj,
+                        arg_base,
+                        dst,
+                        regs,
+                        c3,
+                        heap,
+                        bail,
+                        cross_done,
+                        false,
+                        None,
+                    );
+                }
+                if site.class_method && arms {
+                    // The method the receiver's class has, looked up and
+                    // not called, then called by the arm naming its fid.
+                    let lookup_miss = self.ops.new_dynamic_label();
+                    let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
+                    dynasm!(self.ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + 8 * obj as i32]
+                        ; mov r8, QWORD fip
+                        ; mov rax, QWORD crate::vm::jit_method_callee as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => lookup_miss
+                        ; mov [rsp + c3 + 48], rax
+                    );
+                    for arm in site.cross3.iter() {
+                        emit_cross3_call(
+                            &mut self.ops,
+                            arm,
+                            Cross3Callee::Stash,
+                            Some(obj),
+                            arg_base,
+                            dst,
+                            regs,
+                            c3,
+                            heap,
+                            bail,
+                            cross_done,
+                            false,
+                            None,
+                        );
+                    }
+                    dynasm!(self.ops ; => lookup_miss);
+                }
+            }
+            CallLane::None => unreachable!(),
+        }
+        Some((cross_done, dst))
+    }
+
+    /// `call_out` with the frame state already in the window.
+    fn call_written(&mut self, helper: u64, ip: u32, packed: u64, argc: u16) {
         let fip = ((self.f.func_id as u64) << 32 | ip as u64) as i64;
         dynasm!(self.ops
             ; mov rcx, rdi
@@ -226,6 +361,32 @@ impl Em<'_> {
             ; cmp rax, [r10 + 8]
             ; jae => slow
             ; mov r10, [r10]
+        );
+    }
+
+    /// The typed-array record at `[rsp + rec]` still answers for the
+    /// receiver in `ro` (`emit_ta_cache_get`'s guards: the same object, its
+    /// slot not reused, no buffer moved since), its element count in r11;
+    /// another receiver to `fill`, a record the helper declined to `slow`.
+    /// Uses rcx, r10 and r11.
+    fn ta_record_check(&mut self, ro: u8, rec: i32, fill: DynamicLabel, slow: DynamicLabel) {
+        let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
+        let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+        dynasm!(self.ops
+            ; cmp Rq(ro), [rsp + rec]
+            ; jne => fill
+            ; mov r11, [rsp + rec + 16]
+            ; test r11, r11
+            ; jz => slow
+            ; mov r10, QWORD epoch
+            ; mov r10, [r10]
+            ; cmp r10, [rsp + rec + 32]
+            ; jne => fill
+            ; mov r10, [rdi + versions]
+            ; mov ecx, Rd(ro)
+            ; mov r10d, [r10 + rcx * 4]
+            ; cmp r10d, [rsp + rec + 28]
+            ; jne => fill
         );
     }
 
@@ -751,14 +912,58 @@ impl Em<'_> {
                     ; jne => stub
                 );
             }
-            Op::CallOut { helper, ip, packed, argc } => {
+            Op::CallOut {
+                helper,
+                ip,
+                packed,
+                argc,
+                lane,
+            } => {
                 let s = i.fs.expect("a call-out has a frame state");
-                self.call_out(s, helper, ip, packed, argc);
+                self.write_state(s);
+                let crossed = self.cross_lanes(lane, ip);
+                self.call_written(helper, ip, packed, argc);
+                if let Some((cross_done, dst)) = crossed {
+                    // A lane made the call: its result is in the window.
+                    let join = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; jmp => join
+                        ; => cross_done
+                        ; mov rax, [rbx + 8 * dst as i32]
+                        ; => join
+                    );
+                }
                 if i.rep != Rep::Void {
                     let (d, st) = self.dst_gpr(v);
                     dynasm!(self.ops ; mov Rq(d), rax);
                     self.done_gpr(d, st);
                 }
+            }
+            Op::NewLane {
+                lane,
+                callee,
+                arg_base,
+                dst,
+                ip,
+                packed,
+                argc,
+            } => {
+                // Tier C's allocation lane over the window the state fills:
+                // the instance made in compiled code, else `jit_new_ic`.
+                let s = i.fs.expect("a `new` has a frame state");
+                self.write_state(s);
+                let made = super::super::emit_misc::emit_new_lane(&mut self.ops, lane, callee, arg_base, dst);
+                self.call_written(crate::vm::jit_new_ic as *const () as u64, ip, packed, argc);
+                let join = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; jmp => join
+                    ; => made
+                    ; mov rax, [rbx + 8 * dst as i32]
+                    ; => join
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
             }
             Op::SetPropShape {
                 obj,
@@ -1099,15 +1304,23 @@ impl Em<'_> {
                 self.leave_counted(s);
                 dynasm!(self.ops ; => done);
             }
-            Op::GetIndex { obj, key, ip, packed } => {
+            Op::GetIndex {
+                obj,
+                key,
+                ip,
+                packed,
+                ta,
+            } => {
                 let s = i.fs.expect("a read has a frame state");
                 let (d, st) = self.dst_gpr(v);
                 let slow = self.ops.new_dynamic_label();
+                let full = self.ops.new_dynamic_label();
                 let got = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
+                let ta_lane = ta.map(|k| (self.ta_base + TA_RECORD * i32::from(k), self.ops.new_dynamic_label()));
                 self.index_to_rax(key, slow);
                 let ro = self.gpr(obj, RDX);
-                self.mirror_entry(ro, slow);
+                self.mirror_entry(ro, ta_lane.map_or(slow, |(_, l)| l));
                 dynasm!(self.ops
                     ; mov r10, [r10 + rax * 8]
                     ; mov rcx, QWORD crate::codegen::ARR_HOLE_BITS as i64
@@ -1115,10 +1328,41 @@ impl Em<'_> {
                     ; je => slow
                     ; mov Rq(d), r10
                     ; jmp => done
-                    ; => slow
                 );
-                // The pure helper (typed arrays, strings, holes, string
-                // keys), then the whole op.
+                if let Some((rec, lane)) = ta_lane {
+                    // The typed array the register held before: its element
+                    // through Tier C's stub.
+                    let fill = self.ops.new_dynamic_label();
+                    dynasm!(self.ops ; => lane);
+                    self.ta_record_check(ro, rec, fill, slow);
+                    let stub = self.ta_read;
+                    dynasm!(self.ops
+                        ; cmp rax, r11
+                        ; jae => slow
+                        ; mov rdx, rax
+                        ; mov r9, [rsp + rec + 8]
+                        ; movzx ecx, BYTE [rsp + rec + 24]
+                        ; call => stub
+                        ; jmp => got
+                        ; => fill
+                    );
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops ; mov rdx, Rq(ro));
+                    self.key_to_r8(key);
+                    dynasm!(self.ops
+                        ; lea r9, [rsp + rec]
+                        ; mov rcx, rdi
+                        ; mov rax, QWORD crate::vm::jit_get_index_ta_fill as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => got
+                        ; jmp => full
+                    );
+                }
+                // The pure helper (strings, holes, string keys), then the
+                // whole op.
+                dynasm!(self.ops ; => slow);
                 let ro = self.gpr(obj, RDX);
                 dynasm!(self.ops ; mov rdx, Rq(ro));
                 self.key_to_r8(key);
@@ -1129,6 +1373,7 @@ impl Em<'_> {
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; jne => got
+                    ; => full
                 );
                 self.call_out(s, crate::vm::jit_opt_index_full as *const () as u64, ip, packed, 0);
                 dynasm!(self.ops
@@ -1144,13 +1389,16 @@ impl Em<'_> {
                 val,
                 ip,
                 packed,
+                ta,
             } => {
                 let s = i.fs.expect("a write has a frame state");
                 let slow = self.ops.new_dynamic_label();
+                let full = self.ops.new_dynamic_label();
                 let done = self.ops.new_dynamic_label();
+                let ta_lane = ta.map(|k| (self.ta_base + TA_RECORD * i32::from(k), self.ops.new_dynamic_label()));
                 self.index_to_rax(key, slow);
                 let ro = self.gpr(obj, RDX);
-                self.mirror_entry(ro, slow);
+                self.mirror_entry(ro, ta_lane.map_or(slow, |(_, l)| l));
                 dynasm!(self.ops
                     ; lea r10, [r10 + rax * 8]
                     ; mov rcx, QWORD crate::codegen::ARR_HOLE_BITS as i64
@@ -1168,8 +1416,59 @@ impl Em<'_> {
                     ; mov r8, Rq(rv)
                 );
                 crate::codegen::emit_heap_store_barrier(&mut self.ops, f.gen_lane, done);
+                if let Some((rec, lane)) = ta_lane {
+                    // The typed array the register held before, writable: a
+                    // Number its kind stores exactly, through Tier C's stub.
+                    let fill = self.ops.new_dynamic_label();
+                    dynasm!(self.ops ; => lane);
+                    let ro = self.gpr(obj, RDX);
+                    self.ta_record_check(ro, rec, fill, slow);
+                    let stub = self.ta_write;
+                    dynasm!(self.ops
+                        ; cmp BYTE [rsp + rec + 25], 0
+                        ; je => slow
+                        ; cmp rax, r11
+                        ; jae => slow
+                        // The stub's r8 and r9 may hold this op's operands,
+                        // which a value the stub declines (a double into an
+                        // integer kind) takes to the slow path.
+                        ; mov [rsp + 32], r8
+                        ; mov [rsp + 40], r9
+                    );
+                    let rv = self.gpr(val, 8);
+                    dynasm!(self.ops
+                        ; mov r8, Rq(rv)
+                        ; mov rdx, rax
+                        ; mov r9, [rsp + rec + 8]
+                        ; movzx ecx, BYTE [rsp + rec + 24]
+                        ; call => stub
+                        ; mov r8, [rsp + 32]
+                        ; mov r9, [rsp + 40]
+                        ; test eax, eax
+                        ; jnz => done
+                        ; jmp => slow
+                        ; => fill
+                    );
+                    let rv = self.gpr(val, RAX);
+                    dynasm!(self.ops ; mov [rsp + 40], Rq(rv));
+                    let ro = self.gpr(obj, RDX);
+                    dynasm!(self.ops ; mov rdx, Rq(ro));
+                    self.key_to_r8(key);
+                    dynasm!(self.ops
+                        ; mov r9, [rsp + 40]
+                        ; lea r10, [rsp + rec]
+                        ; mov [rsp + 32], r10
+                        ; mov rcx, rdi
+                        ; mov rax, QWORD crate::vm::jit_set_index_ta_fill as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => done
+                        ; jmp => full
+                    );
+                }
                 dynasm!(self.ops ; => slow);
-                // The pure helper (growth, typed arrays), then the whole op.
+                // The pure helper (growth, holes), then the whole op.
                 let rv = self.gpr(val, RAX);
                 dynasm!(self.ops ; mov [rsp + 40], Rq(rv));
                 let ro = self.gpr(obj, RDX);
@@ -1183,6 +1482,7 @@ impl Em<'_> {
                     ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; jne => done
+                    ; => full
                 );
                 self.call_out(s, crate::vm::jit_opt_index_full as *const () as u64, ip, packed, 0);
                 dynasm!(self.ops ; => done);
@@ -1346,7 +1646,9 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     xmm_saves.sort_unstable();
     let pushes = 3 + gpr_saves.len() as i32;
     let xmm_area = 16 * xmm_saves.len() as i32;
-    let mut frame = OUT_AREA + xmm_area + 8 * a.slots as i32;
+    let ta_base = OUT_AREA + xmm_area + 8 * a.slots as i32;
+    let c3 = ta_base + TA_RECORD * i32::from(f.ta_records);
+    let mut frame = c3 + if f.cross.is_empty() { 0 } else { C3_SCRATCH };
     if (8 + 8 * pushes + frame) % 16 != 0 {
         frame += 8;
     }
@@ -1368,6 +1670,11 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         ; mov rsi, rdx
         ; mov rdi, r8
     );
+    // No typed array recorded yet: no receiver's bits are 0.
+    for k in 0..i32::from(f.ta_records) {
+        dynasm!(ops ; mov QWORD [rsp + ta_base + TA_RECORD * k], 0);
+    }
+    let (ta_read, ta_write) = (ops.new_dynamic_label(), ops.new_dynamic_label());
     let stress = super::stress_every() != 0;
     // Each value's readers, to fuse a compare into the branch that is its
     // only reader (no boolean made, then tested).
@@ -1411,6 +1718,10 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         stubs,
         stress,
         epilogue,
+        ta_base,
+        ta_read,
+        ta_write,
+        c3,
     };
     for (bi, b) in f.blocks.iter().enumerate() {
         dynasm!(em.ops ; => block_labels[bi]);
@@ -1476,7 +1787,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
             }
         }
     }
-    // â”€â”€ deopt stubs â”€â”€
+    // ── deopt stubs ──
     let helper = crate::vm::jit_opt_deopt as *const () as i64;
     for (k, s) in f.states.iter().enumerate() {
         dynasm!(em.ops ; => em.stubs[k]);
@@ -1492,7 +1803,12 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
             ; jmp => epilogue
         );
     }
-    // â”€â”€ epilogue â”€â”€
+    // ── typed-array element stubs ──
+    if f.ta_records > 0 {
+        super::super::proto_mem::emit_ta_read_stub(&mut em.ops, ta_read);
+        super::super::proto_mem::emit_ta_write_stub(&mut em.ops, ta_write);
+    }
+    // ── epilogue ──
     dynasm!(em.ops ; => epilogue);
     for (k, &x) in xmm_saves.iter().enumerate() {
         let off = OUT_AREA + 16 * k as i32;

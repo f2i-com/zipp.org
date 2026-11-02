@@ -3485,6 +3485,9 @@ pub struct Jit {
     /// whose bodies were evicted too often (they take Tier C from then on).
     opt_feedback: FxHashMap<u32, opt::OptFeedback>,
     opt_blacklist: rustc_hash::FxHashSet<u32>,
+    /// The functions whose compiled body is Tier O's. Its call-outs find a
+    /// callee's cross entry at run time, so no retry evicts it for one.
+    opt_bodies: rustc_hash::FxHashSet<u32>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4139,6 +4142,9 @@ impl Jit {
             }
             self.region_counts.remove(&key);
         }
+        if self.opt_bodies.contains(&fid) && self.compiled.contains_key(&fid) {
+            return;
+        }
         if let Some(f) = self.compiled.remove(&fid) {
             if crate::jitlog_enabled() {
                 eprintln!("[cross] Tier C fn{fid} evicted for cross-entry retry");
@@ -4362,12 +4368,14 @@ impl Jit {
         // functions it admits; same ABI and cross entry as Tier C. It runs
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.
+        self.opt_bodies.remove(&func_id);
         if self.opt_may_compile(func_id) {
             let env = opt::Env {
                 const_strs,
                 math: heap_helpers.math_imul_guard,
                 gen_lane: heap_helpers.inline_store_lane_ok,
                 generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
+                heap: heap_helpers.to_heap_helpers(func_id, 0),
             };
             if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
                 let entry = f.entry();
@@ -4376,6 +4384,7 @@ impl Jit {
                     crate::vm::prof::pc::register(a, n, || format!("fn{func_id} tier-o"));
                 }
                 self.compiled.insert(func_id, f);
+                self.opt_bodies.insert(func_id);
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
@@ -4780,7 +4789,8 @@ impl Jit {
         let is_tier_c = self
             .compiled
             .get(&func_id)
-            .is_some_and(|f| f.self_binding().is_none());
+            .is_some_and(|f| f.self_binding().is_none())
+            && !self.opt_bodies.contains(&func_id);
         if !is_tier_c {
             return;
         }
@@ -5516,7 +5526,7 @@ impl Jit {
         if m.region_entry == u32::MAX {
             // Tier C whole-function body: park + reset to cold so the call
             // counter re-offers it (the blacklist is untouched).
-            if let Some(f) = self.compiled.remove(&m.func_id) {
+            if let Some(f) = self.take_tier_c_body(m.func_id) {
                 if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier C fn{} EVICTED (accessor site gate, ip {})",
@@ -5655,7 +5665,7 @@ impl Jit {
         *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
 
         if m.region_entry == u32::MAX {
-            if let Some(f) = self.compiled.remove(&m.func_id) {
+            if let Some(f) = self.take_tier_c_body(m.func_id) {
                 if crate::jitlog_enabled() {
                     eprintln!(
                         "[jit] Tier C fn{} EVICTED (direct-miss site gate, ip {}, batched {})",
@@ -5733,13 +5743,24 @@ impl Jit {
     /// the cap of recompiles per body (`DIRECT_MISS_RECOMPILE_CAP`). The body
     /// may be the one running: it is parked with the retired bodies, never
     /// freed under itself.
+    /// `func_id`'s compiled body taken out for a Tier C recompile, unless
+    /// it is Tier O's: Tier C's site feedback (accessor and direct-miss
+    /// gates, call fallbacks) describes Tier C code, and Tier O has its own
+    /// (`note_opt_deopt`).
+    fn take_tier_c_body(&mut self, func_id: u32) -> Option<JitFn> {
+        if self.opt_bodies.contains(&func_id) {
+            return None;
+        }
+        self.compiled.remove(&func_id)
+    }
+
     fn evict_tier_c(&mut self, func_id: u32, why: std::fmt::Arguments) {
         let owner = (func_id, u32::MAX);
         let parks = self.direct_miss_recompiles.get(&owner).copied().unwrap_or(0);
         if parks >= DIRECT_MISS_RECOMPILE_CAP {
             return;
         }
-        let Some(f) = self.compiled.remove(&func_id) else {
+        let Some(f) = self.take_tier_c_body(func_id) else {
             return;
         };
         if crate::jitlog_enabled() {

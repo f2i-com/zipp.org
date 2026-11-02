@@ -845,6 +845,40 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
+    /// (way 0 an `IcEntry::ClassGetter` of a plain user function), with the
+    /// guards of `ic_class_method_read`'s lane: Tier O inlines its body.
+    /// `value` is the getter. Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_getter_read(&self, func_id: u32, ip: usize) -> Option<crate::codegen::ClassReadLane> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::ClassGetter {
+                class,
+                ver,
+                epoch,
+                getter,
+                recv_shape,
+            } if recv_shape != crate::shape::DICT
+                && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
+            {
+                let (fid, _) = self.ic_plain_fn(getter)?;
+                Some(crate::codegen::ClassReadLane {
+                    recv_shape,
+                    class,
+                    ver,
+                    epoch,
+                    value: getter.bits(),
+                    fid,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Remember that the key of the property instruction at `(func_id, ip)`
     /// is the data property in `slot` of a receiver of `shape` (writable,
     /// with `write_proven`). A table that does not exist yet is not made for

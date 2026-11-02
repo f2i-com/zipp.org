@@ -83,12 +83,24 @@ pub(crate) enum Site {
         epoch: u32,
         fid: u32,
     },
+    /// A `GetProp`'s getter on the receiver's class, with the guards of
+    /// `ClassMethod`.
+    ClassGetter {
+        recv_shape: u32,
+        class: u32,
+        ver: u32,
+        epoch: u32,
+        fid: u32,
+    },
 }
 
 impl Site {
     pub(crate) fn fid(self) -> u32 {
         match self {
-            Site::Call { fid } | Site::Method { fid, .. } | Site::ClassMethod { fid, .. } => fid,
+            Site::Call { fid }
+            | Site::Method { fid, .. }
+            | Site::ClassMethod { fid, .. }
+            | Site::ClassGetter { fid, .. } => fid,
         }
     }
 
@@ -111,6 +123,24 @@ pub(crate) struct Inputs<'a> {
     /// The sites earlier bodies of the function deopted at
     /// (`FrameState::why`): built here without the speculation that failed.
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
+    /// The `New` sites with Tier C's allocation lane (`CrossSite::new_lane`).
+    pub(crate) new_lanes: &'a FxHashMap<usize, &'static super::super::NewLanePlan>,
+}
+
+/// The registers of a call Tier C's emitted cross-call lanes make ahead of
+/// the call-out's helper (`Func::cross` holds their plans).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CallLane {
+    None,
+    /// `Call` (no `this`) or `CallWithThis`: the site's arms.
+    Plain {
+        callee: u16,
+        this: Option<u16>,
+        arg_base: u16,
+        dst: u16,
+    },
+    /// `CallMethod`: the own-method lane, then the class-method arms.
+    Method { obj: u16, arg_base: u16, dst: u16 },
 }
 
 /// A helper's address, for a call-out.
@@ -175,10 +205,37 @@ pub(crate) enum Op {
     /// `obj[key]` (`key` an i32, a double or boxed): a present element of a
     /// dense Array through its mirror, else `jit_get_index`, else the whole
     /// `GetIndex` at `ip` as a call-out (`jit_opt_index_full`, `packed`).
-    GetIndex { obj: V, key: V, ip: u32, packed: u64 },
+    /// `ta`: the typed-array record the op's receiver register keeps
+    /// (`Func::ta_records`), tried after the mirror.
+    GetIndex {
+        obj: V,
+        key: V,
+        ip: u32,
+        packed: u64,
+        ta: Option<u8>,
+    },
     /// `obj[key] = val`, as `GetIndex`: a present element overwritten, else
     /// `jit_set_index`, else the whole `SetIndex`.
-    SetIndex { obj: V, key: V, val: V, ip: u32, packed: u64 },
+    SetIndex {
+        obj: V,
+        key: V,
+        val: V,
+        ip: u32,
+        packed: u64,
+        ta: Option<u8>,
+    },
+    /// `new` at `ip` (registers `callee`, `arg_base`, `dst`) whose
+    /// constructor only stores its arguments: Tier C's allocation lane over
+    /// the window the frame state fills, else `jit_new_ic` as a call-out.
+    NewLane {
+        lane: &'static super::super::NewLanePlan,
+        callee: u16,
+        arg_base: u16,
+        dst: u16,
+        ip: u32,
+        packed: u64,
+        argc: u16,
+    },
     /// A global's slot; a binding in its TDZ fails.
     LoadGlobal(u32),
     /// `v` is a function of id `fid`; anything else fails.
@@ -196,7 +253,13 @@ pub(crate) enum Op {
     /// window, `(func_id << 32) | ip`, `packed`, `argc`), the frame state
     /// written first (`Inst::fs`): a call, `new`, a class value, a property
     /// access the caches do not answer here. Its result boxed (`Void`: none).
-    CallOut { helper: u64, ip: u32, packed: u64, argc: u16 },
+    CallOut {
+        helper: u64,
+        ip: u32,
+        packed: u64,
+        argc: u16,
+        lane: CallLane,
+    },
     /// `obj.<key> = val` into the own data slot the receiver's shape has, the
     /// nursery barrier after a heap value; any other receiver takes the
     /// `SetProp` at `ip` through `jit_set_prop_slow` (`packed`), as a
@@ -249,6 +312,7 @@ impl Op {
                 | Op::GetPropShape { slow: Some(_), .. }
                 | Op::GetIndex { .. }
                 | Op::SetIndex { .. }
+                | Op::NewLane { .. }
         )
     }
 
@@ -273,6 +337,7 @@ impl Op {
             | Op::Phi(_)
             | Op::LoadGlobal(_)
             | Op::CallOut { .. }
+            | Op::NewLane { .. }
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => vec![],
             Op::MathGuard { recv: Some(a), .. }
@@ -370,6 +435,34 @@ pub(crate) struct Func {
     pub(crate) math: Option<MathIntrinsicGuard>,
     /// The nursery barrier may test generation bytes (`emit_heap_store_barrier`).
     pub(crate) gen_lane: bool,
+    /// Typed-array records in the frame, Tier C's (`emit_ta_cache_get`):
+    /// one per receiver register of the most element accesses, at most
+    /// `MAX_TA_RECORDS`.
+    pub(crate) ta_records: u8,
+    /// The call sites with Tier C's emitted cross-call lanes (`CallLane`),
+    /// the helpers they call, and the function's register count.
+    pub(crate) cross: FxHashMap<u32, super::super::CrossCallSitePlan>,
+    pub(crate) heap: Option<super::super::HeapHelpers>,
+    pub(crate) reg_count: u16,
+}
+
+/// The typed-array records a body keeps, as Tier C's `ta_cache_regs`.
+const MAX_TA_RECORDS: usize = 4;
+
+/// The registers whose typed arrays a body keeps a record of: the receivers
+/// of its element accesses, the most used first.
+fn ta_regs(code: &[Instr]) -> Vec<u16> {
+    let mut counts: Vec<(u16, u32)> = Vec::new();
+    for i in code {
+        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *i {
+            match counts.iter_mut().find(|(r, _)| *r == obj) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((obj, 1)),
+            }
+        }
+    }
+    crate::cold_sort::sort_by(&mut counts, |a, b| b.1.cmp(&a.1));
+    counts.into_iter().take(MAX_TA_RECORDS).map(|(r, _)| r).collect()
 }
 
 /// Bodies larger than this are not worth the compile (and keep the bitsets
@@ -619,9 +712,9 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, tagged_add: boo
         | Instr::Eq { .. }
         | Instr::Ne { .. }
         | Instr::Not { .. } => Rep::Bool,
-        Instr::LoadNull { .. } | Instr::LoadUndefined { .. } | Instr::GetProp { .. } | Instr::LoadGlobal { .. } => {
-            Rep::Tagged
-        }
+        Instr::LoadNull { .. } | Instr::LoadUndefined { .. } | Instr::LoadGlobal { .. } => Rep::Tagged,
+        // A getter inlined returns its body's.
+        Instr::GetProp { .. } => call,
         Instr::Move { src, .. } => reps[src as usize],
         Instr::Add { .. } | Instr::Sub { .. } | Instr::Mul { .. } | Instr::Div { .. } | Instr::AddInt { .. } | Instr::Neg { .. } => {
             Rep::F64
@@ -792,6 +885,9 @@ struct Fn<'a> {
     /// The top level's deopted sites (`Inputs::generic`) and full `+`s.
     generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     addt: Option<&'a rustc_hash::FxHashSet<usize>>,
+    new_lanes: Option<&'a FxHashMap<usize, &'static super::super::NewLanePlan>>,
+    /// `ta_regs` of the top level.
+    ta_regs: &'a [u16],
 }
 
 impl Fn<'_> {
@@ -857,9 +953,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         .filter_map(|(&ip, &site)| {
             let (c, plan) = inputs.callees.get(&site.fid())?;
             let method = site.method();
+            let getter = matches!(site, Site::ClassGetter { .. });
             let ok = match code.get(ip) {
                 Some(Instr::Call { .. } | Instr::CallWithThis { .. }) => !method,
-                Some(Instr::CallMethod { .. }) => method,
+                Some(Instr::CallMethod { .. }) => method && !getter,
+                Some(Instr::GetProp { .. }) => getter,
                 _ => false,
             };
             // A site whose inlined body deopted takes the call.
@@ -1093,6 +1191,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         let (arg_base, argc) = match &code[ip] {
             Instr::CallMethod { arg_base, argc, .. } if site.method() => (*arg_base, *argc),
             Instr::Call { arg_base, argc, .. } | Instr::CallWithThis { arg_base, argc, .. } if !site.method() => (*arg_base, *argc),
+            Instr::GetProp { .. } => (0, 0),
             _ => return Rep::Tagged,
         };
         let mut creps = vec![Rep::Tagged; c.reg_count as usize];
@@ -1150,6 +1249,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         inlined: 0,
         math: inputs.math,
     };
+    let top_ta = ta_regs(code);
     let top = Fn {
         p,
         plan: inputs.prop_shape,
@@ -1158,6 +1258,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         math_reads: top_reads.clone(),
         generic: inputs.generic,
         addt: Some(&addt),
+        new_lanes: Some(inputs.new_lanes),
+        ta_regs: &top_ta,
     };
     let mut blocks: Vec<Block> = Vec::with_capacity(order.len());
     let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len()];
@@ -1292,6 +1394,10 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         inlined: b.inlined,
         math: inputs.math,
         gen_lane: false,
+        ta_records: top_ta.len() as u8,
+        cross: FxHashMap::default(),
+        heap: None,
+        reg_count: p.reg_count.max(1),
     })
 }
 
@@ -1357,6 +1463,7 @@ fn translate(
                             ip: ip as u32,
                             packed,
                             argc: 0,
+                            lane: CallLane::None,
                         },
                         Rep::Void,
                         Some(s),
@@ -1371,16 +1478,26 @@ fn translate(
             argc,
         } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = b.push_out(
-                Op::CallOut {
-                    helper: helper(crate::vm::jit_new_ic as *const ()),
+            let packed = ((callee as u64) << 16) | arg_base as u64;
+            let op = match f.new_lanes.and_then(|m| m.get(&ip)) {
+                Some(&lane) => Op::NewLane {
+                    lane,
+                    callee,
+                    arg_base,
+                    dst,
                     ip: ip as u32,
-                    packed: ((callee as u64) << 16) | arg_base as u64,
+                    packed,
                     argc,
                 },
-                Rep::Tagged,
-                Some(s),
-            );
+                None => Op::CallOut {
+                    helper: helper(crate::vm::jit_new_ic as *const ()),
+                    ip: ip as u32,
+                    packed,
+                    argc,
+                    lane: CallLane::None,
+                },
+            };
+            defs[dst as usize] = b.push_out(op, Rep::Tagged, Some(s));
         }
         Instr::LoadClassValue { dst, class_id } => {
             let s = fs.id(b, defs);
@@ -1390,6 +1507,7 @@ fn translate(
                     ip: ip as u32,
                     packed: class_id as u64 | crate::vm::LOAD_CLASS_FROM_TIER_C,
                     argc: 0,
+                    lane: CallLane::None,
                 },
                 Rep::Tagged,
                 Some(s),
@@ -1479,6 +1597,7 @@ fn translate(
                     key: k,
                     ip: ip as u32,
                     packed: obj as u64 | (key as u64) << 16,
+                    ta: f.ta_regs.iter().position(|&r| r == obj).map(|k| k as u8),
                 },
                 Rep::Tagged,
                 Some(s),
@@ -1496,6 +1615,7 @@ fn translate(
                     val: x,
                     ip: ip as u32,
                     packed: obj as u64 | (key as u64) << 16 | (val as u64) << 32 | 1 << 56,
+                    ta: f.ta_regs.iter().position(|&r| r == obj).map(|k| k as u8),
                 },
                 Rep::Void,
                 Some(s),
@@ -1569,7 +1689,33 @@ fn translate(
         }
         Instr::GetProp { dst, obj, name } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = if let Some(&op) = f.math_reads.get(&ip) {
+            defs[dst as usize] = if let Some((
+                c,
+                plan,
+                Site::ClassGetter {
+                    recv_shape,
+                    class,
+                    ver,
+                    epoch,
+                    ..
+                },
+            )) = inline
+            {
+                // The class's getter, inlined behind the class-method guard.
+                let o = b.tagged(defs[obj as usize]);
+                b.push_out(
+                    Op::GuardClass {
+                        obj: o,
+                        recv_shape,
+                        class,
+                        ver,
+                        epoch,
+                    },
+                    Rep::Void,
+                    Some(s),
+                );
+                b.inline(c, plan, o, &[], s)?
+            } else if let Some(&op) = f.math_reads.get(&ip) {
                 // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
                 // `Math` holding its intrinsic method, a constant then.
                 let g = f.math?;
@@ -1598,6 +1744,7 @@ fn translate(
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | obj as u64,
                         argc: 0,
+                        lane: CallLane::None,
                     },
                     Rep::Tagged,
                     Some(s),
@@ -1625,6 +1772,12 @@ fn translate(
                         ip: ip as u32,
                         packed: ((callee as u64) << 16) | arg_base as u64,
                         argc,
+                        lane: CallLane::Plain {
+                            callee,
+                            this: None,
+                            arg_base,
+                            dst,
+                        },
                     },
                     Rep::Tagged,
                     Some(s),
@@ -1688,6 +1841,7 @@ fn translate(
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64,
                         argc,
+                        lane: CallLane::Method { obj, arg_base, dst },
                     },
                     Rep::Tagged,
                     Some(s),
@@ -1717,6 +1871,12 @@ fn translate(
                         ip: ip as u32,
                         packed: ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64,
                         argc,
+                        lane: CallLane::Plain {
+                            callee,
+                            this: Some(this_v),
+                            arg_base,
+                            dst,
+                        },
                     },
                     Rep::Tagged,
                     Some(s),
@@ -1869,6 +2029,8 @@ impl Builder {
             math_reads: math_reads_known(&c.code, math.as_ref()),
             generic: None,
             addt: None,
+            new_lanes: None,
+            ta_regs: &[],
         };
         let mut fs = FsCtx {
             ip: 0,

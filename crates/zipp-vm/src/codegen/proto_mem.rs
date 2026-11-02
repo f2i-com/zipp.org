@@ -8217,7 +8217,7 @@ fn emit_ta_cache_set(
 /// a float kind, and returns 1 in `eax`; anything else (a double into an
 /// integer kind, a non-Number) stores nothing and returns 0. Clobbers r10,
 /// xmm0.
-fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
     let (int, dbl, fail, ok) = (
         ops.new_dynamic_label(),
         ops.new_dynamic_label(),
@@ -8312,7 +8312,7 @@ fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::Dynami
 /// boxes it (an integer kind as an Int, a u32 past i32 and the float kinds
 /// through `Value::num`'s narrowing, NaN canonical). Clobbers rcx, r10,
 /// xmm0, xmm1.
-fn emit_ta_read_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_ta_read_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
     let (u8_, i8_, i16_, u16_, i32_, u32_, f32_, f64_) = (
         ops.new_dynamic_label(),
         ops.new_dynamic_label(),
