@@ -155,6 +155,9 @@ pub(crate) enum CallLane {
         dst: u16,
         intr: Option<MethodIntr>,
     },
+    /// `GetProp` read by its slow helper: Tier C's inline cache probe
+    /// first (`Func::ic_sites`), receivers of any kind, chains included.
+    Prop { obj: u16, dst: u16, name: u32 },
 }
 
 /// A method a `CallMethod` makes through one of Tier C's dedicated pure
@@ -371,6 +374,24 @@ pub(crate) enum Op {
     },
     /// The window's register, as a call-out left it.
     WindowLoad(u16),
+    /// A total helper of the frame's handler stack (`jit_push_finally`,
+    /// `jit_push_catch`, `jit_pop_finally`), `vm` and `packed`.
+    Handler { helper: u64, packed: u64 },
+    /// `EndFinally` at `ip` with the frame state (every register) written:
+    /// a normal completion goes on; a `break` routes on and leaves the body
+    /// at the ip `jit_end_finally_route` names; a return or throw leaves it
+    /// at `ip` for the interpreter.
+    EndFinally { kind: u16, val: u16, ip: u32 },
+    /// `IterCloseFinally` at `ip`: a normal or jump completion closes
+    /// nothing; any other leaves the body at `ip`.
+    IterCloseFin { kind: u16, ip: u32 },
+    /// The way out of a body with a `finally` or `catch` to route through
+    /// (every register written): `JumpFinally` routing (`target`, `floor`),
+    /// `Throw` of `v`, or a return of `v` that a `finally` intercepts
+    /// (`jit_return_finally`; none, and the return goes on).
+    JumpFinally { target: u32, floor: u16 },
+    Throw { v: V, ip: u32 },
+    ReturnFinally { v: V },
     /// A global's slot; a binding in its TDZ fails.
     LoadGlobal(u32),
     /// `v` is a function of id `fid`; anything else fails.
@@ -456,6 +477,12 @@ impl Op {
                 | Op::StoreSlot { .. }
                 | Op::IterPure { .. }
                 | Op::IterStep { .. }
+                | Op::Handler { .. }
+                | Op::EndFinally { .. }
+                | Op::IterCloseFin { .. }
+                | Op::JumpFinally { .. }
+                | Op::Throw { .. }
+                | Op::ReturnFinally { .. }
         )
     }
 
@@ -504,6 +531,10 @@ impl Op {
             | Op::Literal { .. }
             | Op::IterStep { .. }
             | Op::WindowLoad(_)
+            | Op::Handler { .. }
+            | Op::EndFinally { .. }
+            | Op::IterCloseFin { .. }
+            | Op::JumpFinally { .. }
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => vec![],
             Op::MathGuard { recv: Some(a), .. }
@@ -534,6 +565,8 @@ impl Op {
             | Op::GetPropShape { obj: a, .. }
             | Op::ShapeVals { obj: a, .. }
             | Op::IterPure { src: a, .. }
+            | Op::Throw { v: a, .. }
+            | Op::ReturnFinally { v: a }
             | Op::LoadSlot { vals: a, .. }
             | Op::GetPropPoly { obj: a, .. }
             | Op::Length { obj: a, .. }
@@ -571,6 +604,8 @@ pub(crate) enum Term {
     Branch { cond: V, t: B, f: B },
     /// A boxed value.
     Return(V),
+    /// The block's last op left the body (`JumpFinally`, `Throw`).
+    Exit,
 }
 
 impl Term {
@@ -578,7 +613,7 @@ impl Term {
         match *self {
             Term::Jump(s) => vec![s],
             Term::Branch { t, f, .. } => vec![t, f],
-            Term::Return(_) => vec![],
+            Term::Return(_) | Term::Exit => vec![],
         }
     }
 }
@@ -621,6 +656,10 @@ pub(crate) struct Func {
     pub(crate) math: Option<MathIntrinsicGuard>,
     /// The nursery barrier may test generation bytes (`emit_heap_store_barrier`).
     pub(crate) gen_lane: bool,
+    /// This body's number among the function's Tier O bodies, which its
+    /// deopts report: a parked one still running (an array builtin's
+    /// callback) must not count against its successor (`Jit::opt_gen`).
+    pub(crate) body_gen: u32,
     /// Typed-array records in the frame, Tier C's (`emit_ta_cache_get`):
     /// one per receiver register of the most element accesses, at most
     /// `MAX_TA_RECORDS`.
@@ -630,6 +669,14 @@ pub(crate) struct Func {
     pub(crate) cross: FxHashMap<u32, super::super::CrossCallSitePlan>,
     pub(crate) heap: Option<super::super::HeapHelpers>,
     pub(crate) reg_count: u16,
+    /// The `CallWithThis` sites whose callee may be an intrinsic Tier C
+    /// calls directly (`captured_builtin_lane`): Map / Set lookups and
+    /// writes, `push`, `charCodeAt` and the string methods.
+    pub(crate) captured: FxHashMap<u32, super::super::inline::CapturedLane>,
+    /// Each `GetProp`'s inline cache site, as Tier C numbers them (the k-th
+    /// `GetProp` / `SetProp` of the body takes the k-th reserved site), and
+    /// whether its ways are shape-keyed (`opt::ic_identity_keyed`).
+    pub(crate) ic_sites: FxHashMap<u32, (u32, bool)>,
 }
 
 /// The typed-array records a body keeps, as Tier C's `ta_cache_regs`.
@@ -735,6 +782,17 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
         Instr::UpvalSet { src, .. } if top => (vec![src], None),
         Instr::GetIndex { dst, obj, key } if top => (vec![obj, key], Some(dst)),
+        // A `try`'s handler stack, on the activation's own frame (a body with
+        // handler ops is entered frame-backed only).
+        Instr::PushFinally { .. } | Instr::PopFinally | Instr::PushHandler { .. } | Instr::PopHandler if top => {
+            (vec![], None)
+        }
+        Instr::EndFinally { kind_reg, val_reg } if top => (vec![kind_reg, val_reg], None),
+        Instr::IterCloseFinally { iter, kind_reg } if top => (vec![iter, kind_reg], None),
+        Instr::JumpFinally { .. } if top => (vec![], None),
+        // A `break`'s close of the iterator (its `return()` is user code).
+        Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } if top => (vec![iter], Some(iter)),
+        Instr::Throw { src } if top => (vec![src], None),
         Instr::GetIterator { dst, src } if top => (vec![src], Some(dst)),
         Instr::IterPrime { dst, iter } if top => (vec![iter], Some(dst)),
         // Its other two writes (done, the cursor) count as reads too: they
@@ -878,9 +936,30 @@ fn flow(i: &Instr, ip: usize) -> (Option<usize>, Option<usize>) {
         | Instr::JumpIfTrue { target, .. }
         | Instr::JumpIfNotLt { target, .. }
         | Instr::JumpIfNotLe { target, .. } => (Some(ip + 1), Some(target as usize)),
-        Instr::Return { .. } | Instr::ReturnUndefined => (None, None),
+        // Bodies leave at these for the interpreter (`Flow::Exit`).
+        Instr::Return { .. } | Instr::ReturnUndefined | Instr::JumpFinally { .. } | Instr::Throw { .. } => (None, None),
         _ => (Some(ip + 1), None),
     }
+}
+
+/// Where the interpreter may resume a body with handler ops, besides its
+/// own control flow: every `finally` and `catch` (a throw, a return routed
+/// through one) and every `break` target a `finally` routes on to. Liveness
+/// makes them successors of every op, so every frame state holds what they
+/// read.
+fn resume_points(code: &[Instr]) -> Vec<usize> {
+    let mut v: Vec<usize> = code
+        .iter()
+        .filter_map(|i| match *i {
+            Instr::PushFinally { target, .. } | Instr::JumpFinally { target, .. } => Some(target as usize),
+            Instr::PushHandler { catch_target, .. } => Some(catch_target as usize),
+            _ => None,
+        })
+        .filter(|&t| t < code.len())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The representation `i` makes its destination, given the registers'
@@ -910,7 +989,9 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
         | Instr::FinalizeObject { .. }
         | Instr::GetIterator { .. }
         | Instr::IterPrime { .. }
-        | Instr::IterNext { .. } => Rep::Tagged,
+        | Instr::IterNext { .. }
+        | Instr::IterClose { .. }
+        | Instr::IterCloseQuiet { .. } => Rep::Tagged,
         Instr::Mod { .. } => Rep::F64,
         Instr::MathOp { op, .. } => {
             if matches!(op, MathFn::Imul) {
@@ -1132,7 +1213,9 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::FinalizeObject { dst, .. }
         | Instr::GetIterator { dst, .. }
         | Instr::IterPrime { dst, .. }
-        | Instr::IterNext { value_dst: dst, .. } => Some(dst),
+        | Instr::IterNext { value_dst: dst, .. }
+        | Instr::IterClose { iter: dst }
+        | Instr::IterCloseQuiet { iter: dst } => Some(dst),
         _ => None,
     }
 }
@@ -1177,6 +1260,8 @@ enum Flow {
     },
     /// The value returned, in its own representation.
     Ret(V),
+    /// The op left the body for the interpreter (`Term::Exit`).
+    Exit,
 }
 
 /// The function a translation reads its constants and plans from.
@@ -1188,6 +1273,9 @@ struct Fn<'a> {
     /// `trunc_only_arith_ips`: the adds whose result is observed only
     /// through ToInt32, which wrap.
     trunc: Vec<bool>,
+    /// The body has handler ops (`proto_has_handler_ops`): a return may
+    /// route through a `finally` (`Op::ReturnFinally`).
+    handlers: bool,
     plan: &'a PropShapePlan,
     /// The top level's string constants (`Inputs::const_strs`).
     strs: Option<&'a FxHashMap<u32, u64>>,
@@ -1299,6 +1387,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             leader[ip + 1] = true;
         }
     }
+    for t in resume_points(code) {
+        leader[t] = true;
+    }
     let starts: Vec<usize> = (0..n).filter(|&ip| leader[ip]).collect();
     // The `Add`s built as the full `+` (`AddT`, a boxed result): a site that
     // deopted before (`generic`), or one whose operand the same block made a
@@ -1408,11 +1499,30 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     }
 
     // ── liveness ── per block, then per position (live before each op).
+    // In a body with handler ops, what the interpreter may resume at
+    // (`resume_points`: a handler a throw or return reaches, a `break` a
+    // `finally` routes on to) is live before EVERY op, so every frame state
+    // holds it: any call-out may throw. Those blocks may be unreachable in
+    // the body's own flow, so the fixpoint runs over every block.
+    let resume_blocks: Vec<usize> = resume_points(code).into_iter().map(block_of_ip).collect();
+    let resume_live = |live_in: &[Bits]| -> Bits {
+        let mut l = Bits::new(nregs);
+        for &rb in &resume_blocks {
+            l.union(&live_in[rb]);
+        }
+        l
+    };
+    let all_blocks: Vec<usize> = if resume_blocks.is_empty() {
+        order.clone()
+    } else {
+        (0..nb).collect()
+    };
     let mut live_in: Vec<Bits> = vec![Bits::new(nregs); nb];
     let mut changed = true;
     while changed {
         changed = false;
-        for &b in order.iter().rev() {
+        for &b in all_blocks.iter().rev() {
+            let extra = resume_live(&live_in);
             let mut live = Bits::new(nregs);
             for &s in &bsuccs[b] {
                 live.union(&live_in[s]);
@@ -1425,6 +1535,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 for &u in uses {
                     live.set(u as usize);
                 }
+                live.union(&extra);
             }
             if live != live_in[b] {
                 live_in[b] = live;
@@ -1432,6 +1543,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             }
         }
     }
+    let extra = resume_live(&live_in);
     let mut live_before: Vec<Option<Bits>> = vec![None; n];
     for &b in &order {
         let mut live = Bits::new(nregs);
@@ -1446,6 +1558,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             for &u in uses {
                 live.set(u as usize);
             }
+            live.union(&extra);
             live_before[ip] = Some(live.clone());
         }
     }
@@ -1616,6 +1729,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         p,
         func_id: func_id as u64,
         trunc: super::super::emit_misc::trunc_only_arith_ips(p),
+        handlers: super::super::proto_has_handler_ops(p),
         plan: inputs.prop_shape,
         strs: Some(inputs.const_strs),
         math,
@@ -1710,6 +1824,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                     let v = b.tagged(v);
                     term = Some(Term::Return(v));
                 }
+                Flow::Exit => term = Some(Term::Exit),
             }
         }
         let term = term.unwrap_or_else(|| {
@@ -1762,10 +1877,13 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         inlined: b.inlined,
         math: inputs.math,
         gen_lane: false,
+        body_gen: 0,
         ta_records: top_ta.len() as u8,
         cross: FxHashMap::default(),
         heap: None,
         reg_count: p.reg_count.max(1),
+        captured: FxHashMap::default(),
+        ic_sites: FxHashMap::default(),
     })
 }
 
@@ -2262,7 +2380,12 @@ fn translate(
                     Some(s),
                 );
                 b.konst(Op::ConstTagged(g.op_callee_bits[op as usize]), Rep::Tagged)
-            } else if let Some(&(shape, slot)) = f.plan.get(&ip) {
+            } else if let Some(&(shape, slot)) = f
+                .plan
+                .get(&ip)
+                // A site whose cache has met several shapes takes them all.
+                .filter(|_| !f.poly.is_some_and(|m| m.contains_key(&ip)))
+            {
                 let o = b.tagged(defs[obj as usize]);
                 if f.generic(ip) {
                     let slow = Some((ip as u32, ((name as u64) << 32) | obj as u64));
@@ -2304,7 +2427,7 @@ fn translate(
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | obj as u64,
                         argc: 0,
-                        lane: CallLane::None,
+                        lane: CallLane::Prop { obj, dst, name },
                     },
                     Rep::Tagged,
                     Some(s),
@@ -2475,8 +2598,103 @@ fn translate(
                 f: target as usize,
             });
         }
+        Instr::Return { .. } | Instr::ReturnUndefined if f.handlers => {
+            // A `finally` the return passes through runs in the interpreter.
+            let v = match *ins {
+                Instr::Return { src } => b.tagged(defs[src as usize]),
+                _ => b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged),
+            };
+            let s = fs.id(b, defs);
+            b.push_out(Op::ReturnFinally { v }, Rep::Void, Some(s));
+            return Some(Flow::Ret(v));
+        }
         Instr::Return { src } => return Some(Flow::Ret(defs[src as usize])),
         Instr::ReturnUndefined => return Some(Flow::Ret(b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged))),
+        Instr::PushFinally {
+            target,
+            kind_reg,
+            val_reg,
+        } => {
+            let packed = (target as u64) << 32 | (kind_reg as u64) << 16 | val_reg as u64;
+            b.push_out(
+                Op::Handler {
+                    helper: helper(crate::vm::jit_push_finally as *const ()),
+                    packed,
+                },
+                Rep::Void,
+                None,
+            );
+        }
+        Instr::PushHandler { catch_target, catch_reg } => {
+            b.push_out(
+                Op::Handler {
+                    helper: helper(crate::vm::jit_push_catch as *const ()),
+                    packed: (catch_target as u64) << 16 | catch_reg as u64,
+                },
+                Rep::Void,
+                None,
+            );
+        }
+        Instr::PopFinally | Instr::PopHandler => {
+            b.push_out(
+                Op::Handler {
+                    helper: helper(crate::vm::jit_pop_finally as *const ()),
+                    packed: 0,
+                },
+                Rep::Void,
+                None,
+            );
+        }
+        Instr::EndFinally { kind_reg, val_reg } => {
+            let s = fs.id(b, defs);
+            b.push_out(
+                Op::EndFinally {
+                    kind: kind_reg,
+                    val: val_reg,
+                    ip: ip as u32,
+                },
+                Rep::Void,
+                Some(s),
+            );
+        }
+        Instr::IterCloseFinally { kind_reg, .. } => {
+            let s = fs.id(b, defs);
+            b.push_out(
+                Op::IterCloseFin {
+                    kind: kind_reg,
+                    ip: ip as u32,
+                },
+                Rep::Void,
+                Some(s),
+            );
+        }
+        Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => {
+            // `jit_iter_op_ic`'s close (2) or quiet close (3), as Tier C's.
+            let op: u64 = if matches!(*ins, Instr::IterClose { .. }) { 2 } else { 3 };
+            let s = fs.id(b, defs);
+            defs[iter as usize] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_iter_op_ic as *const ()),
+                    ip: ip as u32,
+                    packed: iter as u64 | op << 56,
+                    argc: 0,
+                    lane: CallLane::None,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::JumpFinally { target, floor } => {
+            let s = fs.id(b, defs);
+            b.push_out(Op::JumpFinally { target, floor }, Rep::Void, Some(s));
+            return Some(Flow::Exit);
+        }
+        Instr::Throw { src } => {
+            let v = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            b.push_out(Op::Throw { v, ip: ip as u32 }, Rep::Void, Some(s));
+            return Some(Flow::Exit);
+        }
         _ => return None,
     }
     Some(Flow::Next)
@@ -2638,6 +2856,7 @@ impl Builder {
             p: c,
             func_id: u64::MAX,
             trunc: super::super::emit_misc::trunc_only_arith_ips(c),
+            handlers: false,
             plan,
             strs: None,
             math: math.as_ref(),
@@ -2662,7 +2881,7 @@ impl Builder {
                     self.inlined += 1;
                     return Some(v);
                 }
-                Flow::Jump(_) | Flow::Branch { .. } => unreachable!("the path holds no branch"),
+                Flow::Jump(_) | Flow::Branch { .. } | Flow::Exit => unreachable!("the path holds no branch"),
             }
         }
         None

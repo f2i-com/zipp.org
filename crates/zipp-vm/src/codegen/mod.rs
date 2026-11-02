@@ -2958,6 +2958,11 @@ pub struct FieldSyncPlan {
 /// region `GetProp`/`SetProp` probes up to this many entries natively before
 /// falling to the miss helper, so polymorphic shape-cycling loops stay call-free.
 pub const JIT_IC_WAYS: usize = 8;
+
+/// The `region_entry` of inline cache sites reserved for a Tier O body
+/// (`register_ic_sites`): their probe has neither accessor arms nor the
+/// direct-miss form, and the gates that would recompile for them do not.
+const OPT_IC_ENTRY: u32 = u32::MAX - 1;
 /// Byte stride of one [`IcEntry`] (`size_of`, kept explicit for the emitter).
 pub const JIT_IC_STRIDE: usize = 64;
 /// Maximum proto-chain hops one [`IcEntry`] can guard (the interpreter's
@@ -3496,6 +3501,14 @@ pub struct Jit {
     /// (`Jit::opt_slow_read_due`, `opt_replan`).
     opt_slow_reads: FxHashMap<(u32, u32), u32>,
     opt_replans: FxHashMap<u32, u8>,
+    /// `finally` routings per function (`Jit::note_opt_route_exit`).
+    opt_route_exits: FxHashMap<u32, u32>,
+    /// The deopt sites the log named (`ZIPP_JITLOG`).
+    opt_deopt_logged: rustc_hash::FxHashSet<(u32, u32)>,
+    /// Each function's installed Tier O body's number, and the last number
+    /// handed out (`Jit::opt_body_current`).
+    opt_gen: FxHashMap<u32, u32>,
+    opt_gen_next: u32,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -3887,6 +3900,18 @@ impl Jit {
     /// Look up compiled native code for `func_id`, if any.
     pub fn get(&self, func_id: u32) -> Option<&JitFn> {
         self.compiled.get(&func_id)
+    }
+
+    /// Bodies evicted so far (parked, never freed): a count that only grows.
+    pub(crate) fn retired_count(&self) -> usize {
+        self.retired_fns.len()
+    }
+
+    /// Whether `entry` is still `func_id`'s compiled body's, or its int
+    /// body's, rather than a parked body's.
+    pub(crate) fn entry_is_current(&self, func_id: u32, entry: *const u8) -> bool {
+        self.compiled.get(&func_id).is_some_and(|b| b.entry() == entry)
+            || self.int_bodies.get(&func_id).is_some_and(|b| b.entry() == entry)
     }
 
     /// `func_id`'s int-tier body, which runs with no frame under it: its
@@ -4383,13 +4408,29 @@ impl Jit {
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.
         self.opt_bodies.remove(&func_id);
+        self.opt_gen.remove(&func_id);
         if self.opt_may_compile(func_id) {
+            let body_gen = self.opt_next_gen();
+            // Inline cache sites for the slow property reads' probe, numbered
+            // as Tier C's (`register_ic_sites`).
+            let n_sites = proto
+                .code
+                .iter()
+                .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+                .count();
+            let ic_base = (n_sites > 0 && opt::opt_ic_enabled()).then(|| {
+                let base = self.reserve_ic_sites(n_sites);
+                self.register_ic_sites(base, func_id, OPT_IC_ENTRY, &proto.code, 0);
+                base
+            });
             let env = opt::Env {
                 const_strs,
                 math: heap_helpers.math_imul_guard,
                 gen_lane: heap_helpers.inline_store_lane_ok,
+                body_gen,
+                ic_base,
                 generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
-                heap: heap_helpers.to_heap_helpers(func_id, 0),
+                heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
             };
             if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
                 let entry = f.entry();
@@ -4399,13 +4440,23 @@ impl Jit {
                 }
                 self.compiled.insert(func_id, f);
                 self.opt_bodies.insert(func_id);
+                self.opt_gen.insert(func_id, body_gen);
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
                     crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
                     self.int_bodies.insert(func_id, a);
                 }
-                self.set_cross_entry(func_id, entry, cross_uninit_mask(proto), None, None, None, false);
+                // A body with handler ops mutates its frame's handler stack:
+                // as Tier C's, its entry is flagged frame-backed and takes the
+                // full zero-fill (a `catch` may read what the `try` never set).
+                let needs_frame = proto_has_handler_ops(proto);
+                if needs_frame && !cross_framed_entry_enabled() {
+                    self.clear_cross_entry(func_id);
+                    return;
+                }
+                let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
+                self.set_cross_entry(func_id, entry, mask, None, None, None, needs_frame);
                 return;
             }
         }
@@ -5461,7 +5512,10 @@ impl Jit {
         code: &[Instr],
         code_off: u32,
     ) -> Vec<IcSiteEmit> {
-        let on = accessor_way_enabled();
+        // Tier O's probe has no accessor arms, and takes the direct form by
+        // its receiver (`opt::ic_identity_keyed`), never by a gate.
+        let opt = region_entry == OPT_IC_ENTRY;
+        let on = accessor_way_enabled() && !opt;
         let always = acc_always_emit();
         let direct_on = direct_ic_miss_enabled();
         let force_direct = direct_on && force_direct_ic_miss();
@@ -5469,8 +5523,11 @@ impl Jit {
         for (i, instr) in code.iter().enumerate() {
             if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
                 let op_ip = code_off + i as u32;
-                let direct_miss = direct_on
-                    && (force_direct || self.direct_miss_sites.contains(&(func_id, op_ip)));
+                let direct_miss = if opt {
+                    direct_on && !opt::ic_identity_keyed(code, i)
+                } else {
+                    direct_on && (force_direct || self.direct_miss_sites.contains(&(func_id, op_ip)))
+                };
                 // A direct site has no identity ways to carry an accessor tag.
                 // Accessors remain exact via the existing slow helper.
                 let acc =
@@ -5526,6 +5583,10 @@ impl Jit {
         let Some(&m) = self.ic_site_meta.get(site as usize) else {
             return AccWayGate::Slow;
         };
+        // Tier O's probe has no accessor arms, and no recompile adds them.
+        if m.region_entry == OPT_IC_ENTRY {
+            return AccWayGate::Slow;
+        }
         // A direct-miss compile has no identity probe and therefore nowhere an
         // accessor-tagged way could be consumed. Keep routing through the
         // existing live slow helper; never evict direct form merely to add dead
@@ -5589,6 +5650,10 @@ impl Jit {
         };
         if m.direct_miss_emitted {
             return DirectMissGate::Direct;
+        }
+        // Tier O's probe keeps its identity ways.
+        if m.region_entry == OPT_IC_ENTRY {
+            return DirectMissGate::Probe;
         }
         // A gate flip deopts and replays this bytecode once. Unmetered code can
         // do that because the proven own-data access has no observable effect;

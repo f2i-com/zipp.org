@@ -125,6 +125,40 @@ env_on_switch! {
     fn opt_enabled() = "ZIPP_OPT"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_OPT_IC=1`: Tier O's slow property reads go straight to their
+    /// helper, without Tier C's inline cache probe (`CallLane::Prop`).
+    fn opt_ic_on() = "ZIPP_NO_OPT_IC"
+}
+
+/// `opt_ic_on`, for the compile that reserves the sites.
+pub(crate) fn opt_ic_enabled() -> bool {
+    opt_ic_on()
+}
+
+/// Whether the property op at `ip` keys its inline cache site by its
+/// receiver's identity (Tier C's ways) rather than by its shape (the
+/// direct form's shape ways): a receiver a captured or global binding holds
+/// is most often one object (a module's Map, a cache) of no shape the ways
+/// could key, any other most often one of many objects of a shape (fresh
+/// records a call makes). Read off the few ops before it; a guess either
+/// way stays exact, the other kind only misses.
+pub(crate) fn ic_identity_keyed(code: &[crate::bytecode::Instr], ip: usize) -> bool {
+    use crate::bytecode::Instr;
+    let obj = match code.get(ip) {
+        Some(&Instr::GetProp { obj, .. }) | Some(&Instr::SetProp { obj, .. }) => obj,
+        _ => return false,
+    };
+    for i in code[..ip].iter().rev().take(8) {
+        match *i {
+            Instr::UpvalGet { dst, .. } | Instr::LoadGlobal { dst, .. } if dst == obj => return true,
+            _ if super::fn_int::writes_reg(i) == Some(obj) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Deopts after which a Tier O body is evicted for good.
 pub(crate) const DEOPT_LIMIT: u32 = 64;
 
@@ -140,6 +174,18 @@ pub(crate) fn stress_every() -> u32 {
     })
 }
 
+/// `ZIPP_OPT_ONLY=3,7`: only these functions take Tier O (a diagnostic,
+/// to weigh one body at a time).
+fn only_fns() -> Option<&'static [u32]> {
+    use std::sync::OnceLock;
+    static ONLY: OnceLock<Option<Vec<u32>>> = OnceLock::new();
+    ONLY.get_or_init(|| {
+        let s = std::env::var("ZIPP_OPT_ONLY").ok()?;
+        Some(s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+    })
+    .as_deref()
+}
+
 /// The stress countdown the emitted guards decrement (`stress_every`).
 pub(crate) static STRESS_COUNTDOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -151,6 +197,10 @@ pub(crate) struct Env<'a> {
     pub(crate) math: Option<MathIntrinsicGuard>,
     /// The nursery barrier may test generation bytes.
     pub(crate) gen_lane: bool,
+    /// The body's number (`Func::body_gen`).
+    pub(crate) body_gen: u32,
+    /// The inline cache sites reserved for the body (`Func::ic_sites`).
+    pub(crate) ic_base: Option<u32>,
     /// The sites earlier bodies deopted at (`OptFeedback::generic`).
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// The helpers Tier C's emitted cross-call lanes call.
@@ -180,6 +230,10 @@ const MAX_ROUNDS: u32 = 4;
 /// (`Jit::opt_slow_read_due`), and the replans a function may have.
 const SLOW_READS_REPLAN: u32 = 1024;
 const MAX_REPLANS: u8 = 2;
+
+/// `finally` routings a function's Tier O bodies may leave for before it
+/// takes Tier C (`Jit::note_opt_route_exit`).
+const ROUTE_EXITS_LIMIT: u32 = 64;
 
 /// Tier O's body for `proto`, or `None` when it admits none.
 pub(crate) fn compile(
@@ -211,12 +265,39 @@ pub(crate) fn compile(
     };
     let mut func = build::build(proto, func_id, &inputs)?;
     func.gen_lane = env.gen_lane;
+    func.body_gen = env.body_gen;
     func.heap = Some(env.heap);
     func.cross = cross_plan
         .iter()
         .filter(|(_, s)| !s.cross3.is_empty() || s.cross3m.is_some())
         .map(|(&ip, &s)| (ip as u32, s))
         .collect();
+    func.captured = proto
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(ip, i)| match *i {
+            crate::bytecode::Instr::CallWithThis { callee, argc, .. } => {
+                super::inline::captured_builtin_lane(proto, ip, callee, argc, &env.heap).map(|l| (ip as u32, l))
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(base) = env.ic_base {
+        let mut k = base;
+        let direct_on = super::direct_ic_miss_enabled();
+        for (ip, i) in proto.code.iter().enumerate() {
+            match i {
+                crate::bytecode::Instr::GetProp { .. } => {
+                    let direct = direct_on && !ic_identity_keyed(&proto.code, ip);
+                    func.ic_sites.insert(ip as u32, (k, direct));
+                    k += 1;
+                }
+                crate::bytecode::Instr::SetProp { .. } => k += 1,
+                _ => {}
+            }
+        }
+    }
     let alloc = alloc::allocate(&func);
     let f = emit::emit(&func, &alloc)?;
     if crate::jitlog_enabled() {
@@ -236,7 +317,10 @@ pub(crate) fn compile(
 impl super::Jit {
     /// Whether `func_id` may take Tier O.
     pub(crate) fn opt_may_compile(&self, func_id: u32) -> bool {
-        opt_enabled() && self.meter.is_none() && !self.opt_blacklist.contains(&func_id)
+        opt_enabled()
+            && self.meter.is_none()
+            && !self.opt_blacklist.contains(&func_id)
+            && only_fns().is_none_or(|only| only.contains(&func_id))
     }
 
     /// A Tier O body of `func_id` deopted, blaming site `why`
@@ -245,10 +329,13 @@ impl super::Jit {
     /// building every site that deopted without its speculation; after
     /// `MAX_ROUNDS` bodies it takes Tier C. Under the stress switch every
     /// guard deopts in turn, and nothing is evicted.
-    pub(crate) fn note_opt_deopt(&mut self, func_id: u32, why: u32) {
+    pub(crate) fn note_opt_deopt(&mut self, func_id: u32, why: u32, body_gen: u32) {
         let every = stress_every();
         if every != 0 {
             STRESS_COUNTDOWN.store(every, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if !self.opt_body_current(func_id, body_gen) {
             return;
         }
         let fb = self.opt_feedback.entry(func_id).or_default();
@@ -278,28 +365,62 @@ impl super::Jit {
         self.evict_opt(func_id);
     }
 
+    /// Whether body `body_gen` is `func_id`'s installed Tier O body, not a
+    /// parked one an array builtin still runs from the entry it took.
+    fn opt_body_current(&self, func_id: u32, body_gen: u32) -> bool {
+        self.opt_gen.get(&func_id) == Some(&body_gen)
+    }
+
+    /// The number the next Tier O body of any function takes.
+    pub(crate) fn opt_next_gen(&mut self) -> u32 {
+        self.opt_gen_next = self.opt_gen_next.wrapping_add(1);
+        self.opt_gen_next
+    }
+
+    /// Whether this is the first deopt Tier O makes at `(func_id, why)`,
+    /// for the log.
+    pub(crate) fn opt_first_deopt(&mut self, func_id: u32, why: u32) -> bool {
+        self.opt_deopt_logged.insert((func_id, why))
+    }
+
+    /// A Tier O body of `func_id` left for the interpreter to route a
+    /// `break` or a return through a `finally`, which Tier C does natively:
+    /// after `ROUTE_EXITS_LIMIT` such exits the function takes Tier C.
+    pub(crate) fn note_opt_route_exit(&mut self, func_id: u32, body_gen: u32) {
+        if !self.opt_body_current(func_id, body_gen) {
+            return;
+        }
+        let n = self.opt_route_exits.entry(func_id).or_insert(0);
+        *n += 1;
+        if *n < ROUTE_EXITS_LIMIT {
+            return;
+        }
+        self.opt_blacklist.insert(func_id);
+        if crate::jitlog_enabled() && self.opt_bodies.contains(&func_id) {
+            eprintln!("[jit] Tier O fn{func_id} EVICTED ({ROUTE_EXITS_LIMIT} finally routings)");
+        }
+        self.evict_opt(func_id);
+    }
+
     /// Whether the `GetProp` at `(func_id, ip)` of a Tier O body has gone
     /// through its slow helper `SLOW_READS_REPLAN` times since the last ask
     /// (`vm::jit_opt_get_prop_slow`), with a replan still allowed.
     pub(crate) fn opt_slow_read_due(&mut self, func_id: u32, ip: u32) -> bool {
-        if self.opt_replans.get(&func_id).copied().unwrap_or(0) >= MAX_REPLANS {
-            return false;
-        }
-        // A site made generic by its deopts reads slowly on purpose.
-        if self
-            .opt_feedback
-            .get(&func_id)
-            .is_some_and(|fb| fb.generic.contains(&ip) || fb.generic.contains(&build::ALL_SITES))
-        {
-            return false;
-        }
+        // One lookup per read; the rest only at the count.
         let n = self.opt_slow_reads.entry((func_id, ip)).or_insert(0);
         *n += 1;
         if *n < SLOW_READS_REPLAN {
             return false;
         }
         *n = 0;
-        true
+        if self.opt_replans.get(&func_id).copied().unwrap_or(0) >= MAX_REPLANS {
+            return false;
+        }
+        // A site made generic by its deopts reads slowly on purpose.
+        !self
+            .opt_feedback
+            .get(&func_id)
+            .is_some_and(|fb| fb.generic.contains(&ip) || fb.generic.contains(&build::ALL_SITES))
     }
 
     /// Compile `func_id` again from its caches as they are now: the
@@ -324,6 +445,7 @@ impl super::Jit {
             return;
         };
         self.retired_fns.push(f);
+        self.opt_gen.remove(&func_id);
         let rearm = self.fn_threshold().saturating_sub(1);
         self.counts.insert(func_id, rearm);
         self.set_fn_state(func_id, super::FN_COLD);

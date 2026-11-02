@@ -249,9 +249,60 @@ impl Em<'_> {
                     dynasm!(self.ops ; => lookup_miss);
                 }
             }
-            CallLane::None => unreachable!(),
+            CallLane::None | CallLane::Prop { .. } => unreachable!(),
         }
         Some((cross_done, dst))
+    }
+
+    /// A slow property read's inline cache probe, Tier C's (`emit_ic_probe`
+    /// and its miss helper, which fills the site), over the window the frame
+    /// state fills: a hit or a filled miss stores the value to the window's
+    /// `dst` register and jumps to the returned label; anything else (an
+    /// accessor, a receiver the cache does not take) falls through to the
+    /// read's helper. r13 and r14 hold the cache's bases meanwhile, saved in
+    /// the scratch.
+    fn prop_ic(&mut self, obj: u16, dst: u16, name: u32, ip: u32) -> Option<DynamicLabel> {
+        use super::super::{emit_ic_probe, IcProbe, JIT_IC_STRIDE, JIT_IC_WAYS, PROP_VIA_IC};
+        let (site, direct) = *self.f.ic_sites.get(&ip)?;
+        let heap = self.f.heap?;
+        let (done, hit, decline) = (
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+        );
+        let off = (site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
+        let packed = ((self.f.func_id as u64) << 32) | name as u64;
+        let c3 = self.c3;
+        dynasm!(self.ops
+            ; mov [rsp + c3], r13
+            ; mov [rsp + c3 + 8], r14
+            ; mov r13, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+            ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
+        );
+        emit_ic_probe(&mut self.ops, IcProbe::Get { dst }, obj, off, hit, None, direct);
+        dynasm!(self.ops
+            ; mov rcx, rdi
+            ; mov rdx, rax                        // the receiver, as the probe left it
+            ; mov r8d, site as i32
+            ; mov r9, QWORD packed as i64
+            ; mov rax, QWORD heap.get_prop_miss as i64
+            ; call rax
+            ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => decline
+            ; mov r10, QWORD PROP_VIA_IC as i64
+            ; cmp rax, r10
+            ; je => decline
+            ; mov [rbx + 8 * dst as i32], rax
+            ; => hit
+            ; mov r13, [rsp + c3]
+            ; mov r14, [rsp + c3 + 8]
+            ; jmp => done
+            ; => decline
+            ; mov r13, [rsp + c3]
+            ; mov r14, [rsp + c3 + 8]
+        );
+        Some(done)
     }
 
     /// `obj.<method>(args)` through Tier C's dedicated helper for it (`m`),
@@ -404,6 +455,24 @@ impl Em<'_> {
         );
     }
 
+    /// Out at the ip in eax that a `finally` routing named, counted
+    /// (`vm::jit_opt_route_exit`): the frame state is in the window.
+    fn route_exit(&mut self) {
+        let epilogue = self.epilogue;
+        dynasm!(self.ops
+            ; mov [rsp + 40], rax
+            ; mov rcx, rdi
+            ; mov edx, self.f.func_id as i32
+            ; mov r8d, self.f.body_gen as i32
+            ; mov rax, QWORD crate::vm::jit_opt_route_exit as *const () as i64
+            ; call rax
+            ; mov rax, [rsp + 40]
+            ; mov DWORD [rsi], eax
+            ; xor eax, eax
+            ; jmp => epilogue
+        );
+    }
+
     /// A deopt at frame state `s` already written into the window: counted
     /// (`vm::jit_opt_deopt`), then out at its position.
     fn leave_counted(&mut self, s: u32) {
@@ -415,6 +484,7 @@ impl Em<'_> {
             ; mov rcx, rdi
             ; mov edx, self.f.func_id as i32
             ; mov r8d, why as i32
+            ; mov r9d, self.f.body_gen as i32
             ; mov rax, QWORD crate::vm::jit_opt_deopt as *const () as i64
             ; call rax
             ; xor eax, eax
@@ -1061,14 +1131,12 @@ impl Em<'_> {
             Op::LoadGlobal(idx) => {
                 let stub = stub.expect("a guard has a frame state");
                 let (d, st) = self.dst_gpr(v);
-                let route = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
                 let base = crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32;
                 let off = 8 * idx as i32;
                 dynasm!(self.ops
-                    // A global routed through the global object's own
-                    // property, or one in its TDZ, is the interpreter's.
-                    ; cmp DWORD [rdi + route], 0
-                    ; jne => stub
+                    // The slot, as Tier C reads it: a body is entered only
+                    // while its globals' routes hold (`jit_globals_still_
+                    // routable`). One in its TDZ is the interpreter's.
                     ; mov rax, [rdi + base]
                     ; mov Rq(d), [rax + off]
                     ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
@@ -1153,6 +1221,34 @@ impl Em<'_> {
                     if let Some(l) = self.method_intr(m, obj, arg_base, dst) {
                         made.push((l, dst));
                     }
+                }
+                if let CallLane::Prop { obj, dst, name } = lane {
+                    if let Some(l) = self.prop_ic(obj, dst, name, ip) {
+                        made.push((l, dst));
+                    }
+                }
+                // A split `recv.get(k)`'s intrinsic, as Tier C calls it.
+                if let (
+                    CallLane::Plain {
+                        callee,
+                        this: Some(this_v),
+                        arg_base,
+                        dst,
+                    },
+                    Some(heap),
+                    Some(&cl),
+                ) = (lane, self.f.heap.as_ref(), self.f.captured.get(&ip))
+                {
+                    use super::super::inline::{emit_captured_builtin_lane, emit_captured_method_lane, CapturedLane};
+                    let l = match cl {
+                        CapturedLane::Direct { bits, helper, .. } => {
+                            emit_captured_builtin_lane(&mut self.ops, callee, this_v, arg_base, dst, bits, helper, None)
+                        }
+                        CapturedLane::Proved { op } => {
+                            emit_captured_method_lane(&mut self.ops, callee, this_v, arg_base, argc, dst, op, None, heap)
+                        }
+                    };
+                    made.push((l, dst));
                 }
                 made.extend(self.cross_lanes(lane, ip));
                 self.call_written(helper, ip, packed, argc);
@@ -1253,6 +1349,108 @@ impl Em<'_> {
                 );
                 self.leave_on_sentinel(ip);
                 dynasm!(self.ops ; => stepped);
+            }
+            Op::Handler { helper, packed } => {
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                );
+            }
+            Op::EndFinally { kind, val, ip } => {
+                let s = i.fs.expect("a finally's end has a frame state");
+                self.write_state(s);
+                let (cont, here) = (self.ops.new_dynamic_label(), self.ops.new_dynamic_label());
+                let epilogue = self.epilogue;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + 8 * kind as i32]
+                    ; mov r8, [rbx + 8 * val as i32]
+                    ; mov rax, QWORD crate::vm::jit_end_finally_route as *const () as i64
+                    ; call rax
+                    ; cmp rax, -1                         // a normal completion
+                    ; je => cont
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => here                          // a return or throw
+                );
+                // A `break` routed on: the interpreter goes on there.
+                self.route_exit();
+                dynasm!(self.ops
+                    ; => here
+                    ; mov DWORD [rsi], ip as i32
+                    ; xor eax, eax
+                    ; jmp => epilogue
+                    ; => cont
+                );
+            }
+            Op::IterCloseFin { kind, ip } => {
+                let s = i.fs.expect("an iterator close has a frame state");
+                self.write_state(s);
+                let cont = self.ops.new_dynamic_label();
+                let epilogue = self.epilogue;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + 8 * kind as i32]
+                    ; mov rax, QWORD crate::vm::jit_iter_close_finally as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; jne => cont
+                    ; mov DWORD [rsi], ip as i32
+                    ; xor eax, eax
+                    ; jmp => epilogue
+                    ; => cont
+                );
+            }
+            Op::JumpFinally { target, floor } => {
+                let s = i.fs.expect("a routed jump has a frame state");
+                self.write_state(s);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov edx, target as i32
+                    ; mov r8d, floor as i32
+                    ; mov rax, QWORD crate::vm::jit_jump_finally as *const () as i64
+                    ; call rax
+                );
+                self.route_exit();
+            }
+            Op::Throw { v: x, ip } => {
+                // The value pending, the bail a committed throw the
+                // interpreter unwinds from.
+                let s = i.fs.expect("a throw has a frame state");
+                self.write_state(s);
+                let rx = self.gpr(x, RDX);
+                let epilogue = self.epilogue;
+                dynasm!(self.ops
+                    ; mov rdx, Rq(rx)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_throw as *const () as i64
+                    ; call rax
+                    ; mov DWORD [rsi], ip as i32
+                    ; xor eax, eax
+                    ; jmp => epilogue
+                );
+            }
+            Op::ReturnFinally { v: x } => {
+                let s = i.fs.expect("a return has a frame state");
+                self.write_state(s);
+                let rx = self.gpr(x, RDX);
+                let cont = self.ops.new_dynamic_label();
+                let inter = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov rdx, Rq(rx)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                    ; call rax
+                    ; cmp rax, -2                         // no `finally` to run
+                    ; je => cont
+                    ; jmp => inter
+                    ; => inter
+                );
+                self.route_exit();
+                dynasm!(self.ops ; => cont);
             }
             Op::WindowLoad(r) => {
                 let (d, st) = self.dst_gpr(v);
@@ -1364,14 +1562,12 @@ impl Em<'_> {
             Op::StoreGlobal(idx, x) => {
                 let stub = stub.expect("a guard has a frame state");
                 let rx = self.gpr(x, RDX);
-                let route = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
                 let base = crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32;
                 let off = 8 * idx as i32;
                 dynasm!(self.ops
-                    // A routed global, or one in its TDZ or never made, is
-                    // the interpreter's to write.
-                    ; cmp DWORD [rdi + route], 0
-                    ; jne => stub
+                    // The slot, as Tier C writes it (routes are checked at
+                    // entry); one in its TDZ or never made is the
+                    // interpreter's to write.
                     ; mov rax, [rdi + base]
                     ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
                     ; cmp [rax + off], rcx
@@ -1975,19 +2171,42 @@ impl Em<'_> {
                 let (d, st) = self.dst_gpr(v);
                 let l: Vec<DynamicLabel> = (0..6).map(|_| self.ops.new_dynamic_label()).collect();
                 let (a_int, a_ok, b_int, b_ok, strs, done) = (l[0], l[1], l[2], l[3], l[4], l[5]);
+                let (a_null, a_ok_nan, b_null, b_ok_nan) = (
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                );
                 dynasm!(self.ops
                     ; mov rax, Rq(ra)
                     ; mov rcx, Rq(rb)
-                    // Two Numbers into xmm0 and xmm1; anything else may be
-                    // two strings.
+                    // Each operand's ToNumber into xmm0 / xmm1 when it runs
+                    // no code: a Number, a boolean, `null` (0), `undefined`
+                    // (NaN); a heap value may be a string.
                     ; mov rdx, rax
                     ; shr rdx, 48
                     ; cmp edx, 0x7FF9
                     ; je => a_int
+                    ; cmp edx, 0x7FFA
+                    ; je => a_int                         // a boolean's 0 or 1
+                    ; cmp edx, 0x7FFC
+                    ; je => a_ok_nan
+                    ; cmp edx, 0x7FFB
+                    ; je => a_null
                     ; sub edx, 0x7FF9
                     ; cmp edx, 4
                     ; jbe => strs
                     ; movq xmm0, rax
+                    ; jmp => a_ok
+                    ; => a_null
+                    ; mov rdx, QWORD TAG_NULL as i64
+                    ; cmp rax, rdx
+                    ; jne => strs                         // a small BigInt
+                    ; xorps xmm0, xmm0
+                    ; jmp => a_ok
+                    ; => a_ok_nan
+                    ; mov rdx, QWORD QNAN as i64
+                    ; movq xmm0, rdx
                     ; jmp => a_ok
                     ; => a_int
                     ; cvtsi2sd xmm0, eax
@@ -1996,10 +2215,26 @@ impl Em<'_> {
                     ; shr rdx, 48
                     ; cmp edx, 0x7FF9
                     ; je => b_int
+                    ; cmp edx, 0x7FFA
+                    ; je => b_int
+                    ; cmp edx, 0x7FFC
+                    ; je => b_ok_nan
+                    ; cmp edx, 0x7FFB
+                    ; je => b_null
                     ; sub edx, 0x7FF9
                     ; cmp edx, 4
                     ; jbe => strs
                     ; movq xmm1, rcx
+                    ; jmp => b_ok
+                    ; => b_null
+                    ; mov rdx, QWORD TAG_NULL as i64
+                    ; cmp rcx, rdx
+                    ; jne => strs
+                    ; xorps xmm1, xmm1
+                    ; jmp => b_ok
+                    ; => b_ok_nan
+                    ; mov rdx, QWORD QNAN as i64
+                    ; movq xmm1, rdx
                     ; jmp => b_ok
                     ; => b_int
                     ; cvtsi2sd xmm1, ecx
@@ -2207,7 +2442,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     let xmm_area = 16 * xmm_saves.len() as i32;
     let ta_base = OUT_AREA + xmm_area + 8 * a.slots as i32;
     let c3 = ta_base + TA_RECORD * i32::from(f.ta_records);
-    let mut frame = c3 + if f.cross.is_empty() { 0 } else { C3_SCRATCH };
+    let mut frame = c3 + if f.cross.is_empty() && f.ic_sites.is_empty() { 0 } else { C3_SCRATCH };
     if (8 + 8 * pushes + frame) % 16 != 0 {
         frame += 8;
     }
@@ -2257,7 +2492,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         match b.term {
             Term::Branch { cond, .. } => uses[cond as usize] += 1,
             Term::Return(v) => uses[v as usize] += 1,
-            Term::Jump(_) => {}
+            Term::Jump(_) | Term::Exit => {}
         }
     }
     let fused = |b: &super::build::Block| -> Option<V> {
@@ -2359,6 +2594,8 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
                     ; jmp => epilogue
                 );
             }
+            // The block's last op has left the body.
+            Term::Exit => {}
         }
     }
     // ── deopt stubs ──
@@ -2371,6 +2608,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
             ; mov rcx, rdi
             ; mov edx, f.func_id as i32
             ; mov r8d, s.why as i32
+            ; mov r9d, f.body_gen as i32
             ; mov rax, QWORD helper
             ; call rax
             ; xor eax, eax

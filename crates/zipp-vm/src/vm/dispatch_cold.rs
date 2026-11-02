@@ -4448,7 +4448,9 @@ impl<'p> Vm<'p> {
                             Instr::GetProp { .. } => {
                                 if let Some(lane) = self.ic_class_getter_read(func_id, ip) {
                                     opt_callees.getters.insert(ip, lane);
-                                } else if !prop_shape.contains_key(&ip) {
+                                } else {
+                                    // Ahead of a one-shape plan too: a cache that
+                                    // has met two shapes would deopt that plan.
                                     let ways = self.ic_own_data_ways(func_id, ip);
                                     if ways.len() >= 2 {
                                         opt_callees.poly.insert(ip, ways);

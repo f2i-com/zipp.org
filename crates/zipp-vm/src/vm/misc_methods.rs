@@ -28,6 +28,9 @@ pub(crate) struct NativeCb {
     self_binding: Option<(u32, u64)>,
     /// A closure with captures: its cells are installed around each call.
     capturing: bool,
+    /// The JIT's evictions when `entry` was taken (`Jit::retired_count`):
+    /// after one, `entry` may be a parked body its function has replaced.
+    retired: usize,
 }
 
 impl<'p> Vm<'p> {
@@ -447,6 +450,7 @@ impl<'p> Vm<'p> {
             uninit_mask,
             self_binding,
             capturing,
+            retired: self.jit.retired_count(),
         })
     }
 
@@ -501,8 +505,11 @@ impl<'p> Vm<'p> {
         }
         // Still compiled (an evicted body is parked, never freed, so `entry`
         // stays callable; a function sent back to the interpreter must not be
-        // entered again), under the binding its self-calls assumed.
+        // entered again), by the body `entry` belongs to (one compiled again
+        // after an eviction is another body: the parked one's deopts would
+        // count against it), under the binding its self-calls assumed.
         let live = self.jit.fn_state(fid) == crate::codegen::FN_COMPILED
+            && (self.jit.retired_count() == native.retired || self.jit.entry_is_current(fid, entry))
             && native.self_binding.is_none_or(|(slot, expect)| {
                 self.globals.get(slot as usize).map(|v| v.bits()) == Some(expect)
             });

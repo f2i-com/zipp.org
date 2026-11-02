@@ -1338,10 +1338,30 @@ pub(crate) extern "win64" fn jit_float_bail(vm: *mut core::ffi::c_void, func_id:
 /// # Safety
 /// `vm` is the running VM.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_opt_deopt(vm: *mut core::ffi::c_void, func_id: u32, ip: u32) {
+pub(crate) extern "win64" fn jit_opt_deopt(vm: *mut core::ffi::c_void, func_id: u32, ip: u32, body_gen: u32) {
     // SAFETY: exclusive view; the deopting body holds no borrow of the VM.
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    vm.jit.note_opt_deopt(func_id, ip);
+    if crate::jitlog_enabled() && vm.jit.opt_first_deopt(func_id, ip) {
+        let code = &vm.func(func_id as usize).code;
+        match code.get(ip as usize) {
+            Some(i) => eprintln!("[jit] Tier O fn{func_id} deopts at ip {ip}: {i:?}"),
+            None => eprintln!("[jit] Tier O fn{func_id} deopts at its entry"),
+        }
+    }
+    vm.jit.note_opt_deopt(func_id, ip, body_gen);
+}
+
+/// Win64 helper of a Tier O body leaving for the interpreter to route a
+/// `break` or a return through a `finally` (`Jit::note_opt_route_exit`).
+/// No allocation and no user code.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_opt_route_exit(vm: *mut core::ffi::c_void, func_id: u32, body_gen: u32) {
+    // SAFETY: exclusive view; the leaving body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit.note_opt_route_exit(func_id, body_gen);
 }
 
 /// Win64 helper for Tier O's `a % b` on two Numbers (raw f64 bits) its
