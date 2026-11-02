@@ -1259,6 +1259,12 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // A method naming its own class (`new C(...)` inside `class C`):
             // the binding's helper, with the call protocol for its TDZ.
             Instr::LoadClassValue { .. } => {}
+            // `super.name` (the read half of `super.m()`): the interpreter's
+            // super-property cache and walk through `jit_super_get_ic`, with
+            // the call protocol for an inherited getter. A method calling
+            // its parent's was kept out of compiled code by this op alone,
+            // and every call into it from compiled code crossed tiers.
+            Instr::SuperGet { .. } if !py => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1726,6 +1732,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             ),
             Instr::ToStr { dst, a } => (u1(a), Some(dst)),
             Instr::LoadClassValue { dst, .. } => (u0(), Some(dst)),
+            // `super.name` reads the receiver, register 0, for a getter.
+            Instr::SuperGet { dst, .. } => (u1(0), Some(dst)),
             Instr::CallWithThis {
                 dst,
                 callee,
@@ -6946,6 +6954,28 @@ pub(crate) fn compile_proto_mem(
                     obj as u64 | (val as u64) << 16 | (name as u64) << 32 | 1u64 << 56,
                     0,
                     obj,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::SuperGet {
+                dst,
+                home_class_id,
+                name,
+            } => {
+                // `super.name` through `jit_super_get_ic`: the class id low,
+                // the name's string constant high.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_super_get_ic as *const () as usize,
+                    packed_fip,
+                    home_class_id as u64 | (name as u64) << 32,
+                    0,
+                    dst,
                     refetch,
                     None,
                 );

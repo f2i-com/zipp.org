@@ -1541,6 +1541,58 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind `jit_super_get_ic`: `super.name` as the
+    /// interpreter's arm reads it, the cache's data hit first, then the walk
+    /// (`super_base`, RequireObjectCoercible, `get_member` with `this` =
+    /// register 0), which may run an inherited getter. A repeated class (a
+    /// class expression evaluated more than once) is resolved from the top
+    /// frame, as `class_value_for` does, so unless that frame is this code's
+    /// it declines before any effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_super_get_impl(&mut self, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        let home = packed_args as u32;
+        let name = (packed_args >> 32) as u32;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        if self.class_repeated(home) && !self.frames.last().is_some_and(|f| f.func == func_id && f.base == base) {
+            return SELF_CALL_DEOPT;
+        }
+        let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
+        let Some(key) = func.string_constants.get(name as usize) else {
+            return SELF_CALL_DEOPT;
+        };
+        let key: &'p str = key.as_str();
+        let is_static = func.super_static;
+        if let crate::vm::GetAct::Value(v) = self.ic_super_get(func_id, ip, home, is_static, key) {
+            return v.bits();
+        }
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let proto = self.super_base(home, is_static);
+        let r = match self.require_object_coercible(proto) {
+            Err(t) => Err(t),
+            Ok(()) => {
+                let this = self.get(base, 0);
+                self.get_member(proto, key, this)
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// `jit_private_prop_ic`'s first try, for a read or a write (op 0 or 1)
     /// of a field already there: the field the site's way 0 last served, for
     /// the running callee, as the interpreter's own hit takes it. `None` for
