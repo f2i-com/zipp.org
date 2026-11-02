@@ -680,7 +680,7 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
             let mant = if digits.len() > 1 {
                 format!("{}.{}", &digits[..1], &digits[1..])
             } else {
-                digits
+                digits.to_string()
             };
             (mant, exp)
         }

@@ -1185,6 +1185,17 @@ impl<'p> Vm<'p> {
         if v.is_int() {
             return Ok(self.int_str_value(v.as_int()));
         }
+        if v.is_double() {
+            // The text is ASCII and is the string's buffer: the general path
+            // copied it through the display buffer into a second `String`,
+            // then scanned it for non-ASCII bytes.
+            let text = fmt_f64(v.as_f64());
+            if let [b] = *text.as_bytes() {
+                return Ok(Value::heap(u32::from(b)));
+            }
+            let text = crate::heap::JsStr::from_ascii(text.into_bytes());
+            return Ok(Value::heap(self.heap.alloc_js(text)));
+        }
         // An object's ToPrimitive result is kept as the string VALUE it is:
         // `String(['\uD800'])` is the array's join result, surrogate intact.
         // (Same protocol and order as `to_js_string`'s object path.)
