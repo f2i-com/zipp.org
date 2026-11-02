@@ -1541,6 +1541,48 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `jit_private_prop_ic`'s first try, for a read or a write (op 0 or 1)
+    /// of a field already there: the field the site's way 0 last served, for
+    /// the running callee, as the interpreter's own hit takes it. `None` for
+    /// everything else, which the general path answers. Nothing here can
+    /// throw, call user code or allocate.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn jit_private_way0_hit(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> Option<u64> {
+        let op = ((packed_args >> 56) & 3) as u8;
+        if op == 2 {
+            return None;
+        }
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let o = self.get(base, (packed_args & 0xFFFF) as u16);
+        if !o.is_heap() {
+            return None;
+        }
+        let ctx = self.jit_running_callee(func_id, base)?;
+        let (brand, id, pos) = self.ic_private_way0(func_id, ip, ctx)?;
+        let idx = o.heap_index();
+        let (at, v) = self.private_field_at(idx, brand, id, pos)?;
+        if op == 0 {
+            return Some(v.bits());
+        }
+        let nv = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        // No holder barrier: the collector roots private field values; a
+        // minor takes the young ones from this record (`record_young_value`),
+        // as the interpreter's way-0 write (`ic.rs`) leaves them.
+        self.private_fields_mut(idx)?.get_mut(at)?.2 = nv;
+        self.heap.record_young_value(nv);
+        Some(nv.bits())
+    }
+
     /// The implementation behind `jit_private_prop_ic`: the interpreter's
     /// private-name arms, for the code's own running callee
     /// (`jit_running_callee`: the frame a region or a frame-backed Tier C
@@ -1574,29 +1616,7 @@ impl<'p> Vm<'p> {
         let val_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let name = ((packed_args >> 32) & 0xFF_FFFF) as u32;
         let op = ((packed_args >> 56) & 3) as u8;
-        // The field this site last served, for this callee: the
-        // interpreter's way-0 hit.
-        #[cfg(not(feature = "safe-sandbox"))]
-        if op != 2 && o.is_heap() {
-            if let Some((brand, id, pos)) = self.ic_private_way0(func_id, ip, ctx) {
-                let idx = o.heap_index();
-                if let Some((at, v)) = self.private_field_at(idx, brand, id, pos) {
-                    if op == 0 {
-                        return v.bits();
-                    }
-                    let nv = self.get(base, val_reg);
-                    // No holder barrier: the collector roots private field
-                    // values; a minor takes the young ones from this record
-                    // (`record_young_value`), as the interpreter's way-0
-                    // write (`ic.rs`) leaves them.
-                    if let Some(fields) = self.private_fields_mut(idx) {
-                        fields[at].2 = nv;
-                    }
-                    self.heap.record_young_value(nv);
-                    return nv.bits();
-                }
-            }
-        }
+        // The way-0 hit (`jit_private_way0_hit`) was tried before this.
         let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
         let Some(key) = func.string_constants.get(name as usize) else {
             return SELF_CALL_DEOPT;

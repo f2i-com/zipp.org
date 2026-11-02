@@ -1645,6 +1645,28 @@ pub(crate) extern "win64" fn jit_private_prop_ic(
     packed_args: u64,
     _argc: u32,
 ) -> u64 {
+    // The site's way-0 field first, in this small frame: inlined beside the
+    // general path, every access paid that path's ten xmm saves and restores
+    // and eight pushes, a third of the helper's instructions.
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        // SAFETY: as the general path's.
+        let hit = unsafe { (*(vm as *mut Vm)).jit_private_way0_hit(caller_base_ptr, packed_fip, packed_args) };
+        if let Some(bits) = hit {
+            return bits;
+        }
+    }
+    jit_private_prop_general(vm, caller_base_ptr, packed_fip, packed_args)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(never)]
+fn jit_private_prop_general(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
         vm.jit_region_private_prop_impl(caller_base_ptr, packed_fip, packed_args)
