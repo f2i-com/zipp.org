@@ -340,18 +340,61 @@ const LEAF_BAIL_LIMIT: u8 = 32;
 /// jump it runs each instruction at most once. Not a generator, async
 /// function or one that needs its `arguments`; an arrow only if it never
 /// reads its `this`.
+///
+/// `arguments` only for its length (`args_count_only`): its register holds
+/// the count, as a frame's setup writes it. A captured variable's write
+/// (`UpvalSet`) is the one effect a leaf may have, and so it must be its
+/// last chance to decline: only in a body without jumps, and followed by
+/// nothing that can decline (constants, moves, a read of a cell it wrote,
+/// the return).
 fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
     if p.is_generator
         || p.is_async
         || p.rest_reg.is_some()
-        || p.arguments_reg.is_some()
+        || (p.arguments_reg.is_some() && !p.args_count_only)
         || p.reg_count as usize > LEAF_MAX_REGS
         || (p.param_count as usize) >= LEAF_MAX_REGS
     {
         return LEAF_NO;
     }
+    let has_jumps = p
+        .code
+        .iter()
+        .any(|i| matches!(i, Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }));
+    // The cells written so far, once a write has committed.
+    let mut written: Option<Vec<u16>> = None;
     let mut reads_this = false;
     for (ip, i) in p.code.iter().enumerate() {
+        if let Some(w) = &written {
+            // Past the commit: only what cannot decline.
+            let ok = match *i {
+                Instr::LoadInt { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::Move { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined => true,
+                Instr::LoadConst { idx, .. } => p.constants.get(idx as usize).is_some_and(|c| c.is_number()),
+                Instr::UpvalGet { idx, .. } => w.contains(&idx),
+                _ => false,
+            };
+            if !ok {
+                return LEAF_NO;
+            }
+            if let Instr::Move { src: 0, .. } | Instr::Return { src: 0 } = *i {
+                reads_this = true;
+            }
+            continue;
+        }
+        if let Instr::UpvalSet { idx, src } = *i {
+            if has_jumps {
+                return LEAF_NO;
+            }
+            reads_this |= src == 0;
+            written = Some(vec![idx]);
+            continue;
+        }
         let forward = |t: u32| t as usize > ip && (t as usize) < p.code.len();
         let srcs: &[u16] = match *i {
             Instr::LoadInt { .. }
@@ -587,6 +630,10 @@ impl<'p> Vm<'p> {
         for (k, slot) in r[1..=n].iter_mut().enumerate() {
             *slot = self.get(base, arg_base + k as u16);
         }
+        // `arguments` for its length alone (`leaf_scan`): the count.
+        if let Some(areg) = p.arguments_reg {
+            r[areg as usize] = Value::int(argc as i32);
+        }
         let mut ip = 0;
         macro_rules! decline {
             () => {{
@@ -636,6 +683,23 @@ impl<'p> Vm<'p> {
                         decline!();
                     }
                     r[dst as usize] = v;
+                }
+                // The body's one effect, past which nothing declines
+                // (`leaf_scan`); the lite loop's checks first: a `const`, a
+                // function expression's own name and a binding in its TDZ
+                // are the frame's (it throws, or ignores the write).
+                Instr::UpvalSet { idx, src } => {
+                    if closure == NO_CLOSURE {
+                        decline!();
+                    }
+                    let cell = self.closure_upvalue(closure, idx);
+                    if (!self.const_cells.is_empty() && self.const_cells.contains(&cell))
+                        || (!self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell))
+                        || self.heap.cell_get(cell).is_uninitialized()
+                    {
+                        decline!();
+                    }
+                    self.heap.upval_cell_set(cell, r[src as usize]);
                 }
                 Instr::Eq { dst, a, b } | Instr::Ne { dst, a, b } => {
                     let (x, y) = (r[a as usize], r[b as usize]);
