@@ -1855,6 +1855,9 @@ pub(crate) struct HeapHelpers {
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     pub(crate) ic_base_idx: u32,
+    /// The address of the entry count a Tier C body counts down before it
+    /// asks for Tier O (`Jit::opt_tier_up`), 0 for none.
+    pub(crate) opt_tier_up: u64,
 }
 
 env_off_switch! {

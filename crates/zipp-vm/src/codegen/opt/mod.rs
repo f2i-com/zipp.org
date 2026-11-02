@@ -131,6 +131,27 @@ env_off_switch! {
     fn opt_ic_on() = "ZIPP_NO_OPT_IC"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_OPT_TIER_UP=1`: Tier O takes a function at its first compile,
+    /// with what eight interpreted calls taught the caches, instead of after
+    /// `TIER_UP_ENTRIES` entries of its Tier C body.
+    fn tier_up_on() = "ZIPP_NO_OPT_TIER_UP"
+}
+
+/// `tier_up_on`, for `Jit::compile`.
+pub(crate) fn tier_up_enabled() -> bool {
+    tier_up_on()
+}
+
+/// Entries of a function's Tier C body before it asks for Tier O.
+pub(crate) const TIER_UP_ENTRIES: u32 = 1000;
+
+/// Whether Tier O would admit `proto` (`build::admits`): only then does its
+/// Tier C body count toward Tier O.
+pub(crate) fn admits(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Option<&MathIntrinsicGuard>) -> bool {
+    build::admits(proto, const_strs, math)
+}
+
 /// `opt_ic_on`, for the compile that reserves the sites.
 pub(crate) fn opt_ic_enabled() -> bool {
     opt_ic_on()
@@ -235,7 +256,8 @@ const MAX_REPLANS: u8 = 2;
 /// takes Tier C (`Jit::note_opt_route_exit`).
 const ROUTE_EXITS_LIMIT: u32 = 64;
 
-/// Tier O's body for `proto`, or `None` when it admits none.
+/// Tier O's body for `proto`, or `None` when it admits none, and the ips of
+/// the reads it built knowing nothing of their receivers.
 pub(crate) fn compile(
     proto: &FuncProto,
     func_id: u32,
@@ -244,7 +266,7 @@ pub(crate) fn compile(
     class_read: &ClassReadPlan,
     callees: &OptCallees,
     env: &Env,
-) -> Option<JitFn> {
+) -> Option<(JitFn, rustc_hash::FxHashSet<u32>)> {
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -300,6 +322,20 @@ pub(crate) fn compile(
     }
     let alloc = alloc::allocate(&func);
     let f = emit::emit(&func, &alloc)?;
+    // The reads built knowing nothing of their receivers: the ones a replan
+    // may build better (`Jit::opt_slow_read_due`).
+    let plain: rustc_hash::FxHashSet<u32> = func
+        .insts
+        .iter()
+        .filter_map(|i| match i.op {
+            build::Op::CallOut {
+                ip,
+                lane: build::CallLane::Prop { .. },
+                ..
+            } => Some(ip),
+            _ => None,
+        })
+        .collect();
     if crate::jitlog_enabled() {
         eprintln!(
             "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined)",
@@ -311,7 +347,7 @@ pub(crate) fn compile(
             func.inlined
         );
     }
-    Some(f)
+    Some((f, plain))
 }
 
 impl super::Jit {
@@ -365,6 +401,36 @@ impl super::Jit {
         self.evict_opt(func_id);
     }
 
+    /// Whether `func_id`'s next compile is Tier O's: a function it may take,
+    /// once its Tier C body has asked (`opt_tier_up`).
+    pub(crate) fn opt_compiles_now(&self, func_id: u32) -> bool {
+        self.opt_may_compile(func_id) && (self.opt_ready.contains(&func_id) || !tier_up_enabled())
+    }
+
+    /// `func_id`'s Tier C body counted `TIER_UP_ENTRIES` entries: it is parked
+    /// (it may be the one running, which runs on) and the function's next
+    /// entry compiles it again, for Tier O this time, from the caches and
+    /// callee entries the Tier C body's runs filled.
+    pub(crate) fn opt_tier_up(&mut self, func_id: u32) {
+        if !self.opt_ready.insert(func_id) {
+            return;
+        }
+        let Some(f) = self.take_tier_c_body(func_id) else {
+            return;
+        };
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] Tier C fn{func_id} tiers up ({TIER_UP_ENTRIES} entries)");
+        }
+        self.retired_fns.push(f);
+        let rearm = self.fn_threshold().saturating_sub(1);
+        self.counts.insert(func_id, rearm);
+        self.set_fn_state(func_id, super::FN_COLD);
+        self.clear_cross_entry(func_id);
+        if self.self_cache.is_some_and(|(id, _)| id == func_id) {
+            self.self_cache = None;
+        }
+    }
+
     /// Whether body `body_gen` is `func_id`'s installed Tier O body, not a
     /// parked one an array builtin still runs from the entry it took.
     fn opt_body_current(&self, func_id: u32, body_gen: u32) -> bool {
@@ -414,6 +480,10 @@ impl super::Jit {
         }
         *n = 0;
         if self.opt_replans.get(&func_id).copied().unwrap_or(0) >= MAX_REPLANS {
+            return false;
+        }
+        // A read built with its shapes (a poly read's miss) would build alike.
+        if !self.opt_plain_reads.get(&func_id).is_some_and(|s| s.contains(&ip)) {
             return false;
         }
         // A site made generic by its deopts reads slowly on purpose.

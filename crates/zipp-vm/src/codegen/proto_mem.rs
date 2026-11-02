@@ -3386,6 +3386,21 @@ pub(crate) fn compile_proto_mem(
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
     );
+    // Tier O's tier-up: the entry that takes the count to zero asks for it
+    // (`jit_opt_tier_up`) and runs on, here.
+    if heap.opt_tier_up != 0 {
+        let past = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rax, QWORD heap.opt_tier_up as i64
+            ; sub DWORD [rax], 1
+            ; jnz => past
+            ; mov rcx, rdi
+            ; mov edx, func_id as i32
+            ; mov rax, QWORD crate::vm::jit_opt_tier_up as *const () as i64
+            ; call rax
+            ; => past
+        );
+    }
     for k in 0..fc_slots {
         let off = fc_save_off + 16 * k as i32;
         dynasm!(ops ; movdqu [rsp + off], Rx(FloatCache::FIRST_XMM + k as u8));

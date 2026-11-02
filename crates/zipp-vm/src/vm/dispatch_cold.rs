@@ -4442,7 +4442,7 @@ impl<'p> Vm<'p> {
                 let class_read = self.build_class_read_plan(func_id);
                 // Tier O's inlinable callees, with their own property plans.
                 let mut opt_callees = crate::codegen::OptCallees::default();
-                if self.jit.opt_may_compile(func_id) {
+                if self.jit.opt_compiles_now(func_id) {
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
                         match *instr {
                             Instr::GetProp { .. } => {

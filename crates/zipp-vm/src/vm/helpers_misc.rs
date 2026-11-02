@@ -1351,6 +1351,19 @@ pub(crate) extern "win64" fn jit_opt_deopt(vm: *mut core::ffi::c_void, func_id: 
     vm.jit.note_opt_deopt(func_id, ip, body_gen);
 }
 
+/// Win64 helper a Tier C body's prologue calls on the entry that ends its
+/// count (`Jit::opt_tier_up`). No allocation and no user code; the body
+/// runs on.
+///
+/// # Safety
+/// `vm` is the running VM.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_opt_tier_up(vm: *mut core::ffi::c_void, func_id: u32) {
+    // SAFETY: exclusive view; the entering body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.jit.opt_tier_up(func_id);
+}
+
 /// Win64 helper of a Tier O body leaving for the interpreter to route a
 /// `break` or a return through a `finally` (`Jit::note_opt_route_exit`).
 /// No allocation and no user code.

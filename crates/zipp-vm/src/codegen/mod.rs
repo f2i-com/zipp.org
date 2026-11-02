@@ -1918,6 +1918,7 @@ impl HeapHelperAddrs {
             len_of: self.len_of,
             forin_keys: self.forin_keys,
             ic_base_idx,
+            opt_tier_up: 0,
         }
     }
 }
@@ -3509,6 +3510,14 @@ pub struct Jit {
     /// handed out (`Jit::opt_body_current`).
     opt_gen: FxHashMap<u32, u32>,
     opt_gen_next: u32,
+    /// The entries each Tier C body still counts down before it asks for
+    /// Tier O (boxed: the bodies hold the address), and the functions that
+    /// asked, whose next compile is Tier O's (`Jit::opt_tier_up`).
+    opt_counters: FxHashMap<u32, Box<u32>>,
+    opt_ready: FxHashSet<u32>,
+    /// The reads each installed Tier O body built knowing nothing of their
+    /// receivers (`opt::compile`): the only ones a replan may build better.
+    opt_plain_reads: FxHashMap<u32, FxHashSet<u32>>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4409,7 +4418,10 @@ impl Jit {
         // is no reason to decline: the interpreter no longer runs that loop.
         self.opt_bodies.remove(&func_id);
         self.opt_gen.remove(&func_id);
-        if self.opt_may_compile(func_id) {
+        // A function takes Tier O once its Tier C body has run long enough
+        // to fill the caches and callee entries it plans from.
+        let opt_now = self.opt_compiles_now(func_id);
+        if opt_now {
             let body_gen = self.opt_next_gen();
             // Inline cache sites for the slow property reads' probe, numbered
             // as Tier C's (`register_ic_sites`).
@@ -4432,7 +4444,8 @@ impl Jit {
                 generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
                 heap: heap_helpers.to_heap_helpers(func_id, ic_base.unwrap_or(0)),
             };
-            if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
+            if let Some((f, plain)) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
+                self.opt_plain_reads.insert(func_id, plain);
                 let entry = f.entry();
                 {
                     let (a, n) = f.code_span();
@@ -4491,7 +4504,17 @@ impl Jit {
                 .count();
             let ic_base_idx = self.reserve_ic_sites(n_sites);
             let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
-            let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+            let mut helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+            // A function Tier O may take later counts its entries down.
+            if !opt_now
+                && self.opt_may_compile(func_id)
+                && opt::tier_up_enabled()
+                && !self.opt_ready.contains(&func_id)
+                && opt::admits(proto, const_strs, heap_helpers.math_imul_guard.as_ref())
+            {
+                let c = self.opt_counters.entry(func_id).or_insert_with(|| Box::new(opt::TIER_UP_ENTRIES));
+                helpers.opt_tier_up = &mut **c as *mut u32 as u64;
+            }
             let arith_fb_base = self.arith_table(func_id, proto.code.len());
             let arith_fb = self.arith_feedback(func_id).map(<[u8]>::to_vec);
             if let Some(f) = compile_proto_mem(

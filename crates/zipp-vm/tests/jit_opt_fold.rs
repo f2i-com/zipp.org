@@ -37,6 +37,7 @@ console.log(out.join(" "));
 fn matches_node() {
     // Read once per process, before the first VM: this file's only test.
     std::env::set_var("ZIPP_OPT", "1");
+    std::env::set_var("ZIPP_NO_OPT_TIER_UP", "1");
     let out = zipp_vm::run(PROGRAM).expect("compiles");
     assert_eq!(out.error, None, "{:?}", out.errput);
     assert_eq!(out.output.join("\n"), EXPECTED);

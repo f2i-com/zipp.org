@@ -1302,12 +1302,10 @@ impl Fn<'_> {
     }
 }
 
-/// The IR of `proto`, or `None` when Tier O does not admit it.
-pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func> {
-    let code = &p.code;
-    let n = code.len();
-    let nregs = p.reg_count as usize;
-    if n == 0
+/// Whether Tier O builds a body of `p`'s kind and size at all.
+fn body_ok(p: &FuncProto) -> bool {
+    let (n, nregs) = (p.code.len(), p.reg_count as usize);
+    !(n == 0
         || n > MAX_OPS
         || nregs > MAX_REGS
         || p.is_generator
@@ -1315,8 +1313,37 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         || p.rest_reg.is_some()
         || p.arguments_reg.is_some()
         || !p.eval_sites.is_empty()
-        || (p.param_count as usize) >= nregs.max(1)
-    {
+        || (p.param_count as usize) >= nregs.max(1))
+}
+
+/// Whether Tier O admits every op of `p` without plans (which only widen
+/// it): a Tier C body counts its entries toward Tier O only then
+/// (`Jit::opt_tier_up`); one Tier O would decline is left be.
+pub(crate) fn admits(p: &FuncProto, const_strs: &FxHashMap<u32, u64>, math: Option<&MathIntrinsicGuard>) -> bool {
+    if !body_ok(p) {
+        return false;
+    }
+    let reads = math_reads_known(&p.code, math);
+    let (plan, sites) = (PropShapePlan::default(), FxHashMap::default());
+    let admit = Admit {
+        p,
+        plan: &plan,
+        top: Some((&sites, const_strs)),
+        math,
+        math_reads: &reads,
+    };
+    let nregs = p.reg_count as usize;
+    p.code.iter().enumerate().all(|(ip, i)| {
+        uses_def(i, ip, &admit).is_some_and(|(u, d)| u.iter().chain(d.iter()).all(|&r| (r as usize) < nregs))
+    })
+}
+
+/// The IR of `proto`, or `None` when Tier O does not admit it.
+pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func> {
+    let code = &p.code;
+    let n = code.len();
+    let nregs = p.reg_count as usize;
+    if !body_ok(p) {
         return None;
     }
     let math = inputs.math.as_ref();
