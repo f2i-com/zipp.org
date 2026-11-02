@@ -7869,13 +7869,8 @@ impl<'p> Vm<'p> {
         } else {
             this_val
         };
-        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-        self.regs[new_base] = this_val;
         let n = (argc as usize).min(proto.param_count as usize);
-        for i in 0..n {
-            let v = self.regs[caller_base + arg_base as usize + i];
-            self.regs[new_base + 1 + i] = v;
-        }
+        self.regs.open_window(callee_regs, this_val, caller_base + arg_base as usize, n);
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
@@ -7997,6 +7992,51 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// [`Self::setup_call_lean_this`] for a method of an ordinary object or
+    /// class instance `recv` whose callee's frame facts the caller holds
+    /// (`desc`, [`Self::lean_call_desc`]): the lite method cache's push,
+    /// which reads nothing of the callee's `FuncProto`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_method_desc(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        recv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let new_base = self.regs.len();
+        let lean = desc & LEAN_DESC_OK != 0
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + (desc & 0xFFFF) as usize)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call_lean_this(
+                func_id,
+                closure,
+                recv,
+                true,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        self.lean_desc_push(func_id, closure, desc, recv, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        Ok(())
+    }
+
     /// [`Self::setup_call_lean_desc`] for an arrow ([`LEAN_DESC_ARROW`]): the
     /// same push, with the `this` its closure captured. An arrow took the
     /// whole of `setup_call`, which reads the callee's prototype for every
@@ -8066,13 +8106,9 @@ impl<'p> Vm<'p> {
     ) {
         let callee_regs = (desc & 0xFFFF) as usize;
         let params = ((desc >> 16) & 0xFF) as usize;
-        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-        self.regs[new_base] = this_val;
+        debug_assert_eq!(new_base, self.regs.len());
         let n = (argc as usize).min(params);
-        for i in 0..n {
-            let v = self.regs[caller_base + arg_base as usize + i];
-            self.regs[new_base + 1 + i] = v;
-        }
+        self.regs.open_window(callee_regs, this_val, caller_base + arg_base as usize, n);
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
@@ -8542,7 +8578,7 @@ impl<'p> Vm<'p> {
 /// NaN, the infinities, larger magnitudes and every non-number: those take
 /// the full ToNumeric path.
 #[inline(always)]
-fn number_int32(v: Value) -> Option<i32> {
+pub(crate) fn number_int32(v: Value) -> Option<i32> {
     if v.is_int() {
         return Some(v.as_int());
     }

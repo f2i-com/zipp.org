@@ -1194,6 +1194,66 @@ impl RegisterFile {
         self.resize_general(new_len, fill);
     }
 
+    /// Open a lean call's window of `len` registers at the live end: the
+    /// first `this`, the next `n` copied from `src..src + n` (the caller's
+    /// argument registers), the rest `undefined`. Inside the initialized
+    /// extent (nearly every call: the previous one left it) that is one
+    /// store, one copy and the fill of what the arguments leave; the general
+    /// resize filled the whole window first, and each argument's copy then
+    /// checked both its indices.
+    #[inline(always)]
+    pub(crate) fn open_window(&mut self, len: usize, this: Value, src: usize, n: usize) {
+        let base = self.logical_len;
+        let end = base + len;
+        if n >= len || src + n > base || end > self.storage.len() {
+            return self.open_window_general(len, this, src, n);
+        }
+        // SAFETY: `end <= storage.len()`, so every slot written is
+        // initialized storage, and the source (below `base`) and the
+        // destination (from `base`) do not overlap.
+        unsafe {
+            let p = self.storage.as_mut_ptr();
+            p.add(base).write(this);
+            // A call's few arguments as moves: `copy_nonoverlapping` of a
+            // count only known here was a call to `memcpy`.
+            let (s, d) = (p.add(src), p.add(base + 1));
+            match n {
+                0 => {}
+                1 => d.write(s.read()),
+                2 => {
+                    d.write(s.read());
+                    d.add(1).write(s.add(1).read());
+                }
+                3 => {
+                    d.write(s.read());
+                    d.add(1).write(s.add(1).read());
+                    d.add(2).write(s.add(2).read());
+                }
+                _ => std::ptr::copy_nonoverlapping(s, d, n),
+            }
+            let mut i = base + 1 + n;
+            while i < end {
+                p.add(i).write(Value::UNDEFINED);
+                i += 1;
+            }
+        }
+        self.logical_len = end;
+    }
+
+    /// [`Self::open_window`] past the initialized extent, as the push did it
+    /// before (or with arguments a compiled window never has).
+    #[cold]
+    #[inline(never)]
+    fn open_window_general(&mut self, len: usize, this: Value, src: usize, n: usize) {
+        let base = self.logical_len;
+        self.resize(base + len, Value::UNDEFINED);
+        self.live_mut()[base] = this;
+        for i in 0..n {
+            let v = self.live()[src + i];
+            self.live_mut()[base + 1 + i] = v;
+        }
+    }
+
     #[inline(never)]
     fn resize_general(&mut self, new_len: usize, fill: Value) {
         let old_logical = self.logical_len;
@@ -1342,6 +1402,19 @@ impl RegisterFile {
 
     pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
         self.storage.resize(new_len, fill);
+    }
+
+    /// The other definition's lean-call window: `this`, `n` arguments from
+    /// `src`, the rest `undefined`.
+    #[inline(always)]
+    pub(crate) fn open_window(&mut self, len: usize, this: Value, src: usize, n: usize) {
+        let base = self.storage.len();
+        self.storage.resize(base + len, Value::UNDEFINED);
+        let s = self.storage.as_mut_slice();
+        s[base] = this;
+        for i in 0..n {
+            s[base + 1 + i] = s[src + i];
+        }
     }
 
     #[inline]

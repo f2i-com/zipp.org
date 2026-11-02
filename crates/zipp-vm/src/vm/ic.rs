@@ -1313,7 +1313,7 @@ impl<'p> Vm<'p> {
     /// Forced inline: it is a handful of compares, and as a call it held
     /// 10% of a property-read loop's samples on the WebAssembly build.
     #[inline(always)]
-    fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
+    pub(crate) fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
         if !recv.is_heap() {
             return None;
         }
@@ -3794,6 +3794,44 @@ impl<'p> Vm<'p> {
     }
 
     // ── CallMethod sites ──
+
+    /// The way of the `CallMethod` cache at `(func_id, ip)` that holds
+    /// `recv`'s answer `callee` by `recv`'s hidden class, after
+    /// `ic_call_method` gave it: `(shape, slot, 0, 0, 0)` for an own data
+    /// slot, `(shape, u32::MAX, class, version, epoch)` for a class method.
+    /// The lite loop's method cache keeps it, so its hit checks the same
+    /// guards without the site lookup and the ways' loop.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn ic_method_way(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        callee: Value,
+    ) -> Option<(u32, u32, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        let (_, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        if sh == crate::shape::DICT {
+            return None;
+        }
+        site.entries[..site.n as usize].iter().find_map(|e| match *e {
+            IcEntry::OwnData { shape, slot } if shape == sh && m.val_at(slot as usize).bits() == callee.bits() => {
+                Some((sh, slot, 0, 0, 0))
+            }
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                epoch,
+                callee: c,
+                recv_shape,
+                ..
+            } if recv_shape == sh && c.bits() == callee.bits() && m.class == Some(class) => {
+                Some((sh, u32::MAX, class, ver, epoch))
+            }
+            _ => None,
+        })
+    }
 
     /// IC lookup + fill for a `CallMethod` site: resolves `recv.key` to a
     /// PLAIN user function to frame-call with `this = recv`. `None` ⇒ slow
