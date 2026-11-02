@@ -3479,6 +3479,10 @@ pub struct Jit {
     /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
     /// code we return into. Freed when the VM drops.
     retired_fns: Vec<JitFn>,
+    /// Tier O (`opt`): deopts per function, and the functions whose body was
+    /// evicted for deopting too often (they take Tier C from then on).
+    opt_deopts: FxHashMap<u32, u32>,
+    opt_blacklist: rustc_hash::FxHashSet<u32>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4349,6 +4353,28 @@ impl Jit {
                 return;
             }
             None => {}
+        }
+        // ── Tier O (`opt`, `ZIPP_OPT=1`) ── the optimizing tier, for the
+        // functions it admits; same ABI and cross entry as Tier C. It runs
+        // a whole body, loops included, so a region's loop head (`yield_heads`)
+        // is no reason to decline: the interpreter no longer runs that loop.
+        if self.opt_may_compile(func_id) {
+            if let Some(f) = opt::compile(proto, func_id, prop_shape) {
+                let entry = f.entry();
+                {
+                    let (a, n) = f.code_span();
+                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} tier-o"));
+                }
+                self.compiled.insert(func_id, f);
+                self.set_fn_state(func_id, FN_COMPILED);
+                if let Some(a) = tier_a_fallback.take() {
+                    let (at, n) = a.code_span();
+                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    self.int_bodies.insert(func_id, a);
+                }
+                self.set_cross_entry(func_id, entry, cross_uninit_mask(proto), None, None, None, false);
+                return;
+            }
         }
         // ── Tier C (whole-function memory path) ── Tier A declined (not a
         // fib-shaped int self-recursion). Try the call-heavy / recursive-descent
@@ -5933,6 +5959,7 @@ mod inline;
 mod int_splice;
 mod kernels;
 pub(crate) mod meter;
+mod opt;
 mod plan;
 mod plan_region;
 mod proto_mem;
