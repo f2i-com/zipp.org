@@ -2117,7 +2117,7 @@ mod fmt_general_stack_tests {
 
     #[test]
     fn stack_composition_matches_the_string_composition() {
-        let mut check = |abs: f64| {
+        let check = |abs: f64| {
             if !(abs.is_finite() && abs > 0.0) {
                 return;
             }
