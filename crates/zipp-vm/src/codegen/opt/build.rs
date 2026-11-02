@@ -235,6 +235,12 @@ pub(crate) enum Op {
     I32Truthy(V),
     AddF(V, V),
     SubF(V, V),
+    /// `a + b` / `a - b` / `a + k` on i32s; an overflow fails, unless the
+    /// result is observed only through ToInt32 (`wrap`, Tier C's
+    /// `trunc_only_arith_ips` proof), where it wraps.
+    AddI(V, V, bool),
+    SubI(V, V, bool),
+    AddIK(V, i32, bool),
     MulF(V, V),
     DivF(V, V),
     NegF(V),
@@ -243,6 +249,8 @@ pub(crate) enum Op {
     /// `a >>> b`, a Number.
     UshrF(V, V),
     CmpF(Cmp, V, V),
+    /// A compare of two i32s.
+    CmpI(Cmp, V, V),
     /// `===` (true) or `!==` of two booleans.
     CmpB(bool, V, V),
     NotB(V),
@@ -257,6 +265,17 @@ pub(crate) enum Op {
         shape: u32,
         slot: u32,
         slow: Option<(u32, u64)>,
+    },
+    /// An object literal of a known plan and shape (Tier C's baked form):
+    /// a ready object filled from the window the frame state fills
+    /// (`emit_ready_literal_of`), else `jit_finalize_object_thin`.
+    Literal {
+        plan_ptr: u64,
+        shape: u32,
+        val_base: u16,
+        count: u16,
+        dst: u16,
+        ip: u32,
     },
     /// An array or object literal at `ip` through its allocating helper
     /// (`jit_new_array`, `jit_finalize_object`: `vm`, window, `a`, `b`),
@@ -404,6 +423,7 @@ impl Op {
                 | Op::GetPropPoly { .. }
                 | Op::Length { .. }
                 | Op::AllocOut { .. }
+                | Op::Literal { .. }
         )
     }
 
@@ -431,6 +451,7 @@ impl Op {
             | Op::NewLane { .. }
             | Op::ClassConst { .. }
             | Op::AllocOut { .. }
+            | Op::Literal { .. }
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => vec![],
             Op::MathGuard { recv: Some(a), .. }
@@ -450,6 +471,7 @@ impl Op {
             | Op::F64ToI32(a)
             | Op::TaggedToI32(a)
             | Op::UshrI(a, _)
+            | Op::AddIK(a, _, _)
             | Op::Box(a)
             | Op::TaggedTruthy(a)
             | Op::F64Truthy(a)
@@ -463,11 +485,14 @@ impl Op {
             | Op::GuardClass { obj: a, .. } => vec![a],
             Op::AddF(a, b)
             | Op::SubF(a, b)
+            | Op::AddI(a, b, _)
+            | Op::SubI(a, b, _)
             | Op::MulF(a, b)
             | Op::DivF(a, b)
             | Op::Bit(_, a, b)
             | Op::UshrF(a, b)
             | Op::CmpF(_, a, b)
+            | Op::CmpI(_, a, b)
             | Op::CmpT(_, a, b)
             | Op::CmpB(_, a, b)
             | Op::StrictEqT(_, a, b) => vec![a, b],
@@ -830,6 +855,12 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
         // A getter inlined returns its body's.
         Instr::GetProp { .. } => call,
         Instr::Move { src, .. } => reps[src as usize],
+        // Two i32s add and subtract as an i32 behind an overflow guard
+        // (`AddI`); a site that overflowed before is given `F64` (`over`).
+        Instr::Add { a, b, .. } | Instr::Sub { a, b, .. } if reps[a as usize] == Rep::I32 && reps[b as usize] == Rep::I32 => {
+            Rep::I32
+        }
+        Instr::AddInt { a, .. } if reps[a as usize] == Rep::I32 => Rep::I32,
         Instr::Add { .. } | Instr::Sub { .. } | Instr::Mul { .. } | Instr::Div { .. } | Instr::AddInt { .. } | Instr::Neg { .. } => {
             Rep::F64
         }
@@ -1075,6 +1106,9 @@ struct Fn<'a> {
     /// Its function id (the top level's; an inlined callee makes no op that
     /// names it).
     func_id: u64,
+    /// `trunc_only_arith_ips`: the adds whose result is observed only
+    /// through ToInt32, which wrap.
+    trunc: Vec<bool>,
     plan: &'a PropShapePlan,
     /// The top level's string constants (`Inputs::const_strs`).
     strs: Option<&'a FxHashMap<u32, u64>>,
@@ -1450,6 +1484,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                     Some(Rep::Tagged)
                 } else if ushr_i.contains(&ip) {
                     Some(Rep::I32)
+                } else if generic(ip) && matches!(code[ip], Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }) {
+                    Some(Rep::F64)
                 } else {
                     None
                 };
@@ -1494,6 +1530,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let top = Fn {
         p,
         func_id: func_id as u64,
+        trunc: super::super::emit_misc::trunc_only_arith_ips(p),
         plan: inputs.prop_shape,
         strs: Some(inputs.const_strs),
         math,
@@ -1870,6 +1907,37 @@ fn translate(
         } => {
             let s = fs.id(b, defs);
             let window = u64::from(f.p.reg_count.max(1));
+            // Tier C's baked form (`proto_mem`'s `FinalizeObject`): the
+            // plan's keys folded into the shape it makes.
+            let baked = f.p.static_key_plans.get(plan as usize).filter(|pl| {
+                super::super::finalize_baked_enabled()
+                    && crate::heap::thin_alloc_enabled()
+                    && pl.runtime_valid()
+                    && pl.len() == count as usize
+                    && !pl.has_element_key()
+                    && (count as usize) < crate::heap::PROP_INDEX_THRESHOLD
+                    && val_base as usize + count as usize <= f.p.reg_count as usize
+            });
+            if let Some(pl) = baked {
+                let data = crate::shape::attr_bits(true, true, true, false);
+                let mut shape = crate::shape::EMPTY;
+                for key in pl.keys() {
+                    shape = crate::shape::add(shape, key, data);
+                }
+                defs[dst as usize] = b.push_out(
+                    Op::Literal {
+                        plan_ptr: pl as *const crate::bytecode::StaticKeyPlan as u64,
+                        shape,
+                        val_base,
+                        count,
+                        dst,
+                        ip: ip as u32,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                );
+                return Some(Flow::Next);
+            }
             defs[dst as usize] = b.push_out(
                 Op::AllocOut {
                     helper: helper(crate::vm::jit_finalize_object as *const ()),
@@ -1915,6 +1983,26 @@ fn translate(
                 Some(s),
             );
         }
+        Instr::Add { dst, a, b: c } | Instr::Sub { dst, a, b: c }
+            if !f.generic(ip) && b.rep(defs[a as usize]) == Rep::I32 && b.rep(defs[c as usize]) == Rep::I32 =>
+        {
+            // Small-integer speculation: an overflow resumes the interpreter
+            // here, and the site is a double's next time (`generic`).
+            let (x, y) = (defs[a as usize], defs[c as usize]);
+            let wrap = f.trunc.get(ip).copied().unwrap_or(false);
+            let op = if matches!(*ins, Instr::Add { .. }) {
+                Op::AddI(x, y, wrap)
+            } else {
+                Op::SubI(x, y, wrap)
+            };
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(op, Rep::I32, Some(s));
+        }
+        Instr::AddInt { dst, a, imm, .. } if !f.generic(ip) && b.rep(defs[a as usize]) == Rep::I32 => {
+            let s = fs.id(b, defs);
+            let wrap = f.trunc.get(ip).copied().unwrap_or(false);
+            defs[dst as usize] = b.push_out(Op::AddIK(defs[a as usize], imm, wrap), Rep::I32, Some(s));
+        }
         Instr::Add { dst, a, b: c } | Instr::Sub { dst, a, b: c } | Instr::Mul { dst, a, b: c } | Instr::Div { dst, a, b: c } => {
             let x = b.f64(defs[a as usize], fs, defs);
             let y = b.f64(defs[c as usize], fs, defs);
@@ -1956,6 +2044,8 @@ fn translate(
             defs[dst as usize] = if (num(ra) && nullish(b, vc)) || (num(rc) && nullish(b, va)) {
                 // A Number is never `undefined` or `null` (`inline_sim`).
                 b.konst(Op::ConstBool(!eq), Rep::Bool)
+            } else if ra == Rep::I32 && rc == Rep::I32 {
+                b.emit(Op::CmpI(if eq { Cmp::Eq } else { Cmp::Ne }, va, vc), Rep::Bool)
             } else if num(ra) && num(rc) {
                 let x = b.f64(va, fs, defs);
                 let y = b.f64(vc, fs, defs);
@@ -2388,6 +2478,7 @@ impl Builder {
         let callee = Fn {
             p: c,
             func_id: u64::MAX,
+            trunc: super::super::emit_misc::trunc_only_arith_ips(c),
             plan,
             strs: None,
             math: math.as_ref(),
@@ -2427,6 +2518,9 @@ impl Builder {
             let yt = self.tagged(y);
             let s = fs.id(self, defs);
             return self.push_out(Op::CmpT(cmp, xt, yt), Rep::Bool, Some(s));
+        }
+        if self.rep(x) == Rep::I32 && self.rep(y) == Rep::I32 {
+            return self.emit(Op::CmpI(cmp, x, y), Rep::Bool);
         }
         let xf = self.f64(x, fs, defs);
         let yf = self.f64(y, fs, defs);

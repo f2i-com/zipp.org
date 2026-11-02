@@ -44,11 +44,24 @@ pub(crate) fn emit_ready_literal(
     count: u16,
     dst: u16,
 ) -> Option<dynasmrt::DynamicLabel> {
+    let plan = proto.static_key_plans.get(plan as usize)?;
+    emit_ready_literal_of(ops, plan, shape, val_base, count, dst)
+}
+
+/// `emit_ready_literal` for the literal's plan itself (Tier O, which keeps
+/// the plan's address rather than its function).
+pub(crate) fn emit_ready_literal_of(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &crate::bytecode::StaticKeyPlan,
+    shape: u32,
+    val_base: u16,
+    count: u16,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
     if !crate::heap::ready_objects_enabled() {
         return None;
     }
     let class = crate::heap::val_slab_class(count as usize)? as usize;
-    let plan = proto.static_key_plans.get(plan as usize)?;
     let handle = crate::bytecode::PlanHandle::borrowed_bits(plan);
     let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
     emit_ready_take(ops, class, miss);

@@ -700,6 +700,37 @@ impl Em<'_> {
                 );
                 self.done_gpr(d, st);
             }
+            Op::AddI(a, b, wrap) | Op::SubI(a, b, wrap) => {
+                let stub = stub.expect("a guard has a frame state");
+                let ra = self.gpr(a, RDX);
+                let rb = self.gpr(b, R11);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov eax, Rd(ra));
+                if matches!(i.op, Op::AddI(..)) {
+                    dynasm!(self.ops ; add eax, Rd(rb));
+                } else {
+                    dynasm!(self.ops ; sub eax, Rd(rb));
+                }
+                if !wrap {
+                    dynasm!(self.ops ; jo => stub);
+                }
+                dynasm!(self.ops ; mov Rd(d), eax);
+                self.done_gpr(d, st);
+            }
+            Op::AddIK(a, k, wrap) => {
+                let stub = stub.expect("a guard has a frame state");
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; mov eax, Rd(ra)
+                    ; add eax, k
+                );
+                if !wrap {
+                    dynasm!(self.ops ; jo => stub);
+                }
+                dynasm!(self.ops ; mov Rd(d), eax);
+                self.done_gpr(d, st);
+            }
             Op::UshrI(a, k) => {
                 let ra = self.gpr(a, RDX);
                 let (d, st) = self.dst_gpr(v);
@@ -909,6 +940,22 @@ impl Em<'_> {
                 dynasm!(self.ops ; movzx eax, al ; mov Rd(d), eax);
                 self.done_gpr(d, st);
             }
+            Op::CmpI(c, x, y) => {
+                let ra = self.gpr(x, RDX);
+                let rb = self.gpr(y, R11);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; cmp Rd(ra), Rd(rb));
+                match c {
+                    Cmp::Lt => dynasm!(self.ops ; setl al),
+                    Cmp::Le => dynasm!(self.ops ; setle al),
+                    Cmp::Gt => dynasm!(self.ops ; setg al),
+                    Cmp::Ge => dynasm!(self.ops ; setge al),
+                    Cmp::Eq => dynasm!(self.ops ; sete al),
+                    Cmp::Ne => dynasm!(self.ops ; setne al),
+                }
+                dynasm!(self.ops ; movzx eax, al ; mov Rd(d), eax);
+                self.done_gpr(d, st);
+            }
             Op::CmpB(eq, x, y) => {
                 let ra = self.gpr(x, RDX);
                 let rb = self.gpr(y, R11);
@@ -1104,6 +1151,43 @@ impl Em<'_> {
                     dynasm!(self.ops ; mov Rq(d), rax);
                     self.done_gpr(d, st);
                 }
+            }
+            Op::Literal {
+                plan_ptr,
+                shape,
+                val_base,
+                count,
+                dst,
+                ip,
+            } => {
+                let s = i.fs.expect("a literal has a frame state");
+                self.write_state(s);
+                // SAFETY: a root function's plan, which outlives the VM (the
+                // address Tier C bakes for the same literal).
+                let plan = unsafe { &*(plan_ptr as *const crate::bytecode::StaticKeyPlan) };
+                let ready = super::super::emit_misc::emit_ready_literal_of(&mut self.ops, plan, shape, val_base, count, dst);
+                let packed = (u64::from(shape) << 32) | (u64::from(val_base) << 16) | u64::from(count);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD plan_ptr as i64
+                    ; mov r9, QWORD packed as i64
+                    ; mov rax, QWORD crate::vm::jit_finalize_object_thin as *const () as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                if let Some(ready) = ready {
+                    let join = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; jmp => join
+                        ; => ready
+                        ; mov rax, [rbx + 8 * dst as i32]
+                        ; => join
+                    );
+                }
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
             }
             Op::AllocOut { helper, ip, a, b } => {
                 // The collector may run: the state roots every heap value.
@@ -2065,7 +2149,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         };
         (uses[cond as usize] == 1
             && b.insts.last() == Some(&cond)
-            && matches!(f.insts[cond as usize].op, Op::CmpF(..)))
+            && matches!(f.insts[cond as usize].op, Op::CmpF(..) | Op::CmpI(..)))
         .then_some(cond)
     };
     let mut em = Em {
@@ -2090,20 +2174,35 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
             }
         }
         if let (Some(c), Term::Branch { t, f: fb, .. }) = (fuse, &b.term) {
-            let Op::CmpF(cmp, x, y) = f.insts[c as usize].op else {
-                unreachable!("only a Number compare fuses");
-            };
-            let xa = em.xmm(x, X1);
-            let xb = em.xmm(y, X2);
             let lf = em.ops.new_dynamic_label();
             let lt = em.ops.new_dynamic_label();
-            match cmp {
-                Cmp::Lt => dynasm!(em.ops ; ucomisd Rx(xb), Rx(xa) ; jbe => lf),
-                Cmp::Le => dynasm!(em.ops ; ucomisd Rx(xb), Rx(xa) ; jb => lf),
-                Cmp::Gt => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jbe => lf),
-                Cmp::Ge => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jb => lf),
-                Cmp::Eq => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jne => lf ; jp => lf),
-                Cmp::Ne => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jp => lt ; je => lf),
+            match f.insts[c as usize].op {
+                Op::CmpF(cmp, x, y) => {
+                    let xa = em.xmm(x, X1);
+                    let xb = em.xmm(y, X2);
+                    match cmp {
+                        Cmp::Lt => dynasm!(em.ops ; ucomisd Rx(xb), Rx(xa) ; jbe => lf),
+                        Cmp::Le => dynasm!(em.ops ; ucomisd Rx(xb), Rx(xa) ; jb => lf),
+                        Cmp::Gt => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jbe => lf),
+                        Cmp::Ge => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jb => lf),
+                        Cmp::Eq => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jne => lf ; jp => lf),
+                        Cmp::Ne => dynasm!(em.ops ; ucomisd Rx(xa), Rx(xb) ; jp => lt ; je => lf),
+                    }
+                }
+                Op::CmpI(cmp, x, y) => {
+                    let ra = em.gpr(x, RDX);
+                    let rb = em.gpr(y, R11);
+                    dynasm!(em.ops ; cmp Rd(ra), Rd(rb));
+                    match cmp {
+                        Cmp::Lt => dynasm!(em.ops ; jge => lf),
+                        Cmp::Le => dynasm!(em.ops ; jg => lf),
+                        Cmp::Gt => dynasm!(em.ops ; jle => lf),
+                        Cmp::Ge => dynasm!(em.ops ; jl => lf),
+                        Cmp::Eq => dynasm!(em.ops ; jne => lf),
+                        Cmp::Ne => dynasm!(em.ops ; je => lf),
+                    }
+                }
+                _ => unreachable!("only a compare fuses"),
             }
             dynasm!(em.ops ; => lt);
             em.edge_moves(bi, *t as usize);
