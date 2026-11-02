@@ -14,9 +14,14 @@
 use dynasmrt::{dynasm, DynamicLabel, DynasmApi, DynasmLabelApi};
 
 use super::alloc::{Alloc, Loc};
-use super::build::{Cmp, Func, Op, Rep, Term, V};
+use super::build::{CallKind, Cmp, Func, Op, Rep, Term, V};
 use crate::bytecode::BitwiseOp;
 use crate::codegen::JitFn;
+use crate::value::Value;
+
+/// The outgoing area at the bottom of the frame: a helper's 32-byte shadow
+/// space and its fifth argument, kept 16-aligned.
+const OUT_AREA: i32 = 48;
 
 const TAG_INT: u64 = 0x7FF9 << 48;
 const TAG_BOOL: u64 = 0x7FFA << 48;
@@ -42,6 +47,7 @@ struct Em<'a> {
     a: &'a Alloc,
     slot_base: i32,
     stubs: Vec<DynamicLabel>,
+    epilogue: DynamicLabel,
     stress: bool,
 }
 
@@ -118,6 +124,37 @@ impl Em<'_> {
                 ; sub DWORD [rax], 1
                 ; jz => stub
             );
+        }
+    }
+
+    /// Frame state `s` into the window: each value it names boxed at its
+    /// register. Uses rax, rcx, rdx and xmm0; every value stays where it is.
+    fn write_state(&mut self, s: u32) {
+        let f = self.f;
+        for &(r, v) in &f.states[s as usize].regs {
+            let off = 8 * r as i32;
+            match self.rep(v) {
+                Rep::Tagged => {
+                    let rv = self.gpr(v, RAX);
+                    dynasm!(self.ops ; mov [rbx + off], Rq(rv));
+                }
+                rep @ (Rep::I32 | Rep::Bool) => {
+                    let rv = self.gpr(v, RDX);
+                    let tag = if rep == Rep::I32 { TAG_INT } else { TAG_BOOL };
+                    dynasm!(self.ops
+                        ; mov eax, Rd(rv)
+                        ; mov rcx, QWORD tag as i64
+                        ; or rax, rcx
+                        ; mov [rbx + off], rax
+                    );
+                }
+                Rep::F64 => {
+                    let xv = self.xmm(v, X1);
+                    self.box_f64(xv, RDX);
+                    dynasm!(self.ops ; mov [rbx + off], rdx);
+                }
+                Rep::Void => unreachable!("a frame state names values"),
+            }
         }
     }
 
@@ -260,6 +297,7 @@ impl Em<'_> {
                         let xa = self.xmm(a, X1);
                         self.box_f64(xa, d);
                     }
+                    Rep::Void => unreachable!("a guard has no value to box"),
                 }
                 self.done_gpr(d, st);
             }
@@ -504,6 +542,117 @@ impl Em<'_> {
                 );
                 self.done_gpr(d, st);
             }
+            Op::LoadGlobal(idx) => {
+                let stub = stub.expect("a guard has a frame state");
+                let (d, st) = self.dst_gpr(v);
+                let route = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
+                let base = crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32;
+                let off = 8 * idx as i32;
+                dynasm!(self.ops
+                    // A global routed through the global object's own
+                    // property, or one in its TDZ, is the interpreter's.
+                    ; cmp DWORD [rdi + route], 0
+                    ; jne => stub
+                    ; mov rax, [rdi + base]
+                    ; mov Rq(d), [rax + off]
+                    ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
+                    ; cmp Rq(d), rax
+                    ; je => stub
+                );
+                self.done_gpr(d, st);
+            }
+            Op::GuardFid { v: x, fid } => {
+                let stub = stub.expect("a guard has a frame state");
+                let rx = self.gpr(x, RDX);
+                let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+                dynasm!(self.ops
+                    ; mov rax, Rq(rx)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => stub
+                    ; mov ecx, Rd(rx)
+                    ; mov r11, [rdi + hot_off]
+                    ; lea r11, [r11 + rcx*8]
+                    ; cmp DWORD [r11 + rcx*8 + hot_fid], fid as i32
+                    ; jne => stub
+                );
+            }
+            Op::GuardClass {
+                obj,
+                recv_shape,
+                class,
+                ver,
+                epoch,
+            } => {
+                let stub = stub.expect("a guard has a frame state");
+                let ro = self.gpr(obj, RDX);
+                let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+                let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+                let epoch_off = crate::vm::host_api::JIT_CLASS_PROTO_EPOCH_OFFSET as i32;
+                let class_word = crate::heap::class_mirror_fid(class);
+                let class_ver = 4 * class as i32;
+                dynasm!(self.ops
+                    ; mov rax, Rq(ro)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => stub
+                    ; mov ecx, Rd(ro)
+                    ; mov r11, [rdi + hot_off]
+                    ; lea r11, [r11 + rcx*8]
+                    // No own property of the key at this shape...
+                    ; cmp DWORD [r11 + rcx*8], recv_shape as i32
+                    ; jne => stub
+                    // ...an instance of the class...
+                    ; cmp DWORD [r11 + rcx*8 + hot_fid], class_word as i32
+                    ; jne => stub
+                    // ...whose methods are as they were.
+                    ; mov r11, [rdi + versions]
+                    ; cmp DWORD [r11 + class_ver], ver as i32
+                    ; jne => stub
+                    ; cmp DWORD [rdi + epoch_off], epoch as i32
+                    ; jne => stub
+                );
+            }
+            Op::CallOut { kind, ip, packed, argc } => {
+                let s = i.fs.expect("a call-out has a frame state");
+                let exit = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let (d, st) = self.dst_gpr(v);
+                self.write_state(s);
+                let helper = match kind {
+                    CallKind::Plain => crate::vm::jit_call_ic_cross as *const () as i64,
+                    CallKind::Method => crate::vm::jit_call_method_ic as *const () as i64,
+                    CallKind::WithThis => crate::vm::jit_call_with_this_cross as *const () as i64,
+                };
+                let fip = ((f.func_id as u64) << 32 | ip as u64) as i64;
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD fip
+                    ; mov r9, QWORD packed as i64
+                    ; mov DWORD [rsp + 32], argc as i32
+                    ; mov rax, QWORD helper
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => exit
+                    ; mov r10, QWORD crate::codegen::CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => exit
+                    ; mov Rq(d), rax
+                    ; jmp => done
+                    // Declined (the interpreter makes the call) or threw (it
+                    // unwinds): the window already holds the frame state.
+                    ; => exit
+                    ; mov DWORD [rsi], ip as i32
+                    ; xor eax, eax
+                    ; jmp => self.epilogue
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
             Op::GetPropShape { obj, shape, slot } => {
                 let stub = stub.expect("a guard has a frame state");
                 let ro = self.gpr(obj, RDX);
@@ -616,7 +765,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     xmm_saves.sort_unstable();
     let pushes = 3 + gpr_saves.len() as i32;
     let xmm_area = 16 * xmm_saves.len() as i32;
-    let mut frame = 32 + xmm_area + 8 * a.slots as i32;
+    let mut frame = OUT_AREA + xmm_area + 8 * a.slots as i32;
     if (8 + 8 * pushes + frame) % 16 != 0 {
         frame += 8;
     }
@@ -630,7 +779,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     }
     dynasm!(ops ; sub rsp, frame);
     for (k, &x) in xmm_saves.iter().enumerate() {
-        let off = 32 + 16 * k as i32;
+        let off = OUT_AREA + 16 * k as i32;
         dynasm!(ops ; movdqu [rsp + off], Rx(x));
     }
     dynasm!(ops
@@ -677,9 +826,10 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
         ops,
         f,
         a,
-        slot_base: 32 + xmm_area,
+        slot_base: OUT_AREA + xmm_area,
         stubs,
         stress,
+        epilogue,
     };
     for (bi, b) in f.blocks.iter().enumerate() {
         dynasm!(em.ops ; => block_labels[bi]);
@@ -749,30 +899,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     let helper = crate::vm::jit_opt_deopt as *const () as i64;
     for (k, s) in f.states.iter().enumerate() {
         dynasm!(em.ops ; => em.stubs[k]);
-        for &(r, v) in &s.regs {
-            let off = 8 * r as i32;
-            match em.rep(v) {
-                Rep::Tagged => {
-                    let rv = em.gpr(v, RAX);
-                    dynasm!(em.ops ; mov [rbx + off], Rq(rv));
-                }
-                rep @ (Rep::I32 | Rep::Bool) => {
-                    let rv = em.gpr(v, RDX);
-                    let tag = if rep == Rep::I32 { TAG_INT } else { TAG_BOOL };
-                    dynasm!(em.ops
-                        ; mov eax, Rd(rv)
-                        ; mov rcx, QWORD tag as i64
-                        ; or rax, rcx
-                        ; mov [rbx + off], rax
-                    );
-                }
-                Rep::F64 => {
-                    let xv = em.xmm(v, X1);
-                    em.box_f64(xv, RDX);
-                    dynasm!(em.ops ; mov [rbx + off], rdx);
-                }
-            }
-        }
+        em.write_state(k as u32);
         dynasm!(em.ops
             ; mov DWORD [rsi], s.ip as i32
             ; mov rcx, rdi
@@ -787,7 +914,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     // ── epilogue ──
     dynasm!(em.ops ; => epilogue);
     for (k, &x) in xmm_saves.iter().enumerate() {
-        let off = 32 + 16 * k as i32;
+        let off = OUT_AREA + 16 * k as i32;
         dynasm!(em.ops ; movdqu Rx(x), [rsp + off]);
     }
     dynasm!(em.ops ; add rsp, frame);

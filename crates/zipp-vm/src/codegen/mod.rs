@@ -475,6 +475,8 @@ pub(crate) struct ClassReadLane {
     pub epoch: u32,
     /// The method's value bits.
     pub value: u64,
+    /// The method's function id (Tier O inlines its body).
+    pub fid: u32,
 }
 
 /// Tier C's class-method lane, per `GetProp` or `CallMethod` ip
@@ -4303,6 +4305,8 @@ impl Jit {
         prop_shape: &PropShapePlan,
         // The class-method lane's plan (`ClassReadPlan`).
         class_read: &ClassReadPlan,
+        // Tier O's inlinable callees (empty unless Tier O is on).
+        opt_callees: &OptCallees,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -4359,7 +4363,7 @@ impl Jit {
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.
         if self.opt_may_compile(func_id) {
-            if let Some(f) = opt::compile(proto, func_id, prop_shape) {
+            if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees) {
                 let entry = f.entry();
                 {
                     let (a, n) = f.code_span();
@@ -5960,6 +5964,7 @@ mod int_splice;
 mod kernels;
 pub(crate) mod meter;
 mod opt;
+pub(crate) use opt::{plan_callee_ids as opt_plan_callee_ids, OptCallees};
 mod plan;
 mod plan_region;
 mod proto_mem;

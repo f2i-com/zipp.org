@@ -416,6 +416,7 @@ impl<'p> Vm<'p> {
                 &plain_makefunc,
                 &prop_shape,
                 &class_read,
+                &crate::codegen::OptCallees::default(),
             );
         }
         // The direct global routes the body was compiled with, as

@@ -149,14 +149,33 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             super::build::Term::Jump(_) => {}
         }
     }
-    // ── linear scan ──
-    let mut order: Vec<usize> = (0..nv).collect();
+    // ── linear scan ── a value live across a call-out (a call position
+    // strictly inside its interval) takes a callee-saved register, which
+    // the native callee preserves, or a slot.
+    let calls: Vec<u32> = (0..nv)
+        .filter(|&v| matches!(f.insts[v].op, Op::CallOut { .. }))
+        .map(|v| pos[v])
+        .collect();
+    let crosses = |v: usize| calls.iter().any(|&c| start[v] < c && c < end[v]);
+    let mut order: Vec<usize> = (0..nv).filter(|&v| f.insts[v].rep != Rep::Void).collect();
     order.sort_by_key(|&v| (start[v], v));
     let mut loc = vec![Loc::Slot(u32::MAX); nv];
     let mut slots = 0u32;
-    // Per class: the active intervals (value) and the free registers.
+    let saved = |class: usize, r: u8| if class == 1 { r >= 6 } else { r != 8 && r != 9 };
+    // Per class: the active intervals (value) and the free registers,
+    // caller-saved and callee-saved.
     let mut active: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
-    let mut free: [Vec<u8>; 2] = [GPRS.iter().rev().copied().collect(), XMMS.iter().rev().copied().collect()];
+    let mut free_vol: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut free_sav: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    for (class, regs) in [&GPRS[..], &XMMS[..]].into_iter().enumerate() {
+        for &r in regs.iter().rev() {
+            if saved(class, r) {
+                free_sav[class].push(r);
+            } else {
+                free_vol[class].push(r);
+            }
+        }
+    }
     for &v in &order {
         let class = usize::from(is_xmm(f.insts[v].rep));
         // Expire the intervals that ended before this one starts.
@@ -165,33 +184,50 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             let a = active[class][k];
             if end[a] < start[v] {
                 active[class].swap_remove(k);
-                match loc[a] {
-                    Loc::Gpr(r) | Loc::Xmm(r) => free[class].push(r),
-                    Loc::Slot(_) => {}
+                if let Loc::Gpr(r) | Loc::Xmm(r) = loc[a] {
+                    if saved(class, r) {
+                        free_sav[class].push(r);
+                    } else {
+                        free_vol[class].push(r);
+                    }
                 }
             } else {
                 k += 1;
             }
         }
-        if let Some(r) = free[class].pop() {
+        let cross = crosses(v);
+        let pick = if cross {
+            free_sav[class].pop()
+        } else {
+            free_vol[class].pop().or_else(|| free_sav[class].pop())
+        };
+        if let Some(r) = pick {
             loc[v] = if class == 1 { Loc::Xmm(r) } else { Loc::Gpr(r) };
             active[class].push(v);
             continue;
         }
-        // Spill whichever ends last: the active one gives up its register.
-        let (ki, &victim) = active[class]
+        // Spill whichever ends last among the intervals whose register this
+        // one may take: the active one gives up its register.
+        let victim = active[class]
             .iter()
             .enumerate()
+            .filter(|&(_, &a)| match loc[a] {
+                Loc::Gpr(r) | Loc::Xmm(r) => !cross || saved(class, r),
+                Loc::Slot(_) => false,
+            })
             .max_by_key(|&(_, &a)| end[a])
-            .expect("a full class has active intervals");
-        if end[victim] > end[v] {
-            loc[v] = loc[victim];
-            loc[victim] = Loc::Slot(slots);
-            slots += 1;
-            active[class][ki] = v;
-        } else {
-            loc[v] = Loc::Slot(slots);
-            slots += 1;
+            .map(|(ki, &a)| (ki, a));
+        match victim {
+            Some((ki, victim)) if end[victim] > end[v] => {
+                loc[v] = loc[victim];
+                loc[victim] = Loc::Slot(slots);
+                slots += 1;
+                active[class][ki] = v;
+            }
+            _ => {
+                loc[v] = Loc::Slot(slots);
+                slots += 1;
+            }
         }
     }
     Alloc { loc, slots }

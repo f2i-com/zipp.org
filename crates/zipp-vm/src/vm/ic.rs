@@ -827,6 +827,7 @@ impl<'p> Vm<'p> {
                 epoch,
                 callee,
                 recv_shape,
+                fid,
                 ..
             } if recv_shape != crate::shape::DICT
                 && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
@@ -837,6 +838,7 @@ impl<'p> Vm<'p> {
                     ver,
                     epoch,
                     value: callee.bits(),
+                    fid,
                 })
             }
             _ => None,

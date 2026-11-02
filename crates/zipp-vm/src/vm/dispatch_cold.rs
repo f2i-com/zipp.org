@@ -4440,6 +4440,16 @@ impl<'p> Vm<'p> {
                 let plain_makefunc = self.build_plain_makefunc_plan(func_id);
                 let prop_shape = self.build_prop_shape_plan(func_id);
                 let class_read = self.build_class_read_plan(func_id);
+                // Tier O's inlinable callees, with their own property plans.
+                let mut opt_callees = crate::codegen::OptCallees::default();
+                if self.jit.opt_may_compile(func_id) {
+                    for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read) {
+                        if (fid as usize) < self.main_func_count {
+                            let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);
+                            opt_callees.insert(fid, (callee, self.build_prop_shape_plan(fid)));
+                        }
+                    }
+                }
                 self.jit.compile(
                     func_id,
                     proto_ref,
@@ -4456,6 +4466,7 @@ impl<'p> Vm<'p> {
                     &plain_makefunc,
                     &prop_shape,
                     &class_read,
+                    &opt_callees,
                 );
             }
         }

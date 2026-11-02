@@ -29,7 +29,60 @@ mod alloc;
 mod build;
 mod emit;
 
-use super::{FuncProto, JitFn, PropShapePlan};
+use rustc_hash::FxHashMap;
+
+use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, PropShapePlan};
+
+/// The bodies Tier O may inline, by function id, each with its own property
+/// plan (built by the VM, which has the callees' caches).
+pub(crate) type OptCallees<'a> = FxHashMap<u32, (&'a FuncProto, PropShapePlan)>;
+
+/// The call sites with one plain user-function callee: a `CallMethod`
+/// site's class method (the class-method lane's plan), else its own data
+/// method by shape, and a `Call` site's single cross-call arm.
+pub(crate) fn plan_sites(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan) -> FxHashMap<usize, build::Site> {
+    let mut sites = FxHashMap::default();
+    for (&ip, lane) in class_read {
+        sites.insert(
+            ip,
+            build::Site::ClassMethod {
+                recv_shape: lane.recv_shape,
+                class: lane.class,
+                ver: lane.ver,
+                epoch: lane.epoch,
+                fid: lane.fid,
+            },
+        );
+    }
+    for (&ip, site) in cross_plan {
+        if sites.contains_key(&ip) {
+            continue;
+        }
+        if let Some(m) = site.cross3m {
+            sites.insert(
+                ip,
+                build::Site::Method {
+                    shape: m.shape,
+                    slot: m.slot,
+                    fid: m.fid,
+                },
+            );
+        } else if site.cross3.len() == 1 && !site.class_getter && !site.class_method {
+            if let Some(arm) = site.cross3.iter().next() {
+                sites.insert(ip, build::Site::Call { fid: arm.fid });
+            }
+        }
+    }
+    sites
+}
+
+/// The callees `plan_sites` names, for the VM to supply (`OptCallees`).
+pub(crate) fn plan_callee_ids(cross_plan: &CrossCallPlan, class_read: &ClassReadPlan) -> Vec<u32> {
+    let mut ids: Vec<u32> = plan_sites(cross_plan, class_read).values().map(|s| s.fid()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
 
 env_on_switch! {
     /// `ZIPP_OPT=1`: functions Tier O admits compile there instead of Tier C.
@@ -56,18 +109,35 @@ pub(crate) fn stress_every() -> u32 {
 pub(crate) static STRESS_COUNTDOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Tier O's body for `proto`, or `None` when it admits none.
-pub(crate) fn compile(proto: &FuncProto, func_id: u32, prop_shape: &PropShapePlan) -> Option<JitFn> {
-    let func = build::build(proto, func_id, prop_shape)?;
+pub(crate) fn compile(
+    proto: &FuncProto,
+    func_id: u32,
+    prop_shape: &PropShapePlan,
+    cross_plan: &CrossCallPlan,
+    class_read: &ClassReadPlan,
+    callees: &OptCallees,
+) -> Option<JitFn> {
+    if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
+    }
+    let sites = plan_sites(cross_plan, class_read);
+    let inputs = build::Inputs {
+        prop_shape,
+        sites: &sites,
+        callees,
+    };
+    let func = build::build(proto, func_id, &inputs)?;
     let alloc = alloc::allocate(&func);
     let f = emit::emit(&func, &alloc)?;
     if crate::jitlog_enabled() {
         eprintln!(
-            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills)",
+            "[jit] Tier O fn{func_id} compiled ({} ops, {} blocks, {} values, {} guards, {} spills, {} inlined)",
             proto.code.len(),
             func.blocks.len(),
             func.insts.len(),
             func.states.len(),
-            alloc.slots
+            alloc.slots,
+            func.inlined
         );
     }
     Some(f)
