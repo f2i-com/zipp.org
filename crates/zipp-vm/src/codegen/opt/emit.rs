@@ -564,7 +564,7 @@ impl Em<'_> {
                     self.box_f64(xv, RDX);
                     dynasm!(self.ops ; mov [rbx + off], rdx);
                 }
-                Rep::Void => unreachable!("a frame state names values"),
+                Rep::Void | Rep::Raw => unreachable!("a frame state names values"),
             }
         }
     }
@@ -776,14 +776,14 @@ impl Em<'_> {
                         let xa = self.xmm(a, X1);
                         self.box_f64(xa, d);
                     }
-                    Rep::Void => unreachable!("a guard has no value to box"),
+                    Rep::Void | Rep::Raw => unreachable!("a guard or a pointer has no value to box"),
                 }
                 self.done_gpr(d, st);
             }
             Op::TaggedTruthy(a) => {
-                let stub = stub.expect("a guard has a frame state");
                 let ra = self.gpr(a, RDX);
                 let (d, st) = self.dst_gpr(v);
+                let heap = self.ops.new_dynamic_label();
                 let (int, boolean, null_or_big, truthy, falsy, done) = (
                     self.ops.new_dynamic_label(),
                     self.ops.new_dynamic_label(),
@@ -804,7 +804,7 @@ impl Em<'_> {
                     ; cmp eax, 0x7FFB
                     ; je => null_or_big
                     ; cmp eax, 0x7FFD
-                    ; je => stub
+                    ; je => heap
                     // A double: neither +-0 nor NaN.
                     ; mov rax, Rq(ra)
                     ; shl rax, 1
@@ -817,7 +817,28 @@ impl Em<'_> {
                     ; mov rax, QWORD TAG_NULL as i64
                     ; cmp Rq(ra), rax
                     ; je => falsy
-                    ; jmp => stub
+                    // A heap value (an empty string, a zero BigInt and the
+                    // [[IsHTMLDDA]] object are falsy): `jit_truthy`, read-only,
+                    // with the volatile registers the allocator hands out
+                    // kept, so the test is no call position.
+                    ; => heap
+                    ; mov rdx, Rq(ra)
+                    ; sub rsp, 80
+                    ; mov [rsp + 32], r8
+                    ; mov [rsp + 40], r9
+                    ; movdqu [rsp + 48], xmm4
+                    ; movdqu [rsp + 64], xmm5
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD crate::vm::jit_truthy as *const () as i64
+                    ; call rax
+                    ; mov r8, [rsp + 32]
+                    ; mov r9, [rsp + 40]
+                    ; movdqu xmm4, [rsp + 48]
+                    ; movdqu xmm5, [rsp + 64]
+                    ; add rsp, 80
+                    ; test eax, eax
+                    ; jz => falsy
+                    ; jmp => truthy
                     ; => int
                     ; test Rd(ra), Rd(ra)
                     ; jz => falsy
@@ -1189,6 +1210,55 @@ impl Em<'_> {
                 dynasm!(self.ops ; mov Rq(d), rax);
                 self.done_gpr(d, st);
             }
+            Op::IterPure { helper, src } => {
+                let stub = stub.expect("a guard has a frame state");
+                let rs = self.gpr(src, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(rs)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => stub
+                );
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
+            }
+            Op::IterStep {
+                ip,
+                packed,
+                value_dst,
+                done_dst,
+                iter,
+                idx,
+            } => {
+                // The helper runs the loop's safe point and a user `next`:
+                // the state roots every heap value first.
+                let s = i.fs.expect("a step has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                self.write_state(s);
+                let stepped = self.ops.new_dynamic_label();
+                if crate::codegen::iter_mirror_step_enabled() {
+                    crate::codegen::emit_arr_mirror_iter_step(&mut self.ops, value_dst, done_dst, iter, idx, stepped);
+                }
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed as i64
+                    ; mov r9d, idx as i32
+                    ; mov rax, QWORD heap.iter_next as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                dynasm!(self.ops ; => stepped);
+            }
+            Op::WindowLoad(r) => {
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), [rbx + 8 * r as i32]);
+                self.done_gpr(d, st);
+            }
             Op::AllocOut { helper, ip, a, b } => {
                 // The collector may run: the state roots every heap value.
                 let s = i.fs.expect("an allocation has a frame state");
@@ -1466,6 +1536,53 @@ impl Em<'_> {
                     ; => done
                 );
                 self.done_xmm(d, st);
+            }
+            Op::ShapeVals { obj, shape } => {
+                let stub = stub.expect("a guard has a frame state");
+                let ro = self.gpr(obj, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+                dynasm!(self.ops
+                    ; mov rax, Rq(ro)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => stub
+                    ; mov ecx, Rd(ro)
+                    ; mov r11, [rdi + hot_off]
+                    ; lea r11, [r11 + rcx*8]
+                    ; cmp DWORD [r11 + rcx*8], shape as i32
+                    ; jne => stub
+                    ; mov Rq(d), [r11 + rcx*8 + hot_vals]
+                );
+                self.done_gpr(d, st);
+            }
+            Op::LoadSlot { vals, slot } => {
+                let rv = self.gpr(vals, RDX);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), [Rq(rv) + 8 * slot as i32]);
+                self.done_gpr(d, st);
+            }
+            Op::StoreSlot { vals, obj, val, slot } => {
+                let rv = self.gpr(vals, RDX);
+                let rx = self.gpr(val, R11);
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov [Rq(rv) + 8 * slot as i32], Rq(rx)
+                    // A primitive needs no barrier.
+                    ; mov rax, Rq(rx)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => done
+                    ; mov rax, Rq(rx)
+                );
+                let ro = self.gpr(obj, 1);
+                dynasm!(self.ops
+                    ; mov edx, Rd(ro)
+                    ; mov r8, rax
+                );
+                crate::codegen::emit_heap_store_barrier(&mut self.ops, f.gen_lane, done);
+                dynasm!(self.ops ; => done);
             }
             Op::GetPropShape { obj, shape, slot, slow } => {
                 let stub = stub.expect("a guard has a frame state");

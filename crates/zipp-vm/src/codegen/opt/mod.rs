@@ -285,6 +285,14 @@ impl super::Jit {
         if self.opt_replans.get(&func_id).copied().unwrap_or(0) >= MAX_REPLANS {
             return false;
         }
+        // A site made generic by its deopts reads slowly on purpose.
+        if self
+            .opt_feedback
+            .get(&func_id)
+            .is_some_and(|fb| fb.generic.contains(&ip) || fb.generic.contains(&build::ALL_SITES))
+        {
+            return false;
+        }
         let n = self.opt_slow_reads.entry((func_id, ip)).or_insert(0);
         *n += 1;
         if *n < SLOW_READS_REPLAN {

@@ -42,6 +42,9 @@ pub(crate) enum Rep {
     Bool,
     Tagged,
     Void,
+    /// A raw machine word (an object's values pointer, `ShapeVals`): never
+    /// boxed, never in a frame state or a phi.
+    Raw,
 }
 
 impl Rep {
@@ -229,7 +232,7 @@ pub(crate) enum Op {
     UshrI(V, u8),
     /// Any representation boxed (a double by `Value::num`'s rule).
     Box(V),
-    /// A primitive's truthiness; a heap value fails.
+    /// A boxed value's truthiness (a heap value's through `jit_truthy`).
     TaggedTruthy(V),
     F64Truthy(V),
     I32Truthy(V),
@@ -342,6 +345,32 @@ pub(crate) enum Op {
         packed: u64,
         argc: u16,
     },
+    /// `obj`'s values pointer behind its shape (`Raw`); another shape fails.
+    /// Made once per object and block (`Builder::shape_memo`) while nothing
+    /// that may reshape it runs (`Op::may_reshape`).
+    ShapeVals { obj: V, shape: u32 },
+    /// The value in `slot` of a values pointer.
+    LoadSlot { vals: V, slot: u32 },
+    /// `val` into `slot` of `obj`'s values pointer, the nursery barrier
+    /// after a heap value.
+    StoreSlot { vals: V, obj: V, val: V, slot: u32 },
+    /// `GetIterator` / `IterPrime` through their pure helpers (`vm`, the
+    /// value); a decline deopts.
+    IterPure { helper: u64, src: V },
+    /// `IterNext` at `ip` over the window the frame state fills: a dense
+    /// Array's step through its mirror, else `jit_iter_next` (`packed`,
+    /// the cursor register `idx`), which write the value, done and cursor
+    /// registers there (`WindowLoad` reads them back).
+    IterStep {
+        ip: u32,
+        packed: u64,
+        value_dst: u16,
+        done_dst: u16,
+        iter: u16,
+        idx: u16,
+    },
+    /// The window's register, as a call-out left it.
+    WindowLoad(u16),
     /// A global's slot; a binding in its TDZ fails.
     LoadGlobal(u32),
     /// `v` is a function of id `fid`; anything else fails.
@@ -424,14 +453,35 @@ impl Op {
                 | Op::Length { .. }
                 | Op::AllocOut { .. }
                 | Op::Literal { .. }
+                | Op::StoreSlot { .. }
+                | Op::IterPure { .. }
+                | Op::IterStep { .. }
         )
+    }
+
+    /// Whether the op may run user code or allocate, and so add or delete a
+    /// property of any object (`Builder::shape_memo` forgets its shapes).
+    pub(crate) fn may_reshape(&self) -> bool {
+        self.calls()
+            && !matches!(
+                self,
+                Op::StoreSlot { .. }
+                    | Op::MathCall1(..)
+                    | Op::MathCall2(..)
+                    | Op::ModF(..)
+                    | Op::StrictEqH(..)
+                    | Op::CmpT(..)
+            )
     }
 
     /// Whether the op writes its frame state after a native call (a pure
     /// helper first, then the call-out or a deopt): the state's values must
     /// live through that call.
     pub(crate) fn state_after_call(&self) -> bool {
-        matches!(self, Op::GetIndex { .. } | Op::SetIndex { .. } | Op::CmpT(..) | Op::Length { .. })
+        matches!(
+            self,
+            Op::GetIndex { .. } | Op::SetIndex { .. } | Op::CmpT(..) | Op::Length { .. } | Op::IterPure { .. }
+        )
     }
 }
 
@@ -452,6 +502,8 @@ impl Op {
             | Op::ClassConst { .. }
             | Op::AllocOut { .. }
             | Op::Literal { .. }
+            | Op::IterStep { .. }
+            | Op::WindowLoad(_)
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => vec![],
             Op::MathGuard { recv: Some(a), .. }
@@ -464,6 +516,7 @@ impl Op {
                 vec![a, b]
             }
             Op::UpvalSet(_, a) => vec![a],
+            Op::StoreSlot { vals, obj, val, .. } => vec![vals, obj, val],
             Op::GetIndex { obj, key, .. } => vec![obj, key],
             Op::SetIndex { obj, key, val, .. } => vec![obj, key, val],
             Op::I32ToF64(a)
@@ -479,6 +532,9 @@ impl Op {
             | Op::NegF(a)
             | Op::NotB(a)
             | Op::GetPropShape { obj: a, .. }
+            | Op::ShapeVals { obj: a, .. }
+            | Op::IterPure { src: a, .. }
+            | Op::LoadSlot { vals: a, .. }
             | Op::GetPropPoly { obj: a, .. }
             | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
@@ -679,6 +735,23 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
         Instr::UpvalSet { src, .. } if top => (vec![src], None),
         Instr::GetIndex { dst, obj, key } if top => (vec![obj, key], Some(dst)),
+        Instr::GetIterator { dst, src } if top => (vec![src], Some(dst)),
+        Instr::IterPrime { dst, iter } if top => (vec![iter], Some(dst)),
+        // Its other two writes (done, the cursor) count as reads too: they
+        // stay live a little longer, which only widens the frame states.
+        Instr::IterNext {
+            value_dst,
+            done_dst,
+            iter,
+            idx,
+            next,
+        } if top => {
+            let mut u = vec![iter, idx, done_dst];
+            if next != u16::MAX {
+                u.push(next);
+            }
+            (u, Some(value_dst))
+        }
         Instr::NewArray { dst, arg_base, argc } if top => ((arg_base..arg_base + argc).collect(), Some(dst)),
         Instr::FinalizeObject {
             dst, val_base, count, ..
@@ -834,7 +907,10 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Re
         | Instr::LoadClassValue { .. }
         | Instr::GetIndex { .. }
         | Instr::NewArray { .. }
-        | Instr::FinalizeObject { .. } => Rep::Tagged,
+        | Instr::FinalizeObject { .. }
+        | Instr::GetIterator { .. }
+        | Instr::IterPrime { .. }
+        | Instr::IterNext { .. } => Rep::Tagged,
         Instr::Mod { .. } => Rep::F64,
         Instr::MathOp { op, .. } => {
             if matches!(op, MathFn::Imul) {
@@ -1053,7 +1129,10 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::MathOp { dst, .. }
         | Instr::GetIndex { dst, .. }
         | Instr::NewArray { dst, .. }
-        | Instr::FinalizeObject { dst, .. } => Some(dst),
+        | Instr::FinalizeObject { dst, .. }
+        | Instr::GetIterator { dst, .. }
+        | Instr::IterPrime { dst, .. }
+        | Instr::IterNext { value_dst: dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -1492,6 +1571,11 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 if let (Some(r), (_, Some(d))) = (result_rep(&code[ip], &reps, p, call, over), &ud[ip]) {
                     reps[*d as usize] = r;
                 }
+                // `IterNext`'s other writes come back boxed from the window.
+                if let Instr::IterNext { done_dst, idx, .. } = code[ip] {
+                    reps[done_dst as usize] = Rep::Tagged;
+                    reps[idx as usize] = Rep::Tagged;
+                }
             }
             for &s in &bsuccs[b] {
                 match &mut in_rep[s] {
@@ -1525,6 +1609,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         consts: Vec::new(),
         inlined: 0,
         math: inputs.math,
+        shape_memo: Vec::new(),
     };
     let top_ta = ta_regs(code);
     let top = Fn {
@@ -1551,6 +1636,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     for (k, &bb) in order.iter().enumerate() {
         b.cur_block = k as B;
         b.memo.clear();
+        b.shape_memo.clear();
         let preds: Vec<B> = bpreds[bb].iter().map(|&p| rpo_index[p] as B).collect();
         let mut defs: Vec<V> = vec![V::MAX; nregs];
         let mut insts_of_block: Vec<V> = Vec::new();
@@ -1733,6 +1819,15 @@ fn translate(
             let s = fs.id(b, defs);
             let packed = ((name as u64) << 32) | ((obj as u64) << 16) | val as u64;
             match f.plan.get(&ip) {
+                Some(&(shape, slot)) if !f.generic(ip) => {
+                    // The slot behind the shape, checked once per object and
+                    // block; another shape deopts, and the site keeps its slow
+                    // path next time (`generic`).
+                    let o = b.tagged(defs[obj as usize]);
+                    let x = b.tagged(defs[val as usize]);
+                    let vals = b.shape_vals(o, shape, s);
+                    b.push_out(Op::StoreSlot { vals, obj: o, val: x, slot }, Rep::Void, None);
+                }
                 Some(&(shape, slot)) => {
                     let o = b.tagged(defs[obj as usize]);
                     let x = b.tagged(defs[val as usize]);
@@ -1884,6 +1979,48 @@ fn translate(
             let x = b.tagged(defs[src as usize]);
             let s = fs.id(b, defs);
             b.push_out(Op::UpvalSet(idx, x), Rep::Void, Some(s));
+        }
+        Instr::GetIterator { dst, src } | Instr::IterPrime { dst, iter: src } => {
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            let h = if matches!(*ins, Instr::GetIterator { .. }) {
+                crate::vm::jit_get_iterator as *const ()
+            } else {
+                crate::vm::jit_iter_prime as *const ()
+            };
+            defs[dst as usize] = b.push_out(
+                Op::IterPure {
+                    helper: helper(h),
+                    src: x,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::IterNext {
+            value_dst,
+            done_dst,
+            iter,
+            idx,
+            next,
+        } => {
+            let s = fs.id(b, defs);
+            let packed = (iter as u64) << 48 | (next as u64) << 32 | (value_dst as u64) << 16 | done_dst as u64;
+            b.push_out(
+                Op::IterStep {
+                    ip: ip as u32,
+                    packed,
+                    value_dst,
+                    done_dst,
+                    iter,
+                    idx,
+                },
+                Rep::Void,
+                Some(s),
+            );
+            for r in [value_dst, done_dst, idx] {
+                defs[r as usize] = b.push_out(Op::WindowLoad(r), Rep::Tagged, None);
+            }
         }
         Instr::NewArray { dst, arg_base, argc } => {
             let s = fs.id(b, defs);
@@ -2127,8 +2264,13 @@ fn translate(
                 b.konst(Op::ConstTagged(g.op_callee_bits[op as usize]), Rep::Tagged)
             } else if let Some(&(shape, slot)) = f.plan.get(&ip) {
                 let o = b.tagged(defs[obj as usize]);
-                let slow = f.generic(ip).then_some((ip as u32, ((name as u64) << 32) | obj as u64));
-                b.push_out(Op::GetPropShape { obj: o, shape, slot, slow }, Rep::Tagged, Some(s))
+                if f.generic(ip) {
+                    let slow = Some((ip as u32, ((name as u64) << 32) | obj as u64));
+                    b.push_out(Op::GetPropShape { obj: o, shape, slot, slow }, Rep::Tagged, Some(s))
+                } else {
+                    let vals = b.shape_vals(o, shape, s);
+                    b.emit(Op::LoadSlot { vals, slot }, Rep::Tagged)
+                }
             } else if f.strs.is_some() && f.p.string_constants.get(name as usize).is_some_and(|k| k == "length") {
                 let o = b.tagged(defs[obj as usize]);
                 b.push_out(
@@ -2379,10 +2521,27 @@ struct Builder {
     inlined: u32,
     /// The intrinsic `Math` (`Inputs::math`), for inlined callees.
     math: Option<MathIntrinsicGuard>,
+    /// The current block's shape checks: (object, shape, its values
+    /// pointer), forgotten at an op that may reshape (`Op::may_reshape`).
+    shape_memo: Vec<(V, u32, V)>,
 }
 
 impl Builder {
+    /// `obj`'s values pointer behind its shape: one check per object and
+    /// block while nothing reshapes it.
+    fn shape_vals(&mut self, obj: V, shape: u32, fs: u32) -> V {
+        if let Some(&(_, _, v)) = self.shape_memo.iter().find(|&&(o, sh, _)| o == obj && sh == shape) {
+            return v;
+        }
+        let v = self.push_out(Op::ShapeVals { obj, shape }, Rep::Raw, Some(fs));
+        self.shape_memo.push((obj, shape, v));
+        v
+    }
+
     fn push(&mut self, op: Op, rep: Rep, fs: Option<u32>) -> V {
+        if op.may_reshape() {
+            self.shape_memo.clear();
+        }
         let v = self.insts.len() as V;
         self.insts.push(Inst {
             op,
