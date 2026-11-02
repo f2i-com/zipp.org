@@ -44,6 +44,67 @@ pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
     feature = "wasm-lite"
 ));
 
+/// A same-binary A/B switch: on unless the variable is set, read once. Every
+/// optimization keeps one, so a suspect change can be turned off without a
+/// rebuild.
+///
+/// A browser module has no process environment, so there it is the constant, and
+/// the compiler drops the path behind the switch: read at run time, it kept every
+/// replaced path in the module and paid an atomic load to choose.
+macro_rules! env_off_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                true
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::sync::atomic::{AtomicU8, Ordering};
+                static STATE: AtomicU8 = AtomicU8::new(0);
+                match STATE.load(Ordering::Relaxed) {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let on = std::env::var_os($var).is_none();
+                        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                        on
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// [`env_off_switch`] for a diagnostic: off unless the variable is set.
+#[allow(unused_macros)] // Only the native tiers keep such a switch today.
+macro_rules! env_on_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                false
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::sync::atomic::{AtomicU8, Ordering};
+                static STATE: AtomicU8 = AtomicU8::new(0);
+                match STATE.load(Ordering::Relaxed) {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let on = std::env::var_os($var).is_some();
+                        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                        on
+                    }
+                }
+            }
+        }
+    };
+}
+
 mod bytecode;
 #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
 mod bytecode_codec;

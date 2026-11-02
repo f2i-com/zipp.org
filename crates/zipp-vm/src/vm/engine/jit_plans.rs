@@ -24,25 +24,15 @@ mod cross3_finish_abi_tests {
     }
 }
 
-/// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
-/// ways contain multiple plain-function FuncProto ids. This is a plan-time
-/// profitability decision only: the existing helper still resolves and checks
-/// the live callee Value/fid/entry on every invocation. Metered VMs deliberately
-/// keep the pre-change plan until this broader route has its own explicit
-/// charging gate. `ZIPP_NO_POLY_FID_CROSSCALL=1` is the same-binary off switch.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn poly_fid_crosscall_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_POLY_FID_CROSSCALL").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
+    /// ways contain multiple plain-function FuncProto ids. This is a plan-time
+    /// profitability decision only: the existing helper still resolves and checks
+    /// the live callee Value/fid/entry on every invocation. Metered VMs deliberately
+    /// keep the pre-change plan until this broader route has its own explicit
+    /// charging gate. `ZIPP_NO_POLY_FID_CROSSCALL=1` is the same-binary off switch.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn poly_fid_crosscall_enabled() = "ZIPP_NO_POLY_FID_CROSSCALL"
 }
 
 /// B270: for each `Call` in `code`, the nearest preceding instruction (in
@@ -141,67 +131,37 @@ fn nested_reject(why: &str) {
     }
 }
 
-/// `ZIPP_NO_NESTED_CAPTURED_IMUL=1` makes `splice_nested_leaf` decline an inner
-/// body that holds a reference-captured `Math.imul` again, as it did before
-/// the capture was flattened to the bare form there. For a one-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn nested_captured_imul_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_NESTED_CAPTURED_IMUL").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NESTED_CAPTURED_IMUL=1` makes `splice_nested_leaf` decline an inner
+    /// body that holds a reference-captured `Math.imul` again, as it did before
+    /// the capture was flattened to the bare form there. For a one-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn nested_captured_imul_enabled() = "ZIPP_NO_NESTED_CAPTURED_IMUL"
 }
 
-/// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
-/// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
-/// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
-/// which removes the fat-LTO code-layout confound §2 warns about and that B77 was
-/// reverted for. Cached, because this is read once per candidate receiver per
-/// region compile. (`ZIPP_NO_METHOD_INLINE=1` remains the whole-mechanism switch;
-/// it is no use for attribution, since it also kills the class and own-slot arms.)
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn proto_method_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_PROTO_METHOD_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
+    /// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
+    /// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+    /// which removes the fat-LTO code-layout confound §2 warns about and that B77 was
+    /// reverted for. Cached, because this is read once per candidate receiver per
+    /// region compile. (`ZIPP_NO_METHOD_INLINE=1` remains the whole-mechanism switch;
+    /// it is no use for attribution, since it also kills the class and own-slot arms.)
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn proto_method_inline_enabled() = "ZIPP_NO_PROTO_METHOD_INLINE"
 }
 
-/// W20 (M2): `ZIPP_NO_OWN_ACCESSOR_INLINE=1` drops the OWN-accessor arm back out
-/// of `build_accessor_shape`, leaving the class arm exactly as it was -- i.e. OFF
-/// reproduces pre-wave behaviour byte-identically, since the own-slot receivers
-/// this admits are precisely the ones that used to `return None`. Exists so the
-/// mechanism can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
-/// which removes the fat-LTO code-layout confound a two-binary A/B carries.
-/// Memoized and read at PLAN time only (once per candidate receiver per region
-/// compile), never on a hot path.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn own_accessor_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_OWN_ACCESSOR_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// W20 (M2): `ZIPP_NO_OWN_ACCESSOR_INLINE=1` drops the OWN-accessor arm back out
+    /// of `build_accessor_shape`, leaving the class arm exactly as it was -- i.e. OFF
+    /// reproduces pre-wave behaviour byte-identically, since the own-slot receivers
+    /// this admits are precisely the ones that used to `return None`. Exists so the
+    /// mechanism can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+    /// which removes the fat-LTO code-layout confound a two-binary A/B carries.
+    /// Memoized and read at PLAN time only (once per candidate receiver per region
+    /// compile), never on a hot path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn own_accessor_inline_enabled() = "ZIPP_NO_OWN_ACCESSOR_INLINE"
 }
 
 /// Recognise one exact, effect-free scanner leaf. The match is intentionally

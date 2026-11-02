@@ -302,22 +302,12 @@ fn combinator_lean_enabled() -> bool {
     }
 }
 
-/// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
-/// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn job_window_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_JOB_WINDOW").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
+    /// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn job_window_enabled() = "ZIPP_NO_JOB_WINDOW"
 }
 
 /// The register window a run of reaction jobs calling one compiled callback

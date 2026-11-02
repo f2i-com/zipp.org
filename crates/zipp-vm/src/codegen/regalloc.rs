@@ -494,21 +494,11 @@ fn boxref_passthrough_getter(shape: &MethodInlineShape) -> Option<(u64, u64, u32
     Some((acc_addr, acc_bits, slot))
 }
 
-/// Same-binary A/B switch for the exact BOXREF own-getter prefix. Plan-time
-/// only; OFF leaves the register tier's pre-bridge byte stream unchanged, so the
-/// first accessor fill takes the existing site-gate eviction and MEM retry.
-fn boxref_own_getter_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_BOXREF_OWN_GETTER").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Same-binary A/B switch for the exact BOXREF own-getter prefix. Plan-time
+    /// only; OFF leaves the register tier's pre-bridge byte stream unchanged, so the
+    /// first accessor fill takes the existing site-gate eviction and MEM retry.
+    fn boxref_own_getter_enabled() = "ZIPP_NO_BOXREF_OWN_GETTER"
 }
 
 /// Register-promoting region codegen: each region value lives in a fixed xmm

@@ -68,21 +68,11 @@ use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
 use crate::value::Value;
 
-/// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
-/// `Vm::mark_roots`). The two sides of a one-binary A/B.
-#[inline]
-fn old_jobs_skip_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_OLD_JOBS_SKIP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
+    /// `Vm::mark_roots`). The two sides of a one-binary A/B.
+    #[inline]
+    fn old_jobs_skip_enabled() = "ZIPP_NO_OLD_JOBS_SKIP"
 }
 
 /// RAII guard that suspends collection for its scope (decrements on drop, even
@@ -2749,21 +2739,11 @@ pub use gcstats::dump_budget as gc_young_budget_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;
 
-/// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
-/// (minor-only refill, the B194-landed behavior) — the single-binary A/B
-/// for the B196a major-refill widening. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn major_refill_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_MAJOR").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
+    /// (minor-only refill, the B194-landed behavior) — the single-binary A/B
+    /// for the B196a major-refill widening. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn major_refill_enabled() = "ZIPP_NO_OBJ_POOL_MAJOR"
 }

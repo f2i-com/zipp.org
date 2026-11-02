@@ -52,54 +52,24 @@ const LITE_NO: u8 = 2;
 /// Runs in the full copy.
 const LITE_FULL: u8 = 3;
 
-/// `ZIPP_NO_LITE=1`: every frame runs in the main loop (for A/B).
-#[inline]
-fn lite_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_LITE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_LITE=1`: every frame runs in the main loop (for A/B).
+    #[inline]
+    fn lite_enabled() = "ZIPP_NO_LITE"
 }
 
-/// `ZIPP_NO_LITE_ASYNC=1`: no async function (and no module's top level)
-/// runs in the lite loop, for A/B.
-#[inline]
-fn lite_async_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_LITE_ASYNC").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_LITE_ASYNC=1`: no async function (and no module's top level)
+    /// runs in the lite loop, for A/B.
+    #[inline]
+    fn lite_async_enabled() = "ZIPP_NO_LITE_ASYNC"
 }
 
-/// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
-/// runs in the lite loop (`loops_are_lite`), for A/B.
-#[inline]
-fn partial_lite_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PARTIAL_LITE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
+    /// runs in the lite loop (`loops_are_lite`), for A/B.
+    #[inline]
+    fn partial_lite_enabled() = "ZIPP_NO_PARTIAL_LITE"
 }
 
 /// The instructions of the lite loop's small copy, the superinstructions over

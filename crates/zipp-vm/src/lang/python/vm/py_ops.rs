@@ -64,21 +64,11 @@ const ORD_COLUMNS_MAX: usize = 6;
 /// How deep a tuple key `Vm::py_ord_sort_columns` sorts by columns nests.
 const ORD_COLUMNS_DEPTH: usize = 4;
 
-/// Whether a native sort may compare its keys by columns
-/// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
-/// (the same-binary A/B). Read once per process.
-fn py_sort_columns_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_SORT_COLUMNS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a native sort may compare its keys by columns
+    /// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
+    /// (the same-binary A/B). Read once per process.
+    fn py_sort_columns_enabled() = "ZIPP_NO_PY_SORT_COLUMNS"
 }
 
 /// One operand, classified.

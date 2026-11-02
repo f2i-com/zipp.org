@@ -67,56 +67,26 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// Kill switch: `ZIPP_NO_GPR_HOMES=1` disables the GPR-home sub-mode (the
-/// region then compiles on the xmm-home INT emitter exactly as before).
-pub(crate) fn gpr_homes_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_HOMES").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_HOMES=1` disables the GPR-home sub-mode (the
+    /// region then compiles on the xmm-home INT emitter exactly as before).
+    fn gpr_homes_enabled() = "ZIPP_NO_GPR_HOMES"
 }
 
-/// Kill switch: `ZIPP_NO_DV_GPR=1` disables the W9 DataView-on-GPR-homes
-/// hosting (the `region_int` DV retry and this emitter's DV arms). The region
-/// then falls to the DOUBLE tier's B115 DV arm exactly as before the wave.
-pub(crate) fn dv_gpr_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_DV_GPR").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_DV_GPR=1` disables the W9 DataView-on-GPR-homes
+    /// hosting (the `region_int` DV retry and this emitter's DV arms). The region
+    /// then falls to the DOUBLE tier's B115 DV arm exactly as before the wave.
+    fn dv_gpr_enabled() = "ZIPP_NO_DV_GPR"
 }
 
-/// Collapse repeated executions of a statically pure nested integer reduction
-/// after executing one real inner pass. The first pass supplies the exact
-/// modulo-2^32 accumulator delta; the generated tail applies that affine delta
-/// to the remaining outer iterations. `ZIPP_NO_DV_NESTED_REDUCE=1` restores
-/// the ordinary outer backedge for a same-binary comparison.
-fn dv_nested_reduce_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_DV_NESTED_REDUCE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Collapse repeated executions of a statically pure nested integer reduction
+    /// after executing one real inner pass. The first pass supplies the exact
+    /// modulo-2^32 accumulator delta; the generated tail applies that affine delta
+    /// to the remaining outer iterations. `ZIPP_NO_DV_NESTED_REDUCE=1` restores
+    /// the ordinary outer backedge for a same-binary comparison.
+    fn dv_nested_reduce_enabled() = "ZIPP_NO_DV_NESTED_REDUCE"
 }
 
 /// Fail-closed description of the canonical nested-loop shape emitted for a
@@ -842,68 +812,38 @@ fn dv_nested_reduce_plan(
     })
 }
 
-/// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
-/// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
-/// a region that fits the pool one-home-per-value still engages, restoring
-/// wave-6 behavior byte-for-byte. `ZIPP_NO_GPR_HOMES=1` kills the whole
-/// sub-mode, retry included.
-pub(crate) fn gpr_nest_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_NEST").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
+    /// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
+    /// a region that fits the pool one-home-per-value still engages, restoring
+    /// wave-6 behavior byte-for-byte. `ZIPP_NO_GPR_HOMES=1` kills the whole
+    /// sub-mode, retry included.
+    fn gpr_nest_enabled() = "ZIPP_NO_GPR_NEST"
 }
 
-/// Kill switch: `ZIPP_NO_GPR_SPLIT=1` refuses B94 split-receiver plans in this
-/// emitter again (W8). With it set, a split plan reaches native code only via
-/// the xmm INT emitter under `ZIPP_INT_SPLIT=1` — exactly the pre-W8 world.
-///
-/// Why splits are IN scope here: `int_split_enabled`'s refutation priced the
-/// split on the XMM emitter, where every Bitwise op round-trips xmm↔gpr on the
-/// serial chain (the i32 fill measured ~96ms vs ~60ms MEM), and its own
-/// follow-up note named "gpr (not xmm) homes for bitwise-chain regions" as the
-/// real fix. This emitter IS those homes; the write-through contract is
-/// mirrored instruction-for-instruction from the xmm emitter's proven B94 arm
-/// (def → boxed store to the reg-file slot BEFORE any i53 guard; flush skips
-/// the register; the receiver LoadGlobal stores the object to the same slot).
-pub(crate) fn gpr_split_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_SPLIT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_SPLIT=1` refuses B94 split-receiver plans in this
+    /// emitter again (W8). With it set, a split plan reaches native code only via
+    /// the xmm INT emitter under `ZIPP_INT_SPLIT=1` — exactly the pre-W8 world.
+    ///
+    /// Why splits are IN scope here: `int_split_enabled`'s refutation priced the
+    /// split on the XMM emitter, where every Bitwise op round-trips xmm↔gpr on the
+    /// serial chain (the i32 fill measured ~96ms vs ~60ms MEM), and its own
+    /// follow-up note named "gpr (not xmm) homes for bitwise-chain regions" as the
+    /// real fix. This emitter IS those homes; the write-through contract is
+    /// mirrored instruction-for-instruction from the xmm emitter's proven B94 arm
+    /// (def → boxed store to the reg-file slot BEFORE any i53 guard; flush skips
+    /// the register; the receiver LoadGlobal stores the object to the same slot).
+    fn gpr_split_enabled() = "ZIPP_NO_GPR_SPLIT"
 }
 
-/// Kill switch: `ZIPP_NO_GPR_LAZYSX=1` disables ONLY the W8 deferred
-/// sign-extension ([`lazy_sx_sets`] returns empty sets): every Bitwise/imul
-/// def canonicalizes immediately and entry admission stays wave-7 loose. The
-/// in-place instruction selection is unconditional — it is representation-
-/// neutral and locally verifiable arm by arm.
-pub(crate) fn gpr_lazysx_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_LAZYSX").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_LAZYSX=1` disables ONLY the W8 deferred
+    /// sign-extension ([`lazy_sx_sets`] returns empty sets): every Bitwise/imul
+    /// def canonicalizes immediately and entry admission stays wave-7 loose. The
+    /// in-place instruction selection is unconditional — it is representation-
+    /// neutral and locally verifiable arm by arm.
+    fn gpr_lazysx_enabled() = "ZIPP_NO_GPR_LAZYSX"
 }
 
 /// Kill switch: `ZIPP_NO_GPR_SPILL_SLOTS=1` disables the W10.3 frame spill
@@ -938,21 +878,11 @@ pub(crate) fn gpr_spill_slots_enabled() -> bool {
     }
 }
 
-/// Kill switch: `ZIPP_NO_GPR_DEOPT_SHADOW=1` restores the per-definition
-/// boxed write-through used by B94/B97 and narrowed globals. The shadow mode
-/// is selected per plan below; an empty/refused plan emits the old bytes too.
-fn gpr_deopt_shadow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_DEOPT_SHADOW").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_DEOPT_SHADOW=1` restores the per-definition
+    /// boxed write-through used by B94/B97 and narrowed globals. The shadow mode
+    /// is selected per plan below; an empty/refused plan emits the old bytes too.
+    fn gpr_deopt_shadow_enabled() = "ZIPP_NO_GPR_DEOPT_SHADOW"
 }
 
 /// `compile_region_int_gpr`'s result. `PoolOverflow` is the one decline worth

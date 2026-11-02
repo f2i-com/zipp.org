@@ -180,21 +180,11 @@ pub(crate) fn emit_cross_refetch_ta(
     );
 }
 
-/// Same-binary A/B switch for the guarded `hasOwnProperty.call` intrinsic.
-/// Read while compiling a region, never on the generated hot path.
-#[inline]
-pub(crate) fn has_own_call_intrinsic_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_HASOWN_CALL_INTRINSIC").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Same-binary A/B switch for the guarded `hasOwnProperty.call` intrinsic.
+    /// Read while compiling a region, never on the generated hot path.
+    #[inline]
+    fn has_own_call_intrinsic_enabled() = "ZIPP_NO_HASOWN_CALL_INTRINSIC"
 }
 
 /// Same-binary escape hatch for the guarded cyclic existing-field store

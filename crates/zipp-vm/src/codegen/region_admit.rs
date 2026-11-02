@@ -1856,29 +1856,19 @@ pub(crate) struct HeapHelpers {
     pub(crate) ic_base_idx: u32,
 }
 
-/// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
-/// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
-/// append. If that tier later declines, however, the memory emitter cannot use
-/// that push-only snapshot: it still calls the generic push helper, then used to
-/// re-snapshot every pin in the region after every append. On tokenizer-shaped
-/// loops that turned a failed INTEGER offer into substantial boxed-tier work.
-///
-/// Keep the switch local to planning so one binary can reproduce the old
-/// fallback byte stream. The full push-inclusive plan has already been consumed
-/// by the INTEGER attempt before this module is called; this filter affects only
-/// REGALLOC/MEM fallback compilation.
-fn push_pin_filter_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_PUSH_PIN_FILTER").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
+    /// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
+    /// append. If that tier later declines, however, the memory emitter cannot use
+    /// that push-only snapshot: it still calls the generic push helper, then used to
+    /// re-snapshot every pin in the region after every append. On tokenizer-shaped
+    /// loops that turned a failed INTEGER offer into substantial boxed-tier work.
+    ///
+    /// Keep the switch local to planning so one binary can reproduce the old
+    /// fallback byte stream. The full push-inclusive plan has already been consumed
+    /// by the INTEGER attempt before this module is called; this filter affects only
+    /// REGALLOC/MEM fallback compilation.
+    fn push_pin_filter_enabled() = "ZIPP_NO_PUSH_PIN_FILTER"
 }
 
 #[derive(Default)]

@@ -280,19 +280,9 @@ thread_local! {
 /// cache could use.
 pub(crate) struct DataKeys(());
 
-/// `ZIPP_NO_DATA_KEYS=1`: a data key mints shapes like any other (A/B).
-fn data_keys_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_DATA_KEYS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_DATA_KEYS=1`: a data key mints shapes like any other (A/B).
+    fn data_keys_enabled() = "ZIPP_NO_DATA_KEYS"
 }
 
 pub(crate) fn data_keys() -> DataKeys {

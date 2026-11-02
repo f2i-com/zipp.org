@@ -259,20 +259,10 @@ pub(crate) type NewStoredMemo = (u64, u32, u32, u32, u64);
 /// The most stores a body may make here: the shared key lists stop at 16.
 const STORE_MAX: usize = 16;
 
-/// `ZIPP_NO_CTOR_STORE=1` runs every constructor's body again (the
-/// same-binary A/B).
-fn ctor_store_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_CTOR_STORE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CTOR_STORE=1` runs every constructor's body again (the
+    /// same-binary A/B).
+    fn ctor_store_enabled() = "ZIPP_NO_CTOR_STORE"
 }
 
 /// A name a computed or exotic write could intercept: the store miss

@@ -4094,52 +4094,22 @@ mod fused_code_tests {
     }
 }
 
-/// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
-/// same-binary A/B for [`FusedCode`]).
-#[inline]
-/// `ZIPP_NO_MOVE_FUSE=1` keeps `Move` pairs and `UpvalGet; Move` apart.
-fn move_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_MOVE_FUSE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
+    /// same-binary A/B for [`FusedCode`]).
+    #[inline]
+    /// `ZIPP_NO_MOVE_FUSE=1` keeps `Move` pairs and `UpvalGet; Move` apart.
+    fn move_fuse_enabled() = "ZIPP_NO_MOVE_FUSE"
 }
 
-/// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
-fn null_jump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_NULL_JUMP").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
+    fn null_jump_enabled() = "ZIPP_NO_NULL_JUMP"
 }
 
-/// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
-fn int_switch_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_SWITCH").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
+    fn int_switch_enabled() = "ZIPP_NO_INT_SWITCH"
 }
 
 pub(crate) fn interp_fuse_enabled() -> bool {
@@ -4623,22 +4593,12 @@ impl PlanHandle {
     }
 }
 
-/// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
-/// same-binary comparator for borrowed handles).
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-pub(crate) fn plan_borrow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PLAN_BORROW").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
+    /// same-binary comparator for borrowed handles).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn plan_borrow_enabled() = "ZIPP_NO_PLAN_BORROW"
 }
 
 // The sizes are a 64-bit host's.

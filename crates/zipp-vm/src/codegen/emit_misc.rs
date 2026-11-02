@@ -5,40 +5,20 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// `ZIPP_NO_POLYEQ_FAST=1` restores the pre-B88 `region_poly_eq`, where either
-/// operand being a double jumped to the numeric path unconditionally — and that
-/// path bails for a tagged non-number, so `x !== undefined` deopted the region
-/// on every iteration whenever `x` held a double. Read once per region compile.
-#[inline]
-fn poly_eq_fast_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_POLYEQ_FAST").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_POLYEQ_FAST=1` restores the pre-B88 `region_poly_eq`, where either
+    /// operand being a double jumped to the numeric path unconditionally — and that
+    /// path bails for a tagged non-number, so `x !== undefined` deopted the region
+    /// on every iteration whenever `x` held a double. Read once per region compile.
+    #[inline]
+    fn poly_eq_fast_enabled() = "ZIPP_NO_POLYEQ_FAST"
 }
 
-/// `ZIPP_NO_TYPEOF_IS_INLINE=1` restores the helper-only `TypeOfIs` arm
-/// (`emit_typeof_is` calls `jit_typeof_is` for every value). Read once.
-#[inline]
-fn typeof_is_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_TYPEOF_IS_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_TYPEOF_IS_INLINE=1` restores the helper-only `TypeOfIs` arm
+    /// (`emit_typeof_is` calls `jit_typeof_is` for every value). Read once.
+    #[inline]
+    fn typeof_is_inline_enabled() = "ZIPP_NO_TYPEOF_IS_INLINE"
 }
 
 env_off_switch! {
@@ -349,41 +329,21 @@ pub(crate) fn emit_typeof_is(
     );
 }
 
-/// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
-/// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
-/// byte-identically. Read once per region compile.
-#[inline]
-pub(crate) fn mem_cmp_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_MEM_CMPJUMP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
+    /// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
+    /// byte-identically. Read once per region compile.
+    #[inline]
+    fn mem_cmp_fuse_enabled() = "ZIPP_NO_MEM_CMPJUMP"
 }
 
-/// Fast Int/Int head for the memory-path fused relational jumps. The generic
-/// path below has to convert both numeric operands to f64 for mixed Int/double
-/// semantics; two tagged Ints can compare their signed i32 payloads directly.
-/// `ZIPP_NO_MEM_INT_CMPJUMP=1` restores the conversion-only emission.
-#[inline]
-fn mem_int_cmpjump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_MEM_INT_CMPJUMP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Fast Int/Int head for the memory-path fused relational jumps. The generic
+    /// path below has to convert both numeric operands to f64 for mixed Int/double
+    /// semantics; two tagged Ints can compare their signed i32 payloads directly.
+    /// `ZIPP_NO_MEM_INT_CMPJUMP=1` restores the conversion-only emission.
+    #[inline]
+    fn mem_int_cmpjump_enabled() = "ZIPP_NO_MEM_INT_CMPJUMP"
 }
 
 /// Fused compare→branch fast head for the MEMORY path (B118): when a

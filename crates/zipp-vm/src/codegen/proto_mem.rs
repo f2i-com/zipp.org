@@ -276,148 +276,71 @@ mod str_append_cursor_proof_tests {
     }
 }
 
-/// Admit numeric remainder into Tier C.  The emitted prefix handles only
-/// integer-valued Number operands; zero divisors, fractional values, BigInts,
-/// and observable ToNumeric coercions decline before doing any work and resume
-/// at the original bytecode.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_mod_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_MOD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit numeric remainder into Tier C.  The emitted prefix handles only
+    /// integer-valued Number operands; zero divisors, fractional values, BigInts,
+    /// and observable ToNumeric coercions decline before doing any work and resume
+    /// at the original bytecode.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_mod_enabled() = "ZIPP_NO_TIERC_MOD"
 }
 
-/// Admit RequireObjectCoercible into Tier C.  It is a no-op for every value
-/// except null/undefined; those two exact bit patterns exit before effects so
-/// the interpreter remains responsible for constructing and throwing the
-/// TypeError.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_check_coercible_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_CHECK_COERCIBLE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit RequireObjectCoercible into Tier C.  It is a no-op for every value
+    /// except null/undefined; those two exact bit patterns exit before effects so
+    /// the interpreter remains responsible for constructing and throwing the
+    /// TypeError.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_check_coercible_enabled() = "ZIPP_NO_TIERC_CHECK_COERCIBLE"
 }
 
-/// Admit the two non-callback Map mutations used by warm application code.
-/// Generated code still proves the live receiver resolves to the main-realm
-/// intrinsic before the helper performs any mutation.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_coll_mutate_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_COLL_MUTATE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit the two non-callback Map mutations used by warm application code.
+    /// Generated code still proves the live receiver resolves to the main-realm
+    /// intrinsic before the helper performs any mutation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_coll_mutate_enabled() = "ZIPP_NO_TIERC_COLL_MUTATE"
 }
 
-/// Admit guarded primitive-string `toUpperCase()` into Tier C.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_string_upper_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_STRING_UPPER").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit guarded primitive-string `toUpperCase()` into Tier C.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_string_upper_enabled() = "ZIPP_NO_TIERC_STRING_UPPER"
 }
 
-/// Admit the dynamically-resolved zero-argument `random` method into Tier C.
-/// This deliberately remains a `CallMethod`: the helper re-reads the live
-/// property on every IC miss, so replacing `Math.random` is still observable.
-/// The same-binary switch isolates the whole-function-entry benefit from the
-/// arrow-local/string changes used by the NanoID workload.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_random_method_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_RANDOM_METHOD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit the dynamically-resolved zero-argument `random` method into Tier C.
+    /// This deliberately remains a `CallMethod`: the helper re-reads the live
+    /// property on every IC miss, so replacing `Math.random` is still observable.
+    /// The same-binary switch isolates the whole-function-entry benefit from the
+    /// arrow-local/string changes used by the NanoID workload.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_random_method_enabled() = "ZIPP_NO_TIERC_RANDOM_METHOD"
 }
 
-/// Native-to-native prefix for an admitted Tier-C `CallMethod`. The helper
-/// resolves the live data property through the interpreter IC and declines to
-/// the unchanged generic call helper unless the current callee has a Tier-C
-/// entry. Kept separately switchable from admission for direct A/B evidence.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_method_crosscall_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_METHOD_CROSSCALL").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Native-to-native prefix for an admitted Tier-C `CallMethod`. The helper
+    /// resolves the live data property through the interpreter IC and declines to
+    /// the unchanged generic call helper unless the current callee has a Tier-C
+    /// entry. Kept separately switchable from admission for direct A/B evidence.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_method_crosscall_enabled() = "ZIPP_NO_METHOD_CROSSCALL"
 }
 
-/// Bounded own-data `CallMethod` prefix: consume an already-filled guardable
-/// `OwnData { shape, slot }` IC way without cloning/hashing the property name.
-/// The runtime helper revalidates exact shape/slot/key/descriptor and re-reads
-/// the live callee before delegating to the unchanged Tier-C cross-call.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_method_own_slot_direct_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_METHOD_OWN_SLOT_DIRECT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Bounded own-data `CallMethod` prefix: consume an already-filled guardable
+    /// `OwnData { shape, slot }` IC way without cloning/hashing the property name.
+    /// The runtime helper revalidates exact shape/slot/key/descriptor and re-reads
+    /// the live callee before delegating to the unchanged Tier-C cross-call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_method_own_slot_direct_enabled() = "ZIPP_NO_METHOD_OWN_SLOT_DIRECT"
 }
 
 env_off_switch! {
@@ -436,157 +359,80 @@ env_off_switch! {
     fn tierc_block_sroa_enabled() = "ZIPP_NO_TIERC_BLOCK_SROA"
 }
 
-/// Admit unary numeric negation into Tier C. The emitted path flips the f64
-/// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
-/// declines non-numeric operands to the exact interpreter instruction.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_neg_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_NEG").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit unary numeric negation into Tier C. The emitted path flips the f64
+    /// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
+    /// declines non-numeric operands to the exact interpreter instruction.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_neg_enabled() = "ZIPP_NO_TIERC_NEG"
 }
 
-/// Admit a statically named property delete as a deliberately cold exact-ip
-/// exit from Tier C.  The common path keeps the surrounding function native;
-/// if execution reaches the delete, generated code performs no part of the
-/// operation and resumes the interpreter at that bytecode.  This preserves
-/// ToObject, configurability, strict-mode throwing and proxy semantics without
-/// duplicating any of them in native code.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_cold_delete_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_COLD_DELETE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit a statically named property delete as a deliberately cold exact-ip
+    /// exit from Tier C.  The common path keeps the surrounding function native;
+    /// if execution reaches the delete, generated code performs no part of the
+    /// operation and resumes the interpreter at that bytecode.  This preserves
+    /// ToObject, configurability, strict-mode throwing and proxy semantics without
+    /// duplicating any of them in native code.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_cold_delete_enabled() = "ZIPP_NO_TIERC_COLD_DELETE"
 }
 
-/// Forward an immediately preceding captured read/write into the next read of
-/// the same upvalue. There is no call, allocation, branch target, or other VM
-/// action between the two bytecodes, so the source register and the cell must
-/// still contain identical `Value` bits. This removes one win64 helper crossing
-/// per hostile-pipeline activation while retaining an exact-ip TDZ guard.
-/// `ZIPP_NO_TIERC_UPVAL_FORWARD=1` restores the helper call for A/B evidence.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_forward_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_FORWARD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Forward an immediately preceding captured read/write into the next read of
+    /// the same upvalue. There is no call, allocation, branch target, or other VM
+    /// action between the two bytecodes, so the source register and the cell must
+    /// still contain identical `Value` bits. This removes one win64 helper crossing
+    /// per hostile-pipeline activation while retaining an exact-ip TDZ guard.
+    /// `ZIPP_NO_TIERC_UPVAL_FORWARD=1` restores the helper call for A/B evidence.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_forward_enabled() = "ZIPP_NO_TIERC_UPVAL_FORWARD"
 }
 
-/// Fuse the compiler's exact captured-counter lowering
-/// `get; 1; add; 0; or; set` through one resolved-cell helper. Disabled for a
-/// metered VM by the planner below: skipping five bytecodes must never reduce a
-/// sandbox's instruction charge. `ZIPP_NO_TIERC_UPVAL_INC_I32=1` restores the
-/// unfused sequence for a same-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_inc_i32_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INC_I32").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Fuse the compiler's exact captured-counter lowering
+    /// `get; 1; add; 0; or; set` through one resolved-cell helper. Disabled for a
+    /// metered VM by the planner below: skipping five bytecodes must never reduce a
+    /// sandbox's instruction charge. `ZIPP_NO_TIERC_UPVAL_INC_I32=1` restores the
+    /// unfused sequence for a same-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_inc_i32_enabled() = "ZIPP_NO_TIERC_UPVAL_INC_I32"
 }
 
-/// B189: emit `UpvalGet` as three inline loads (activation upvalue base →
-/// cell index → cell-value mirror) instead of the resolving helper call.
-/// `ZIPP_NO_TIERC_UPVAL_INLINE=1` restores the helper for a same-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INLINE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// B189: emit `UpvalGet` as three inline loads (activation upvalue base →
+    /// cell index → cell-value mirror) instead of the resolving helper call.
+    /// `ZIPP_NO_TIERC_UPVAL_INLINE=1` restores the helper for a same-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_inline_enabled() = "ZIPP_NO_TIERC_UPVAL_INLINE"
 }
 
-/// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
-/// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
-/// every accepted step may use an arbitrary constant count and any of `<<`,
-/// `>>`, or `>>>` in the generic expression `x ^= x SHIFT count`.
-///
-/// The planner declines under instruction metering because one helper replaces
-/// several bytecodes. `ZIPP_NO_TIERC_UPVAL_XORSHIFT=1` keeps a same-binary
-/// unfused route for performance and semantic differential testing.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_xorshift_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_XORSHIFT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
+    /// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
+    /// every accepted step may use an arbitrary constant count and any of `<<`,
+    /// `>>`, or `>>>` in the generic expression `x ^= x SHIFT count`.
+    ///
+    /// The planner declines under instruction metering because one helper replaces
+    /// several bytecodes. `ZIPP_NO_TIERC_UPVAL_XORSHIFT=1` keeps a same-binary
+    /// unfused route for performance and semantic differential testing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_xorshift_enabled() = "ZIPP_NO_TIERC_UPVAL_XORSHIFT"
 }
 
-/// Direct-slot counterpart used by module/top-level lexical bindings. It has a
-/// distinct switch because a real workload may exercise the global shape while
-/// a closure microbenchmark exercises only the captured-cell helper.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_global_xorshift_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_GLOBAL_XORSHIFT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Direct-slot counterpart used by module/top-level lexical bindings. It has a
+    /// distinct switch because a real workload may exercise the global shape while
+    /// a closure microbenchmark exercises only the captured-cell helper.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_global_xorshift_enabled() = "ZIPP_NO_TIERC_GLOBAL_XORSHIFT"
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -975,39 +821,19 @@ fn emit_tierc_xorshift_registers(
     }
 }
 
-/// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
-/// uses `arguments` out of Tier C again (it then runs interpreted, as every
-/// such function did).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn tierc_arguments_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_ARGUMENTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
+    /// uses `arguments` out of Tier C again (it then runs interpreted, as every
+    /// such function did).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_arguments_enabled() = "ZIPP_NO_TIERC_ARGUMENTS"
 }
 
-/// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
-/// parameter out of Tier C again (and so out of every frame-free entry).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn tierc_rest_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_REST").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
+    /// parameter out of Tier C again (and so out of every frame-free entry).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_rest_enabled() = "ZIPP_NO_TIERC_REST"
 }
 
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path

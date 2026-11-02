@@ -91,19 +91,9 @@ const IC_PROBATION: u8 = 64;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
 
-/// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
-fn class_miss_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CLASS_MISS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
+    fn class_miss_enabled() = "ZIPP_NO_CLASS_MISS"
 }
 
 /// `Vm::own_slot_cache`'s size, a power of two.

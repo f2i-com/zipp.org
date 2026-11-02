@@ -30,24 +30,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub(super) type R<T> = Result<T, String>;
 
-/// Whether the emitter lowers operations to guarded inline fast paths (int
-/// and float arithmetic, comparisons, identity tests, unpacking, counted and
-/// indexed loops) ahead of the runtime helper each one falls back to.
-/// `ZIPP_PY_NOFAST=1` (like `ZIPP_NOJIT`, any value) compiles every such
-/// operation to its helper only, so the differential corpus can check both
-/// lowerings. Read once per process.
-pub(super) fn py_fast_paths() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_PY_NOFAST").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether the emitter lowers operations to guarded inline fast paths (int
+    /// and float arithmetic, comparisons, identity tests, unpacking, counted and
+    /// indexed loops) ahead of the runtime helper each one falls back to.
+    /// `ZIPP_PY_NOFAST=1` (like `ZIPP_NOJIT`, any value) compiles every such
+    /// operation to its helper only, so the differential corpus can check both
+    /// lowerings. Read once per process.
+    fn py_fast_paths() = "ZIPP_PY_NOFAST"
 }
 /// Whether plain positional calls compile to one `PyCall` (with the
 /// positional-array call out of line) instead of `PyCallEntry` +
@@ -66,40 +56,20 @@ pub(super) fn py_call_op() -> bool {
         }
     }
 }
-/// Whether a function that only reads globals hands `PyGlobal` its own
-/// record instead of loading its globals in its prologue (see
-/// `Emitter::lazy_globals`). On unless `ZIPP_NO_PY_LAZY_GLOBALS` is set (the
-/// same-binary A/B). Read once per process.
-pub(super) fn py_lazy_globals() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_LAZY_GLOBALS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a function that only reads globals hands `PyGlobal` its own
+    /// record instead of loading its globals in its prologue (see
+    /// `Emitter::lazy_globals`). On unless `ZIPP_NO_PY_LAZY_GLOBALS` is set (the
+    /// same-binary A/B). Read once per process.
+    fn py_lazy_globals() = "ZIPP_NO_PY_LAZY_GLOBALS"
 }
-/// Whether `super().name(...)` reads `R.mself` and the runtime's UNBOUND
-/// only where they are needed (`Emitter::super_method_call`, the
-/// prologue's implicit `__class__` cell) instead of on every call. On unless
-/// `ZIPP_NO_PY_SUPER_LEAN` is set (the same-binary A/B). Read once per
-/// process.
-pub(super) fn py_super_lean() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_SUPER_LEAN").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether `super().name(...)` reads `R.mself` and the runtime's UNBOUND
+    /// only where they are needed (`Emitter::super_method_call`, the
+    /// prologue's implicit `__class__` cell) instead of on every call. On unless
+    /// `ZIPP_NO_PY_SUPER_LEAN` is set (the same-binary A/B). Read once per
+    /// process.
+    fn py_super_lean() = "ZIPP_NO_PY_SUPER_LEAN"
 }
 pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own

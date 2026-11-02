@@ -5,39 +5,19 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// `ZIPP_NO_SPAN_CODEUNIT_PRED=1` restores the generic boxed leaf expansion.
-/// Read once while plans are built; never consulted by emitted hot code.
-#[inline]
-pub(crate) fn span_code_unit_pred_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PRED").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SPAN_CODEUNIT_PRED=1` restores the generic boxed leaf expansion.
+    /// Read once while plans are built; never consulted by emitted hot code.
+    #[inline]
+    fn span_code_unit_pred_enabled() = "ZIPP_NO_SPAN_CODEUNIT_PRED"
 }
 
-/// `ZIPP_NO_SPAN_CODEUNIT_PAIR=1` keeps the single-predicate fusion but drops
-/// the caller-level `pred(i, a) || pred(i, b)` collapse.  Like the parent gate,
-/// this is latched once at plan time and is absent from emitted hot code.
-#[inline]
-pub(crate) fn span_code_unit_pair_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PAIR").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SPAN_CODEUNIT_PAIR=1` keeps the single-predicate fusion but drops
+    /// the caller-level `pred(i, a) || pred(i, b)` collapse.  Like the parent gate,
+    /// this is latched once at plan time and is absent from emitted hot code.
+    #[inline]
+    fn span_code_unit_pair_enabled() = "ZIPP_NO_SPAN_CODEUNIT_PAIR"
 }
 
 env_off_switch! {

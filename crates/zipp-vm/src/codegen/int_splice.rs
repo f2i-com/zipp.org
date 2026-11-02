@@ -1340,19 +1340,9 @@ fn span_pinned_charcodeat(proto: &FuncProto, ta_plan: &TaPinPlan, ip: usize) -> 
             .is_some_and(|&j| ta_plan.pins[j as usize].kind == crate::codegen::STR_PIN_KIND)
 }
 
-/// B223 latch: see `span_pinned_charcodeat`.
-fn splice_charcodeat_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SPLICE_CCA").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B223 latch: see `span_pinned_charcodeat`.
+    fn splice_charcodeat_enabled() = "ZIPP_NO_SPLICE_CCA"
 }
 
 /// Every exit inside `[def_ip, call_ip]` resumes at `def_ip`, so the whole span

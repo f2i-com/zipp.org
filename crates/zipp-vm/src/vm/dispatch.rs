@@ -108,21 +108,11 @@ pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 /// How many arguments `Vm::arg_window` copies out on the stack.
 const ARGS_ON_STACK: usize = 8;
 
-/// `ZIPP_NO_JIT_SHARED_CONSTS=1`: compiled code embeds a fresh string per
-/// literal, as before `Vm::jit_const_str_bits` took the shared one.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn jit_shared_const_strs_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_JIT_SHARED_CONSTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_JIT_SHARED_CONSTS=1`: compiled code embeds a fresh string per
+    /// literal, as before `Vm::jit_const_str_bits` took the shared one.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_shared_const_strs_enabled() = "ZIPP_NO_JIT_SHARED_CONSTS"
 }
 
 #[inline(always)]

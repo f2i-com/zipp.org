@@ -307,73 +307,33 @@ pub(crate) fn arr_pin_loose() -> bool {
     }
 }
 
-pub(crate) fn double_bitwise_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DOUBLE_BITWISE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    fn double_bitwise_enabled() = "ZIPP_NO_DOUBLE_BITWISE"
 }
 
-/// `ZIPP_NO_DOUBLE_MOD=1` restores the pre-Mod emitter on the DOUBLE path: an
-/// `Instr::Mod` falls through to the emitter's catch-all and the whole region
-/// declines to the memory tier again (the named `regalloc-emit-unhandled: Mod`
-/// decline B113 documented). Cached — read once per process, never on the
-/// generated hot path.
-pub(crate) fn double_mod_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DOUBLE_MOD").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_DOUBLE_MOD=1` restores the pre-Mod emitter on the DOUBLE path: an
+    /// `Instr::Mod` falls through to the emitter's catch-all and the whole region
+    /// declines to the memory tier again (the named `regalloc-emit-unhandled: Mod`
+    /// decline B113 documented). Cached — read once per process, never on the
+    /// generated hot path.
+    fn double_mod_enabled() = "ZIPP_NO_DOUBLE_MOD"
 }
 
-/// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
-/// whitelisted DataView `get*` CallMethod declines the whole region to the
-/// memory tier again (helper call, boxed operands). Cached — read once per
-/// process, never on the generated hot path.
-pub(crate) fn dv_double_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DV_DOUBLE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
+    /// whitelisted DataView `get*` CallMethod declines the whole region to the
+    /// memory tier again (helper call, boxed operands). Cached — read once per
+    /// process, never on the generated hot path.
+    fn dv_double_enabled() = "ZIPP_NO_DV_DOUBLE"
 }
 
-/// `ZIPP_NO_GUARD_HOIST=1` disables W7 pinned-guard hoisting: `hoist_pins` /
-/// `hoist_len_ips` stay empty, so every pinned access re-emits its per-access
-/// identity compare and the length GetProp stays a body op — the pre-wave
-/// emission, byte-identical. Cached once per process, never on the hot path.
-pub(crate) fn guard_hoist_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_GUARD_HOIST").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_GUARD_HOIST=1` disables W7 pinned-guard hoisting: `hoist_pins` /
+    /// `hoist_len_ips` stay empty, so every pinned access re-emits its per-access
+    /// identity compare and the length GetProp stays a body op — the pre-wave
+    /// emission, byte-identical. Cached once per process, never on the hot path.
+    fn guard_hoist_enabled() = "ZIPP_NO_GUARD_HOIST"
 }
 
 /// W7: the pin slots whose per-access identity guard can be hoisted to region

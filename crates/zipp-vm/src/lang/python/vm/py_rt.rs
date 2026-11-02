@@ -175,20 +175,10 @@ fn keyed_by_a(kind: u8) -> bool {
     )
 }
 
-/// Whether sites keep alternate entries (`Vm::py_ic_class`). On unless
-/// `ZIPP_NO_PY_IC_ALTS` is set (the same-binary A/B). Read once per process.
-fn py_ic_alts_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_IC_ALTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether sites keep alternate entries (`Vm::py_ic_class`). On unless
+    /// `ZIPP_NO_PY_IC_ALTS` is set (the same-binary A/B). Read once per process.
+    fn py_ic_alts_enabled() = "ZIPP_NO_PY_IC_ALTS"
 }
 
 /// One per-site cache entry (see the module comment); kind 0 is empty.

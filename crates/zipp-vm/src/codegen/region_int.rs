@@ -53,21 +53,11 @@ pub(crate) enum IntTaLoadKind {
     I32,
 }
 
-/// Kill switch for the narrow fixed-width integer TypedArray read widening.
-/// Int32 (the pre-existing path) remains enabled when the switch is set, so an
-/// off run is an exact semantic fallback rather than a JIT-wide disable.
-fn int_ta_narrow_reads_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_TA_NARROW_READS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch for the narrow fixed-width integer TypedArray read widening.
+    /// Int32 (the pre-existing path) remains enabled when the switch is set, so an
+    /// off run is an exact semantic fallback rather than a JIT-wide disable.
+    fn int_ta_narrow_reads_enabled() = "ZIPP_NO_INT_TA_NARROW_READS"
 }
 
 pub(crate) fn int_ta_load_kind(kind: u8) -> Option<IntTaLoadKind> {

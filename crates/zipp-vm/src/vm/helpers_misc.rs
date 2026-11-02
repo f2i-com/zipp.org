@@ -2087,60 +2087,40 @@ pub(crate) extern "win64" fn jit_set_prop_acc(
     })
 }
 
-/// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
-/// fast path (identity + version check, direct `vals[slot]` read) only calls this
-/// when its cache misses. Looks up `obj.<key>`, and on the fast-path-eligible case
-/// (a plain Object that HAS the key) fills inline-cache slot `site` with
-/// `(obj_bits, vals.as_ptr(), version, slot)` so subsequent accesses are call-free.
-/// Returns the property bits, or `SELF_CALL_DEOPT` (non-Object → interpreter
-/// re-executes at this ip; arrays/strings/`.length`/null/undefined handled there).
-/// A missing key on an Object returns `undefined` WITHOUT caching (rare).
-/// `packed = (func_id << 32) | name_idx`.
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm`.
-/// Win64 helper for a JIT'd dense-array element read `a[i]` (`GetIndex`).
-/// Returns the element's Value bits; `undefined` bits for an in-bounds-checks-fail
-/// (negative or `>= len`) index, matching JS `a[oob] === undefined`; or
-/// `SELF_CALL_DEOPT` for a non-array receiver or a non-int key (string indexing,
-/// `arr["foo"]`, etc.) so the interpreter re-executes this op. Read-only — no
-/// caching needed (a dense array's element address is a direct `vals[i]`).
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm`.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn jit_sparse_get_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_JIT_SPARSE_GET").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
+    /// fast path (identity + version check, direct `vals[slot]` read) only calls this
+    /// when its cache misses. Looks up `obj.<key>`, and on the fast-path-eligible case
+    /// (a plain Object that HAS the key) fills inline-cache slot `site` with
+    /// `(obj_bits, vals.as_ptr(), version, slot)` so subsequent accesses are call-free.
+    /// Returns the property bits, or `SELF_CALL_DEOPT` (non-Object → interpreter
+    /// re-executes at this ip; arrays/strings/`.length`/null/undefined handled there).
+    /// A missing key on an Object returns `undefined` WITHOUT caching (rare).
+    /// `packed = (func_id << 32) | name_idx`.
+    ///
+    /// # Safety
+    /// `vm` is a valid `*mut Vm`.
+    /// Win64 helper for a JIT'd dense-array element read `a[i]` (`GetIndex`).
+    /// Returns the element's Value bits; `undefined` bits for an in-bounds-checks-fail
+    /// (negative or `>= len`) index, matching JS `a[oob] === undefined`; or
+    /// `SELF_CALL_DEOPT` for a non-array receiver or a non-int key (string indexing,
+    /// `arr["foo"]`, etc.) so the interpreter re-executes this op. Read-only — no
+    /// caching needed (a dense array's element address is a direct `vals[i]`).
+    ///
+    /// # Safety
+    /// `vm` is a valid `*mut Vm`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_sparse_get_enabled() = "ZIPP_NO_JIT_SPARSE_GET"
 }
 
-/// B256 same-binary switch: `ZIPP_NO_ARRAY_STORE_NOBUMP=1` makes every JIT'd
-/// dense-Array element store advance the array snapshot epoch again (the
-/// pre-B256 route through `Heap::get_mut`).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn array_store_nobump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_ARRAY_STORE_NOBUMP").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B256 same-binary switch: `ZIPP_NO_ARRAY_STORE_NOBUMP=1` makes every JIT'd
+    /// dense-Array element store advance the array snapshot epoch again (the
+    /// pre-B256 route through `Heap::get_mut`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn array_store_nobump_enabled() = "ZIPP_NO_ARRAY_STORE_NOBUMP"
 }
 
 /// Read one absent Array index through the exact default intrinsic chain.
@@ -2176,23 +2156,13 @@ fn jit_default_array_proto_index(vm: &Vm<'_>, i: usize) -> Option<Value> {
     Some(Value::UNDEFINED)
 }
 
-/// Same-binary switch: `ZIPP_NO_JIT_STRKEY_LANE=1` makes compiled `o[k]`
-/// with a string key leave the region again on an own miss, on a key that is
-/// new, and on a key that is still a rope.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn jit_strkey_lane_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_JIT_STRKEY_LANE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary switch: `ZIPP_NO_JIT_STRKEY_LANE=1` makes compiled `o[k]`
+    /// with a string key leave the region again on an own miss, on a key that is
+    /// new, and on a key that is still a rope.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_strkey_lane_enabled() = "ZIPP_NO_JIT_STRKEY_LANE"
 }
 
 /// `o[k]` where the flat string `key` is not among the plain object `idx`'s
@@ -4570,22 +4540,12 @@ pub(crate) fn method_memo_way(packed_fip: u64) -> usize {
     (packed_fip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize & (METHOD_MEMO_WAYS - 1)
 }
 
-/// `ZIPP_NO_METHOD_MEMO=1` resolves every class-method lane lookup through
-/// the interpreter's method cache again (`Vm::jit_method_callee_impl`).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn method_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_METHOD_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_METHOD_MEMO=1` resolves every class-method lane lookup through
+    /// the interpreter's method cache again (`Vm::jit_method_callee_impl`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn method_memo_enabled() = "ZIPP_NO_METHOD_MEMO"
 }
 
 /// Win64 helper for the emitted class-method lane: the callee a `CallMethod`
@@ -5052,24 +5012,14 @@ pub fn concat_set_stats() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
-/// Whether a JIT property miss may serve an ES-module namespace binding
-/// directly from its live global slot. The escape hatch is intentionally
-/// default-on: setting `ZIPP_NO_JIT_MODULE_NS_GET` restores the interpreter
-/// replay used before this optimization.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn jit_module_ns_get_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_JIT_MODULE_NS_GET").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a JIT property miss may serve an ES-module namespace binding
+    /// directly from its live global slot. The escape hatch is intentionally
+    /// default-on: setting `ZIPP_NO_JIT_MODULE_NS_GET` restores the interpreter
+    /// replay used before this optimization.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_module_ns_get_enabled() = "ZIPP_NO_JIT_MODULE_NS_GET"
 }
 
 /// Ask the adaptive direct-miss gate after a LIVE shape-memo hit. Building the
@@ -5230,23 +5180,13 @@ fn jit_proto_named_get(vm: &Vm, idx: u32, key: &str) -> Option<Value> {
     Some(Value::UNDEFINED)
 }
 
-/// `ZIPP_NO_COLL_METHOD_WAY=1` stops the property miss helper filling an
-/// inline-cache way for a Map / Set method read, so every such read takes the
-/// helper again — the same-binary A/B for that fill.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn coll_method_way_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_COLL_METHOD_WAY").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_COLL_METHOD_WAY=1` stops the property miss helper filling an
+    /// inline-cache way for a Map / Set method read, so every such read takes the
+    /// helper again — the same-binary A/B for that fill.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn coll_method_way_enabled() = "ZIPP_NO_COLL_METHOD_WAY"
 }
 
 /// Make a Map / Set receiver's METHOD read call-free: fill the site's inline
@@ -5854,22 +5794,12 @@ fn leaf_read_way(packed: u64) -> usize {
     (packed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize & (LEAF_READ_WAYS - 1)
 }
 
-/// `ZIPP_NO_LEAF_READ_MEMO=1` resolves every inlined leaf body's property
-/// read by its key again (`jit_get_prop_leaf`), as before the memo.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn leaf_read_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_LEAF_READ_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_READ_MEMO=1` resolves every inlined leaf body's property
+    /// read by its key again (`jit_get_prop_leaf`), as before the memo.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn leaf_read_memo_enabled() = "ZIPP_NO_LEAF_READ_MEMO"
 }
 
 /// Win64 helper: a SITE-FREE named property read, for a `GetProp` inside an
@@ -6125,22 +6055,12 @@ fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: 
     callee.bits()
 }
 
-/// `ZIPP_NO_CLASS_READ_MEMO=1` sends every class-method read in compiled
-/// code through the interpreter-IC slow helper, as before the memo.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn class_read_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CLASS_READ_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CLASS_READ_MEMO=1` sends every class-method read in compiled
+    /// code through the interpreter-IC slow helper, as before the memo.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn class_read_memo_enabled() = "ZIPP_NO_CLASS_READ_MEMO"
 }
 
 /// One JIT `SetProp` site's last proved append (`Vm::jit_add_ways`): adding
@@ -6917,23 +6837,13 @@ pub(crate) extern "win64" fn jit_to_concat_key(vm: *mut core::ffi::c_void, v_bit
     }
 }
 
-/// `ZIPP_NO_CONCAT_APPEND=1` restores the pre-B86 behaviour: a NEW key at a
-/// JIT'd `obj["name" + i] = v` deopts instead of appending. Exists so the change
-/// is A/B-able with `--ab-env` on ONE binary and bisectable without a rebuild.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn concat_append_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_CONCAT_APPEND").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CONCAT_APPEND=1` restores the pre-B86 behaviour: a NEW key at a
+    /// JIT'd `obj["name" + i] = v` deopts instead of appending. Exists so the change
+    /// is A/B-able with `--ab-env` on ONE binary and bisectable without a rebuild.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn concat_append_enabled() = "ZIPP_NO_CONCAT_APPEND"
 }
 
 /// `ZIPP_ICSTATS=1` engagement counters for the fused computed-write helper.

@@ -5,44 +5,24 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// `ZIPP_NO_CALLVALUE_FLAT=1` restores the sequential exotic-receiver cascade
-/// `call_value` walked in full before reaching the plain-function tail. See
-/// the comment at `call_value`'s fast-path match for why hoisting the
-/// Func/Closure test is sound; this exists purely so the change is A/B-able
-/// and bisectable on one binary.
-#[inline]
-fn callvalue_flat_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_CALLVALUE_FLAT").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CALLVALUE_FLAT=1` restores the sequential exotic-receiver cascade
+    /// `call_value` walked in full before reaching the plain-function tail. See
+    /// the comment at `call_value`'s fast-path match for why hoisting the
+    /// Func/Closure test is sound; this exists purely so the change is A/B-able
+    /// and bisectable on one binary.
+    #[inline]
+    fn callvalue_flat_enabled() = "ZIPP_NO_CALLVALUE_FLAT"
 }
 
-/// `ZIPP_NO_JOB_INT_WINDOW=1` makes `call_compiled_windowed` decline whenever
-/// the frame stack is empty, as it did for every body: a promise reaction's
-/// int-tier callback then takes a frame of its own again. The two sides of a
-/// one-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn job_int_window_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_JOB_INT_WINDOW").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_JOB_INT_WINDOW=1` makes `call_compiled_windowed` decline whenever
+    /// the frame stack is empty, as it did for every body: a promise reaction's
+    /// int-tier callback then takes a frame of its own again. The two sides of a
+    /// one-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn job_int_window_enabled() = "ZIPP_NO_JOB_INT_WINDOW"
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

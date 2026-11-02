@@ -8,21 +8,11 @@
 
 use super::*;
 
-/// Same-binary ablation for capture-free `MakeFunc` and `SetHomeObject`.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_makefunc_home_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_MAKEFUNC_HOME").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary ablation for capture-free `MakeFunc` and `SetHomeObject`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_makefunc_home_enabled() = "ZIPP_NO_TIERC_MAKEFUNC_HOME"
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

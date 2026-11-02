@@ -336,20 +336,10 @@ fn renumber_above(slots: &mut [u32], slot: u32) {
 #[cfg(not(target_arch = "wasm32"))]
 const SLOT_TABLE_FIRST_GROWTH: usize = 1 << 17;
 
-/// `ZIPP_NO_SLOT_JUMP=1` grows the slot tables by `Vec`'s doubling.
-#[cfg(not(target_arch = "wasm32"))]
-fn slot_jump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SLOT_JUMP").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SLOT_JUMP=1` grows the slot tables by `Vec`'s doubling.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slot_jump_enabled() = "ZIPP_NO_SLOT_JUMP"
 }
 
 /// A hint that the cache line at `p` is about to be read. A prefetch reads
@@ -1235,83 +1225,43 @@ fn sparse_num_index_enabled() -> bool {
     }
 }
 
-/// `ZIPP_NO_VAL_SLAB=1` makes every finalize-born literal carry an owned
-/// `Vec<Value>` (the pre-B187 representation) — the single-binary A/B for
-/// the literal value slab. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn val_slab_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_VAL_SLAB").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_VAL_SLAB=1` makes every finalize-born literal carry an owned
+    /// `Vec<Value>` (the pre-B187 representation) — the single-binary A/B for
+    /// the literal value slab. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn val_slab_enabled() = "ZIPP_NO_VAL_SLAB"
 }
 
-/// `ZIPP_NO_OBJ_POOL=1` disables the B187 stage-3 `Box<ObjMap>` recycle pool
-/// (every finalize-born literal takes a fresh allocation and every dead shell
-/// ships to the courier, the stage-2 behavior) — the single-binary A/B for
-/// the pool. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL=1` disables the B187 stage-3 `Box<ObjMap>` recycle pool
+    /// (every finalize-born literal takes a fresh allocation and every dead shell
+    /// ships to the courier, the stage-2 behavior) — the single-binary A/B for
+    /// the pool. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_enabled() = "ZIPP_NO_OBJ_POOL"
 }
 
-/// `ZIPP_NO_OBJ_POOL_SORT=1` skips the address sort at trim (LIFO serve in
-/// push order, the pre-B196a behavior) — the single-binary A/B separating
-/// the sort's own cost from the locality it buys. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_sort_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_SORT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_SORT=1` skips the address sort at trim (LIFO serve in
+    /// push order, the pre-B196a behavior) — the single-binary A/B separating
+    /// the sort's own cost from the locality it buys. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_sort_enabled() = "ZIPP_NO_OBJ_POOL_SORT"
 }
 
-/// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
-/// post-major pool flush. By default the sorter first proves the common
-/// recycle shape -- an already-sorted retained prefix followed by one
-/// monotone sweep run -- and joins those runs in linear time. Any uncertainty
-/// falls back to the exact pre-existing full sort. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_run_sort_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_RUN_SORT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
+    /// post-major pool flush. By default the sorter first proves the common
+    /// recycle shape -- an already-sorted retained prefix followed by one
+    /// monotone sweep run -- and joins those runs in linear time. Any uncertainty
+    /// falls back to the exact pre-existing full sort. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_run_sort_enabled() = "ZIPP_NO_OBJ_POOL_RUN_SORT"
 }
 
 /// Address-order one recycle pool while preserving the FULL sort's result.
@@ -1440,20 +1390,10 @@ const fn attrs_elide_enabled() -> bool {
     true
 }
 
-#[cfg(not(feature = "meter-only"))]
-#[inline]
-fn attrs_elide_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_ATTRS_ELIDE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn attrs_elide_enabled() = "ZIPP_NO_ATTRS_ELIDE"
 }
 
 pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
@@ -2449,21 +2389,11 @@ pub(crate) fn ready_layout() -> ReadyLayout {
     ReadyLayout { shape, keys_all, keys_len, attrs_len, vals_owner_len, class }
 }
 
-/// `ZIPP_NO_READY_OBJECTS=1`: every object takes the allocating path (the
-/// same-binary A/B).
-#[cfg(not(feature = "safe-sandbox"))]
-pub(crate) fn ready_objects_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_READY_OBJECTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_READY_OBJECTS=1`: every object takes the allocating path (the
+    /// same-binary A/B).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_objects_enabled() = "ZIPP_NO_READY_OBJECTS"
 }
 
 /// Where compiled code writes in a ready object's map. Enum payloads have no
@@ -6584,19 +6514,9 @@ mod gc_courier {
         false
     }
 
-    #[cfg(not(feature = "meter-only"))]
-    fn enabled() -> bool {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static STATE: AtomicU8 = AtomicU8::new(0);
-        match STATE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => {
-                let on = std::env::var_os("ZIPP_NO_GC_COURIER").is_none();
-                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-                on
-            }
-        }
+    env_off_switch! {
+        #[cfg(not(feature = "meter-only"))]
+        fn enabled() = "ZIPP_NO_GC_COURIER"
     }
 
     /// B210: buffer capacity a payload must clear to be worth an off-thread
@@ -6760,54 +6680,24 @@ const KEY_POOL_MAX: usize = 4096;
 #[cfg(not(feature = "safe-sandbox"))]
 const KEY_POOL_MAX_CAP: usize = 64;
 
-/// B220 latch: `ZIPP_NO_KEY_POOL=1` mallocs a fresh key String per append and
-/// drops dying keys (the pricing comparator).
-#[cfg(not(feature = "safe-sandbox"))]
-pub(crate) fn key_pool_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_KEY_POOL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B220 latch: `ZIPP_NO_KEY_POOL=1` mallocs a fresh key String per append and
+    /// drops dying keys (the pricing comparator).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn key_pool_enabled() = "ZIPP_NO_KEY_POOL"
 }
 
-/// B239 latch: `ZIPP_NO_SHELL_REFIT=1` builds a fresh `ObjMap` and assigns it
-/// over the pooled shell, as before.
-#[cfg(not(feature = "safe-sandbox"))]
-fn shell_refit_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SHELL_REFIT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B239 latch: `ZIPP_NO_SHELL_REFIT=1` builds a fresh `ObjMap` and assigns it
+    /// over the pooled shell, as before.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn shell_refit_enabled() = "ZIPP_NO_SHELL_REFIT"
 }
 
-/// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
-/// mirror through `refresh_mirror` again, as before.
-fn settled_alloc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SETTLED_ALLOC").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
+    /// mirror through `refresh_mirror` again, as before.
+    fn settled_alloc_enabled() = "ZIPP_NO_SETTLED_ALLOC"
 }
 
 /// B257 latch: `ZIPP_NO_THIN_ALLOC=1` disables the thin literal-allocation
@@ -6852,23 +6742,13 @@ fn thin_alloc_default() -> bool {
     false
 }
 
-/// B258 latch: `ZIPP_NO_SHELL_CELL=1` makes a pool-bound shell return its
-/// slab cell at death (the B187 form) instead of carrying the cell into the
-/// recycle pool for the next same-class literal to fill in place. Latched on
-/// first use; the heap folds it into [`Heap::shell_cell`] at construction.
-#[cfg(not(feature = "safe-sandbox"))]
-fn shell_cell_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SHELL_CELL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B258 latch: `ZIPP_NO_SHELL_CELL=1` makes a pool-bound shell return its
+    /// slab cell at death (the B187 form) instead of carrying the cell into the
+    /// recycle pool for the next same-class literal to fill in place. Latched on
+    /// first use; the heap folds it into [`Heap::shell_cell`] at construction.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn shell_cell_enabled() = "ZIPP_NO_SHELL_CELL"
 }
 
 /// B258: the construction-time fold behind [`Heap::shell_cell`]. The thin
@@ -6888,40 +6768,20 @@ const CONCAT_MEMO_SLOTS: usize = 2048;
 #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
 const CONCAT_SUFFIX_MEMO_SLOTS: usize = 256;
 
-/// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
-/// misses, every insert is skipped, no string is ever frozen).
-#[cfg(not(feature = "safe-sandbox"))]
-fn concat_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CONCAT_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
+    /// misses, every insert is skipped, no string is ever frozen).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn concat_memo_enabled() = "ZIPP_NO_CONCAT_MEMO"
 }
 
-/// B253 pricing switch. This leaves B212's const+int memo enabled so the
-/// same binary isolates only the stable-suffix bridge between two int memos.
-/// The JIT emitters consult it too, so disabling the bridge also removes its
-/// next-leaf tag proof from generated code.
-#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn concat_suffix_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CONCAT_SUFFIX_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B253 pricing switch. This leaves B212's const+int memo enabled so the
+    /// same binary isolates only the stable-suffix bridge between two int memos.
+    /// The JIT emitters consult it too, so disabling the bridge also removes its
+    /// next-leaf tag proof from generated code.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    fn concat_suffix_memo_enabled() = "ZIPP_NO_CONCAT_SUFFIX_MEMO"
 }
 
 #[cfg(all(feature = "safe-sandbox", feature = "jit", target_arch = "x86_64"))]
@@ -8378,20 +8238,10 @@ const NURSERY_BUDGET_MAX: usize = 1 << 16;
 /// `Heap::adapt_young_budget`): a phase change gets another try.
 const NURSERY_GROW_HOLD: u32 = 64;
 
-/// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
-/// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
-fn nursery_marginal_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_NURSERY_MARGINAL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
+    /// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
+    fn nursery_marginal_enabled() = "ZIPP_NO_NURSERY_MARGINAL"
 }
 
 /// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
