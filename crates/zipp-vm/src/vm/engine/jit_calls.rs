@@ -1897,6 +1897,58 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_cold_op_ic`]: `ObjectRest` (`op` 0,
+    /// `packed_args` = `src | exclude_start << 16 | exclude_count << 32`) and
+    /// `MathSpread` (1, `callee | this_v << 16 | args << 32 | MathFn << 48`),
+    /// the interpreter's arms over the compiled body's window. Every decline
+    /// precedes the first effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_cold_op_impl(&mut self, op: u32, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(self.regs.as_ptr() as *const u64) } as usize;
+        let field = |k: u32| ((packed_args >> (16 * k)) & 0xFFFF) as u16;
+        let math = (op == 1).then(|| field(3) as u8);
+        if let Some(m) = math {
+            // The spread arguments are a compiler-made Array; anything else
+            // is malformed bytecode, which declines.
+            let args = self.get(base, field(2));
+            if (m as usize) >= crate::bytecode::MATH_FN_COUNT
+                || !args.is_heap()
+                || !matches!(self.heap.get(args.heap_index()), HeapObj::Array(_))
+            {
+                return SELF_CALL_DEOPT;
+            }
+        }
+        // The window's Values are roots: the safe point may precede the reads.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r = match math {
+            None => self.object_rest_value(
+                base,
+                (packed_fip >> 32) as u32,
+                field(0),
+                u32::from(field(1)),
+                u32::from(field(2)),
+            ),
+            Some(m) => {
+                // SAFETY: `MathFn` is a fieldless `repr(u8)` enum of
+                // `MATH_FN_COUNT` variants, and `m` is below that.
+                let f: crate::bytecode::MathFn = unsafe { core::mem::transmute(m) };
+                self.math_spread_value(base, f, field(0), field(1), field(2))
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_iter_to_array_ic`] (`op` 0),
     /// [`jit_array_append_ic`] (1) and [`jit_call_spread_ic`] (2). Every
     /// decline precedes the first effect.

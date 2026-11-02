@@ -1058,6 +1058,18 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // region's `jit_iter_to_array_ic`, with the call protocol (a
             // non-array iterator is user code).
             Instr::IterToArray { count, .. } if !py && count <= 0xFFFF => {}
+            // An object rest and a spread `Math` call: the interpreter's arms
+            // through `jit_cold_op_ic` (a getter, a replaced `Math` method is
+            // user code).
+            Instr::ObjectRest {
+                exclude_start,
+                exclude_count,
+                ..
+            } if !py && (exclude_start as u64) <= 0xFFFF && (exclude_count as u64) <= 0xFFFF => {}
+            Instr::MathSpread { .. } if !py => {}
+            // `Object.values(o)` / `Object.entries(o)`: the region's
+            // `jit_obj_enum_ic` (a getter, a replaced builtin is user code).
+            Instr::ObjectValues { .. } | Instr::ObjectEntries { .. } if !py => {}
             // A destructuring's close of an unexhausted iterator, and its
             // error-path form: the region's `jit_iter_op_ic` (`return()` is
             // user code).
@@ -1608,6 +1620,10 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             // A private write: `val`'s own bits come back into its register.
             Instr::SetPrivate { obj, val, .. } => (u2(obj, val), Some(val)),
             Instr::IterToArray { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::ObjectRest { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::MathSpread {
+                dst, callee, this_v, args, ..
+            } => (u3(callee, this_v, args), Some(dst)),
             // The iterator's own bits come back into its register.
             Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => (u1(iter), Some(iter)),
             Instr::NewRegExp {
@@ -1666,6 +1682,18 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::GetIterator { dst, src } => (u1(src), Some(dst)),
             Instr::IterPrime { dst, iter } => (u1(iter), Some(dst)),
             Instr::ObjectKeys {
+                dst,
+                obj,
+                callee,
+                this_v,
+            }
+            | Instr::ObjectValues {
+                dst,
+                obj,
+                callee,
+                this_v,
+            }
+            | Instr::ObjectEntries {
                 dst,
                 obj,
                 callee,
@@ -4614,6 +4642,36 @@ pub(crate) fn compile_proto_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::ObjectValues {
+                dst,
+                obj,
+                callee,
+                this_v,
+            }
+            | Instr::ObjectEntries {
+                dst,
+                obj,
+                callee,
+                this_v,
+            } if !py => {
+                // `Object.values(o)` / `Object.entries(o)`: the region's
+                // `jit_obj_enum_ic`, with the call protocol.
+                let op: u64 = if matches!(proto.code[ip], Instr::ObjectValues { .. }) { 1 } else { 2 };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (callee as u64) << 16 | (this_v as u64) << 32 | op << 56,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
             Instr::NewObject { dst, hint } => {
                 // Allocation is a GC safe point.  The native frame's Values
                 // live in vm.regs, and the helper reproduces realm_born before
@@ -6819,6 +6877,51 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, QWORD crate::vm::jit_iter_probe as *const () as i64
                     ; call rax
                     ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::ObjectRest {
+                dst,
+                src,
+                exclude_start,
+                exclude_count,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed = src as u64 | (exclude_start as u64) << 16 | (exclude_count as u64) << 32;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    packed,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::MathSpread {
+                dst,
+                op,
+                callee,
+                this_v,
+                args,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed = callee as u64 | (this_v as u64) << 16 | (args as u64) << 32 | (op as u64) << 48;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    packed,
+                    1,
+                    dst,
+                    refetch,
+                    None,
                 );
             }
             Instr::IterToArray { dst, src, count } if !py => {

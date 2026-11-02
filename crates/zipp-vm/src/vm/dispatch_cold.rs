@@ -40,6 +40,99 @@ const DIRECT_EVAL_CACHE_MAX_SOURCE: usize = 1024;
 const DIRECT_EVAL_CACHE_MAX_ENTRIES: usize = 4096;
 
 impl<'p> Vm<'p> {
+    /// `ObjectRest`'s value (`let {a, ...rest} = src`) over the window at
+    /// `base`: the interpreter's arm, and Tier C's (`jit_cold_op_ic`).
+    pub(crate) fn object_rest_value(
+        &mut self,
+        base: usize,
+        func_id: u32,
+        src: u16,
+        exclude_start: u32,
+        exclude_count: u32,
+    ) -> Result<Value, Thrown> {
+        let s = self.get(base, src);
+        let consts = &self.func(func_id as usize).string_constants;
+        let excluded = &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
+        // Only an ORDINARY object (or a string, handled below) can be walked
+        // straight off its ObjMap. Every other source — a Proxy's traps, but
+        // equally an Array's or a TypedArray's own INDEX properties, which live
+        // outside any ObjMap — needs the general CopyDataProperties (ownKeys →
+        // gopd → get per key, excluded keys never probed). `let {...r} =
+        // ['x','y']` produced `{}`.
+        if s.is_heap()
+            && !matches!(
+                self.heap.get(s.heap_index()),
+                HeapObj::Object(_) | HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+        {
+            let m = self.copy_data_properties_rest(s, excluded)?;
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
+        }
+        // Copy src's own enumerable keys except the destructured siblings —
+        // Getting each (CopyDataProperties), so a getter's VALUE is copied (not
+        // the accessor) and a throw propagates.
+        let keys: Vec<String> = if s.is_heap() {
+            match self.heap.get(s.heap_index()) {
+                HeapObj::Object(map) => spec_key_order_map(&map)
+                    .into_iter()
+                    .filter(|&i| map.attr_at(i).enumerable)
+                    .map(|i| map.key_at(i).to_owned())
+                    .filter(|k| !excluded.iter().any(|e| e == k))
+                    .collect(),
+                // A STRING source: its UNITS are own enumerable index
+                // properties (CopyDataProperties copies them).
+                HeapObj::Str(st) => (0..st.units())
+                    .map(|i| i.to_string())
+                    .filter(|k| !excluded.iter().any(|e| e == k))
+                    .collect(),
+                HeapObj::Cons { len, .. } => (0..*len)
+                    .map(|i| i.to_string())
+                    .filter(|k| !excluded.iter().any(|e| e == k))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let m = self.object_rest_plain(s, keys)?;
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))))
+    }
+
+    /// `MathSpread`'s value (`Math.max(...xs)`) over the window at `base`:
+    /// the interpreter's arm, and Tier C's (`jit_cold_op_ic`).
+    pub(crate) fn math_spread_value(
+        &mut self,
+        base: usize,
+        op: crate::bytecode::MathFn,
+        callee: u16,
+        this_v: u16,
+        args: u16,
+    ) -> Result<Value, Thrown> {
+        use crate::bytecode::MathFn as M;
+        let av = self.get(base, args);
+        let elems = self.array_snapshot(av.heap_index());
+        let callee = self.get(base, callee);
+        let this_v = self.get(base, this_v);
+        let native_id = native::MATH_METHOD_BASE + op as u16;
+        if !self.static_builtin_is_intrinsic("Math", native_id, callee, this_v) {
+            return self.call_value(callee, this_v, &elems);
+        }
+        // The variadic ops reduce exactly like a direct call (`eval_math_args`:
+        // -0 < +0 ordering, a ±Infinity hypot argument beating NaN);
+        // f64::max/min leave the sign of a zero tie unspecified.
+        let r = match op {
+            // `eval_math_args` is the ONE reduction: Hypot goes through
+            // `hypot_scaled` there, as every other tier computes it.
+            M::Max | M::Min | M::Hypot => self.eval_math_args(op, &elems)?,
+            // A non-variadic Math fn spread is unusual; apply to elem 0.
+            _ => {
+                let nums: Vec<f64> = elems.iter().map(|&v| self.to_number_strict(v)).collect::<Result<_, _>>()?;
+                self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN))
+            }
+        };
+        Ok(Value::num(r))
+    }
+
     /// Whether `it` is a generator whose `next` is the intrinsic: a primed
     /// loop decided at `IterPrime` (its record's [[NextMethod]] is read once:
     /// undefined there means the intrinsic), an unprimed step asks now.
@@ -625,57 +718,7 @@ impl<'p> Vm<'p> {
                 exclude_start,
                 exclude_count,
             } => {
-                let s = self.get(base, src);
-                let consts = &self.func(func_id as usize).string_constants;
-                let excluded = &consts[exclude_start as usize
-                    ..exclude_start as usize + exclude_count as usize];
-                // Only an ORDINARY object (or a string, handled below)
-                // can be walked straight off its ObjMap. Every other
-                // source — a Proxy's traps, but equally an Array's or a
-                // TypedArray's own INDEX properties, which live outside
-                // any ObjMap — needs the general CopyDataProperties
-                // (ownKeys → gopd → get per key, excluded keys never
-                // probed). `let {...r} = ['x','y']` produced `{}`.
-                if s.is_heap()
-                    && !matches!(
-                        self.heap.get(s.heap_index()),
-                        HeapObj::Object(_) | HeapObj::Str(_) | HeapObj::Cons { .. }
-                    )
-                {
-                    let m = self.copy_data_properties_rest(s, excluded)?;
-                    let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                    self.set(base, dst, v);
-                    ip += 1;
-                    return Ok(ColdFlow::Next(ip));
-                }
-                // Copy src's own enumerable keys except the destructured
-                // siblings â€” Getting each (CopyDataProperties), so a getter's
-                // VALUE is copied (not the accessor) and a throw propagates.
-                let keys: Vec<String> = if s.is_heap() {
-                    match self.heap.get(s.heap_index()) {
-                        HeapObj::Object(map) => spec_key_order_map(&map)
-                            .into_iter()
-                            .filter(|&i| map.attr_at(i).enumerable)
-                            .map(|i| map.key_at(i).to_owned())
-                            .filter(|k| !excluded.iter().any(|e| e == k))
-                            .collect(),
-                        // A STRING source: its UNITS are own enumerable
-                        // index properties (CopyDataProperties copies them).
-                        HeapObj::Str(st) => (0..st.units())
-                            .map(|i| i.to_string())
-                            .filter(|k| !excluded.iter().any(|e| e == k))
-                            .collect(),
-                        HeapObj::Cons { len, .. } => (0..*len)
-                            .map(|i| i.to_string())
-                            .filter(|k| !excluded.iter().any(|e| e == k))
-                            .collect(),
-                        _ => Vec::new(),
-                    }
-                } else {
-                    Vec::new()
-                };
-                let m = self.object_rest_plain(s, keys)?;
-                let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                let v = self.object_rest_value(base, func_id, src, exclude_start as u32, exclude_count as u32)?;
                 self.set(base, dst, v);
                 ip += 1;
             }
@@ -1414,37 +1457,8 @@ impl<'p> Vm<'p> {
                 this_v,
                 args,
             } => {
-                use crate::bytecode::MathFn as M;
-                let av = self.get(base, args);
-                let elems = self.array_snapshot(av.heap_index());
-                let callee = self.get(base, callee);
-                let this_v = self.get(base, this_v);
-                let native_id = native::MATH_METHOD_BASE + op as u16;
-                if !self.static_builtin_is_intrinsic("Math", native_id, callee, this_v) {
-                    let result = self.call_value(callee, this_v, &elems)?;
-                    self.set(base, dst, result);
-                    ip += 1;
-                    return Ok(ColdFlow::Next(ip));
-                }
-                // The variadic ops reduce exactly like a direct call
-                // (`eval_math_args`: -0 < +0 ordering, a ±Infinity
-                // hypot argument beating NaN); f64::max/min leave the
-                // sign of a zero tie unspecified.
-                let r = match op {
-                    // `eval_math_args` is the ONE reduction: Hypot goes
-                    // through `hypot_scaled` there, as every other tier
-                    // computes it.
-                    M::Max | M::Min | M::Hypot => self.eval_math_args(op, &elems)?,
-                    // A non-variadic Math fn spread is unusual; apply to elem 0.
-                    _ => {
-                        let nums: Vec<f64> = elems
-                            .iter()
-                            .map(|&v| self.to_number_strict(v))
-                            .collect::<Result<_, _>>()?;
-                        self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN))
-                    }
-                };
-                self.set(base, dst, Value::num(r));
+                let v = self.math_spread_value(base, op, callee, this_v, args)?;
+                self.set(base, dst, v);
                 ip += 1;
             }
 

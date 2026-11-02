@@ -1488,6 +1488,27 @@ pub(crate) extern "win64" fn jit_throw(vm: *mut core::ffi::c_void, v: u64) {
     vm.osr_deopt_exempt = true;
 }
 
+/// Win64 helper for an object rest (`let {a, ...rest} = o`, `op` 0) and a
+/// spread `Math` call (`Math.max(...xs)`, 1) in a Tier C body: the
+/// interpreter's arm for the op (`Vm::jit_cold_op_impl`). A getter and a
+/// replaced `Math` method are user code, so the call protocol applies.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cold_op_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    op: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_cold_op_impl(op, caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
 /// Win64 helpers for array destructuring, array spread and a spread call in a
 /// compiled region: `IterToArray` (`packed_args` = `src | count << 16`),
 /// `ArrayAppend` (`arr | val << 16 | spread << 32`; the array's own bits come
