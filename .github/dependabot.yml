@@ -6,6 +6,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Wasmtime stays on its long-term-support line, and wasmparser on the
+    # version that line uses (see crates/zipp-vm/Cargo.toml). Patch releases
+    # of the line, which carry its security fixes, still arrive.
+    ignore:
+      - dependency-name: "wasmtime"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "wasmparser"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # zipp-wasm is deliberately a separate Cargo workspace and has its own lock.
   - package-ecosystem: cargo
