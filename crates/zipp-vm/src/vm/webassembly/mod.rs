@@ -515,6 +515,7 @@ impl<'p> Vm<'p> {
 
     fn wasm_detach(&mut self, ab: u32) {
         if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(ab) {
+            crate::heap::note_buffer_moved();
             *data = AbData::Local(Vec::new());
             *detached = true;
         }

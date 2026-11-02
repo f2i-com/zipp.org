@@ -2810,6 +2810,122 @@ fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
     0
 }
 
+/// Win64 helper for Tier C's typed-array receiver cache (`emit_ta_cache_get`):
+/// first record in the 40-byte frame slot at `slot` what lets the next read
+/// through the same register skip every call, then the read itself, exactly
+/// as [`jit_get_index`] does it.
+///
+/// The record is `[receiver bits, element base, element count, kind | slot
+/// version << 32, buffer epoch]`. Emitted code trusts the base only while
+/// the receiver is the same object (bits and slot version: a slot freed and
+/// reused by another object has a new version) and no buffer has moved or
+/// been detached since (`heap::TA_DATA_EPOCH`, read before the buffer).
+/// Anything but a fixed-length numeric view over a live buffer of its own
+/// records a count of 0, which sends later reads through that receiver
+/// straight to `jit_get_index` without coming back here: a dense Array the
+/// mirror missed, a length-tracking view, a BigInt or Float16 kind, a
+/// WebAssembly memory's view. Runs no user code and never allocates.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `slot` points to 40 writable bytes.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_index_ta_fill(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    key_bits: u64,
+    slot: *mut u64,
+) -> u64 {
+    // SAFETY: as `ta_cache_fill`.
+    unsafe { ta_cache_fill(vm, obj_bits, slot) };
+    jit_get_index(vm, obj_bits, key_bits)
+}
+
+/// [`jit_get_index_ta_fill`] for an element write: the record, then the
+/// write exactly as [`jit_set_index`] makes it, whose result it returns.
+///
+/// # Safety
+/// As [`jit_get_index_ta_fill`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_index_ta_fill(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+    slot: *mut u64,
+) -> u64 {
+    // SAFETY: as `ta_cache_fill`.
+    unsafe { ta_cache_fill(vm, obj_bits, slot) };
+    jit_set_index(vm, obj_bits, key_bits, val_bits)
+}
+
+/// Record `obj_bits` at `slot` when it is a typed array, and only then: the
+/// record of any other receiver would be a declined one, and an element
+/// access through a register that holds a different object each time (a
+/// field read off a new instance per call) filled one per access.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `slot` points to 40 writable bytes.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn ta_cache_fill(vm: *mut core::ffi::c_void, obj_bits: u64, slot: *mut u64) {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let v = Value::from_bits(obj_bits);
+    if !v.is_heap() || !matches!(vm.heap.get(v.heap_index()), HeapObj::TypedArray { .. }) {
+        return;
+    }
+    for (k, word) in vm.ta_cache_record(obj_bits).into_iter().enumerate() {
+        // SAFETY: the caller's slot holds five words.
+        unsafe { *slot.add(k) = word };
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Vm<'_> {
+    /// The record `jit_get_index_ta_fill` stores for `obj_bits`.
+    fn ta_cache_record(&self, obj_bits: u64) -> [u64; 5] {
+        let epoch = crate::heap::TA_DATA_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let v = Value::from_bits(obj_bits);
+        if !v.is_heap() {
+            // Bits 0 with epoch 0 never match a receiver: every epoch is >= 1.
+            return [0; 5];
+        }
+        let idx = v.heap_index();
+        let version = u64::from(self.heap.version_of(idx)) << 32;
+        let declined = [obj_bits, 0, 0, 0xFF | version, epoch];
+        let HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            length,
+        } = *self.heap.get(idx)
+        else {
+            return declined;
+        };
+        let (size, bigint) = (native::TA_KINDS[kind as usize].1, native::TA_KINDS[kind as usize].2);
+        if kind > 8 || bigint || (!self.ta_tracking.is_empty() && self.ta_tracking.contains(&idx)) {
+            return declined;
+        }
+        let HeapObj::ArrayBuffer { data, detached: false } = self.heap.get(buffer) else {
+            return declined;
+        };
+        if length.checked_mul(size).and_then(|bytes| bytes.checked_add(byte_offset)).is_none_or(|end| end > data.len()) {
+            return declined;
+        }
+        let base = match data {
+            crate::heap::AbData::Local(bytes) => bytes.as_ptr(),
+            crate::heap::AbData::Shared(m) => m.base_ptr() as *const u8,
+            #[cfg(feature = "webassembly")]
+            crate::heap::AbData::External(_) => return declined,
+        };
+        // Byte 25: an element write may go through the record (not a view
+        // of an immutable buffer).
+        let writable = u64::from(!self.ta_view_immutable(idx)) << 8;
+        // In bounds by the check above (an empty view's offset may be the end).
+        [obj_bits, base.wrapping_add(byte_offset) as u64, length as u64, u64::from(kind) | writable | version, epoch]
+    }
+}
+
+
 /// A pinned-TypedArray region snapshot: receiver identity bits, raw element
 /// base pointer (buffer data + byteOffset) and element count. `repr(C)` with
 /// the fixed layout the region's stack slot uses (`obj_bits @0, base @8,

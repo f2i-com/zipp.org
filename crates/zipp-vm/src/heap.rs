@@ -6197,6 +6197,7 @@ impl AbData {
     /// growth); Shared stores the new visible length (the allocation is
     /// preallocated to `maxByteLength` — callers validate `n <= max`).
     pub fn resize_bytes(&mut self, n: usize) {
+        note_buffer_moved();
         match self {
             AbData::Local(v) => v.resize(n, 0u8),
             AbData::Shared(m) => m.set_byte_len(n),
@@ -6209,6 +6210,7 @@ impl AbData {
     /// `SharedArrayBuffer.prototype.grow`. Returns false when `n` is below the
     /// live length (including a concurrent growth observed by SharedMem's CAS).
     pub fn grow_bytes(&mut self, n: usize) -> bool {
+        note_buffer_moved();
         match self {
             AbData::Local(v) => {
                 if n < v.len() {
@@ -6223,6 +6225,22 @@ impl AbData {
             AbData::External(_) => false,
         }
     }
+}
+
+/// Advanced whenever an ArrayBuffer's bytes may move or stop being its own:
+/// every resize, growth and detach goes through [`AbData::resize_bytes`] or
+/// [`AbData::grow_bytes`], and a WebAssembly memory's detach calls this
+/// itself. Compiled code keeps a typed array's element base across calls
+/// (Tier C's receiver cache, `jit_get_index_ta_fill`) only while this is the
+/// value it read with it. Process-wide, so a VM on another thread can only
+/// make the caches miss more often. Starts at 1: a zeroed cache slot never
+/// matches it.
+pub(crate) static TA_DATA_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// See [`TA_DATA_EPOCH`].
+#[inline]
+pub(crate) fn note_buffer_moved() {
+    TA_DATA_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl From<Vec<u8>> for AbData {

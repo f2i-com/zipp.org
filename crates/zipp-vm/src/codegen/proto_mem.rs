@@ -3082,6 +3082,13 @@ pub(crate) fn compile_proto_mem(
     if rc_slots != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C receiver cache slots={rc_slots}");
     }
+    // Typed-array receivers kept across calls (`emit_ta_cache_get`).
+    let ta_regs = ta_cache_regs(proto, meter.is_some());
+    let ta_read_stub = ops.new_dynamic_label();
+    let ta_write_stub = ops.new_dynamic_label();
+    if !ta_regs.is_empty() && crate::jitlog_enabled() {
+        eprintln!("[jit] fn{func_id} Tier-C typed-array cache regs={ta_regs:?}");
+    }
     if !class_read.is_empty() && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C class-read lanes={}", class_read.len());
     }
@@ -3262,7 +3269,13 @@ pub(crate) fn compile_proto_mem(
     // receiver cache's slots above them (rounded up to 16 bytes).
     let fc_save_off = frame_core;
     let rc_off = fc_save_off + 16 * fc_slots as i32;
-    let frame: i32 = rc_off + (8 * rc_slots as i32 + 15) / 16 * 16;
+    // The typed-array cache's records above the receiver cache, 48 bytes each
+    // (40 used) so the frame keeps its alignment.
+    let ta_off = rc_off + (8 * rc_slots as i32 + 15) / 16 * 16;
+    let frame: i32 = ta_off + TA_CACHE_STRIDE * ta_regs.len() as i32;
+    let ta_slot_of = |reg: u16| -> Option<i32> {
+        ta_regs.iter().position(|&r| r == reg).map(|k| ta_off + TA_CACHE_STRIDE * k as i32)
+    };
     let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
     let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
     let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
@@ -3376,6 +3389,13 @@ pub(crate) fn compile_proto_mem(
     for k in 0..fc_slots {
         let off = fc_save_off + 16 * k as i32;
         dynasm!(ops ; movdqu [rsp + off], Rx(FloatCache::FIRST_XMM + k as u8));
+    }
+    // Every typed-array record starts with epoch word 0, which matches no
+    // epoch (they start at 1): whatever the other words hold, a read
+    // through it either goes the general way (a count of 0) or fills.
+    for k in 0..ta_regs.len() {
+        let off = ta_off + TA_CACHE_STRIDE * k as i32;
+        dynasm!(ops ; mov QWORD [rsp + off + 32], 0);
     }
     if str_append_cursor.is_some() {
         dynasm!(ops
@@ -4146,6 +4166,11 @@ pub(crate) fn compile_proto_mem(
                 if crate::codegen::arr_set_mirror_enabled() {
                     emit_arr_mirror_set(&mut ops, obj, key, val, heap.inline_store_lane_ok, set_done);
                 }
+                // Then a typed array this register held before.
+                let after_call = ops.new_dynamic_label();
+                if let Some(slot) = ta_slot_of(obj) {
+                    emit_ta_cache_set(&mut ops, slot, obj, key, val, ta_write_stub, set_done, after_call);
+                }
                 // The region path's generic element write: dense store/grow and
                 // unpinned-TypedArray number stores; observable coercion or
                 // exotic receivers deopt. A grow REALLOCATES the dense Vec, so
@@ -4157,6 +4182,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov r9, [rbx + dreg(val)]
                     ; mov rax, QWORD heap.set_index as i64
                     ; call rax
+                    ; => after_call
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
@@ -5657,6 +5683,10 @@ pub(crate) fn compile_proto_mem(
                 // A present dense element first, through the array mirror.
                 let done = ops.new_dynamic_label();
                 emit_arr_mirror_get(&mut ops, dst, obj, key, done);
+                // Then a typed array this register held before.
+                if let Some(slot) = ta_slot_of(obj) {
+                    emit_ta_cache_get(&mut ops, slot, dst, obj, key, ta_read_stub, bail, done);
+                }
                 // Generic element read `a[i]` via the win64 helper (dense arrays,
                 // flat-ASCII strings, unpinned TypedArrays); `undefined` for
                 // out-of-range, deopt sentinel for receivers/keys needing
@@ -7878,6 +7908,10 @@ pub(crate) fn compile_proto_mem(
         ; pop rbx
         ; ret
     );
+    if !ta_regs.is_empty() {
+        emit_ta_read_stub(&mut ops, ta_read_stub);
+        emit_ta_write_stub(&mut ops, ta_write_stub);
+    }
 
     // The IC-site cursor must have consumed exactly the sites `Jit::compile`
     // reserved (one per GetProp/SetProp). A mismatch ⇒ a GetProp's `[r14+off]`
@@ -7998,6 +8032,372 @@ impl FloatCache {
         self.held[k] = Some(reg);
         Some(Self::FIRST_XMM + k as u8)
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_TA_CACHE=1`: every Tier C typed-array read calls
+    /// `jit_get_index`, as before the receiver cache (`emit_ta_cache_get`).
+    #[inline]
+    fn tierc_ta_cache_enabled() = "ZIPP_NO_TIERC_TA_CACHE"
+}
+
+/// Bytes of one typed-array cache record in a Tier C frame (40 used).
+const TA_CACHE_STRIDE: i32 = 48;
+
+/// The registers whose typed arrays a Tier C body keeps (`emit_ta_cache_get`):
+/// the receivers of its element reads, the most read first, at most four.
+fn ta_cache_regs(proto: &FuncProto, metered: bool) -> Vec<u16> {
+    if metered || !tierc_ta_cache_enabled() {
+        return Vec::new();
+    }
+    let mut counts: Vec<(u16, u32)> = Vec::new();
+    for instr in &proto.code {
+        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+            match counts.iter_mut().find(|(r, _)| *r == obj) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((obj, 1)),
+            }
+        }
+    }
+    crate::cold_sort::sort_by(&mut counts, |a, b| b.1.cmp(&a.1));
+    counts.into_iter().take(4).map(|(r, _)| r).collect()
+}
+
+/// `dst = obj[key]` through the typed array `obj`'s register held when this
+/// body last read through it, with no call: the record at `[rsp + slot]`
+/// (`jit_get_index_ta_fill`) is trusted while the register holds the same
+/// object (bits, then its slot version, as a freed slot's reuse bumps it) and
+/// no buffer has moved since (`TA_DATA_EPOCH`); then an Int key below the
+/// recorded count reads its element through `stub` (`emit_ta_read_stub`).
+/// A record that does not match is filled again by the helper, which does
+/// the read; a key that is no Int, an index past the count and a receiver
+/// the helper declined (count 0) fall through to the caller's `jit_get_index`
+/// call. Clobbers rax, rcx, rdx, r8-r11, xmm0, xmm1, as that call does.
+#[allow(clippy::too_many_arguments)]
+fn emit_ta_cache_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    slot: i32,
+    dst: u16,
+    obj: u16,
+    key: u16,
+    stub: dynasmrt::DynamicLabel,
+    bail: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) {
+    let fill = ops.new_dynamic_label();
+    let general = ops.new_dynamic_label();
+    let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
+    let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let helper = crate::vm::jit_get_index_ta_fill as *const () as i64;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; cmp rax, [rsp + slot]
+        ; jne => fill
+        // A receiver the helper declined (count 0) goes straight on, before
+        // the guards that license the base: the general path is right for
+        // any receiver, and most that reach here (strings, dense Arrays the
+        // mirror missed) are such.
+        ; mov r11, [rsp + slot + 16]
+        ; test r11, r11
+        ; jz => general
+        ; mov r10, QWORD epoch
+        ; mov r10, [r10]
+        ; cmp r10, [rsp + slot + 32]
+        ; jne => fill
+        ; mov r10, [rdi + versions]
+        ; mov ecx, eax
+        ; mov r10d, [r10 + rcx * 4]
+        ; cmp r10d, [rsp + slot + 28]
+        ; jne => fill
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; mov edx, edx                         // a negative index is huge
+        ; cmp rdx, r11
+        ; jae => general
+        ; mov r9, [rsp + slot + 8]
+        ; movzx ecx, BYTE [rsp + slot + 24]
+        ; call => stub
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => fill
+        ; mov rcx, rdi
+        ; mov rdx, rax
+        ; mov r8, [rbx + dreg(key)]
+        ; lea r9, [rsp + slot]
+        ; mov rax, QWORD helper
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => general
+    );
+}
+
+/// `obj[key] = val` through the typed array `obj`'s register held when this
+/// body last went through it, as [`emit_ta_cache_get`] reads: the same
+/// record and guards, a writable buffer (the record's byte 25), an Int key
+/// below the count, and a Number `stub` (`emit_ta_write_stub`) can store
+/// without ToNumber or a modular conversion. A record that does not match is
+/// filled again by `jit_set_index_ta_fill`, which makes the write, and the
+/// code continues at `after_call`, the caller's handling of its own
+/// `jit_set_index` call's result; everything the stub declines falls through
+/// to that call.
+#[allow(clippy::too_many_arguments)]
+fn emit_ta_cache_set(
+    ops: &mut dynasmrt::x64::Assembler,
+    slot: i32,
+    obj: u16,
+    key: u16,
+    val: u16,
+    stub: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+    after_call: dynasmrt::DynamicLabel,
+) {
+    let fill = ops.new_dynamic_label();
+    let general = ops.new_dynamic_label();
+    let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
+    let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let helper = crate::vm::jit_set_index_ta_fill as *const () as i64;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; cmp rax, [rsp + slot]
+        ; jne => fill
+        ; mov r11, [rsp + slot + 16]
+        ; test r11, r11
+        ; jz => general
+        ; mov r10, QWORD epoch
+        ; mov r10, [r10]
+        ; cmp r10, [rsp + slot + 32]
+        ; jne => fill
+        ; mov r10, [rdi + versions]
+        ; mov ecx, eax
+        ; mov r10d, [r10 + rcx * 4]
+        ; cmp r10d, [rsp + slot + 28]
+        ; jne => fill
+        ; cmp BYTE [rsp + slot + 25], 0
+        ; je => general
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; mov edx, edx
+        ; cmp rdx, r11
+        ; jae => general
+        ; mov r9, [rsp + slot + 8]
+        ; movzx ecx, BYTE [rsp + slot + 24]
+        ; mov r8, [rbx + dreg(val)]
+        ; call => stub
+        ; test eax, eax
+        ; jnz => done
+        ; jmp => general
+        ; => fill
+        ; lea r10, [rsp + slot]
+        ; mov [rsp + 32], r10                   // 5th arg: the record
+        ; mov rcx, rdi
+        ; mov rdx, rax
+        ; mov r8, [rbx + dreg(key)]
+        ; mov r9, [rbx + dreg(val)]
+        ; mov rax, QWORD helper
+        ; call rax
+        ; jmp => after_call
+        ; => general
+    );
+}
+
+/// The element write `emit_ta_cache_set` calls: `ecx` the kind, `r9` the
+/// element base, `rdx` the index, in bounds, `r8` the Value. Stores what
+/// `ta_element_set` stores for an Int into any kind (its low bits, clamped
+/// for Uint8Clamped, converted for the float kinds) and for a double into
+/// a float kind, and returns 1 in `eax`; anything else (a double into an
+/// integer kind, a non-Number) stores nothing and returns 0. Clobbers r10,
+/// xmm0.
+fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+    let (int, dbl, fail, ok) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    let (i8_, i16_, i32_, clamp, f32i, f64i, f32d, f64d) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; => stub
+        ; mov r10, r8
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int
+        ; sub r10d, (INT_TAG_HI + 1) as i32
+        ; cmp r10d, 3                           // Bool/Null/Undefined/Heap
+        ; jbe => fail
+        ; jmp => dbl
+        // An Int: its low bits for the integer kinds (ToInt8 and the rest of
+        // an int32 are its truncation), clamped for Uint8Clamped.
+        ; => int
+        ; cmp ecx, 1 ; je => i8_
+        ; cmp ecx, 0 ; je => i8_
+        ; cmp ecx, 5 ; je => i32_
+        ; cmp ecx, 6 ; je => i32_
+        ; cmp ecx, 3 ; je => i16_
+        ; cmp ecx, 4 ; je => i16_
+        ; cmp ecx, 2 ; je => clamp
+        ; cmp ecx, 7 ; je => f32i
+        ; jmp => f64i
+        ; => i8_
+        ; mov BYTE [r9 + rdx], r8b
+        ; jmp => ok
+        ; => i16_
+        ; mov WORD [r9 + rdx * 2], r8w
+        ; jmp => ok
+        ; => i32_
+        ; mov DWORD [r9 + rdx * 4], r8d
+        ; jmp => ok
+        ; => clamp
+        ; mov r10d, r8d
+        ; test r10d, r10d
+        ; jns >nonneg
+        ; xor r10d, r10d
+        ; nonneg:
+        ; cmp r10d, 255
+        ; jle >store
+        ; mov r10d, 255
+        ; store:
+        ; mov BYTE [r9 + rdx], r10b
+        ; jmp => ok
+        ; => f32i
+        ; cvtsi2ss xmm0, r8d
+        ; movss DWORD [r9 + rdx * 4], xmm0
+        ; jmp => ok
+        ; => f64i
+        ; cvtsi2sd xmm0, r8d
+        ; movsd QWORD [r9 + rdx * 8], xmm0
+        ; jmp => ok
+        // A double: only into a float kind.
+        ; => dbl
+        ; cmp ecx, 8 ; je => f64d
+        ; cmp ecx, 7 ; je => f32d
+        ; jmp => fail
+        ; => f32d
+        ; movq xmm0, r8
+        ; cvtsd2ss xmm0, xmm0
+        ; movss DWORD [r9 + rdx * 4], xmm0
+        ; jmp => ok
+        ; => f64d
+        ; mov QWORD [r9 + rdx * 8], r8
+        ; => ok
+        ; mov eax, 1
+        ; ret
+        ; => fail
+        ; xor eax, eax
+        ; ret
+    );
+}
+
+/// The element read `emit_ta_cache_get` calls: `ecx` the kind (a numeric
+/// `TA_KINDS` index, 0 to 8), `r9` the element base, `rdx` the index, in
+/// bounds; the element's Value in `rax`, boxed as `ta_interp_numeric_get_view`
+/// boxes it (an integer kind as an Int, a u32 past i32 and the float kinds
+/// through `Value::num`'s narrowing, NaN canonical). Clobbers rcx, r10,
+/// xmm0, xmm1.
+fn emit_ta_read_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+    let (u8_, i8_, i16_, u16_, i32_, u32_, f32_, f64_) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    let (int, num, as_dbl, canon) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; => stub
+        ; cmp ecx, 1 ; je => u8_
+        ; cmp ecx, 2 ; je => u8_
+        ; cmp ecx, 5 ; je => i32_
+        ; cmp ecx, 6 ; je => u32_
+        ; cmp ecx, 8 ; je => f64_
+        ; cmp ecx, 0 ; je => i8_
+        ; cmp ecx, 3 ; je => i16_
+        ; cmp ecx, 4 ; je => u16_
+        ; jmp => f32_
+        ; => u8_
+        ; movzx eax, BYTE [r9 + rdx]
+        ; jmp => int
+        ; => i8_
+        ; movsx eax, BYTE [r9 + rdx]
+        ; jmp => int
+        ; => i16_
+        ; movsx eax, WORD [r9 + rdx * 2]
+        ; jmp => int
+        ; => u16_
+        ; movzx eax, WORD [r9 + rdx * 2]
+        ; jmp => int
+        ; => i32_
+        ; mov eax, [r9 + rdx * 4]
+        ; jmp => int
+        ; => u32_
+        ; mov eax, [r9 + rdx * 4]
+        ; test eax, eax
+        ; jns => int
+        ; mov eax, eax
+        ; cvtsi2sd xmm0, rax                    // exact below 2^32, never integral i32
+        ; movq rax, xmm0
+        ; ret
+        ; => f32_
+        ; movss xmm0, [r9 + rdx * 4]
+        ; cvtss2sd xmm0, xmm0
+        ; jmp => num
+        ; => f64_
+        ; movsd xmm0, [r9 + rdx * 8]
+        ; => num
+        // `Value::num`: an exact i32 other than -0 is an Int, NaN canonical.
+        ; cvttsd2si ecx, xmm0
+        ; xorps xmm1, xmm1
+        ; cvtsi2sd xmm1, ecx
+        ; ucomisd xmm1, xmm0
+        ; jp => as_dbl
+        ; jne => as_dbl
+        ; test ecx, ecx
+        ; jnz >narrow
+        ; movq rax, xmm0
+        ; bt rax, 63
+        ; jc => as_dbl
+        ; narrow:
+        ; mov eax, ecx
+        ; => int
+        ; mov eax, eax
+        ; mov r10, QWORD INT_TAG as i64
+        ; or rax, r10
+        ; ret
+        ; => as_dbl
+        ; ucomisd xmm0, xmm0
+        ; jp => canon
+        ; movq rax, xmm0
+        ; ret
+        ; => canon
+        ; mov rax, QWORD QNAN_BITS as i64
+        ; ret
+    );
 }
 
 /// Tier C's receiver cache: for a VM register whose object a known-shape lane
