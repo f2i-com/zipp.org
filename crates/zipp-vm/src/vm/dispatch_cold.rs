@@ -4444,12 +4444,26 @@ impl<'p> Vm<'p> {
                 let mut opt_callees = crate::codegen::OptCallees::default();
                 if self.jit.opt_may_compile(func_id) {
                     for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
-                        if matches!(instr, Instr::GetProp { .. }) {
-                            if let Some(lane) = self.ic_class_getter_read(func_id, ip) {
-                                opt_callees.getters.insert(ip, lane);
+                        match *instr {
+                            Instr::GetProp { .. } => {
+                                if let Some(lane) = self.ic_class_getter_read(func_id, ip) {
+                                    opt_callees.getters.insert(ip, lane);
+                                } else if !prop_shape.contains_key(&ip) {
+                                    let ways = self.ic_own_data_ways(func_id, ip);
+                                    if ways.len() >= 2 {
+                                        opt_callees.poly.insert(ip, ways);
+                                    }
+                                }
                             }
+                            Instr::LoadClassValue { class_id, .. } => {
+                                if let Some(v) = self.class_value_fixed(class_id) {
+                                    opt_callees.class_values.insert(class_id, v.bits());
+                                }
+                            }
+                            _ => {}
                         }
                     }
+                    opt_callees.class_epoch = self.mi_class_epoch;
                     for fid in crate::codegen::opt_plan_callee_ids(&cross_plan, &class_read, &opt_callees.getters) {
                         if (fid as usize) < self.main_func_count {
                             let callee: &'p crate::bytecode::FuncProto = self.func(fid as usize);

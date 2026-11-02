@@ -1352,6 +1352,35 @@ pub(crate) extern "win64" fn jit_opt_fmod(a: u64, b: u64) -> u64 {
     (f64::from_bits(a) % f64::from_bits(b)).to_bits()
 }
 
+/// Win64 helper for Tier O's `GetProp` that its lanes did not answer:
+/// [`jit_get_prop_slow`], then the read counted for the body's replan
+/// (`Jit::note_opt_slow_read`): a function compiled before its caches knew
+/// the site's shapes is compiled again once they do.
+///
+/// # Safety
+/// As [`jit_get_prop_slow`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_opt_get_prop_slow(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+) -> u64 {
+    let r = jit_get_prop_slow(vm, caller_base_ptr, packed_fip, packed2);
+    // SAFETY: exclusive view after the read; the body holds no borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let (fid, ip) = ((packed_fip >> 32) as u32, packed_fip as u32);
+    if vm.jit.opt_slow_read_due(fid, ip) {
+        let known = vm.ic_cell_own_pair(fid, ip as usize).is_some()
+            || vm.ic_own_data_ways(fid, ip as usize).len() >= 2
+            || vm.ic_class_getter_read(fid, ip as usize).is_some();
+        if known {
+            vm.jit.opt_replan(fid, ip);
+        }
+    }
+    r
+}
+
 /// Win64 helpers for Tier O's `o[k]` (`op` 0) and `o[k] = v` (1) that its
 /// lanes did not answer: the interpreter's whole `GetIndex` / `SetIndex`
 /// (getters, setters, proxies, key coercion), with the call protocol.

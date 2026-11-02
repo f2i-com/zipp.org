@@ -490,6 +490,21 @@ impl<'p> Vm<'p> {
             .or(slot.latest)
     }
 
+    /// The value `LoadClassValue` of `class_id` has for all running code
+    /// while no class is evaluated again (`mi_class_epoch` unmoved): a class
+    /// evaluated exactly once, undecorated or with no replacement. Tier O
+    /// bakes it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn class_value_fixed(&self, class_id: u32) -> Option<Value> {
+        let slot = self.class_values.get(class_id as usize)?;
+        let v = slot.latest.filter(|_| !slot.repeated)?;
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Class(c) if c.dec.as_ref().is_some_and(|d| d.replacement.is_heap()) => None,
+            HeapObj::Class(_) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Whether compile-time class `class_id` has been evaluated more than once.
     /// Asked by the frame-free JIT paths only.
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]

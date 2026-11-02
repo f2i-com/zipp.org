@@ -42,6 +42,14 @@ pub(crate) struct OptCallees<'a> {
     /// The `GetProp` sites whose cache found a class getter
     /// (`Vm::ic_class_getter_read`), by position.
     pub(crate) getters: ClassReadPlan,
+    /// The class values `LoadClassValue` has while no class is evaluated
+    /// again (`Vm::class_value_fixed`), by class id, and the
+    /// `Vm::mi_class_epoch` that says so.
+    pub(crate) class_values: FxHashMap<u32, u64>,
+    pub(crate) class_epoch: u32,
+    /// The `GetProp` sites with no single-shape plan whose cache holds own
+    /// data properties of several shapes (`Vm::ic_own_data_ways`).
+    pub(crate) poly: FxHashMap<usize, Vec<(u32, u32)>>,
 }
 
 /// The call sites with one plain user-function callee: a `CallMethod`
@@ -168,6 +176,11 @@ pub(crate) struct OptFeedback {
 /// one learned) before it takes Tier C for good.
 const MAX_ROUNDS: u32 = 4;
 
+/// Slow property reads at one site before its function asks for a replan
+/// (`Jit::opt_slow_read_due`), and the replans a function may have.
+const SLOW_READS_REPLAN: u32 = 1024;
+const MAX_REPLANS: u8 = 2;
+
 /// Tier O's body for `proto`, or `None` when it admits none.
 pub(crate) fn compile(
     proto: &FuncProto,
@@ -186,6 +199,9 @@ pub(crate) fn compile(
         cross_plan.iter().filter_map(|(&ip, s)| s.new_lane.map(|l| (ip, l))).collect();
     let inputs = build::Inputs {
         new_lanes: &new_lanes,
+        class_values: &callees.class_values,
+        class_epoch: callees.class_epoch,
+        poly: &callees.poly,
         prop_shape,
         sites: &sites,
         callees: &callees.bodies,
@@ -245,18 +261,60 @@ impl super::Jit {
         fb.rounds += 1;
         let sites = std::mem::take(&mut fb.sites);
         fb.generic.extend(sites.iter().copied());
+        // A second body that deopted as often learned too slowly site by
+        // site (a comparator's every compare met strings): every site.
+        if fb.rounds >= 2 {
+            fb.generic.insert(build::ALL_SITES);
+        }
         let round = fb.rounds;
         if round >= MAX_ROUNDS {
             self.opt_blacklist.insert(func_id);
         }
-        let Some(f) = self.compiled.remove(&func_id) else {
-            return;
-        };
-        if crate::jitlog_enabled() {
+        if crate::jitlog_enabled() && self.compiled.contains_key(&func_id) {
             let mut s: Vec<u32> = sites.into_iter().collect();
             s.sort_unstable();
             eprintln!("[jit] Tier O fn{func_id} EVICTED ({DEOPT_LIMIT} deopts, round {round}, sites {s:?})");
         }
+        self.evict_opt(func_id);
+    }
+
+    /// Whether the `GetProp` at `(func_id, ip)` of a Tier O body has gone
+    /// through its slow helper `SLOW_READS_REPLAN` times since the last ask
+    /// (`vm::jit_opt_get_prop_slow`), with a replan still allowed.
+    pub(crate) fn opt_slow_read_due(&mut self, func_id: u32, ip: u32) -> bool {
+        if self.opt_replans.get(&func_id).copied().unwrap_or(0) >= MAX_REPLANS {
+            return false;
+        }
+        let n = self.opt_slow_reads.entry((func_id, ip)).or_insert(0);
+        *n += 1;
+        if *n < SLOW_READS_REPLAN {
+            return false;
+        }
+        *n = 0;
+        true
+    }
+
+    /// Compile `func_id` again from its caches as they are now: the
+    /// interpreter's cache knows the shapes of the read at `ip`, which the
+    /// body was compiled without (`MAX_REPLANS` per function).
+    pub(crate) fn opt_replan(&mut self, func_id: u32, ip: u32) {
+        *self.opt_replans.entry(func_id).or_insert(0) += 1;
+        if crate::jitlog_enabled() && self.compiled.contains_key(&func_id) {
+            eprintln!("[jit] Tier O fn{func_id} EVICTED (replan: read at ip {ip} now has shapes)");
+        }
+        self.evict_opt(func_id);
+    }
+
+    /// Park `func_id`'s Tier O body (never freed under itself) and re-arm
+    /// its counter so its next call compiles it again.
+    fn evict_opt(&mut self, func_id: u32) {
+        // A parked body still running may ask after another tier's took over.
+        if !self.opt_bodies.contains(&func_id) {
+            return;
+        }
+        let Some(f) = self.compiled.remove(&func_id) else {
+            return;
+        };
         self.retired_fns.push(f);
         let rearm = self.fn_threshold().saturating_sub(1);
         self.counts.insert(func_id, rearm);

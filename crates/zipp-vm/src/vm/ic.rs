@@ -845,6 +845,23 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The own data properties the `GetProp` at `(func_id, ip)`'s cache
+    /// holds, as (receiver shape, slot) pairs: its ways for receivers of a
+    /// shape (a dictionary receiver's way names no shape). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_own_data_ways(&self, func_id: u32, ip: usize) -> Vec<(u32, u32)> {
+        let Some(site) = self.ic_site(func_id, ip) else {
+            return Vec::new();
+        };
+        site.entries[..site.n as usize]
+            .iter()
+            .filter_map(|e| match *e {
+                IcEntry::OwnData { shape, slot } if shape != crate::shape::DICT => Some((shape, slot)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
     /// (way 0 an `IcEntry::ClassGetter` of a plain user function), with the
     /// guards of `ic_class_method_read`'s lane: Tier O inlines its body.

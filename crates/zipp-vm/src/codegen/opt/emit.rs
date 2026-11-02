@@ -14,7 +14,7 @@
 use dynasmrt::{dynasm, DynamicLabel, DynasmApi, DynasmLabelApi};
 
 use super::alloc::{Alloc, Loc};
-use super::build::{CallLane, Cmp, Func, Op, Rep, Term, V};
+use super::build::{CallLane, Cmp, Func, MethodIntr, Op, Rep, Term, V};
 use crate::bytecode::{BitwiseOp, MathFn};
 use crate::codegen::JitFn;
 use crate::value::Value;
@@ -196,7 +196,7 @@ impl Em<'_> {
                     );
                 }
             }
-            CallLane::Method { obj, arg_base, dst } => {
+            CallLane::Method { obj, arg_base, dst, .. } => {
                 if let Some(mp) = own {
                     emit_cross3_method_call(
                         &mut self.ops,
@@ -252,6 +252,120 @@ impl Em<'_> {
             CallLane::None => unreachable!(),
         }
         Some((cross_done, dst))
+    }
+
+    /// `obj.<method>(args)` through Tier C's dedicated helper for it (`m`),
+    /// over the window the frame state fills: an answer is stored to the
+    /// window's `dst` register and jumps to the returned label; a decline
+    /// (another receiver, a user method of the name) falls through, nothing
+    /// done. `None` when the helpers are not at hand.
+    fn method_intr(&mut self, m: MethodIntr, obj: u16, arg_base: u16, dst: u16) -> Option<DynamicLabel> {
+        let heap = self.f.heap?;
+        let done = self.ops.new_dynamic_label();
+        let decline = self.ops.new_dynamic_label();
+        let (o, a0, d) = (8 * obj as i32, 8 * arg_base as i32, 8 * dst as i32);
+        let deopt = crate::codegen::SELF_CALL_DEOPT as i64;
+        // The helper's answer, or the decline.
+        let answer = |em: &mut Self| {
+            dynasm!(em.ops
+                ; mov r10, QWORD deopt
+                ; cmp rax, r10
+                ; je => decline
+                ; mov [rbx + d], rax
+                ; jmp => done
+            );
+        };
+        match m {
+            MethodIntr::CharCodeAt | MethodIntr::IndexOf | MethodIntr::Push => {
+                let helper = match m {
+                    MethodIntr::IndexOf => heap.str_index_of,
+                    MethodIntr::Push => heap.array_push,
+                    _ => heap.char_code_at,
+                };
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + o]
+                    ; mov r8, [rbx + a0]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                );
+                answer(self);
+            }
+            MethodIntr::Substring(mode) => {
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + o]
+                    ; lea r8, [rbx + a0]
+                    ; mov r9d, mode
+                    ; mov rax, QWORD heap.str_substring as i64
+                    ; call rax
+                );
+                answer(self);
+            }
+            MethodIntr::Get | MethodIntr::Has => {
+                // `has` asks as a Set (op 2) when not a Map's.
+                let ops: &[i32] = if matches!(m, MethodIntr::Get) { &[0] } else { &[1, 2] };
+                for &op in ops {
+                    let next = self.ops.new_dynamic_label();
+                    dynasm!(self.ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + o]
+                        ; mov r8, [rbx + a0]
+                        ; mov r9d, op
+                        ; mov rax, QWORD heap.coll_lookup as i64
+                        ; call rax
+                        ; mov r10, QWORD deopt
+                        ; cmp rax, r10
+                        ; je => next
+                        ; mov [rbx + d], rax
+                        ; jmp => done
+                        ; => next
+                    );
+                }
+                dynasm!(self.ops ; jmp => decline);
+            }
+            MethodIntr::Mutate(op, argc) => {
+                // `delete` asks as a Set (op 4) when not a Map's.
+                let ops: &[i32] = if op == 3 { &[3, 4] } else { &[op] };
+                for &op in ops {
+                    let next = self.ops.new_dynamic_label();
+                    match argc {
+                        2 => dynasm!(self.ops ; mov r8, [rbx + a0] ; mov r9, [rbx + a0 + 8]),
+                        1 => dynasm!(self.ops ; mov r8, [rbx + a0] ; xor r9d, r9d),
+                        _ => dynasm!(self.ops ; xor r8d, r8d ; xor r9d, r9d),
+                    }
+                    dynasm!(self.ops
+                        ; mov QWORD [rsp + 32], op
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + o]
+                        ; mov rax, QWORD heap.coll_mutate as i64
+                        ; call rax
+                        ; mov r10, QWORD deopt
+                        ; cmp rax, r10
+                        ; je => next
+                        ; mov [rbx + d], rax
+                        ; jmp => done
+                        ; => next
+                    );
+                }
+                dynasm!(self.ops ; jmp => decline);
+            }
+            MethodIntr::Upper | MethodIntr::Pop => {
+                let helper = match m {
+                    MethodIntr::Upper => heap.str_upper_case as i64,
+                    _ => crate::vm::jit_array_pop as *const () as i64,
+                };
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + o]
+                    ; mov rax, QWORD helper
+                    ; call rax
+                );
+                answer(self);
+            }
+        }
+        dynasm!(self.ops ; => decline);
+        Some(done)
     }
 
     /// `call_out` with the frame state already in the window.
@@ -558,6 +672,43 @@ impl Em<'_> {
                     ; => done
                 );
                 self.done_xmm(d, st);
+            }
+            Op::TaggedToI32(a) => {
+                let stub = stub.expect("a guard has a frame state");
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let dbl = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; mov rax, Rq(ra)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FF9
+                    ; jne => dbl
+                    ; mov Rd(d), Rd(ra)
+                    ; jmp => done
+                    ; => dbl
+                    ; sub eax, 0x7FF9
+                    ; cmp eax, 4
+                    ; jbe => stub
+                    ; movq xmm0, Rq(ra)
+                    ; cvttsd2si rax, xmm0
+                    ; mov rcx, QWORD SIGN as i64
+                    ; cmp rax, rcx
+                    ; je => stub
+                    ; mov Rd(d), eax
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::UshrI(a, k) => {
+                let ra = self.gpr(a, RDX);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; mov eax, Rd(ra)
+                    ; shr eax, k as i8
+                    ; mov Rd(d), eax
+                );
+                self.done_gpr(d, st);
             }
             Op::F64ToI32(a) => {
                 let stub = stub.expect("a guard has a frame state");
@@ -921,14 +1072,29 @@ impl Em<'_> {
             } => {
                 let s = i.fs.expect("a call-out has a frame state");
                 self.write_state(s);
-                let crossed = self.cross_lanes(lane, ip);
+                // The lanes ahead of the helper, which leave their result in
+                // the window's `dst` register.
+                let mut made: Vec<(DynamicLabel, u16)> = Vec::new();
+                if let CallLane::Method {
+                    obj,
+                    arg_base,
+                    dst,
+                    intr: Some(m),
+                } = lane
+                {
+                    if let Some(l) = self.method_intr(m, obj, arg_base, dst) {
+                        made.push((l, dst));
+                    }
+                }
+                made.extend(self.cross_lanes(lane, ip));
                 self.call_written(helper, ip, packed, argc);
-                if let Some((cross_done, dst)) = crossed {
-                    // A lane made the call: its result is in the window.
+                if let Some(&(_, dst)) = made.first() {
                     let join = self.ops.new_dynamic_label();
+                    dynasm!(self.ops ; jmp => join);
+                    for &(l, _) in &made {
+                        dynasm!(self.ops ; => l);
+                    }
                     dynasm!(self.ops
-                        ; jmp => join
-                        ; => cross_done
                         ; mov rax, [rbx + 8 * dst as i32]
                         ; => join
                     );
@@ -938,6 +1104,23 @@ impl Em<'_> {
                     dynasm!(self.ops ; mov Rq(d), rax);
                     self.done_gpr(d, st);
                 }
+            }
+            Op::AllocOut { helper, ip, a, b } => {
+                // The collector may run: the state roots every heap value.
+                let s = i.fs.expect("an allocation has a frame state");
+                self.write_state(s);
+                dynasm!(self.ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD a as i64
+                    ; mov r9, QWORD b as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                );
+                self.leave_on_sentinel(ip);
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops ; mov Rq(d), rax);
+                self.done_gpr(d, st);
             }
             Op::NewLane {
                 lane,
@@ -1226,9 +1409,106 @@ impl Em<'_> {
                     let s = i.fs.expect("a read has a frame state");
                     let done = self.ops.new_dynamic_label();
                     dynasm!(self.ops ; jmp => done ; => miss);
-                    self.call_out(s, crate::vm::jit_get_prop_slow as *const () as u64, ip, packed, 0);
+                    self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
                     dynasm!(self.ops ; mov Rq(d), rax ; => done);
                 }
+                self.done_gpr(d, st);
+            }
+            Op::Length { obj, ip, packed } => {
+                let s = i.fs.expect("a read has a frame state");
+                let heap = f.heap.expect("Tier O bodies have their helpers");
+                let ro = self.gpr(obj, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+                let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+                let (slow, got, done) = (
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                    self.ops.new_dynamic_label(),
+                );
+                dynasm!(self.ops
+                    // A dense Array's live mirror entry holds its length.
+                    ; mov rax, Rq(ro)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => slow
+                    ; mov ecx, Rd(ro)
+                    ; cmp ecx, [rdi + arr_len]
+                    ; jae => slow
+                    ; mov r10, [rdi + arr_raw]
+                    ; shl rcx, 4
+                    ; add r10, rcx
+                    ; cmp QWORD [r10], 0
+                    ; je => slow
+                    ; mov rcx, [r10 + 8]
+                    ; cmp rcx, i32::MAX
+                    ; ja => slow
+                    ; mov rax, QWORD TAG_INT as i64
+                    ; or rax, rcx
+                    ; mov Rq(d), rax
+                    ; jmp => done
+                    ; => slow
+                );
+                // A string's (or another Array's) through the pure helper,
+                // then the whole read.
+                let ro = self.gpr(obj, RDX);
+                dynasm!(self.ops
+                    ; mov rdx, Rq(ro)
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.quick_len as i64
+                    ; call rax
+                    ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; jne => got
+                );
+                self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
+                dynasm!(self.ops
+                    ; => got
+                    ; mov Rq(d), rax
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::GetPropPoly { obj, ways, ip, packed } => {
+                let s = i.fs.expect("a read has a frame state");
+                let ro = self.gpr(obj, RDX);
+                let (d, st) = self.dst_gpr(v);
+                let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+                let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
+                let miss = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let arms: Vec<DynamicLabel> = ways.iter().map(|_| self.ops.new_dynamic_label()).collect();
+                dynasm!(self.ops
+                    ; mov rax, Rq(ro)
+                    ; shr rax, 48
+                    ; cmp eax, 0x7FFD
+                    ; jne => miss
+                    ; mov ecx, Rd(ro)
+                    ; mov r11, [rdi + hot_off]
+                    ; lea r11, [r11 + rcx*8]
+                    ; mov eax, DWORD [r11 + rcx*8]
+                );
+                for (&(shape, _), &arm) in ways.iter().zip(&arms) {
+                    dynasm!(self.ops
+                        ; cmp eax, shape as i32
+                        ; je => arm
+                    );
+                }
+                dynasm!(self.ops ; jmp => miss);
+                for (&(_, slot), &arm) in ways.iter().zip(&arms) {
+                    dynasm!(self.ops
+                        ; => arm
+                        ; mov r10, [r11 + rcx*8 + hot_vals]
+                        ; mov Rq(d), [r10 + 8 * slot as i32]
+                        ; jmp => done
+                    );
+                }
+                dynasm!(self.ops ; => miss);
+                self.call_out(s, crate::vm::jit_opt_get_prop_slow as *const () as u64, ip, packed, 0);
+                dynasm!(self.ops
+                    ; mov Rq(d), rax
+                    ; => done
+                );
                 self.done_gpr(d, st);
             }
             Op::AddT(a, b) => {
@@ -1486,6 +1766,84 @@ impl Em<'_> {
                 );
                 self.call_out(s, crate::vm::jit_opt_index_full as *const () as u64, ip, packed, 0);
                 dynasm!(self.ops ; => done);
+            }
+            Op::CmpT(c, x, y) => {
+                let stub = stub.expect("a guard has a frame state");
+                let ra = self.gpr(x, RDX);
+                let rb = self.gpr(y, R11);
+                let (d, st) = self.dst_gpr(v);
+                let l: Vec<DynamicLabel> = (0..6).map(|_| self.ops.new_dynamic_label()).collect();
+                let (a_int, a_ok, b_int, b_ok, strs, done) = (l[0], l[1], l[2], l[3], l[4], l[5]);
+                dynasm!(self.ops
+                    ; mov rax, Rq(ra)
+                    ; mov rcx, Rq(rb)
+                    // Two Numbers into xmm0 and xmm1; anything else may be
+                    // two strings.
+                    ; mov rdx, rax
+                    ; shr rdx, 48
+                    ; cmp edx, 0x7FF9
+                    ; je => a_int
+                    ; sub edx, 0x7FF9
+                    ; cmp edx, 4
+                    ; jbe => strs
+                    ; movq xmm0, rax
+                    ; jmp => a_ok
+                    ; => a_int
+                    ; cvtsi2sd xmm0, eax
+                    ; => a_ok
+                    ; mov rdx, rcx
+                    ; shr rdx, 48
+                    ; cmp edx, 0x7FF9
+                    ; je => b_int
+                    ; sub edx, 0x7FF9
+                    ; cmp edx, 4
+                    ; jbe => strs
+                    ; movq xmm1, rcx
+                    ; jmp => b_ok
+                    ; => b_int
+                    ; cvtsi2sd xmm1, ecx
+                    ; => b_ok
+                );
+                match c {
+                    Cmp::Lt => dynasm!(self.ops ; ucomisd xmm1, xmm0 ; seta al),
+                    Cmp::Le => dynasm!(self.ops ; ucomisd xmm1, xmm0 ; setae al),
+                    Cmp::Gt => dynasm!(self.ops ; ucomisd xmm0, xmm1 ; seta al),
+                    Cmp::Ge => dynasm!(self.ops ; ucomisd xmm0, xmm1 ; setae al),
+                    Cmp::Eq | Cmp::Ne => unreachable!("a relational compare"),
+                }
+                let op = match c {
+                    Cmp::Lt => 0,
+                    Cmp::Le => 1,
+                    Cmp::Gt => 2,
+                    _ => 3,
+                };
+                dynasm!(self.ops
+                    ; movzx eax, al
+                    ; mov Rd(d), eax
+                    ; jmp => done
+                    ; => strs
+                    ; mov r8, rcx
+                    ; mov rdx, rax
+                    ; mov rcx, rdi
+                    ; mov r9d, op
+                    ; mov rax, QWORD crate::vm::jit_str_relational as *const () as i64
+                    ; call rax
+                    ; cmp eax, 2
+                    ; je => stub
+                    ; mov Rd(d), eax
+                    ; => done
+                );
+                self.done_gpr(d, st);
+            }
+            Op::ClassConst { bits, epoch } => {
+                let stub = stub.expect("a guard has a frame state");
+                let (d, st) = self.dst_gpr(v);
+                dynasm!(self.ops
+                    ; cmp DWORD [rdi + crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32], epoch as i32
+                    ; jne => stub
+                    ; mov Rq(d), QWORD bits as i64
+                );
+                self.done_gpr(d, st);
             }
             Op::StrictEqH(eq, x, y) => {
                 let ra = self.gpr(x, RDX);

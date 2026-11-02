@@ -2988,6 +2988,8 @@ const _: () = assert!(IC_ROT_PERIOD == 256);
 const DIRECT_MISS_EVICTION_THRESHOLD: IcRotCursor = 32;
 /// Maximum adaptive park/recompile events per Tier-C body or OSR region.
 const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
+/// Cross-entry retries per Tier O function (`evict_for_cross_retry`).
+const OPT_CROSS_RETRIES: u8 = 2;
 /// Fallback calls at one compiled call site before its body is recompiled
 /// (`Jit::note_call_fallback`).
 const CALL_FALLBACK_RECOMPILE_THRESHOLD: u32 = 4096;
@@ -3485,9 +3487,15 @@ pub struct Jit {
     /// whose bodies were evicted too often (they take Tier C from then on).
     opt_feedback: FxHashMap<u32, opt::OptFeedback>,
     opt_blacklist: rustc_hash::FxHashSet<u32>,
-    /// The functions whose compiled body is Tier O's. Its call-outs find a
-    /// callee's cross entry at run time, so no retry evicts it for one.
+    /// The functions whose compiled body is Tier O's: Tier C's site
+    /// feedback leaves them be (`take_tier_c_body`).
     opt_bodies: rustc_hash::FxHashSet<u32>,
+    /// Cross-entry retries each Tier O function has had (`OPT_CROSS_RETRIES`).
+    opt_cross_retries: FxHashMap<u32, u8>,
+    /// Slow property reads per Tier O site, and replans per function
+    /// (`Jit::opt_slow_read_due`, `opt_replan`).
+    opt_slow_reads: FxHashMap<(u32, u32), u32>,
+    opt_replans: FxHashMap<u32, u8>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -4142,8 +4150,14 @@ impl Jit {
             }
             self.region_counts.remove(&key);
         }
+        // A Tier O body takes a callee's new cross entry into its emitted
+        // call lanes too, but only twice: its other recompiles are its own.
         if self.opt_bodies.contains(&fid) && self.compiled.contains_key(&fid) {
-            return;
+            let n = self.opt_cross_retries.entry(fid).or_insert(0);
+            if *n >= OPT_CROSS_RETRIES {
+                return;
+            }
+            *n += 1;
         }
         if let Some(f) = self.compiled.remove(&fid) {
             if crate::jitlog_enabled() {

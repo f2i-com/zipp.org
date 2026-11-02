@@ -125,6 +125,11 @@ pub(crate) struct Inputs<'a> {
     pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     /// The `New` sites with Tier C's allocation lane (`CrossSite::new_lane`).
     pub(crate) new_lanes: &'a FxHashMap<usize, &'static super::super::NewLanePlan>,
+    /// `OptCallees::class_values` and `class_epoch`.
+    pub(crate) class_values: &'a FxHashMap<u32, u64>,
+    pub(crate) class_epoch: u32,
+    /// `OptCallees::poly`.
+    pub(crate) poly: &'a FxHashMap<usize, Vec<(u32, u32)>>,
 }
 
 /// The registers of a call Tier C's emitted cross-call lanes make ahead of
@@ -139,8 +144,62 @@ pub(crate) enum CallLane {
         arg_base: u16,
         dst: u16,
     },
-    /// `CallMethod`: the own-method lane, then the class-method arms.
-    Method { obj: u16, arg_base: u16, dst: u16 },
+    /// `CallMethod`: a dedicated helper for its name (`intr`), then the
+    /// own-method lane and the class-method arms.
+    Method {
+        obj: u16,
+        arg_base: u16,
+        dst: u16,
+        intr: Option<MethodIntr>,
+    },
+}
+
+/// A method a `CallMethod` makes through one of Tier C's dedicated pure
+/// helpers by its name and arity, before the general route: the helper
+/// declines, before any effect, a receiver it is not for (a user `push`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MethodIntr {
+    CharCodeAt,
+    IndexOf,
+    Push,
+    /// `substring` / `slice`, the helper's mode bits.
+    Substring(i32),
+    Get,
+    Has,
+    /// Map/Set `set`, `clear`, `add`, `delete`: the helper's op, and argc.
+    Mutate(i32, u16),
+    Upper,
+    Pop,
+}
+
+/// `MethodIntr` for a method `key` called with `argc` arguments, as Tier C
+/// picks its lanes (`proto_mem`'s `CallMethod`).
+fn method_intr(key: &str, argc: u16) -> Option<MethodIntr> {
+    let one_arg_substring = super::super::substring1_intrinsic_enabled();
+    Some(match (key, argc) {
+        ("charCodeAt", 1) => MethodIntr::CharCodeAt,
+        ("indexOf", 1) => MethodIntr::IndexOf,
+        ("push", 1) => MethodIntr::Push,
+        ("substring" | "slice", 2) | ("substring" | "slice", 1) if argc == 2 || one_arg_substring => {
+            MethodIntr::Substring((key == "slice") as i32 | (((argc == 1) as i32) << 1))
+        }
+        ("get", 1) => MethodIntr::Get,
+        ("has", 1) => MethodIntr::Has,
+        ("set", 2) | ("clear", 0) | ("add", 1) | ("delete", 1)
+            if super::super::proto_mem::tierc_coll_mutate_enabled() =>
+        {
+            let op = match key {
+                "set" => 0,
+                "clear" => 1,
+                "add" => 2,
+                _ => 3,
+            };
+            MethodIntr::Mutate(op, argc)
+        }
+        ("toUpperCase", 0) if super::super::proto_mem::tierc_string_upper_enabled() => MethodIntr::Upper,
+        ("pop", 0) => MethodIntr::Pop,
+        _ => return None,
+    })
 }
 
 /// A helper's address, for a call-out.
@@ -163,6 +222,11 @@ pub(crate) enum Op {
     TaggedToF64(V),
     /// ToInt32 of a double; NaN, the infinities and |x| >= 2^63 fail.
     F64ToI32(V),
+    /// ToInt32 of a boxed Number (an Int as it is), as `F64ToI32`;
+    /// anything but a Number fails.
+    TaggedToI32(V),
+    /// `a >>> k` for a constant `k` in 1..=31, which always fits an i32.
+    UshrI(V, u8),
     /// Any representation boxed (a double by `Value::num`'s rule).
     Box(V),
     /// A primitive's truthiness; a heap value fails.
@@ -194,14 +258,37 @@ pub(crate) enum Op {
         slot: u32,
         slow: Option<(u32, u64)>,
     },
+    /// An array or object literal at `ip` through its allocating helper
+    /// (`jit_new_array`, `jit_finalize_object`: `vm`, window, `a`, `b`),
+    /// which reads its values from the window the frame state fills.
+    AllocOut { helper: u64, ip: u32, a: u64, b: u64 },
+    /// `obj.length` with no shape plan: a dense Array's through its mirror,
+    /// else a string's or an Array's through `quick_len`, else the `GetProp`
+    /// at `ip` as a call-out.
+    Length { obj: V, ip: u32, packed: u64 },
+    /// An own data property read for receivers of several shapes (the
+    /// cache's ways, `ways`), else the `GetProp` at `ip` as a call-out
+    /// (`jit_get_prop_slow`, `packed`).
+    GetPropPoly {
+        obj: V,
+        ways: Vec<(u32, u32)>,
+        ip: u32,
+        packed: u64,
+    },
     /// `a + b`, the whole operator (`jit_concat`: strings, coercions), with
     /// the frame state written first; a boxed result.
     AddT(V, V),
     /// `===` (true) or `!==` of two boxed values, two heap values compared
     /// by `jit_strict_eq`.
     StrictEqH(bool, V, V),
+    /// A relational compare of two boxed values: Numbers inline, two
+    /// strings through `jit_str_relational`; anything else fails.
+    CmpT(Cmp, V, V),
     /// `<upvalue idx> = v`; a const or TDZ cell fails.
     UpvalSet(u16, V),
+    /// A class value fixed while `Vm::mi_class_epoch` is `epoch`; a class
+    /// evaluated since fails.
+    ClassConst { bits: u64, epoch: u32 },
     /// `obj[key]` (`key` an i32, a double or boxed): a present element of a
     /// dense Array through its mirror, else `jit_get_index`, else the whole
     /// `GetIndex` at `ip` as a call-out (`jit_opt_index_full`, `packed`).
@@ -313,14 +400,18 @@ impl Op {
                 | Op::GetIndex { .. }
                 | Op::SetIndex { .. }
                 | Op::NewLane { .. }
+                | Op::CmpT(..)
+                | Op::GetPropPoly { .. }
+                | Op::Length { .. }
+                | Op::AllocOut { .. }
         )
     }
 
     /// Whether the op writes its frame state after a native call (a pure
-    /// helper first, then the call-out): the state's values must live
-    /// through that call.
+    /// helper first, then the call-out or a deopt): the state's values must
+    /// live through that call.
     pub(crate) fn state_after_call(&self) -> bool {
-        matches!(self, Op::GetIndex { .. } | Op::SetIndex { .. })
+        matches!(self, Op::GetIndex { .. } | Op::SetIndex { .. } | Op::CmpT(..) | Op::Length { .. })
     }
 }
 
@@ -338,6 +429,8 @@ impl Op {
             | Op::LoadGlobal(_)
             | Op::CallOut { .. }
             | Op::NewLane { .. }
+            | Op::ClassConst { .. }
+            | Op::AllocOut { .. }
             | Op::UpvalGet(_)
             | Op::MathGuard { recv: None, .. } => vec![],
             Op::MathGuard { recv: Some(a), .. }
@@ -355,6 +448,8 @@ impl Op {
             Op::I32ToF64(a)
             | Op::TaggedToF64(a)
             | Op::F64ToI32(a)
+            | Op::TaggedToI32(a)
+            | Op::UshrI(a, _)
             | Op::Box(a)
             | Op::TaggedTruthy(a)
             | Op::F64Truthy(a)
@@ -362,6 +457,8 @@ impl Op {
             | Op::NegF(a)
             | Op::NotB(a)
             | Op::GetPropShape { obj: a, .. }
+            | Op::GetPropPoly { obj: a, .. }
+            | Op::Length { obj: a, .. }
             | Op::GuardFid { v: a, .. }
             | Op::GuardClass { obj: a, .. } => vec![a],
             Op::AddF(a, b)
@@ -371,6 +468,7 @@ impl Op {
             | Op::Bit(_, a, b)
             | Op::UshrF(a, b)
             | Op::CmpF(_, a, b)
+            | Op::CmpT(_, a, b)
             | Op::CmpB(_, a, b)
             | Op::StrictEqT(_, a, b) => vec![a, b],
         }
@@ -423,6 +521,13 @@ pub(crate) struct FrameState {
 
 /// The deopt site of the parameters unboxed at entry.
 pub(crate) const ENTRY_SITE: u32 = u32::MAX;
+/// In `Inputs::generic`: every site is generic (`Jit::note_opt_deopt`).
+pub(crate) const ALL_SITES: u32 = u32::MAX - 1;
+
+/// Whether `generic` (`Inputs::generic`) makes the site `ip` generic.
+fn is_generic(generic: Option<&rustc_hash::FxHashSet<u32>>, ip: u32) -> bool {
+    generic.is_some_and(|g| g.contains(&ip) || g.contains(&ALL_SITES))
+}
 
 pub(crate) struct Func {
     pub(crate) func_id: u32,
@@ -549,6 +654,10 @@ fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> 
         Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
         Instr::UpvalSet { src, .. } if top => (vec![src], None),
         Instr::GetIndex { dst, obj, key } if top => (vec![obj, key], Some(dst)),
+        Instr::NewArray { dst, arg_base, argc } if top => ((arg_base..arg_base + argc).collect(), Some(dst)),
+        Instr::FinalizeObject {
+            dst, val_base, count, ..
+        } if top => ((val_base..val_base + count).collect(), Some(dst)),
         Instr::SetIndex { obj, key, val } if top => (vec![obj, key, val], None),
         Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } if top => (vec![src], None),
         Instr::SetProp {
@@ -678,10 +787,12 @@ fn flow(i: &Instr, ip: usize) -> (Option<usize>, Option<usize>) {
 
 /// The representation `i` makes its destination, given the registers'
 /// (`reps`); a call's is `call` (an inlined callee's result, else boxed).
-/// `tagged_add`: the op is an `Add` built as the full `+` (`addt`).
-fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, tagged_add: bool) -> Option<Rep> {
+/// `over`: the representation the op's site was given (`addt`, `ushr_i`).
+fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, over: Option<Rep>) -> Option<Rep> {
+    if let Some(r) = over {
+        return Some(r);
+    }
     Some(match *i {
-        Instr::Add { .. } if tagged_add => Rep::Tagged,
         Instr::LoadInt { .. } => Rep::I32,
         Instr::LoadConst { idx, .. } => {
             let c = p.constants[idx as usize];
@@ -693,9 +804,12 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, tagged_add: boo
                 Rep::Tagged
             }
         }
-        Instr::UpvalGet { .. } | Instr::New { .. } | Instr::LoadClassValue { .. } | Instr::GetIndex { .. } => {
-            Rep::Tagged
-        }
+        Instr::UpvalGet { .. }
+        | Instr::New { .. }
+        | Instr::LoadClassValue { .. }
+        | Instr::GetIndex { .. }
+        | Instr::NewArray { .. }
+        | Instr::FinalizeObject { .. } => Rep::Tagged,
         Instr::Mod { .. } => Rep::F64,
         Instr::MathOp { op, .. } => {
             if matches!(op, MathFn::Imul) {
@@ -758,16 +872,18 @@ fn inlinable(c: &FuncProto, plan: &PropShapePlan, method: bool, math: Option<&Ma
     }
     let mut reads_this = false;
     for (ip, i) in c.code.iter().enumerate() {
-        if matches!(i, Instr::Return { .. } | Instr::ReturnUndefined) {
-            if let Instr::Return { src: 0 } = i {
-                reads_this = true;
-            }
-            break;
-        }
         let Some((uses, def)) = uses_def(i, ip, &admit) else {
             return false;
         };
-        if flow(i, ip).1.is_some() || uses.iter().chain(def.iter()).any(|&r| r >= c.reg_count) {
+        // Only forward branches a call's arguments may decide (`inline_sim`).
+        let fwd = match *i {
+            Instr::Jump { target } | Instr::JumpIfFalse { target, .. } | Instr::JumpIfTrue { target, .. } => {
+                target as usize > ip
+            }
+            Instr::JumpIfNotLt { .. } | Instr::JumpIfNotLe { .. } => false,
+            _ => true,
+        };
+        if !fwd || uses.iter().chain(def.iter()).any(|&r| r >= c.reg_count) {
             return false;
         }
         reads_this |= uses.contains(&0);
@@ -778,20 +894,98 @@ fn inlinable(c: &FuncProto, plan: &PropShapePlan, method: bool, math: Option<&Ma
     !reads_this || (!c.lexical_this && (method || c.is_strict))
 }
 
-/// The representation an inlined straight-line callee returns, its
-/// registers entering with `reps`.
-fn inline_result_rep(c: &FuncProto, mut reps: Vec<Rep>) -> Rep {
-    for i in &c.code {
+/// What `inline_sim` knows of a callee register beyond its representation.
+#[derive(Clone, Copy, PartialEq)]
+enum Known {
+    Unknown,
+    Num,
+    Undef,
+    Null,
+    Bool(bool),
+}
+
+/// The way an inlined callee `c` goes, its registers entering with `reps`
+/// and `argc` arguments passed: every branch on it decided by what the
+/// arguments are (a default parameter's `x === undefined` of a Number, or
+/// of an argument not passed), the ops built in order, the last a return,
+/// and the representation it returns. `None`: a branch the arguments do not
+/// decide, and the call is not inlined. The representation dataflow and the
+/// translation both ask, so they agree.
+fn inline_sim(c: &FuncProto, mut reps: Vec<Rep>, argc: usize) -> Option<(Rep, Vec<usize>)> {
+    let n = c.code.len();
+    let mut known = vec![Known::Unknown; reps.len()];
+    for r in 1..=(c.param_count as usize).min(reps.len().saturating_sub(1)) {
+        known[r] = if r > argc {
+            Known::Undef
+        } else {
+            match reps[r] {
+                Rep::I32 | Rep::F64 => Known::Num,
+                _ => Known::Unknown,
+            }
+        };
+    }
+    let mut path = Vec::new();
+    let mut ip = 0;
+    while ip < n {
+        let i = &c.code[ip];
         match *i {
-            Instr::Return { src } => return reps[src as usize],
-            Instr::ReturnUndefined => return Rep::Tagged,
+            Instr::Return { src } => {
+                path.push(ip);
+                return Some((reps[src as usize], path));
+            }
+            Instr::ReturnUndefined => {
+                path.push(ip);
+                return Some((Rep::Tagged, path));
+            }
+            Instr::Jump { target } => {
+                if target as usize <= ip {
+                    return None;
+                }
+                ip = target as usize;
+                continue;
+            }
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                let Known::Bool(v) = known[cond as usize] else {
+                    return None;
+                };
+                if target as usize <= ip {
+                    return None;
+                }
+                let on = matches!(*i, Instr::JumpIfTrue { .. });
+                ip = if v == on { target as usize } else { ip + 1 };
+                continue;
+            }
+            Instr::JumpIfNotLt { .. } | Instr::JumpIfNotLe { .. } => return None,
             _ => {}
         }
-        if let (Some(r), Some(d)) = (result_rep(i, &reps, c, Rep::Tagged, false), dst_of(i)) {
+        path.push(ip);
+        let r = result_rep(i, &reps, c, Rep::Tagged, None);
+        let k = match *i {
+            Instr::LoadUndefined { .. } => Known::Undef,
+            Instr::LoadNull { .. } => Known::Null,
+            Instr::LoadBool { val, .. } => Known::Bool(val),
+            Instr::Move { src, .. } => known[src as usize],
+            Instr::Eq { a, b, .. } | Instr::Ne { a, b, .. } => {
+                let eq = matches!(*i, Instr::Eq { .. });
+                let nullish = |k: Known| matches!(k, Known::Undef | Known::Null);
+                match (known[a as usize], known[b as usize]) {
+                    (Known::Num, k) | (k, Known::Num) if nullish(k) => Known::Bool(!eq),
+                    (x, y) if nullish(x) && nullish(y) => Known::Bool((x == y) == eq),
+                    _ => Known::Unknown,
+                }
+            }
+            _ => match r {
+                Some(Rep::I32 | Rep::F64) => Known::Num,
+                _ => Known::Unknown,
+            },
+        };
+        if let (Some(r), Some(d)) = (r, dst_of(i)) {
             reps[d as usize] = r;
+            known[d as usize] = k;
         }
+        ip += 1;
     }
-    Rep::Tagged
+    None
 }
 
 fn dst_of(i: &Instr) -> Option<u16> {
@@ -826,7 +1020,9 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::LoadClassValue { dst, .. }
         | Instr::Mod { dst, .. }
         | Instr::MathOp { dst, .. }
-        | Instr::GetIndex { dst, .. } => Some(dst),
+        | Instr::GetIndex { dst, .. }
+        | Instr::NewArray { dst, .. }
+        | Instr::FinalizeObject { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -876,6 +1072,9 @@ enum Flow {
 /// The function a translation reads its constants and plans from.
 struct Fn<'a> {
     p: &'a FuncProto,
+    /// Its function id (the top level's; an inlined callee makes no op that
+    /// names it).
+    func_id: u64,
     plan: &'a PropShapePlan,
     /// The top level's string constants (`Inputs::const_strs`).
     strs: Option<&'a FxHashMap<u32, u64>>,
@@ -885,15 +1084,20 @@ struct Fn<'a> {
     /// The top level's deopted sites (`Inputs::generic`) and full `+`s.
     generic: Option<&'a rustc_hash::FxHashSet<u32>>,
     addt: Option<&'a rustc_hash::FxHashSet<usize>>,
+    ushr_i: Option<&'a rustc_hash::FxHashSet<usize>>,
     new_lanes: Option<&'a FxHashMap<usize, &'static super::super::NewLanePlan>>,
     /// `ta_regs` of the top level.
     ta_regs: &'a [u16],
+    /// `Inputs::class_values` and `class_epoch` (none in a callee).
+    class_values: Option<(&'a FxHashMap<u32, u64>, u32)>,
+    /// `Inputs::poly` (none in a callee).
+    poly: Option<&'a FxHashMap<usize, Vec<(u32, u32)>>>,
 }
 
 impl Fn<'_> {
     /// Whether the top level's op at `ip` deopted in an earlier body.
     fn generic(&self, ip: usize) -> bool {
-        self.generic.is_some_and(|g| g.contains(&(ip as u32)))
+        is_generic(self.generic, ip as u32)
     }
 }
 
@@ -961,7 +1165,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 _ => false,
             };
             // A site whose inlined body deopted takes the call.
-            let deopted = inputs.generic.is_some_and(|g| g.contains(&(ip as u32)));
+            let deopted = is_generic(inputs.generic, ip as u32);
             (ok && !deopted && inlinable(c, plan, method, math)).then_some((ip, (*c, plan, site)))
         })
         .collect();
@@ -986,7 +1190,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     // The `Add`s built as the full `+` (`AddT`, a boxed result): a site that
     // deopted before (`generic`), or one whose operand the same block made a
     // string, a string constant or another such `Add`.
-    let generic = |ip: usize| inputs.generic.is_some_and(|g| g.contains(&(ip as u32)));
+    let generic = |ip: usize| is_generic(inputs.generic, ip as u32);
     let mut addt: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     for (ip, i) in code.iter().enumerate() {
         let Instr::Add { a, b: c, .. } = *i else {
@@ -1010,6 +1214,36 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         };
         if generic(ip) || stringy(a) || stringy(c) {
             addt.insert(ip);
+        }
+    }
+    // The `>>>`s by a constant 1..=31 the same block loads: an i32.
+    let mut ushr_i: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    for (ip, i) in code.iter().enumerate() {
+        let Instr::Bitwise {
+            op: BitwiseOp::Ushr,
+            b: c,
+            ..
+        } = *i
+        else {
+            continue;
+        };
+        for back in (0..ip).rev() {
+            if ud[back].1 == Some(c) {
+                let k = match code[back] {
+                    Instr::LoadInt { val, .. } => Some(val),
+                    Instr::LoadConst { idx, .. } if p.constants[idx as usize].is_int() => {
+                        Some(p.constants[idx as usize].as_int())
+                    }
+                    _ => None,
+                };
+                if k.is_some_and(|k| k & 31 != 0) {
+                    ushr_i.insert(ip);
+                }
+                break;
+            }
+            if leader[back] {
+                break;
+            }
         }
     }
     let block_of_ip = |ip: usize| starts.partition_point(|&s| s <= ip) - 1;
@@ -1177,7 +1411,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         }
         spec[r] = ok
             && numeric_read
-            && !inputs.generic.is_some_and(|g| g.contains(&ENTRY_SITE))
+            && !is_generic(inputs.generic, ENTRY_SITE)
             && live_before[0].as_ref().is_some_and(|l| l.get(r));
     }
 
@@ -1198,7 +1432,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         for k in 0..(argc as usize).min(c.param_count as usize) {
             creps[1 + k] = reps[arg_base as usize + k];
         }
-        inline_result_rep(c, creps)
+        inline_sim(c, creps, argc as usize).map_or(Rep::Tagged, |(r, _)| r)
     };
     // `None`: not yet reached.
     let mut in_rep: Vec<Option<Vec<Rep>>> = vec![None; nb];
@@ -1212,7 +1446,14 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             };
             for ip in starts[b]..end_of(b) {
                 let call = call_rep(ip, &reps);
-                if let (Some(r), (_, Some(d))) = (result_rep(&code[ip], &reps, p, call, addt.contains(&ip)), &ud[ip]) {
+                let over = if addt.contains(&ip) {
+                    Some(Rep::Tagged)
+                } else if ushr_i.contains(&ip) {
+                    Some(Rep::I32)
+                } else {
+                    None
+                };
+                if let (Some(r), (_, Some(d))) = (result_rep(&code[ip], &reps, p, call, over), &ud[ip]) {
                     reps[*d as usize] = r;
                 }
             }
@@ -1252,14 +1493,18 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     let top_ta = ta_regs(code);
     let top = Fn {
         p,
+        func_id: func_id as u64,
         plan: inputs.prop_shape,
         strs: Some(inputs.const_strs),
         math,
         math_reads: top_reads.clone(),
         generic: inputs.generic,
         addt: Some(&addt),
+        ushr_i: Some(&ushr_i),
         new_lanes: Some(inputs.new_lanes),
         ta_regs: &top_ta,
+        class_values: Some((inputs.class_values, inputs.class_epoch)),
+        poly: Some(inputs.poly),
     };
     let mut blocks: Vec<Block> = Vec::with_capacity(order.len());
     let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len()];
@@ -1413,6 +1658,17 @@ fn translate(
     inline: Option<(&FuncProto, &PropShapePlan, Site)>,
 ) -> Option<Flow> {
     let undefined_bits = Value::UNDEFINED.bits();
+    // A callee its arguments do not take straight through is called instead
+    // (`inline_sim`), as the representation dataflow decided.
+    let inline = inline.filter(|&(c, _, _)| {
+        let args: Vec<V> = match *ins {
+            Instr::Call { arg_base, argc, .. }
+            | Instr::CallWithThis { arg_base, argc, .. }
+            | Instr::CallMethod { arg_base, argc, .. } => (0..argc).map(|k| defs[(arg_base + k) as usize]).collect(),
+            _ => Vec::new(),
+        };
+        b.inline_path(c, &args).is_some()
+    });
     match *ins {
         Instr::LoadInt { dst, val } => defs[dst as usize] = b.konst(Op::ConstI32(val), Rep::I32),
         Instr::LoadConst { dst, idx } => {
@@ -1498,6 +1754,11 @@ fn translate(
                 },
             };
             defs[dst as usize] = b.push_out(op, Rep::Tagged, Some(s));
+        }
+        Instr::LoadClassValue { dst, class_id } if !f.generic(ip) && f.class_values.is_some_and(|(m, _)| m.contains_key(&class_id)) => {
+            let (m, epoch) = f.class_values.expect("checked");
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::ClassConst { bits: m[&class_id], epoch }, Rep::Tagged, Some(s));
         }
         Instr::LoadClassValue { dst, class_id } => {
             let s = fs.id(b, defs);
@@ -1587,6 +1848,39 @@ fn translate(
             let s = fs.id(b, defs);
             b.push_out(Op::UpvalSet(idx, x), Rep::Void, Some(s));
         }
+        Instr::NewArray { dst, arg_base, argc } => {
+            let s = fs.id(b, defs);
+            let window = u64::from(f.p.reg_count.max(1));
+            defs[dst as usize] = b.push_out(
+                Op::AllocOut {
+                    helper: helper(crate::vm::jit_new_array as *const ()),
+                    ip: ip as u32,
+                    a: window << 32 | (arg_base as u64) << 16 | argc as u64,
+                    b: 0,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::FinalizeObject {
+            dst,
+            plan,
+            val_base,
+            count,
+        } => {
+            let s = fs.id(b, defs);
+            let window = u64::from(f.p.reg_count.max(1));
+            defs[dst as usize] = b.push_out(
+                Op::AllocOut {
+                    helper: helper(crate::vm::jit_finalize_object as *const ()),
+                    ip: ip as u32,
+                    a: f.func_id << 32 | plan as u64,
+                    b: window << 32 | (val_base as u64) << 16 | count as u64,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
         Instr::GetIndex { dst, obj, key } => {
             let o = b.tagged(defs[obj as usize]);
             let k = b.index_key(defs[key as usize]);
@@ -1648,16 +1942,21 @@ fn translate(
                 Instr::Gt { .. } => Cmp::Gt,
                 _ => Cmp::Ge,
             };
-            let x = b.f64(defs[a as usize], fs, defs);
-            let y = b.f64(defs[c as usize], fs, defs);
-            defs[dst as usize] = b.emit(Op::CmpF(cmp, x, y), Rep::Bool);
+            defs[dst as usize] = b.compare(f, ip, cmp, defs[a as usize], defs[c as usize], fs, defs);
         }
         Instr::Eq { dst, a, b: c } | Instr::Ne { dst, a, b: c } => {
             let eq = matches!(*ins, Instr::Eq { .. });
             let (va, vc) = (defs[a as usize], defs[c as usize]);
             let (ra, rc) = (b.rep(va), b.rep(vc));
             let num = |r: Rep| matches!(r, Rep::I32 | Rep::F64);
-            defs[dst as usize] = if num(ra) && num(rc) {
+            let nullish = |b: &Builder, v: V| {
+                matches!(b.insts[v as usize].op,
+                    Op::ConstTagged(bits) if bits == Value::UNDEFINED.bits() || bits == Value::NULL.bits())
+            };
+            defs[dst as usize] = if (num(ra) && nullish(b, vc)) || (num(rc) && nullish(b, va)) {
+                // A Number is never `undefined` or `null` (`inline_sim`).
+                b.konst(Op::ConstBool(!eq), Rep::Bool)
+            } else if num(ra) && num(rc) {
                 let x = b.f64(va, fs, defs);
                 let y = b.f64(vc, fs, defs);
                 b.emit(Op::CmpF(if eq { Cmp::Eq } else { Cmp::Ne }, x, y), Rep::Bool)
@@ -1681,7 +1980,13 @@ fn translate(
         Instr::Bitwise { dst, a, b: c, op } => {
             let x = b.i32(defs[a as usize], fs, defs);
             let y = b.i32(defs[c as usize], fs, defs);
-            defs[dst as usize] = if matches!(op, BitwiseOp::Ushr) {
+            let small_shift = match b.insts[y as usize].op {
+                Op::ConstI32(k) if k & 31 != 0 => Some((k & 31) as u8),
+                _ => None,
+            };
+            defs[dst as usize] = if let (true, Some(k)) = (f.ushr_i.is_some_and(|s| s.contains(&ip)), small_shift) {
+                b.emit(Op::UshrI(x, k), Rep::I32)
+            } else if matches!(op, BitwiseOp::Ushr) {
                 b.emit(Op::UshrF(x, y), Rep::F64)
             } else {
                 b.emit(Op::Bit(op, x, y), Rep::I32)
@@ -1714,7 +2019,7 @@ fn translate(
                     Rep::Void,
                     Some(s),
                 );
-                b.inline(c, plan, o, &[], s)?
+                b.inline_call(c, plan, o, &[], s)?
             } else if let Some(&op) = f.math_reads.get(&ip) {
                 // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
                 // `Math` holding its intrinsic method, a constant then.
@@ -1734,13 +2039,36 @@ fn translate(
                 let o = b.tagged(defs[obj as usize]);
                 let slow = f.generic(ip).then_some((ip as u32, ((name as u64) << 32) | obj as u64));
                 b.push_out(Op::GetPropShape { obj: o, shape, slot, slow }, Rep::Tagged, Some(s))
+            } else if f.strs.is_some() && f.p.string_constants.get(name as usize).is_some_and(|k| k == "length") {
+                let o = b.tagged(defs[obj as usize]);
+                b.push_out(
+                    Op::Length {
+                        obj: o,
+                        ip: ip as u32,
+                        packed: ((name as u64) << 32) | obj as u64,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
+            } else if let Some(ways) = f.poly.and_then(|m| m.get(&ip)) {
+                let o = b.tagged(defs[obj as usize]);
+                b.push_out(
+                    Op::GetPropPoly {
+                        obj: o,
+                        ways: ways.clone(),
+                        ip: ip as u32,
+                        packed: ((name as u64) << 32) | obj as u64,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
             } else {
                 // Admitted only at the top level, where the window is the
                 // function's own.
                 f.strs?;
                 b.push_out(
                     Op::CallOut {
-                        helper: helper(crate::vm::jit_get_prop_slow as *const ()),
+                        helper: helper(crate::vm::jit_opt_get_prop_slow as *const ()),
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | obj as u64,
                         argc: 0,
@@ -1764,7 +2092,7 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline(c, plan, this, &args, s)?
+                    b.inline_call(c, plan, this, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -1807,7 +2135,7 @@ fn translate(
                     );
                     b.push_out(Op::GuardFid { v: m, fid }, Rep::Void, Some(s));
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline(c, plan, o, &args, s)?
+                    b.inline_call(c, plan, o, &args, s)?
                 }
                 Some((
                     c,
@@ -1833,7 +2161,7 @@ fn translate(
                         Some(s),
                     );
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline(c, plan, o, &args, s)?
+                    b.inline_call(c, plan, o, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -1841,7 +2169,16 @@ fn translate(
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64,
                         argc,
-                        lane: CallLane::Method { obj, arg_base, dst },
+                        lane: CallLane::Method {
+                            obj,
+                            arg_base,
+                            dst,
+                            intr: f
+                                .p
+                                .string_constants
+                                .get(name as usize)
+                                .and_then(|k| method_intr(k, argc)),
+                        },
                     },
                     Rep::Tagged,
                     Some(s),
@@ -1863,7 +2200,7 @@ fn translate(
                     b.push_out(Op::GuardFid { v: cv, fid }, Rep::Void, Some(s));
                     let this = b.tagged(defs[this_v as usize]);
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
-                    b.inline(c, plan, this, &args, s)?
+                    b.inline_call(c, plan, this, &args, s)?
                 }
                 _ => b.push_out(
                     Op::CallOut {
@@ -1899,9 +2236,7 @@ fn translate(
             } else {
                 Cmp::Le
             };
-            let x = b.f64(defs[a as usize], fs, defs);
-            let y = b.f64(defs[c as usize], fs, defs);
-            let t = b.emit(Op::CmpF(cmp, x, y), Rep::Bool);
+            let t = b.compare(f, ip, cmp, defs[a as usize], defs[c as usize], fs, defs);
             return Some(Flow::Branch {
                 cond: t,
                 t: ip + 1,
@@ -2013,7 +2348,36 @@ impl Builder {
     /// `inlinable`): `this` and the arguments its registers start with,
     /// every guard the call's frame state `call_fs`. Its result, in its
     /// own representation.
-    fn inline(&mut self, c: &FuncProto, plan: &PropShapePlan, this: V, args: &[V], call_fs: u32) -> Option<V> {
+    /// `inline_sim`'s way through `c` for these arguments (their
+    /// representations), the call inlined only when there is one.
+    fn inline_path(&self, c: &FuncProto, args: &[V]) -> Option<Vec<usize>> {
+        let mut reps = vec![Rep::Tagged; c.reg_count as usize];
+        for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
+            reps[1 + k] = self.rep(a);
+        }
+        inline_sim(c, reps, args.len()).map(|(_, path)| path)
+    }
+
+    /// `inline` along the callee's way for these arguments.
+    fn inline_call(&mut self, c: &FuncProto, plan: &PropShapePlan, this: V, args: &[V], call_fs: u32) -> Option<V> {
+        let path = self.inline_path(c, args)?;
+        self.inline(c, plan, this, args, call_fs, &path)
+    }
+
+    /// The callee `c` inlined into the current block along `path`
+    /// (`inline_path`): `this` and the arguments its registers start with,
+    /// every guard the call's frame state `call_fs`. Its result, in its own
+    /// representation.
+    #[allow(clippy::too_many_arguments)]
+    fn inline(
+        &mut self,
+        c: &FuncProto,
+        plan: &PropShapePlan,
+        this: V,
+        args: &[V],
+        call_fs: u32,
+        path: &[usize],
+    ) -> Option<V> {
         let undef = self.konst(Op::ConstTagged(Value::UNDEFINED.bits()), Rep::Tagged);
         let mut defs = vec![undef; c.reg_count as usize];
         defs[0] = this;
@@ -2023,31 +2387,50 @@ impl Builder {
         let math = self.math;
         let callee = Fn {
             p: c,
+            func_id: u64::MAX,
             plan,
             strs: None,
             math: math.as_ref(),
             math_reads: math_reads_known(&c.code, math.as_ref()),
             generic: None,
             addt: None,
+            ushr_i: None,
             new_lanes: None,
             ta_regs: &[],
+            class_values: None,
+            poly: None,
         };
         let mut fs = FsCtx {
             ip: 0,
             regs: &[],
             id: Some(call_fs),
         };
-        for (ip, i) in c.code.iter().enumerate() {
-            match translate(self, &callee, ip, i, &mut defs, &mut fs, None)? {
+        for &ip in path {
+            match translate(self, &callee, ip, &c.code[ip], &mut defs, &mut fs, None)? {
                 Flow::Next => {}
                 Flow::Ret(v) => {
                     self.inlined += 1;
                     return Some(v);
                 }
-                Flow::Jump(_) | Flow::Branch { .. } => return None,
+                Flow::Jump(_) | Flow::Branch { .. } => unreachable!("the path holds no branch"),
             }
         }
         None
+    }
+
+    /// `x <cmp> y`: on Numbers, unless the site deopted before (`generic`)
+    /// with a boxed operand, which then compares strings too (`CmpT`).
+    #[allow(clippy::too_many_arguments)]
+    fn compare(&mut self, f: &Fn, ip: usize, cmp: Cmp, x: V, y: V, fs: &mut FsCtx, defs: &[V]) -> V {
+        if f.generic(ip) && (self.rep(x) == Rep::Tagged || self.rep(y) == Rep::Tagged) {
+            let xt = self.tagged(x);
+            let yt = self.tagged(y);
+            let s = fs.id(self, defs);
+            return self.push_out(Op::CmpT(cmp, xt, yt), Rep::Bool, Some(s));
+        }
+        let xf = self.f64(x, fs, defs);
+        let yf = self.f64(y, fs, defs);
+        self.emit(Op::CmpF(cmp, xf, yf), Rep::Bool)
     }
 
     /// `v` as an element key: a Number as it is (an i32 or a double), any
@@ -2103,9 +2486,15 @@ impl Builder {
         if let Some(c) = self.memo_get(v, Rep::I32) {
             return c;
         }
-        let x = self.f64(v, fs, defs);
-        let s = fs.id(self, defs);
-        let c = self.push_out(Op::F64ToI32(x), Rep::I32, Some(s));
+        let c = if self.rep(v) == Rep::Tagged && self.memo_get(v, Rep::F64).is_none() {
+            // A boxed Int needs no double on its way.
+            let s = fs.id(self, defs);
+            self.push_out(Op::TaggedToI32(v), Rep::I32, Some(s))
+        } else {
+            let x = self.f64(v, fs, defs);
+            let s = fs.id(self, defs);
+            self.push_out(Op::F64ToI32(x), Rep::I32, Some(s))
+        };
         self.memo.push((v, Rep::I32, c));
         c
     }
