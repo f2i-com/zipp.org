@@ -50,7 +50,7 @@ mod bstats {
             Some(m) => m.iter().map(|((k, n), c)| (*k, n.clone(), *c)).collect(),
             None => Vec::new(),
         };
-        v.sort_by(|a, b| {
+        crate::cold_sort::sort_by(&mut v, |a, b| {
             b.2.cmp(&a.2)
                 .then_with(|| a.0.cmp(b.0))
                 .then_with(|| a.1.cmp(&b.1))

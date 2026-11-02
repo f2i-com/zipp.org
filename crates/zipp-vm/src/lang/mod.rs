@@ -446,7 +446,7 @@ mod tests {
         }
         let mut exts: Vec<&str> = languages().iter().flat_map(|l| l.extensions().iter().copied()).collect();
         let n = exts.len();
-        exts.sort_unstable();
+        crate::cold_sort::sort(&mut exts);
         exts.dedup();
         assert_eq!(exts.len(), n, "an extension selects two languages");
         assert_eq!(languages()[0].id(), LanguageId::JavaScript, "the base language first");

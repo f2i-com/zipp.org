@@ -153,7 +153,7 @@ impl<'a> FnCompiler<'a> {
         }
         let free = crate::capture::closure_free_names(arg);
         let mut names: Vec<String> = self.late_boxed.iter().filter(|n| free.contains(*n)).cloned().collect();
-        names.sort();
+        crate::cold_sort::sort(&mut names);
         let mut boxed = Vec::with_capacity(names.len());
         for n in &names {
             // A parameter or `var`: a register in the function scope (the

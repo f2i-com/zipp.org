@@ -181,7 +181,7 @@ pub(crate) fn hoisted_var_names(body: &[Stmt]) -> Vec<String> {
 /// a conformance property it currently has.)
 pub(crate) fn sorted_name_vec(set: &rustc_hash::FxHashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = set.iter().cloned().collect();
-    v.sort_unstable();
+    crate::cold_sort::sort(&mut v);
     v
 }
 

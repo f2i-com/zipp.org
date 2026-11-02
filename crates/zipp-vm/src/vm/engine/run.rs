@@ -1912,7 +1912,7 @@ impl<'p> Vm<'p> {
             })
             .map(|(&s, n)| (s, n.as_str()))
             .collect();
-        v.sort_unstable_by_key(|&(s, _)| s);
+        crate::cold_sort::sort_by_key(&mut v, |&(s, _)| s);
         v.into_iter().map(|(_, n)| n).collect()
     }
 

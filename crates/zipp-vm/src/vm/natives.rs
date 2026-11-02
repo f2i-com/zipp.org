@@ -6675,7 +6675,7 @@ impl<'p> Vm<'p> {
                 // the result against its own `.sort()`.
                 let mut sorted: Vec<String> =
                     vals.iter().map(|s| s.to_string()).chain(zones).collect();
-                sorted.sort_unstable();
+                crate::cold_sort::sort(&mut sorted);
                 let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
                 self.alloc_array_current_realm(items)
             }

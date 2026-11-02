@@ -245,7 +245,7 @@ impl<'p> Vm<'p> {
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
-                names.sort();
+                crate::cold_sort::sort(&mut names);
                 let items: Vec<Value> = names.into_iter().map(|n| self.alloc_str(n)).collect();
                 self.alloc_array_current_realm(items)
             }

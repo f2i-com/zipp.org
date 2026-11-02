@@ -471,7 +471,7 @@ impl<'a> FnCompiler<'a> {
             })
             .collect();
         // Recorded as each one ENDS, so a nested site comes first.
-        sites.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+        crate::cold_sort::sort_by_key(&mut sites, |s| (s.start, std::cmp::Reverse(s.end)));
         sites.into_boxed_slice()
     }
 

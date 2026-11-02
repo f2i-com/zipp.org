@@ -1923,7 +1923,7 @@ pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     let mut out = Names::default();
     fn_node_free(f, &mut out);
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
-    v.sort_unstable();
+    crate::cold_sort::sort(&mut v);
     v
 }
 
@@ -1932,7 +1932,7 @@ pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
     let mut out = Names::default();
     arrow_free(a, &mut out);
     let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
-    v.sort_unstable();
+    crate::cold_sort::sort(&mut v);
     v
 }
 

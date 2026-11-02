@@ -559,7 +559,7 @@ impl<'p> Vm<'p> {
                             })
                             .cloned()
                             .collect();
-                        extra.sort_unstable();
+                        crate::cold_sort::sort(&mut extra);
                         keys.extend(extra);
                     }
                 }

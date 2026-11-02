@@ -966,7 +966,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        hops.sort_unstable();
+        crate::cold_sort::sort(&mut hops);
         hops.dedup();
         let mut shape = crate::shape::EMPTY;
         for (k, _) in keys {

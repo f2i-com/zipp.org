@@ -564,7 +564,7 @@ fn note_eager(why: Option<&'static str>, bytes: u32) {
 pub(super) fn take_eager_census() -> Vec<(&'static str, u64, u64)> {
     let mut v: Vec<(&'static str, u64, u64)> =
         EAGER_WHY.with(|m| m.borrow_mut().drain().map(|(k, (n, b))| (k, n, b)).collect());
-    v.sort_by(|a, b| b.2.cmp(&a.2));
+    crate::cold_sort::sort_by(&mut v, |a, b| b.2.cmp(&a.2));
     v
 }
 

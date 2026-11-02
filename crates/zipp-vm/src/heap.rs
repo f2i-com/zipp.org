@@ -15142,7 +15142,7 @@ impl Heap {
                 }
             }
         }
-        kinds.sort_by(|a, b| b.2.cmp(&a.2));
+        crate::cold_sort::sort_by(&mut kinds, |a, b| b.2.cmp(&a.2));
         (
             self.objs.capacity(),
             self.resident_payload_current.get(),

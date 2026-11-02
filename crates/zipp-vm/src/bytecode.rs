@@ -89,7 +89,8 @@ pub const ITER_PROBE: u32 = 0x8000;
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
 /// and the JIT will consume this same structured form rather than re-decoding
 /// bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), derive(Debug))]
 pub enum Instr {
     /// `dst = <constant pool[idx]>`
     LoadConst {
@@ -2816,6 +2817,16 @@ pub enum Instr {
     /// stub it stands in carries the function's real call interface, so the
     /// frame was set up as the body expects.
     LazyCompile,
+}
+
+/// The derived text of an instruction is 24 KB of a browser module, and nothing
+/// there prints it: `compile_to_text` is a command-line and test path, and `Program`
+/// needs `Debug` only for the errors that carry one.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl std::fmt::Debug for Instr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Instr")
+    }
 }
 
 /// [`Instr::LoadBigInt`]'s value: an `i64` as two `u32` words, lowest first.

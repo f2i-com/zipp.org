@@ -168,7 +168,7 @@ impl Compiler {
         // Sorted for the same reason the emitted Program fields are: these come
         // from HashSets, and `RandomState` reseeds per INSTANCE, so the order
         // differs between two sets in one process, not merely between runs.
-        v.sort_unstable();
+        crate::cold_sort::sort(&mut v);
         v
     }
 

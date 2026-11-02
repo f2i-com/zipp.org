@@ -1990,7 +1990,7 @@ impl<'a> FnCompiler<'a> {
         if names.is_empty() {
             return None;
         }
-        names.sort();
+        crate::cold_sort::sort(&mut names);
         names.dedup();
         let mut copies = Vec::with_capacity(names.len());
         for n in names {

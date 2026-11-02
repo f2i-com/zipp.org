@@ -225,7 +225,7 @@ pub fn dump() -> (Vec<(&'static str, u64, f64)>, u64) {
         })
         .filter(|(_, c, _)| *c > 0)
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    crate::cold_sort::sort_by(&mut v, |a, b| b.1.cmp(&a.1));
     (v, total)
 }
 
@@ -689,7 +689,7 @@ pub(crate) mod pc {
             Ok(r) => r.clone(),
             Err(_) => return (Vec::new(), 0),
         };
-        ranges.sort_by_key(|r| r.0);
+        crate::cold_sort::sort_by_key(&mut ranges, |r| r.0);
         let mut tally: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut sym_cache: std::collections::HashMap<u64, Option<String>> =
             std::collections::HashMap::new();
@@ -748,7 +748,7 @@ pub(crate) mod pc {
                 dropped as f64 * 100.0 / (total as u64 + dropped) as f64,
             ));
         }
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        crate::cold_sort::sort_by(&mut rows, |a, b| b.1.cmp(&a.1));
         // `ZIPP_PROF_PC_DUMP=<path>` writes every sample as a module-relative
         // offset (or an absolute address when it is outside the image), one
         // per line, so a whole profile can be bucketed offline rather than
