@@ -1593,6 +1593,49 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind `jit_private_in_ic`: the interpreter's
+    /// `#x in obj` arm for the code's running callee (`jit_running_callee`
+    /// in place of the top frame's). A non-object right side (a TypeError)
+    /// and a name the private memo cannot resolve (the textual fallback)
+    /// decline before any effect, so the interpreter re-executes them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_private_in_impl(&mut self, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let o = self.get(base, (packed_args & 0xFFFF) as u16);
+        let k = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        if !self.is_object_value(o) {
+            return SELF_CALL_DEOPT;
+        }
+        let Some(ctx) = self.jit_running_callee(func_id, base) else {
+            return SELF_CALL_DEOPT;
+        };
+        let site = super::values::private_site(func_id, 0x8000_0000 | ip as u32);
+        let resolved = match self.private_memo_hit(ctx, site) {
+            Some(hit) => Some(hit),
+            None => {
+                let key = self.key_of(k);
+                self.resolve_private_site(ctx, site, &key)
+            }
+        };
+        let Some((brand, kind, owner, pid)) = resolved else {
+            return SELF_CALL_DEOPT;
+        };
+        let present = if kind & 7 == 0 {
+            self.private_field_get_id(o, brand, pid).is_some()
+        } else {
+            self.private_receiver_ok(o, brand, kind, owner)
+        };
+        Value::bool(present).bits()
+    }
+
     /// `jit_private_prop_ic`'s first try, for a read or a write (op 0 or 1)
     /// of a field already there: the field the site's way 0 last served, for
     /// the running callee, as the interpreter's own hit takes it. `None` for

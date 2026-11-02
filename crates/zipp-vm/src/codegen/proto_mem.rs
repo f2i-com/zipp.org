@@ -1154,6 +1154,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] op HasProp (disabled)");
                 }
             }
+            // `#x in obj`: the brand check through `jit_private_in_ic`, which
+            // declines whatever the private memo cannot resolve.
+            Instr::HasProp { brand: true, .. } if !py => {}
             Instr::GlobalFn {
                 op: crate::bytecode::GlobalFn::String,
                 argc: 1,
@@ -1668,12 +1671,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 callee,
                 this_v,
             } => (u3(obj, callee, this_v), Some(dst)),
-            Instr::HasProp {
-                dst,
-                key,
-                obj,
-                brand: false,
-            } => (u2(key, obj), Some(dst)),
+            Instr::HasProp { dst, key, obj, .. } => (u2(key, obj), Some(dst)),
             // The finally bracket manipulates frame state only; EndFinally and
             // IterCloseFinally read their completion registers on either path.
             Instr::PushFinally { .. } | Instr::PopFinally | Instr::JumpFinally { .. } => (u0(), None),
@@ -4522,6 +4520,29 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: true,
+            } => {
+                // `#x in obj` for the running callee: no user code, no
+                // allocation; anything unresolved declines purely.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_in_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (key as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::ObjectKeys {
                 dst,

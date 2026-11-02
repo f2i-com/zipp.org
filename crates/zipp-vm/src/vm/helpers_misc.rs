@@ -1797,6 +1797,25 @@ pub(crate) extern "win64" fn jit_super_get_ic(
     })
 }
 
+/// Win64 helper for `#x in obj` (`HasProp` with `brand`) in a Tier C body,
+/// `packed_args` = `obj | key << 16` (`Vm::jit_private_in_impl`).
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_private_in_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_private_in_impl(caller_base_ptr, packed_fip, packed_args)
+    })
+}
+
 /// Win64 helper for the iterator-protocol instructions in a compiled region,
 /// outside the scalar matchAll plan: `GetIterator` (op 0, `packed_args` =
 /// `src`), `IterPrime` (1, `iter`), `IterClose` (2, `iter`), `IterCloseQuiet`
