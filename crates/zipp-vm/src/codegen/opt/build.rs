@@ -24,10 +24,10 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::bytecode::{BitwiseOp, FuncProto, Instr};
+use crate::bytecode::{BitwiseOp, FuncProto, Instr, MathFn};
 use crate::value::Value;
 
-use super::PropShapePlan;
+use super::{MathIntrinsicGuard, PropShapePlan};
 
 /// An SSA value: an index into `Func::insts`.
 pub(crate) type V = u32;
@@ -67,18 +67,6 @@ pub(crate) enum Cmp {
     Ne,
 }
 
-/// Which bytecode call a call-out makes, so which helper.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CallKind {
-    /// `f(args)`.
-    Plain,
-    /// `o.m(args)`.
-    Method,
-    /// `f(args)` with the `this` of a register (`o.m(args)` whose callee was
-    /// read before its arguments).
-    WithThis,
-}
-
 /// A call site's one plain user-function callee, from the cross-call plan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Site {
@@ -116,6 +104,18 @@ pub(crate) struct Inputs<'a> {
     pub(crate) prop_shape: &'a PropShapePlan,
     pub(crate) sites: &'a FxHashMap<usize, Site>,
     pub(crate) callees: &'a FxHashMap<u32, (&'a FuncProto, PropShapePlan)>,
+    /// The function's string constants, as the shared strings Tier C loads.
+    pub(crate) const_strs: &'a FxHashMap<u32, u64>,
+    /// The intrinsic `Math` and its methods, as compiled code proves them.
+    pub(crate) math: Option<MathIntrinsicGuard>,
+    /// The sites earlier bodies of the function deopted at
+    /// (`FrameState::why`): built here without the speculation that failed.
+    pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
+}
+
+/// A helper's address, for a call-out.
+fn helper(f: *const ()) -> u64 {
+    f as u64
 }
 
 #[derive(Clone, Debug)]
@@ -156,8 +156,29 @@ pub(crate) enum Op {
     /// (strings may be equal) fail.
     StrictEqT(bool, V, V),
     /// An own data property read behind the receiver's shape; anything else
-    /// fails.
-    GetPropShape { obj: V, shape: u32, slot: u32 },
+    /// fails, or with `slow` (a site that deopted before: its position and
+    /// `jit_get_prop_slow`'s operand) takes the `GetProp` as a call-out.
+    GetPropShape {
+        obj: V,
+        shape: u32,
+        slot: u32,
+        slow: Option<(u32, u64)>,
+    },
+    /// `a + b`, the whole operator (`jit_concat`: strings, coercions), with
+    /// the frame state written first; a boxed result.
+    AddT(V, V),
+    /// `===` (true) or `!==` of two boxed values, two heap values compared
+    /// by `jit_strict_eq`.
+    StrictEqH(bool, V, V),
+    /// `<upvalue idx> = v`; a const or TDZ cell fails.
+    UpvalSet(u16, V),
+    /// `obj[key]` (`key` an i32, a double or boxed): a present element of a
+    /// dense Array through its mirror, else `jit_get_index`, else the whole
+    /// `GetIndex` at `ip` as a call-out (`jit_opt_index_full`, `packed`).
+    GetIndex { obj: V, key: V, ip: u32, packed: u64 },
+    /// `obj[key] = val`, as `GetIndex`: a present element overwritten, else
+    /// `jit_set_index`, else the whole `SetIndex`.
+    SetIndex { obj: V, key: V, val: V, ip: u32, packed: u64 },
     /// A global's slot; a binding in its TDZ fails.
     LoadGlobal(u32),
     /// `v` is a function of id `fid`; anything else fails.
@@ -171,9 +192,72 @@ pub(crate) enum Op {
         ver: u32,
         epoch: u32,
     },
-    /// The call at `ip` through its native helper (`CallKind`), the frame
-    /// state written first (`Inst::fs`); its result boxed.
-    CallOut { kind: CallKind, ip: u32, packed: u64, argc: u16 },
+    /// The op at `ip` through a native helper of the call protocol (`vm`,
+    /// window, `(func_id << 32) | ip`, `packed`, `argc`), the frame state
+    /// written first (`Inst::fs`): a call, `new`, a class value, a property
+    /// access the caches do not answer here. Its result boxed (`Void`: none).
+    CallOut { helper: u64, ip: u32, packed: u64, argc: u16 },
+    /// `obj.<key> = val` into the own data slot the receiver's shape has, the
+    /// nursery barrier after a heap value; any other receiver takes the
+    /// `SetProp` at `ip` through `jit_set_prop_slow` (`packed`), as a
+    /// call-out.
+    SetPropShape {
+        obj: V,
+        val: V,
+        shape: u32,
+        slot: u32,
+        ip: u32,
+        packed: u64,
+    },
+    /// The running closure's captured variable; one in its TDZ, or no
+    /// activation to read it from, fails.
+    UpvalGet(u16),
+    /// `globals[idx] = v`; a routed global or one in its TDZ fails.
+    StoreGlobal(u32, V),
+    /// `Math`'s method `op` is the intrinsic: through `recv` (the receiver a
+    /// `Math.<op>` read was made on) or the global `gidx` (a bare `MathOp`);
+    /// anything else fails.
+    MathGuard { recv: Option<V>, gidx: u32, op: MathFn },
+    /// `v` is `Math`'s intrinsic `op`; anything else fails.
+    GuardCallee { v: V, op: MathFn },
+    /// `Math.<op>(x)` in one instruction (`sqrt`, `abs`, `floor`, `ceil`,
+    /// `trunc`).
+    MathF1(MathFn, V),
+    /// `Math.<op>` through its pure helpers.
+    MathCall1(MathFn, V),
+    MathCall2(MathFn, V, V),
+    /// `Math.imul` on ToInt32s.
+    ImulI(V, V),
+    /// `a % b` on Numbers (fmod).
+    ModF(V, V),
+}
+
+impl Op {
+    /// Whether the op calls native code, which keeps no caller-saved
+    /// register: a value live across it needs a callee-saved one.
+    pub(crate) fn calls(&self) -> bool {
+        matches!(
+            self,
+            Op::CallOut { .. }
+                | Op::SetPropShape { .. }
+                | Op::MathCall1(..)
+                | Op::MathCall2(..)
+                | Op::ModF(..)
+                | Op::AddT(..)
+                | Op::StrictEqH(..)
+                | Op::UpvalSet(..)
+                | Op::GetPropShape { slow: Some(_), .. }
+                | Op::GetIndex { .. }
+                | Op::SetIndex { .. }
+        )
+    }
+
+    /// Whether the op writes its frame state after a native call (a pure
+    /// helper first, then the call-out): the state's values must live
+    /// through that call.
+    pub(crate) fn state_after_call(&self) -> bool {
+        matches!(self, Op::GetIndex { .. } | Op::SetIndex { .. })
+    }
 }
 
 impl Op {
@@ -188,7 +272,21 @@ impl Op {
             | Op::Param(_)
             | Op::Phi(_)
             | Op::LoadGlobal(_)
-            | Op::CallOut { .. } => vec![],
+            | Op::CallOut { .. }
+            | Op::UpvalGet(_)
+            | Op::MathGuard { recv: None, .. } => vec![],
+            Op::MathGuard { recv: Some(a), .. }
+            | Op::StoreGlobal(_, a)
+            | Op::GuardCallee { v: a, .. }
+            | Op::MathF1(_, a)
+            | Op::MathCall1(_, a) => vec![a],
+            Op::SetPropShape { obj, val, .. } => vec![obj, val],
+            Op::MathCall2(_, a, b) | Op::ImulI(a, b) | Op::ModF(a, b) | Op::AddT(a, b) | Op::StrictEqH(_, a, b) => {
+                vec![a, b]
+            }
+            Op::UpvalSet(_, a) => vec![a],
+            Op::GetIndex { obj, key, .. } => vec![obj, key],
+            Op::SetIndex { obj, key, val, .. } => vec![obj, key, val],
             Op::I32ToF64(a)
             | Op::TaggedToF64(a)
             | Op::F64ToI32(a)
@@ -252,8 +350,14 @@ pub(crate) struct Block {
 /// each VM register live there, the value it holds.
 pub(crate) struct FrameState {
     pub(crate) ip: u32,
+    /// The site a deopt here blames (`Jit::note_opt_deopt`): the op's
+    /// position, an inlined body's call, or `ENTRY_SITE`.
+    pub(crate) why: u32,
     pub(crate) regs: Vec<(u16, V)>,
 }
+
+/// The deopt site of the parameters unboxed at entry.
+pub(crate) const ENTRY_SITE: u32 = u32::MAX;
 
 pub(crate) struct Func {
     pub(crate) func_id: u32,
@@ -262,6 +366,10 @@ pub(crate) struct Func {
     pub(crate) states: Vec<FrameState>,
     /// Calls inlined, for the log.
     pub(crate) inlined: u32,
+    /// The intrinsic `Math` the `MathGuard`s prove.
+    pub(crate) math: Option<MathIntrinsicGuard>,
+    /// The nursery barrier may test generation bytes (`emit_heap_store_barrier`).
+    pub(crate) gen_lane: bool,
 }
 
 /// Bodies larger than this are not worth the compile (and keep the bitsets
@@ -271,30 +379,120 @@ const MAX_REGS: usize = 1024;
 /// The largest callee inlined.
 const MAX_INLINE_OPS: usize = 64;
 
-/// The registers `i` at `ip` of `p` reads and the one it writes, for the ops
-/// Tier O admits; `None` for any other op. `sites` admits the calls (none
-/// inside an inlined callee).
-fn uses_def(
-    i: &Instr,
-    p: &FuncProto,
-    prop_shape: &PropShapePlan,
-    sites: Option<&FxHashMap<usize, Site>>,
-    ip: usize,
-) -> Option<(Vec<u16>, Option<u16>)> {
+/// What decides the ops a function admits: its plans, and (`top`) the
+/// top-level function's call sites and string constants. An inlined callee
+/// has no `top`: no call, no helper that reads the window, no effect.
+struct Admit<'a> {
+    p: &'a FuncProto,
+    plan: &'a PropShapePlan,
+    top: Option<(&'a FxHashMap<usize, Site>, &'a FxHashMap<u32, u64>)>,
+    /// The intrinsic `Math`, when known (`Inputs::math`).
+    math: Option<&'a MathIntrinsicGuard>,
+    /// `Math.<op>` reads that feed a `MathOp`, by position (`math_reads`).
+    math_reads: &'a FxHashMap<usize, MathFn>,
+}
+
+/// The `GetProp`s of `code` that read a `Math` method only for a `MathOp`
+/// later in the same straight run (its callee and receiver registers
+/// untouched between): the read's position, and the op.
+fn math_reads(code: &[Instr]) -> FxHashMap<usize, MathFn> {
+    let mut out = FxHashMap::default();
+    for (ip, i) in code.iter().enumerate() {
+        let Instr::MathOp {
+            op, callee, this_v, ..
+        } = *i
+        else {
+            continue;
+        };
+        if callee == crate::bytecode::NO_REG {
+            continue;
+        }
+        for back in (0..ip).rev() {
+            let j = &code[back];
+            if let Instr::GetProp { dst, obj, .. } = *j {
+                if dst == callee && obj == this_v {
+                    out.insert(back, op);
+                    break;
+                }
+            }
+            if flow(j, back).1.is_some() || dst_of(j).is_some_and(|d| d == callee || d == this_v) {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `math_reads` kept to the methods the intrinsic guard can prove (`math`).
+fn math_reads_known(code: &[Instr], math: Option<&MathIntrinsicGuard>) -> FxHashMap<usize, MathFn> {
+    let Some(g) = math else {
+        return FxHashMap::default();
+    };
+    let mut r = math_reads(code);
+    r.retain(|_, op| g.op_callee_bits[*op as usize] != 0 && g.op_slot[*op as usize] != u32::MAX);
+    r
+}
+
+/// The registers `i` at `ip` reads and the one it writes, for the ops Tier O
+/// admits; `None` for any other op.
+fn uses_def(i: &Instr, ip: usize, a: &Admit) -> Option<(Vec<u16>, Option<u16>)> {
     let args = |first: u16, base: u16, argc: u16| -> Vec<u16> {
         std::iter::once(first).chain(base..base + argc).collect()
     };
+    let p = a.p;
+    let top = a.top.is_some();
     Some(match *i {
         Instr::LoadInt { dst, .. } | Instr::LoadBool { dst, .. } | Instr::LoadNull { dst } | Instr::LoadUndefined { dst } => {
             (vec![], Some(dst))
         }
         Instr::LoadConst { dst, idx } => {
-            if !p.constants.get(idx as usize).is_some_and(|c| c.is_number()) {
+            let num = p.constants.get(idx as usize).is_some_and(|c| c.is_number());
+            if !num && !a.top.is_some_and(|(_, strs)| strs.contains_key(&(idx as u32))) {
                 return None;
             }
             (vec![], Some(dst))
         }
-        Instr::LoadGlobal { dst, .. } if sites.is_some() => (vec![], Some(dst)),
+        Instr::LoadGlobal { dst, .. } if top => (vec![], Some(dst)),
+        Instr::UpvalGet { dst, .. } if top => (vec![], Some(dst)),
+        Instr::UpvalSet { src, .. } if top => (vec![src], None),
+        Instr::GetIndex { dst, obj, key } if top => (vec![obj, key], Some(dst)),
+        Instr::SetIndex { obj, key, val } if top => (vec![obj, key, val], None),
+        Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } if top => (vec![src], None),
+        Instr::SetProp {
+            obj,
+            val,
+            name,
+            strict: false,
+        } if top && !is_private(p, name) => (vec![obj, val], None),
+        Instr::New {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } if top => (args(callee, arg_base, argc), Some(dst)),
+        Instr::LoadClassValue { dst, .. } if top => (vec![], Some(dst)),
+        Instr::Mod { dst, a: x, b: y } => (vec![x, y], Some(dst)),
+        Instr::MathOp {
+            dst,
+            op,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } if a
+            .math
+            .is_some_and(|g| g.op_callee_bits[op as usize] != 0 && g.op_slot[op as usize] != u32::MAX)
+            && (1..=2).contains(&argc)
+            && super::super::emit_misc::math_op_emittable(op, argc)
+            && (callee != crate::bytecode::NO_REG || this_v < crate::bytecode::BARE_MATH_BY_NAME) =>
+        {
+            let mut u: Vec<u16> = (arg_base..arg_base + argc).collect();
+            if callee != crate::bytecode::NO_REG {
+                u.push(callee);
+                u.push(this_v);
+            }
+            (u, Some(dst))
+        }
         Instr::Move { dst, src } => (vec![src], Some(dst)),
         Instr::Add { dst, a, b }
         | Instr::Sub { dst, a, b }
@@ -308,8 +506,11 @@ fn uses_def(
         | Instr::Ne { dst, a, b }
         | Instr::Bitwise { dst, a, b, .. } => (vec![a, b], Some(dst)),
         Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } | Instr::Not { dst, a } => (vec![a], Some(dst)),
-        Instr::GetProp { dst, obj, .. } => {
-            if !prop_shape.contains_key(&ip) {
+        Instr::GetProp { dst, obj, name } => {
+            // The receiver's shape, a `Math` method's guard, or (at the top)
+            // the slow helper; a private name is the frame's.
+            let fused = a.math_reads.contains_key(&ip);
+            if !a.plan.contains_key(&ip) && !fused && !(top && !is_private(p, name)) {
                 return None;
             }
             (vec![obj], Some(dst))
@@ -319,7 +520,7 @@ fn uses_def(
             callee,
             arg_base,
             argc,
-        } if sites.is_some_and(|s| matches!(s.get(&ip), Some(Site::Call { .. }))) => {
+        } if top => {
             (args(callee, arg_base, argc), Some(dst))
         }
         Instr::CallWithThis {
@@ -329,7 +530,7 @@ fn uses_def(
             arg_base,
             argc,
             ..
-        } if sites.is_some_and(|s| matches!(s.get(&ip), Some(Site::Call { .. }))) => {
+        } if top => {
             let mut u = args(callee, arg_base, argc);
             u.push(this_v);
             (u, Some(dst))
@@ -340,7 +541,7 @@ fn uses_def(
             arg_base,
             argc,
             ..
-        } if sites.is_some_and(|s| matches!(s.get(&ip), Some(Site::Method { .. } | Site::ClassMethod { .. }))) => {
+        } if top => {
             (args(obj, arg_base, argc), Some(dst))
         }
         Instr::Jump { .. } | Instr::ReturnUndefined => (vec![], None),
@@ -349,6 +550,23 @@ fn uses_def(
         Instr::Return { src } => (vec![src], None),
         _ => return None,
     })
+}
+
+/// Whether `Math.<op>(x)` is one instruction (`emit`'s `MathF1`), as Tier
+/// C's `emit_math_unary_inline` makes it.
+fn math_f1_inline(op: MathFn) -> bool {
+    crate::codegen::math_inline_enabled()
+        && match op {
+            MathFn::Sqrt | MathFn::Abs => true,
+            MathFn::Floor | MathFn::Ceil | MathFn::Trunc => std::arch::is_x86_feature_detected!("sse4.1"),
+            _ => false,
+        }
+}
+
+fn is_private(p: &FuncProto, name: u32) -> bool {
+    p.string_constants
+        .get(name as usize)
+        .is_none_or(|k| crate::vm::is_private_key(k))
 }
 
 /// Where control goes after `i` at `ip`: its fall-through (if any) and its
@@ -367,11 +585,27 @@ fn flow(i: &Instr, ip: usize) -> (Option<usize>, Option<usize>) {
 
 /// The representation `i` makes its destination, given the registers'
 /// (`reps`); a call's is `call` (an inlined callee's result, else boxed).
-fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep) -> Option<Rep> {
+/// `tagged_add`: the op is an `Add` built as the full `+` (`addt`).
+fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep, tagged_add: bool) -> Option<Rep> {
     Some(match *i {
+        Instr::Add { .. } if tagged_add => Rep::Tagged,
         Instr::LoadInt { .. } => Rep::I32,
         Instr::LoadConst { idx, .. } => {
-            if p.constants[idx as usize].is_int() {
+            let c = p.constants[idx as usize];
+            if c.is_int() {
+                Rep::I32
+            } else if c.is_number() {
+                Rep::F64
+            } else {
+                Rep::Tagged
+            }
+        }
+        Instr::UpvalGet { .. } | Instr::New { .. } | Instr::LoadClassValue { .. } | Instr::GetIndex { .. } => {
+            Rep::Tagged
+        }
+        Instr::Mod { .. } => Rep::F64,
+        Instr::MathOp { op, .. } => {
+            if matches!(op, MathFn::Imul) {
                 Rep::I32
             } else {
                 Rep::F64
@@ -409,7 +643,15 @@ fn result_rep(i: &Instr, reps: &[Rep], p: &FuncProto, call: Rep) -> Option<Rep> 
 /// return, small, with a `this` the inlined body can be given: the
 /// receiver of a method call, `undefined` for a strict function's plain
 /// call; an arrow or a sloppy plain call that reads its `this` is not.
-fn inlinable(c: &FuncProto, plan: &PropShapePlan, method: bool) -> bool {
+fn inlinable(c: &FuncProto, plan: &PropShapePlan, method: bool, math: Option<&MathIntrinsicGuard>) -> bool {
+    let reads = math_reads_known(&c.code, math);
+    let admit = Admit {
+        p: c,
+        plan,
+        top: None,
+        math,
+        math_reads: &reads,
+    };
     if c.is_generator
         || c.is_async
         || c.rest_reg.is_some()
@@ -429,7 +671,7 @@ fn inlinable(c: &FuncProto, plan: &PropShapePlan, method: bool) -> bool {
             }
             break;
         }
-        let Some((uses, def)) = uses_def(i, c, plan, None, ip) else {
+        let Some((uses, def)) = uses_def(i, ip, &admit) else {
             return false;
         };
         if flow(i, ip).1.is_some() || uses.iter().chain(def.iter()).any(|&r| r >= c.reg_count) {
@@ -452,7 +694,7 @@ fn inline_result_rep(c: &FuncProto, mut reps: Vec<Rep>) -> Rep {
             Instr::ReturnUndefined => return Rep::Tagged,
             _ => {}
         }
-        if let (Some(r), Some(d)) = (result_rep(i, &reps, c, Rep::Tagged), dst_of(i)) {
+        if let (Some(r), Some(d)) = (result_rep(i, &reps, c, Rep::Tagged, false), dst_of(i)) {
             reps[d as usize] = r;
         }
     }
@@ -485,7 +727,13 @@ fn dst_of(i: &Instr) -> Option<u16> {
         | Instr::GetProp { dst, .. }
         | Instr::Call { dst, .. }
         | Instr::CallMethod { dst, .. }
-        | Instr::CallWithThis { dst, .. } => Some(dst),
+        | Instr::CallWithThis { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::New { dst, .. }
+        | Instr::LoadClassValue { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::MathOp { dst, .. }
+        | Instr::GetIndex { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -536,6 +784,21 @@ enum Flow {
 struct Fn<'a> {
     p: &'a FuncProto,
     plan: &'a PropShapePlan,
+    /// The top level's string constants (`Inputs::const_strs`).
+    strs: Option<&'a FxHashMap<u32, u64>>,
+    math: Option<&'a MathIntrinsicGuard>,
+    /// `math_reads_known`.
+    math_reads: FxHashMap<usize, MathFn>,
+    /// The top level's deopted sites (`Inputs::generic`) and full `+`s.
+    generic: Option<&'a rustc_hash::FxHashSet<u32>>,
+    addt: Option<&'a rustc_hash::FxHashSet<usize>>,
+}
+
+impl Fn<'_> {
+    /// Whether the top level's op at `ip` deopted in an earlier body.
+    fn generic(&self, ip: usize) -> bool {
+        self.generic.is_some_and(|g| g.contains(&(ip as u32)))
+    }
 }
 
 /// The IR of `proto`, or `None` when Tier O does not admit it.
@@ -555,9 +818,18 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
     {
         return None;
     }
+    let math = inputs.math.as_ref();
+    let top_reads = math_reads_known(code, math);
+    let admit = Admit {
+        p,
+        plan: inputs.prop_shape,
+        top: Some((inputs.sites, inputs.const_strs)),
+        math,
+        math_reads: &top_reads,
+    };
     let mut ud = Vec::with_capacity(n);
     for (ip, i) in code.iter().enumerate() {
-        let Some((uses, def)) = uses_def(i, p, inputs.prop_shape, Some(inputs.sites), ip) else {
+        let Some((uses, def)) = uses_def(i, ip, &admit) else {
             if crate::jitlog_enabled() {
                 eprintln!("[jit] Tier O fn{func_id} declines at ip {ip}: {i:?}");
             }
@@ -590,7 +862,9 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 Some(Instr::CallMethod { .. }) => method,
                 _ => false,
             };
-            (ok && inlinable(c, plan, method)).then_some((ip, (*c, plan, site)))
+            // A site whose inlined body deopted takes the call.
+            let deopted = inputs.generic.is_some_and(|g| g.contains(&(ip as u32)));
+            (ok && !deopted && inlinable(c, plan, method, math)).then_some((ip, (*c, plan, site)))
         })
         .collect();
 
@@ -611,6 +885,35 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         }
     }
     let starts: Vec<usize> = (0..n).filter(|&ip| leader[ip]).collect();
+    // The `Add`s built as the full `+` (`AddT`, a boxed result): a site that
+    // deopted before (`generic`), or one whose operand the same block made a
+    // string, a string constant or another such `Add`.
+    let generic = |ip: usize| inputs.generic.is_some_and(|g| g.contains(&(ip as u32)));
+    let mut addt: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    for (ip, i) in code.iter().enumerate() {
+        let Instr::Add { a, b: c, .. } = *i else {
+            continue;
+        };
+        let stringy = |r: u16| {
+            for back in (0..ip).rev() {
+                let j = &code[back];
+                if ud[back].1 == Some(r) {
+                    return match *j {
+                        Instr::LoadConst { idx, .. } => inputs.const_strs.contains_key(&(idx as u32)),
+                        Instr::Add { .. } => addt.contains(&back),
+                        _ => false,
+                    };
+                }
+                if leader[back] {
+                    return false;
+                }
+            }
+            false
+        };
+        if generic(ip) || stringy(a) || stringy(c) {
+            addt.insert(ip);
+        }
+    }
     let block_of_ip = |ip: usize| starts.partition_point(|&s| s <= ip) - 1;
     let nb = starts.len();
     let end_of = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
@@ -715,47 +1018,69 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         let mut numeric_read = false;
         let mut ok = true;
         for (ip, i) in code.iter().enumerate() {
-            match *i {
-                Instr::Add { a, b, .. }
-                | Instr::Sub { a, b, .. }
-                | Instr::Mul { a, b, .. }
-                | Instr::Div { a, b, .. }
-                | Instr::Lt { a, b, .. }
-                | Instr::Le { a, b, .. }
-                | Instr::Gt { a, b, .. }
-                | Instr::Ge { a, b, .. }
-                | Instr::Bitwise { a, b, .. }
-                | Instr::JumpIfNotLt { a, b, .. }
-                | Instr::JumpIfNotLe { a, b, .. }
-                    if a == r16 || b == r16 =>
-                {
-                    numeric_read = true
+            if ud[ip].0.contains(&r16) {
+                match *i {
+                    Instr::Add { .. }
+                    | Instr::Sub { .. }
+                    | Instr::Mul { .. }
+                    | Instr::Div { .. }
+                    | Instr::Mod { .. }
+                    | Instr::Lt { .. }
+                    | Instr::Le { .. }
+                    | Instr::Gt { .. }
+                    | Instr::Ge { .. }
+                    | Instr::Bitwise { .. }
+                    | Instr::JumpIfNotLt { .. }
+                    | Instr::JumpIfNotLe { .. }
+                    | Instr::AddInt { .. }
+                    | Instr::Neg { .. } => numeric_read = true,
+                    Instr::MathOp { callee, this_v, .. }
+                        if callee != r16 && (callee == crate::bytecode::NO_REG || this_v != r16) =>
+                    {
+                        numeric_read = true
+                    }
+                    // Any representation: a boxed copy, a truthiness, `===`.
+                    Instr::Eq { .. }
+                    | Instr::Ne { .. }
+                    | Instr::Not { .. }
+                    | Instr::JumpIfFalse { .. }
+                    | Instr::JumpIfTrue { .. }
+                    | Instr::Return { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::UpvalSet { .. } => {}
+                    Instr::SetProp { obj, .. } if obj != r16 => {}
+                    Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } if obj != r16 => {}
+                    // An object, a callee, a move, an argument.
+                    _ => ok = false,
                 }
-                Instr::AddInt { a, .. } | Instr::Neg { a, .. } if a == r16 => numeric_read = true,
-                Instr::GetProp { obj, .. } if obj == r16 => ok = false,
-                Instr::Move { src, .. } if src == r16 => ok = false,
-                Instr::Call { .. } | Instr::CallMethod { .. } | Instr::CallWithThis { .. } if ud[ip].0.contains(&r16) => ok = false,
-                _ => {}
             }
             if let Some(d) = ud[ip].1 {
-                let numeric_write = matches!(
-                    i,
-                    Instr::Add { .. }
-                        | Instr::Sub { .. }
-                        | Instr::Mul { .. }
-                        | Instr::Div { .. }
-                        | Instr::AddInt { .. }
-                        | Instr::Neg { .. }
-                        | Instr::Bitwise { .. }
-                        | Instr::LoadInt { .. }
-                        | Instr::LoadConst { .. }
-                );
+                let numeric_write = match *i {
+                    Instr::LoadConst { idx, .. } => p.constants[idx as usize].is_number(),
+                    _ => matches!(
+                        i,
+                        Instr::Add { .. }
+                            | Instr::Sub { .. }
+                            | Instr::Mul { .. }
+                            | Instr::Div { .. }
+                            | Instr::Mod { .. }
+                            | Instr::AddInt { .. }
+                            | Instr::Neg { .. }
+                            | Instr::Bitwise { .. }
+                            | Instr::LoadInt { .. }
+                            | Instr::MathOp { .. }
+                    ),
+                };
                 if d == r16 && !numeric_write {
                     ok = false;
                 }
             }
         }
-        spec[r] = ok && numeric_read && live_before[0].as_ref().is_some_and(|l| l.get(r));
+        spec[r] = ok
+            && numeric_read
+            && !inputs.generic.is_some_and(|g| g.contains(&ENTRY_SITE))
+            && live_before[0].as_ref().is_some_and(|l| l.get(r));
     }
 
     // ── representations ── each live register's at each block entry. An
@@ -788,7 +1113,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             };
             for ip in starts[b]..end_of(b) {
                 let call = call_rep(ip, &reps);
-                if let (Some(r), (_, Some(d))) = (result_rep(&code[ip], &reps, p, call), &ud[ip]) {
+                if let (Some(r), (_, Some(d))) = (result_rep(&code[ip], &reps, p, call, addt.contains(&ip)), &ud[ip]) {
                     reps[*d as usize] = r;
                 }
             }
@@ -823,10 +1148,16 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         out: Vec::new(),
         consts: Vec::new(),
         inlined: 0,
+        math: inputs.math,
     };
     let top = Fn {
         p,
         plan: inputs.prop_shape,
+        strs: Some(inputs.const_strs),
+        math,
+        math_reads: top_reads.clone(),
+        generic: inputs.generic,
+        addt: Some(&addt),
     };
     let mut blocks: Vec<Block> = Vec::with_capacity(order.len());
     let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len()];
@@ -859,6 +1190,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
                 let s = b.states.len() as u32;
                 b.states.push(FrameState {
                     ip: starts[bb] as u32,
+                    why: ENTRY_SITE,
                     regs: (0..nregs)
                         .filter(|&r| entry_live.get(r))
                         .map(|r| (r as u16, defs[r]))
@@ -958,6 +1290,8 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         blocks,
         states: b.states,
         inlined: b.inlined,
+        math: inputs.math,
+        gen_lane: false,
     })
 }
 
@@ -979,8 +1313,141 @@ fn translate(
             let c = f.p.constants[idx as usize];
             defs[dst as usize] = if c.is_int() {
                 b.konst(Op::ConstI32(c.as_int()), Rep::I32)
-            } else {
+            } else if c.is_number() {
                 b.konst(Op::ConstF64(c.as_f64()), Rep::F64)
+            } else {
+                // A string the VM roots for its life.
+                let bits = *f.strs?.get(&(idx as u32))?;
+                b.konst(Op::ConstTagged(bits), Rep::Tagged)
+            };
+        }
+        Instr::UpvalGet { dst, idx } => {
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::UpvalGet(idx), Rep::Tagged, Some(s));
+        }
+        Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            b.push_out(Op::StoreGlobal(idx, x), Rep::Void, Some(s));
+        }
+        Instr::SetProp { obj, name, val, .. } => {
+            let s = fs.id(b, defs);
+            let packed = ((name as u64) << 32) | ((obj as u64) << 16) | val as u64;
+            match f.plan.get(&ip) {
+                Some(&(shape, slot)) => {
+                    let o = b.tagged(defs[obj as usize]);
+                    let x = b.tagged(defs[val as usize]);
+                    b.push_out(
+                        Op::SetPropShape {
+                            obj: o,
+                            val: x,
+                            shape,
+                            slot,
+                            ip: ip as u32,
+                            packed,
+                        },
+                        Rep::Void,
+                        Some(s),
+                    );
+                }
+                None => {
+                    b.push_out(
+                        Op::CallOut {
+                            helper: helper(crate::vm::jit_set_prop_slow as *const ()),
+                            ip: ip as u32,
+                            packed,
+                            argc: 0,
+                        },
+                        Rep::Void,
+                        Some(s),
+                    );
+                }
+            }
+        }
+        Instr::New {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } => {
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_new_ic as *const ()),
+                    ip: ip as u32,
+                    packed: ((callee as u64) << 16) | arg_base as u64,
+                    argc,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::LoadClassValue { dst, class_id } => {
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(
+                Op::CallOut {
+                    helper: helper(crate::vm::jit_load_class_value_ic as *const ()),
+                    ip: ip as u32,
+                    packed: class_id as u64 | crate::vm::LOAD_CLASS_FROM_TIER_C,
+                    argc: 0,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::Mod { dst, a, b: c } => {
+            let x = b.f64(defs[a as usize], fs, defs);
+            let y = b.f64(defs[c as usize], fs, defs);
+            defs[dst as usize] = b.emit(Op::ModF(x, y), Rep::F64);
+        }
+        Instr::MathOp {
+            dst,
+            op,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } => {
+            let g = f.math?;
+            let s = fs.id(b, defs);
+            if callee == crate::bytecode::NO_REG {
+                b.push_out(
+                    Op::MathGuard {
+                        recv: None,
+                        gidx: this_v as u32,
+                        op,
+                    },
+                    Rep::Void,
+                    Some(s),
+                );
+            } else {
+                // The callee a fused `Math.<op>` read made is proven already.
+                let want = g.op_callee_bits[op as usize];
+                let cv = defs[callee as usize];
+                if !matches!(b.insts[cv as usize].op, Op::ConstTagged(bits) if bits == want) {
+                    let cv = b.tagged(cv);
+                    b.push_out(Op::GuardCallee { v: cv, op }, Rep::Void, Some(s));
+                }
+            }
+            let x = defs[arg_base as usize];
+            defs[dst as usize] = if argc == 2 {
+                let y = defs[arg_base as usize + 1];
+                if matches!(op, MathFn::Imul) {
+                    let xi = b.i32(x, fs, defs);
+                    let yi = b.i32(y, fs, defs);
+                    b.emit(Op::ImulI(xi, yi), Rep::I32)
+                } else {
+                    let xf = b.f64(x, fs, defs);
+                    let yf = b.f64(y, fs, defs);
+                    b.emit(Op::MathCall2(op, xf, yf), Rep::F64)
+                }
+            } else {
+                let xf = b.f64(x, fs, defs);
+                if math_f1_inline(op) {
+                    b.emit(Op::MathF1(op, xf), Rep::F64)
+                } else {
+                    b.emit(Op::MathCall1(op, xf), Rep::F64)
+                }
             };
         }
         Instr::LoadBool { dst, val } => defs[dst as usize] = b.konst(Op::ConstBool(val), Rep::Bool),
@@ -991,6 +1458,49 @@ fn translate(
             defs[dst as usize] = b.push_out(Op::LoadGlobal(idx), Rep::Tagged, Some(s));
         }
         Instr::Move { dst, src } => defs[dst as usize] = defs[src as usize],
+        Instr::Add { dst, a, b: c } if f.addt.is_some_and(|s| s.contains(&ip)) => {
+            let x = b.tagged(defs[a as usize]);
+            let y = b.tagged(defs[c as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(Op::AddT(x, y), Rep::Tagged, Some(s));
+        }
+        Instr::UpvalSet { idx, src } => {
+            let x = b.tagged(defs[src as usize]);
+            let s = fs.id(b, defs);
+            b.push_out(Op::UpvalSet(idx, x), Rep::Void, Some(s));
+        }
+        Instr::GetIndex { dst, obj, key } => {
+            let o = b.tagged(defs[obj as usize]);
+            let k = b.index_key(defs[key as usize]);
+            let s = fs.id(b, defs);
+            defs[dst as usize] = b.push_out(
+                Op::GetIndex {
+                    obj: o,
+                    key: k,
+                    ip: ip as u32,
+                    packed: obj as u64 | (key as u64) << 16,
+                },
+                Rep::Tagged,
+                Some(s),
+            );
+        }
+        Instr::SetIndex { obj, key, val } => {
+            let o = b.tagged(defs[obj as usize]);
+            let k = b.index_key(defs[key as usize]);
+            let x = b.tagged(defs[val as usize]);
+            let s = fs.id(b, defs);
+            b.push_out(
+                Op::SetIndex {
+                    obj: o,
+                    key: k,
+                    val: x,
+                    ip: ip as u32,
+                    packed: obj as u64 | (key as u64) << 16 | (val as u64) << 32 | 1 << 56,
+                },
+                Rep::Void,
+                Some(s),
+            );
+        }
         Instr::Add { dst, a, b: c } | Instr::Sub { dst, a, b: c } | Instr::Mul { dst, a, b: c } | Instr::Div { dst, a, b: c } => {
             let x = b.f64(defs[a as usize], fs, defs);
             let y = b.f64(defs[c as usize], fs, defs);
@@ -1037,7 +1547,11 @@ fn translate(
                 let x = b.tagged(va);
                 let y = b.tagged(vc);
                 let s = fs.id(b, defs);
-                b.push_out(Op::StrictEqT(eq, x, y), Rep::Bool, Some(s))
+                if f.generic(ip) {
+                    b.push_out(Op::StrictEqH(eq, x, y), Rep::Bool, Some(s))
+                } else {
+                    b.push_out(Op::StrictEqT(eq, x, y), Rep::Bool, Some(s))
+                }
             };
         }
         Instr::Not { dst, a } => {
@@ -1053,11 +1567,42 @@ fn translate(
                 b.emit(Op::Bit(op, x, y), Rep::I32)
             };
         }
-        Instr::GetProp { dst, obj, .. } => {
-            let (shape, slot) = *f.plan.get(&ip)?;
-            let o = b.tagged(defs[obj as usize]);
+        Instr::GetProp { dst, obj, name } => {
             let s = fs.id(b, defs);
-            defs[dst as usize] = b.push_out(Op::GetPropShape { obj: o, shape, slot }, Rep::Tagged, Some(s));
+            defs[dst as usize] = if let Some(&op) = f.math_reads.get(&ip) {
+                // `Math.<op>` for a `MathOp`: the receiver is the intrinsic
+                // `Math` holding its intrinsic method, a constant then.
+                let g = f.math?;
+                let o = b.tagged(defs[obj as usize]);
+                b.push_out(
+                    Op::MathGuard {
+                        recv: Some(o),
+                        gidx: 0,
+                        op,
+                    },
+                    Rep::Void,
+                    Some(s),
+                );
+                b.konst(Op::ConstTagged(g.op_callee_bits[op as usize]), Rep::Tagged)
+            } else if let Some(&(shape, slot)) = f.plan.get(&ip) {
+                let o = b.tagged(defs[obj as usize]);
+                let slow = f.generic(ip).then_some((ip as u32, ((name as u64) << 32) | obj as u64));
+                b.push_out(Op::GetPropShape { obj: o, shape, slot, slow }, Rep::Tagged, Some(s))
+            } else {
+                // Admitted only at the top level, where the window is the
+                // function's own.
+                f.strs?;
+                b.push_out(
+                    Op::CallOut {
+                        helper: helper(crate::vm::jit_get_prop_slow as *const ()),
+                        ip: ip as u32,
+                        packed: ((name as u64) << 32) | obj as u64,
+                        argc: 0,
+                    },
+                    Rep::Tagged,
+                    Some(s),
+                )
+            };
         }
         Instr::Call {
             dst,
@@ -1076,7 +1621,7 @@ fn translate(
                 }
                 _ => b.push_out(
                     Op::CallOut {
-                        kind: CallKind::Plain,
+                        helper: helper(crate::vm::jit_call_ic_cross as *const ()),
                         ip: ip as u32,
                         packed: ((callee as u64) << 16) | arg_base as u64,
                         argc,
@@ -1097,7 +1642,16 @@ fn translate(
             defs[dst as usize] = match inline {
                 Some((c, plan, Site::Method { shape, slot, fid })) => {
                     let o = b.tagged(defs[obj as usize]);
-                    let m = b.push_out(Op::GetPropShape { obj: o, shape, slot }, Rep::Tagged, Some(s));
+                    let m = b.push_out(
+                        Op::GetPropShape {
+                            obj: o,
+                            shape,
+                            slot,
+                            slow: None,
+                        },
+                        Rep::Tagged,
+                        Some(s),
+                    );
                     b.push_out(Op::GuardFid { v: m, fid }, Rep::Void, Some(s));
                     let args: Vec<V> = (0..argc).map(|k| defs[(arg_base + k) as usize]).collect();
                     b.inline(c, plan, o, &args, s)?
@@ -1130,7 +1684,7 @@ fn translate(
                 }
                 _ => b.push_out(
                     Op::CallOut {
-                        kind: CallKind::Method,
+                        helper: helper(crate::vm::jit_call_method_ic as *const ()),
                         ip: ip as u32,
                         packed: ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64,
                         argc,
@@ -1159,7 +1713,7 @@ fn translate(
                 }
                 _ => b.push_out(
                     Op::CallOut {
-                        kind: CallKind::WithThis,
+                        helper: helper(crate::vm::jit_call_with_this_cross as *const ()),
                         ip: ip as u32,
                         packed: ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64,
                         argc,
@@ -1217,7 +1771,8 @@ impl FsCtx<'_> {
         let id = b.states.len() as u32;
         b.states.push(FrameState {
             ip: self.ip,
-            regs: self.regs.iter().map(|&r| (r, defs[r as usize])).collect(),
+            why: self.ip,
+            regs:self.regs.iter().map(|&r| (r, defs[r as usize])).collect(),
         });
         self.id = Some(id);
         id
@@ -1237,6 +1792,8 @@ struct Builder {
     /// every iteration.
     consts: Vec<(Rep, u64, V)>,
     inlined: u32,
+    /// The intrinsic `Math` (`Inputs::math`), for inlined callees.
+    math: Option<MathIntrinsicGuard>,
 }
 
 impl Builder {
@@ -1303,7 +1860,16 @@ impl Builder {
         for (k, &a) in args.iter().take(c.param_count as usize).enumerate() {
             defs[1 + k] = a;
         }
-        let callee = Fn { p: c, plan };
+        let math = self.math;
+        let callee = Fn {
+            p: c,
+            plan,
+            strs: None,
+            math: math.as_ref(),
+            math_reads: math_reads_known(&c.code, math.as_ref()),
+            generic: None,
+            addt: None,
+        };
         let mut fs = FsCtx {
             ip: 0,
             regs: &[],
@@ -1320,6 +1886,15 @@ impl Builder {
             }
         }
         None
+    }
+
+    /// `v` as an element key: a Number as it is (an i32 or a double), any
+    /// other value boxed.
+    fn index_key(&mut self, v: V) -> V {
+        match self.rep(v) {
+            Rep::I32 | Rep::F64 => v,
+            _ => self.tagged(v),
+        }
     }
 
     /// `v` as an f64; a boxed value is unboxed behind a guard.

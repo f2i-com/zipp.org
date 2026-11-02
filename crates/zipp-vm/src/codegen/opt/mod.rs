@@ -31,7 +31,7 @@ mod emit;
 
 use rustc_hash::FxHashMap;
 
-use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, PropShapePlan};
+use super::{ClassReadPlan, CrossCallPlan, FuncProto, JitFn, MathIntrinsicGuard, PropShapePlan};
 
 /// The bodies Tier O may inline, by function id, each with its own property
 /// plan (built by the VM, which has the callees' caches).
@@ -108,6 +108,37 @@ pub(crate) fn stress_every() -> u32 {
 /// The stress countdown the emitted guards decrement (`stress_every`).
 pub(crate) static STRESS_COUNTDOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// What a compile knows of the running VM.
+pub(crate) struct Env<'a> {
+    /// The function's string constants, rooted (`Vm::jit_build_const_strs`).
+    pub(crate) const_strs: &'a FxHashMap<u32, u64>,
+    /// The intrinsic `Math` and its methods.
+    pub(crate) math: Option<MathIntrinsicGuard>,
+    /// The nursery barrier may test generation bytes.
+    pub(crate) gen_lane: bool,
+    /// The sites earlier bodies deopted at (`OptFeedback::generic`).
+    pub(crate) generic: Option<&'a rustc_hash::FxHashSet<u32>>,
+}
+
+/// What a function's Tier O bodies learned by deopting.
+#[derive(Default)]
+pub(crate) struct OptFeedback {
+    /// Deopts of the current body.
+    deopts: u32,
+    /// Its deopt sites (`FrameState::why`).
+    sites: rustc_hash::FxHashSet<u32>,
+    /// The sites the next body builds without the speculation that failed:
+    /// a property read with its slow path, `+` as the whole operator, `===`
+    /// with the string compare, a call not inlined, parameters left boxed.
+    pub(crate) generic: rustc_hash::FxHashSet<u32>,
+    /// Bodies evicted so far.
+    rounds: u32,
+}
+
+/// Bodies a function may have evicted (each recompiled with what the last
+/// one learned) before it takes Tier C for good.
+const MAX_ROUNDS: u32 = 4;
+
 /// Tier O's body for `proto`, or `None` when it admits none.
 pub(crate) fn compile(
     proto: &FuncProto,
@@ -116,6 +147,7 @@ pub(crate) fn compile(
     cross_plan: &CrossCallPlan,
     class_read: &ClassReadPlan,
     callees: &OptCallees,
+    env: &Env,
 ) -> Option<JitFn> {
     if stress_every() != 0 && STRESS_COUNTDOWN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         STRESS_COUNTDOWN.store(stress_every(), std::sync::atomic::Ordering::Relaxed);
@@ -125,8 +157,12 @@ pub(crate) fn compile(
         prop_shape,
         sites: &sites,
         callees,
+        const_strs: env.const_strs,
+        math: env.math,
+        generic: env.generic,
     };
-    let func = build::build(proto, func_id, &inputs)?;
+    let mut func = build::build(proto, func_id, &inputs)?;
+    func.gen_lane = env.gen_lane;
     let alloc = alloc::allocate(&func);
     let f = emit::emit(&func, &alloc)?;
     if crate::jitlog_enabled() {
@@ -149,27 +185,39 @@ impl super::Jit {
         opt_enabled() && self.meter.is_none() && !self.opt_blacklist.contains(&func_id)
     }
 
-    /// A Tier O body of `func_id` deopted at `ip`: after `DEOPT_LIMIT`
-    /// deopts the body is evicted (parked, never freed under itself) and the
-    /// function's next compile takes Tier C. Under the stress switch every
+    /// A Tier O body of `func_id` deopted, blaming site `why`
+    /// (`FrameState::why`): after `DEOPT_LIMIT` deopts the body is evicted
+    /// (parked, never freed under itself) and the function compiles again,
+    /// building every site that deopted without its speculation; after
+    /// `MAX_ROUNDS` bodies it takes Tier C. Under the stress switch every
     /// guard deopts in turn, and nothing is evicted.
-    pub(crate) fn note_opt_deopt(&mut self, func_id: u32, ip: u32) {
+    pub(crate) fn note_opt_deopt(&mut self, func_id: u32, why: u32) {
         let every = stress_every();
         if every != 0 {
             STRESS_COUNTDOWN.store(every, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        let n = self.opt_deopts.entry(func_id).or_insert(0);
-        *n += 1;
-        if *n < DEOPT_LIMIT {
+        let fb = self.opt_feedback.entry(func_id).or_default();
+        fb.deopts += 1;
+        fb.sites.insert(why);
+        if fb.deopts < DEOPT_LIMIT {
             return;
         }
-        self.opt_blacklist.insert(func_id);
+        fb.deopts = 0;
+        fb.rounds += 1;
+        let sites = std::mem::take(&mut fb.sites);
+        fb.generic.extend(sites.iter().copied());
+        let round = fb.rounds;
+        if round >= MAX_ROUNDS {
+            self.opt_blacklist.insert(func_id);
+        }
         let Some(f) = self.compiled.remove(&func_id) else {
             return;
         };
         if crate::jitlog_enabled() {
-            eprintln!("[jit] Tier O fn{func_id} EVICTED ({DEOPT_LIMIT} deopts, last at ip {ip})");
+            let mut s: Vec<u32> = sites.into_iter().collect();
+            s.sort_unstable();
+            eprintln!("[jit] Tier O fn{func_id} EVICTED ({DEOPT_LIMIT} deopts, round {round}, sites {s:?})");
         }
         self.retired_fns.push(f);
         let rearm = self.fn_threshold().saturating_sub(1);

@@ -3481,9 +3481,9 @@ pub struct Jit {
     /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
     /// code we return into. Freed when the VM drops.
     retired_fns: Vec<JitFn>,
-    /// Tier O (`opt`): deopts per function, and the functions whose body was
-    /// evicted for deopting too often (they take Tier C from then on).
-    opt_deopts: FxHashMap<u32, u32>,
+    /// Tier O (`opt`): each function's deopt feedback, and the functions
+    /// whose bodies were evicted too often (they take Tier C from then on).
+    opt_feedback: FxHashMap<u32, opt::OptFeedback>,
     opt_blacklist: rustc_hash::FxHashSet<u32>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
@@ -4363,7 +4363,13 @@ impl Jit {
         // a whole body, loops included, so a region's loop head (`yield_heads`)
         // is no reason to decline: the interpreter no longer runs that loop.
         if self.opt_may_compile(func_id) {
-            if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees) {
+            let env = opt::Env {
+                const_strs,
+                math: heap_helpers.math_imul_guard,
+                gen_lane: heap_helpers.inline_store_lane_ok,
+                generic: self.opt_feedback.get(&func_id).map(|fb| &fb.generic),
+            };
+            if let Some(f) = opt::compile(proto, func_id, prop_shape, cross_plan, class_read, opt_callees, &env) {
                 let entry = f.entry();
                 {
                     let (a, n) = f.code_span();

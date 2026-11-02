@@ -1344,6 +1344,52 @@ pub(crate) extern "win64" fn jit_opt_deopt(vm: *mut core::ffi::c_void, func_id: 
     vm.jit.note_opt_deopt(func_id, ip);
 }
 
+/// Win64 helper for Tier O's `a % b` on two Numbers (raw f64 bits) its
+/// integer lane does not answer: the IEEE remainder of the dividend's sign,
+/// as the interpreter's `%`. Pure.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_opt_fmod(a: u64, b: u64) -> u64 {
+    (f64::from_bits(a) % f64::from_bits(b)).to_bits()
+}
+
+/// Win64 helpers for Tier O's `o[k]` (`op` 0) and `o[k] = v` (1) that its
+/// lanes did not answer: the interpreter's whole `GetIndex` / `SetIndex`
+/// (getters, setters, proxies, key coercion), with the call protocol.
+/// `packed_args` = `obj | key << 16 | val << 32 | op << 56`; a write
+/// returns 0.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_opt_index_full(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    _argc: u32,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        if vm.at_call_cap() || vm.jit_complete_declines() {
+            vm.osr_deopt_exempt = true;
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let regs_base = vm.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = caller_base_ptr.offset_from(regs_base) as usize;
+        let o = vm.get(base, packed_args as u16);
+        let k = vm.get(base, (packed_args >> 16) as u16);
+        let r = if packed_args >> 56 == 0 {
+            vm.get_index(o, k).map(|v| v.bits())
+        } else {
+            let v = vm.get(base, (packed_args >> 32) as u16);
+            let strict = vm.func((packed_fip >> 32) as usize).is_strict;
+            vm.set_index(o, k, v, strict).map(|_| 0)
+        };
+        r.unwrap_or_else(|t| vm.jit_thrown_to_sentinel(t))
+    })
+}
+
 /// Win64 helper for `new F(args…)` (`New`) in a compiled region or Tier C
 /// body: `construct` on the callee and the arguments in the caller's window,
 /// exactly as the interpreter's `New` runs it. r9 = (callee_reg<<16)|arg_base;

@@ -137,9 +137,16 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
             }
         }
         for &v in &b.insts {
-            if !matches!(f.insts[v as usize].op, Op::Phi(_)) {
+            let i = &f.insts[v as usize];
+            if !matches!(i.op, Op::Phi(_)) {
                 for u in reads(v) {
                     extend(u as usize, pos[v as usize], &mut start, &mut end);
+                }
+                // A state written after a native call is read after it.
+                if let (true, Some(s)) = (i.op.state_after_call(), i.fs) {
+                    for &(_, u) in &f.states[s as usize].regs {
+                        extend(u as usize, pos[v as usize] + 1, &mut start, &mut end);
+                    }
                 }
             }
         }
@@ -153,7 +160,7 @@ pub(crate) fn allocate(f: &Func) -> Alloc {
     // strictly inside its interval) takes a callee-saved register, which
     // the native callee preserves, or a slot.
     let calls: Vec<u32> = (0..nv)
-        .filter(|&v| matches!(f.insts[v].op, Op::CallOut { .. }))
+        .filter(|&v| f.insts[v].op.calls())
         .map(|v| pos[v])
         .collect();
     let crosses = |v: usize| calls.iter().any(|&c| start[v] < c && c < end[v]);
