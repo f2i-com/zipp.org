@@ -3602,6 +3602,16 @@ impl<'p> Vm<'p> {
                                 closure,
                                 getter,
                             } => {
+                                // A leaf getter (`get v() { return this._v; }`)
+                                // runs without a frame (`lite::leaf_scan`).
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, o, true, base, 0, 0) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 // A shaped receiver is an object: no boxing.
                                 self.setup_call_this_outlined(
                                     fid,
@@ -3746,6 +3756,14 @@ impl<'p> Vm<'p> {
                                 // The lean push: an object receiver needs no
                                 // boxing even for a sloppy getter.
                                 let this_is_object = self.is_object_value(o);
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, o, this_is_object, base, 0, 0) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 self.setup_call_this_outlined(
                                     fid,
                                     closure,
@@ -4211,6 +4229,21 @@ impl<'p> Vm<'p> {
                                 if self.jit_enabled && crate::codegen::cwt_leaf_enabled() {
                                     let _ = self.ic_call(func_id, ip, callee_v);
                                 }
+                                // A leaf callee runs without a frame
+                                // (`lite::leaf_scan`): a `super.area()` whose
+                                // target reads a field and adds. A sloppy
+                                // callee's `this` is boxed by its frame, so
+                                // only a strict one's is passed as it is.
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) =
+                                        self.leaf_call(fid, closure, this_val, p.is_strict, base, arg_base, argc)
+                                    {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 // The lean push for a strict callee (every
                                 // class method: `super.m()`, `this.#m()`);
                                 // anything else goes on to `setup_call`.
@@ -4381,6 +4414,17 @@ impl<'p> Vm<'p> {
                                     self.try_metered_numeric_fib(call.fib_global, callee_v, arg)
                                 {
                                     self.set(base, dst, result);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                            // A leaf callee runs without a frame (`lite::leaf_scan`).
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            if LITE {
+                                if let Some(v) =
+                                    self.leaf_call(call.fid, call.closure, Value::UNDEFINED, false, base, arg_base, argc)
+                                {
+                                    self.set(base, dst, v);
                                     ip += 1;
                                     continue;
                                 }
@@ -4604,6 +4648,15 @@ impl<'p> Vm<'p> {
                             && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_));
                         if object_recv {
                             if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                                // A leaf callee runs without a frame (`lite::leaf_scan`).
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, recv, true, base, arg_base, argc) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 self.setup_call_lean_this(
                                     fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee,
                                 )?;

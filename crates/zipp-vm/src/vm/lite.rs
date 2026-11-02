@@ -501,6 +501,24 @@ impl<'p> Vm<'p> {
         self.lite_leaf_try(fid, closure, this, this_ok, base, arg_base, argc)
     }
 
+    /// [`Self::lite_leaf`] for the main loop's calls an interpreter-only VM
+    /// makes (its frames' calls the lite loop does not run: a script's top
+    /// level past its first hand-over, a `super.m()`).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn leaf_call(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this: Value,
+        this_ok: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        self.lite_leaf(fid, closure, this, this_ok, base, arg_base, argc)
+    }
+
     /// [`Self::lite_leaf`] for a callee that may be a leaf.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
