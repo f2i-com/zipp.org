@@ -410,6 +410,8 @@ fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
             Instr::Add { a, b, .. }
             | Instr::Sub { a, b, .. }
             | Instr::Mul { a, b, .. }
+            | Instr::Div { a, b, .. }
+            | Instr::Mod { a, b, .. }
             | Instr::Lt { a, b, .. }
             | Instr::Le { a, b, .. }
             | Instr::Gt { a, b, .. }
@@ -418,6 +420,20 @@ fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
             | Instr::Ne { a, b, .. }
             | Instr::Bitwise { a, b, .. } => &[a, b],
             Instr::GetProp { obj, name, .. } if !is_private_key(&p.string_constants[name as usize]) => &[obj],
+            // A `Math` method (every `MathFn` is a pure function of its
+            // arguments), with its arguments in the window.
+            Instr::MathOp {
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } if arg_base as usize + argc as usize <= LEAF_MAX_REGS => {
+                let reads = (arg_base..arg_base + argc).any(|x| x == 0)
+                    || (callee != crate::bytecode::NO_REG && (callee == 0 || this_v == 0));
+                reads_this |= reads;
+                &[]
+            }
             Instr::Jump { target } if forward(target) => &[],
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } if forward(target) => &[cond],
             _ => return LEAF_NO,
@@ -815,10 +831,68 @@ impl<'p> Vm<'p> {
                         B::Ushr => Value::num(((x as u32) >> (y as u32 & 31)) as f64),
                     };
                 }
-                Instr::GetProp { dst, obj, .. } => match self.ic_get_prop_own_hit(fid, ip, r[obj as usize]) {
-                    Some(v) => r[dst as usize] = v,
-                    None => decline!(),
-                },
+                Instr::GetProp { dst, obj, name } => {
+                    let o = r[obj as usize];
+                    if let Some(v) = self.ic_get_prop_own_hit(fid, ip, o) {
+                        r[dst as usize] = v;
+                    } else {
+                        // The site's inherited or dictionary-hint way (a
+                        // `Math` method's read), as the lite loop's arm
+                        // takes it; its settle refreshes a mirror only.
+                        let key: &'p str = p.string_constants[name as usize].as_str();
+                        match self.ic_get_prop_proto_hit(fid, ip, o, key) {
+                            Some(v) => {
+                                self.ic_proto_hit_settle(o);
+                                r[dst as usize] = v;
+                            }
+                            None => decline!(),
+                        }
+                    }
+                }
+                Instr::Div { dst, a, b } => {
+                    r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 / y as f64), |x: f64, y: f64| {
+                        Value::num(x / y)
+                    })
+                }
+                // JS `%` on Numbers is C's fmod: the dividend's sign, -0 kept.
+                Instr::Mod { dst, a, b } => {
+                    r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 % y as f64), |x: f64, y: f64| {
+                        Value::num(x % y)
+                    })
+                }
+                Instr::MathOp {
+                    dst,
+                    op,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                } => {
+                    let intrinsic = if callee == crate::bytecode::NO_REG {
+                        self.math_bare_is_intrinsic(op, this_v as u32)
+                    } else {
+                        self.math_method_is_intrinsic(
+                            native::MATH_METHOD_BASE + op as u16,
+                            r[callee as usize],
+                            r[this_v as usize],
+                        )
+                    };
+                    let args = &r[arg_base as usize..(arg_base + argc) as usize];
+                    // Numbers only: anything else's ToNumber can run code.
+                    if !intrinsic || !args.iter().all(|v| v.is_number()) {
+                        decline!();
+                    }
+                    let v = match (op, args) {
+                        (crate::bytecode::MathFn::Imul, [a, b, ..]) if a.is_int() && b.is_int() => {
+                            Value::int(a.as_int().wrapping_mul(b.as_int()))
+                        }
+                        _ => match self.eval_math_args(op, args) {
+                            Ok(x) => Value::num(x),
+                            Err(_) => decline!(),
+                        },
+                    };
+                    r[dst as usize] = v;
+                }
                 Instr::Return { src } => return Some(r[src as usize]),
                 Instr::ReturnUndefined => return Some(Value::UNDEFINED),
                 _ => decline!(),
