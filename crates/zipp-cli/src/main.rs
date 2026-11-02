@@ -162,7 +162,10 @@ fn main() -> ExitCode {
     if std::env::var_os("ZIPP_PROF_PC").is_some() {
         let (rows, total) = zipp_vm::prof_pc_stats();
         eprintln!("[profpc] {total} instruction-pointer samples");
-        for (name, n, pct) in rows.iter().take(25) {
+        // `ZIPP_PROF_PC_ROWS=N` shows more than the first 25, as a per-line
+        // profile (`ZIPP_PROF_PC_LINES`) wants.
+        let shown = std::env::var("ZIPP_PROF_PC_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
+        for (name, n, pct) in rows.iter().take(shown) {
             eprintln!("[profpc] {n:>8}  {pct:>5.1}%  {name}");
         }
     }

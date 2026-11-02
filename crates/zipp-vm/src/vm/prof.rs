@@ -287,6 +287,7 @@ pub(crate) mod pc {
     type SymInitializeFn = unsafe extern "system" fn(Handle, *const u8, i32) -> i32;
     type SymSetOptionsFn = unsafe extern "system" fn(u32) -> u32;
     type SymFromAddrFn = unsafe extern "system" fn(Handle, u64, *mut u64, *mut u8) -> i32;
+    type SymGetLineFromAddr64Fn = unsafe extern "system" fn(Handle, u64, *mut u32, *mut u8) -> i32;
 
     /// dbghelp, resolved at REPORT time rather than linked.
     ///
@@ -297,6 +298,8 @@ pub(crate) mod pc {
     /// after sampling stops, so a runtime lookup is free here.
     struct DbgHelp {
         from_addr: SymFromAddrFn,
+        /// `SymGetLineFromAddr64`, asked only under `ZIPP_PROF_PC_LINES`.
+        line_from_addr: Option<SymGetLineFromAddr64Fn>,
     }
 
     fn load_dbghelp() -> Option<DbgHelp> {
@@ -320,9 +323,13 @@ pub(crate) mod pc {
             let init: SymInitializeFn = std::mem::transmute(init);
             let set_options: SymSetOptionsFn = std::mem::transmute(opts);
             let from_addr: SymFromAddrFn = std::mem::transmute(from);
-            set_options(SYMOPT);
+            let lines = lines_wanted();
+            let line = GetProcAddress(m, b"SymGetLineFromAddr64\0".as_ptr());
+            let line_from_addr = (lines && line != 0)
+                .then(|| std::mem::transmute::<usize, SymGetLineFromAddr64Fn>(line));
+            set_options(if lines { SYMOPT | SYMOPT_LOAD_LINES } else { SYMOPT });
             init(GetCurrentProcess(), std::ptr::null(), 1);
-            Some(DbgHelp { from_addr })
+            Some(DbgHelp { from_addr, line_from_addr })
         }
     }
 
@@ -627,6 +634,49 @@ pub(crate) mod pc {
     const SYMBOL_NAME_CAP: usize = 512;
     /// `SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS`.
     const SYMOPT: u32 = 0x0000_0002 | 0x0000_0004;
+    const SYMOPT_LOAD_LINES: u32 = 0x0000_0010;
+    /// `IMAGEHLP_LINE64` (x86-64): `SizeOfStruct` at 0x00, `LineNumber` at
+    /// 0x10, the `FileName` pointer at 0x18; 40 bytes.
+    const LINE_SIZE: usize = 40;
+    const LINE_NUMBER_OFF: usize = 0x10;
+    const LINE_FILE_OFF: usize = 0x18;
+
+    /// `ZIPP_PROF_PC_LINES=1`: name each sample by its source line, not only
+    /// its function, so the time inside one large function (the interpreter
+    /// loop) can be read. Needs a build with line tables (the `profiling`
+    /// profile).
+    fn lines_wanted() -> bool {
+        std::env::var_os("ZIPP_PROF_PC_LINES").is_some()
+    }
+
+    /// `addr`'s `file:line` (the file's last path component), or `None`.
+    fn line_of(dbg: &DbgHelp, addr: u64) -> Option<String> {
+        let f = dbg.line_from_addr?;
+        #[repr(C, align(8))]
+        struct LineBuf([u8; LINE_SIZE]);
+        let mut buf = LineBuf([0u8; LINE_SIZE]);
+        let mut disp: u32 = 0;
+        // SAFETY: `buf` is an `IMAGEHLP_LINE64` with its size set; dbghelp
+        // fills it and points `FileName` at a string it owns, read at once.
+        unsafe {
+            std::ptr::write(buf.0.as_mut_ptr() as *mut u32, LINE_SIZE as u32);
+            if f(GetCurrentProcess(), addr, &mut disp, buf.0.as_mut_ptr()) == 0 {
+                return None;
+            }
+            let line = std::ptr::read(buf.0.as_ptr().add(LINE_NUMBER_OFF) as *const u32);
+            let file = std::ptr::read(buf.0.as_ptr().add(LINE_FILE_OFF) as *const *const u8);
+            if file.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while n < 1024 && *file.add(n) != 0 {
+                n += 1;
+            }
+            let path = String::from_utf8_lossy(std::slice::from_raw_parts(file, n)).into_owned();
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+            Some(format!("{name}:{line}"))
+        }
+    }
 
     /// dbghelp fills `SYMBOL_INFO` through `ULONG`/`ULONG64` fields, so the
     /// buffer must be 8-aligned; a bare `[u8; N]` is align-1 and the `u32`
@@ -711,7 +761,11 @@ pub(crate) mod pc {
             let name = match sym_cache.entry(rip) {
                 std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let n = dbg.as_ref().and_then(|d| symbolicate(d, rip));
+                    let mut n = dbg.as_ref().and_then(|d| symbolicate(d, rip));
+                    if let (Some(name), Some(line)) = (&mut n, dbg.as_ref().and_then(|d| line_of(d, rip))) {
+                        name.push(' ');
+                        name.push_str(&line);
+                    }
                     e.insert(n.clone());
                     n
                 }
