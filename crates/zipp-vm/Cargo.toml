@@ -53,8 +53,10 @@ wasmi_core = { version = "2", optional = true, default-features = false }
 # much larger build. Its custom sections, which Wasmtime does not keep, read
 # with the wasmparser it already uses. The 36 line: Wasmtime's long-term
 # support release, the one with security fixes that builds on Rust 1.92 (48
-# and later need 1.95); 36.0.19 has every fix in RustSEC up to 2026-10-19.
-wasmtime = { version = "36.0.19", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "gc", "gc-drc", "parallel-compilation"] }
+# needs 1.95 and 49 needs 1.96); 36.0.20 has every fix published up to
+# 2026-10-29. `wasmparser` moves with it: 36 builds with 0.236, and another
+# version here would link a second copy.
+wasmtime = { version = "36.0.20", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "gc", "gc-drc", "parallel-compilation"] }
 wasmparser = { version = "0.236", optional = true, default-features = false, features = ["std"] }
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
