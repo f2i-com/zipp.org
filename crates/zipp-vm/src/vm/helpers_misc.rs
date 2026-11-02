@@ -6739,6 +6739,21 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
     r.to_bits()
 }
 
+/// Win64 helper: `Math.min`, `max` or `hypot` of the `argc` registers at
+/// `args`, at most [`crate::codegen::MATH_MANY_MAX`], which the emitted code
+/// has already checked hold numbers. PURE. Returns the result's f64 bits.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_math_many(code: u32, args: *const u64, argc: u32) -> u64 {
+    let op: crate::bytecode::MathFn = unsafe { core::mem::transmute(code as u8) };
+    let mut nums = [0f64; crate::codegen::MATH_MANY_MAX as usize];
+    let nums = &mut nums[..argc as usize];
+    for (k, n) in nums.iter_mut().enumerate() {
+        // SAFETY: the emitter passes the instruction's argument window.
+        *n = Value::from_bits(unsafe { *args.add(k) }).as_f64();
+    }
+    crate::vm::helpers_num2::math_reduce(op, nums).to_bits()
+}
+
 /// Win64 helper: read a captured local's cell (`CellGet`). `cell_bits` is the
 /// register's Value (a Heap-tagged cell); returns the cell's inner Value bits,
 /// or `SELF_CALL_DEOPT` when the cell is still UNINITIALIZED (TDZ) so the region

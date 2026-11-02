@@ -1272,47 +1272,7 @@ impl<'p> Vm<'p> {
                 for (slot, &v) in nums.iter_mut().zip(args) {
                     *slot = self.to_number_strict(v)?;
                 }
-                if matches!(op, M::Hypot) {
-                    return Ok(crate::vm::helpers_num2::hypot_scaled(nums));
-                }
-                let mut acc = match op {
-                    M::Min => f64::INFINITY,
-                    _ => f64::NEG_INFINITY,
-                };
-                for &v in nums.iter() {
-                    acc = match op {
-                        // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
-                        // so tie-break on the sign (Min prefers -0, Max prefers +0).
-                        M::Min => {
-                            if v.is_nan() || acc.is_nan() {
-                                f64::NAN
-                            } else if v == acc {
-                                if v.is_sign_negative() {
-                                    v
-                                } else {
-                                    acc
-                                }
-                            } else {
-                                acc.min(v)
-                            }
-                        }
-                        // Max (Hypot returned above).
-                        _ => {
-                            if v.is_nan() || acc.is_nan() {
-                                f64::NAN
-                            } else if v == acc {
-                                if v.is_sign_positive() {
-                                    v
-                                } else {
-                                    acc
-                                }
-                            } else {
-                                acc.max(v)
-                            }
-                        }
-                    };
-                }
-                acc
+                crate::vm::helpers_num2::math_reduce(op, nums)
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
             M::Pow | M::Atan2 | M::Imul => {

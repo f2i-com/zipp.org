@@ -7,6 +7,34 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `Math.min`, `Math.max` or `Math.hypot` of numbers already coerced, for the
+/// interpreter and for compiled code, so the two cannot answer differently.
+pub(crate) fn math_reduce(op: crate::bytecode::MathFn, nums: &[f64]) -> f64 {
+    use crate::bytecode::MathFn as M;
+    if matches!(op, M::Hypot) {
+        return hypot_scaled(nums);
+    }
+    let min = matches!(op, M::Min);
+    let mut acc = if min { f64::INFINITY } else { f64::NEG_INFINITY };
+    for &v in nums {
+        acc = if v.is_nan() || acc.is_nan() {
+            f64::NAN
+        } else if v == acc {
+            // f64 min/max treat -0 and +0 as equal; the spec orders -0 < +0.
+            if v.is_sign_negative() == min {
+                v
+            } else {
+                acc
+            }
+        } else if min {
+            acc.min(v)
+        } else {
+            acc.max(v)
+        };
+    }
+    acc
+}
+
 /// `Math.hypot` over ALREADY-COERCED arguments, in spec order: any ±Infinity
 /// gives +Infinity (even beside a NaN), then any NaN gives NaN, then all zeros
 /// give +0.

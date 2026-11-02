@@ -689,9 +689,8 @@ pub(crate) fn emit_math_identity_guard(
 /// ("the emitter exists in TWO byte-identical copies — factor before editing"),
 /// so it is factored here instead.
 ///
-/// The caller must have gated the op/arity set (`argc == 1` and not `Imul`, or
-/// `argc == 2` and one of Pow/Atan2/Imul/Min/Max/Hypot) — the arms below assume
-/// it, exactly as the region admission check guarantees.
+/// The caller must have gated the op/arity set with [`math_op_emittable`]: the
+/// arms below assume it, exactly as the region admission check guarantees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_math_op(
     ops: &mut dynasmrt::x64::Assembler,
@@ -709,7 +708,23 @@ pub(crate) fn emit_math_op(
     math_imul_guard: Option<MathIntrinsicGuard>,
 ) {
     emit_math_identity_guard(ops, op, callee, this_v, bail, math_imul_guard);
-    if argc == 1 {
+    if argc > 2 {
+        // `Math.min(a, b, c)`: every argument a number, or the interpreter
+        // runs ToNumber on them in order; the helper reads them from the frame.
+        for k in 0..argc {
+            load_num_xmm(ops, arg_base + k, 0, bail);
+        }
+        let many = crate::vm::jit_math_many as *const () as i64;
+        dynasm!(ops
+            ; mov ecx, op as i32
+            ; lea rdx, [rbx + dreg(arg_base)]
+            ; mov r8d, argc as i32
+            ; mov rax, QWORD many
+            ; call rax
+            ; movq xmm0, rax
+        );
+        emit_box_num(ops, dst);
+    } else if argc == 1 {
         load_num_xmm(ops, arg_base, 0, bail);
         if !emit_math_unary_inline(ops, op) {
             dynasm!(ops
@@ -794,9 +809,14 @@ pub(crate) fn math_op_emittable(op: MathFn, argc: u16) -> bool {
             op,
             MathFn::Pow | MathFn::Atan2 | MathFn::Imul | MathFn::Min | MathFn::Max | MathFn::Hypot
         ),
+        3..=MATH_MANY_MAX => matches!(op, MathFn::Min | MathFn::Max | MathFn::Hypot),
         _ => false,
     }
 }
+
+/// The most arguments `Math.min`, `max` or `hypot` takes in compiled code: one
+/// such call past it, or a zero-argument one, keeps its loop in the interpreter.
+pub(crate) const MATH_MANY_MAX: u16 = 8;
 
 /// `regs[dst] = regs[a] <op> regs[b]`. Add/Sub/Mul take an INT fast path when
 /// both operands are Int-tagged (32-bit op + overflow check, result boxed Int —

@@ -797,9 +797,10 @@ pub(crate) fn region_op_admitted(
         // interpreter — which runs ToNumber coercion — if not) and calls the
         // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
         // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
-        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
-        // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
-        // the interpreter handles it. The helpers run no user code and never
+        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`, and
+        // `min`/`max`/`hypot` of up to eight numbers `jit_math_many`. Any other
+        // arity declines -- the interpreter handles it, and a single such call
+        // keeps its whole loop there. The helpers run no user code and never
         // allocate (a non-numeric arg already bailed), so no pinned-pointer
         // re-fetch is needed.
         Instr::MathOp { op, argc, .. } => {
