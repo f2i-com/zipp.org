@@ -2297,7 +2297,7 @@ dependencies = [
  "unicode-normalization",
  "wasmi",
  "wasmi_core",
- "wasmparser 0.236.1",
+ "wasmparser 0.262.0",
  "wasmtime",
  "wat",
  "zipp-numparse",
