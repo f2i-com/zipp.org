@@ -9071,10 +9071,7 @@ pub(crate) extern "win64" fn jit_typeof_is(
     code_neg: u32,
 ) -> u64 {
     let vm = unsafe { &*(vm as *const Vm) };
-    let t = vm.type_of(Value::from_bits(v_bits));
-    let m = crate::bytecode::TYPEOF_NAMES
-        .get((code_neg & 0xFF) as usize)
-        .is_some_and(|&n| n == t);
+    let m = u32::from(vm.type_code(Value::from_bits(v_bits))) == code_neg & 0xFF;
     Value::bool(m != (code_neg & 0x100 != 0)).bits()
 }
 
@@ -9089,7 +9086,7 @@ pub(crate) extern "win64" fn jit_typeof_same(
     neg: u32,
 ) -> u64 {
     let vm = unsafe { &*(vm as *const Vm) };
-    let same = vm.type_of(Value::from_bits(a_bits)) == vm.type_of(Value::from_bits(b_bits));
+    let same = vm.type_code(Value::from_bits(a_bits)) == vm.type_code(Value::from_bits(b_bits));
     Value::bool(same != (neg != 0)).bits()
 }
 

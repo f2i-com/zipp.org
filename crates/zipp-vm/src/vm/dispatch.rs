@@ -1821,11 +1821,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::FuseTypeOfJump { dst, a, code, neg, when, target } => {
                         let va = self.get(base, a);
-                        let t = self.type_of(va);
-                        let m = crate::bytecode::TYPEOF_NAMES
-                            .get(code as usize)
-                            .is_some_and(|&n| n == t)
-                            != neg;
+                        let m = (self.type_code(va) == code) != neg;
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
@@ -1930,17 +1926,14 @@ impl<'p> Vm<'p> {
                         // unfused pair computes (code 255 indexes nothing and
                         // so never matches).
                         let va = self.get(base, a);
-                        let t = self.type_of(va);
-                        let m = crate::bytecode::TYPEOF_NAMES
-                            .get(code as usize)
-                            .is_some_and(|&n| n == t);
+                        let m = self.type_code(va) == code;
                         self.set(base, dst, Value::bool(m != neg));
                         ip += 1;
                     }
                     Instr::TypeOfSame { dst, a, b, neg } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let same = self.type_of(va) == self.type_of(vb);
+                        let same = self.type_code(va) == self.type_code(vb);
                         self.set(base, dst, Value::bool(same != neg));
                         ip += 1;
                     }

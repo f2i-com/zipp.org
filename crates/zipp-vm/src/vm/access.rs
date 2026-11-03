@@ -115,37 +115,52 @@ impl<'p> Vm<'p> {
     /// Falls back to allocating if the table is not yet populated (a `typeof`
     /// evaluated before `setup_globals`), so this can never return a bad handle.
     pub(crate) fn typeof_value(&mut self, v: Value) -> Value {
-        let name = self.type_of(v);
-        match crate::bytecode::TYPEOF_NAMES
-            .iter()
-            .position(|&n| n == name)
-        {
-            Some(i) if !self.typeof_strs[i].is_undefined() => self.typeof_strs[i],
-            _ => self.alloc_str(name.to_string()),
+        let i = self.type_code(v) as usize;
+        if !self.typeof_strs[i].is_undefined() {
+            return self.typeof_strs[i];
         }
+        self.alloc_str(crate::bytecode::TYPEOF_NAMES[i].to_string())
     }
 
-    pub(crate) fn type_of(&self, mut v: Value) -> &'static str {
+    /// JS `typeof` type-name: [`crate::bytecode::TYPEOF_NAMES`] at
+    /// [`Self::type_code`].
+    #[inline]
+    pub(crate) fn type_of(&self, v: Value) -> &'static str {
+        crate::bytecode::TYPEOF_NAMES[self.type_code(v) as usize]
+    }
+
+    /// `typeof v`'s index in [`crate::bytecode::TYPEOF_NAMES`], the code a
+    /// fused `TypeOfIs` names: what every `typeof` test compares. They
+    /// compared the name's text instead, a `memcmp` per test.
+    pub(crate) fn type_code(&self, mut v: Value) -> u8 {
+        const NUMBER: u8 = 0;
+        const STRING: u8 = 1;
+        const BOOLEAN: u8 = 2;
+        const UNDEFINED: u8 = 3;
+        const OBJECT: u8 = 4;
+        const FUNCTION: u8 = 5;
+        const SYMBOL: u8 = 6;
+        const BIGINT: u8 = 7;
         loop {
             if v.is_int() || v.is_double() {
-                return "number";
+                return NUMBER;
             } else if v.is_small_bigint() {
-                return "bigint";
+                return BIGINT;
             } else if v.is_bool() {
-                return "boolean";
+                return BOOLEAN;
             } else if v.is_undefined() {
-                return "undefined";
+                return UNDEFINED;
             } else if v.is_null() {
-                return "object";
+                return OBJECT;
             } else if !v.is_heap() {
-                return "undefined";
+                return UNDEFINED;
             }
             // An [[IsHTMLDDA]] exotic (`document.all`): `typeof` is "undefined".
             if self.is_htmldda_index(v.heap_index()) {
-                return "undefined";
+                return UNDEFINED;
             }
             return match self.heap.get(v.heap_index()) {
-                HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
+                HeapObj::Str(_) | HeapObj::Cons { .. } => STRING,
                 // A class is callable (with `new`), so `typeof C === "function"`.
                 // Native builtins and bound functions are callable too.
                 HeapObj::Func(_)
@@ -156,7 +171,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
-                | HeapObj::CombinatorResolver { .. } => "function",
+                | HeapObj::CombinatorResolver { .. } => FUNCTION,
                 // Transparent wrappers are guest-chainable. Unwrap them in this
                 // frame instead of recursing once per Proxy/Cell.
                 HeapObj::Cell => {
@@ -167,27 +182,17 @@ impl<'p> Vm<'p> {
                     v = *target;
                     continue;
                 }
-                HeapObj::Symbol { .. } => "symbol",
-                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => "bigint",
+                HeapObj::Symbol { .. } => SYMBOL,
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => BIGINT,
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
-                HeapObj::Object(m) if m.is_ctor => "function",
+                HeapObj::Object(m) if m.is_ctor => FUNCTION,
                 // %Function.prototype% is itself a (no-op) callable function.
-                HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => {
-                    "function"
-                }
+                HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => FUNCTION,
                 // `Symbol` is callable (typeof "function") but NOT a constructor
                 // (so `new Symbol()` throws and IsConstructor is false).
-                HeapObj::Object(_)
-                    if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 =>
-                {
-                    "function"
-                }
-                HeapObj::Object(_)
-                    if v.heap_index() == self.bigint_ctor && self.bigint_ctor != 0 =>
-                {
-                    "function"
-                }
-                _ => "object", // Array, ordinary Object, namespace globals
+                HeapObj::Object(_) if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 => FUNCTION,
+                HeapObj::Object(_) if v.heap_index() == self.bigint_ctor && self.bigint_ctor != 0 => FUNCTION,
+                _ => OBJECT, // Array, ordinary Object, namespace globals
             };
         }
     }
