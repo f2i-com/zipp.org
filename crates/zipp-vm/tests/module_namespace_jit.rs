@@ -2,7 +2,7 @@
 //! but it must re-read that slot on every access so exported `let` bindings
 //! stay live. The fixture reads through a barrel namespace whose re-export map
 //! points at another module's slots. Run both sides of the process-cached
-//! ablation switch in fresh children and require byte-identical output.
+//! ablation switch in fresh children and require the same exact output.
 
 #![cfg(all(feature = "jit", target_arch = "x86_64"))]
 
@@ -82,12 +82,12 @@ fn module_namespace_jit_preserves_live_bindings() {
         String::from_utf8_lossy(&disabled.stderr)
     );
     let disabled_err = String::from_utf8_lossy(&disabled.stderr);
+    // The child asserts the same live-binding output. Without the lane the
+    // region no longer bails at the namespace get either: since compiled
+    // code completes a read the caches miss in its slow helper (b4a3346e),
+    // the ablated run stays compiled too, so it cannot show an eviction.
     assert!(
         disabled_err.contains(OUTPUT_MARKER),
         "missing ablated output marker"
-    );
-    assert!(
-        disabled_err.contains("EVICTED"),
-        "ablation did not restore interpreter replay at the namespace get:\n{disabled_err}"
     );
 }
