@@ -422,7 +422,6 @@ impl<'p> Vm<'p> {
         cur_closure: u32,
         running: &'p crate::bytecode::FuncProto,
         code: &'p [Instr],
-        strs: &'p [String],
         stop_depth: usize,
     ) -> Result<ColdFlow, Thrown> {
         match *instr {
@@ -3745,7 +3744,7 @@ impl<'p> Vm<'p> {
             Instr::DefineField { obj, name, val } => {
                 let o = self.get(base, obj);
                 let v = self.get(base, val);
-                let key = strs[name as usize].as_str();
+                let key = running.string_constants[name as usize].as_str();
                 #[cfg(not(feature = "safe-sandbox"))]
                 let done = self.ic_define_field(func_id, ip, o, key, v);
                 #[cfg(feature = "safe-sandbox")]

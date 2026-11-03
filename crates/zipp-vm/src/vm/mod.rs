@@ -1651,6 +1651,9 @@ pub struct Vm<'p> {
     /// a deferred body replaces its stub (`engine::lazy_install`), so code
     /// that asks about a function's code reads it here, not in `program`.
     funcs: Vec<&'p crate::bytecode::FuncProto>,
+    /// What each function's frames dispatch on (`Vm::entered_code`), `None`
+    /// until its first entry. Cleared when a body replaces its stub.
+    entered_code: Vec<Option<&'p [crate::bytecode::Instr]>>,
     /// The compiler of the program's deferred function bodies, each compiled
     /// at its function's first call (`compile::LazySession`); `None` when
     /// every body compiled with the program.

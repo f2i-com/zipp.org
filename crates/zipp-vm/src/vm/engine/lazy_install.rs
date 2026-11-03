@@ -136,6 +136,10 @@ impl<'p> Vm<'p> {
             let i = id as usize;
             if i < self.funcs.len() {
                 self.funcs[i] = r;
+                // A frame of the stub dispatched on the stub's code.
+                if let Some(entered) = self.entered_code.get_mut(i) {
+                    *entered = None;
+                }
                 if i >= self.main_func_count {
                     self.eval_funcs[i - self.main_func_count] = r;
                 }

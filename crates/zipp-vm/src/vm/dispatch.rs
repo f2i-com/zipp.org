@@ -439,12 +439,6 @@ impl<'p> Vm<'p> {
             // loop; we never mutate program functions during execution.
             #[cfg(not(feature = "safe-sandbox"))]
             let code: &Vec<Instr> = unsafe { &*code };
-            // The running function's string constants, kept for the same
-            // reason: a property read, a property write and a method call
-            // each name their key through them, and each used to find the
-            // function again first (a bounds-checked double index, and in a
-            // size-first build a call).
-            let strs: &'p [String] = running.string_constants.as_slice();
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -560,7 +554,7 @@ impl<'p> Vm<'p> {
             // tiers: a frame they run whole needs none, and code placed
             // before their entry slowed a JIT row by 7% (warm-router).
             let icode: &'p [Instr] = if self.interp_fuse_ok() {
-                running.fused.entered(&running.code).unwrap_or(running.code.as_slice())
+                self.entered_code(func_id, running)
             } else {
                 running.code.as_slice()
             };
@@ -3635,7 +3629,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
                         // A private name the own hit did not answer (`private_get_slow`).
                         if is_private_key(key) {
                             if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
@@ -3857,7 +3851,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
                         // Private stores (field-init emission, compound and update
                         // writes) go to the side table or the accessors. One
                         // byte-compare on the hot path.
@@ -3973,7 +3967,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
                         self.private_set_strict(func_id, ip, name, o, key, v)?;
                         ip += 1;
                     }
@@ -4198,7 +4192,7 @@ impl<'p> Vm<'p> {
                         // `this.#m()` ran it.
                         let copy_method = if plain.is_none()
                             && (name == crate::bytecode::NO_NAME
-                                || matches!(strs[name as usize].as_str(), "slice" | "concat"))
+                                || matches!(running.string_constants[name as usize].as_str(), "slice" | "concat"))
                         {
                             self.captured_array_copy_method(func_id, ip)
                         } else {
@@ -4636,7 +4630,7 @@ impl<'p> Vm<'p> {
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
-                        let key: &'p str = &strs[name as usize];
+                        let key: &'p str = &running.string_constants[name as usize];
                         // A method of an ordinary object or class instance: the
                         // method cache first. None of the receiver-kind leaves
                         // below can serve such a receiver (they want a string,
@@ -5550,7 +5544,7 @@ impl<'p> Vm<'p> {
                     // Instructions no measured workload executes run in `dispatch_cold`,
                     // out of line, so this loop stays small (see `vm/dispatch_cold.rs`).
                     _ => match self.dispatch_cold(
-                        instr, ip, frame_idx, func_id, base, cur_closure, running, code, strs, stop_depth,
+                        instr, ip, frame_idx, func_id, base, cur_closure, running, code, stop_depth,
                     )? {
                         super::dispatch_cold::ColdFlow::Next(next) => ip = next,
                         super::dispatch_cold::ColdFlow::Frame => break,
@@ -6864,6 +6858,33 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "safe-sandbox"))]
         return unsafe { *self.regs.get_unchecked(index) };
     }
+    /// The instructions a frame of `func_id` (`running`) dispatches on: its
+    /// superinstruction copy (`FusedCode`, built on its first entry) when
+    /// anything in it fused, else its code. Every call and every return asks,
+    /// and a program of thousands of functions kept that answer in a record of
+    /// its own, a cold line per frame transition; `Vm::entered_code` keeps
+    /// only the answers, four to a line.
+    #[inline(always)]
+    fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+        match self.entered_code.get(func_id as usize) {
+            Some(&Some(code)) => code,
+            _ => self.entered_code_fill(func_id, running),
+        }
+    }
+
+    /// [`Self::entered_code`]'s first ask for a function.
+    #[cold]
+    #[inline(never)]
+    fn entered_code_fill(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+        let code = running.fused.entered(&running.code).unwrap_or(running.code.as_slice());
+        let i = func_id as usize;
+        if self.entered_code.len() <= i {
+            self.entered_code.resize(self.funcs.len().max(i + 1), None);
+        }
+        self.entered_code[i] = Some(code);
+        code
+    }
+
     /// Whether the dispatch may run a function's superinstruction copy
     /// (`FusedCode`): not under `ZIPP_NO_INTERP_FUSE`, and not while a
     /// recorder meters or traces each instruction, which a superinstruction

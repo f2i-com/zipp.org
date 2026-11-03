@@ -278,6 +278,7 @@ impl<'p> Vm<'p> {
             program,
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
+            entered_code: Vec::new(),
             lazy: None,
             lazy_gmap: Vec::new(),
             static_key_plan_sites,
