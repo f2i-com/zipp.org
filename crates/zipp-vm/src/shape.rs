@@ -176,6 +176,8 @@ struct Table {
     nodes: Vec<Node>,
     /// Sum of every edge key's length, bounded by [`SHAPE_KEY_BYTES_MAX`].
     key_bytes: usize,
+    /// Shapes minted inside [`data_keys`] scopes, bounded by [`DATA_SHAPE_MAX`].
+    data_minted: usize,
 }
 
 impl Table {
@@ -202,6 +204,7 @@ impl Table {
                 },
             ],
             key_bytes: 0,
+            data_minted: 0,
         }
     }
 
@@ -260,8 +263,17 @@ fn disabled() -> bool {
     }
 }
 
-/// The cap for a shape minted inside a [`data_keys`] scope: the table size
-/// past which a computed key or a parsed JSON key no longer mints one.
+/// How many shapes [`data_keys`] scopes may mint between them: past it a
+/// computed key or a parsed JSON key no longer mints one.
+///
+/// It bounded the whole table's size: a computed key minted only while the
+/// table held fewer than this many shapes. An application's own layouts fill
+/// that long before it builds its data, so Babel's `@babel/types` builders,
+/// which make every AST node with `node[key] = arg`, made every node `DICT`
+/// (1.56M of its `node.type` reads went to a dictionary lookup). Counting
+/// only the scopes' own mints keeps the bound on data-shaped keys
+/// (`json-large`'s mint as before) and lets a builder's few hundred layouts
+/// have shapes.
 const DATA_SHAPE_MAX: usize = 4096;
 
 thread_local! {
@@ -271,8 +283,8 @@ thread_local! {
 
 /// A scope in which the keys appended are data: a computed member store's
 /// (`o[k] = v`) and `JSON.parse`'s. Inside it a new shape is minted only
-/// while the table holds fewer than [`DATA_SHAPE_MAX`]; existing transitions
-/// are still followed. Code's own layouts (`o.x = v`, literals, class
+/// while such scopes have minted fewer than [`DATA_SHAPE_MAX`]; existing
+/// transitions are still followed. Code's own layouts (`o.x = v`, literals, class
 /// fields) keep the whole table: a bundled application needs tens of
 /// thousands of them, while keys built from data (`json-large`'s
 /// `obj[word + "_" + j]`, its parse back) are effectively unique, and
@@ -374,14 +386,14 @@ pub fn add(from: u32, key: &str, bits: u8) -> u32 {
                 }
             }
         }
-        let cap = if DATA_KEYS.with(|c| c.get()) > 0 && data_keys_enabled() {
-            DATA_SHAPE_MAX.min(shape_max())
-        } else {
-            shape_max()
-        };
-        if t.nodes.len() >= cap || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
+        let data = DATA_KEYS.with(|c| c.get()) > 0 && data_keys_enabled();
+        if t.nodes.len() >= shape_max()
+            || (data && t.data_minted >= DATA_SHAPE_MAX)
+            || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX
+        {
             return DICT;
         }
+        t.data_minted += usize::from(data);
         t.key_bytes += key.len();
         let len = t.nodes[from as usize].len + 1;
         let pos = t.nodes[from as usize].next.len() as u32;
@@ -590,6 +602,36 @@ mod tests {
         })
         .join()
         .expect("full-table thread");
+    }
+
+    #[test]
+    fn data_keys_have_their_own_budget() {
+        // A table the program's own layouts filled past DATA_SHAPE_MAX still
+        // mints shapes for data keys (a builder's `node[key] = v`), until the
+        // data scopes themselves have minted DATA_SHAPE_MAX. A fresh thread:
+        // the table must not leak into other tests.
+        std::thread::spawn(|| {
+            let mut i = 0;
+            while count() < DATA_SHAPE_MAX + 100 {
+                add(EMPTY, &format!("code-key-{i}"), D);
+                i += 1;
+            }
+            let _scope = data_keys();
+            let node = add(EMPTY, "type", D);
+            assert_ne!(add(node, "name", D), DICT, "a builder's layout gets a shape");
+            let mut minted = 2;
+            while minted < DATA_SHAPE_MAX {
+                assert_ne!(add(EMPTY, &format!("data-key-{minted}"), D), DICT);
+                minted += 1;
+            }
+            assert_eq!(add(EMPTY, "one-data-key-too-many", D), DICT);
+            // Existing transitions are still followed, and code keys still mint.
+            assert_ne!(add(node, "name", D), DICT);
+            drop(_scope);
+            assert_ne!(add(EMPTY, "a-code-key-after", D), DICT);
+        })
+        .join()
+        .expect("data-keys thread");
     }
 
     #[test]
