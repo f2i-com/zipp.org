@@ -11894,6 +11894,12 @@ impl Heap {
     /// still holds that string, else a fresh one, frozen because every holder
     /// of the handle shares it. Iterating non-ASCII text or slicing it a
     /// character at a time allocated one string per step.
+    ///
+    /// Out of line: inlined through `str_from_cp`/`str_from_unit` into the
+    /// interpreter loops' string arms, its body moved their register
+    /// allocation under PGO and halved the lite loop's leaf calls
+    /// (call_method 434 -> 811 ms interpreted) while plain builds were equal.
+    #[inline(never)]
     pub fn cp_str(&mut self, cp: u32) -> u32 {
         const CACHE: usize = 1024;
         let k = cp as usize & (CACHE - 1);
