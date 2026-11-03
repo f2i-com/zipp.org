@@ -1928,7 +1928,10 @@ impl<'p> Vm<'p> {
         // A function `replacer` is applied after `toJSON`: replacer(key, value)
         // with `this` = the holder. Its result is what gets serialized.
         let v = if self.is_callable(replacer) {
-            let kv = self.alloc_key_str(key.to_string());
+            let kv = match self.cached_key_str_front(key) {
+                Some(kv) => kv,
+                None => self.alloc_key_str(key.to_string()),
+            };
             self.call_value(replacer, holder, &[kv, v])?
         } else {
             v
@@ -2885,7 +2888,10 @@ impl<'p> Vm<'p> {
             walk?;
         }
         let context = self.make_json_context(src);
-        let kv = self.alloc_key_str(key.to_string());
+        let kv = match self.cached_key_str_front(key) {
+            Some(kv) => kv,
+            None => self.alloc_key_str(key.to_string()),
+        };
         self.call_value(reviver, holder, &[kv, val, context])
     }
 
