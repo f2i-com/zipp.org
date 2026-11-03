@@ -4857,10 +4857,15 @@ impl<'p> Vm<'p> {
     pub(crate) fn units_value(&mut self, units: &[u16]) -> Value {
         // One ASCII unit is an interned string (as `alloc_js` would pick):
         // `/./gu` over mostly-ASCII text slices one per match.
-        if let [u] = units {
-            if *u < 128 {
-                return Value::heap(u32::from(*u));
+        // One code point (a unit, or a surrogate pair) is the heap's cached
+        // one-character string: `/./gu` over text slices one per match.
+        match *units {
+            [u] => return self.str_from_cp(u32::from(u)),
+            [hi, lo] if (0xD800..0xDC00).contains(&hi) && (0xDC00..0xE000).contains(&lo) => {
+                let cp = 0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+                return self.str_from_cp(cp);
             }
+            _ => {}
         }
         // An ASCII slice of a non-ASCII subject (most tokens of mixed text):
         // its bytes are its units, with no WTF-8 encoding or rescan.

@@ -402,26 +402,17 @@ impl<'p> Vm<'p> {
     /// index): an interned slot for ASCII, else a fresh 1-unit string — a REAL
     /// lone-surrogate string when `u` is a surrogate half.
     pub(crate) fn str_from_unit(&mut self, u: u16) -> Value {
-        if u < 128 {
-            return Value::heap(u as u32);
-        }
-        Value::heap(
-            self.heap
-                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(u as u32))),
-        )
+        self.str_from_cp(u32::from(u))
     }
 
     /// The string Value for code point `cp` (for-of / iterator steps): an
-    /// interned slot for ASCII, else a fresh 1-code-point string (`cp` may be
-    /// a lone surrogate).
+    /// interned slot for ASCII, else the heap's cached 1-code-point string
+    /// (`cp` may be a lone surrogate).
     pub(crate) fn str_from_cp(&mut self, cp: u32) -> Value {
         if cp < 128 {
             return Value::heap(cp);
         }
-        Value::heap(
-            self.heap
-                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(cp))),
-        )
+        Value::heap(self.heap.cp_str(cp))
     }
 
     /// Allocate the receiver substring corresponding to subslice `t` of the
@@ -1421,6 +1412,30 @@ impl<'p> Vm<'p> {
                     return Ok(Some(Value::heap(self.heap.alloc_js(js))));
                 }
                 use crate::unorm::{nfc, nfd, nfkc, nfkd};
+                // ASCII is in every normalization form: no ASCII character has
+                // a decomposition or composes, and strings are values, so the
+                // receiver is the result.
+                if js_recv.is_ascii() {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                // A short receiver is normalized once and admitted after: the
+                // longest expansion (a compatibility decomposition, U+FDFA's 18
+                // characters from one) keeps the result a small allocation to
+                // make before the size check. Longer ones are measured first.
+                if s.len() <= CASE_MAP_ONE_PASS_BYTES {
+                    let mut out = String::with_capacity(s.len() + (s.len() >> 2));
+                    match form.as_str() {
+                        "NFC" => extend_chars(&mut out, nfc(s)),
+                        "NFD" => extend_chars(&mut out, nfd(s)),
+                        "NFKC" => extend_chars(&mut out, nfkc(s)),
+                        _ => extend_chars(&mut out, nfkd(s)),
+                    }
+                    if out == s {
+                        return Ok(Some(Value::heap(idx)));
+                    }
+                    self.preflight_guest_string_size(out.len())?;
+                    return Ok(Some(self.alloc_str(out)));
+                }
                 let out_len = match form.as_str() {
                     "NFC" => checked_char_output_len(nfc(s))?,
                     "NFD" => checked_char_output_len(nfd(s))?,
@@ -1747,6 +1762,7 @@ impl<'p> Vm<'p> {
                         // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
                         let from = pos + usize::from(lo != hi);
                         let at = from + crate::heap::wtf8_units(&hay.as_bytes()[hi..hi + b]);
+                        hay.note_boundary(at, hi + b);
                         Value::int(at as i32)
                     }
                     None => Value::int(-1),
@@ -1782,6 +1798,7 @@ impl<'p> Vm<'p> {
                             // `lo` is unit `pos`, or `pos - 1` inside a pair.
                             let lo_unit = pos - usize::from(lo != hi);
                             let at = lo_unit - crate::heap::wtf8_units(&hay.as_bytes()[b..lo]);
+                            hay.note_boundary(at, b);
                             Value::int(at as i32)
                         }
                     }

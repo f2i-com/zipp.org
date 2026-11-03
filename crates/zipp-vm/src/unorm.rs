@@ -328,6 +328,16 @@ impl<'a> Decompositions<'a> {
     /// The next character with its canonical combining class.
     #[inline]
     fn next_classed(&mut self) -> Option<(u8, char)> {
+        // An ASCII character with nothing buffered: a starter with no
+        // decomposition in any form, given out as it is read.
+        if self.ready == 0 && self.buffer.is_empty() {
+            if let Some(&b) = self.source.as_str().as_bytes().first() {
+                if b < 0x80 {
+                    self.source.next();
+                    return Some((0, char::from(b)));
+                }
+            }
+        }
         while self.ready == 0 {
             let Some(c) = self.source.next() else {
                 if self.buffer.is_empty() {

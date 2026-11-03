@@ -5380,16 +5380,48 @@ impl JsStr {
         } else {
             (units, self.bytes.len())
         };
-        if pos.abs_diff(i) > SEEK_MARKS_DISTANCE {
-            let marks = self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes)));
-            if let Some(&m) = marks.get(i / SEEK_MARK_STRIDE) {
+        let dist = pos.abs_diff(i);
+        if dist > SEEK_MARK_STRIDE {
+            // Made once a walk would be long; once made, the nearer of the
+            // mark and the memo (a search that found a match leaves the memo
+            // there, up to SEEK_MARKS_DISTANCE from the next start).
+            let marks = if dist > SEEK_MARKS_DISTANCE {
+                Some(&**self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes))))
+            } else {
+                self.marks.get().map(|m| &**m)
+            };
+            if let Some(&m) = marks.and_then(|marks| marks.get(i / SEEK_MARK_STRIDE)) {
                 // At or before `i`, by at most a stride and a pair.
-                (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+                if i - ((m >> 32) as usize) < dist {
+                    (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+                }
             }
         }
+        // A lead byte gives both the sequence's length and its unit count (two
+        // for a 4-byte astral scalar), so the walk decodes nothing, and an
+        // ASCII stretch is crossed eight bytes at a time.
+        let bytes: &[u8] = &self.bytes;
         while pos < i {
-            let (cp, blen) = wtf8_decode(&self.bytes, bi);
-            let n = cp_units(cp);
+            if i - pos >= 8 {
+                if let Some(word) = bytes.get(bi..bi + 8) {
+                    let word = u64::from_le_bytes(word.try_into().unwrap_or([0x80; 8]));
+                    if word & 0x8080_8080_8080_8080 == 0 {
+                        pos += 8;
+                        bi += 8;
+                        continue;
+                    }
+                }
+            }
+            let b0 = bytes[bi];
+            let (blen, n) = if b0 < 0x80 {
+                (1, 1)
+            } else if b0 < 0xE0 {
+                (2, 1)
+            } else if b0 < 0xF0 {
+                (3, 1)
+            } else {
+                (4, 2)
+            };
             if pos + n > i {
                 // `i` addresses the trail half of this astral scalar.
                 break;
@@ -5399,14 +5431,25 @@ impl JsStr {
         }
         while pos > i {
             bi -= 1;
-            while self.bytes[bi] & 0xC0 == 0x80 {
+            while bytes[bi] & 0xC0 == 0x80 {
                 bi -= 1;
             }
-            let (cp, _) = wtf8_decode(&self.bytes, bi);
-            pos -= cp_units(cp);
+            pos -= 1 + usize::from(bytes[bi] >= 0xF0);
         }
         self.cursor.set(((pos as u64) << 32) | bi as u64);
         (pos, bi)
+    }
+
+    /// Leave the position memo at a code-point boundary the caller has just
+    /// found: unit `pos` starts at byte `byte`. A find-all loop's next
+    /// `indexOf(needle, at + 1)` then seeks one step instead of walking from
+    /// where the previous search started. No-op on ASCII (no memo needed).
+    #[inline]
+    pub fn note_boundary(&self, pos: usize, byte: usize) {
+        if !self.ascii && pos <= self.units as usize && byte <= self.bytes.len() {
+            debug_assert!(byte == self.bytes.len() || self.bytes[byte] & 0xC0 != 0x80);
+            self.cursor.set(((pos as u64) << 32) | byte as u64);
+        }
     }
 
     /// Locate unit position `i`: the code point containing it and `i`'s offset
@@ -7385,6 +7428,11 @@ pub struct Heap {
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
     versions: Vec<u32>,
+    /// One-code-point strings handed out by [`Heap::cp_str`], direct-mapped by
+    /// code point: (code point, slot, the slot's version when cached). A slot
+    /// freed or reused since has another version, so a stale entry is seen
+    /// and replaced; the cache roots nothing. Empty until first used.
+    cp_strs: Vec<(u32, u32, u32)>,
     /// B244: one coarse invalidation epoch for emitted dense-Array snapshots.
     ///
     /// A native region may hold an Array's raw `Vec<Value>` base and length in
@@ -8452,6 +8500,7 @@ impl Heap {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             gen_raw: 0,
             versions,
+            cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
             free: Vec::new(),
@@ -11838,6 +11887,32 @@ impl Heap {
     #[inline]
     pub fn version_of(&self, idx: u32) -> u32 {
         self.versions[idx as usize]
+    }
+
+    /// The string of the one code point `cp` (at or above 128; a lone
+    /// surrogate's own value is a code point here): the cached slot while it
+    /// still holds that string, else a fresh one, frozen because every holder
+    /// of the handle shares it. Iterating non-ASCII text or slicing it a
+    /// character at a time allocated one string per step.
+    pub fn cp_str(&mut self, cp: u32) -> u32 {
+        const CACHE: usize = 1024;
+        let k = cp as usize & (CACHE - 1);
+        if let Some(&(c, idx, version)) = self.cp_strs.get(k) {
+            if c == cp
+                && self.versions.get(idx as usize) == Some(&version)
+                && matches!(self.objs.get(idx as usize), Some(HeapObj::Str(_)))
+            {
+                return idx;
+            }
+        }
+        let mut js = JsStr::from_code_point(cp);
+        js.freeze_shared();
+        let idx = self.alloc(HeapObj::Str(js));
+        if self.cp_strs.is_empty() {
+            self.cp_strs = vec![(u32::MAX, 0, 0); CACHE];
+        }
+        self.cp_strs[k] = (cp, idx, self.versions[idx as usize]);
+        idx
     }
 
     #[inline]
