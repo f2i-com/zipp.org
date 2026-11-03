@@ -1261,7 +1261,7 @@ impl<'p> Vm<'p> {
     /// compiler's AST) took that whole call on most reads. `None` for
     /// anything else, which goes on to the call.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-    #[inline]
+    #[inline(never)]
     pub(crate) fn ic_get_prop_mega(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
         // A private name is its brand's, never a string key's that spells it.
         if !recv.is_heap()
@@ -1565,9 +1565,16 @@ impl<'p> Vm<'p> {
     /// (`ic_get_acc_tail`). Each went to the full `ic_get_prop` call once
     /// this hit and the prototype probe had missed: an object literal's
     /// getter took 31 ns a read against QuickJS's 22.
+    ///
+    /// A shaped receiver at a site that has found its key as an own data
+    /// property, in a layout none of this answers, asks the (shape, key) memo
+    /// here (`ic_get_memo_tail`): such a read (`node.flags` over a compiler's
+    /// AST, up to a third of a bundle's) came to it only after the dispatch
+    /// arm's other probes and the `ic_get_prop` call, where no other read
+    /// pays for the question.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    pub(crate) fn ic_get_prop_way0(&self, func_id: u32, ip: usize, recv: Value) -> GetAct {
+    pub(crate) fn ic_get_prop_way0(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
         if !recv.is_heap() {
             return GetAct::None;
         }
@@ -1586,27 +1593,45 @@ impl<'p> Vm<'p> {
             // SAFETY: as in `ic_get_prop_own_hit`.
             return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
         }
-        let Some(site) = cell.site.as_deref() else {
-            return GetAct::None;
-        };
-        if site.n == 0 {
-            return GetAct::None;
-        }
-        match site.entries[0] {
-            IcEntry::OwnData { shape, slot } if shape == mir.shape => {
-                // SAFETY: as in `ic_get_prop_own_hit`.
-                GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) })
-            }
-            IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
-                match self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape) {
-                    Some(v) => GetAct::Value(v),
-                    None => GetAct::None,
+        let knows_own = cell.knows_own();
+        let act = match cell.site.as_deref() {
+            Some(site) if site.n != 0 => match site.entries[0] {
+                IcEntry::OwnData { shape, slot } if shape == mir.shape => {
+                    // SAFETY: as in `ic_get_prop_own_hit`.
+                    return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
                 }
-            }
-            IcEntry::OwnAcc { .. } | IcEntry::ProtoAcc { .. } | IcEntry::ClassGetter { .. } | IcEntry::ClassMethod { .. } => {
-                self.ic_get_acc_tail(recv.heap_index(), &site.entries[0], mir.shape, mir.vals)
-            }
+                IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+                    match self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape) {
+                        Some(v) => GetAct::Value(v),
+                        None => GetAct::None,
+                    }
+                }
+                IcEntry::OwnAcc { .. }
+                | IcEntry::ProtoAcc { .. }
+                | IcEntry::ClassGetter { .. }
+                | IcEntry::ClassMethod { .. } => {
+                    self.ic_get_acc_tail(recv.heap_index(), &site.entries[0], mir.shape, mir.vals)
+                }
+                _ => GetAct::None,
+            },
             _ => GetAct::None,
+        };
+        if knows_own && matches!(act, GetAct::None) {
+            return self.ic_get_memo_tail(func_id, ip, recv, name);
+        }
+        act
+    }
+
+    /// [`Self::ic_get_prop_way0`]'s question to the (shape, key) memo. Out of
+    /// line: the loop keeps its one call, and `name`'s text, the first load
+    /// of a read that gets here, is read only if one does.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_get_memo_tail(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        match self.ic_get_prop_mega(func_id, ip, recv, key) {
+            Some(v) => GetAct::Value(v),
+            None => GetAct::None,
         }
     }
 
@@ -2124,6 +2149,18 @@ impl<'p> Vm<'p> {
         (!v.is_uninitialized()).then_some((v, slot))
     }
 
+    /// [`Self::ic_get_prop`] after the (shape, key) memo, for the lite loop,
+    /// whose arm stays one call (`ic_get_prop_mega`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn ic_get_prop_memo_first(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> GetAct {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if let Some(v) = self.ic_get_prop_mega(func_id, ip, recv, key) {
+            return GetAct::Value(v);
+        }
+        self.ic_get_prop(func_id, ip, recv, key)
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     ///
     /// The safe profile's dispatch loop takes it inline. Left to the
@@ -2139,15 +2176,6 @@ impl<'p> Vm<'p> {
         recv: Value,
         key: &str,
     ) -> GetAct {
-        // A field read through more layouts than the inline hits keep: the
-        // mirror and the (shape, key) memo before this call's site probe and
-        // the receiver's map (`ic_get_prop_mega`), here rather than as its own
-        // step in the dispatch loops, where every read the hits missed paid
-        // its call whether or not it could answer.
-        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-        if let Some(v) = self.ic_get_prop_mega(func_id, ip, recv, key) {
-            return GetAct::Value(v);
-        }
         // Receiver guards + own-`pos` are entry-independent: derive ONCE per
         // probe (a 4-way site otherwise pays the heap fetch + key scan per
         // entry). The site is fetched once for both probe and disable check.

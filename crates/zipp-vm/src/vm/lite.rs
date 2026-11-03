@@ -1626,7 +1626,7 @@ impl<'p> Vm<'p> {
                         }
                         hand_over!();
                     }
-                    match self.ic_get_prop(func_id, ip, o, key) {
+                    match self.ic_get_prop_memo_first(func_id, ip, o, key) {
                         GetAct::Value(v) => {
                             self.set(base, dst, v);
                             ip += 1;

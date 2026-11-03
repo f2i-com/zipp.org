@@ -3596,7 +3596,7 @@ impl<'p> Vm<'p> {
                         // `ic_get_prop` call further down. A getter way 0
                         // names is called from here as that call's would be.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        match self.ic_get_prop_way0(func_id, ip, o) {
+                        match self.ic_get_prop_way0(func_id, ip, o, name) {
                             GetAct::Value(v) => {
                                 self.set(base, dst, v);
                                 ip += 1;
@@ -3641,6 +3641,21 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let key = running.string_constants[name as usize].as_str();
+                        // `.length` of a string, an Array or a TypedArray is
+                        // an internal slot, not a property the shape-keyed IC
+                        // can hold, so every such read used to fall through
+                        // the IC miss and the generic member walk: ~26ns on a
+                        // string or Array and ~45ns on a TypedArray, against
+                        // ~6ns for a cached field. It is the bound of nearly
+                        // every loop, and a fifth of a bundle's reads, so
+                        // answer it before any probe.
+                        if key.len() == 6 && key == "length" && o.is_heap() {
+                            if let Some(v) = self.length_fast(o) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // A private name the own hit did not answer (`private_get_slow`).
                         if is_private_key(key) {
                             if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
@@ -3660,20 +3675,6 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
-                        }
-                        // `.length` of a string, an Array or a TypedArray is
-                        // an internal slot, not a property the shape-keyed IC
-                        // can hold, so every such read used to fall through
-                        // the IC miss and the generic member walk: ~26ns on a
-                        // string or Array and ~45ns on a TypedArray, against
-                        // ~6ns for a cached field. It is the bound of nearly
-                        // every loop, so answer it before the IC.
-                        if key.len() == 6 && key == "length" && o.is_heap() {
-                            if let Some(v) = self.length_fast(o) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
                         }
                         // A receiver with no shape (an Array, a string, a
                         // DataView, a Map or Set, a promise) can never hit the
@@ -4872,7 +4873,7 @@ impl<'p> Vm<'p> {
                             // and owner's method search below were two thirds
                             // of a `this.#m()` call.
                             #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv) {
+                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv, name) {
                                 if let Some((fid, closure)) = self.plain_fn_entry(f) {
                                     self.setup_call_lean_this(
                                         fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, f,
