@@ -1019,6 +1019,13 @@ fn slim_exec_enabled() -> bool {
     }
 }
 
+#[cfg(not(feature = "safe-sandbox"))]
+env_off_switch!(
+    /// `ZIPP_NO_REGEXP_MATCH_FAST=1` sends every global `@@match` back
+    /// through the per-match RegExpExec loop (`Vm::regexp_match_global_fast`).
+    fn regexp_match_fast_enabled() = "ZIPP_NO_REGEXP_MATCH_FAST"
+);
+
 /// Short-subject ASCII execs a RegExp runs on its base program before its
 /// byte-optimized twin is built (`Vm::ensure_regexp_ascii_twin_deferred`).
 const TWIN_DEFER_EXECS: u8 = 3;
@@ -2548,6 +2555,10 @@ impl<'p> Vm<'p> {
         // ToString(Get(rx,"flags")); a non-global match is just RegExpExec; a global
         // match loops RegExpExec (honouring a user `exec`) collecting ToString(Get(
         // result,"0")), resets lastIndex first, and advances past an empty match.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(v) = self.regexp_match_global_fast(re, input)? {
+            return Ok(v);
+        }
         let rx = Value::heap(re);
         let flags_v = self.get_prop(rx, "flags")?;
         #[cfg(feature = "safe-sandbox")]
@@ -2631,6 +2642,283 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
     }
 
+    /// The global `@@match` loop in one engine scan, when nothing in it is
+    /// observable: a real RegExp, global and not sticky, whose `flags` reads
+    /// and `exec` are the intrinsics, with a writable `lastIndex`, matched
+    /// against a string (ToString is the identity). The generic loop then runs
+    /// RegExpBuiltinExec once per match: a result array with its side record,
+    /// the statics, a `"0"` read and a `lastIndex` round trip each time, about
+    /// 130 ns per match where this keeps only the slice. The scan is the one
+    /// `regex_replace` takes: the engine's own iterator advances past an empty
+    /// match exactly as AdvanceStringIndex does (one element, a code point
+    /// under `u`/`v`). `lastIndex` ends at 0 either way (the final failed
+    /// exec resets it), and the statics name the last match, as the loop's
+    /// last successful exec leaves them. `None` declines before any effect.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regexp_match_global_fast(&mut self, re: u32, input: Value) -> Result<Option<Value>, Thrown> {
+        if !regexp_match_fast_enabled()
+            || !input.is_heap()
+            || !matches!(
+                self.heap.get(input.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let unicode = match self.heap.get(re) {
+            HeapObj::RegExp(r) => {
+                let f = r.core.flags.as_bytes();
+                if !f.contains(&b'g') || f.contains(&b'y') {
+                    return Ok(None);
+                }
+                f.contains(&b'u') || f.contains(&b'v')
+            }
+            _ => return Ok(None),
+        };
+        if !self.regexp_exec_fast_ok(re)
+            || !self.regexp_last_index_writable(re)
+            || !self.regexp_pristine_flag_accessors_ok(re, Value::heap(re))
+        {
+            return Ok(None);
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        let s_idx = input.heap_index();
+        self.heap.flatten(s_idx);
+        let _gc = self.gc_lock_guard();
+        self.regexp_write_last_index(re, Value::int(0))?;
+        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+            _ => (false, 0),
+        };
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut last: Option<regress::Match> = None;
+        let u16s: Vec<u16> = if is_ascii {
+            self.ensure_regexp_ascii_twin_deferred(re, ascii_units);
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = match r.ascii_twin.get() {
+                    Some(Some(twin)) => &**twin,
+                    _ => &*r.regex,
+                };
+                for m in regex.find_from_ascii(subj, 0) {
+                    ranges.push(m.range());
+                    last = Some(m);
+                }
+            }
+            Vec::new()
+        } else {
+            let u16s = self.regex_subject_units_take(input);
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = &r.core.regex;
+                if unicode {
+                    for m in regex.find_from_utf16(&u16s, 0) {
+                        ranges.push(m.range());
+                        last = Some(m);
+                    }
+                } else {
+                    for m in regex.find_from_ucs2(&u16s, 0) {
+                        ranges.push(m.range());
+                        last = Some(m);
+                    }
+                }
+            }
+            u16s
+        };
+        // The generic loop runs one more exec than it finds matches.
+        self.preflight_native_iteration_work(ranges.len() as u64 + 1)?;
+        let subj_units = if is_ascii { ascii_units } else { u16s.len() };
+        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+            if is_ascii {
+                vm.ascii_slice_value(s_idx, r)
+            } else {
+                vm.units_value(&u16s[r])
+            }
+        };
+        let result = match last {
+            None => Value::NULL,
+            Some(m) => {
+                let mut elems: Vec<Value> = Vec::new();
+                elems.try_reserve_exact(ranges.len()).map_err(|_| {
+                    Thrown::from_static("RangeError: RegExp match-result allocation failed")
+                })?;
+                for r in ranges {
+                    elems.push(mk(self, r));
+                }
+                let defer = subj_units <= u32::MAX as usize;
+                self.regexp_record_statics(
+                    &m,
+                    input,
+                    s_idx,
+                    m.start(),
+                    m.end(),
+                    subj_units,
+                    defer,
+                    is_ascii,
+                    &mk,
+                );
+                Value::heap(self.heap.alloc(HeapObj::Array(elems)))
+            }
+        };
+        if !is_ascii {
+            self.regex_subject_units_put(input, u16s);
+        }
+        Ok(Some(result))
+    }
+
+    /// `@@split` in one engine scan, when nothing in it is observable: the
+    /// receiver passes `regexp_matchall_fast_ok` (so SpeciesConstructor finds
+    /// %RegExp%, the `flags` reads are the intrinsics, IsRegExp inside the
+    /// splitter's construction reads the intrinsic `@@match`, and `exec` is
+    /// the intrinsic), the subject is a string and `limit` is undefined or a
+    /// number (no ToUint32 user code). The generic loop builds a sticky
+    /// splitter and then one result array per piece; the scan keeps none of
+    /// it. Its matches are the splitter's: the search from `q` finds the first
+    /// position whose sticky attempt succeeds (the `ITFB_SPLIT_SCAN`
+    /// argument), the engine's step past an empty match is AdvanceStringIndex,
+    /// a match starting at the end is never tried (`q < size`), and an empty
+    /// match where the piece starts (`e == p`) is skipped as the spec skips
+    /// it. The statics name the last successful attempt. `None` declines
+    /// before any effect.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regexp_split_scan(
+        &mut self,
+        re: u32,
+        input: Value,
+        limit: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        if !regexp_match_fast_enabled()
+            || !(limit.is_undefined() || limit.is_number())
+            || !input.is_heap()
+            || !matches!(
+                self.heap.get(input.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+            || !matches!(self.heap.get(re), HeapObj::RegExp(_))
+            || !self.regexp_matchall_fast_ok(re)
+        {
+            return Ok(None);
+        }
+        let unicode = match self.heap.get(re) {
+            HeapObj::RegExp(r) => {
+                let f = r.core.flags.as_bytes();
+                f.contains(&b'u') || f.contains(&b'v')
+            }
+            _ => return Ok(None),
+        };
+        let lim: u64 = if limit.is_undefined() {
+            u32::MAX as u64
+        } else {
+            to_uint32(limit.as_f64()) as u64
+        };
+        if lim == 0 {
+            return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())))));
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        let s_idx = input.heap_index();
+        self.heap.flatten(s_idx);
+        let _gc = self.gc_lock_guard();
+        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+            _ => (false, 0),
+        };
+        let mut found: Vec<regress::Match> = Vec::new();
+        let u16s: Vec<u16> = if is_ascii {
+            self.ensure_regexp_ascii_twin_deferred(re, ascii_units);
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = match r.ascii_twin.get() {
+                    Some(Some(twin)) => &**twin,
+                    _ => &*r.regex,
+                };
+                if ascii_units == 0 {
+                    found.extend(regex.match_at_ascii(subj, 0));
+                } else {
+                    found.extend(regex.find_from_ascii(subj, 0).take_while(|m| m.start() < ascii_units));
+                }
+            }
+            Vec::new()
+        } else {
+            let u16s = self.regex_subject_units_take(input);
+            let size = u16s.len();
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = &r.core.regex;
+                if unicode {
+                    found.extend(regex.find_from_utf16(&u16s, 0).take_while(|m| m.start() < size));
+                } else {
+                    found.extend(regex.find_from_ucs2(&u16s, 0).take_while(|m| m.start() < size));
+                }
+            }
+            u16s
+        };
+        let size = if is_ascii { ascii_units } else { u16s.len() };
+        // One exec per match plus the failed one that ends the generic loop.
+        self.preflight_native_iteration_work(found.len() as u64 + 1)?;
+        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+            if is_ascii {
+                vm.ascii_slice_value(s_idx, r)
+            } else {
+                vm.units_value(&u16s[r])
+            }
+        };
+        let mut a: Vec<Value> = Vec::new();
+        // The last successful exec: the match the loop stopped at when `limit`
+        // ends it, else the last one (every match from `q < size` is tried).
+        let mut last = found.len().checked_sub(1);
+        if size == 0 {
+            // One sticky attempt at 0: a match leaves the result empty.
+            if found.is_empty() {
+                a.push(input);
+            }
+        } else {
+            let mut p = 0usize;
+            let mut done = false;
+            'scan: for (i, m) in found.iter().enumerate() {
+                let (q, e) = (m.start(), m.end().min(size));
+                if e == p {
+                    continue;
+                }
+                let piece = mk(self, p..q);
+                a.push(piece);
+                if a.len() as u64 == lim {
+                    done = true;
+                    last = Some(i);
+                    break;
+                }
+                p = e;
+                for cap in &m.captures {
+                    let v = match cap {
+                        Some(r) => mk(self, r.clone()),
+                        None => Value::UNDEFINED,
+                    };
+                    a.push(v);
+                    if a.len() as u64 == lim {
+                        done = true;
+                        last = Some(i);
+                        break 'scan;
+                    }
+                }
+            }
+            if !done {
+                let tail = mk(self, p..size);
+                a.push(tail);
+            }
+        }
+        if let Some(m) = last.map(|i| &found[i]) {
+            let defer = size <= u32::MAX as usize;
+            self.regexp_record_statics(m, input, s_idx, m.start(), m.end(), size, defer, is_ascii, &mk);
+        }
+        if !is_ascii {
+            self.regex_subject_units_put(input, u16s);
+        }
+        Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(a)))))
+    }
+
     /// RegExp.prototype[Symbol.split] core (simplified — no capture groups in the
     /// output yet). Shared by String.prototype.split for a regex separator.
     pub(crate) fn regexp_split_impl(
@@ -2644,6 +2932,10 @@ impl<'p> Vm<'p> {
         // loop calls RegExpExec (honouring a user `exec`) reading lastIndex/length/
         // captures via Get. Positions p/q/e are UTF-16 unit indices; the no-match
         // advance is spec AdvanceStringIndex (+2 over an astral pair in `u`/`v`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(v) = self.regexp_split_scan(re, input, limit)? {
+            return Ok(v);
+        }
         let rx = Value::heap(re);
         // ToString(string) — IDENTITY for a string value (exact WTF-8).
         let s_val = self.to_str_value(input)?;
@@ -4560,6 +4852,13 @@ impl<'p> Vm<'p> {
     /// lone surrogates round-trip exactly and a covered (high, low) pair
     /// recombines into its astral scalar (canonical form).
     pub(crate) fn units_value(&mut self, units: &[u16]) -> Value {
+        // One ASCII unit is an interned string (as `alloc_js` would pick):
+        // `/./gu` over mostly-ASCII text slices one per match.
+        if let [u] = units {
+            if *u < 128 {
+                return Value::heap(u32::from(*u));
+            }
+        }
         let mut out: Vec<u8> = Vec::with_capacity(units.len() * 3);
         push_units(&mut out, units);
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))

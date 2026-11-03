@@ -1965,6 +1965,12 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         let candidate = if Input::CODE_UNITS_ARE_BYTES {
             self.input.find_bytes(start, prefix_search)?
         } else {
+            #[cfg(feature = "utf16")]
+            match &self.matcher.re.unit_start {
+                Some(filter) => self.input.find_unit_start(start, filter)?,
+                None => start,
+            }
+            #[cfg(not(feature = "utf16"))]
             start
         };
         Some((candidate, None))

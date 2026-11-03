@@ -5610,10 +5610,17 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // in the object IC). A memoised `String.prototype` method that is still
     // its intrinsic is answered from the memo, ahead of the general walk
     // below; anything else continues to it.
-    if matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
-        if let Some(bits) = vm.str_proto_method_memo_bits(key) {
-            return bits;
+    match vm.heap.get(idx) {
+        HeapObj::Str(_) | HeapObj::Cons { .. } => {
+            if let Some(bits) = vm.str_proto_method_memo_bits(key) {
+                return bits;
+            }
         }
+        // A RegExp's `lastIndex` is a non-configurable own data property whose
+        // value lives in the struct (defineProperty writes it through), so
+        // the Get is the slot: a sticky lexer reads it once per token.
+        HeapObj::RegExp(re) if key == "lastIndex" => return re.last_index.bits(),
+        _ => {}
     }
 
     // RegExp/String direct calls are lowered as an exact Get before argument
@@ -6627,6 +6634,15 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         return 0;
     }
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
+    // `re.lastIndex = n`: while no defineProperty/freeze has recorded
+    // attributes for it, the property is the writable struct slot, so the Set
+    // is the store (the barrier ran above).
+    if key == "lastIndex" && !vm.arr_props.contains_key(&idx) {
+        if let HeapObj::RegExp(re) = vm.heap.get_mut(idx) {
+            re.last_index = Value::from_bits(val_bits);
+            return 0;
+        }
+    }
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
     // receivers: the same exclusions as the interpreter's SetProp IC.

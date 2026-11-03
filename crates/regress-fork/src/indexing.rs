@@ -135,6 +135,19 @@ where
         search: &Search,
     ) -> Option<Self::Position>;
 
+    /// PATCH (see startpredicate.rs `UnitFilter`): the first element boundary
+    /// at or after `pos` whose leading code unit passes `filter`, or None when
+    /// none does. Inputs whose elements are not UTF-16 units do not filter.
+    #[cfg(feature = "utf16")]
+    #[inline(always)]
+    fn find_unit_start(
+        &self,
+        pos: Self::Position,
+        _filter: &crate::startpredicate::UnitFilter,
+    ) -> Option<Self::Position> {
+        Some(pos)
+    }
+
     /// Peek at the char to the right of a position, without changing that position.
     #[inline(always)]
     fn peek_right(&self, mut pos: Self::Position) -> Option<Self::Element> {
@@ -1160,6 +1173,31 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         panic!("Should never be finding bytes for utf16");
     }
 
+    #[inline(always)]
+    fn find_unit_start(
+        &self,
+        pos: Self::Position,
+        filter: &crate::startpredicate::UnitFilter,
+    ) -> Option<Self::Position> {
+        let s = self.input;
+        let mut i = self.pos_to_offset(pos);
+        while let Some(&u) = s.get(i) {
+            if filter.contains(u) {
+                return Some(Self::Position::new(i));
+            }
+            // Step one element, as `next_right_pos` does: a combined
+            // surrogate pair is one code point, filtered by its first unit.
+            i += if self.combines_high_surrogate(u)
+                && s.get(i + 1).is_some_and(|&l| Self::is_low_surrogate(l))
+            {
+                2
+            } else {
+                1
+            };
+        }
+        None
+    }
+
     fn subrange_eq<Dir: Direction>(
         &self,
         _dir: Dir,
@@ -1357,6 +1395,18 @@ impl<'a> InputIndexer for Ucs2Input<'a> {
         _search: &Search,
     ) -> Option<Self::Position> {
         panic!("Should never be finding bytes for ucs2");
+    }
+
+    #[inline(always)]
+    fn find_unit_start(
+        &self,
+        pos: Self::Position,
+        filter: &crate::startpredicate::UnitFilter,
+    ) -> Option<Self::Position> {
+        let s = self.input;
+        let start = self.pos_to_offset(pos);
+        let i = s.get(start..)?.iter().position(|&u| filter.contains(u))?;
+        Some(Self::Position::new(start + i))
     }
 
     fn subrange_eq<Dir: Direction>(

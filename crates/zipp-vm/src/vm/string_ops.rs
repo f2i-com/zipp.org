@@ -978,6 +978,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.call_value(searcher, rxv, &[Value::heap(idx)])?))
             }
             "match" => {
+                // A RegExp whose `@@match` is the intrinsic data property (no own
+                // shadow, the prototype slot untouched): the Get is unobservable
+                // and the call is `regexp_match_impl`, without the generic call.
+                if let Some(re) = self.as_regexp(arg0) {
+                    if self.regexp_method_is_intrinsic(re, "@@match", native::REGEXP_SYM_MATCH) {
+                        return Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?));
+                    }
+                }
                 // An OBJECT regexp's `@@match` overrides the default (a real RegExp's
                 // RegExp.prototype[@@match] routes through the same regexp_match_impl);
                 // a primitive argument builds a RegExp. Mirrors `matchAll`.
