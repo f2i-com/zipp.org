@@ -5,6 +5,27 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Whether a function's own-property side table holds `@@hasInstance`, and
+/// whether it holds `prototype`: the two keys `instanceof` asks of a plain
+/// function. Side tables have no shape for the (shape, key) memo, so each
+/// `pos` scanned every key: two scans per test of an `instanceof` against a
+/// constructor with a few statics (a minifier's AST node classes, 2.95M tests
+/// in a run). One pass answers both; an indexed table keeps its lookups.
+fn own_has_instance_and_prototype(m: &crate::heap::ObjMap) -> (bool, bool) {
+    if m.is_indexed() {
+        return (m.pos("@@hasInstance").is_some(), m.pos("prototype").is_some());
+    }
+    let (mut has_instance, mut prototype) = (false, false);
+    for k in m.keys_iter() {
+        match k.len() {
+            13 => has_instance |= k == "@@hasInstance",
+            9 => prototype |= k == "prototype",
+            _ => {}
+        }
+    }
+    (has_instance, prototype)
+}
+
 /// Whether class `cc` has no own `@@hasInstance` (a static method, field or
 /// accessor), remembered by the shape of its `statics`
 /// (`ClassData::no_has_instance_shape`): every `instanceof` against a class
@@ -194,16 +215,21 @@ impl<'p> Vm<'p> {
         let ci = c.heap_index();
         let mut cur = ci;
         let mut chain_ok = false;
+        // Whether `c` itself, a function, has an own `prototype`, when the
+        // walk below already looked at its side table.
+        let mut ci_own_prototype = None;
         for _ in 0..64 {
             match self.heap.get(cur) {
                 HeapObj::Func(_) | HeapObj::Closure { .. } => {
-                    if self
-                        .fn_props
-                        .get(&cur)
-                        .is_some_and(|m| m.pos("@@hasInstance").is_some())
-                        || self.proto_of.has(cur)
-                    {
+                    let (has_instance, prototype) = match self.fn_props.get(&cur) {
+                        Some(m) => own_has_instance_and_prototype(m),
+                        None => (false, false),
+                    };
+                    if has_instance || self.proto_of.has(cur) {
                         return None;
+                    }
+                    if cur == ci {
+                        ci_own_prototype = Some(prototype);
                     }
                     chain_ok = true;
                     break;
@@ -240,10 +266,9 @@ impl<'p> Vm<'p> {
             let f = self.func(fid as usize);
             if f.non_constructable
                 || f.lexical_this
-                || self
-                    .fn_props
-                    .get(&ci)
-                    .is_some_and(|m| m.pos("prototype").is_some())
+                || ci_own_prototype.unwrap_or_else(|| {
+                    self.fn_props.get(&ci).is_some_and(|m| m.pos("prototype").is_some())
+                })
             {
                 return None;
             }
