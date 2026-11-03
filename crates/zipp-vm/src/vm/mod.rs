@@ -3598,6 +3598,22 @@ pub struct Vm<'p> {
     ta_len_base: (u32, u32, u64),
     ta_len_kind_ver: [u32; 12],
     ta_len_kinds: u16,
+    /// The prototype half of `ta.<method>` (`Vm::ta_proto_method_read`),
+    /// memoized like `ta_len_*`: per kind, the version of its prototype when
+    /// it was last proved to shadow no `%TypedArray%.prototype` method and to
+    /// inherit from %TypedArray%.prototype% (valid while its bit in
+    /// `ta_meth_kinds` is set); per method (its `TA_PROTO_METHODS`
+    /// position), the version of %TypedArray%.prototype% and the slot its
+    /// name was found at. Slot values are re-read on every use.
+    ta_meth_kind_ver: [u32; 12],
+    ta_meth_kinds: u16,
+    ta_meth_slots: Box<[(u32, u32)]>,
+    /// The prototype half of `ta_species_default`, per kind: the versions of
+    /// the kind's prototype, its constructor and %TypedArray% when proved,
+    /// then the prototype's `constructor` slot and %TypedArray%'s `@@species`
+    /// slot (their values re-read on every use). `u32::MAX` versions: not
+    /// proved.
+    ta_species_memo: [(u32, u32, u32, u32, u32); 12],
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer

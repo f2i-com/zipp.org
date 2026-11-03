@@ -782,6 +782,10 @@ impl<'p> Vm<'p> {
             ta_len_base: (0, 0, 0),
             ta_len_kind_ver: [0; 12],
             ta_len_kinds: 0,
+            ta_meth_kind_ver: [0; 12],
+            ta_meth_kinds: 0,
+            ta_meth_slots: vec![(u32::MAX, 0); crate::vm::native::TA_PROTO_METHODS.len()].into_boxed_slice(),
+            ta_species_memo: [(u32::MAX, u32::MAX, u32::MAX, 0, 0); 12],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

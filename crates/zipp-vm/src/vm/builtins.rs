@@ -1047,6 +1047,8 @@ impl<'p> Vm<'p> {
             }
             // `dv.getUint32` on a default-constructed DataView.
             HeapObj::DataView { .. } => return self.dataview_proto_read(idx, name),
+            // `ta.subarray` on a view with its kind's intrinsic chain.
+            HeapObj::TypedArray { .. } => return self.ta_proto_method_read(idx, name),
             _ => return None,
         };
         self.proto_intrinsic_bits(name, is_arr)
@@ -3068,7 +3070,14 @@ impl<'p> Vm<'p> {
     /// %TypedArray%'s `@@species` the intrinsic getter (which returns
     /// `this`). Its two Gets would read exactly those and run nothing else,
     /// so a caller may skip them for the default path.
-    fn ta_species_default(&self, idx: u32, kind: u8) -> bool {
+    ///
+    /// The prototype half is memoized per kind (`ta_species_memo`): the
+    /// versions of the kind's prototype, its constructor and %TypedArray%
+    /// cover every key add, delete, redefinition and `setPrototypeOf`; the
+    /// two slots' values are re-read on every use, since an in-place
+    /// overwrite advances no version. `subarray` and `slice` asked the three
+    /// objects for their keys by name on every call.
+    fn ta_species_default(&mut self, idx: u32, kind: u8) -> bool {
         let (proto, ctor, base) = (self.ta_protos[kind as usize], self.ta_ctors[kind as usize], self.ta_base_ctor);
         if proto == 0 || ctor == 0 || base == 0 {
             return false;
@@ -3076,9 +3085,32 @@ impl<'p> Vm<'p> {
         if !self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos("constructor").is_some()) {
             return false;
         }
-        if self.proto_of.get_copied(idx) != Some(Value::heap(proto))
-            || self.proto_of.get_copied(ctor) != Some(Value::heap(base))
-        {
+        if self.proto_of.get_copied(idx) != Some(Value::heap(proto)) {
+            return false;
+        }
+        let vers = (self.heap.version_of(proto), self.heap.version_of(ctor), self.heap.version_of(base));
+        let species_getter = |vm: &Self, bm: &crate::heap::ObjMap, s: usize| {
+            let g = bm.val_at(s);
+            bm.attr_at(s).accessor
+                && g.is_heap()
+                && matches!(vm.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
+        };
+        if let Some(&(pv, cv, bv, cs, ss)) = self.ta_species_memo.get(kind as usize) {
+            if (pv, cv, bv) == vers {
+                if let (HeapObj::Object(pm), HeapObj::Object(bm)) = (self.heap.get(proto), self.heap.get(base)) {
+                    let (cs, ss) = (cs as usize, ss as usize);
+                    if cs < pm.slot_len()
+                        && ss < bm.slot_len()
+                        && !pm.attr_at(cs).accessor
+                        && pm.val_at(cs) == Value::heap(ctor)
+                        && species_getter(self, bm, ss)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if self.proto_of.get_copied(ctor) != Some(Value::heap(base)) {
             return false;
         }
         let (HeapObj::Object(pm), HeapObj::Object(cm), HeapObj::Object(bm)) =
@@ -3086,14 +3118,20 @@ impl<'p> Vm<'p> {
         else {
             return false;
         };
-        pm.pos("constructor").is_some_and(|s| !pm.attr_at(s).accessor && pm.val_at(s) == Value::heap(ctor))
-            && cm.pos("@@species").is_none()
-            && bm.pos("@@species").is_some_and(|s| {
-                let g = bm.val_at(s);
-                bm.attr_at(s).accessor
-                    && g.is_heap()
-                    && matches!(self.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
-            })
+        let Some(cs) = pm.pos("constructor").filter(|&s| !pm.attr_at(s).accessor && pm.val_at(s) == Value::heap(ctor))
+        else {
+            return false;
+        };
+        if cm.pos("@@species").is_some() {
+            return false;
+        }
+        let Some(ss) = bm.pos("@@species").filter(|&s| species_getter(self, bm, s)) else {
+            return false;
+        };
+        if let Some(memo) = self.ta_species_memo.get_mut(kind as usize) {
+            *memo = (vers.0, vers.1, vers.2, cs as u32, ss as u32);
+        }
+        true
     }
 
     /// TypedArraySpeciesCreate(exemplar, «count»): the result TypedArray that

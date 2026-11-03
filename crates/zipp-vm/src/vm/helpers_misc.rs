@@ -5620,6 +5620,14 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         // value lives in the struct (defineProperty writes it through), so
         // the Get is the slot: a sticky lexer reads it once per token.
         HeapObj::RegExp(re) if key == "lastIndex" => return re.last_index.bits(),
+        // `ta.subarray` / `dv.setUint32`: the read half of a split method call
+        // on a view, which the object IC never fills. The interpreter's
+        // prototype proofs answer it; it went to the slow Get on every call.
+        HeapObj::TypedArray { .. } | HeapObj::DataView { .. } if key != "length" => {
+            if let Some(bits) = vm.proto_intrinsic_read(obj, key) {
+                return bits;
+            }
+        }
         _ => {}
     }
 

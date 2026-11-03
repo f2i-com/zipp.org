@@ -2730,6 +2730,10 @@ impl<'p> Vm<'p> {
     /// ToNumber (a BigInt or Symbol argument is a TypeError, per spec) - for
     /// String.prototype position/count arguments.
     pub(crate) fn to_integer_strict(&mut self, v: Value) -> Result<i64, Thrown> {
+        // An Int is already integral (`ta.set(src, at)`, `a.at(i)`).
+        if v.is_int() {
+            return Ok(v.as_int() as i64);
+        }
         let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Ok(0);

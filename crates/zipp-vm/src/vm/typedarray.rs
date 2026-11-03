@@ -76,6 +76,52 @@ impl TaInterpNumericView {
 /// `DV_PROTO_METHODS`: the kinds `dataview_get_kind` pairs with them.
 const DV_GET_KINDS: [u8; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
 
+/// The position of the `%TypedArray%.prototype` method `name` in
+/// `TA_PROTO_METHODS`, picked by the name's length and a byte or two and then
+/// confirmed by one compare (as `dataview_proto_slot` does). A scan of the
+/// table compared the name with up to 32 literals.
+#[inline]
+pub(crate) fn ta_proto_method_slot(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    let at = |i: usize| b.get(i).copied().unwrap_or(0);
+    let slot = match (b.len(), at(0)) {
+        (2, b'a') => 0,
+        (3, b'm') => 7,
+        (3, b's') => 23,
+        (4, b'j') => 1,
+        (4, b'f') if at(2) == b'n' => 9,
+        (4, b'f') => 17,
+        (4, b's') if at(2) == b'm' => 14,
+        (4, b's') => 21,
+        (4, b'k') => 24,
+        (4, b'w') => 30,
+        (5, b'e') => 13,
+        (5, b's') => 19,
+        (6, b'f') => 8,
+        (6, b'r') => 15,
+        (6, b'v') => 25,
+        (7, b'i') => 3,
+        (7, b'f') => 6,
+        (7, b'r') => 18,
+        (7, b'e') => 26,
+        (8, b't') if at(3) == b't' => 2,
+        (8, b't') => 29,
+        (8, b'i') => 5,
+        (8, b'f') => 11,
+        (8, b's') => 20,
+        (9, b'f') => 10,
+        (10, b'c') => 22,
+        (10, b'@') => 27,
+        (10, b't') => 28,
+        (11, b'l') => 4,
+        (11, b'r') => 16,
+        (13, b'f') => 12,
+        (14, b't') => 31,
+        _ => return None,
+    };
+    crate::heap::key_eq(name, native::TA_PROTO_METHODS.get(slot)?).then_some(slot)
+}
+
 /// The %DataView.prototype% entry of the accessor `name` (the slot
 /// `dataview_get_kind`, `dataview_set_kind` and `dataview_big_kind` give),
 /// picked by the name's length and two of its bytes and then confirmed by
@@ -418,6 +464,79 @@ impl<'p> Vm<'p> {
             }
         }
         Some(self.ta_effective_len(ta_idx).unwrap_or(0))
+    }
+
+    /// `ta.<name>` for a `%TypedArray%.prototype` method `name`: what a Get
+    /// finds when the view has no own `name` and its [[Prototype]] is its
+    /// kind's intrinsic prototype, which shadows no such method and inherits
+    /// from %TypedArray%.prototype%: that prototype's slot, read in place.
+    /// `None` (an accessor there, an own shadow, a subclass instance, another
+    /// realm's view, a name that is not such a method) sends the caller to
+    /// the ordinary lookup. The view has no shape for the property cache, so
+    /// `ta.subarray` walked the chain and searched both prototypes by name on
+    /// every read, after trying the name as a numeric index.
+    ///
+    /// The prototype half is memoized under versions as `ta_length_fast`'s
+    /// is (`ta_meth_kind_ver` per kind, `ta_meth_slots` per method); the
+    /// slot's value is re-read on every use, since an in-place overwrite
+    /// advances no version.
+    pub(crate) fn ta_proto_method_read(&mut self, ta_idx: u32, name: &str) -> Option<u64> {
+        let method = ta_proto_method_slot(name)?;
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind as usize,
+            _ => return None,
+        };
+        let want_proto = match self.ta_protos.get(kind) {
+            Some(&p) if p != 0 => p,
+            _ => return None,
+        };
+        let base = self.ta_base_proto;
+        if base == 0
+            || kind >= self.ta_meth_kind_ver.len()
+            || (!self.arr_props.is_empty()
+                && self.arr_props.get(&ta_idx).is_some_and(|m| m.pos(name).is_some()))
+            || !matches!(
+                self.proto_of.get(&ta_idx),
+                Some(v) if v.is_heap() && v.heap_index() == want_proto
+            )
+        {
+            return None;
+        }
+        // The kind's prototype: proved once per version to carry none of the
+        // method names and to inherit from %TypedArray%.prototype%.
+        if self.ta_meth_kinds & (1 << kind) == 0 || self.ta_meth_kind_ver[kind] != self.heap.version_of(want_proto) {
+            let clean = match self.heap.get(want_proto) {
+                HeapObj::Object(m) => native::TA_PROTO_METHODS.iter().all(|n| m.pos(n).is_none()),
+                _ => false,
+            } && matches!(
+                self.proto_of.get_copied(want_proto),
+                Some(v) if v.is_heap() && v.heap_index() == base
+            );
+            if !clean {
+                return None;
+            }
+            self.ta_meth_kind_ver[kind] = self.heap.version_of(want_proto);
+            self.ta_meth_kinds |= 1 << kind;
+        }
+        let base_ver = self.heap.version_of(base);
+        let (ver, slot) = self.ta_meth_slots.get(method).copied()?;
+        let HeapObj::Object(m) = self.heap.get(base) else {
+            return None;
+        };
+        let slot = if ver == base_ver && (slot as usize) < m.slot_len() {
+            slot as usize
+        } else {
+            let s = m.pos(name)?;
+            self.ta_meth_slots[method] = (base_ver, s as u32);
+            s
+        };
+        let HeapObj::Object(m) = self.heap.get(base) else {
+            return None;
+        };
+        if m.is_accessor_at(slot) {
+            return None;
+        }
+        m.val_get_ref(slot).map(|v| v.bits())
     }
 
     /// `o.length` for the receivers whose length is an internal slot rather
@@ -1519,7 +1638,27 @@ impl<'p> Vm<'p> {
         else {
             return false;
         };
-        let bytes: Vec<u8> = match self.heap.get(sbuf) {
+        // One buffer: a memmove in place (overlap-safe), with no snapshot.
+        if sbuf == dbuf {
+            return match self.heap.get_mut(dbuf) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                    let (Some(ae), Some(be)) = (a.checked_add(n), b.checked_add(n)) else {
+                        return false;
+                    };
+                    if ae > data.len() || be > data.len() {
+                        return false;
+                    }
+                    data.copy_within(a..ae, b);
+                    true
+                }
+                _ => false,
+            };
+        }
+        // Two buffers: snapshot the source bytes (on the stack when short —
+        // `out.set(frame, at)` paid an allocation per call), then copy.
+        let mut small = [0u8; 256];
+        let big: Vec<u8>;
+        let bytes: &[u8] = match self.heap.get(sbuf) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => {
                 let Some(end) = a.checked_add(n) else {
                     return false;
@@ -1527,7 +1666,13 @@ impl<'p> Vm<'p> {
                 if end > data.len() {
                     return false;
                 }
-                data[a..end].to_vec()
+                if n <= small.len() {
+                    small[..n].copy_from_slice(&data[a..end]);
+                    &small[..n]
+                } else {
+                    big = data[a..end].to_vec();
+                    &big
+                }
             }
             _ => return false,
         };
@@ -1539,7 +1684,7 @@ impl<'p> Vm<'p> {
                 if end > data.len() {
                     return false;
                 }
-                data[b..end].copy_from_slice(&bytes);
+                data[b..end].copy_from_slice(bytes);
                 true
             }
             _ => false,
@@ -2918,6 +3063,20 @@ mod tests {
             "setBigUint6x", "gotUint32", "buffer", "byteLength", "getUint3", "GetUint32", "setInt7",
         ] {
             assert_eq!(dataview_proto_slot(n), None, "{n:?}");
+        }
+    }
+
+    #[test]
+    fn ta_proto_method_slot_matches_the_name_table() {
+        for (i, n) in native::TA_PROTO_METHODS.iter().enumerate() {
+            assert_eq!(ta_proto_method_slot(n), Some(i), "{n}");
+        }
+        for n in [
+            "", "a", "ad", "mop", "sex", "jo1n", "fine", "filt", "sore", "slicE", "length", "buffer", "byteLength",
+            "constructor", "toStrong", "toSortex", "subarrax", "@@iterato", "@@toStringTag", "BYTES_PER_ELEMENT",
+            "findLastIndey", "toLocaleStrinG", "getUint32",
+        ] {
+            assert_eq!(ta_proto_method_slot(n), None, "{n:?}");
         }
     }
 }
