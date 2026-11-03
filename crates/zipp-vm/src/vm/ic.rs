@@ -3914,6 +3914,88 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// [`Self::ic_call_method`]'s shape-keyed ways, guarded by the receiver's
+    /// hot mirror alone: its shape is the map's, and its fid word tells a
+    /// class instance's class (`FID_MIRROR_CLASS`) from a plain object's
+    /// (`FID_MIRROR_NONE`), which is all the ways ask of the map. Every
+    /// method call read the name and its text (the private-name test), the
+    /// receiver's slot for its kind and its map for the shape before these
+    /// ways: a third of a Babel run's method calls hit way 0 of an inherited
+    /// method and another third a later way. `None` for anything else,
+    /// which takes `ic_call_method` (and fills there).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_call_method_mirror(&self, func_id: u32, ip: usize, recv: Value) -> Option<(u32, u32, Value)> {
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        let mir = self.heap.hot_mirror_of(idx);
+        if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+            return None;
+        }
+        self.ic_call_method_mirror_ways(func_id, ip, idx, mir)
+    }
+
+    /// [`Self::ic_call_method_mirror`]'s site and ways, out of line: the
+    /// dispatch loop keeps one call.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_call_method_mirror_ways(
+        &self,
+        func_id: u32,
+        ip: usize,
+        idx: u32,
+        mir: crate::heap::HotMirror,
+    ) -> Option<(u32, u32, Value)> {
+        if !self.deferred_ns_state.is_empty() || !self.ic_func_eligible(func_id) {
+            return None;
+        }
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let sh = mir.shape;
+        for e in &site.entries[..site.n as usize] {
+            match *e {
+                IcEntry::OwnData { shape, slot } if shape == sh => {
+                    // SAFETY: the matching shape proves `vals` is the map's
+                    // live value column and that it holds `slot`.
+                    let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
+                    return self.ic_plain_fn(v).map(|(fid, closure)| (fid, closure, v));
+                }
+                IcEntry::ClassMethod {
+                    class,
+                    ver,
+                    epoch,
+                    callee,
+                    fid,
+                    closure,
+                    recv_shape,
+                } if recv_shape == sh => {
+                    if mir.fid == crate::heap::FID_MIRROR_CLASS | class
+                        && self.heap.version_of(class) == ver
+                        && self.class_proto_epoch == epoch
+                    {
+                        return Some((fid, closure, callee));
+                    }
+                }
+                IcEntry::ProtoData {
+                    recv_shape,
+                    first,
+                    hops,
+                    slot,
+                } if recv_shape == sh && slot != u32::MAX && mir.fid == crate::heap::FID_MIRROR_NONE => {
+                    if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                        let v = hm.val_at(slot as usize);
+                        if let Some((fid, closure)) = self.ic_plain_fn(v) {
+                            return Some((fid, closure, v));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// IC lookup + fill for a `CallMethod` site: resolves `recv.key` to a
     /// PLAIN user function to frame-call with `this = recv`. `None` ⇒ slow
     /// path (builtins, natives, accessors, generators, exotic receivers).

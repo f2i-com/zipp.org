@@ -4642,24 +4642,41 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let recv = self.get(base, obj);
+                        // The method cache's ways by the receiver's mirror
+                        // alone (`ic_call_method_mirror`): a hit needs neither
+                        // the name nor the receiver's slot and map.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let early = self.ic_call_method_mirror(func_id, ip, recv);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let early: Option<(u32, u32, Value)> = None;
                         // `program` outlives the VM, so borrow the method name
                         // with the program's lifetime (NOT self's) â€” avoids
                         // cloning the name string on every method call (a heap
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
-                        let key: &'p str = &running.string_constants[name as usize];
+                        // An early hit leaves this arm below without it.
+                        let key: &'p str = if early.is_none() {
+                            &running.string_constants[name as usize]
+                        } else {
+                            ""
+                        };
                         // A method of an ordinary object or class instance: the
                         // method cache first. None of the receiver-kind leaves
                         // below can serve such a receiver (they want a string,
                         // a DataView, a generator, an array, a Map or a
                         // function), and each paid a key compare or a heap read
                         // before the cache on every `o.m()`.
-                        let object_recv = recv.is_heap()
-                            && !is_private_key(key)
-                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_));
+                        let object_recv = early.is_some()
+                            || (recv.is_heap()
+                                && !is_private_key(key)
+                                && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_)));
                         if object_recv {
-                            if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                            let hit = match early {
+                                Some(hit) => Some(hit),
+                                None => self.ic_call_method(func_id, ip, recv, key),
+                            };
+                            if let Some((fid, closure, callee)) = hit {
                                 // A leaf callee runs without a frame (`lite::leaf_scan`).
                                 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                                 if LITE {
