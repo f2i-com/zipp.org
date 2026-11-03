@@ -640,10 +640,7 @@ impl<'p> Vm<'p> {
                 // `JSON.stringify(undefined)` (and of a function) is undefined.
                 // This op is the single-arg form: no replacer / allowlist.
                 let _gc = self.gc_lock_guard();
-                let plain = indent
-                    .is_empty()
-                    .then(|| self.json_plain_stringify(v))
-                    .flatten();
+                let plain = self.json_plain_stringify(v, &indent);
                 let result = match plain {
                     Some(s) => self.alloc_str(s),
                     None => {
