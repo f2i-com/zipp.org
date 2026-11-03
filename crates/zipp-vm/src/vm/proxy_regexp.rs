@@ -3814,6 +3814,9 @@ impl<'p> Vm<'p> {
         elems.push(whole);
         for cap in &m.captures {
             let v = match cap {
+                // A group spanning the whole match (a tokenizer's `(\d+)|(\w+)`)
+                // is the same string: strings are values, so one serves both.
+                Some(r) if r.start == mstart && r.end == mend => whole,
                 Some(r) => mk(self, r.clone()),
                 None => Value::UNDEFINED,
             };
@@ -4858,6 +4861,12 @@ impl<'p> Vm<'p> {
             if *u < 128 {
                 return Value::heap(u32::from(*u));
             }
+        }
+        // An ASCII slice of a non-ASCII subject (most tokens of mixed text):
+        // its bytes are its units, with no WTF-8 encoding or rescan.
+        if units.iter().all(|&u| u < 0x80) {
+            let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+            return Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_ascii(bytes)));
         }
         let mut out: Vec<u8> = Vec::with_capacity(units.len() * 3);
         push_units(&mut out, units);

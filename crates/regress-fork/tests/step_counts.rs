@@ -40,13 +40,13 @@ const CASES: &[(&str, &str, &str, Mode, u64, u64, usize)] = &[
     (r"hello\s+world", "i", "HELLO   World hello world", Mode::Ascii, 30, 30, 2),
     (r"^(?:\w+\s)+end$", "", "one two three end", Mode::Ascii, 38, 38, 1),
     (r"(a|aa)+$", "", "aaaaaaaaaa!", Mode::Ascii, 8091, 8091, 0),
-    (r"\p{L}+", "u", "héllo wörld κόσμε", Mode::Utf16, 30, 30, 3),
-    (r"(?<=\p{Lu})\p{Ll}+", "u", "Ωmega Δelta", Mode::Utf16, 36, 36, 2),
-    (r"(?<!\p{L})\d+", "u", "a1 22 б3 444", Mode::Utf16, 55, 55, 2),
-    (r"[\p{L}--[a-z]]+", "v", "abcΣΤΥdef", Mode::Utf16, 20, 20, 1),
-    (r"(?<=é{1,3})x", "", "éx ééx eeex", Mode::Ucs2, 58, 58, 2),
-    (r"(?<=(ab)+?)c", "i", "ABABc abc", Mode::Ucs2, 125, 125, 2),
-    (r"σ+", "i", "ΣσςΣ", Mode::Ucs2, 9, 9, 1),
+    (r"\p{L}+", "u", "héllo wörld κόσμε", Mode::Utf16, 24, 24, 3),
+    (r"(?<=\p{Lu})\p{Ll}+", "u", "Ωmega Δelta", Mode::Utf16, 28, 28, 2),
+    (r"(?<!\p{L})\d+", "u", "a1 22 б3 444", Mode::Utf16, 25, 25, 2),
+    (r"[\p{L}--[a-z]]+", "v", "abcΣΤΥdef", Mode::Utf16, 6, 6, 1),
+    (r"(?<=é{1,3})x", "", "éx ééx eeex", Mode::Ucs2, 19, 19, 2),
+    (r"(?<=(ab)+?)c", "i", "ABABc abc", Mode::Ucs2, 28, 28, 2),
+    (r"σ+", "i", "ΣσςΣ", Mode::Ucs2, 7, 7, 1),
 ];
 
 fn steps(pattern: &str, flags: &str, subject: &str, mode: Mode) -> (u64, usize) {
