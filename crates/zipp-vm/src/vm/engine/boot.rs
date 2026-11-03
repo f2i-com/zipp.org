@@ -279,6 +279,8 @@ impl<'p> Vm<'p> {
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
             entered_code: Vec::new(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            frame_descs: Vec::new(),
             lazy: None,
             lazy_gmap: Vec::new(),
             static_key_plan_sites,

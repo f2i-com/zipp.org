@@ -140,6 +140,10 @@ impl<'p> Vm<'p> {
                 if let Some(entered) = self.entered_code.get_mut(i) {
                     *entered = None;
                 }
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if let Some(desc) = self.frame_descs.get_mut(i) {
+                    *desc = 0;
+                }
                 if i >= self.main_func_count {
                     self.eval_funcs[i - self.main_func_count] = r;
                 }

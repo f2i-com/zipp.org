@@ -105,6 +105,17 @@ pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 
+/// What [`Vm::tail_call_lean`] made of a tail call.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+enum TailLean {
+    /// Nothing: the full path decides.
+    No,
+    /// The dispatch continues with the frame now on top.
+    Next,
+    /// The callee's value finished the run.
+    Done(Value),
+}
+
 /// How many arguments `Vm::arg_window` copies out on the stack.
 const ARGS_ON_STACK: usize = 8;
 
@@ -4109,6 +4120,12 @@ impl<'p> Vm<'p> {
                         // callee (native/bound/class/generator/async/primitive)
                         // falls through to the Call+Return emitted after.
                         let callee_v = self.get(base, callee);
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        match self.tail_call_lean::<LITE>(base, callee_v, arg_base, argc, stop_depth) {
+                            TailLean::Next => break,
+                            TailLean::Done(v) => return Ok(v),
+                            TailLean::No => {}
+                        }
                         // Args live above `base` — copy them out BEFORE the
                         // window is rebuilt in place: into a stack buffer for
                         // the usual few (a `Vec` here was an allocator round
@@ -5653,6 +5670,114 @@ impl<'p> Vm<'p> {
         } else {
             sw.after as usize
         }
+    }
+
+    /// A tail call of a plain function, from its entry in `frame_descs`. A
+    /// leaf runs without a frame and its value is this frame's return;
+    /// anything else with a lean frame takes this frame over.
+    /// `try_tail_reuse` reads the callee's `FuncProto` for every flag and
+    /// copies the arguments out first, and it gives a leaf a frame. A site's
+    /// call cache would answer no better: tail sites are often polymorphic
+    /// or call a fresh closure each time, and it refilled, costing more
+    /// instructions than this saved. The answer depends only on the function.
+    /// Out of line, so the dispatch loop stays the size it was.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn tail_call_lean<const LITE: bool>(
+        &mut self,
+        base: usize,
+        callee_v: Value,
+        arg_base: u16,
+        argc: u16,
+        stop_depth: usize,
+    ) -> TailLean {
+        if !callee_v.is_heap() {
+            return TailLean::No;
+        }
+        let idx = callee_v.heap_index();
+        let (fid, closure) = match self.heap.get(idx) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, idx),
+            _ => return TailLean::No,
+        };
+        let desc = match self.frame_descs.get(fid as usize) {
+            Some(&d) if d != 0 => d,
+            _ => self.frame_desc_fill(fid),
+        };
+        if desc & (LEAN_DESC_OK | LEAN_DESC_ARROW) == 0 {
+            return TailLean::No;
+        }
+        let top = self.frames.len() - 1;
+        // A constructing frame's `this` is the instance its pop returns, and
+        // a frame with handlers has a `finally` to route through.
+        if self.frames[top].construct_this || self.frames[top].handlers.capacity() != 0 {
+            return TailLean::No;
+        }
+        if LITE {
+            if let Some(v) = self.leaf_call(fid, closure, Value::UNDEFINED, false, base, arg_base, argc) {
+                return if self.pop_frame_fast(v, stop_depth) {
+                    TailLean::Done(v)
+                } else {
+                    TailLean::Next
+                };
+            }
+        }
+        let this_val = if desc & LEAN_DESC_OK != 0 {
+            if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+                Value::heap(self.callee_this_global(callee_v))
+            } else {
+                Value::UNDEFINED
+            }
+        } else if desc & LEAN_DESC_ARROW != 0 && closure != NO_CLOSURE {
+            self.arrow_closure_this(closure, Value::UNDEFINED)
+        } else {
+            return TailLean::No;
+        };
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let n = (argc as usize).min(((desc >> 16) & 0xFF) as usize);
+        // The streak's end throws on the full path.
+        if self.tail_reuse_streak >= MAX_TAIL_REUSE_STREAK
+            || !self.regs_fit_now(base + callee_regs)
+            || !lean_calls_enabled()
+            || !self.regs.reopen_window(base, callee_regs, this_val, base + arg_base as usize, n)
+        {
+            return TailLean::No;
+        }
+        self.tail_reuse_streak += 1;
+        let fr = &mut self.frames[top];
+        fr.func = fid;
+        fr.closure = closure;
+        fr.ip = 0;
+        fr.callee = callee_v;
+        fr.new_target = Value::UNDEFINED;
+        fr.eval_scope = u32::MAX;
+        fr.super_done = false;
+        fr.args_obj = u32::MAX;
+        fr.arg_win = u32::MAX;
+        fr.argc = 0;
+        fr.is_eval = false;
+        TailLean::Next
+    }
+
+    /// Function `fid`'s entry in `frame_descs`, first asked: its
+    /// [`Self::lean_call_desc`], with neither lean flag for a generator or an
+    /// async function, whose call does not run its body in a frame.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[cold]
+    #[inline(never)]
+    fn frame_desc_fill(&mut self, fid: u32) -> u32 {
+        let p = self.func(fid as usize);
+        let desc = if p.is_generator || p.is_async {
+            LEAN_DESC_KNOWN
+        } else {
+            self.lean_call_desc(fid) | LEAN_DESC_KNOWN
+        };
+        let i = fid as usize;
+        if self.frame_descs.len() <= i {
+            self.frame_descs.resize(self.funcs.len().max(i + 1), 0);
+        }
+        self.frame_descs[i] = desc;
+        desc
     }
 
     /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,

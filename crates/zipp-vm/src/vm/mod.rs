@@ -1254,6 +1254,39 @@ impl RegisterFile {
         }
     }
 
+    /// [`Self::open_window`] for a proper tail call: the live window at
+    /// `base` becomes the callee's, its `n` arguments moved down from their
+    /// registers `src..src + n` above `base`. `false`, with nothing done,
+    /// past the initialized extent or for arguments elsewhere.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(always)]
+    pub(crate) fn reopen_window(&mut self, base: usize, len: usize, this: Value, src: usize, n: usize) -> bool {
+        let end = base + len;
+        if n >= len || src <= base || src + n > self.logical_len || end > self.storage.len() {
+            return false;
+        }
+        // SAFETY: `end` and `src + n` are within `storage.len()`, so every
+        // slot read or written is initialized storage. Each destination is
+        // below its source, so moving upwards reads every argument before
+        // anything overwrites it.
+        unsafe {
+            let p = self.storage.as_mut_ptr();
+            p.add(base).write(this);
+            let mut i = 0;
+            while i < n {
+                p.add(base + 1 + i).write(p.add(src + i).read());
+                i += 1;
+            }
+            let mut i = base + 1 + n;
+            while i < end {
+                p.add(i).write(Value::UNDEFINED);
+                i += 1;
+            }
+        }
+        self.logical_len = end;
+        true
+    }
+
     #[inline(never)]
     fn resize_general(&mut self, new_len: usize, fill: Value) {
         let old_logical = self.logical_len;
@@ -1654,6 +1687,10 @@ pub struct Vm<'p> {
     /// What each function's frames dispatch on (`Vm::entered_code`), `None`
     /// until its first entry. Cleared when a body replaces its stub.
     entered_code: Vec<Option<&'p [crate::bytecode::Instr]>>,
+    /// Each function's frame facts for a tail call (`Vm::tail_call_lean`), 0
+    /// until first asked. Cleared when a body replaces its stub.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    frame_descs: Vec<u32>,
     /// The compiler of the program's deferred function bodies, each compiled
     /// at its function's first call (`compile::LazySession`); `None` when
     /// every body compiled with the program.
