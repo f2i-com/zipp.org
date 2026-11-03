@@ -360,6 +360,13 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_TIERC_YIELD_ENTRY=1`: a Tier C body bails at every yield
+    /// head, as before `jit_tierc_run_region`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_yield_entry_enabled() = "ZIPP_NO_TIERC_YIELD_ENTRY"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_TIERC_DV_LANE=1`: a Tier C DataView accessor call takes the
     /// general method route, as before `jit_dv_method_call`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -2943,6 +2950,83 @@ fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
     out
 }
 
+/// B206 direct entry: whether the loop headed at a yield head `head` may run
+/// its region straight from the Tier C body (`jit_tierc_run_region`), and the
+/// clean exits the body can resume at. The loop `[head, back]` (`back` the
+/// last `Jump` to `head`) must hold only ops that neither call (except the
+/// pure `charCodeAt` and DataView accessor lanes) nor reach a captured
+/// variable, so the region needs no interpreter frame: a frame-free Tier C
+/// activation has none. The exits are the loop's jump targets outside it and
+/// `back + 1`, kept only where they are jump targets of the body (where the
+/// emitted code assumes nothing cached). Any other resume ip leaves through a
+/// dynamic bail. `None`: the plain yield bail.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn yield_entry_exits(proto: &FuncProto, head: usize, targeted: &[bool]) -> Option<Vec<u32>> {
+    let code = &proto.code;
+    let back = code
+        .iter()
+        .enumerate()
+        .skip(head)
+        .filter(|(_, i)| matches!(i, Instr::Jump { target } if *target as usize == head))
+        .map(|(ip, _)| ip)
+        .max()?;
+    let mut exits = vec![back as u32 + 1];
+    for ip in head..=back {
+        let ins = &code[ip];
+        let pure = match *ins {
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadBool { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::Move { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Not { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::GetIndex { .. }
+            | Instr::SetIndex { .. }
+            | Instr::GetProp { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::MathOp { .. } => true,
+            Instr::CallMethod { name, .. } => {
+                let key = proto.string_constants.get(name as usize).map(String::as_str).unwrap_or("");
+                key == "charCodeAt" || crate::vm::typedarray::dataview_proto_slot(key).is_some()
+            }
+            _ => false,
+        };
+        if !pure {
+            return None;
+        }
+        if let Some(t) = bytecode_control_target(ins) {
+            if (t as usize) < head || t as usize > back {
+                exits.push(t);
+            }
+        }
+    }
+    exits.retain(|&e| targeted.get(e as usize) == Some(&true));
+    exits.sort_unstable();
+    exits.dedup();
+    Some(exits)
+}
+
 /// Compile the WHOLE body of `proto` to native code via the memory-path op
 /// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
 /// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/
@@ -3738,6 +3822,33 @@ pub(crate) fn compile_proto_mem(
             ; jmp => epilogue
         );
     }
+    // B206 direct entry plans: yield head -> the exits it may continue at, and
+    // each of its back-edge `Jump`s -> the head (`yield_entry_exits`). A head
+    // whose loop has no plain back-edge, or sits in a lazy `try`, keeps the
+    // plain yield bail.
+    let mut yield_entry: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+    let mut yield_backedge: FxHashMap<usize, usize> = FxHashMap::default();
+    if tierc_yield_entry_enabled() {
+        for &h in yield_heads {
+            let h = h as usize;
+            if h >= n || lazy_at[h].is_some() {
+                continue;
+            }
+            let Some(exits) = yield_entry_exits(proto, h, &targeted) else {
+                continue;
+            };
+            let backs: Vec<usize> = (h + 1..n)
+                .filter(|&j| matches!(proto.code[j], Instr::Jump { target } if target as usize == h))
+                .collect();
+            if backs.is_empty() || backs.iter().any(|&j| lazy_at[j].is_some()) {
+                continue;
+            }
+            for j in backs {
+                yield_backedge.insert(j, h);
+            }
+            yield_entry.insert(h, exits);
+        }
+    }
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
         // Every way out of a lazy `try`'s body, for this op's arms below.
@@ -3773,10 +3884,57 @@ pub(crate) fn compile_proto_mem(
         // the bail; the ops after it still emit (dead but label-linked).
         // Metered bodies never carry heads (the caller passes none): a
         // charge-then-bail would double-charge on replay.
-        if !yield_heads.is_empty() && yield_heads.contains(&(ip as u32)) {
+        if !yield_heads.is_empty() && yield_heads.contains(&(ip as u32)) && !yield_entry.contains_key(&ip) {
             dynasm!(ops
                 ; mov DWORD [rsi], ip as i32
                 ; jmp => epilogue
+            );
+        }
+        // B206 direct entry (`yield_entry`): this body runs the loop's first
+        // iteration itself and, at the back-edge, hands the loop to its
+        // region as the interpreter's back-edge would. The helper answers the
+        // ip the region resumed at: a clean exit (or the head, an entry the
+        // region refused) continues in this body, anything else leaves there
+        // as a bail. `u32::MAX`: nothing ran, and the jump below takes the
+        // next iteration here. A frame-free activation paid an interpreter
+        // frame plus the back-edge entry per call: a crc32 over a 64-byte
+        // frame, an `fnv` over a short string.
+        if let Some(&head) = yield_backedge.get(&ip) {
+            let exits = &yield_entry[&head];
+            let not_run = ops.new_dynamic_label();
+            let helper = crate::vm::jit_tierc_run_region as *const () as usize;
+            dynasm!(ops
+                ; mov rcx, rdi                        // vm
+                ; mov rdx, rbx                        // this activation's window
+                ; mov r8d, head as i32                // loop head
+                ; mov r9d, func_id as i32
+                ; mov rax, QWORD helper as i64
+                ; call rax
+                ; cmp eax, -1
+                ; je => not_run
+            );
+            // A region exit can run a materialization that allocates. The
+            // resume ip waits in the bail slot across the refetch (a callee
+            // may spill into its home space, so not on the stack); the slot
+            // holds `NO_BAIL` again before the body goes on.
+            if refetch_pinned {
+                dynasm!(ops ; mov DWORD [rsi], eax);
+                emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                dynasm!(ops
+                    ; mov eax, DWORD [rsi]
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                );
+            }
+            for &e in exits.iter().chain(std::iter::once(&(head as u32))) {
+                dynasm!(ops
+                    ; cmp eax, e as i32
+                    ; je => labels[e as usize]
+                );
+            }
+            dynasm!(ops
+                ; mov DWORD [rsi], eax
+                ; jmp => epilogue
+                ; => not_run
             );
         }
         if lazy_try.iter().any(|t| t.push == ip || t.pop == ip) {

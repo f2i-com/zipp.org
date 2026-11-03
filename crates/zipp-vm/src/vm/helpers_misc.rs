@@ -5604,6 +5604,37 @@ pub(crate) extern "win64" fn jit_bitwise_slow(
     }
 }
 
+/// B206 direct entry: run the region owning the loop headed at `head` of
+/// `func_id` over the Tier C activation's window at `regs_ptr`, as the
+/// interpreter's back-edge would (`try_run_osr`), and answer the ip it
+/// resumed at. `u32::MAX`: nothing ran (the JIT off, inside a native
+/// self-recursion, a dead or absent region, a refused entry), and the body
+/// takes its plain yield bail. The emitter admits only call-free loops
+/// (`yield_entry_exits`), so the region needs no interpreter frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_tierc_run_region(
+    vm: *mut core::ffi::c_void,
+    regs_ptr: *const u64,
+    head: u32,
+    func_id: u32,
+) -> u64 {
+    const NOT_RUN: u64 = u32::MAX as u64;
+    // SAFETY: the running Tier C body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    if !vm.jit_enabled || vm.jit_recurse_depth != 0 || vm.jit.region_dead_state(func_id, head) != 0 {
+        return NOT_RUN;
+    }
+    // SAFETY: the window lies in the pinned register buffer.
+    let base = unsafe { regs_ptr.offset_from(vm.regs.as_ptr() as *const u64) };
+    if base < 0 {
+        return NOT_RUN;
+    }
+    match vm.try_run_osr(func_id, head, base as usize) {
+        Some(resume) if resume < u32::MAX as usize => resume as u64,
+        _ => NOT_RUN,
+    }
+}
+
 /// Tier C's DataView accessor lane: `view.<name>(args…)` for the
 /// `DV_PROTO_METHODS` entry `packed & 0xff` with `packed >> 8` arguments at
 /// `args`, through the interpreter's pristine-DataView lanes (numeric
