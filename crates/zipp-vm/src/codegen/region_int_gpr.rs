@@ -1841,8 +1841,9 @@ fn spill_census(
 /// home to write an i32-range value:
 ///   - Bitwise (non-`>>>`) and `Math.imul` results are ToInt32 by definition;
 ///   - `LoadInt` / Int `LoadConst` / hoisted-const fills are i32 payloads;
-///   - pinned `GetIndex` (Int payload / i32 element, both movsxd'd) and pinned
-///     `charCodeAt` (movzx byte, 0..255) land in i32 range;
+///   - pinned `GetIndex` (Int payload / i32-or-narrower element) and pinned
+///     `charCodeAt` (movzx byte, 0..255) land in i32 range — a Uint32Array
+///     `GetIndex` (zero-extended, up to 2^32-1) is WIDE;
 ///   - `Move` / `LoadGlobal` / `StoreGlobal` / `AddInt +0` copies require the
 ///     SOURCE home i32-invariant (or an i32 immediate);
 ///   - everything else — Add/Sub/Mul/Mod/Neg, `AddInt` with a real immediate,
@@ -1883,6 +1884,7 @@ fn spill_census(
 fn lazy_sx_sets(
     proto: &FuncProto,
     plan: &RegionPlan,
+    ta_plan: &TaPinPlan,
     s: usize,
     e: usize,
     map: &FxHashMap<u8, Loc>,
@@ -2017,8 +2019,22 @@ fn lazy_sx_sets(
                 }
             }
             // Pinned element reads sign-extend an i32 (Int payload / i32
-            // element); pinned charCodeAt zero-extends a byte. Both i32.
-            Instr::GetIndex { .. } => {}
+            // element); pinned charCodeAt zero-extends a byte. Both i32 —
+            // except a Uint32Array read, which zero-extends up to 2^32-1 and
+            // is WIDE for the same reason as a DV getUint32 below.
+            Instr::GetIndex { dst, .. } => {
+                let u32_read = ta_plan
+                    .access
+                    .get(&ip)
+                    .and_then(|&j| ta_plan.pins.get(j as usize))
+                    .and_then(|p| int_ta_load_kind(p.kind))
+                    .is_some_and(|k| !k.fits_i32());
+                if u32_read {
+                    if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
+                        wide.insert(dh);
+                    }
+                }
+            }
             // W9: DV get* kinds 0-5 land in i32 range (census-neutral, like
             // charCodeAt); a getUint32 (kind 6) ranges to 2^32-1 and is NOT
             // i32-provable — its home is WIDE, or a consumer's lazy movsxd
@@ -2619,7 +2635,7 @@ pub(crate) fn compile_region_int_gpr(
     // i32-strict to license it (empty sets under ZIPP_NO_GPR_LAZYSX=1; split,
     // write-through and W10.3 spilled homes are never members — see
     // `lazy_sx_sets`).
-    let (lazy, strict) = lazy_sx_sets(proto, plan, s, e, &map, &hoist_c);
+    let (lazy, strict) = lazy_sx_sets(proto, plan, ta_plan, s, e, &map, &hoist_c);
     // V1 deopt shadows are local to call-free, unspliced, all-DV plans. Any
     // failed proof produces the empty plan and therefore the exact old boxed
     // write-through/frame bytes.
@@ -3662,6 +3678,10 @@ pub(crate) fn compile_region_int_gpr(
                         }
                         Some(IntTaLoadKind::I32) => {
                             dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx * 4])
+                        }
+                        // Zero-extends to the exact u32 (home WIDE, see lazy_sx_sets).
+                        Some(IntTaLoadKind::U32) => {
+                            dynasm!(ops ; mov Rd(d), DWORD [rdx + rcx * 4])
                         }
                         None => {
                             crate::codegen::region_int_gpr::gpr_decline_note(

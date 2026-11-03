@@ -225,7 +225,8 @@ fn ta_len_parity_growable_shared_buffer() {
 }
 
 /// Child target for default/off mechanism assertions. Uint32 `.length` may use
-/// the marker while Uint32 element access must continue to decline INTEGER.
+/// the marker while Uint32 element access (with `ZIPP_NO_INT_TA_U32`) must
+/// continue to decline INTEGER.
 #[test]
 fn ta_len_mechanism_probe() {
     assert_matches_node(
@@ -247,6 +248,9 @@ fn ta_len_mechanism_and_uint32_element_decline() {
         cmd.args(["ta_len_mechanism_probe", "--exact", "--nocapture"])
             .env("ZIPP_JITLOG", "1")
             .env("ZIPP_JITDECLINE", "1")
+            // Uint32 element reads have their own INTEGER lane now; with it
+            // switched off, the length marker alone must not admit them.
+            .env("ZIPP_NO_INT_TA_U32", "1")
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_NO_INT_TA_LENGTH");
         if off {

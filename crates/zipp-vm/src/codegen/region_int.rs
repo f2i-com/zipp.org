@@ -39,11 +39,11 @@ pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// Keep the dtype decision in this one place: admission, the xmm-home emitter
 /// and the GPR-home emitter all consume this enum. The metadata check against
 /// `TA_KINDS` makes the numeric kind ids fail closed if that authoritative
-/// table is ever reordered or extended. Uint32 is intentionally absent: its
-/// values do fit i53, but the GPR tier's deferred-sign-extension analysis has
-/// historically treated every pinned GetIndex as i32-range. Widening that
-/// proof is separate work; silently admitting kind 6 here would sign-mangle
-/// values above `i32::MAX` on some downstream paths.
+/// table is ever reordered or extended. Uint32 (`U32`) loads zero-extended:
+/// its values fit the i64/i53 home but not i32, so the GPR tier's
+/// deferred-sign-extension census marks its destination WIDE
+/// (`IntTaLoadKind::fits_i32`), as it does a DataView `getUint32`, and the
+/// interval analysis gives it `[0, 2^32 - 1]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntTaLoadKind {
     I8,
@@ -51,6 +51,19 @@ pub(crate) enum IntTaLoadKind {
     I16,
     U16,
     I32,
+    U32,
+}
+
+impl IntTaLoadKind {
+    /// Whether every value this load produces fits i32 (all but `U32`).
+    pub(crate) fn fits_i32(self) -> bool {
+        self != IntTaLoadKind::U32
+    }
+}
+
+env_off_switch! {
+    /// Kill switch for Uint32Array reads on the INTEGER tier (`IntTaLoadKind::U32`).
+    fn int_ta_u32_reads_enabled() = "ZIPP_NO_INT_TA_U32"
 }
 
 env_off_switch! {
@@ -73,11 +86,12 @@ pub(crate) fn int_ta_load_kind(kind: u8) -> Option<IntTaLoadKind> {
         (3, "Int16Array", 2) => IntTaLoadKind::I16,
         (4, "Uint16Array", 2) => IntTaLoadKind::U16,
         (5, "Int32Array", 4) => IntTaLoadKind::I32,
-        // Uint32 and every future non-float numeric kind decline until their
-        // full range is proven through lazy-sx, compares, exits and boxing.
+        (6, "Uint32Array", 4) if int_ta_u32_reads_enabled() => IntTaLoadKind::U32,
+        // Every future non-float numeric kind declines until its full range is
+        // proven through lazy-sx, compares, exits and boxing.
         _ => return None,
     };
-    if load != IntTaLoadKind::I32 && !int_ta_narrow_reads_enabled() {
+    if !matches!(load, IntTaLoadKind::I32 | IntTaLoadKind::U32) && !int_ta_narrow_reads_enabled() {
         return None;
     }
     Some(load)
@@ -2123,6 +2137,8 @@ pub(crate) fn compile_region_int_maybe_cold(
                         IntTaLoadKind::I32 => {
                             dynasm!(ops ; movsxd rax, DWORD [rdx + rcx * 4])
                         }
+                        // A 32-bit load zero-extends into rax: the exact u32.
+                        IntTaLoadKind::U32 => dynasm!(ops ; mov eax, DWORD [rdx + rcx * 4]),
                     }
                 }
                 dynasm!(ops
