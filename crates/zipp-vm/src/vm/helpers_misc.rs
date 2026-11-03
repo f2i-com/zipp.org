@@ -5566,6 +5566,92 @@ fn jit_fill_collection_method_way(
     }
 }
 
+/// Tier C's `Bitwise` off its inline path (an Int or a double whose
+/// truncation fits i64): two Numbers of any value (NaN, ±Infinity, beyond
+/// 2^63) or two BigInts (`big & 0xffffn`, `u >> 48n`), through the
+/// interpreter's own arm. Every other operand pair, whose conversion could
+/// run user code, and every abrupt result (`>>>` on BigInts, an oversized
+/// shift) answer `SELF_CALL_DEOPT`: the op bails to the interpreter, which
+/// redoes it, as it did for every one of these before. The op code is
+/// `BitwiseOp`'s order (And, Or, Xor, Shl, Shr, Ushr).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_bitwise_slow(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    op: u32,
+) -> u64 {
+    use crate::bytecode::BitwiseOp as B;
+    // SAFETY: the running Tier C body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let (a, b) = (Value::from_bits(a_bits), Value::from_bits(b_bits));
+    let numbers = a.is_number() && b.is_number();
+    if !numbers && !(vm.is_bigint_prim(a) && vm.is_bigint_prim(b)) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let op = match op {
+        0 => B::And,
+        1 => B::Or,
+        2 => B::Xor,
+        3 => B::Shl,
+        4 => B::Shr,
+        5 if numbers => B::Ushr,
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    match vm.fused_bitwise(a, b, op) {
+        Ok(v) => v.bits(),
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Tier C's DataView accessor lane: `view.<name>(args…)` for the
+/// `DV_PROTO_METHODS` entry `packed & 0xff` with `packed >> 8` arguments at
+/// `args`, through the interpreter's pristine-DataView lanes (numeric
+/// getters, numeric setters, BigInt accessors). `SELF_CALL_DEOPT` when they
+/// did nothing: not a pristine main-realm DataView, an argument needing a
+/// coercion, or an error to throw (raised before any write), so the general
+/// method route redoes the call and reports it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_dv_method_call(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    args: *const u64,
+    packed: u32,
+) -> u64 {
+    let decline = crate::codegen::SELF_CALL_DEOPT;
+    // SAFETY: the running Tier C body holds no borrow of the VM.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let recv = Value::from_bits(recv_bits);
+    if !recv.is_heap() || !matches!(vm.heap.get(recv.heap_index()), HeapObj::DataView { .. }) {
+        return decline;
+    }
+    let argc = (packed >> 8) as usize;
+    let Some(&name) = crate::vm::native::DV_PROTO_METHODS.get((packed & 0xff) as usize) else {
+        return decline;
+    };
+    // SAFETY: generated code passes the call's argument window, `argc` long.
+    let arg = |i: usize| {
+        if i < argc {
+            Value::from_bits(unsafe { *args.add(i) })
+        } else {
+            Value::UNDEFINED
+        }
+    };
+    let view = recv.heap_index();
+    let big = name.len() > 6 && name.as_bytes()[3..6] == *b"Big";
+    let done = if big {
+        vm.dataview_interp_big_fast(view, name, arg(0), arg(1), arg(2))
+    } else if name.starts_with('g') {
+        vm.dataview_interp_get_fast(view, name, arg(0), arg(1))
+    } else {
+        vm.dataview_interp_set_fast(view, name, arg(0), arg(1), arg(2)).map(|o| o.map(|()| Value::UNDEFINED))
+    };
+    match done {
+        Ok(Some(v)) => v.bits(),
+        _ => decline,
+    }
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,

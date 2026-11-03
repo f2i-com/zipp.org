@@ -128,7 +128,7 @@ pub(crate) fn ta_proto_method_slot(name: &str) -> Option<usize> {
 /// one inline compare. The three `match`es compared the name with up to
 /// twenty literals by `memcmp`, on every `dv.getUint32` read: 11 ns of it.
 #[inline]
-fn dataview_proto_slot(name: &str) -> Option<usize> {
+pub(crate) fn dataview_proto_slot(name: &str) -> Option<usize> {
     let b = name.as_bytes();
     let (cand, slot) = match (b.len(), *b.first()?, *b.get(3)?) {
         (7, b'g', b'I') => ("getInt8", 0),

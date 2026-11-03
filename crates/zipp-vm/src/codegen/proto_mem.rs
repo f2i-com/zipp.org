@@ -360,6 +360,20 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_TIERC_DV_LANE=1`: a Tier C DataView accessor call takes the
+    /// general method route, as before `jit_dv_method_call`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_dv_lane_enabled() = "ZIPP_NO_TIERC_DV_LANE"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_BITWISE_SLOW=1`: a Tier C bitwise op whose operand is
+    /// off the inline path bails, as before `jit_bitwise_slow`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_bitwise_slow_enabled() = "ZIPP_NO_TIERC_BITWISE_SLOW"
+}
+
+env_off_switch! {
     /// Admit unary numeric negation into Tier C. The emitted path flips the f64
     /// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
     /// declines non-numeric operands to the exact interpreter instruction.
@@ -5303,9 +5317,17 @@ pub(crate) fn compile_proto_mem(
                 // (boxed Int) except `>>>`, whose u32 result may exceed
                 // i32::MAX and is then boxed as an (exact) double.
                 use crate::bytecode::BitwiseOp as B;
-                load_toint32(&mut ops, a, bail);
+                // An operand off the inline path (a BigInt, NaN/±Inf, a double
+                // past 2^63, a non-number) asks `jit_bitwise_slow`, which
+                // answers two Numbers or two BigInts and declines the rest
+                // into the bail. `decode`'s `big & 0xffffn` bailed once per
+                // call and left the call's loop to the interpreter.
+                let use_slow = tierc_bitwise_slow_enabled();
+                let slow = if use_slow { ops.new_dynamic_label() } else { bail };
+                let done_b = ops.new_dynamic_label();
+                load_toint32(&mut ops, a, slow);
                 dynasm!(ops ; mov r8d, eax); // stash a
-                load_toint32(&mut ops, b, bail);
+                load_toint32(&mut ops, b, slow);
                 dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
                 match op {
                     B::And => {
@@ -5348,6 +5370,32 @@ pub(crate) fn compile_proto_mem(
                         );
                     }
                 }
+                if use_slow {
+                    let code = match op {
+                        B::And => 0,
+                        B::Or => 1,
+                        B::Xor => 2,
+                        B::Shl => 3,
+                        B::Shr => 4,
+                        B::Ushr => 5,
+                    };
+                    let helper = crate::vm::jit_bitwise_slow as *const () as usize;
+                    dynasm!(ops
+                        ; jmp => done_b
+                        ; => slow
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(b)]
+                        ; mov r9d, code
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+                dynasm!(ops ; => done_b);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Not { dst, a } => {
@@ -6491,6 +6539,41 @@ pub(crate) fn compile_proto_mem(
                         );
                         done
                     });
+                    // `view.getUint32(pos, le)` and the other DataView accessors
+                    // on a pristine view: the interpreter's own lanes, run from
+                    // here (`jit_dv_method_call`). The route below reached them
+                    // only after the method cross-call prefixes and the live
+                    // method IC had each declined. A decline (not a pristine
+                    // DataView, an argument needing coercion, an error to
+                    // throw) did nothing, and the route below redoes the call.
+                    let dv_slot = crate::vm::typedarray::dataview_proto_slot(key)
+                        .filter(|_| (1..=3).contains(&argc) && tierc_dv_lane_enabled());
+                    let dv_done = dv_slot.map(|slot| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                            ; mov r9d, (slot as i32) | ((argc as i32) << 8)
+                            ; mov rax, QWORD crate::vm::jit_dv_method_call as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        // A BigInt getter allocates its result, which can move
+                        // the heap's versions Vec; no user code runs.
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     // Every remaining name/arity: the same live-IC route as
                     // `random` — a USER function/closure runs to completion
                     // through the method cross-call or generic helper; natives
@@ -6646,6 +6729,9 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => leaf_done);
                     }
                     if let Some(done) = pop_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = dv_done {
                         dynasm!(ops ; => done);
                     }
                 }
