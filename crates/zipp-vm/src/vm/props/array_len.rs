@@ -211,16 +211,20 @@ impl<'p> Vm<'p> {
                     None
                 } else {
                     // Where the Vec would end had the plain elements past it been
-                    // written in ascending order.
-                    let mut past: Vec<usize> = m
+                    // written in ascending order. As `u32`s (an array index is
+                    // below 2^32 - 1), they sort through the engine's one
+                    // `[u32]` sort rather than a `[usize]` copy of it.
+                    let mut past: Vec<u32> = m
                         .iter()
                         .filter_map(|(k, _, a)| {
                             canonical_index_str(k).filter(|n| *n >= dense_len && plain(a))
                         })
+                        .filter_map(|n| u32::try_from(n).ok())
                         .collect();
                     past.sort_unstable();
                     let mut end = dense_len;
                     for n in past {
+                        let n = n as usize;
                         if Self::array_index_goes_sparse(n, end) {
                             break;
                         }

@@ -1348,7 +1348,19 @@ impl<'p> Vm<'p> {
             }
             sparse_entries.push((index as u32, value));
         }
-        sparse_entries.sort_unstable_by_key(|(index, _)| *index);
+        // Ascending index order. The indices are distinct, so each entry's
+        // index above its position is a `u64` that sorts the same way, through
+        // the engine's one `[u64]` sort rather than a copy for this tuple.
+        let mut order: Vec<u64> = sparse_entries
+            .iter()
+            .enumerate()
+            .map(|(pos, &(index, _))| u64::from(index) << 32 | pos as u64)
+            .collect();
+        order.sort_unstable();
+        let sparse_entries: Vec<(u32, Value)> = order
+            .into_iter()
+            .map(|key| sparse_entries[(key & u64::from(u32::MAX)) as usize])
+            .collect();
         let key_count = dense_entries.len().checked_add(sparse_entries.len())?;
         let final_count = (count.as_int() as i64).checked_add(key_count as i64)?;
         let final_count = i32::try_from(final_count).ok()?;

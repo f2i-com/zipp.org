@@ -404,19 +404,36 @@ pub(crate) fn spec_key_order_map(m: &crate::heap::ObjMap) -> Vec<usize> {
 
 /// [`spec_key_order_map`] over `(slot, key)` pairs given in insertion order.
 fn spec_key_order_slots<'a>(keys: impl ExactSizeIterator<Item = (usize, &'a str)>) -> Vec<usize> {
-    let mut ints: Vec<(u32, usize)> = Vec::new();
+    // Each integer key with its slot below it (`int_key_slot`): the keys are
+    // distinct, so the `u64`s sort by key, through the engine's one `[u64]`
+    // sort.
+    let mut ints: Vec<u64> = Vec::new();
     let mut rest: Vec<usize> = Vec::with_capacity(keys.len());
     for (i, k) in keys {
         match canonical_u32_key(k) {
-            Some(n) => ints.push((n, i)),
+            Some(n) => ints.push(int_key_slot(n, i)),
             None => rest.push(i),
         }
     }
     if ints.is_empty() {
         return rest; // common fast path: no integer keys → original order
     }
-    ints.sort_unstable_by_key(|&(n, _)| n);
-    ints.into_iter().map(|(_, i)| i).chain(rest).collect()
+    ints.sort_unstable();
+    ints.into_iter().map(slot_of_int_key).chain(rest).collect()
+}
+
+/// An integer key `n` and its slot as one `u64` that orders by `n` (a slot
+/// index is below 2^32: an object holds fewer properties than that).
+#[inline]
+pub(crate) fn int_key_slot(n: u32, slot: usize) -> u64 {
+    debug_assert!(u32::try_from(slot).is_ok());
+    u64::from(n) << 32 | slot as u32 as u64
+}
+
+/// The slot of an [`int_key_slot`] value.
+#[inline]
+pub(crate) fn slot_of_int_key(packed: u64) -> usize {
+    packed as u32 as usize
 }
 
 /// A canonical non-negative integer property key as a usize index — "0", "1",

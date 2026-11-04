@@ -119,7 +119,9 @@ impl ClassSet {
         // CompileAtom tries the strings longest first, so `[\q{a|ab}]`
         // matches all of "ab". The code points are the length-one strings,
         // and the empty string comes last.
-        strings.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        crate::util::cold_sort_by(&mut strings, |a, b| {
+            b.len().cmp(&a.len()).then_with(|| a.cmp(b))
+        });
         strings.dedup();
         let empty = strings.last().is_some_and(|s| s.is_empty());
         if empty {

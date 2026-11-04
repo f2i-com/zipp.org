@@ -481,7 +481,7 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
         .map_err(|_| JsonOutputError)?;
     for (index, key) in map.slot_keys() {
         match canonical_u32_key(key) {
-            Some(number) => integers.push((number, index)),
+            Some(number) => integers.push(int_key_slot(number, index)),
             None => rest.push(index),
         }
     }
@@ -492,14 +492,14 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
             .ok_or(JsonOutputError)?;
         return Ok((rest, allocated));
     }
-    integers.sort_unstable_by_key(|&(number, _)| number);
+    integers.sort_unstable();
     let mut ordered = Vec::new();
     ordered
         .try_reserve_exact(map.live_len())
         .map_err(|_| JsonOutputError)?;
     let allocated = integers
         .capacity()
-        .checked_mul(std::mem::size_of::<(u32, usize)>())
+        .checked_mul(std::mem::size_of::<u64>())
         .and_then(|bytes| {
             rest.capacity()
                 .checked_mul(std::mem::size_of::<usize>())
@@ -512,7 +512,7 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
                 .and_then(|ordered_bytes| bytes.checked_add(ordered_bytes))
         })
         .ok_or(JsonOutputError)?;
-    ordered.extend(integers.into_iter().map(|(_, index)| index));
+    ordered.extend(integers.into_iter().map(slot_of_int_key));
     ordered.extend(rest);
     Ok((ordered, allocated))
 }

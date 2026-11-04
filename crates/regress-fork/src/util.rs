@@ -166,6 +166,34 @@ impl<T> SliceHelp for [T] {
     }
 }
 
+/// Sort `order`, a permutation of positions, by `cmp`, ties by position.
+///
+/// Each `sort_by` with its own closure, and each `sort()` on its own element
+/// type, is a whole copy of the standard library's sort: about 4.4 KB of
+/// WebAssembly for an unstable sort and 8 KB for a stable one. The sorts
+/// that run once per pattern or table, here and in the ZIPP engine
+/// (`zipp_vm::cold_sort`), all come through this one instantiation instead.
+#[doc(hidden)]
+#[inline(never)]
+pub fn sort_positions(order: &mut [usize], cmp: &mut dyn FnMut(usize, usize) -> Ordering) {
+    order.sort_unstable_by(|&a, &b| cmp(a, b).then(a.cmp(&b)));
+}
+
+/// `v.sort_by(cmp)`, stable, through [`sort_positions`]. For cold call
+/// sites only: each comparison is an indirect call, and a sort of two or more
+/// elements allocates twice.
+#[doc(hidden)]
+pub fn cold_sort_by<T>(v: &mut Vec<T>, mut cmp: impl FnMut(&T, &T) -> Ordering) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    sort_positions(&mut order, &mut |a, b| cmp(&v[a], &v[b]));
+    let mut slots: Vec<Option<T>> = v.drain(..).map(Some).collect();
+    v.extend(order.into_iter().filter_map(|i| slots[i].take()));
+}
+
 // Given a byte \p b, keep its low \p mask bits, and then shift left by \p shift.
 const fn mask_shift(b: u8, mask: u8, shift: u8) -> u32 {
     let masked = b & ((1 << mask) - 1);

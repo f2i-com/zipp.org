@@ -396,6 +396,15 @@ pub const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
 /// A module's export names and the global slots holding their live bindings.
 pub(crate) type ExportSlots = rustc_hash::FxHashMap<String, u32>;
 
+/// One compiled RegExp program in the resident-memory audit: its `Arc`
+/// identity and its resident bytes (`Vm::regex_program_resident_bytes`). On a
+/// 32-bit target the two pack into one `u64` that orders by identity, so the
+/// audit sorts through the engine's one `[u64]` sort (WebAssembly size).
+#[cfg(target_pointer_width = "32")]
+pub(crate) type RegexAuditEntry = u64;
+#[cfg(not(target_pointer_width = "32"))]
+pub(crate) type RegexAuditEntry = (usize, usize);
+
 /// An active `try` handler within a frame.
 /// One activation record.
 struct Frame {
@@ -2361,7 +2370,7 @@ pub struct Vm<'p> {
     /// species clones, the compile cache, and inline ASCII twins can all hold
     /// the same `Arc`; charging it once per reference would reject harmless
     /// clones while still failing to describe actual resident memory.
-    regex_program_audit_scratch: std::cell::RefCell<Vec<(usize, usize)>>,
+    regex_program_audit_scratch: std::cell::RefCell<Vec<RegexAuditEntry>>,
     /// Lazy SameValueZero hash index over a Map/Set/WeakMap/WeakSet's backing
     /// Vec, keyed by the collection's heap index (see vm/collections.rs). An
     /// ABSENT entry means linear-scan behavior (always correct); an entry is

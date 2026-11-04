@@ -5,6 +5,26 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// A [`RegexAuditEntry`] for a program's identity and resident bytes.
+#[cfg(target_pointer_width = "32")]
+fn regex_audit_entry(identity: usize, bytes: usize) -> RegexAuditEntry {
+    (identity as u64) << 32 | bytes as u64
+}
+#[cfg(not(target_pointer_width = "32"))]
+fn regex_audit_entry(identity: usize, bytes: usize) -> RegexAuditEntry {
+    (identity, bytes)
+}
+
+/// The identity and resident bytes of a [`RegexAuditEntry`].
+#[cfg(target_pointer_width = "32")]
+fn regex_audit_parts(entry: RegexAuditEntry) -> (usize, usize) {
+    ((entry >> 32) as usize, entry as u32 as usize)
+}
+#[cfg(not(target_pointer_width = "32"))]
+fn regex_audit_parts(entry: RegexAuditEntry) -> (usize, usize) {
+    entry
+}
+
 /// The global slots that the program's bytecode stores can reach: the
 /// fail-closed set `slot_guard_key` keys on (eval and Function registration
 /// extend it at run time, in `eval_prog`).
@@ -948,7 +968,7 @@ impl<'p> Vm<'p> {
                 self.regex_program_audit_scratch
                     .borrow()
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+                    .saturating_mul(std::mem::size_of::<RegexAuditEntry>()),
             )
             .saturating_add(self.sloppy_eval_memo.capacity())
             .saturating_add(
@@ -1037,13 +1057,13 @@ impl<'p> Vm<'p> {
         let mut programs = self.regex_program_audit_scratch.borrow_mut();
         programs.clear();
         self.heap.visit_regexp_programs(|program| {
-            programs.push((
+            programs.push(regex_audit_entry(
                 std::sync::Arc::as_ptr(program) as usize,
                 program.resident_bytes(),
             ));
         });
         for program in self.regex_compile_cache.values() {
-            programs.push((
+            programs.push(regex_audit_entry(
                 std::sync::Arc::as_ptr(program) as usize,
                 program.resident_bytes(),
             ));
@@ -1051,11 +1071,13 @@ impl<'p> Vm<'p> {
         // The standard sort, not `cold_sort`: the periodic heap audit runs
         // this over every compiled program into a reused scratch buffer, and
         // the shared sort's two allocations and indirect comparisons made
-        // RegExp compilation 1.6-2.7x slower in the WebAssembly screen.
-        programs.sort_unstable_by_key(|&(identity, _)| identity);
-        programs.dedup_by_key(|entry| entry.0);
-        programs.iter().fold(0usize, |bytes, &(_, program_bytes)| {
-            bytes.saturating_add(program_bytes)
+        // RegExp compilation 1.6-2.7x slower in the WebAssembly screen. One
+        // `Arc` always reports the same size, so ordering by (identity, size)
+        // groups each program's references together.
+        programs.sort_unstable();
+        programs.dedup_by_key(|entry| regex_audit_parts(*entry).0);
+        programs.iter().fold(0usize, |bytes, &entry| {
+            bytes.saturating_add(regex_audit_parts(entry).1)
         })
     }
 
