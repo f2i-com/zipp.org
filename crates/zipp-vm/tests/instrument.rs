@@ -168,7 +168,15 @@ fn results_are_unchanged_by_tracing() {
 #[cfg(not(feature = "meter-only"))]
 #[test]
 fn unprovable_arithmetic_is_demoted_rather_than_faked() {
-    for script in ["(-5) + 3", "0.1 + 0.2", "'a' + 'b'", "1 / 3", "7 % 2.5"] {
+    // One operand is a variable: the compiler folds an expression of number
+    // literals to its value, which leaves no arithmetic to classify.
+    for script in [
+        "var x = -5; x + 3",
+        "var x = 0.1; x + 0.2",
+        "'a' + 'b'",
+        "var x = 1; x / 3",
+        "var x = 7; x % 2.5",
+    ] {
         let (rows, _) = trace(script);
         let rows = rows.unwrap();
         assert_provable(&rows);
@@ -183,10 +191,10 @@ fn unprovable_arithmetic_is_demoted_rather_than_faked() {
     // …while arithmetic that IS exact still gets claimed, or the classifier
     // would be trivially "sound" by never claiming anything.
     for (script, opcode) in [
-        ("6 * 7", op::MUL),
-        ("100 / 4", op::DIV),
-        ("17 % 5", op::MOD),
-        ("6 & 3", op::BITWISE),
+        ("var x = 6; x * 7", op::MUL),
+        ("var x = 100; x / 4", op::DIV),
+        ("var x = 17; x % 5", op::MOD),
+        ("var x = 6; x & 3", op::BITWISE),
     ] {
         let (rows, _) = trace(script);
         let rows = rows.unwrap();
