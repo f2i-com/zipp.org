@@ -13,9 +13,11 @@ fn leaf_callbacks_child() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    let out = zipp_vm::run(PROGRAM).expect("compiles");
-    assert_eq!(out.error, None, "{:?}", out.errput);
-    assert_eq!(out.output.join("\n"), EXPECTED);
+    for (program, expected) in [(PROGRAM, EXPECTED), (TA_PROGRAM, TA_EXPECTED)] {
+        let out = zipp_vm::run(program).expect("compiles");
+        assert_eq!(out.error, None, "{:?}", out.errput);
+        assert_eq!(out.output.join("\n"), expected);
+    }
 }
 
 #[test]
@@ -107,5 +109,44 @@ show("global", [1, 2, 3, 4].map(function (x) { if (x === 2) K = "s"; return x + 
 var h = []; for (var i = 0; i < 100; i++) h.push(i); for (var i = 0; i < 100; i += 3) delete h[i];
 show("holey", [h.map((x) => x * 2).filter((x) => x % 4 === 0).length, h.reduce((s, x) => s + x, 0)]);
 show("like", Array.prototype.map.call({ length: 4, 0: 5, 2: 7 }, (x) => x + 1));
+console.log(out.join("\n"));
+"####;
+
+/// TypedArray callback methods (map, filter, forEach, reduce, the find family,
+/// some, every) take the leaf path too.
+const TA_EXPECTED: &str = r####"acc=126433977
+bigmap=-6000,-4000,-2000,0,2000,4000,6000,8000
+bigred=4000
+thisObj=1,8,15,22
+thisStrict=9,9,9
+mutate=6:0|7|14|99|28|35
+throw=big
+types=0,0,14,99
+empty=TypeError"####;
+
+const TA_PROGRAM: &str = r####"// TypedArray callback methods with leaf and non-leaf callbacks, against Node.
+var out = [];
+function show(l, v) { out.push(l + "=" + (v && v.length !== undefined && typeof v !== "string" ? Array.prototype.join.call(v, ",") : String(v))); }
+var f = new Float64Array(64), u = new Uint8Array(64), b = new BigInt64Array(8);
+for (var i = 0; i < 64; i++) { f[i] = (i * 37 % 61) / 4; u[i] = i * 7; }
+for (var i = 0; i < 8; i++) b[i] = BigInt(i * 1000 - 3000);
+var acc = 0;
+for (var rep = 0; rep < 500; rep++) {
+  var m = f.map((x) => x * 2 + rep);
+  var fl = u.filter((x) => (x & 3) === 0);
+  var s = 0; u.forEach(function (x, i) { s = s + x * i; });
+  var r = f.reduce((a, x) => a + x, 0) + u.reduceRight((a, x) => a ^ x, 0);
+  var fi = f.findIndex((x) => x > 14) + u.findLast((x) => x < 100) + (f.some((x) => x === 7.5) ? 1 : 0) + (u.every((x) => x < 250) ? 2 : 0);
+  acc = (acc + m[rep & 63] + fl.length + s + r + fi) | 0;
+}
+show("acc", acc);
+show("bigmap", b.map((x) => x * 2n));
+show("bigred", b.reduce((a, x) => a + x, 0n));
+show("thisObj", u.subarray(0, 4).map(function (x) { return x + this.k; }, { k: 1 }));
+show("thisStrict", Array.from(u.subarray(0, 3).map(function () { "use strict"; return typeof this === "number" ? 9 : 0; }, 5)));
+show("mutate", Array.from(u.subarray(0, 6)).length + ":" + u.subarray(0, 6).map(function (x, i, arr) { if (i === 1) arr[3] = 99; return x; }).join("|"));
+try { f.map((x) => { if (x > 10) throw new RangeError("big"); return x; }); } catch (e) { show("throw", e.message); }
+show("types", u.subarray(0, 4).map((x) => (x === 7 ? "s" : x)));
+show("empty", (() => { try { return new Uint8Array(0).reduce((a, b) => a + b); } catch (e) { return e.name; } })());
 console.log(out.join("\n"));
 "####;

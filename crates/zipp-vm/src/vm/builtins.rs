@@ -3526,7 +3526,8 @@ impl<'p> Vm<'p> {
                 let dest = self.ta_species_create(idx, len)?;
                 for i in 0..len {
                     let e = self.ta_element_get(idx, i);
-                    let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
+                    // A leaf callback runs without a frame (`run_cb_elem`).
+                    let r = self.run_cb_elem(&None, 0, a0, &[e, Value::num(i as f64), recv], a1)?;
                     self.ta_element_set(dest.heap_index(), i, r)?;
                 }
                 Ok(Some(dest))
@@ -3552,7 +3553,7 @@ impl<'p> Vm<'p> {
                     // callback that mutates the TypedArray is observed — values are
                     // not cached before iteration).
                     let e = self.ta_element_get(idx, i);
-                    let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
+                    let r = self.run_cb_elem(&None, 0, a0, &[e, Value::num(i as f64), recv], a1)?;
                     match name {
                         "forEach" => {}
                         "filter" => {
@@ -3633,11 +3634,7 @@ impl<'p> Vm<'p> {
                 for &i in &order[start..] {
                     // Read each element fresh (not cached) per the spec.
                     let e = self.ta_element_get(idx, i);
-                    acc = self.call_value(
-                        a0,
-                        Value::UNDEFINED,
-                        &[acc, e, Value::num(i as f64), recv],
-                    )?;
+                    acc = self.run_cb_elem(&None, 0, a0, &[acc, e, Value::num(i as f64), recv], Value::UNDEFINED)?;
                 }
                 Ok(Some(acc))
             }
