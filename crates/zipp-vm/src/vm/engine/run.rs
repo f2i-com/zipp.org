@@ -25,6 +25,16 @@ env_off_switch! {
     fn job_int_window_enabled() = "ZIPP_NO_JOB_INT_WINDOW"
 }
 
+/// What `Vm::call_compiled_windowed_raw` did (its report's first half).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WINDOWED_NOT_RUN: u32 = 0;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WINDOWED_DONE: u32 = 1;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WINDOWED_THREW: u32 = 2;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WINDOWED_BAILED: u32 = 3;
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod tier_a_module_pin_tests {
     use super::*;
@@ -1324,6 +1334,62 @@ impl<'p> Vm<'p> {
         fid: u32,
         closure: u32,
     ) -> Option<Result<Value, Thrown>> {
+        // The run reports in two registers; only a throw or a resumed bail
+        // builds a `Result` out of line. Returned as the 24-byte
+        // `Option<Result>` it was, the result went through a stack slot that
+        // the caller re-read with one 16-byte load over the callee's two
+        // 8-byte stores, which the CPU cannot forward: a stall on every
+        // compiled call a builtin or getter made (6% of class-features).
+        let (kind, bits) = self.call_compiled_windowed_raw(callee, this, args, fid, closure);
+        match kind {
+            WINDOWED_DONE => Some(Ok(Value::from_bits(bits))),
+            WINDOWED_NOT_RUN => None,
+            _ => Some(self.finish_compiled_windowed(callee, fid, closure, kind, bits)),
+        }
+    }
+
+    /// The result of a windowed run that threw or bailed past its entry
+    /// (`call_compiled_windowed_raw`'s `WINDOWED_THREW` / `WINDOWED_BAILED`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    fn finish_compiled_windowed(
+        &mut self,
+        callee: Value,
+        fid: u32,
+        closure: u32,
+        kind: u32,
+        bits: u64,
+    ) -> Result<Value, Thrown> {
+        if kind == WINDOWED_THREW {
+            return Err(Thrown(self.throw_message(Value::from_bits(bits))));
+        }
+        // A guard bail past the entry: native code already ran `[0, bail)`,
+        // so the activation resumes there over the same window.
+        let (bail, win) = ((bits >> 32) as usize, (bits & 0xFFFF_FFFF) as usize);
+        let resumed = self.resume_frame_window(callee, fid, closure, win, bail);
+        // The resumed frame's pop releases the window; a resume refused at
+        // the frame limit never pushed one.
+        if self.regs.len() > win {
+            self.regs.truncate(win);
+        }
+        resumed
+    }
+
+    /// [`Vm::call_compiled_windowed`]'s run, as `(kind, bits)`: the value's
+    /// bits for `WINDOWED_DONE`, the thrown value's for `WINDOWED_THREW`,
+    /// `bail << 32 | window` for `WINDOWED_BAILED`, nothing for
+    /// `WINDOWED_NOT_RUN` (nothing done).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn call_compiled_windowed_raw(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: WinArgs<'_>,
+        fid: u32,
+        closure: u32,
+    ) -> (u32, u64) {
+        const NOT_RUN: (u32, u64) = (WINDOWED_NOT_RUN, 0);
         if self.jit.fn_state(fid) != crate::codegen::FN_COMPILED
             || !self.jit_fused_ok()
             || self.jit_recurse_depth != 0
@@ -1335,7 +1401,7 @@ impl<'p> Vm<'p> {
             // The cap on native re-entry is `run_loop`'s to raise.
             || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
         {
-            return None;
+            return NOT_RUN;
         }
         // A frame-free activation always has a frame under it: the compiled
         // caller's, or the frame of the code that called the builtin. The
@@ -1347,7 +1413,7 @@ impl<'p> Vm<'p> {
         // host's jobs run it frame-free too: a promise reaction's callback.
         let frameless = self.frames.is_empty();
         if frameless && !job_int_window_enabled() {
-            return None;
+            return NOT_RUN;
         }
         // A Tier C body's frame-free entry, run under an activation; or an
         // int-tier body, which needs neither a frame nor an activation and
@@ -1355,12 +1421,14 @@ impl<'p> Vm<'p> {
         let (entry, activate) = match self.jit.cross_entry(fid) {
             Some((entry, _, _, _)) if !frameless => (entry, true),
             _ => {
-                let body = self.jit.int_body(fid)?;
+                let Some(body) = self.jit.int_body(fid) else {
+                    return NOT_RUN;
+                };
                 let rebound = body.self_binding().is_some_and(|(slot, expect)| {
                     self.globals.get(slot as usize).map(|v| v.bits()) != Some(expect)
                 });
                 if rebound {
-                    return None;
+                    return NOT_RUN;
                 }
                 (body.entry(), false)
             }
@@ -1368,16 +1436,17 @@ impl<'p> Vm<'p> {
         let (callee_regs, params) = {
             let proto = self.func(fid as usize);
             if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
-                return None;
+                return NOT_RUN;
             }
             ((proto.reg_count as usize).max(1), proto.param_count as usize)
         };
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            return None;
+            return NOT_RUN;
         }
         let win = self.regs.len();
-        if self.regs_would_overflow(win + callee_regs) {
-            return None;
+        // `win` rides in 32 bits of a bailed run's report.
+        if self.regs_would_overflow(win + callee_regs) || win > u32::MAX as usize {
+            return NOT_RUN;
         }
         // A full activation stack declines before any effect. An int-tier
         // body has no activation to name its callee, and no frame: the
@@ -1386,7 +1455,10 @@ impl<'p> Vm<'p> {
         let rooted = self.host_result_roots.len();
         let token = if activate {
             let upvals_raw = self.resolve_upvals_raw(closure);
-            Some(self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw)?)
+            let Some(token) = self.enter_tierc_activation(closure, callee.heap_index(), true, upvals_raw) else {
+                return NOT_RUN;
+            };
+            Some(token)
         } else {
             self.host_result_roots.push(callee);
             None
@@ -1436,28 +1508,22 @@ impl<'p> Vm<'p> {
         self.host_result_roots.truncate(rooted);
         if bail == crate::codegen::NO_BAIL {
             self.regs.truncate(win);
-            return Some(Ok(Value::from_bits(bits)));
+            return (WINDOWED_DONE, bits);
         }
         if let Some(tv) = self.pending_throw {
             // A callee of the native body threw: unwind, never resume. The
             // activation had no frame, so no handler of its own.
             self.regs.truncate(win);
-            return Some(Err(Thrown(self.throw_message(tv))));
+            return (WINDOWED_THREW, tv.bits());
         }
         if bail == 0 {
             // Nothing ran: the ordinary call starts this activation again.
             self.regs.truncate(win);
-            return None;
+            return NOT_RUN;
         }
-        // A guard bail past the entry: native code already ran `[0, bail)`,
-        // so the activation resumes there over the same window.
-        let resumed = self.resume_frame_window(callee, fid, closure, win, bail as usize);
-        // The resumed frame's pop releases the window; a resume refused at
-        // the frame limit never pushed one.
-        if self.regs.len() > win {
-            self.regs.truncate(win);
-        }
-        Some(resumed)
+        // A guard bail past the entry: `finish_compiled_windowed` resumes the
+        // activation at `bail` over the same window.
+        (WINDOWED_BAILED, (bail as u64) << 32 | win as u64)
     }
 
     /// Run the frame `call_value_plain_body` just pushed for `fid` (at
