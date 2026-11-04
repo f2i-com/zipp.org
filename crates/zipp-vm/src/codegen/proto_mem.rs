@@ -3925,6 +3925,12 @@ pub(crate) fn compile_proto_mem(
                     ; mov DWORD [rsi], NO_BAIL as i32
                 );
             }
+            // Bit 31: a throw is pending; leave at the resume ip.
+            let leave = ops.new_dynamic_label();
+            dynasm!(ops
+                ; test eax, eax
+                ; js => leave
+            );
             for &e in exits.iter().chain(std::iter::once(&(head as u32))) {
                 dynasm!(ops
                     ; cmp eax, e as i32
@@ -3932,6 +3938,8 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             dynasm!(ops
+                ; => leave
+                ; and eax, 0x7FFF_FFFF
                 ; mov DWORD [rsi], eax
                 ; jmp => epilogue
                 ; => not_run

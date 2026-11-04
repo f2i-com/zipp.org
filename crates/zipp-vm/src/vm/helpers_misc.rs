@@ -5672,7 +5672,15 @@ pub(crate) extern "win64" fn jit_tierc_run_region(
         return NOT_RUN;
     }
     match vm.try_run_osr(func_id, head, base as usize) {
-        Some(resume) if resume < u32::MAX as usize => resume as u64,
+        // A throw left pending by the run must unwind, never continue in the
+        // body. A region that throws resumes at the throwing op, inside the
+        // loop, and the only ip inside the loop the body continues at is the
+        // head (a refused entry): so only that resume reads the throw (the
+        // read on every run measured 10% of a short call). Bit 31 tells the
+        // body to leave by a bail at the resume ip, where its caller unwinds
+        // as for any other bail with a throw.
+        Some(resume) if resume == head as usize && vm.pending_throw.is_some() => resume as u64 | 0x8000_0000,
+        Some(resume) if resume < 0x8000_0000 => resume as u64,
         _ => NOT_RUN,
     }
 }

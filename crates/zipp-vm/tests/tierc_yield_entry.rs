@@ -71,6 +71,20 @@ G = 1.5; log("global double", globalLoop(9), globalLoop(9));
 let h2 = 0;
 for (let r = 0; r < 2000; r++) h2 = (h2 + crc32(buf, r & 1023, (r & 1023) + (r & 63)) + fnv(r, words[r % 7]) + sumTo(ints, r & 63)) | 0;
 log("after", h2 >>> 0);
+// Loops whose property read runs a getter that throws partway through: in
+// the body, and at the loop head (the one in-loop ip the body continues at).
+let calls = 0;
+const g = { get v() { if (++calls % 997 === 0) throw new RangeError("v" + calls); return 1.5; } };
+function sumV(o, n) { let s = 0; for (let i = 0; i < n; i++) s += o.v * 2; return s; }
+let thrown = 0, tot = 0;
+for (let r = 0; r < 4000; r++) { try { tot += sumV(g, 7); } catch (e) { thrown++; } }
+log("throwing getter", tot, thrown, calls);
+let lc = 0;
+const L = { get len() { if (++lc % 501 === 0) throw new TypeError("len"); return 5; } };
+function headLoop(o) { let i = 0; while (i < o.len) i++; return i; }
+let ht = 0, hs = 0;
+for (let r = 0; r < 4000; r++) { try { hs += headLoop(L); } catch (e) { ht++; } }
+log("throwing head", hs, ht, lc);
 console.log(out.join("\n"));
 "##;
 
