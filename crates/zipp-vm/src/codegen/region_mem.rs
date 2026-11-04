@@ -644,6 +644,39 @@ pub(crate) fn compile_region_mem(
             _ => None,
         }
     };
+    // As Tier C's (`proto_mem`): a fused compare whose other operand the
+    // previous instruction, inside the region and reached only from it, set
+    // to an Int constant. The region is entered at its head alone.
+    let mut jump_target = vec![false; proto.code.len()];
+    for i in &proto.code {
+        if let Some(t) = crate::codegen::fn_int::bytecode_control_target(i) {
+            if let Some(slot) = jump_target.get_mut(t as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let cmp_const_operand = |ip: usize, a: u16, b: u16, cmp: Cmp| -> Option<(u16, i32, Cmp)> {
+        if ip <= s || jump_target[ip] || a == b || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        let Instr::LoadInt { dst, val } = proto.code[ip - 1] else {
+            return None;
+        };
+        if dst == b {
+            Some((a, val, cmp))
+        } else if dst == a {
+            let flipped = match cmp {
+                Cmp::Lt => Cmp::Gt,
+                Cmp::Le => Cmp::Ge,
+                Cmp::Gt => Cmp::Lt,
+                Cmp::Ge => Cmp::Le,
+                other => other,
+            };
+            Some((b, val, flipped))
+        } else {
+            None
+        }
+    };
     // The k-th GetProp/SetProp in the region uses inline-cache site `ic_site`.
     let mut ic_site = heap.ic_base_idx;
     for ip in s..=e {
@@ -1804,7 +1837,12 @@ pub(crate) fn compile_region_mem(
                 if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
                     let t = region_target(tgt, start, end, &in_region, &mut exit_stubs, &mut ops);
                     let ft = lbl((ip + 2) as u32, &in_region);
-                    emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
+                    match cmp_const_operand(ip, a, b, cmp) {
+                        Some((reg, imm, c)) => crate::codegen::emit_misc::emit_fused_cmp_imm_branch_head(
+                            &mut ops, dst, reg, imm, c, iff, t, ft,
+                        ),
+                        None => emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft),
+                    }
                 }
                 match cmp {
                     // `===` / `!==` are polymorphic: numeric operands compare as

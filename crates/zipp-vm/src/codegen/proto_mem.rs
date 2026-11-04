@@ -4001,6 +4001,44 @@ pub(crate) fn compile_proto_mem(
             _ => None,
         }
     };
+    // Where control can arrive other than from the previous instruction:
+    // every jump, `finally` and `catch` target (the entry, the loop heads
+    // `run_at` enters at and the `finally` routings' landings are among
+    // them, or ip 0).
+    let mut jump_target = vec![false; n];
+    for i in &proto.code {
+        if let Some(t) = crate::codegen::fn_int::bytecode_control_target(i) {
+            if let Some(slot) = jump_target.get_mut(t as usize) {
+                *slot = true;
+            }
+        }
+    }
+    // A fused compare whose other operand the previous instruction set to an
+    // Int constant, reached only from it: `(register, constant, comparison
+    // as register CMP constant)`, the constant compared as an immediate.
+    let cmp_const_operand = |ip: usize, a: u16, b: u16, cmp: Cmp| -> Option<(u16, i32, Cmp)> {
+        if ip == 0 || jump_target[ip] || a == b || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        let Instr::LoadInt { dst, val } = proto.code[ip - 1] else {
+            return None;
+        };
+        if dst == b {
+            Some((a, val, cmp))
+        } else if dst == a {
+            // `c CMP b` is `b CMP' c` with the operands swapped.
+            let flipped = match cmp {
+                Cmp::Lt => Cmp::Gt,
+                Cmp::Le => Cmp::Ge,
+                Cmp::Gt => Cmp::Lt,
+                Cmp::Ge => Cmp::Le,
+                other => other,
+            };
+            Some((b, val, flipped))
+        } else {
+            None
+        }
+    };
     // The loop heads the interpreter's back-edge may enter this body at
     // mid-call (`JitFn::run_at`, for a hot loop no region serves): the
     // targets of backward `Jump`s, which are jump targets, so both caches
@@ -6279,7 +6317,12 @@ pub(crate) fn compile_proto_mem(
                 if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
                     let t = labels[tgt as usize];
                     let ft = labels[ip + 2];
-                    emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
+                    match cmp_const_operand(ip, a, b, cmp) {
+                        Some((reg, imm, c)) => crate::codegen::emit_misc::emit_fused_cmp_imm_branch_head(
+                            &mut ops, dst, reg, imm, c, iff, t, ft,
+                        ),
+                        None => emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft),
+                    }
                 }
                 match cmp {
                     Cmp::Eq => region_poly_eq(

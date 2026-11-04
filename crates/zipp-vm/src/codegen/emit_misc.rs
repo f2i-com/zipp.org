@@ -428,6 +428,63 @@ pub(crate) fn emit_fused_cmp_branch_head(
     );
 }
 
+/// [`emit_fused_cmp_branch_head`] for `a CMP imm`, where the other operand
+/// is a register the instruction just before set to the Int `imm`
+/// (`LoadInt`) and no jump lands between the two: the register is not read
+/// or tag-tested. A non-Int `a` falls to the same generic sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_fused_cmp_imm_branch_head(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    imm: i32,
+    cmp: Cmp,
+    if_false: bool,
+    target: dynasmrt::DynamicLabel,
+    fallthrough: dynasmrt::DynamicLabel,
+) {
+    let generic = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => generic                      // a not Int → generic pair
+        ; cmp eax, imm                        // signed i32 payload compare
+    );
+    match cmp {
+        Cmp::Eq => dynasm!(ops ; sete dl),
+        Cmp::Ne => dynasm!(ops ; setne dl),
+        Cmp::Lt => dynasm!(ops ; setl dl),
+        Cmp::Le => dynasm!(ops ; setle dl),
+        Cmp::Gt => dynasm!(ops ; setg dl),
+        Cmp::Ge => dynasm!(ops ; setge dl),
+    }
+    dynasm!(ops
+        ; movzx edx, dl
+        ; mov r10, QWORD BOOL_TAG as i64
+        ; or r10, rdx
+        ; mov [rbx + dreg(dst)], r10          // dst gets the Bool Value regardless
+        ; test dl, dl
+    );
+    if if_false {
+        dynasm!(ops ; jz => target);
+    } else {
+        dynasm!(ops ; jnz => target);
+    }
+    dynasm!(ops
+        ; jmp => fallthrough
+        ; => generic
+    );
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_CONST_CMP=1`: a fused compare against a register the
+    /// previous `LoadInt` set reads and tag-tests that register again.
+    #[inline]
+    fn const_cmp_enabled() = "ZIPP_NO_CONST_CMP"
+}
+
 /// Resolve a jump `target` to a label: an in-region ip uses its own label; an
 /// out-of-region ip gets (or reuses) an exit stub label.
 pub(crate) fn region_target(
