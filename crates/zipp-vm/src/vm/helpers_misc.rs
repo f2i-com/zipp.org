@@ -8157,7 +8157,7 @@ pub(crate) extern "win64" fn jit_cross3_finish(
     let fid = (packed & 0x00FF_FFFF) as u32;
     let regs_base = vm.regs.as_ptr() as usize;
     let new_base = (new_base_ptr as usize - regs_base) / 8;
-    if vm.pending_throw.is_some() {
+    if vm.pending_throw.is_some() && !vm.has_lazy_handlers(new_base) {
         // The callee's own deeper call threw and its native code signalled
         // unwind via a bail with the throw pending: unwind, never resume.
         vm.regs.truncate(new_base);
@@ -8165,7 +8165,10 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         vm.osr_deopt_exempt = true;
         return crate::codegen::CALL_THREW;
     }
+    // A throw out of a lazy bracket whose handler push waits for this frame
+    // (`jit_lazy_push`) unwinds to it below; a guard bail resumes.
     if vm.frames.len() >= crate::vm::MAX_FRAMES {
+        vm.drop_lazy_handlers(new_base);
         let e = vm.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
         vm.pending_throw = Some(e);
         vm.regs.truncate(new_base);
@@ -8199,16 +8202,22 @@ pub(crate) extern "win64" fn jit_cross3_finish(
         callee: cv,
     });
     let stop = vm.frames.len() - 1;
-    let out = match vm.run_loop(stop) {
-        Ok(v) => {
-            vm.regs.truncate(new_base);
-            v.bits()
-        }
-        Err(_) => {
-            // pending_throw is set; the native chain unwinds and the
-            // enclosing interpreter dispatches it to a handler.
-            vm.osr_deopt_exempt = true;
-            crate::codegen::CALL_THREW
+    vm.adopt_lazy_handlers(stop);
+    let out = if !vm.finish_lazy_throw(stop) {
+        vm.osr_deopt_exempt = true;
+        crate::codegen::CALL_THREW
+    } else {
+        match vm.run_loop(stop) {
+            Ok(v) => {
+                vm.regs.truncate(new_base);
+                v.bits()
+            }
+            Err(_) => {
+                // pending_throw is set; the native chain unwinds and the
+                // enclosing interpreter dispatches it to a handler.
+                vm.osr_deopt_exempt = true;
+                crate::codegen::CALL_THREW
+            }
         }
     };
     vm.jit_call_depth -= 1;
@@ -8941,6 +8950,126 @@ pub(crate) extern "win64" fn jit_push_catch(vm: *mut core::ffi::c_void, packed: 
         reg: packed as u16,
     });
     0
+}
+
+/// Bit 63 of `jit_lazy_push`'s `packed`: the bracket is a `finally`'s.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const LAZY_PUSH_FINALLY: u64 = 1 << 63;
+
+/// Win64 helper for a Tier C lazy bracket's exit stub: one handler push the
+/// body skipped (`proto_mem::lazy_tries`), outermost first. `packed` is
+/// `jit_push_finally`'s with [`LAZY_PUSH_FINALLY`], or `jit_push_catch`'s;
+/// `window` is the activation's register window and `fid` its function.
+///
+/// A body running over its own frame (the top one, at `window`) takes the push
+/// there, as those helpers would. A frame-free activation has no frame yet:
+/// every frame lies below its window, so the push waits in `lazy_handlers` for
+/// the frame its bail or throw materializes (`Vm::adopt_lazy_handlers`). Total.
+///
+/// # Safety
+/// `vm` is the running VM; `window` points into its register file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_lazy_push(
+    vm: *mut core::ffi::c_void,
+    packed: u64,
+    window: *const u64,
+    fid: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let base = (window as usize - vm.regs.as_ptr() as usize) / core::mem::size_of::<u64>();
+    let h = if packed & LAZY_PUSH_FINALLY != 0 {
+        Handler::Finally {
+            target: ((packed >> 32) & 0x7FFF_FFFF) as u32,
+            kind_reg: ((packed >> 16) & 0xFFFF) as u16,
+            val_reg: (packed & 0xFFFF) as u16,
+        }
+    } else {
+        Handler::Catch {
+            target: (packed >> 16) as u32,
+            reg: packed as u16,
+        }
+    };
+    match vm.frames.last() {
+        Some(f) if f.base == base => {
+            debug_assert_eq!(f.func, fid as u32, "a lazy push's frame is its own body's");
+            let top = vm.frames.len() - 1;
+            let hs = &mut vm.frames[top].handlers;
+            if hs.capacity() == 0 {
+                *hs = crate::vm::handler_pool::take(&mut vm.handler_pool);
+            }
+            hs.push(h);
+        }
+        _ => vm.lazy_handlers.push((base, h)),
+    }
+    0
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl Vm<'_> {
+    /// Whether a frame-free activation over `base` deferred handler pushes.
+    #[inline]
+    pub(crate) fn has_lazy_handlers(&self, base: usize) -> bool {
+        !self.lazy_handlers.is_empty() && self.lazy_handlers.iter().any(|&(b, _)| b == base)
+    }
+
+    /// Hand the frame materialized for a frame-free activation the handler
+    /// pushes it deferred (`jit_lazy_push`), in order. Deferrals of windows
+    /// above it belonged to activations that are gone, and go too.
+    #[inline]
+    pub(crate) fn adopt_lazy_handlers(&mut self, frame: usize) {
+        if !self.lazy_handlers.is_empty() {
+            self.adopt_lazy_handlers_slow(frame);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn adopt_lazy_handlers_slow(&mut self, frame: usize) {
+        let base = self.frames[frame].base;
+        let mut mine: Vec<Handler> = Vec::new();
+        self.lazy_handlers.retain(|&(b, h)| {
+            if b == base {
+                mine.push(h);
+            }
+            b < base
+        });
+        if mine.is_empty() {
+            return;
+        }
+        let hs = &mut self.frames[frame].handlers;
+        if hs.capacity() == 0 {
+            *hs = crate::vm::handler_pool::take(&mut self.handler_pool);
+        }
+        hs.extend(mine);
+    }
+
+    /// A throw pending as the activation the transient frame `stop` finishes
+    /// left native code: unwind it to the handlers that frame holds (those it
+    /// adopted), as the frame-backed cross call does. `true` when the frame
+    /// resumes (no throw, or a handler took it); `false` when none did, the
+    /// frame is popped and the throw goes on.
+    pub(crate) fn finish_lazy_throw(&mut self, stop: usize) -> bool {
+        match self.pending_throw {
+            Some(tv) => {
+                if self.unwind_to_handler(tv, stop) {
+                    self.pending_throw = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => true,
+        }
+    }
+
+    /// Forget the deferred pushes of an activation over `base` that leaves
+    /// without a frame (and of any above it).
+    #[inline]
+    pub(crate) fn drop_lazy_handlers(&mut self, base: usize) {
+        if !self.lazy_handlers.is_empty() {
+            self.lazy_handlers.retain(|&(b, _)| b < base);
+        }
+    }
 }
 
 /// Win64 helper for a region `PopFinally` — the pop half of `jit_push_finally`

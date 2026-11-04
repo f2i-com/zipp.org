@@ -3570,6 +3570,13 @@ pub struct Jit {
     /// other reader and the native-visible `cross_table` slot stays null, so
     /// no emitted lane can enter one frame-free.
     cross_needs_frame: Vec<bool>,
+    /// Entries whose handler-op body may run frame-free all the same
+    /// (`proto_mem::lazy_frame_free`): its exit stubs defer the pushes they
+    /// make until the frame a bail or throw materializes, which only the
+    /// generic cross helper and `jit_cross3_finish` adopt. So the emitted
+    /// lanes and the generic helper see the entry (`cross_entry_lane`) and
+    /// every other reader of `cross_entry` does not.
+    cross_lazy_ff: Vec<bool>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -3892,6 +3899,7 @@ impl Jit {
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.cross_needs_frame.clear();
+        self.cross_lazy_ff.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -3982,12 +3990,40 @@ impl Jit {
     )> {
         match self.cross_entries.get(func_id as usize) {
             Some(&(p, mask, json, markdown))
-                if !p.is_null() && !self.cross_needs_frame(func_id) =>
+                if !p.is_null() && !self.cross_needs_frame(func_id) && !self.cross_lazy_ff(func_id) =>
             {
                 Some((p, mask, json, markdown))
             }
             _ => None,
         }
+    }
+
+    /// [`Jit::cross_entry`] for the emitted cross-call lanes' planners, which
+    /// also take a `cross_lazy_ff` body's: a bail from one finishes in
+    /// `jit_cross3_finish`, which adopts its deferred handler pushes.
+    #[inline]
+    pub fn cross_entry_lane(
+        &self,
+        func_id: u32,
+    ) -> Option<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+    )> {
+        match self.cross_entries.get(func_id as usize) {
+            Some(&(p, mask, json, markdown)) if !p.is_null() && !self.cross_needs_frame(func_id) => {
+                Some((p, mask, json, markdown))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `func_id`'s entry is a handler-op body that may run frame-free
+    /// (`cross_lazy_ff`).
+    #[inline]
+    pub fn cross_lazy_ff(&self, func_id: u32) -> bool {
+        self.cross_lazy_ff.get(func_id as usize).copied().unwrap_or(false)
     }
 
     /// B272: whether `func_id`'s entry may only be entered frame-backed.
@@ -4041,6 +4077,7 @@ impl Jit {
         json_walk: Option<JsonWalkPlan>,
         markdown_inline: Option<MarkdownInlinePlan>,
         needs_frame: bool,
+        lazy_ff: bool,
     ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
@@ -4054,6 +4091,10 @@ impl Jit {
             self.cross_needs_frame.resize(i + 1, false);
         }
         self.cross_needs_frame[i] = needs_frame;
+        if self.cross_lazy_ff.len() <= i {
+            self.cross_lazy_ff.resize(i + 1, false);
+        }
+        self.cross_lazy_ff[i] = lazy_ff && !needs_frame;
         // B199: the mask generation bumps only when the mask CHANGES — a
         // same-shape recompile keeps every dependent lane's baked mask
         // valid, which is what lets a re-set entry resume those lanes
@@ -4256,6 +4297,9 @@ impl Jit {
             // gen guard must observe — a recompile whose analysis declines
             // to u64::MAX — compared equal to the sentinel and did NOT bump.
             *p = (std::ptr::null(), p.1, None, None);
+        }
+        if let Some(flag) = self.cross_lazy_ff.get_mut(func_id as usize) {
+            *flag = false;
         }
         if let Some(flag) = self.cross_needs_frame.get_mut(func_id as usize) {
             *flag = false;
@@ -4469,7 +4513,7 @@ impl Jit {
                     return;
                 }
                 let mask = if needs_frame { u64::MAX } else { cross_uninit_mask(proto) };
-                self.set_cross_entry(func_id, entry, mask, None, None, None, needs_frame);
+                self.set_cross_entry(func_id, entry, mask, None, None, None, needs_frame, false);
                 return;
             }
         }
@@ -4615,18 +4659,22 @@ impl Jit {
                 // frame-backed. Every Python function already carries the
                 // traceback handler's `PushHandler`; the second test states
                 // the requirement rather than relying on that emitter habit.
-                let needs_frame = proto_has_handler_ops(proto) || has_py_ops(&proto.code);
-                if needs_frame && !cross_framed_entry_enabled() {
+                // A body whose brackets are all lazy holds no handler while
+                // it runs (`lazy_frame_free`), so it runs frame-free too: its
+                // exit stubs defer their pushes for the frame a bail or a
+                // throw materializes (`cross_lazy_ff`).
+                let has_handlers = proto_has_handler_ops(proto) || has_py_ops(&proto.code);
+                let lazy_ff = has_handlers && meter.is_none() && lazy_frame_free(proto);
+                let needs_frame = has_handlers && !lazy_ff;
+                if has_handlers && !cross_framed_entry_enabled() {
                     self.clear_cross_entry(func_id);
                     return;
                 }
-                // A handler-op body always takes the FULL zero-fill: the
-                // may-read-before-write pass follows jumps only, and a throw
-                // inside a bracket reaches the handler with the bracket's
-                // defs possibly unexecuted (a hoisted `var` assigned in the
-                // `try` and read in the `catch` is the concrete shape), so a
-                // masked fill could expose a stale slot there. The
-                // interpreter zero-fills the whole window; so does this.
+                // A frame-backed handler-op body takes the FULL zero-fill, as
+                // the interpreter's window. The may-read-before-write pass
+                // gives a handler's entry the state at its push (a throw from
+                // its block reaches it with the block's defs possibly
+                // unexecuted), so a frame-free one keeps its mask.
                 let (uninit_mask, wide_uninit_mask) = if needs_frame {
                     (u64::MAX, None)
                 } else {
@@ -4640,6 +4688,7 @@ impl Jit {
                     json_walk,
                     markdown_inline,
                     needs_frame,
+                    lazy_ff,
                 );
                 return;
             }

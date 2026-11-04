@@ -455,6 +455,8 @@ impl<'p> Vm<'p> {
             json_key_plans: Default::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),
             handler_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            lazy_handlers: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,

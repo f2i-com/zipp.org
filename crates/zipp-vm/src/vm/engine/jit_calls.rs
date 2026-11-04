@@ -757,6 +757,10 @@ impl<'p> Vm<'p> {
         };
         self.leave_tierc_activation(activation_token);
         let out = if bail == crate::codegen::NO_BAIL {
+            debug_assert!(
+                !self.has_lazy_handlers(new_base),
+                "a clean return defers no handler push"
+            );
             if needs_frame {
                 // B272: the native body completed; its frame carried no live
                 // handler (the brackets are balanced on a normal completion).
@@ -811,7 +815,7 @@ impl<'p> Vm<'p> {
                 self.osr_deopt_exempt = true;
                 CALL_THREW
             }
-        } else if self.pending_throw.is_some() {
+        } else if self.pending_throw.is_some() && !self.has_lazy_handlers(new_base) {
             // The callee's own (deeper) call threw and its native code
             // signalled unwind via a bail with the throw pending (the
             // `try_run_jit` (b) case): unwind, never resume.
@@ -819,10 +823,14 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             CALL_THREW
         } else {
-            // Guard bail mid-body: finish this activation on the interpreter
-            // over the SAME window via a transient frame (regs stay as the
-            // native code left them; ip = the recorded resume point).
+            // Guard bail mid-body, or a throw out of a lazy bracket whose
+            // handler push waits for this frame (`jit_lazy_push`): finish this
+            // activation on the interpreter over the SAME window via a
+            // transient frame (regs stay as the native code left them; ip =
+            // the recorded resume point). A throw first unwinds to the
+            // handlers the frame adopted, as the frame-backed route above.
             if self.frames.len() >= MAX_FRAMES {
+                self.drop_lazy_handlers(new_base);
                 let e =
                     self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
                 self.pending_throw = Some(e);
@@ -852,17 +860,23 @@ impl<'p> Vm<'p> {
                 callee: cv,
             });
             let stop = self.frames.len() - 1;
-            match self.run_loop(stop) {
-                Ok(v) => {
-                    self.regs.truncate(new_base);
-                    v.bits()
+            self.adopt_lazy_handlers(stop);
+            if self.finish_lazy_throw(stop) {
+                match self.run_loop(stop) {
+                    Ok(v) => {
+                        self.regs.truncate(new_base);
+                        v.bits()
+                    }
+                    Err(_) => {
+                        // pending_throw is set; the native chain unwinds and the
+                        // enclosing interpreter dispatches it to a handler.
+                        self.osr_deopt_exempt = true;
+                        CALL_THREW
+                    }
                 }
-                Err(_) => {
-                    // pending_throw is set; the native chain unwinds and the
-                    // enclosing interpreter dispatches it to a handler.
-                    self.osr_deopt_exempt = true;
-                    CALL_THREW
-                }
+            } else {
+                self.osr_deopt_exempt = true;
+                CALL_THREW
             }
         };
         self.jit_call_depth -= 1;
@@ -2582,7 +2596,7 @@ impl<'p> Vm<'p> {
             // without `setup_call` and the interpreter's prologue. `this` is
             // already bound (above), which the cross call keeps as it is; a
             // pure decline falls through.
-            if self.jit.cross_needs_frame(fid) {
+            if self.jit.cross_needs_frame(fid) || self.jit.cross_lazy_ff(fid) {
                 let caller_regs = self.func(func_id as usize).reg_count.max(1);
                 let packed = argc as u64 | (u64::from(caller_regs) << 16);
                 // SAFETY: the argument registers lie in the caller's window.

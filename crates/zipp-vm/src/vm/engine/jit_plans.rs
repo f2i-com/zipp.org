@@ -1962,7 +1962,8 @@ impl<'p> Vm<'p> {
             || callee.rest_reg.is_some()
             || callee.arguments_reg.is_some()
             || (crate::codegen::handler_callee_skip_enabled()
-                && crate::codegen::proto_has_handler_ops(callee))
+                && crate::codegen::proto_has_handler_ops(callee)
+                && !self.jit.cross_lazy_ff(fid))
             || usize::from(callee.param_count) != usize::from(argc)
             || argc > 6
         {
@@ -2014,7 +2015,7 @@ impl<'p> Vm<'p> {
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
         let parked = self.jit.cross_parked_mask(fid);
-        let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry(fid)
+        let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry_lane(fid)
         {
             Some((_entry, mask, json, markdown)) => {
                 (mask, json, markdown, self.jit.cross_mask_gen(fid))
@@ -2495,12 +2496,13 @@ impl<'p> Vm<'p> {
                         || usize::from(callee.param_count) != usize::from(argc)
                         // B213: see the call arm — no entry can ever exist.
                         || (crate::codegen::handler_callee_skip_enabled()
-                            && crate::codegen::proto_has_handler_ops(callee))
+                            && crate::codegen::proto_has_handler_ops(callee)
+                            && !self.jit.cross_lazy_ff(fid))
                     {
                         continue;
                     }
                     let Some((_entry, uninit_mask, json_walk, markdown_inline)) =
-                        self.jit.cross_entry(fid)
+                        self.jit.cross_entry_lane(fid)
                     else {
                         pending.push(fid);
                         continue;

@@ -2349,6 +2349,13 @@ pub struct Vm<'p> {
     /// Emptied `Frame::handlers` buffers for the next frame's first `try`
     /// push (see `handler_pool`). Holds no `Value`s.
     handler_pool: Vec<Vec<Handler>>,
+    /// Handler pushes a frame-free Tier C activation's lazy bracket deferred
+    /// on its way out (`jit_lazy_push`), keyed by the activation's window
+    /// base, for the frame its bail or throw materializes
+    /// (`Vm::adopt_lazy_handlers`). Empty except between such an exit and its
+    /// finish. Holds no `Value`s.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) lazy_handlers: Vec<(usize, Handler)>,
     /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
     /// programs during the periodic resident-memory audit. Regex literals,
     /// species clones, the compile cache, and inline ASCII twins can all hold

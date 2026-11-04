@@ -1724,6 +1724,9 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             // The finally bracket manipulates frame state only; EndFinally and
             // IterCloseFinally read their completion registers on either path.
             Instr::PushFinally { .. } | Instr::PopFinally | Instr::JumpFinally { .. } => (u0(), None),
+            // A catch's bracket too (`catch_reg` is the unwinder's to write
+            // before the catch runs; read there, it only counts as unwritten).
+            Instr::PushHandler { .. } | Instr::PopHandler => (u0(), None),
             Instr::EndFinally { kind_reg, val_reg } => (u2(kind_reg, val_reg), None),
             Instr::IterCloseFinally { iter, kind_reg } => (u2(iter, kind_reg), None),
             // IterNext writes three registers, which does not fit the
@@ -2899,6 +2902,51 @@ env_off_switch! {
     fn lazy_nest_enabled() = "ZIPP_NO_LAZY_NEST"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_FRAME_FREE=1`: a body whose brackets are all lazy keeps
+    /// the frame-backed entry every handler body takes (the same-binary A/B).
+    fn lazy_frame_free_enabled() = "ZIPP_NO_LAZY_FRAME_FREE"
+}
+
+/// Whether `proto`'s unmetered Tier C body may run with no frame of its own:
+/// every bracket is lazy, so compiled code never holds a handler (the exit
+/// stubs defer a push that finds no frame of the body's, `jit_lazy_push`), no
+/// `break`/`continue` routes through a frame's handlers, and every return a
+/// `finally` protects is a lazy body's. Iterators stay out: their helpers have
+/// only ever run over the body's own frame.
+pub(crate) fn lazy_frame_free(proto: &crate::bytecode::FuncProto) -> bool {
+    if proto.is_generator
+        || proto.is_async
+        || has_py_ops(&proto.code)
+        || !lazy_try_enabled()
+        || !lazy_nest_enabled()
+        || !lazy_frame_free_enabled()
+    {
+        return false;
+    }
+    let mut brackets = 0;
+    for i in proto.code.iter() {
+        match i {
+            Instr::PushHandler { .. } | Instr::PushFinally { .. } => brackets += 1,
+            Instr::JumpFinally { .. }
+            | Instr::TailCall { .. }
+            | Instr::IterDelegate { .. }
+            | Instr::IterNext { .. }
+            | Instr::IterPrime { .. }
+            | Instr::IterClose { .. }
+            | Instr::IterCloseQuiet { .. }
+            | Instr::IterCloseFinally { .. }
+            | Instr::IterToArray { .. }
+            | Instr::GetIterator { .. }
+            | Instr::GetIteratorObj { .. }
+            | Instr::GetAsyncIterator { .. } => return false,
+            _ => {}
+        }
+    }
+    let protected = tierc_protected_return_map(&proto.code);
+    brackets != 0 && lazy_tries(&proto.code, &protected).tries.len() == brackets
+}
+
 /// The innermost lazy `finally` bracket `ip` is in the body of: where a return
 /// there goes, and the completion registers it fills. A lazy catch in between
 /// is left on the way, as the routing discards its handler.
@@ -3938,7 +3986,10 @@ pub(crate) fn compile_proto_mem(
     // plain yield bail.
     let mut yield_entry: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
     let mut yield_backedge: FxHashMap<usize, usize> = FxHashMap::default();
-    if tierc_yield_entry_enabled() {
+    // A body that may run frame-free with handler ops (`lazy_frame_free`)
+    // keeps the plain yield bail: a region's handler push writes the top
+    // frame, which would be its caller's.
+    if tierc_yield_entry_enabled() && !(meter.is_none() && lazy_frame_free(proto)) {
         for &h in yield_heads {
             let h = h as usize;
             if h >= n || lazy_at[h].is_some() {
@@ -8385,15 +8436,19 @@ pub(crate) fn compile_proto_mem(
             ; mov [rsp + 32], rax
         );
         for &(packed, finally) in &t.chain {
-            let helper = if finally {
-                heap.push_finally as i64
+            // On this activation's frame, or deferred for the frame a
+            // frame-free one's bail or throw materializes (`jit_lazy_push`).
+            let packed = if finally {
+                packed | crate::vm::LAZY_PUSH_FINALLY
             } else {
-                crate::vm::jit_push_catch as *const () as i64
+                packed
             };
             dynasm!(ops
                 ; mov rcx, rdi
                 ; mov rdx, QWORD packed as i64
-                ; mov rax, QWORD helper
+                ; mov r8, rbx
+                ; mov r9d, func_id as i32
+                ; mov rax, QWORD crate::vm::jit_lazy_push as *const () as i64
                 ; call rax
             );
         }
