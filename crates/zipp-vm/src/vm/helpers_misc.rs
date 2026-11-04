@@ -5566,6 +5566,48 @@ fn jit_fill_collection_method_way(
     }
 }
 
+/// `jit_fill_collection_method_way` for a view's method read (`dv.setUint32`,
+/// `ta.subarray`), once `proto_intrinsic_read` has proved it: a chain way to
+/// the prototype slot, with one hop (%DataView.prototype%) or two (the
+/// TypedArray kind's prototype, then %TypedArray.prototype%, which holds
+/// the method). The guards are those of the collection way: the receiver's
+/// identity and version (an own shadow and `setPrototypeOf` advance it), each
+/// prototype's version (a key add, delete or redefinition, `setPrototypeOf`),
+/// and the slot's value re-read on every hit. `dataview-binary`'s encoder read
+/// ten setters per record through the miss helper.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_fill_view_method_way(vm: &mut Vm, idx: u32, obj_bits: u64, key: &str, site_idx: u32) {
+    if !coll_method_way_enabled() || vm.jit.direct_miss_active(site_idx) {
+        return;
+    }
+    let (first, holder) = match vm.heap.get(idx) {
+        HeapObj::DataView { .. } => (0, vm.dataview_proto),
+        HeapObj::TypedArray { kind, .. } => (vm.ta_protos.get(*kind as usize).copied().unwrap_or(0), vm.ta_base_proto),
+        _ => return,
+    };
+    if holder == 0 || !vm.ic_obj_ok(holder) || (first != 0 && !vm.ic_obj_ok(first)) {
+        return;
+    }
+    let (vals_ptr, slot) = match vm.heap.get(holder) {
+        HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => match m.pos(key) {
+            Some(slot) if !m.attr_at(slot).accessor => (m.vals_ptr_raw() as u64, slot as u32),
+            _ => return,
+        },
+        _ => return,
+    };
+    let hops_buf = [(first, vm.heap.version_of(first)), (holder, vm.heap.version_of(holder))];
+    let hops = if first == 0 { &hops_buf[1..] } else { &hops_buf[..] };
+    let Some(entry) = crate::codegen::IcEntry::chain(obj_bits, vals_ptr, vm.heap.version_of(idx), slot, hops)
+    else {
+        return;
+    };
+    if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
+        vm.jit.ic_rot_bump(site_idx);
+    } else {
+        vm.jit.set_ic(site_idx, entry);
+    }
+}
+
 /// Tier C's `Bitwise` off its inline path (an Int or a double whose
 /// truncation fits i64): two Numbers of any value (NaN, ±Infinity, beyond
 /// 2^63) or two BigInts (`big & 0xffffn`, `u >> 48n`), through the
@@ -5742,6 +5784,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         // prototype proofs answer it; it went to the slow Get on every call.
         HeapObj::TypedArray { .. } | HeapObj::DataView { .. } if key != "length" => {
             if let Some(bits) = vm.proto_intrinsic_read(obj, key) {
+                jit_fill_view_method_way(vm, idx, obj_bits, key, site_idx);
                 return bits;
             }
         }

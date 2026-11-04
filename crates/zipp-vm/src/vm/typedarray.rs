@@ -1005,9 +1005,10 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let name = native::DV_PROTO_METHODS[slot];
-        let Some((_, kind)) = dataview_set_kind(name) else {
-            return Ok(None);
-        };
+        // The setters' kinds are the getters' (`setInt8` is entry 10 to
+        // `getInt8`'s 0): a table read, where the name was matched by memcmp.
+        let kind = DV_GET_KINDS[slot - 10];
+        debug_assert_eq!(dataview_set_kind(name), Some((slot, kind)));
         self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
     }
 
