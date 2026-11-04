@@ -2878,11 +2878,70 @@ struct LazyPlan {
     /// Per ip: in the body of a bracket that keeps its push, so the frame may
     /// hold a handler there (every ip when the brackets are not analysed).
     pushed: Vec<bool>,
+    /// Every bracket, lazy or not, in push order; empty when not analysed.
+    brackets: Vec<PlanBracket>,
+}
+
+/// A bracket as `LazyPlan::jump_route` walks them.
+struct PlanBracket {
+    push: usize,
+    pop: usize,
+    finally: Option<(u32, u16, u16)>,
+    /// A `finally` bracket's closing `EndFinally`.
+    end: Option<usize>,
+    lazy: bool,
+}
+
+/// Where a `break`/`continue` routing goes next (`LazyPlan::jump_route`).
+#[derive(Clone, Copy)]
+enum JumpRoute {
+    /// Every bracket it leaves is done with: the jump's own target.
+    Target,
+    /// A lazy `finally` it leaves runs first, entered with the jump
+    /// completion: its target and completion registers.
+    Finally(u32, u16, u16),
+    /// A bracket that keeps its push is next: the frame's routing helper
+    /// takes it from here (the lazy ones inside it are done with).
+    Helper,
 }
 
 impl LazyPlan {
     fn none(n: usize) -> Self {
-        LazyPlan { tries: Vec::new(), pushed: vec![true; n] }
+        LazyPlan { tries: Vec::new(), pushed: vec![true; n], brackets: Vec::new() }
+    }
+
+    /// The next step of a jump to `target` from `ip` (a `JumpFinally`, or an
+    /// `EndFinally` going on with its jump completion): the brackets whose
+    /// body holds `ip` and that do not hold `target` are left, innermost
+    /// first. A lazy catch's handler is only discarded; a lazy `finally` runs.
+    fn jump_route(&self, ip: usize, target: usize) -> JumpRoute {
+        if self.brackets.is_empty() {
+            return JumpRoute::Helper;
+        }
+        let mut left: Vec<&PlanBracket> = self
+            .brackets
+            .iter()
+            .filter(|b| b.push < ip && ip < b.pop && !(b.push < target && target <= b.pop))
+            .collect();
+        left.sort_by_key(|b| std::cmp::Reverse(b.push));
+        for b in left {
+            if !b.lazy {
+                return JumpRoute::Helper;
+            }
+            if let Some((t, k, v)) = b.finally {
+                return JumpRoute::Finally(t, k, v);
+            }
+        }
+        JumpRoute::Target
+    }
+
+    /// The closing `EndFinally` of the lazy `finally` bracket whose target is
+    /// `target`.
+    fn finally_end(&self, target: u32) -> Option<usize> {
+        self.brackets
+            .iter()
+            .find(|b| b.lazy && b.finally.is_some_and(|(t, _, _)| t == target))
+            .and_then(|b| b.end)
     }
 }
 
@@ -2900,6 +2959,12 @@ env_off_switch! {
     /// no return, and every `EndFinally` routes through the helper (the
     /// same-binary A/B).
     fn lazy_nest_enabled() = "ZIPP_NO_LAZY_NEST"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_JUMP=1`: a `break`/`continue` leaving a bracket keeps it
+    /// pushed and routes through the frame (the same-binary A/B).
+    fn lazy_jump_enabled() = "ZIPP_NO_LAZY_JUMP"
 }
 
 env_off_switch! {
@@ -3041,11 +3106,21 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
     // the statements nest), and a lazy one's own nested brackets, `finally`
     // blocks included, lie inside its body.
     let mut lazy = vec![false; brs.len()];
+    // A `break`/`continue` routed statically (`LazyPlan::jump_route`): the
+    // brackets enclosing both it and its target must be exactly the `floor`
+    // its loop recorded, and it may not jump back into the body it is in.
+    let jumps = nest && lazy_jump_enabled();
+    let jump_ok = |b: usize, ip: usize, target: u32, floor: u16| {
+        let t = target as usize;
+        let enclosing = brs.iter().filter(|c| c.push < ip && ip < c.pop && c.push < t && t <= c.pop).count();
+        jumps && enclosing == floor as usize && !(brs[b].push < t && t <= ip)
+    };
     for b in (0..brs.len()).rev() {
         let (push, pop) = (brs[b].push, brs[b].pop);
         let child = |c: Option<usize>| c.is_some_and(|c| nest && lazy[c]);
         let closed = (push + 1..pop).all(|ip| match code[ip] {
-            Instr::TailCall { .. } | Instr::JumpFinally { .. } => false,
+            Instr::TailCall { .. } => false,
+            Instr::JumpFinally { target, floor } => jump_ok(b, ip, target, floor),
             Instr::PushHandler { .. } | Instr::PushFinally { .. } => {
                 child(push_of[ip])
                     && push_of[ip].is_some_and(|c| brs[c].finally.is_none() || brs[c].end.is_some_and(|e| e < pop))
@@ -3062,11 +3137,13 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
             }
             _ => true,
         }) && code.iter().enumerate().all(|(at, i)| {
+            // A routed jump leaves the body (`jump_ok`), forward or back.
+            let leaves = jumps && matches!(i, Instr::JumpFinally { .. });
             control_targets(i).into_iter().flatten().all(|target| {
                 let target = target as usize;
                 let inside = at > push && at < pop;
                 if inside {
-                    target > at && target <= pop
+                    (target > at && (target <= pop || leaves)) || (leaves && target <= push)
                 } else {
                     at == push || target <= push || target > pop
                 }
@@ -3076,7 +3153,9 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
     }
     let mut pushed = vec![false; n];
     let mut tries = Vec::new();
+    let mut brackets = Vec::with_capacity(brs.len());
     for (b, br) in brs.iter().enumerate() {
+        brackets.push(PlanBracket { push: br.push, pop: br.pop, finally: br.finally, end: br.end, lazy: lazy[b] });
         if !lazy[b] {
             pushed[br.push + 1..br.pop].fill(true);
             continue;
@@ -3094,7 +3173,11 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
         // The former rule: no `EndFinally` is routed statically.
         pushed.fill(true);
     }
-    LazyPlan { tries, pushed }
+    if !jumps {
+        // ...and no `break`/`continue` either.
+        brackets.clear();
+    }
+    LazyPlan { tries, pushed, brackets }
 }
 
 /// B206 direct entry: whether the loop headed at a yield head `head` may run
@@ -3834,6 +3917,30 @@ pub(crate) fn compile_proto_mem(
         lazy_tries(&proto.code, &protected_returns)
     };
     let lazy_try = &lazy_plan.tries;
+    // The jump completions (target, floor) each lazy `finally`'s `EndFinally`
+    // can resume with: every routed `break`/`continue` that runs it.
+    let mut jump_ends: FxHashMap<usize, Vec<(u32, u16)>> = FxHashMap::default();
+    if !lazy_plan.brackets.is_empty() {
+        for (ip, i) in proto.code.iter().enumerate() {
+            let Instr::JumpFinally { target, floor } = *i else {
+                continue;
+            };
+            let mut at = ip;
+            for _ in 0..lazy_plan.brackets.len() {
+                let JumpRoute::Finally(ft, _, _) = lazy_plan.jump_route(at, target as usize) else {
+                    break;
+                };
+                let Some(end) = lazy_plan.finally_end(ft) else {
+                    break;
+                };
+                let resumes = jump_ends.entry(end).or_default();
+                if !resumes.contains(&(target, floor)) {
+                    resumes.push((target, floor));
+                }
+                at = end;
+            }
+        }
+    }
     if crate::jitlog_enabled() {
         let brackets = proto
             .code
@@ -4849,32 +4956,75 @@ pub(crate) fn compile_proto_mem(
                 // returns. Lazy brackets hold only lazy ones, so no pushed
                 // `finally` comes first.
                 let next_finally = lazy_finally(lazy_try, ip);
-                if next_finally.is_some() || !lazy_plan.pushed[ip] {
-                    // A normal completion goes on, a return as above; the rest
-                    // (a routed jump, a throw) takes the helper below.
+                let static_return = next_finally.is_some() || !lazy_plan.pushed[ip];
+                let resumes = jump_ends.get(&ip);
+                if static_return || resumes.is_some() {
+                    // A normal completion goes on, a return as above, a routed
+                    // `break`/`continue` this `finally` was entered for goes on
+                    // statically (`LazyPlan::jump_route`); the rest (a throw)
+                    // takes the helper below, or bails inside a lazy body,
+                    // whose exit pushes the handlers the interpreter needs.
                     let routed = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(kind_reg)]
                         ; mov r10, QWORD Value::int(0).bits() as i64
                         ; cmp rax, r10
                         ; je => labels[ip + 1]
-                        ; mov r10, QWORD Value::int(1).bits() as i64
-                        ; cmp rax, r10
-                        ; jne => routed
-                        ; mov rax, [rbx + dreg(val_reg)]
                     );
-                    if let Some((target, k, v)) = next_finally {
+                    if static_return {
+                        let not_return = ops.new_dynamic_label();
                         dynasm!(ops
-                            ; mov [rbx + dreg(v)], rax
-                            ; mov rax, QWORD Value::int(1).bits() as i64
-                            ; mov [rbx + dreg(k)], rax
-                            ; jmp => labels[target as usize]
+                            ; mov r10, QWORD Value::int(1).bits() as i64
+                            ; cmp rax, r10
+                            ; jne => not_return
+                            ; mov rax, [rbx + dreg(val_reg)]
                         );
-                    } else {
+                        if let Some((target, k, v)) = next_finally {
+                            dynasm!(ops
+                                ; mov [rbx + dreg(v)], rax
+                                ; mov rax, QWORD Value::int(1).bits() as i64
+                                ; mov [rbx + dreg(k)], rax
+                                ; jmp => labels[target as usize]
+                            );
+                        } else {
+                            dynasm!(ops
+                                ; mov DWORD [rsi], NO_BAIL as i32
+                                ; jmp => clean_exit
+                            );
+                        }
+                        dynasm!(ops ; => not_return);
+                    }
+                    for &(target, floor) in resumes.into_iter().flatten() {
+                        let other = ops.new_dynamic_label();
+                        let kind = Value::int(3 | ((floor as i32) << 2)).bits();
                         dynasm!(ops
-                            ; mov DWORD [rsi], NO_BAIL as i32
-                            ; jmp => clean_exit
+                            ; mov r10, QWORD kind as i64
+                            ; cmp rax, r10
+                            ; jne => other
+                            ; mov r11, [rbx + dreg(val_reg)]
+                            ; mov r10, QWORD Value::int(target as i32).bits() as i64
+                            ; cmp r11, r10
+                            ; jne => other
                         );
+                        match lazy_plan.jump_route(ip, target as usize) {
+                            JumpRoute::Target => {
+                                dynasm!(ops ; jmp => labels[target as usize]);
+                            }
+                            JumpRoute::Finally(ft, k, v) => {
+                                dynasm!(ops
+                                    ; mov [rbx + dreg(k)], rax
+                                    ; mov [rbx + dreg(v)], r11
+                                    ; jmp => labels[ft as usize]
+                                );
+                            }
+                            JumpRoute::Helper => {
+                                dynasm!(ops ; jmp => routed);
+                            }
+                        }
+                        dynasm!(ops ; => other);
+                    }
+                    if lazy_try.iter().any(|t| t.push < ip && ip < t.pop) {
+                        dynasm!(ops ; jmp => bail);
                     }
                     dynasm!(ops ; => routed);
                 }
@@ -4914,6 +5064,26 @@ pub(crate) fn compile_proto_mem(
                     ; jmp => clean_exit
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::JumpFinally { target, floor } if !matches!(lazy_plan.jump_route(ip, target as usize), JumpRoute::Helper) => {
+                // Out of lazy brackets only (`LazyPlan::jump_route`): straight
+                // to the target, or into the first lazy `finally` on the way
+                // with the jump completion the routing would deposit.
+                match lazy_plan.jump_route(ip, target as usize) {
+                    JumpRoute::Finally(ft, k, v) => {
+                        let kind = Value::int(3 | ((floor as i32) << 2)).bits();
+                        dynasm!(ops
+                            ; mov rax, QWORD kind as i64
+                            ; mov [rbx + dreg(k)], rax
+                            ; mov rax, QWORD Value::int(target as i32).bits() as i64
+                            ; mov [rbx + dreg(v)], rax
+                            ; jmp => labels[ft as usize]
+                        );
+                    }
+                    _ => {
+                        dynasm!(ops ; jmp => labels[target as usize]);
+                    }
+                }
             }
             Instr::JumpFinally { target, floor } => {
                 // The interpreter arm's routing (`jit_jump_finally`): the
