@@ -857,7 +857,7 @@ impl<'p> Vm<'p> {
                 // JS `%` on Numbers is C's fmod: the dividend's sign, -0 kept.
                 Instr::Mod { dst, a, b } => {
                     r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 % y as f64), |x: f64, y: f64| {
-                        Value::num(x % y)
+                        Value::num(crate::vm::helpers_numeric::js_rem(x, y))
                     })
                 }
                 Instr::MathOp {
@@ -1765,7 +1765,7 @@ impl<'p> Vm<'p> {
                             _ => Value::num(va.as_f64() % vb.as_f64()),
                         }
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() % vb.as_f64())
+                        Value::num(crate::vm::helpers_numeric::js_rem(va.as_f64(), vb.as_f64()))
                     } else {
                         hand_over!();
                     };

@@ -63,6 +63,26 @@ pub(crate) fn to_uint_modular(f: f64, bits: u32) -> u64 {
 }
 
 /// JS ToUint8Clamp: clamp to [0,255] with round-half-to-even.
+/// JS `%` on two Numbers: C's fmod (the dividend's sign, -0 kept). Integral
+/// operands below 2^53 take the exact i64 remainder instead, because `f64 %`
+/// is a libm call (a software one on wasm), and `((i * k) >>> 0) % m` —
+/// an integral double past i32 — is the common shape that misses the Int
+/// arm. Integrality is an i64 round trip: `trunc`/`fract` are calls on the
+/// baseline x86-64 target as well. Out of line, as `fmod` was: the
+/// interpreter loops that call it stay the size they were.
+#[inline(never)]
+pub(crate) fn js_rem(a: f64, b: f64) -> f64 {
+    const LIM: f64 = 9_007_199_254_740_992.0;
+    if a.abs() < LIM && b.abs() < LIM {
+        let (ai, bi) = (a as i64, b as i64);
+        if bi != 0 && ai as f64 == a && bi as f64 == b {
+            let r = ai % bi;
+            return if r == 0 && a.is_sign_negative() { -0.0 } else { r as f64 };
+        }
+    }
+    a % b
+}
+
 pub(crate) fn clamp_u8(f: f64) -> u8 {
     if f.is_nan() || f <= 0.0 {
         return 0;
@@ -449,6 +469,29 @@ pub(crate) fn array_index(key: Value) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// `js_rem` is fmod bit for bit: zeros of both signs, negatives, the
+    /// 2^53 edges, fractions, NaN and the infinities, and a sweep of
+    /// integral doubles past i32 (`(i * 2654435761) >>> 0`).
+    #[test]
+    fn js_rem_is_fmod() {
+        let mut vals = vec![0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 3.0, 7.0, -7.0, 0.5, -2.5, 1e15 + 0.5, f64::NAN,
+            f64::INFINITY, f64::NEG_INFINITY, 9007199254740991.0, 9007199254740992.0, -9007199254740992.0,
+            9007199254740994.0, 4294967295.0, 2147483648.0, -2147483648.0, 1e21, 5e-324, 100000.0];
+        for i in 0..400u64 {
+            vals.push(((i.wrapping_mul(2654435761)) & 0xffff_ffff) as f64);
+            vals.push(-(((i * 40503 + 12345) % 1000003) as f64));
+        }
+        for &a in &vals {
+            for &b in &vals {
+                let (got, want) = (super::js_rem(a, b), a % b);
+                assert!(
+                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                    "{a} % {b}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
     /// The direct reduction against the remainder formula it stands in for,
     /// at every width, around each power-of-two edge, for fractions,
     /// negatives, -0, NaN and the infinities.

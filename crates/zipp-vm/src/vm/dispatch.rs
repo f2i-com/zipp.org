@@ -1253,7 +1253,7 @@ impl<'p> Vm<'p> {
                                 _ => Value::num(va.as_f64() % vb.as_f64()),
                             }
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() % vb.as_f64())
+                            Value::num(crate::vm::helpers_numeric::js_rem(va.as_f64(), vb.as_f64()))
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?
                         };
