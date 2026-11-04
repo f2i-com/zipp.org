@@ -2859,11 +2859,28 @@ fn do_wide_mask_passes(
 struct LazyTry {
     push: usize,
     pop: usize,
-    /// The push the exit stub makes: `jit_push_catch`'s argument, or the
-    /// `finally` bracket's.
-    packed: u64,
     /// A `finally` bracket's target and completion registers.
     finally: Option<(u32, u16, u16)>,
+    /// The pushes the exit stub makes, outermost first, each with whether it
+    /// is a `finally` bracket's (`jit_push_finally`) or a catch's
+    /// (`jit_push_catch`): the lazy brackets this one is nested in, whose
+    /// bodies are left with its own, then its own.
+    chain: Vec<(u64, bool)>,
+}
+
+/// The lazy brackets of a body, and where compiled code may run with a
+/// handler on its frame.
+struct LazyPlan {
+    tries: Vec<LazyTry>,
+    /// Per ip: in the body of a bracket that keeps its push, so the frame may
+    /// hold a handler there (every ip when the brackets are not analysed).
+    pushed: Vec<bool>,
+}
+
+impl LazyPlan {
+    fn none(n: usize) -> Self {
+        LazyPlan { tries: Vec::new(), pushed: vec![true; n] }
+    }
 }
 
 env_off_switch! {
@@ -2875,10 +2892,21 @@ env_off_switch! {
     fn lazy_try_enabled() = "ZIPP_NO_LAZY_TRY"
 }
 
-/// The `finally` bracket `ip` is in the body of with no handler pushed: where a
-/// return there goes, and the completion registers it fills.
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_NEST=1`: a lazy bracket holds no other, a catch's body
+    /// no return, and every `EndFinally` routes through the helper (the
+    /// same-binary A/B).
+    fn lazy_nest_enabled() = "ZIPP_NO_LAZY_NEST"
+}
+
+/// The innermost lazy `finally` bracket `ip` is in the body of: where a return
+/// there goes, and the completion registers it fills. A lazy catch in between
+/// is left on the way, as the routing discards its handler.
 fn lazy_finally(lazy: &[LazyTry], ip: usize) -> Option<(u32, u16, u16)> {
-    lazy.iter().find(|t| t.push < ip && ip < t.pop).and_then(|t| t.finally)
+    lazy.iter()
+        .filter(|t| t.finally.is_some() && t.push < ip && ip < t.pop)
+        .max_by_key(|t| t.push)
+        .and_then(|t| t.finally)
 }
 
 /// The handler of a `try` is only ever read by what happens after the body is
@@ -2889,16 +2917,37 @@ fn lazy_finally(lazy: &[LazyTry], ip: usize) -> Option<(u32, u16, u16)> {
 ///
 /// That takes a body with one way in and one way out: nothing outside jumps into
 /// it, every branch in it stays in it and runs forward (a loop head is an entry
-/// from the interpreter, which has pushed), and no nested handler or `finally`
-/// routing, whose exits read the frame's handlers on the way through.
+/// from the interpreter, which has pushed), and no `break` or `continue` that
+/// routes through it, which reads the frame's handlers.
 ///
 /// A `finally` bracket (`try ... finally`, a for-of's body, which paid a push and
-/// a pop per iteration) is the same, and may also return: the bracket is the
-/// innermost one, so the return is a jump to its `finally` with the completion
-/// the routing would deposit.
-fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
-    let mut out = Vec::new();
-    for (push, ins) in code.iter().enumerate() {
+/// a pop per iteration) is the same, and may also return: a return is a jump to
+/// the innermost lazy `finally` with the completion the routing would deposit.
+/// A catch's body may return when no `finally` encloses the return or a lazy
+/// one inside the catch takes it.
+///
+/// A bracket may hold others when they are lazy too, their `finally` blocks
+/// included: the exit stub of an inner one pushes the outer handlers first, as
+/// the interpreter would hold them, and an inner `EndFinally` resuming a return
+/// goes on to the next lazy `finally` out (see `pushed`, which tells where no
+/// handler can be on the frame for such a static routing).
+fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
+    let n = code.len();
+    let nest = lazy_nest_enabled();
+    struct Bracket {
+        push: usize,
+        pop: usize,
+        packed: u64,
+        finally: Option<(u32, u16, u16)>,
+        /// A `finally` bracket's closing `EndFinally`.
+        end: Option<usize>,
+        parent: Option<usize>,
+    }
+    // Pair each push with its pop: the brackets nest as the statements do,
+    // one pop each, in order.
+    let mut brs: Vec<Bracket> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (ip, ins) in code.iter().enumerate() {
         let (packed, finally) = match *ins {
             Instr::PushHandler { catch_target, catch_reg } => {
                 (((catch_target as u64) << 16) | catch_reg as u64, None)
@@ -2907,31 +2956,63 @@ fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
                 ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64,
                 Some((target, kind_reg, val_reg)),
             ),
+            Instr::PopHandler | Instr::PopFinally => {
+                let fin = matches!(ins, Instr::PopFinally);
+                match open.pop() {
+                    Some(b) if brs[b].finally.is_some() == fin => brs[b].pop = ip,
+                    _ => return LazyPlan::none(n),
+                }
+                continue;
+            }
             _ => continue,
         };
-        let pops = |i: &Instr| {
-            if finally.is_some() {
-                matches!(i, Instr::PopFinally)
-            } else {
-                matches!(i, Instr::PopHandler)
+        let end = finally.and_then(|(target, k, v)| {
+            (target as usize..n).find(|&e| {
+                matches!(code[e], Instr::EndFinally { kind_reg, val_reg } if kind_reg == k && val_reg == v)
+            })
+        });
+        let parent = open.last().copied();
+        open.push(brs.len());
+        brs.push(Bracket { push: ip, pop: usize::MAX, packed, finally, end, parent });
+    }
+    if !open.is_empty() {
+        return LazyPlan::none(n);
+    }
+    let mut push_of = vec![None; n];
+    let mut pop_of = vec![None; n];
+    let mut end_of = vec![None; n];
+    for (b, br) in brs.iter().enumerate() {
+        push_of[br.push] = Some(b);
+        pop_of[br.pop] = Some(b);
+        if let Some(e) = br.end {
+            end_of[e] = Some(b);
+        }
+    }
+    // Inner brackets first: a body may hold only lazy ones. A bracket whose
+    // push, pop or `EndFinally` is in this body is nested in it (they pair as
+    // the statements nest), and a lazy one's own nested brackets, `finally`
+    // blocks included, lie inside its body.
+    let mut lazy = vec![false; brs.len()];
+    for b in (0..brs.len()).rev() {
+        let (push, pop) = (brs[b].push, brs[b].pop);
+        let child = |c: Option<usize>| c.is_some_and(|c| nest && lazy[c]);
+        let closed = (push + 1..pop).all(|ip| match code[ip] {
+            Instr::TailCall { .. } | Instr::JumpFinally { .. } => false,
+            Instr::PushHandler { .. } | Instr::PushFinally { .. } => {
+                child(push_of[ip])
+                    && push_of[ip].is_some_and(|c| brs[c].finally.is_none() || brs[c].end.is_some_and(|e| e < pop))
             }
-        };
-        let Some(pop) = (push + 1..code.len()).find(|&i| pops(&code[i])) else {
-            continue;
-        };
-        let body = &code[push + 1..pop];
-        let closed = body.iter().all(|i| {
-            let returns = matches!(i, Instr::Return { .. } | Instr::ReturnUndefined);
-            !(returns && finally.is_none())
-                && !matches!(
-                i,
-                Instr::TailCall { .. }
-                    | Instr::PushHandler { .. }
-                    | Instr::PushFinally { .. }
-                    | Instr::PopFinally
-                    | Instr::JumpFinally { .. }
-                    | Instr::EndFinally { .. }
-            )
+            Instr::PopHandler | Instr::PopFinally => child(pop_of[ip]),
+            Instr::EndFinally { .. } => child(end_of[ip]),
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                brs[b].finally.is_some()
+                    || (nest
+                        && (!protected_returns[ip]
+                            || (b + 1..brs.len()).any(|c| {
+                                lazy[c] && brs[c].finally.is_some() && brs[c].push < ip && ip < brs[c].pop
+                            })))
+            }
+            _ => true,
         }) && code.iter().enumerate().all(|(at, i)| {
             control_targets(i).into_iter().flatten().all(|target| {
                 let target = target as usize;
@@ -2943,11 +3024,29 @@ fn lazy_tries(code: &[Instr]) -> Vec<LazyTry> {
                 }
             })
         });
-        if closed {
-            out.push(LazyTry { push, pop, packed, finally });
-        }
+        lazy[b] = closed;
     }
-    out
+    let mut pushed = vec![false; n];
+    let mut tries = Vec::new();
+    for (b, br) in brs.iter().enumerate() {
+        if !lazy[b] {
+            pushed[br.push + 1..br.pop].fill(true);
+            continue;
+        }
+        let mut chain = vec![(br.packed, br.finally.is_some())];
+        let mut up = br.parent;
+        while let Some(p) = up.filter(|&p| lazy[p]) {
+            chain.push((brs[p].packed, brs[p].finally.is_some()));
+            up = brs[p].parent;
+        }
+        chain.reverse();
+        tries.push(LazyTry { push: br.push, pop: br.pop, finally: br.finally, chain });
+    }
+    if !nest {
+        // The former rule: no `EndFinally` is routed statically.
+        pushed.fill(true);
+    }
+    LazyPlan { tries, pushed }
 }
 
 /// B206 direct entry: whether the loop headed at a yield head `head` may run
@@ -3681,11 +3780,22 @@ pub(crate) fn compile_proto_mem(
     // in. The metered exits are out of line, on the real epilogue.
     // (A suspension leaves a body in a generator or an async function and comes
     // back into it, with the handler pushed and no pop to come.)
-    let lazy_try = if py || meter.is_some() || proto.is_generator || proto.is_async || !lazy_try_enabled() {
-        Vec::new()
+    let lazy_plan = if py || meter.is_some() || proto.is_generator || proto.is_async || !lazy_try_enabled() {
+        LazyPlan::none(n)
     } else {
-        lazy_tries(&proto.code)
+        lazy_tries(&proto.code, &protected_returns)
     };
+    let lazy_try = &lazy_plan.tries;
+    if crate::jitlog_enabled() {
+        let brackets = proto
+            .code
+            .iter()
+            .filter(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }))
+            .count();
+        if brackets != 0 {
+            eprintln!("[jit] fn{func_id} lazy brackets {}/{brackets}", lazy_try.len());
+        }
+    }
     let lazy_exit: Vec<dynasmrt::DynamicLabel> = lazy_try.iter().map(|_| ops.new_dynamic_label()).collect();
     let mut lazy_at: Vec<Option<dynasmrt::DynamicLabel>> = vec![None; n];
     for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
@@ -3849,6 +3959,8 @@ pub(crate) fn compile_proto_mem(
             yield_entry.insert(h, exits);
         }
     }
+    // A clean return, which leaves a lazy body with nothing to push.
+    let clean_exit = epilogue;
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
         // Every way out of a lazy `try`'s body, for this op's arms below.
@@ -4680,6 +4792,41 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::EndFinally { kind_reg, val_reg } => {
+                // A return resuming in a lazy body goes to that body's
+                // `finally`, whose handler the frame does not hold; with none
+                // and no handler on the frame either (`LazyPlan::pushed`), it
+                // returns. Lazy brackets hold only lazy ones, so no pushed
+                // `finally` comes first.
+                let next_finally = lazy_finally(lazy_try, ip);
+                if next_finally.is_some() || !lazy_plan.pushed[ip] {
+                    // A normal completion goes on, a return as above; the rest
+                    // (a routed jump, a throw) takes the helper below.
+                    let routed = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(kind_reg)]
+                        ; mov r10, QWORD Value::int(0).bits() as i64
+                        ; cmp rax, r10
+                        ; je => labels[ip + 1]
+                        ; mov r10, QWORD Value::int(1).bits() as i64
+                        ; cmp rax, r10
+                        ; jne => routed
+                        ; mov rax, [rbx + dreg(val_reg)]
+                    );
+                    if let Some((target, k, v)) = next_finally {
+                        dynasm!(ops
+                            ; mov [rbx + dreg(v)], rax
+                            ; mov rax, QWORD Value::int(1).bits() as i64
+                            ; mov [rbx + dreg(k)], rax
+                            ; jmp => labels[target as usize]
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; mov DWORD [rsi], NO_BAIL as i32
+                            ; jmp => clean_exit
+                        );
+                    }
+                    dynasm!(ops ; => routed);
+                }
                 // A normal completion goes on to the next op, a `break` or
                 // `continue` jump and a return go on routing toward their
                 // target (`jit_end_finally_route`, `jit_end_finally_returns`);
@@ -4713,7 +4860,7 @@ pub(crate) fn compile_proto_mem(
                     ; => returns
                     ; mov DWORD [rsi], NO_BAIL as i32
                     ; mov rax, [rbx + dreg(val_reg)]
-                    ; jmp => epilogue
+                    ; jmp => clean_exit
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -8126,7 +8273,7 @@ pub(crate) fn compile_proto_mem(
                         ; => returns
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, [rbx + dreg(src)]
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 } else if protected_returns[ip] {
                     // Resume on the untouched Return: a metered run's charges
@@ -8141,7 +8288,7 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, [rbx + dreg(src)]
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 }
             }
@@ -8169,7 +8316,7 @@ pub(crate) fn compile_proto_mem(
                         ; => returns
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 } else if protected_returns[ip] {
                     dynasm!(ops
@@ -8180,7 +8327,7 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 }
             }
@@ -8228,22 +8375,29 @@ pub(crate) fn compile_proto_mem(
         );
     }
 
-    // ── lazy `try` exits ── the push the body skipped, for whoever reads the
-    // frame next: the interpreter resuming inside the body, or unwinding from it.
+    // ── lazy `try` exits ── the pushes the body skipped, the enclosing lazy
+    // brackets' first, for whoever reads the frame next: the interpreter
+    // resuming inside the body, or unwinding from it.
     for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
-        let helper = if t.finally.is_some() {
-            heap.push_finally as i64
-        } else {
-            crate::vm::jit_push_catch as *const () as i64
-        };
         dynasm!(ops
             ; => exit
             ; sub rsp, 48
             ; mov [rsp + 32], rax
-            ; mov rcx, rdi
-            ; mov rdx, QWORD t.packed as i64
-            ; mov rax, QWORD helper
-            ; call rax
+        );
+        for &(packed, finally) in &t.chain {
+            let helper = if finally {
+                heap.push_finally as i64
+            } else {
+                crate::vm::jit_push_catch as *const () as i64
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, QWORD packed as i64
+                ; mov rax, QWORD helper
+                ; call rax
+            );
+        }
+        dynasm!(ops
             ; mov rax, [rsp + 32]
             ; add rsp, 48
             ; jmp => epilogue
