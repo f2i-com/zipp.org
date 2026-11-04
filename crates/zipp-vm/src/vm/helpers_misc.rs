@@ -1382,7 +1382,7 @@ pub(crate) extern "win64" fn jit_opt_route_exit(vm: *mut core::ffi::c_void, func
 /// as the interpreter's `%`. Pure.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_opt_fmod(a: u64, b: u64) -> u64 {
-    (f64::from_bits(a) % f64::from_bits(b)).to_bits()
+    crate::vm::helpers_num2::js_rem(f64::from_bits(a), f64::from_bits(b)).to_bits()
 }
 
 /// Win64 helper for Tier O's `GetProp` that its lanes did not answer:

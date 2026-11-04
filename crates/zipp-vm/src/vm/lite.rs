@@ -856,8 +856,8 @@ impl<'p> Vm<'p> {
                 }
                 // JS `%` on Numbers is C's fmod: the dividend's sign, -0 kept.
                 Instr::Mod { dst, a, b } => {
-                    r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 % y as f64), |x: f64, y: f64| {
-                        Value::num(x % y)
+                    r[dst as usize] = num2!(a, b, super::helpers_num2::js_rem_int, |x: f64, y: f64| {
+                        Value::num(super::helpers_num2::js_rem(x, y))
                     })
                 }
                 Instr::MathOp {
@@ -1759,13 +1759,9 @@ impl<'p> Vm<'p> {
                     // ToNumeric path.
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
-                        let ia = va.as_int();
-                        match ia.checked_rem(vb.as_int()) {
-                            Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
-                            _ => Value::num(va.as_f64() % vb.as_f64()),
-                        }
+                        super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() % vb.as_f64())
+                        Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
                     } else {
                         hand_over!();
                     };

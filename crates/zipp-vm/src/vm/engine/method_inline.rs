@@ -577,7 +577,7 @@ impl<'p> Vm<'p> {
             }
             BigOp::Mod => {
                 if va.is_number() && vb.is_number() {
-                    Some(Value::num(va.as_f64() % vb.as_f64()))
+                    Some(Value::num(crate::vm::helpers_num2::js_rem(va.as_f64(), vb.as_f64())))
                 } else {
                     None
                 }

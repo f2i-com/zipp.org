@@ -395,7 +395,7 @@ impl<'p> Vm<'p> {
             BigOp::Sub => Value::num(self.to_number(pa)? - self.to_number(pb)?),
             BigOp::Mul => Value::num(self.to_number(pa)? * self.to_number(pb)?),
             BigOp::Div => Value::num(self.to_number(pa)? / self.to_number(pb)?),
-            BigOp::Mod => Value::num(self.to_number(pa)? % self.to_number(pb)?),
+            BigOp::Mod => Value::num(super::helpers_num2::js_rem(self.to_number(pa)?, self.to_number(pb)?)),
             BigOp::Pow => {
                 let bb = self.to_number(pa)?;
                 let ee = self.to_number(pb)?;

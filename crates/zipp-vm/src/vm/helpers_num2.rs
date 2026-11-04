@@ -1550,6 +1550,38 @@ pub(crate) fn normalize_zero(v: Value) -> Value {
     }
 }
 
+/// JS `%` on two Numbers (Number::remainder): the truncating remainder, with
+/// the dividend's sign and -0 kept. Two integral operands under 2^53 take the
+/// exact integer remainder: `f64 % f64` is a call to a software `fmod`, and
+/// `(x >>> 0) % n` (an index past 2^31, a hash) is a double on both sides.
+/// The rest (a fraction, a zero divisor, NaN, an infinity) is the IEEE fmod.
+#[inline]
+pub(crate) fn js_rem(x: f64, y: f64) -> f64 {
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    if y != 0.0 && x.abs() < EXACT && y.abs() < EXACT && x == x.trunc() && y == y.trunc() {
+        let r = (x as i64) % (y as i64);
+        if r != 0 {
+            r as f64
+        } else if x.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else {
+        x % y
+    }
+}
+
+/// [`js_rem`] of two Int-tagged operands: the i32 remainder when it is one,
+/// else the double (a zero divisor's NaN, a negative dividend's -0).
+#[inline]
+pub(crate) fn js_rem_int(x: i32, y: i32) -> Value {
+    match x.checked_rem(y) {
+        Some(r) if r != 0 || x >= 0 => Value::int(r),
+        _ => Value::num(js_rem(x as f64, y as f64)),
+    }
+}
+
 /// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.
 /// NaN/±Infinity → 0. Used by the bitwise operators.
 pub(crate) fn to_int32(n: f64) -> i32 {

@@ -1247,13 +1247,11 @@ impl<'p> Vm<'p> {
                             // `i32::MIN % -1` (JS: -0) — and a zero remainder from
                             // a NEGATIVE dividend is -0 in JS, a double. All three
                             // fall through to the f64 path, which produces them.
-                            let ia = va.as_int();
-                            match ia.checked_rem(vb.as_int()) {
-                                Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
-                                _ => Value::num(va.as_f64() % vb.as_f64()),
-                            }
+                            super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() % vb.as_f64())
+                            // Two doubles: integral ones (`(x >>> 0) % n`)
+                            // still skip the software fmod (`js_rem`).
+                            Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?
                         };
