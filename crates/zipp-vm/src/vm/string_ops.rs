@@ -53,7 +53,23 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
+        self.char_code_at_unit(recv, arg)
+    }
 
+    /// [`Vm::interp_char_code_at_fast`] for a call whose callee is KNOWN to be
+    /// `String.prototype.charCodeAt` (a captured native of that id): no proof
+    /// of what the prototype holds.
+    #[inline]
+    pub(crate) fn captured_char_code_at(&mut self, recv: Value, arg: Value) -> Option<Value> {
+        if !recv.is_heap() || !arg.is_int() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_)) {
+            return None;
+        }
+        self.char_code_at_unit(recv, arg)
+    }
+
+    /// `charCodeAt(arg)` of the flat string `recv` with an Int `arg`.
+    #[inline(always)]
+    fn char_code_at_unit(&mut self, recv: Value, arg: Value) -> Option<Value> {
         // Keep the optional diagnostics identical to dispatch_builtin_method:
         // stats are counted outside the StringOps phase, then the actual string
         // operation is attributed to that phase when the sampler is enabled.

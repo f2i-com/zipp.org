@@ -70,6 +70,13 @@ pub(super) fn builtin_stats_enabled_for_vm() -> bool {
     std::env::var_os("ZIPP_BUILTINSTATS").is_some()
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_CAPTURED_OWN=1`: a captured prototype-method native runs only
+    /// after the proof by the call site's name (`captured_is_boot_intrinsic`),
+    /// not by its own identity (`captured_own_method`), for A/B.
+    fn captured_own_enabled() = "ZIPP_NO_CAPTURED_OWN"
+}
+
 /// `charCodeAt`'s index in the B191 memo (`str_memo_id`).
 const STR_MEMO_CHAR_CODE_AT: usize = 0;
 
@@ -1787,6 +1794,26 @@ impl<'p> Vm<'p> {
             }
             _ => return Ok(None),
         };
+        // The captured callee says what it is: with one realm there is one
+        // function object per native, and a prototype-method native of the
+        // receiver's kind IS `Array.prototype.<m>` / `String.prototype.<m>`.
+        // It runs by its own name, with no proof of what the prototype holds
+        // now (the Get that captured it read that) and none by the site's
+        // name, which was two name matches and a memo probe per call.
+        if let Some(own) = self.captured_own_method(native_id, is_arr) {
+            if argc == 1 && !is_arr && own == "charCodeAt" {
+                let arg = self.regs[base + arg_base as usize];
+                if let Some(unit) = self.captured_char_code_at(recv, arg) {
+                    return Ok(Some(unit));
+                }
+            } else if argc == 1 && is_arr && is_push_name(own) {
+                let arg = self.regs[base + arg_base as usize];
+                if let Some(len) = self.interp_array_push_fast(recv, arg) {
+                    return Ok(Some(len));
+                }
+            }
+            return self.try_builtin_method(recv, own, base, arg_base, argc);
+        }
         if !self.captured_is_boot_intrinsic(key, is_arr, callee.bits()) {
             return Ok(None);
         }
@@ -1805,6 +1832,24 @@ impl<'p> Vm<'p> {
             }
         }
         self.try_builtin_method(recv, key, base, arg_base, argc)
+    }
+
+    /// The method a captured native `native_id` is, for a call on an Array
+    /// (`is_arr`) or a primitive string while only the main realm exists:
+    /// `Array.prototype.push` or a `PROTO_METHODS` row of the receiver's
+    /// kind. `None` for anything else.
+    #[inline(always)]
+    fn captured_own_method(&self, native_id: u16, is_arr: bool) -> Option<&'static str> {
+        if !self.realm_global_objs.is_empty() || !captured_own_enabled() {
+            return None;
+        }
+        if is_arr && native_id == native::ARR_PUSH {
+            return Some("push");
+        }
+        match native::proto_method(native_id) {
+            Some((m, kind, _)) if kind == u8::from(!is_arr) => Some(m),
+            _ => None,
+        }
     }
 
     /// What `Get(s, name)` finds on a primitive string `s` when `name` is one
