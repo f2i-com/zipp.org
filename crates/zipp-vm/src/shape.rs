@@ -609,7 +609,12 @@ mod tests {
         // A table the program's own layouts filled past DATA_SHAPE_MAX still
         // mints shapes for data keys (a builder's `node[key] = v`), until the
         // data scopes themselves have minted DATA_SHAPE_MAX. A fresh thread:
-        // the table must not leak into other tests.
+        // the table must not leak into other tests. The safe profile's whole
+        // table is DATA_SHAPE_MAX shapes (`SHAPE_MAX`), so it can never be
+        // filled past the budget: the fill loop below would never end there.
+        if SHAPE_MAX < 2 * DATA_SHAPE_MAX + 100 {
+            return;
+        }
         std::thread::spawn(|| {
             let mut i = 0;
             while count() < DATA_SHAPE_MAX + 100 {
