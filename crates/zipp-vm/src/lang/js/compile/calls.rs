@@ -751,6 +751,10 @@ impl<'a> FnCompiler<'a> {
     ) -> R<(Reg, Reg)> {
         let stable = match &m.object {
             Expr::Ident(id) => self.stable_register_receiver(id, args),
+            // `this` is never assigned: outside a derived constructor (where
+            // `super()` initializes it) and a redirected `this`, its register
+            // already is the snapshot (`this.scale(1 / this.length)`).
+            Expr::This => !self.in_derived_ctor && self.this_override.is_none() && this_receiver_enabled(),
             _ => false,
         };
         // Only a NAMED member call gets the above-high-water callee register:

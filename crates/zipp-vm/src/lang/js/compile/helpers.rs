@@ -803,6 +803,12 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_THIS_RECEIVER=1` snapshots `this` into a fresh register for a
+    /// split method call (`this.m(this.x)`), as every receiver was, for A/B.
+    fn this_receiver_enabled() = "ZIPP_NO_THIS_RECEIVER"
+}
+
+env_off_switch! {
     /// `ZIPP_NO_DISCARDED_STORE=1` keeps the copy of a member store's value
     /// into the assignment's result register when nothing reads it (`this.x
     /// = x;` as `Move` + `SetProp`), for A/B.
