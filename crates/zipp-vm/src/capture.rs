@@ -1116,11 +1116,15 @@ pub fn numeric_locals(excluded: &[&str], params: Option<&Params>, body: &[Stmt])
     if !scan.wants || scan.declared.is_empty() {
         return HashSet::default();
     }
-    scan.bad.sort_unstable();
-    let mut set: Vec<&str> = scan.declared;
-    set.sort_unstable();
-    set.dedup();
-    set.retain(|n| scan.bad.binary_search(n).is_err() && !excluded.contains(n));
+    // Sets of the walk's own hashed kind (`Names`): a sort of `&str` here
+    // was a monomorphized slice sort, 3 KB of the WebAssembly module.
+    let bad: Names<'_> = scan.bad.iter().copied().collect();
+    let mut set: Names<'_> = scan
+        .declared
+        .iter()
+        .copied()
+        .filter(|n| !bad.contains(n) && !excluded.contains(n))
+        .collect();
     // The greatest fixed point: drop every name with a write that is not a
     // number under the current set, until none drops. Each round drops one
     // name at least; a body that has not settled by the cap keeps none.
@@ -1128,17 +1132,18 @@ pub fn numeric_locals(excluded: &[&str], params: Option<&Params>, body: &[Stmt])
         if set.is_empty() {
             return HashSet::default();
         }
-        let mut drop: Vec<&str> = scan
+        let drop: Vec<&str> = scan
             .writes
             .iter()
-            .filter(|(n, e)| set.binary_search(n).is_ok() && !num_value(e, &set, NUM_EXPR_DEPTH))
+            .filter(|(n, e)| set.contains(n) && !num_value(e, &set, NUM_EXPR_DEPTH))
             .map(|(n, _)| *n)
             .collect();
         if drop.is_empty() {
             return set.into_iter().map(str::to_owned).collect();
         }
-        drop.sort_unstable();
-        set.retain(|n| drop.binary_search(n).is_err());
+        for n in drop {
+            set.remove(n);
+        }
     }
     HashSet::default()
 }
@@ -1149,9 +1154,8 @@ const NUM_LOCAL_ROUNDS: usize = 16;
 const NUM_EXPR_DEPTH: u8 = 24;
 
 /// Whether `e`'s value is a number, `undefined`, `null` or a boolean when
-/// every name in `set` (sorted) holds one (or `e` throws instead of producing
-/// a value).
-fn num_value(e: &Expr, set: &[&str], depth: u8) -> bool {
+/// every name in `set` holds one (or `e` throws instead of producing a value).
+fn num_value(e: &Expr, set: &Names<'_>, depth: u8) -> bool {
     use crate::parse::ast::{AssignOp, BinaryOp, UnaryOp};
     if depth == 0 {
         return false;
@@ -1159,7 +1163,7 @@ fn num_value(e: &Expr, set: &[&str], depth: u8) -> bool {
     let d = depth - 1;
     match e {
         Expr::Num(_) | Expr::Bool(_) | Expr::Null => true,
-        Expr::Ident(n) => set.binary_search(&&**n).is_ok(),
+        Expr::Ident(n) => set.contains(&**n),
         Expr::Unary { op, arg } => match op {
             // ToNumber, ToBoolean, `undefined`, a boolean.
             UnaryOp::Plus | UnaryOp::Not | UnaryOp::Void | UnaryOp::Delete => true,
@@ -1167,9 +1171,7 @@ fn num_value(e: &Expr, set: &[&str], depth: u8) -> bool {
             UnaryOp::Minus | UnaryOp::BitNot => num_value(arg, set, d),
             UnaryOp::Typeof => false,
         },
-        Expr::Update { target, .. } => {
-            matches!(target, Target::Ident { name, .. } if set.binary_search(&&**name).is_ok())
-        }
+        Expr::Update { target, .. } => matches!(target, Target::Ident { name, .. } if set.contains(&**name)),
         Expr::Binary { op, left, right } => match op {
             // A string or an object on either side may concatenate.
             BinaryOp::Add => num_value(left, set, d) && num_value(right, set, d),
