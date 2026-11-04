@@ -3075,9 +3075,10 @@ impl<'p> Vm<'p> {
                             ip = target as usize;
                         } else {
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            // The cycle is 14 instructions, 15 when `o.a = i;`
+                            // stores from a copy of `i` (`object_loop`).
                             if ip >= 6
-                                && target as usize >= 15
-                                && target as usize - 15 == ip
+                                && matches!((target as usize).checked_sub(ip), Some(14 | 15))
                                 && self.get(base, a) == Value::int(1)
                             {
                                 // Run the first iteration normally so its
