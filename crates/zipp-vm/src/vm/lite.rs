@@ -477,6 +477,20 @@ pub(crate) struct LiteState<'p> {
     leaf_bails: Vec<u8>,
 }
 
+/// Where a leaf run (`lite_leaf_run`) reads its arguments: a caller's
+/// register window, or a builtin's argument list.
+#[derive(Clone, Copy)]
+enum LeafArgs<'a> {
+    Window { base: usize, arg_base: u16, argc: u16 },
+    Slice(&'a [Value]),
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_CALLBACK=1`: a builtin calls a leaf callback in a frame
+    /// (the same-binary A/B).
+    fn leaf_callback_enabled() = "ZIPP_NO_LEAF_CALLBACK"
+}
+
 impl Default for LiteState<'_> {
     fn default() -> Self {
         LiteState {
@@ -598,7 +612,52 @@ impl<'p> Vm<'p> {
         if state == LEAF_NO || (state == LEAF_THIS && !this_ok) || self.frames.len() >= MAX_FRAMES {
             return None;
         }
-        self.lite_leaf_run(fid, closure, this, base, arg_base, argc)
+        self.lite_leaf_run(fid, closure, this, LeafArgs::Window { base, arg_base, argc })
+    }
+
+    /// A builtin's callback `cb` (an array method's, a sort's comparator)
+    /// run as a leaf (`leaf_scan`) with `args`, in a VM that runs only the
+    /// interpreter: its result, or `None` when it is not one or this run
+    /// declined, and the builtin calls it in a frame. `this_arg` is passed as
+    /// it is to a strict callee or as an object; a sloppy one reading any
+    /// other `this` needs its frame's binding.
+    #[inline]
+    pub(crate) fn leaf_callback(&mut self, cb: Value, this_arg: Value, args: &[Value]) -> Option<Value> {
+        if !self.lite_entry_ok() || !cb.is_heap() || !leaf_callback_enabled() {
+            return None;
+        }
+        let (fid, closure) = match self.heap.get(cb.heap_index()) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, cb.heap_index()),
+            _ => return None,
+        };
+        if self.lite.leaf.get(fid as usize) == Some(&LEAF_NO) {
+            return None;
+        }
+        self.leaf_callback_try(fid, closure, this_arg, args)
+    }
+
+    #[inline(never)]
+    fn leaf_callback_try(&mut self, fid: u32, closure: u32, this_arg: Value, args: &[Value]) -> Option<Value> {
+        // Another realm's function reads its own globals, and a closure made
+        // under direct `eval` its scope: both take their frame.
+        if !self.realm_global_objs.is_empty()
+            || !self.obj_realm.is_empty()
+            || (!self.closure_eval_scope.is_empty() && self.closure_eval_scope.contains_key(&closure))
+        {
+            return None;
+        }
+        let state = match self.lite.leaf.get(fid as usize) {
+            Some(&s) if s != LEAF_UNDECIDED => s,
+            _ => self.lite_leaf_decide(fid),
+        };
+        if state == LEAF_NO || self.frames.len() >= MAX_FRAMES {
+            return None;
+        }
+        if state == LEAF_THIS && !(self.func(fid as usize).is_strict || self.is_object_value(this_arg)) {
+            return None;
+        }
+        self.lite_leaf_run(fid, closure, this_arg, LeafArgs::Slice(args))
     }
 
     #[cold]
@@ -626,25 +685,25 @@ impl<'p> Vm<'p> {
     /// anything a caller could see, so the call then runs it again in a
     /// frame. A leaf that declines `LEAF_BAIL_LIMIT` times stays a frame
     /// call.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    fn lite_leaf_run(
-        &mut self,
-        fid: u32,
-        closure: u32,
-        this: Value,
-        base: usize,
-        arg_base: u16,
-        argc: u16,
-    ) -> Option<Value> {
+    fn lite_leaf_run(&mut self, fid: u32, closure: u32, this: Value, args: LeafArgs<'_>) -> Option<Value> {
         use crate::bytecode::BitwiseOp as B;
         let p = self.func(fid as usize);
         let code: &'p [Instr] = &p.code;
         let mut r = [Value::UNDEFINED; LEAF_MAX_REGS];
         r[0] = this;
-        let n = (argc as usize).min(p.param_count as usize).min(LEAF_MAX_REGS - 1);
-        for (k, slot) in r[1..=n].iter_mut().enumerate() {
-            *slot = self.get(base, arg_base + k as u16);
+        let argc = match args {
+            LeafArgs::Window { argc, .. } => argc as usize,
+            LeafArgs::Slice(s) => s.len(),
+        };
+        let n = argc.min(p.param_count as usize).min(LEAF_MAX_REGS - 1);
+        match args {
+            LeafArgs::Window { base, arg_base, .. } => {
+                for (k, slot) in r[1..=n].iter_mut().enumerate() {
+                    *slot = self.get(base, arg_base + k as u16);
+                }
+            }
+            LeafArgs::Slice(s) => r[1..=n].copy_from_slice(&s[..n]),
         }
         // `arguments` for its length alone (`leaf_scan`): the count.
         if let Some(areg) = p.arguments_reg {

@@ -655,6 +655,12 @@ impl<'p> Vm<'p> {
             return result;
         }
         let _ = (native, win);
+        // In a VM that runs only the interpreter, a leaf callback runs
+        // without a frame (`Vm::leaf_callback`).
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if let Some(v) = self.leaf_callback(cb, this_val, args) {
+            return Ok(v);
+        }
         self.call_value(cb, this_val, args)
     }
 }
