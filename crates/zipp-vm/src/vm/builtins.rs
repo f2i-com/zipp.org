@@ -1801,18 +1801,7 @@ impl<'p> Vm<'p> {
         // now (the Get that captured it read that) and none by the site's
         // name, which was two name matches and a memo probe per call.
         if let Some(own) = self.captured_own_method(native_id, is_arr) {
-            if argc == 1 && !is_arr && own == "charCodeAt" {
-                let arg = self.regs[base + arg_base as usize];
-                if let Some(unit) = self.captured_char_code_at(recv, arg) {
-                    return Ok(Some(unit));
-                }
-            } else if argc == 1 && is_arr && is_push_name(own) {
-                let arg = self.regs[base + arg_base as usize];
-                if let Some(len) = self.interp_array_push_fast(recv, arg) {
-                    return Ok(Some(len));
-                }
-            }
-            return self.try_builtin_method(recv, own, base, arg_base, argc);
+            return self.captured_own_call(recv, own, is_arr, base, arg_base, argc);
         }
         if !self.captured_is_boot_intrinsic(key, is_arr, callee.bits()) {
             return Ok(None);
@@ -1832,6 +1821,34 @@ impl<'p> Vm<'p> {
             }
         }
         self.try_builtin_method(recv, key, base, arg_base, argc)
+    }
+
+    /// [`Vm::captured_intrinsic_lane`]'s call of a captured method by its own
+    /// name `own` (see [`Vm::captured_own_method`]). Out of line: inlined into
+    /// the interpreter's `CallWithThis` arm, it moved the profile-guided layout
+    /// of the loop's hot code (parse-large-js 10% slower interpreted).
+    #[inline(never)]
+    fn captured_own_call(
+        &mut self,
+        recv: Value,
+        own: &'static str,
+        is_arr: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if argc == 1 && !is_arr && own == "charCodeAt" {
+            let arg = self.regs[base + arg_base as usize];
+            if let Some(unit) = self.captured_char_code_at(recv, arg) {
+                return Ok(Some(unit));
+            }
+        } else if argc == 1 && is_arr && is_push_name(own) {
+            let arg = self.regs[base + arg_base as usize];
+            if let Some(len) = self.interp_array_push_fast(recv, arg) {
+                return Ok(Some(len));
+            }
+        }
+        self.try_builtin_method(recv, own, base, arg_base, argc)
     }
 
     /// The method a captured native `native_id` is, for a call on an Array

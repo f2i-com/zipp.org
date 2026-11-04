@@ -53,26 +53,34 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        self.char_code_at_unit(recv, arg)
+
+        // Keep the optional diagnostics identical to dispatch_builtin_method:
+        // stats are counted outside the StringOps phase, then the actual string
+        // operation is attributed to that phase when the sampler is enabled.
+        super::builtins::builtin_stats_count(self, recv, "charCodeAt");
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
+        let i = arg.as_int();
+        let unit = if i >= 0 {
+            self.heap_unit_at(recv.heap_index(), i as usize)
+        } else {
+            None
+        };
+        Some(match unit {
+            Some(unit) => Value::int(unit as i32),
+            None => Value::num(f64::NAN),
+        })
     }
 
     /// [`Vm::interp_char_code_at_fast`] for a call whose callee is KNOWN to be
     /// `String.prototype.charCodeAt` (a captured native of that id): no proof
-    /// of what the prototype holds.
-    #[inline]
+    /// of what the prototype holds. Out of line, as the rest of the captured
+    /// own-method path: inlined into the interpreter's call arms it moved the
+    /// profile-guided layout of their hot code (parse-large-js 10% slower).
+    #[inline(never)]
     pub(crate) fn captured_char_code_at(&mut self, recv: Value, arg: Value) -> Option<Value> {
         if !recv.is_heap() || !arg.is_int() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_)) {
             return None;
         }
-        self.char_code_at_unit(recv, arg)
-    }
-
-    /// `charCodeAt(arg)` of the flat string `recv` with an Int `arg`.
-    #[inline(always)]
-    fn char_code_at_unit(&mut self, recv: Value, arg: Value) -> Option<Value> {
-        // Keep the optional diagnostics identical to dispatch_builtin_method:
-        // stats are counted outside the StringOps phase, then the actual string
-        // operation is attributed to that phase when the sampler is enabled.
         super::builtins::builtin_stats_count(self, recv, "charCodeAt");
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
         let i = arg.as_int();
