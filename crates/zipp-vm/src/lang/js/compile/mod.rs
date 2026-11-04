@@ -716,6 +716,9 @@ struct FnCompiler<'a> {
     /// provably primitive, so an argument such as `i + 1` keeps a method call
     /// fused. Empty where eval may reach the bindings.
     num_locals: HashSet<String>,
+    /// `expr_discarded` is compiling a member assignment whose result nothing
+    /// reads; `assign` takes (and clears) it at entry.
+    assign_discarded: bool,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,

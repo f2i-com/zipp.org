@@ -1102,6 +1102,17 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// The register a plain member store takes its value from: `val` itself
+    /// when nothing reads the assignment's result (`discarded`), else `dst`,
+    /// with the value copied in when it is elsewhere.
+    fn assign_result(&mut self, val: Reg, dst: Reg, discarded: bool) -> Reg {
+        if discarded || val == dst {
+            return val;
+        }
+        self.emit(Instr::Move { dst, src: val });
+        dst
+    }
+
     pub(crate) fn assign(
         &mut self,
         op: AssignOp,
@@ -1110,6 +1121,9 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
     ) -> R<Reg> {
         let is_logical = op.is_logical();
+        // Set by `expr_discarded` for this call alone: nothing reads the
+        // result, so a plain member store takes the value's own register.
+        let discarded = std::mem::take(&mut self.assign_discarded);
         // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
         // `=` is supported for members in this subset.
         match target {
@@ -1204,15 +1218,14 @@ impl<'a> FnCompiler<'a> {
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
                         let val = self.expr_into(value, dst)?;
-                        if val != dst {
-                            self.emit(Instr::Move { dst, src: val });
-                        }
+                        let val = self.assign_result(val, dst, discarded);
                         self.emit(Instr::SetProp {
                             obj,
                             name,
-                            val: dst,
+                            val,
                             strict: self.cx.strict_expr_region > 0,
                         });
+                        return Ok(val);
                     } else {
                         // Compound `obj.x op= v`: read obj.x, combine, write back.
                         let cur = self.temp();
@@ -1257,14 +1270,9 @@ impl<'a> FnCompiler<'a> {
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
                         let val = self.expr_into(value, dst)?;
-                        if val != dst {
-                            self.emit(Instr::Move { dst, src: val });
-                        }
-                        self.emit(Instr::SetPrivate {
-                            obj,
-                            name,
-                            val: dst,
-                        });
+                        let val = self.assign_result(val, dst, discarded);
+                        self.emit(Instr::SetPrivate { obj, name, val });
+                        return Ok(val);
                     } else {
                         let cur = self.temp();
                         self.emit(Instr::GetProp {
@@ -1387,16 +1395,14 @@ impl<'a> FnCompiler<'a> {
                                 src: key,
                             });
                             let val = self.expr_into(value, dst)?;
-                            if val != dst {
-                                self.emit(Instr::Move { dst, src: val });
-                            }
+                            let val = self.assign_result(val, dst, discarded);
                             self.emit(Instr::SetIndexConcat {
                                 obj,
                                 name: nidx,
                                 key: keyk,
-                                val: dst,
+                                val,
                             });
-                            return Ok(dst);
+                            return Ok(val);
                         }
                     }
                     let key = self.expr(key_expr)?;
@@ -1442,10 +1448,9 @@ impl<'a> FnCompiler<'a> {
                     } else if matches!(op, AssignOp::Assign) {
                         // A plain store coerces the key once (the single SetIndex).
                         let val = self.expr_into(value, dst)?;
-                        if val != dst {
-                            self.emit(Instr::Move { dst, src: val });
-                        }
-                        self.emit(Instr::SetIndex { obj, key, val: dst });
+                        let val = self.assign_result(val, dst, discarded);
+                        self.emit(Instr::SetIndex { obj, key, val });
+                        return Ok(val);
                     } else {
                         let keyk = if literal_key {
                             key

@@ -679,12 +679,18 @@ fn recognize_write(
         Instr::GetIndex { dst, obj, key } => (dst, obj, key),
         _ => return None,
     };
-    // The stored value's own register: a real copy, not a discarded one.
-    let value = match c.next()? {
-        Instr::Move { dst, src } if src == i => dst,
-        _ => return None,
-    };
-    let name = match c.next()? {
+    // The stored value: the counter's own register (a statement's store,
+    // whose result nothing reads), or a copy of it.
+    let mut store = c.next()?;
+    let mut value = i;
+    if let Instr::Move { dst, src } = store {
+        if src != i {
+            return None;
+        }
+        value = dst;
+        store = c.next()?;
+    }
+    let name = match store {
         Instr::SetProp {
             obj,
             name,

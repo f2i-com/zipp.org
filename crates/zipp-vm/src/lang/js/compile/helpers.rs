@@ -802,6 +802,13 @@ env_off_switch! {
     fn numeric_locals_enabled() = "ZIPP_NO_NUMERIC_LOCALS"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_DISCARDED_STORE=1` keeps the copy of a member store's value
+    /// into the assignment's result register when nothing reads it (`this.x
+    /// = x;` as `Move` + `SetProp`), for A/B.
+    fn discarded_store_enabled() = "ZIPP_NO_DISCARDED_STORE"
+}
+
 /// How deep [`const_number`] looks: a constant expression in real code is a
 /// literal or two (`-1`, `4096 * 4`, `1 << 20`), and a bound keeps the probe
 /// O(1) per node, so a long non-constant chain stays linear to compile.

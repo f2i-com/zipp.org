@@ -421,6 +421,21 @@ impl<'a> FnCompiler<'a> {
             let dst = self.temp();
             return self.update(*op, true, target, dst, true);
         }
+        // `this.x = x;`: the store takes the value's own register, with no
+        // copy into a result register nothing reads (`assign_discarded`).
+        if let ast::Expr::Assign {
+            op: ast::AssignOp::Assign,
+            target: target @ ast::Target::Member(m),
+            value,
+            ..
+        } = e
+        {
+            if !matches!(&m.object, ast::Expr::Super) && discarded_store_enabled() {
+                let dst = self.temp();
+                self.assign_discarded = true;
+                return self.assign(ast::AssignOp::Assign, target, value, dst);
+            }
+        }
         // `[a, b] = [b, a];`: no array is built when nothing reads it.
         if let ast::Expr::Assign {
             op: ast::AssignOp::Assign,
