@@ -966,7 +966,14 @@ impl<'p> Vm<'p> {
         mapper: Option<(Value, Value)>,
     ) -> Result<(), Thrown> {
         let mut work = 0u64;
-        self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work)
+        // A compiled mapper runs over one reused window (`open_cb_window`).
+        let (native, win) = match mapper {
+            Some((cb, this_arg)) => self.open_cb_window(cb, this_arg),
+            None => (None, self.regs.len()),
+        };
+        let r = self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work, &native, win);
+        self.regs.truncate(win);
+        r
     }
 
     /// `flat` / `flatMap`: FlattenIntoArray into `target` (the ArraySpeciesCreate
@@ -1040,6 +1047,7 @@ impl<'p> Vm<'p> {
 
     /// `source_len` is a ToLength (up to 2^53-1), so the walk counts in u64;
     /// only a dense store is indexed by `usize`.
+    #[allow(clippy::too_many_arguments)]
     fn flatten_into_array_at(
         &mut self,
         out: &mut Vec<Value>,
@@ -1049,6 +1057,8 @@ impl<'p> Vm<'p> {
         mapper: Option<(Value, Value)>,
         active_depth: u32,
         work: &mut u64,
+        native: &Option<super::misc_methods::NativeCb>,
+        win: usize,
     ) -> Result<(), Thrown> {
         *work = work
             .checked_add(source_len)
@@ -1091,7 +1101,7 @@ impl<'p> Vm<'p> {
             };
             let v = match mapper {
                 Some((cb, ta)) => {
-                    let r = self.call_value(cb, ta, &[got, Value::num(k as f64), source])?;
+                    let r = self.run_cb_elem(native, win, cb, &[got, Value::num(k as f64), source], ta)?;
                     dense = self.flatten_dense(source);
                     r
                 }
@@ -1126,7 +1136,7 @@ impl<'p> Vm<'p> {
                         "RangeError: array flattening nesting limit exceeded",
                     ));
                 }
-                self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
+                self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work, &None, win)?;
                 // The nested walk's Gets can be Proxy traps or accessors.
                 dense = self.flatten_dense(source);
             } else {
@@ -1329,14 +1339,37 @@ impl<'p> Vm<'p> {
             )));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-        let idxv = |k: u64| Value::num(k as f64);
         self.preflight_native_iteration_work(len)?;
+        // A compiled callback runs over one reused window, as the dense
+        // path's does (`open_cb_window`); `reduce` calls it with no `this`.
+        let bind_this = if name.starts_with("reduce") { Value::UNDEFINED } else { this_arg };
+        let (native, win) = self.open_cb_window(cb, bind_this);
+        let out = self.array_like_iterate_each(this, name, args, len, lenf, cb, this_arg, &native, win);
+        self.regs.truncate(win);
+        out
+    }
 
+    /// [`Vm::array_like_iterate`]'s visit, each callback through
+    /// [`Vm::run_cb_elem`] over the window the caller opened (and closes).
+    #[allow(clippy::too_many_arguments)]
+    fn array_like_iterate_each(
+        &mut self,
+        this: Value,
+        name: &str,
+        args: &[Value],
+        len: u64,
+        lenf: f64,
+        cb: Value,
+        this_arg: Value,
+        native: &Option<super::misc_methods::NativeCb>,
+        win: usize,
+    ) -> Result<Option<Value>, Thrown> {
+        let idxv = |k: u64| Value::num(k as f64);
         match name {
             "forEach" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                     }
                 }
                 Ok(Some(Value::UNDEFINED))
@@ -1382,7 +1415,7 @@ impl<'p> Vm<'p> {
                 };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         match target {
                             Some(a) => self.create_data_property_or_throw(a, k, r)?,
                             None => out[k as usize] = r,
@@ -1402,7 +1435,7 @@ impl<'p> Vm<'p> {
                 let mut n = 0u64;
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if self.truthy(r) {
                             match target {
                                 Some(a) => self.create_data_property_or_throw(a, n, val)?,
@@ -1420,7 +1453,7 @@ impl<'p> Vm<'p> {
             "some" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if self.truthy(r) {
                             return Ok(Some(Value::bool(true)));
                         }
@@ -1431,7 +1464,7 @@ impl<'p> Vm<'p> {
             "every" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if !self.truthy(r) {
                             return Ok(Some(Value::bool(false)));
                         }
@@ -1448,7 +1481,7 @@ impl<'p> Vm<'p> {
                 while i < len {
                     let k = if backward { len - 1 - i } else { i };
                     let val = self.array_iter_get_u64(this, k)?.unwrap_or(Value::UNDEFINED);
-                    let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                    let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                     if self.truthy(r) {
                         return Ok(Some(match name {
                             "find" | "findLast" => val,
@@ -1491,7 +1524,7 @@ impl<'p> Vm<'p> {
                             acc = val;
                             started = true;
                         } else {
-                            acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, kv, this])?;
+                            acc = self.run_cb_elem(native, win, cb, &[acc, val, kv, this], Value::UNDEFINED)?;
                         }
                     }
                     if !started {
@@ -1515,7 +1548,7 @@ impl<'p> Vm<'p> {
                         acc = val;
                         started = true;
                     } else {
-                        acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, idxv(k), this])?;
+                        acc = self.run_cb_elem(native, win, cb, &[acc, val, idxv(k), this], Value::UNDEFINED)?;
                     }
                 }
                 if !started {
