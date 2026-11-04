@@ -5687,10 +5687,12 @@ pub enum Reactions {
 }
 
 impl Reactions {
-    /// Always inlined, so the caller's pair is built where it is stored: out
-    /// of line, it was built on the stack and copied in with 16-byte loads
-    /// over 8-byte stores, which cannot forward (3% of await-sustained).
-    #[inline(always)]
+    /// Always inlined natively, so the caller's pair is built where it is
+    /// stored: out of line, it was built on the stack and copied in with
+    /// 16-byte loads over 8-byte stores, which cannot forward (3% of
+    /// await-sustained). WebAssembly keeps the one copy (1 KB of Lite).
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     pub fn push(&mut self, r: ReactionPair) {
         match self {
             Reactions::None => *self = Reactions::One(r),

@@ -64,9 +64,9 @@ impl<'p> Vm<'p> {
         caller_home: Option<u32>,
         var_env_global: bool,
         eval_scope_idx: Option<u32>,
-        import_aliases: Option<&std::collections::HashMap<u32, u32>>,
-        self_aliases: Option<&std::collections::HashMap<u32, u32>>,
-        prealloc: Option<&std::collections::HashMap<u32, u32>>,
+        import_aliases: Option<&rustc_hash::FxHashMap<u32, u32>>,
+        self_aliases: Option<&rustc_hash::FxHashMap<u32, u32>>,
+        prealloc: Option<&rustc_hash::FxHashMap<u32, u32>>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Eval and confined modules share these stable-address tables. Bound
@@ -89,10 +89,10 @@ impl<'p> Vm<'p> {
         //    `*default*`) draws a FRESH per-module slot so two modules' same-named
         //    exports don't collide — the foundation for correct live bindings. A
         //    free reference (builtin or import) still resolves realm-shared by name.
-        let decl: std::collections::HashSet<u32> = if module {
+        let decl: rustc_hash::FxHashSet<u32> = if module {
             eval_prog.module_decl_globals.iter().copied().collect()
         } else {
-            std::collections::HashSet::new()
+            Default::default()
         };
         let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
         for (i, name) in eval_prog.global_names.iter().enumerate() {

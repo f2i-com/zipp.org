@@ -2138,7 +2138,7 @@ pub struct Vm<'p> {
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
-    template_raws: std::collections::HashMap<u32, Value>,
+    template_raws: rustc_hash::FxHashMap<u32, Value>,
     /// GetTemplateObject memoization: the canonical frozen tagged-template object
     /// per source call site, keyed by (function id, per-function site index). The
     /// cached objects are permanent GC roots (they live as long as the realm).
@@ -2486,11 +2486,11 @@ pub struct Vm<'p> {
     regexp_result_props: crate::slot_table::SlotTable<RegexpResultProps>,
     /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
     /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
-    ab_max: std::collections::HashMap<u32, usize>,
+    ab_max: rustc_hash::FxHashMap<u32, usize>,
     /// Length-tracking TypedArrays/DataViews (created on a resizable buffer with
     /// no explicit length): heap idx set. Their effective length follows the
     /// buffer's current byte length.
-    ta_tracking: std::collections::HashSet<u32>,
+    ta_tracking: rustc_hash::FxHashSet<u32>,
     /// Heap indices of async activations (`AsyncState` / `AsyncGenerator`) that
     /// may still be suspended. A suspended activation is referenced only by the
     /// await-reaction it registered — a cycle the program cannot otherwise reach
@@ -2507,7 +2507,7 @@ pub struct Vm<'p> {
     /// explicit byteLength): heap idx set. Their byteLength follows the buffer's
     /// current size, and byteLength/byteOffset throw (IsViewOutOfBounds) once the
     /// offset exceeds the shrunk buffer.
-    dv_tracking: std::collections::HashSet<u32>,
+    dv_tracking: rustc_hash::FxHashSet<u32>,
     /// Callables expose `name`/`length` as synthesized own properties (computed
     /// from the proto, not stored). They're `configurable: true`, so `delete
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
@@ -2672,7 +2672,7 @@ pub struct Vm<'p> {
     /// hiding the creator's eval `var`s from the rest of the closure body
     /// (staging/sm/regress/regress-554955-{2,3}.js: `b` read the global 1, not
     /// the 2 the creator's `eval("var b = 2")` had bound). Pruned at GC.
-    eval_scope_parent: std::collections::HashMap<u32, u32>,
+    eval_scope_parent: rustc_hash::FxHashMap<u32, u32>,
     /// Memo per func id: 0 unknown, 1 no, 2 yes — "code contains a sloppy
     /// function-context DirectEval". Drives EAGER EvalScope creation at
     /// closure-stamp time, so closures made before the eval call share the
@@ -2844,15 +2844,15 @@ pub struct Vm<'p> {
     sab_ctor: u32,
     sab_proto: u32,
     /// Heap indices of ArrayBuffers that are actually SharedArrayBuffers.
-    shared_buffers: std::collections::HashSet<u32>,
+    shared_buffers: rustc_hash::FxHashSet<u32>,
     /// Heap indices of ArrayBuffers that are immutable (ES2026): their `immutable`
     /// getter is true, they are never resizable/detachable, and writes through a
     /// TypedArray view throw a TypeError.
-    immutable_buffers: std::collections::HashSet<u32>,
+    immutable_buffers: rustc_hash::FxHashSet<u32>,
     /// ArrayBuffers a host holds a view over ([`HostCtx::typed_array_region`]):
     /// GC roots for the VM's lifetime, and never resized, transferred or
     /// detached, so the host's view stays over the bytes it was given.
-    pub(crate) pinned_buffers: std::collections::HashSet<u32>,
+    pub(crate) pinned_buffers: rustc_hash::FxHashSet<u32>,
     /// Heap indices of objects that have the [[ErrorData]] internal slot (real
     /// Error instances — built-in error ctors, internal throws, and
     /// `class X extends Error` instances). Distinguishes a true error from a
@@ -2892,7 +2892,7 @@ pub struct Vm<'p> {
     /// value (e.g. a promise-valued last statement) must NOT be adopted
     /// (adoption makes a completed module look suspended and deadlocks its
     /// importers). Entries are removed at settle; pruned on GC sweep.
-    module_body_results: std::collections::HashSet<u32>,
+    module_body_results: rustc_hash::FxHashSet<u32>,
     /// Body promises of modules whose evaluation SUSPENDED (top-level await,
     /// or deps still pending): canonical path → the promise importers settle
     /// from. A LATER import of the same module (its namespace is already
@@ -2946,13 +2946,13 @@ pub struct Vm<'p> {
     /// scripts: collision SyntaxErrors + invisible to global-object property
     /// reflection (the main program's own lexicals live in
     /// program.lexical_globals).
-    eval_lexical_globals: std::collections::HashSet<u32>,
+    eval_lexical_globals: rustc_hash::FxHashSet<u32>,
     /// The `const` subset of eval_lexical_globals: a write to an INITIALIZED
     /// one throws TypeError (the initializing write sees UNINITIALIZED).
-    eval_const_globals: std::collections::HashSet<u32>,
+    eval_const_globals: rustc_hash::FxHashSet<u32>,
     /// Realm slots declared var/function by `$262.evalScript` scripts —
     /// HasVarDeclaration for later scripts' lexical-collision checks.
-    eval_var_globals: std::collections::HashSet<u32>,
+    eval_var_globals: rustc_hash::FxHashSet<u32>,
     /// Set while a PRELUDE script runs (`run_with_prelude` — the test262 harness).
     /// CreateGlobalVar/FunctionBinding then initializes the SLOT rather than
     /// parking an own property and leaving the slot UNINITIALIZED. A prelude is a
@@ -2974,7 +2974,7 @@ pub struct Vm<'p> {
     /// arguments object's heap index. Each resume re-links the [[ParameterMap]]
     /// to the freshly spliced frame (`relink_mapped_args`), so the live aliasing
     /// survives suspension. Pruned on GC sweep alongside `arguments_objs`.
-    gen_args_obj: std::collections::HashMap<u32, u32>,
+    gen_args_obj: rustc_hash::FxHashMap<u32, u32>,
     /// Per generator function: whether a `for-of` step may resume it in the
     /// consumer's loop (`Vm::gen_enter_inline`). 0 undecided, 1 yes, 2 no.
     gen_inline_ok: Vec<u8>,
@@ -3044,7 +3044,7 @@ pub struct Vm<'p> {
     module_source_slots: std::collections::HashMap<std::path::PathBuf, u32>,
     /// Per-module `import.meta` objects (module key = its namespace heap index
     /// → the lazily-created meta object). Values are GC ROOTS (gc.rs).
-    module_metas: std::collections::HashMap<u32, u32>,
+    module_metas: rustc_hash::FxHashMap<u32, u32>,
     /// Unified-function-id ranges owned by loader-loaded modules:
     /// (start, end, namespace heap index). The `ImportMeta` op resolves the
     /// CURRENT module as the one whose range contains the executing frame's
@@ -3269,7 +3269,7 @@ pub struct Vm<'p> {
     /// disposal goes through `disposeAsync`, which returns a Promise).
     asyncdisposablestack_ctor: u32,
     asyncdisposablestack_proto: u32,
-    async_stacks: std::collections::HashSet<u32>,
+    async_stacks: rustc_hash::FxHashSet<u32>,
     /// In-flight `AsyncDisposableStack.prototype.disposeAsync` drivers, keyed
     /// by the capability promise heap index. Each disposer's result is awaited
     /// before the next runs (the DISPOSE_ASYNC_STEP reactions re-enter
@@ -3286,13 +3286,13 @@ pub struct Vm<'p> {
     /// to a primitive + the argument/return TypeError checks do.
     shadowrealm_ctor: u32,
     shadowrealm_proto: u32,
-    shadow_realms: std::collections::HashSet<u32>,
+    shadow_realms: rustc_hash::FxHashSet<u32>,
     /// Callable created by a ShadowRealm's `evaluate` → its realm INSTANCE heap
     /// idx. A WrappedFunction call switches `active_realm` to the target's
     /// realm so `globalThis.x` in its body binds the realm's slots at CALL time
     /// (not just during `evaluate`). u32→u32 (no Values); gc.rs roots the realm
     /// instances and retains live keys.
-    shadow_fn_realm: std::collections::HashMap<u32, u32>,
+    shadow_fn_realm: rustc_hash::FxHashMap<u32, u32>,
     /// `%AbstractModuleSource%` ctor + prototype (source-phase-imports proposal).
     /// Reached via `$262.AbstractModuleSource`; the ctor always throws when
     /// called/constructed and the prototype carries the @@toStringTag accessor.
@@ -3344,7 +3344,7 @@ pub struct Vm<'p> {
     /// A realm constructor's heap index → the MAIN-realm constructor it mirrors, so
     /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
     /// call behaviour (with the realm's prototype + realm tag).
-    realm_ctor_main: std::collections::HashMap<u32, u32>,
+    realm_ctor_main: rustc_hash::FxHashMap<u32, u32>,
     /// A `$262.createRealm()` child realm's GLOBAL object heap index → its realm
     /// id. Doubles as the `active_realm`/`realm_globals` key space for child
     /// realms (disjoint from ShadowRealm instance indices) and as the gate for
@@ -3365,7 +3365,7 @@ pub struct Vm<'p> {
     /// index): a strict arguments object built for a CHILD-realm function gets
     /// the child's thrower, so the `callee` accessor identity is stable within
     /// a realm and distinct across realms. Values are GC roots.
-    realm_throw_type_errors: std::collections::HashMap<u32, u32>,
+    realm_throw_type_errors: rustc_hash::FxHashMap<u32, u32>,
     /// An explicit `fn.prototype = value` assignment, for ANY value — including a
     /// NON-object (undefined/null/primitive) which the `prototypes` map (heap-only)
     /// can't hold. Consulted FIRST by the `.prototype` read / `prototype_of` /
@@ -3386,7 +3386,7 @@ pub struct Vm<'p> {
     /// undefined` is true, ToBoolean is false, and calling it returns undefined —
     /// yet it is otherwise an ordinary object (and `Object.is`/`===` do NOT treat
     /// it as undefined).
-    is_htmldda: std::collections::HashSet<u32>,
+    is_htmldda: rustc_hash::FxHashSet<u32>,
     /// Scalar mirror of the singleton `is_htmldda` member, or `u32::MAX` before
     /// globals are installed / if the set ever stops being a singleton. The set
     /// remains the authoritative representation and the
@@ -3420,19 +3420,19 @@ pub struct Vm<'p> {
     /// heap string, kept here so it's GC-traced — the `Temporal{fields:Vec<i64>}`
     /// layout can't hold a heap reference). The instance's `fields` are
     /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
-    zdt_tz: std::collections::HashMap<u32, Value>,
+    zdt_tz: rustc_hash::FxHashMap<u32, Value>,
     /// The `[[Calendar]]` slot of every calendar-bearing Temporal instance, as a
     /// `Cal` discriminant keyed by heap index. Absent means `iso8601`, so an
     /// ISO-only program never touches this map. Instances always store their
     /// *ISO* date in `fields`; the calendar is the view applied on read
     /// (see `vm/temporal/calendar.rs`).
-    temporal_cal: std::collections::HashMap<u32, u8>,
+    temporal_cal: rustc_hash::FxHashMap<u32, u8>,
     intl_ns: u32,
     intl_ctors: [u32; native::INTL_KINDS],
     intl_protos: [u32; native::INTL_KINDS],
     /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
     /// indirectly: every entry is also in `symbol_keys`.
-    intl_fallback_syms: std::collections::HashMap<u32, Value>,
+    intl_fallback_syms: rustc_hash::FxHashMap<u32, Value>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -3661,7 +3661,7 @@ pub struct Vm<'p> {
     /// Heap slots currently occupied by WeakMap/WeakSet/WeakRef/registry
     /// objects. This is an index only, never a root; the weak phase validates
     /// each slot's current variant and prunes dead/reused entries.
-    weak_containers: std::collections::HashSet<u32>,
+    weak_containers: rustc_hash::FxHashSet<u32>,
     /// WeakRef targets kept through the current ECMAScript job by
     /// AddToKeptObjects (constructor and successful deref). Cleared only at a
     /// main-script or microtask boundary.
