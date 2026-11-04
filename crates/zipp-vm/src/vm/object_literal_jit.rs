@@ -483,6 +483,26 @@ pub(crate) extern "win64" fn jit_int_string(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let value = Value::from_bits(value_bits);
+    // A primitive string is its own ToString.
+    if value.is_heap() && matches!(vm.heap.get(value.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+        return value_bits;
+    }
+    // A double: Number::toString, as the interpreter's `String(x)` gives it.
+    // `addParsed`'s `String(v)` of a parsed float bailed here on every call
+    // and left the rest of the call to the interpreter.
+    if value.is_double() {
+        let n = value.as_f64();
+        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // As below: the argument is immediate and every other live Value
+            // is in the frame's window, so a collection here is safe.
+            vm.maybe_gc();
+            let text = crate::heap::JsStr::from_ascii(crate::vm::helpers_num2::fmt_f64(n).into_bytes());
+            Value::heap(vm.heap.alloc_js(text)).bits()
+        })) {
+            Ok(bits) => bits,
+            Err(_) => std::process::abort(),
+        };
+    }
     if !value.is_int() {
         return crate::codegen::SELF_CALL_DEOPT;
     }

@@ -5,7 +5,31 @@
 #![allow(unused_imports)]
 use super::*;
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_CTOR_CALL=1`: a compiled call of a built-in constructor
+    /// as a function deopts, as before `jit_native_like_callee`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_ctor_call_enabled() = "ZIPP_NO_JIT_CTOR_CALL"
+}
+
 impl<'p> Vm<'p> {
+    /// A callee the compiled call fallback completes through `call_value`, as
+    /// the interpreter's Call op does: a native function (`parseInt`), or a
+    /// built-in constructor called as a function (`BigInt(x)`, `Number(s)`,
+    /// `Boolean(v)`), which is a constructor object on the heap. It deopted
+    /// before, so `randBig`'s `x << 32n | BigInt(u32())` left every call's
+    /// loop to the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_native_like_callee(&self, cv: Value) -> bool {
+        cv.is_heap()
+            && match self.heap.get(cv.heap_index()) {
+                HeapObj::Native(_) => true,
+                HeapObj::Object(m) => m.is_ctor && jit_ctor_call_enabled(),
+                _ => false,
+            }
+    }
+
     /// The native self-recursive-call implementation behind the `jit_self_call`
     /// FFI trampoline. Runs `self`-recursion natively on a fresh register window
     /// appended to `self.regs`. Returns result Value bits, or
@@ -2467,9 +2491,7 @@ impl<'p> Vm<'p> {
                             // A plain NATIVE callee (parseInt, …): invoke via
                             // call_value with this=undefined, exactly like the
                             // interpreter's Call op. Everything else deopts.
-                            if cv.is_heap()
-                                && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
-                            {
+                            if self.jit_native_like_callee(cv) {
                                 // A captured boot intrinsic takes the fused
                                 // `CallMethod` builtin lanes, as it does in the
                                 // interpreter's `CallWithThis` arm (B289): the
@@ -2517,9 +2539,7 @@ impl<'p> Vm<'p> {
                         // A plain NATIVE callee (parseInt, …): invoke via
                         // call_value with this=undefined, exactly like the
                         // interpreter's Call op. Everything else deopts.
-                        if cv.is_heap()
-                            && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
-                        {
+                        if self.jit_native_like_callee(cv) {
                             let called = self.with_argv(base, arg_base, argc, |vm, argv| {
                                 vm.call_value(cv, explicit_this, argv)
                             });
