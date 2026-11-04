@@ -655,6 +655,15 @@ pub(crate) fn compile_region_mem(
             }
         }
     }
+    let prev_load_int = |ip: usize, reg: u16| -> Option<i32> {
+        if ip <= s || jump_target[ip] || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        match proto.code[ip - 1] {
+            Instr::LoadInt { dst, val } if dst == reg => Some(val),
+            _ => None,
+        }
+    };
     let cmp_const_operand = |ip: usize, a: u16, b: u16, cmp: Cmp| -> Option<(u16, i32, Cmp)> {
         if ip <= s || jump_target[ip] || a == b || !crate::codegen::emit_misc::const_cmp_enabled() {
             return None;
@@ -1094,10 +1103,24 @@ pub(crate) fn compile_region_mem(
                 // (boxed Int) except `>>>`, whose u32 result may exceed
                 // i32::MAX and is then boxed as an (exact) double.
                 use crate::bytecode::BitwiseOp as B;
-                load_toint32(&mut ops, a, bail);
-                dynasm!(ops ; mov r8d, eax); // stash a
-                load_toint32(&mut ops, b, bail);
-                dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                // An operand the previous `LoadInt` set is its constant, with
+                // no load or conversion (`x | 0`, `i & 15`, `h >>> 0`).
+                match (prev_load_int(ip, a).filter(|_| a != b), prev_load_int(ip, b).filter(|_| a != b)) {
+                    (_, Some(cb)) => {
+                        load_toint32(&mut ops, a, bail);
+                        dynasm!(ops ; mov ecx, cb); // eax = a, ecx = b
+                    }
+                    (Some(ca), None) => {
+                        load_toint32(&mut ops, b, bail);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, ca); // eax = a, ecx = b
+                    }
+                    (None, None) => {
+                        load_toint32(&mut ops, a, bail);
+                        dynasm!(ops ; mov r8d, eax); // stash a
+                        load_toint32(&mut ops, b, bail);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                    }
+                }
                 match op {
                     B::And => {
                         dynasm!(ops ; and eax, ecx);

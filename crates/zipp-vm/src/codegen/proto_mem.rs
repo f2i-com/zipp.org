@@ -4013,6 +4013,17 @@ pub(crate) fn compile_proto_mem(
             }
         }
     }
+    // The Int constant register `reg` holds at `ip` because the instruction
+    // before it, the only way to `ip`, was `LoadInt` into it.
+    let prev_load_int = |ip: usize, reg: u16| -> Option<i32> {
+        if ip == 0 || jump_target[ip] || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        match proto.code[ip - 1] {
+            Instr::LoadInt { dst, val } if dst == reg => Some(val),
+            _ => None,
+        }
+    };
     // A fused compare whose other operand the previous instruction set to an
     // Int constant, reached only from it: `(register, constant, comparison
     // as register CMP constant)`, the constant compared as an immediate.
@@ -5927,10 +5938,24 @@ pub(crate) fn compile_proto_mem(
                 let use_slow = tierc_bitwise_slow_enabled();
                 let slow = if use_slow { ops.new_dynamic_label() } else { bail };
                 let done_b = ops.new_dynamic_label();
-                load_toint32(&mut ops, a, slow);
-                dynasm!(ops ; mov r8d, eax); // stash a
-                load_toint32(&mut ops, b, slow);
-                dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                // An operand the previous `LoadInt` set is its constant, with
+                // no load or conversion (`x | 0`, `i & 15`, `h >>> 0`).
+                match (prev_load_int(ip, a).filter(|_| a != b), prev_load_int(ip, b).filter(|_| a != b)) {
+                    (_, Some(cb)) => {
+                        load_toint32(&mut ops, a, slow);
+                        dynasm!(ops ; mov ecx, cb); // eax = a, ecx = b
+                    }
+                    (Some(ca), None) => {
+                        load_toint32(&mut ops, b, slow);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, ca); // eax = a, ecx = b
+                    }
+                    (None, None) => {
+                        load_toint32(&mut ops, a, slow);
+                        dynasm!(ops ; mov r8d, eax); // stash a
+                        load_toint32(&mut ops, b, slow);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                    }
+                }
                 match op {
                     B::And => {
                         dynasm!(ops ; and eax, ecx);
