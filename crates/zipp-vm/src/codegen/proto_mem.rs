@@ -2861,7 +2861,9 @@ fn do_wide_mask_passes(
 /// handler pushed.
 struct LazyTry {
     push: usize,
+    /// The last pop; `pops` holds every one (all skipped).
     pop: usize,
+    pops: Vec<usize>,
     /// A `finally` bracket's target and completion registers.
     finally: Option<(u32, u16, u16)>,
     /// The pushes the exit stub makes, outermost first, each with whether it
@@ -2993,8 +2995,10 @@ pub(crate) fn lazy_frame_free(proto: &crate::bytecode::FuncProto) -> bool {
     for i in proto.code.iter() {
         match i {
             Instr::PushHandler { .. } | Instr::PushFinally { .. } => brackets += 1,
-            Instr::JumpFinally { .. }
-            | Instr::TailCall { .. }
+            // A routed `break`/`continue` stays off the frame's routing when
+            // every bracket is lazy (`LazyPlan::jump_route`).
+            Instr::JumpFinally { .. } if !lazy_jump_enabled() => return false,
+            Instr::TailCall { .. }
             | Instr::IterDelegate { .. }
             | Instr::IterNext { .. }
             | Instr::IterPrime { .. }
@@ -3008,8 +3012,7 @@ pub(crate) fn lazy_frame_free(proto: &crate::bytecode::FuncProto) -> bool {
             _ => {}
         }
     }
-    let protected = tierc_protected_return_map(&proto.code);
-    brackets != 0 && lazy_tries(&proto.code, &protected).tries.len() == brackets
+    brackets != 0 && lazy_tries(&proto.code).tries.len() == brackets
 }
 
 /// The innermost lazy `finally` bracket `ip` is in the body of: where a return
@@ -3035,32 +3038,44 @@ fn lazy_finally(lazy: &[LazyTry], ip: usize) -> Option<(u32, u16, u16)> {
 ///
 /// A `finally` bracket (`try ... finally`, a for-of's body, which paid a push and
 /// a pop per iteration) is the same, and may also return: a return is a jump to
-/// the innermost lazy `finally` with the completion the routing would deposit.
-/// A catch's body may return when no `finally` encloses the return or a lazy
-/// one inside the catch takes it.
+/// the innermost lazy `finally` with the completion the routing would deposit,
+/// or through the frame's routing when the `finally` around it is pushed. A
+/// catch's body may return too: its handler is only left on the way.
 ///
 /// A bracket may hold others when they are lazy too, their `finally` blocks
 /// included: the exit stub of an inner one pushes the outer handlers first, as
 /// the interpreter would hold them, and an inner `EndFinally` resuming a return
 /// goes on to the next lazy `finally` out (see `pushed`, which tells where no
 /// handler can be on the frame for such a static routing).
-fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
+fn lazy_tries(code: &[Instr]) -> LazyPlan {
     let n = code.len();
     let nest = lazy_nest_enabled();
     struct Bracket {
         push: usize,
+        /// The last pop: the body is `(push, pop)`.
         pop: usize,
+        /// Every pop, in order: `try ... catch ... finally` pops its `finally`
+        /// once on the way out of the `try` and again out of the catch.
+        pops: Vec<usize>,
         packed: u64,
         finally: Option<(u32, u16, u16)>,
         /// A `finally` bracket's closing `EndFinally`.
         end: Option<usize>,
         parent: Option<usize>,
     }
-    // Pair each push with its pop: the brackets nest as the statements do,
-    // one pop each, in order.
+    // Pair each push with its pops: the brackets nest as the statements do.
+    // A catch block runs under the `finally` of its `try ... catch ...
+    // finally`, which the `try`'s way out has already popped: it opens again
+    // at the catch, for the catch's own way out to pop.
     let mut brs: Vec<Bracket> = Vec::new();
     let mut open: Vec<usize> = Vec::new();
+    let mut reopen: FxHashMap<usize, usize> = FxHashMap::default();
     for (ip, ins) in code.iter().enumerate() {
+        if let Some(&f) = reopen.get(&ip) {
+            if !open.contains(&f) && !brs[f].pops.is_empty() {
+                open.push(f);
+            }
+        }
         let (packed, finally) = match *ins {
             Instr::PushHandler { catch_target, catch_reg } => {
                 (((catch_target as u64) << 16) | catch_reg as u64, None)
@@ -3072,7 +3087,10 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
             Instr::PopHandler | Instr::PopFinally => {
                 let fin = matches!(ins, Instr::PopFinally);
                 match open.pop() {
-                    Some(b) if brs[b].finally.is_some() == fin => brs[b].pop = ip,
+                    Some(b) if brs[b].finally.is_some() == fin => {
+                        brs[b].pop = ip;
+                        brs[b].pops.push(ip);
+                    }
                     _ => return LazyPlan::none(n),
                 }
                 continue;
@@ -3085,10 +3103,15 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
             })
         });
         let parent = open.last().copied();
+        if let (Instr::PushHandler { catch_target, .. }, Some(p)) = (*ins, parent) {
+            if brs[p].finally.is_some_and(|(t, _, _)| catch_target < t) {
+                reopen.insert(catch_target as usize, p);
+            }
+        }
         open.push(brs.len());
-        brs.push(Bracket { push: ip, pop: usize::MAX, packed, finally, end, parent });
+        brs.push(Bracket { push: ip, pop: usize::MAX, pops: Vec::new(), packed, finally, end, parent });
     }
-    if !open.is_empty() {
+    if !open.is_empty() || brs.iter().any(|b| b.finally.is_some_and(|(t, _, _)| b.pop >= t as usize)) {
         return LazyPlan::none(n);
     }
     let mut push_of = vec![None; n];
@@ -3096,7 +3119,9 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
     let mut end_of = vec![None; n];
     for (b, br) in brs.iter().enumerate() {
         push_of[br.push] = Some(b);
-        pop_of[br.pop] = Some(b);
+        for &p in &br.pops {
+            pop_of[p] = Some(b);
+        }
         if let Some(e) = br.end {
             end_of[e] = Some(b);
         }
@@ -3125,25 +3150,27 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
                 child(push_of[ip])
                     && push_of[ip].is_some_and(|c| brs[c].finally.is_none() || brs[c].end.is_some_and(|e| e < pop))
             }
-            Instr::PopHandler | Instr::PopFinally => child(pop_of[ip]),
+            // Its own first pop (out of the `try`, before the catch) too.
+            Instr::PopHandler | Instr::PopFinally => pop_of[ip] == Some(b) || child(pop_of[ip]),
             Instr::EndFinally { .. } => child(end_of[ip]),
-            Instr::Return { .. } | Instr::ReturnUndefined => {
-                brs[b].finally.is_some()
-                    || (nest
-                        && (!protected_returns[ip]
-                            || (b + 1..brs.len()).any(|c| {
-                                lazy[c] && brs[c].finally.is_some() && brs[c].push < ip && ip < brs[c].pop
-                            })))
-            }
+            // A return goes to the innermost lazy `finally` around it, or
+            // through the frame's routing to the pushed one, which a lazy
+            // bracket never encloses; a catch on the way is only left.
+            Instr::Return { .. } | Instr::ReturnUndefined => brs[b].finally.is_some() || nest,
             _ => true,
         }) && code.iter().enumerate().all(|(at, i)| {
-            // A routed jump leaves the body (`jump_ok`), forward or back.
+            // A routed jump leaves the body (`jump_ok`), forward or back; so
+            // does the jump to this bracket's own `finally` after its first
+            // pop (the `try`'s way out, before the catch block).
             let leaves = jumps && matches!(i, Instr::JumpFinally { .. });
+            let own_exit = at > 0 && pop_of[at - 1] == Some(b) && matches!(i, Instr::Jump { .. });
             control_targets(i).into_iter().flatten().all(|target| {
                 let target = target as usize;
                 let inside = at > push && at < pop;
                 if inside {
-                    (target > at && (target <= pop || leaves)) || (leaves && target <= push)
+                    (target > at && (target <= pop || leaves))
+                        || (leaves && target <= push)
+                        || (own_exit && brs[b].finally.is_some_and(|(t, _, _)| t as usize == target))
                 } else {
                     at == push || target <= push || target > pop
                 }
@@ -3167,7 +3194,7 @@ fn lazy_tries(code: &[Instr], protected_returns: &[bool]) -> LazyPlan {
             up = brs[p].parent;
         }
         chain.reverse();
-        tries.push(LazyTry { push: br.push, pop: br.pop, finally: br.finally, chain });
+        tries.push(LazyTry { push: br.push, pop: br.pop, pops: br.pops.clone(), finally: br.finally, chain });
     }
     if !nest {
         // The former rule: no `EndFinally` is routed statically.
@@ -3914,7 +3941,7 @@ pub(crate) fn compile_proto_mem(
     let lazy_plan = if py || meter.is_some() || proto.is_generator || proto.is_async || !lazy_try_enabled() {
         LazyPlan::none(n)
     } else {
-        lazy_tries(&proto.code, &protected_returns)
+        lazy_tries(&proto.code)
     };
     let lazy_try = &lazy_plan.tries;
     // The jump completions (target, floor) each lazy `finally`'s `EndFinally`
@@ -4096,7 +4123,8 @@ pub(crate) fn compile_proto_mem(
     // A body that may run frame-free with handler ops (`lazy_frame_free`)
     // keeps the plain yield bail: a region's handler push writes the top
     // frame, which would be its caller's.
-    if tierc_yield_entry_enabled() && !(meter.is_none() && lazy_frame_free(proto)) {
+    let frame_free_body = meter.is_none() && lazy_frame_free(proto);
+    if tierc_yield_entry_enabled() && !frame_free_body {
         for &h in yield_heads {
             let h = h as usize;
             if h >= n || lazy_at[h].is_some() {
@@ -4215,7 +4243,7 @@ pub(crate) fn compile_proto_mem(
                 ; => not_run
             );
         }
-        if lazy_try.iter().any(|t| t.push == ip || t.pop == ip) {
+        if lazy_try.iter().any(|t| t.push == ip || t.pops.contains(&ip)) {
             continue;
         }
         // These bytecodes were materialized exactly by the fused captured-int
@@ -5023,7 +5051,9 @@ pub(crate) fn compile_proto_mem(
                         }
                         dynasm!(ops ; => other);
                     }
-                    if lazy_try.iter().any(|t| t.push < ip && ip < t.pop) {
+                    // The helper reads the top frame, which a frame-free
+                    // activation does not own.
+                    if frame_free_body || lazy_try.iter().any(|t| t.push < ip && ip < t.pop) {
                         dynasm!(ops ; jmp => bail);
                     }
                     dynasm!(ops ; => routed);
