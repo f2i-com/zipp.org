@@ -7363,13 +7363,17 @@ mod local_sroa_tests {
                 _ => None,
             })
             .expect("new object");
+        // The first post-loop register write, made to read the elided object
+        // instead. (`console.log(checksum)` passes `checksum`'s own register
+        // as its argument window now, so the `Move` there is gone; the
+        // receiver's `LoadGlobal` serves.)
         let post_move = proto.code[end as usize + 1..]
             .iter()
-            .position(|i| matches!(i, Instr::Move { .. }))
+            .position(|i| matches!(i, Instr::Move { .. } | Instr::LoadGlobal { .. }))
             .map(|off| end as usize + 1 + off)
-            .expect("post-loop move");
+            .expect("post-loop register write");
         let dst = match proto.code[post_move] {
-            Instr::Move { dst, .. } => dst,
+            Instr::Move { dst, .. } | Instr::LoadGlobal { dst, .. } => dst,
             _ => unreachable!(),
         };
         proto.code[post_move] = Instr::Move {
