@@ -5687,7 +5687,10 @@ pub enum Reactions {
 }
 
 impl Reactions {
-    #[inline]
+    /// Always inlined, so the caller's pair is built where it is stored: out
+    /// of line, it was built on the stack and copied in with 16-byte loads
+    /// over 8-byte stores, which cannot forward (3% of await-sustained).
+    #[inline(always)]
     pub fn push(&mut self, r: ReactionPair) {
         match self {
             Reactions::None => *self = Reactions::One(r),

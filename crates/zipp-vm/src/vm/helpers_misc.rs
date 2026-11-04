@@ -3023,7 +3023,12 @@ unsafe fn ta_cache_fill(vm: *mut core::ffi::c_void, obj_bits: u64, slot: *mut u6
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl Vm<'_> {
-    /// The record `jit_get_index_ta_fill` stores for `obj_bits`.
+    /// The record `jit_get_index_ta_fill` stores for `obj_bits`. Inlined, so
+    /// its words are stored into the slot directly: returned through the
+    /// stack, they were copied on with 16-byte loads over 8-byte stores,
+    /// which cannot forward (4% of dataview-binary, whose views are new
+    /// receivers often enough to refill).
+    #[inline(always)]
     fn ta_cache_record(&self, obj_bits: u64) -> [u64; 5] {
         let epoch = crate::heap::TA_DATA_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let v = Value::from_bits(obj_bits);

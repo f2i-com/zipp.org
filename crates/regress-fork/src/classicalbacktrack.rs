@@ -2024,7 +2024,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         // A for loop is the easiest way to do this while satisfying the borrow checker.
         // TODO: avoid allocating so much.
         #[cfg(feature = "bounded-backtracking")]
-        let Some(mut captures) = self
+        let Some(captures) = self
             .matcher
             .budget
             .try_capture_vec_with_capacity(self.matcher.s.groups.len())
@@ -2039,11 +2039,20 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         let mut captures = Vec::new();
         #[cfg(not(feature = "bounded-backtracking"))]
         captures.reserve_exact(self.matcher.s.groups.len());
+        // The result is built first and filled where it is returned: a
+        // captures vector filled in a local and then moved into the result
+        // was copied with 16-byte loads over the pushes' 8-byte stores, which
+        // cannot forward (4% of a sticky Unicode scan's cycles).
+        let mut m = Match {
+            range: 0..0,
+            captures,
+            group_names: self.matcher.re.group_names.clone(),
+        };
         for gd in self.matcher.s.groups.iter_mut() {
             if !self.matcher.budget.consume(1) {
                 break;
             }
-            captures.push(match gd.as_range() {
+            m.captures.push(match gd.as_range() {
                 Some(r) => Some(Range {
                     start: self.input.pos_to_offset(r.start),
                     end: self.input.pos_to_offset(r.end),
@@ -2053,11 +2062,8 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             gd.start = None;
             gd.end = None;
         }
-        Match {
-            range: self.input.pos_to_offset(start)..self.input.pos_to_offset(end),
-            captures,
-            group_names: self.matcher.re.group_names.clone(),
-        }
+        m.range = self.input.pos_to_offset(start)..self.input.pos_to_offset(end);
+        m
     }
 
     /// \return the next match for an anchored regex that only matches at the start.
