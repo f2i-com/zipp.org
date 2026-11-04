@@ -795,6 +795,13 @@ env_off_switch! {
     fn const_fold_enabled() = "ZIPP_NO_CONST_FOLD"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_NUMERIC_LOCALS=1` skips `capture::numeric_locals`, so no
+    /// local read counts as provably primitive (`s.charCodeAt(i + 1)` is the
+    /// split `GetProp` + `CallWithThis` again), for A/B.
+    fn numeric_locals_enabled() = "ZIPP_NO_NUMERIC_LOCALS"
+}
+
 /// How deep [`const_number`] looks: a constant expression in real code is a
 /// literal or two (`-1`, `4096 * 4`, `1 << 20`), and a bound keeps the probe
 /// O(1) per node, so a long non-constant chain stays linear to compile.

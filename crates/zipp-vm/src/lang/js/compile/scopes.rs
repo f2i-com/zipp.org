@@ -218,6 +218,7 @@ impl<'a> FnCompiler<'a> {
             captured,
             late_boxed: HashSet::default(),
             copy_boxed: HashSet::default(),
+            num_locals: HashSet::default(),
             cell_regs: HashSet::default(),
             lexical_regs: HashSet::default(),
             const_regs: HashSet::default(),

@@ -546,6 +546,13 @@ impl Compiler {
         if is_script && fc.cx.eval_fn_context {
             fc.box_all_locals = true;
         }
+        if !fc.box_all_locals && !fc.script_eval_lexicals && numeric_locals_enabled() {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.extend(self_name);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, params_ast, body);
+        }
         // The eval ROOT closes over the caller bindings: seed them as upvalues
         // (the runtime hands the cells to the manually-built eval closure).
         if is_script && !fc.cx.eval_caller_scope.is_empty() {
@@ -1319,6 +1326,14 @@ impl Compiler {
         if cls_body_refs_eval {
             fc.box_all_locals = true;
         }
+        // Not where field initializers compile into the body: the walk sees
+        // the body only.
+        if !cls_body_refs_eval && fields.is_empty() && computed_inits.is_empty() && numeric_locals_enabled() {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, params_ast, body);
+        }
         fc.in_derived_ctor = fc.cx.in_derived_ctor;
         fc.cx.in_strict = true;
         fc.super_class = super_class;
@@ -1646,6 +1661,12 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         if arrow_refs_eval {
             fc.box_all_locals = true;
+        }
+        if let (false, ast::ArrowBody::Block(b), true) = (arrow_refs_eval, &a.body, numeric_locals_enabled()) {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, Some(&a.params), &b.stmts);
         }
         fc.cx.in_strict = is_strict;
         // An arrow has no `super` binding of its own: `super.x` / `super.m()` inside

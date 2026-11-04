@@ -1085,6 +1085,523 @@ impl<'a> WriteScan<'a> {
     }
 }
 
+/// The names, among a function's simply declared `var`/`let`/`const`
+/// bindings, that only ever hold a NUMBER, or `undefined`, `null` or a
+/// boolean: every declaration initializer and every assignment stores such a
+/// value, given that the names in the set hold one. `x++`, `x -= e` and the
+/// other arithmetic compound assignments always store a number then (or
+/// throw before storing), as do `x += e`, `x = e`, `x ||= e` with such an
+/// `e`. Arithmetic over these values runs no user code and cannot throw (no
+/// object to coerce, no BigInt to mix), which is what the compiler's
+/// call-order proof needs to fuse `s.charCodeAt(i + 1)` (`provably_primitive`).
+///
+/// The walk covers this function's own code only. A nested function, arrow,
+/// method or class body that writes one of the names makes it a captured
+/// cell, which the caller never asks about. A name bound or written any other
+/// way (a parameter or one of `excluded`, a destructuring pattern, a
+/// for-in/of head, a function, class, catch or import binding, `using`) is
+/// left out, and so is everything two bindings share a name with: the walk is
+/// by name, so it judges every same-named binding of the function together.
+pub fn numeric_locals(excluded: &[&str], params: Option<&Params>, body: &[Stmt]) -> HashSet<String> {
+    let mut scan = NumScan::default();
+    // Every name a parameter binds is left out (a body `var` of the same name
+    // is the same binding), and its defaults are walked.
+    for p in params.map_or(&[][..], |p| &p.items) {
+        scan.bad_pattern(p);
+    }
+    for s in body {
+        scan.stmt(s);
+    }
+    // Only a method call with a computed argument can use the answer.
+    if !scan.wants || scan.declared.is_empty() {
+        return HashSet::default();
+    }
+    scan.bad.sort_unstable();
+    let mut set: Vec<&str> = scan.declared;
+    set.sort_unstable();
+    set.dedup();
+    set.retain(|n| scan.bad.binary_search(n).is_err() && !excluded.contains(n));
+    // The greatest fixed point: drop every name with a write that is not a
+    // number under the current set, until none drops. Each round drops one
+    // name at least; a body that has not settled by the cap keeps none.
+    for _ in 0..NUM_LOCAL_ROUNDS {
+        if set.is_empty() {
+            return HashSet::default();
+        }
+        let mut drop: Vec<&str> = scan
+            .writes
+            .iter()
+            .filter(|(n, e)| set.binary_search(n).is_ok() && !num_value(e, &set, NUM_EXPR_DEPTH))
+            .map(|(n, _)| *n)
+            .collect();
+        if drop.is_empty() {
+            return set.into_iter().map(str::to_owned).collect();
+        }
+        drop.sort_unstable();
+        set.retain(|n| drop.binary_search(n).is_err());
+    }
+    HashSet::default()
+}
+
+/// [`numeric_locals`]' bound on its fixed-point rounds.
+const NUM_LOCAL_ROUNDS: usize = 16;
+/// [`num_value`]'s bound on expression depth.
+const NUM_EXPR_DEPTH: u8 = 24;
+
+/// Whether `e`'s value is a number, `undefined`, `null` or a boolean when
+/// every name in `set` (sorted) holds one (or `e` throws instead of producing
+/// a value).
+fn num_value(e: &Expr, set: &[&str], depth: u8) -> bool {
+    use crate::parse::ast::{AssignOp, BinaryOp, UnaryOp};
+    if depth == 0 {
+        return false;
+    }
+    let d = depth - 1;
+    match e {
+        Expr::Num(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::Ident(n) => set.binary_search(&&**n).is_ok(),
+        Expr::Unary { op, arg } => match op {
+            // ToNumber, ToBoolean, `undefined`, a boolean.
+            UnaryOp::Plus | UnaryOp::Not | UnaryOp::Void | UnaryOp::Delete => true,
+            // A BigInt operand stays a BigInt.
+            UnaryOp::Minus | UnaryOp::BitNot => num_value(arg, set, d),
+            UnaryOp::Typeof => false,
+        },
+        Expr::Update { target, .. } => {
+            matches!(target, Target::Ident { name, .. } if set.binary_search(&&**name).is_ok())
+        }
+        Expr::Binary { op, left, right } => match op {
+            // A string or an object on either side may concatenate.
+            BinaryOp::Add => num_value(left, set, d) && num_value(right, set, d),
+            // A number on one side: the other's ToNumeric is a number, or a
+            // BigInt that throws the mixed-type TypeError.
+            BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::Exp
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => num_value(left, set, d) || num_value(right, set, d),
+            // Always a number (a BigInt operand throws), or a boolean.
+            BinaryOp::UShr
+            | BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::StrictEq
+            | BinaryOp::StrictNotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::In
+            | BinaryOp::Instanceof => true,
+        },
+        Expr::Logical { left, right, .. } => num_value(left, set, d) && num_value(right, set, d),
+        Expr::Cond { cons, alt, .. } => num_value(cons, set, d) && num_value(alt, set, d),
+        Expr::Seq(v) => v.last().is_some_and(|x| num_value(x, set, d)),
+        Expr::Assign { op: AssignOp::Assign, value, .. } => num_value(value, set, d),
+        _ => false,
+    }
+}
+
+/// [`numeric_locals`]' walk over one function's own code: its simple
+/// declarations, the values written to them, and the names bound or written
+/// any other way. Exhaustive over the tree, as [`WriteScan`] is, except that
+/// it does not enter nested function bodies (see `numeric_locals`).
+#[derive(Default)]
+struct NumScan<'a> {
+    declared: Vec<&'a str>,
+    bad: Vec<&'a str>,
+    writes: Vec<(&'a str, &'a Expr)>,
+    /// A method call has an argument other than a name or a literal.
+    wants: bool,
+}
+
+impl<'a> NumScan<'a> {
+    fn stmts(&mut self, v: &'a [Stmt]) {
+        for s in v {
+            self.stmt(s);
+        }
+    }
+
+    fn stmt(&mut self, s: &'a Stmt) {
+        match s {
+            Stmt::Block(v) => self.stmts(v),
+            Stmt::Empty | Stmt::Debugger | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Expr(e) | Stmt::Throw(e) => self.expr(e),
+            Stmt::Return(e) => {
+                if let Some(e) = e {
+                    self.expr(e);
+                }
+            }
+            Stmt::If { test, cons, alt } => {
+                self.expr(test);
+                self.stmt(cons);
+                if let Some(a) = alt {
+                    self.stmt(a);
+                }
+            }
+            Stmt::While { test, body } | Stmt::DoWhile { body, test } => {
+                self.expr(test);
+                self.stmt(body);
+            }
+            Stmt::For { init, test, update, body } => {
+                match init.as_deref() {
+                    Some(ForInit::Var(d)) => self.var_decl(d),
+                    Some(ForInit::Expr(e)) => self.expr(e),
+                    None => {}
+                }
+                if let Some(t) = test {
+                    self.expr(t);
+                }
+                if let Some(u) = update {
+                    self.expr(u);
+                }
+                self.stmt(body);
+            }
+            Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+                match left {
+                    ForTarget::Var(d) => {
+                        for decl in &d.decls {
+                            self.bad_pattern(&decl.id);
+                            if let Some(i) = &decl.init {
+                                self.expr(i);
+                            }
+                        }
+                    }
+                    ForTarget::Target(t) => self.bad_target(t),
+                }
+                self.expr(right);
+                self.stmt(body);
+            }
+            Stmt::Switch { disc, cases } => {
+                self.expr(disc);
+                for c in cases {
+                    if let Some(t) = &c.test {
+                        self.expr(t);
+                    }
+                    self.stmts(&c.body);
+                }
+            }
+            Stmt::Try { block, handler, finalizer } => {
+                self.stmts(block);
+                if let Some(h) = handler {
+                    if let Some(p) = &h.param {
+                        self.bad_pattern(p);
+                    }
+                    self.stmts(&h.body);
+                }
+                if let Some(f) = finalizer {
+                    self.stmts(f);
+                }
+            }
+            Stmt::Labeled { body, .. } => self.stmt(body),
+            Stmt::With { object, body } => {
+                self.expr(object);
+                self.stmt(body);
+            }
+            Stmt::VarDecl(d) => self.var_decl(d),
+            Stmt::FnDecl(f) => self.nested_function(f),
+            Stmt::ClassDecl(c) => self.class(c),
+            Stmt::Import(i) => {
+                for sp in &i.specifiers {
+                    match sp {
+                        ImportSpecifier::Default(n) | ImportSpecifier::Namespace(n) => {
+                            self.bad.push(&**n);
+                        }
+                        ImportSpecifier::Named { local, .. } => {
+                            self.bad.push(&**local);
+                        }
+                    }
+                }
+            }
+            Stmt::Export(e) => match &**e {
+                ExportDecl::Decl(s) => self.stmt(s),
+                ExportDecl::Default(ExportDefault::Expr(e)) => self.expr(e),
+                ExportDecl::Default(ExportDefault::Function(f)) => self.nested_function(f),
+                ExportDecl::Default(ExportDefault::Class(c)) => self.class(c),
+                ExportDecl::Named { .. } | ExportDecl::All { .. } => {}
+            },
+        }
+    }
+
+    fn var_decl(&mut self, d: &'a VarDecl) {
+        let simple = matches!(d.kind, VarKind::Var | VarKind::Let | VarKind::Const);
+        for decl in &d.decls {
+            match &decl.id {
+                Pattern::Ident(n) if simple => {
+                    self.declared.push(&**n);
+                    if let Some(i) = &decl.init {
+                        self.writes.push((&**n, i));
+                    }
+                }
+                p => self.bad_pattern(p),
+            }
+            if let Some(i) = &decl.init {
+                self.expr(i);
+            }
+        }
+    }
+
+    /// Every name `p` binds is left out; its defaults and keys are walked.
+    fn bad_pattern(&mut self, p: &'a Pattern) {
+        match p {
+            Pattern::Ident(n) => {
+                self.bad.push(&**n);
+            }
+            Pattern::Array(els) => {
+                for el in els.iter().flatten() {
+                    self.bad_pattern(&el.pat);
+                }
+            }
+            Pattern::Object { props, rest } => {
+                for pr in props {
+                    self.prop_key(&pr.key);
+                    self.bad_pattern(&pr.value);
+                }
+                if let Some(r) = rest {
+                    self.bad_pattern(r);
+                }
+            }
+            Pattern::Assign { left, right } => {
+                self.bad_pattern(left);
+                self.expr(right);
+            }
+            Pattern::Rest(p) => self.bad_pattern(p),
+        }
+    }
+
+    /// An assignment target outside a plain `x = e` / `x op= e` / `x++`:
+    /// every name it writes is left out.
+    fn bad_target(&mut self, t: &'a Target) {
+        match t {
+            Target::Ident { name, .. } => {
+                self.bad.push(&**name);
+            }
+            Target::Member(m) => self.member(m),
+            Target::Call(c) => self.call(c),
+            Target::Array(els) => {
+                for el in els.iter().flatten() {
+                    self.bad_target(&el.target);
+                    if let Some(d) = &el.default {
+                        self.expr(d);
+                    }
+                }
+            }
+            Target::Object { props, rest } => {
+                for p in props {
+                    self.prop_key(&p.key);
+                    self.bad_target(&p.target);
+                    if let Some(d) = &p.default {
+                        self.expr(d);
+                    }
+                }
+                if let Some(r) = rest {
+                    self.bad_target(r);
+                }
+            }
+        }
+    }
+
+    fn prop_key(&mut self, k: &'a PropKey) {
+        match k {
+            PropKey::Computed(e) => self.expr(e),
+            PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_) | PropKey::Private(_) => {}
+        }
+    }
+
+    fn member(&mut self, m: &'a Member) {
+        self.expr(&m.object);
+        if let MemberProp::Computed(k) = &m.prop {
+            self.expr(k);
+        }
+    }
+
+    fn call(&mut self, c: &'a crate::parse::ast::CallExpr) {
+        if !self.wants && matches!(c.callee, Expr::Member(_)) {
+            self.wants = c.args.iter().any(|a| {
+                !matches!(
+                    a,
+                    Arg::Expr(Expr::Ident(_) | Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null)
+                )
+            });
+        }
+        self.expr(&c.callee);
+        self.args(&c.args);
+    }
+
+    fn args(&mut self, args: &'a [Arg]) {
+        for a in args {
+            match a {
+                Arg::Expr(e) | Arg::Spread(e) => self.expr(e),
+            }
+        }
+    }
+
+    /// A function declaration: its name is a binding of this function; its
+    /// body is its own.
+    fn nested_function(&mut self, f: &'a Function) {
+        if let Some(n) = &f.name {
+            self.bad.push(&**n);
+        }
+    }
+
+    /// A class: its name is a binding; what the definition evaluates here
+    /// (decorators, the heritage, computed keys) is walked; method, field and
+    /// static-block bodies are functions of their own.
+    fn class(&mut self, c: &'a Class) {
+        if let Some(n) = &c.name {
+            self.bad.push(&**n);
+        }
+        for d in &c.decorators {
+            self.expr(d);
+        }
+        if let Some(s) = &c.superclass {
+            self.expr(s);
+        }
+        for m in &c.body {
+            match m {
+                ClassMember::Method(m) => {
+                    self.prop_key(&m.key);
+                    for d in &m.decorators {
+                        self.expr(d);
+                    }
+                }
+                ClassMember::Field(f) => {
+                    self.prop_key(&f.key);
+                    for d in &f.decorators {
+                        self.expr(d);
+                    }
+                }
+                ClassMember::StaticBlock(_) => {}
+            }
+        }
+    }
+
+    fn expr(&mut self, e: &'a Expr) {
+        use crate::parse::ast::AssignOp;
+        match e {
+            Expr::Ident(_)
+            | Expr::This
+            | Expr::Super
+            | Expr::Null
+            | Expr::Bool(_)
+            | Expr::Num(_)
+            | Expr::BigInt(_)
+            | Expr::Str(_)
+            | Expr::Regex { .. }
+            | Expr::NewTarget
+            | Expr::ImportMeta => {}
+            Expr::Array(els, _) => {
+                for el in els.iter().flatten() {
+                    match el {
+                        ArrayElem::Expr(e) | ArrayElem::Spread(e) => self.expr(e),
+                    }
+                }
+            }
+            Expr::Object(members, _) => {
+                for m in members {
+                    match m {
+                        ObjectMember::Prop { key, value, init, .. } => {
+                            self.prop_key(key);
+                            self.expr(value);
+                            if let Some(i) = init {
+                                self.expr(i);
+                            }
+                        }
+                        ObjectMember::Method { key, .. }
+                        | ObjectMember::Get { key, .. }
+                        | ObjectMember::Set { key, .. } => self.prop_key(key),
+                        ObjectMember::Spread(e) => self.expr(e),
+                    }
+                }
+            }
+            Expr::Template(t) => {
+                for e in &t.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::TaggedTemplate { tag, quasi } => {
+                self.expr(tag);
+                for e in &quasi.exprs {
+                    self.expr(e);
+                }
+            }
+            Expr::Unary { arg, .. } => self.expr(arg),
+            // `x++` stores ToNumeric(x) + 1: a number whenever `x` holds one.
+            Expr::Update { target, .. } => match target {
+                Target::Ident { .. } => {}
+                t => self.bad_target(t),
+            },
+            Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+                self.expr(left);
+                self.expr(right);
+            }
+            Expr::Assign { op, target, value, .. } => {
+                match target {
+                    Target::Ident { name, .. } => match op {
+                        // The stored value is `value` (`+=`: with `x`).
+                        AssignOp::Assign
+                        | AssignOp::Add
+                        | AssignOp::LogicalAnd
+                        | AssignOp::LogicalOr
+                        | AssignOp::LogicalCoalesce => self.writes.push((&**name, value)),
+                        // A number on the left: a number, or a throw.
+                        AssignOp::Sub
+                        | AssignOp::Mul
+                        | AssignOp::Div
+                        | AssignOp::Rem
+                        | AssignOp::Exp
+                        | AssignOp::Shl
+                        | AssignOp::Shr
+                        | AssignOp::UShr
+                        | AssignOp::BitAnd
+                        | AssignOp::BitOr
+                        | AssignOp::BitXor => {}
+                    },
+                    t => self.bad_target(t),
+                }
+                self.expr(value);
+            }
+            Expr::Cond { test, cons, alt } => {
+                self.expr(test);
+                self.expr(cons);
+                self.expr(alt);
+            }
+            Expr::Call(c) => self.call(c),
+            Expr::New { callee, args, .. } => {
+                self.expr(callee);
+                self.args(args);
+            }
+            Expr::Member(m) => self.member(m),
+            Expr::Chain(inner) => self.expr(inner),
+            Expr::Seq(v) => {
+                for e in v {
+                    self.expr(e);
+                }
+            }
+            // Bodies of their own.
+            Expr::Arrow(_) | Expr::Function(_) => {}
+            Expr::Class(c) => self.class(c),
+            Expr::Yield { arg, .. } => {
+                if let Some(a) = arg {
+                    self.expr(a);
+                }
+            }
+            Expr::Await(a) => self.expr(a),
+            Expr::PrivateIn { object, .. } => self.expr(object),
+            Expr::ImportCall { spec, options, .. } => {
+                self.expr(spec);
+                if let Some(o) = options {
+                    self.expr(o);
+                }
+            }
+        }
+    }
+}
+
 /// The free names of a closure expression: what a `return` of it must box
 /// (`late_box_names`).
 pub fn closure_free_names(e: &Expr) -> HashSet<String> {

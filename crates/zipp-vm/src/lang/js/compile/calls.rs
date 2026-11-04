@@ -2107,8 +2107,15 @@ impl<'a> FnCompiler<'a> {
             Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
             Expr::Ident(id) => {
                 let name: &str = id;
-                matches!(name, "undefined" | "NaN" | "Infinity")
+                if matches!(name, "undefined" | "NaN" | "Infinity") {
+                    return self.ident_order_transparent(name, false);
+                }
+                // A register local that only ever holds a number, undefined,
+                // null or a boolean (`capture::numeric_locals`): the read is
+                // the register, and the value has nothing to coerce.
+                self.num_locals.contains(name)
                     && self.ident_order_transparent(name, false)
+                    && matches!(self.resolve(name), Binding::Local(_) | Binding::Spill(_))
             }
             Expr::Unary {
                 op: UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Void,

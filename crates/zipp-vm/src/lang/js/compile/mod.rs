@@ -711,6 +711,11 @@ struct FnCompiler<'a> {
     /// (`capture::copy_box_names`): plain registers, copied into a fresh cell
     /// for each such closure as it is made (`copy_box_for_child`).
     copy_boxed: HashSet<String>,
+    /// Locals that only ever hold a number, `undefined`, `null` or a boolean
+    /// (`capture::numeric_locals`): as a register binding, a read of one is
+    /// provably primitive, so an argument such as `i + 1` keeps a method call
+    /// fused. Empty where eval may reach the bindings.
+    num_locals: HashSet<String>,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,
