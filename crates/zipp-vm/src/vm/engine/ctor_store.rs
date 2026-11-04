@@ -929,6 +929,13 @@ impl<'p> Vm<'p> {
             if self.class_body_fn(Value::heap(class), true).is_some() {
                 return None;
             }
+            // A class that declares private methods or accessors brands each
+            // instance as it is made (`brand_instance`), and an instance born
+            // finished would have no brand: `this.#m()` on it threw. A
+            // class's brand is fixed when it is made, as its fields are.
+            if self.class_brands_instances(class) {
+                return None;
+            }
             let mut buf = [(0u32, 0u32); 16];
             for (k, _) in keys {
                 let n = self.class_add_chain(NO_INSTANCE, class, k, &mut buf)?;

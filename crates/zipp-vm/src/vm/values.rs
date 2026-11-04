@@ -696,6 +696,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether [`Vm::brand_instance`] installs a brand on an instance of the
+    /// class at heap `class`: it declares private methods or accessors. (Only
+    /// the native tiers' store-only `new` asks.)
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn class_brands_instances(&self, class: u32) -> bool {
+        self.method_brand
+            .get(&class)
+            .and_then(|c| c.first())
+            .is_some_and(|own| self.brand_private_names.contains_key(own))
+    }
+
     /// PrivateBrandAdd: install a class's own private brand on an instance at
     /// its InitializeInstanceElements point. Only classes that DECLARE private
     /// members brand (keeps the side map empty on the hot path).
