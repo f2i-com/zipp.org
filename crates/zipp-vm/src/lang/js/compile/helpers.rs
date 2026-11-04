@@ -789,6 +789,80 @@ pub(crate) fn concat_key_literal_prefix(key: &Expr) -> Option<(&str, &Expr)> {
     None
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_CONST_FOLD=1` compiles numeric constant expressions as
+    /// written (`-1` as `LoadInt 1; Neg`), for A/B.
+    fn const_fold_enabled() = "ZIPP_NO_CONST_FOLD"
+}
+
+/// How deep [`const_number`] looks: a constant expression in real code is a
+/// literal or two (`-1`, `4096 * 4`, `1 << 20`), and a bound keeps the probe
+/// O(1) per node, so a long non-constant chain stays linear to compile.
+pub(crate) const CONST_FOLD_DEPTH: u8 = 6;
+
+/// The value of a numeric constant expression: a number literal, `-`, `+` or
+/// `~` of one, or `+ - * /`, a bitwise or a shift operator over two, nested
+/// at most `depth` deep. Each of these on two numbers is fixed by IEEE-754
+/// arithmetic (and ToInt32/ToUint32 for the bitwise forms) and runs no code,
+/// so the compiler loads the result instead of computing it at every
+/// evaluation: `-1` was `LoadInt 1; Neg`, `4096 * 4` two loads and a `Mul`
+/// in the loop test that read it. `%` and `**` are left to the runtime, and
+/// any other operand (a string, a name) is not a constant number.
+pub(crate) fn const_number(e: &Expr, depth: u8) -> Option<f64> {
+    match e {
+        Expr::Num(n) => Some(*n),
+        _ if depth == 0 => None,
+        Expr::Unary { op, arg } => {
+            let v = const_number(arg, depth - 1)?;
+            match op {
+                UnaryOp::Minus => Some(-v),
+                UnaryOp::Plus => Some(v),
+                UnaryOp::BitNot => Some(f64::from(!crate::vm::helpers_num2::to_int32(v))),
+                _ => None,
+            }
+        }
+        Expr::Binary { op, left, right } => const_binary(*op, left, right, depth),
+        _ => None,
+    }
+}
+
+/// [`const_number`] of `left <op> right`.
+pub(crate) fn const_binary(op: BinaryOp, left: &Expr, right: &Expr, depth: u8) -> Option<f64> {
+    use crate::vm::helpers_num2::{to_int32, to_uint32};
+    if depth == 0
+        || !matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::UShr
+        )
+    {
+        return None;
+    }
+    let a = const_number(left, depth - 1)?;
+    let b = const_number(right, depth - 1)?;
+    let shift = to_uint32(b) & 31;
+    Some(match op {
+        BinaryOp::Add => a + b,
+        BinaryOp::Sub => a - b,
+        BinaryOp::Mul => a * b,
+        BinaryOp::Div => a / b,
+        BinaryOp::BitAnd => f64::from(to_int32(a) & to_int32(b)),
+        BinaryOp::BitOr => f64::from(to_int32(a) | to_int32(b)),
+        BinaryOp::BitXor => f64::from(to_int32(a) ^ to_int32(b)),
+        BinaryOp::Shl => f64::from(to_int32(a).wrapping_shl(shift)),
+        BinaryOp::Shr => f64::from(to_int32(a) >> shift),
+        _ => f64::from(to_uint32(a) >> shift),
+    })
+}
+
 pub(crate) fn is_numeric_expr(e: &Expr) -> bool {
     use crate::parse::ast::Expr as E;
     match e {

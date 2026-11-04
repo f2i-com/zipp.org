@@ -2226,6 +2226,19 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// [`Self::load_number`] for a folded constant, which unlike a literal
+    /// can be `-0` (`-0`, `0 * -1`): that one is a double constant, since an
+    /// int load would drop its sign.
+    fn load_folded_number(&mut self, dst: Reg, n: f64) -> Reg {
+        if n == 0.0 && n.is_sign_negative() {
+            let idx = self.add_const(Value::num(n));
+            self.emit(Instr::LoadConst { dst, idx });
+        } else {
+            self.load_number(dst, n);
+        }
+        dst
+    }
+
     /// Compile the OPERAND of a `typeof`, without the `TypeOf` itself.
     ///
     /// `typeof <unbound identifier>` must yield "undefined", NOT throw a
@@ -2401,6 +2414,12 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
     ) -> R<Reg> {
         use ast::BinaryOp as Op;
+        // `4096 * 4`, `1 << 20`: a numeric constant expression loads its value.
+        if const_fold_enabled() {
+            if let Some(v) = const_binary(op, left, right, CONST_FOLD_DEPTH) {
+                return Ok(self.load_folded_number(dst, v));
+            }
+        }
         // `typeof a === typeof b` (and every equality polarity) compares two
         // members of the same fixed eight-name domain. Evaluate both operands
         // in source order, then classify them in one total opcode. This is
@@ -2746,6 +2765,17 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn unary(&mut self, op: ast::UnaryOp, arg: &ast::Expr, dst: Reg) -> R<Reg> {
         use ast::UnaryOp as Op;
+        // `-1`, `~0`: a numeric constant loads its value.
+        if matches!(op, Op::Minus | Op::Plus | Op::BitNot) && const_fold_enabled() {
+            if let Some(v) = const_number(arg, CONST_FOLD_DEPTH) {
+                let v = match op {
+                    Op::Minus => -v,
+                    Op::Plus => v,
+                    _ => f64::from(!crate::vm::helpers_num2::to_int32(v)),
+                };
+                return Ok(self.load_folded_number(dst, v));
+            }
+        }
         match op {
             Op::Minus => {
                 let a = self.expr(arg)?;
