@@ -67,6 +67,17 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// Kill switch for in-place Int stores into a pinned dense all-Int Array
+    /// on the INTEGER tiers (`arr[i] = v` with an Int element and an i32 value).
+    fn int_arr_store_enabled() = "ZIPP_NO_INT_ARR_STORE"
+}
+
+/// [`int_arr_store_enabled`] for the region planner (`plan_region`).
+pub(crate) fn int_arr_store_on() -> bool {
+    int_arr_store_enabled()
+}
+
+env_off_switch! {
     /// Kill switch for the narrow fixed-width integer TypedArray read widening.
     /// Int32 (the pre-existing path) remains enabled when the switch is set, so an
     /// off run is an exact semantic fallback rather than a JIT-wide disable.
@@ -668,9 +679,10 @@ pub(crate) fn int_unadmitted_ips(
         })
     };
     // A dense Array observed all-Int (kind 252): `arr[i]` loads the element and
-    // unboxes it into an i64 home under a per-access tag guard. READS only —
-    // a store would have to re-box and can grow/realloc the Vec, so `SetIndex`
-    // still falls to the memory path (see the catch-all below).
+    // unboxes it into an i64 home under a per-access tag guard. A store is
+    // admitted only in bounds over an Int element with an i32 value (the
+    // emitter's guards; anything else deopts AT the op), so it never grows or
+    // reallocates the Vec and re-boxes by a tag.
     let pinned_int_arr = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| {
             ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
@@ -718,9 +730,10 @@ pub(crate) fn int_unadmitted_ips(
             // Int32 write are admissible; all other index ops decline to MEM.
             Instr::GetIndex { .. } if pinned_int_read(s + off) => {}
             Instr::SetIndex { .. } if pinned_i32_write(s + off) => {}
-            // Dense all-Int Array READ (see `pinned_int_arr`); the write is not
-            // admitted and falls through to the catch-all.
+            // Dense all-Int Array read, and (behind `int_arr_store_enabled`)
+            // its guarded in-place Int store; see `pinned_int_arr`.
             Instr::GetIndex { .. } if pinned_int_arr(s + off) => {}
+            Instr::SetIndex { .. } if pinned_int_arr(s + off) && int_arr_store_enabled() => {}
             // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
@@ -2178,8 +2191,37 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; cmp rcx, [rsp + off + 16]
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
-                    ; movq rax, Rx(vx)                   // value i64 home
-                    ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
+                );
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                    // Dense all-Int Array (`int_arr_store_enabled`): an in-bounds
+                    // store over an Int element is the own writable data
+                    // property's [[Set]] (the pin declined any array with an
+                    // arr_props overlay: frozen, sealed, redefined indices). A
+                    // hole, double or heap element, and a value outside i32
+                    // (which would store a double), deopt AT this ip. An Int
+                    // is no heap pointer: no write barrier.
+                    dynasm!(ops
+                        ; mov rax, [rdx + rcx * 8]       // the element it replaces
+                        ; shr rax, 48
+                        ; cmp eax, INT_TAG_HI as i32
+                        ; jne => deopt
+                        ; lea rdx, [rdx + rcx * 8]
+                        ; movq rax, Rx(vx)               // value i64 home
+                        ; movsxd rcx, eax
+                        ; cmp rcx, rax
+                        ; jne => deopt                   // outside i32
+                        ; mov ecx, eax
+                        ; mov rax, QWORD ((INT_TAG_HI as u64) << 48) as i64
+                        ; or rax, rcx
+                        ; mov [rdx], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; movq rax, Rx(vx)               // value i64 home
+                        ; mov DWORD [rdx + rcx * 4], eax // store low 32 (== ToInt32(v))
+                    );
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => deopt
                     ; mov DWORD [rsi], rip_at

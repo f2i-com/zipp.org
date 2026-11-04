@@ -1075,6 +1075,13 @@ fn plan_region_cold_inner(
                     if (!admit_bitwise && k == 8) || (admit_bitwise && k == 5) {
                         return true;
                     }
+                    // A dense all-Int Array's in-place Int store on the int path
+                    // (`region_int`'s guarded arm: in bounds, over an Int, an i32
+                    // value, else a deopt AT the op), so it never grows the Vec or
+                    // allocates and the staleness argument below still holds.
+                    if admit_bitwise && k == ARR_INT_PIN_KIND && crate::codegen::region_int::int_arr_store_on() {
+                        return true;
+                    }
                 }
                 _ => {}
             }

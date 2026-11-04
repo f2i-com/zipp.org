@@ -3724,13 +3724,39 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
                 );
-                emit_src64(&mut ops, src(val), 0); // rax = value (low 32 used;
-                                                   // a lazy home's low 32 is right)
-                dynasm!(ops
-                    ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
-                    ; jmp => done
-                    ; => deopt
-                );
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                    // Dense all-Int Array: as the xmm arm. The element it replaces
+                    // must be an Int (a hole, double or heap value deopts), and the
+                    // value an i32 (the canonical i64 form is compared with its
+                    // sign-extended low half), then the boxed Int is stored.
+                    dynasm!(ops
+                        ; mov rax, [rdx + rcx * 8]
+                        ; shr rax, 48
+                        ; cmp eax, INT_TAG_HI as i32
+                        ; jne => deopt
+                        ; lea rdx, [rdx + rcx * 8]
+                    );
+                    emit_src64_canon(&mut ops, src(val), 0, &lazy); // rax = canonical value
+                    dynasm!(ops
+                        ; movsxd rcx, eax
+                        ; cmp rcx, rax
+                        ; jne => deopt                   // outside i32
+                        ; mov ecx, eax
+                        ; mov rax, QWORD ((INT_TAG_HI as u64) << 48) as i64
+                        ; or rax, rcx
+                        ; mov [rdx], rax
+                        ; jmp => done
+                        ; => deopt
+                    );
+                } else {
+                    emit_src64(&mut ops, src(val), 0); // rax = value (low 32 used;
+                                                       // a lazy home's low 32 is right)
+                    dynasm!(ops
+                        ; mov DWORD [rdx + rcx * 4], eax // store low 32 (== ToInt32(v))
+                        ; jmp => done
+                        ; => deopt
+                    );
+                }
                 emit_store_ip(&mut ops, ip_slot, rip_at);
                 dynasm!(ops
                     ; jmp => flush_exit
