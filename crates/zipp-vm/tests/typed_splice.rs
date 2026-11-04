@@ -321,13 +321,11 @@ fn tl_parity_wide_imm_chain_fold() {
     ));
 }
 
-/// The literal spelling of the same wide fold, kept as a CONTROL: `-2` is
-/// `Neg`, which is outside the lane's closed op set, so this body declines
-/// (the census below pins the reason) and the generic splice must produce
-/// the identical `4294967294 ± x`. It is the reason `wide_imm_matrix` builds
-/// its negative constants as `z - N`: written the obvious way, the operand
-/// shapes under test never reach the lane at all — and a matrix that quietly
-/// stopped laning would go green while testing nothing.
+/// The literal spelling of the same wide fold. `-2` was `Neg`, outside the
+/// lane's closed op set, so this body declined, and `wide_imm_matrix` builds
+/// its negative constants as `z - N` for that reason. Constant folding now
+/// emits `-2` as the literal itself, so the body takes the lane (the census
+/// below pins that) and must produce the identical `4294967294 ± x`.
 #[test]
 fn tl_parity_ushr_neg_literal_control() {
     let src = r#""use strict";
@@ -395,13 +393,9 @@ fn typed_lane_jitlog_census() {
             "tl_parity_zero_arg_activation",
             "typed-lane=DECLINED(param-not-passed)",
         ),
-        // Unary minus is `Neg` — outside the closed set, so a `-N` literal
-        // costs the lane. This is what forces the wide-immediate matrix to
-        // spell its negative constants `z - N`.
-        (
-            "tl_parity_ushr_neg_literal_control",
-            "typed-lane=DECLINED(op-outside-lane-set)",
-        ),
+        // A `-N` literal is folded to the constant, so it no longer costs the
+        // lane (unary minus on a variable is still `Neg`, outside the set).
+        ("tl_parity_ushr_neg_literal_control", "TYPED-LANE (ops="),
     ] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg(filter)
