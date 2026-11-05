@@ -2150,8 +2150,13 @@ mod tests {
             assert_eq!(vm.lite.ok[fb as usize], LITE_SMALL, "fib runs in the small copy");
             assert_eq!(vm.lite.ok[fid("readP") as usize], LITE_FULL, "a property read needs the full copy");
             // Its caller's loop holds a `typeof`, so the main program runs in
-            // the main loop and every call of `tiny` is a short entry.
-            assert!(!vm.lite_eligible(fid("tiny")), "tiny's short entries from the main program spent its budget");
+            // the main loop, which runs `tiny` as a frameless leaf
+            // (`leaf_call`): no call of it enters the lite loop, so none
+            // spends its hand-over budget.
+            let tiny = fid("tiny");
+            assert_eq!(vm.lite.leaf.get(tiny as usize), Some(&LEAF_ANY), "tiny runs as a frameless leaf");
+            assert!(vm.lite_eligible(tiny), "tiny's leaf runs spent none of its hand-overs");
+            assert_eq!(vm.lite.budget[tiny as usize], LITE_HANDOVER_BUDGET);
             assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
             // Eligible by its instructions, so only the budget sent it back.
             let p = &program.functions[out as usize];
