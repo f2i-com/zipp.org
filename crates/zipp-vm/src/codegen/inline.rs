@@ -2390,6 +2390,20 @@ pub(crate) enum LaneOp32 {
     I(i32),
 }
 
+/// A 64-bit operand of a lane op: a GPR home's exact integer or an
+/// immediate.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LaneOp64 {
+    R(u8),
+    I(i64),
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LANE_MOD=1`: a typed lane declines `%` again
+    /// (`op-outside-lane-set`), for an A/B.
+    fn lane_mod_enabled() = "ZIPP_NO_LANE_MOD"
+}
+
 /// One scheduled lane instruction. Emission is a dumb match — every decision
 /// (types, homes, folds, in-place forms) was made by `build_typed_lane`.
 pub(crate) enum LaneStep {
@@ -2492,6 +2506,16 @@ pub(crate) enum LaneStep {
         d: u8,
         a: LaneOp32,
         b: LaneOp32,
+    },
+    /// `a % b` of two exact integers: `idiv`'s remainder (the dividend's
+    /// sign, as JS has it). Falls back on a zero divisor (`zero_check`: NaN)
+    /// and on a zero remainder of a negative dividend (`neg0_check`: -0).
+    Mod64 {
+        d: u8,
+        a: LaneOp64,
+        b: LaneOp64,
+        zero_check: bool,
+        neg0_check: bool,
     },
     /// `movsxd Rq(d), low32(s)` — the `|0` wrap of a wide exact integer.
     SignExt {
@@ -3983,6 +4007,52 @@ fn build_lane_inner(
                 };
                 b.bind_int(dst, d, iv);
             }
+            // JS `%` of two exact integers is the truncated remainder with the
+            // dividend's sign: `idiv`. A zero divisor (NaN) and a zero
+            // remainder of a negative dividend (-0) are doubles the lane does
+            // not hold, so those fall back, each checked only where the
+            // operand ranges allow it. `((seed >>> 0) % n) | 0` in a PRNG
+            // helper took the generic boxed emitter for this one op.
+            Instr::Mod { dst, a, b: rb } if lane_mod_enabled() => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                let int_of = |av: Av| match av {
+                    Av::Int { h, lo, hi } => Some((LaneOp64::R(h), lo, hi)),
+                    Av::ImmI(v) => Some((LaneOp64::I(v), v, v)),
+                    _ => None,
+                };
+                let (Some((oa, alo, ahi)), Some((ob, blo, bhi))) = (int_of(b.slots[sa]), int_of(b.slots[sb])) else {
+                    return Err("mod-non-int");
+                };
+                if let (LaneOp64::I(va), LaneOp64::I(vb)) = (oa, ob) {
+                    if vb == 0 || (va < 0 && va % vb == 0) {
+                        return Err("mod-const-not-int");
+                    }
+                    let sid = b.push_slot(Av::ImmI(va % vb));
+                    b.binds.insert(dst, sid);
+                    continue;
+                }
+                // |a % b| < |b| and |a % b| <= |a|, with a's sign (or zero).
+                let m = blo.unsigned_abs().max(bhi.unsigned_abs()).saturating_sub(1).min(i64::MAX as u64) as i64;
+                let iv = if alo >= 0 {
+                    (0, ahi.min(m))
+                } else if ahi <= 0 {
+                    (alo.max(-m), 0)
+                } else {
+                    (alo.max(-m), ahi.min(m))
+                };
+                b.binds.remove(&dst);
+                let prefer = b.dying_homes(i, &[sa, sb], true);
+                let d = b.alloc_gpr(i + 1, &prefer, None)?;
+                b.steps.push(LaneStep::Mod64 {
+                    d,
+                    a: oa,
+                    b: ob,
+                    zero_check: blo <= 0 && bhi >= 0,
+                    neg0_check: alo < 0,
+                });
+                b.bind_int(dst, d, iv);
+            }
             Instr::MathOp {
                 dst,
                 op: MathFn::Imul,
@@ -4444,6 +4514,49 @@ fn emit_typed_lane(
                     LaneOp32::I(v) => dynasm!(ops ; mov ecx, v ; imul eax, ecx),
                 }
                 dynasm!(ops ; movsxd Rq(d), eax);
+            }
+            LaneStep::Mod64 {
+                d,
+                a,
+                b,
+                zero_check,
+                neg0_check,
+            } => {
+                // `idiv` writes rdx, a value home: park it in xmm0 (operand
+                // scratch, free between steps) across the divide. Exact lane
+                // integers are within 2^53, so the i64 divide cannot fault.
+                match b {
+                    LaneOp64::R(r) => dynasm!(ops ; mov rcx, Rq(r)),
+                    LaneOp64::I(v) => dynasm!(ops ; mov rcx, QWORD v),
+                }
+                if zero_check {
+                    dynasm!(ops ; test rcx, rcx ; jz => fallback);
+                }
+                match a {
+                    LaneOp64::R(r) => dynasm!(ops ; mov rax, Rq(r)),
+                    LaneOp64::I(v) => dynasm!(ops ; mov rax, QWORD v),
+                }
+                dynasm!(ops
+                    ; movq xmm0, rdx
+                    ; cqo
+                    ; idiv rcx
+                    ; mov rcx, rdx
+                    ; movq rdx, xmm0
+                );
+                if neg0_check {
+                    let ok = ops.new_dynamic_label();
+                    dynasm!(ops ; test rcx, rcx ; jnz => ok);
+                    match a {
+                        LaneOp64::R(r) => dynasm!(ops ; test Rq(r), Rq(r) ; js => fallback),
+                        LaneOp64::I(v) => {
+                            if v < 0 {
+                                dynasm!(ops ; jmp => fallback);
+                            }
+                        }
+                    }
+                    dynasm!(ops ; => ok);
+                }
+                dynasm!(ops ; mov Rq(d), rcx);
             }
             LaneStep::SignExt { d, s } => {
                 dynasm!(ops ; movsxd Rq(d), Rd(s));
