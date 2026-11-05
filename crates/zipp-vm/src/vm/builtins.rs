@@ -243,6 +243,13 @@ pub(super) fn bind_fast_enabled() -> bool {
     }
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_SPREAD_FRAME=1`: a spread call to a plain function runs it in
+    /// a nested run loop again (`Vm::spread_call_frame`), for an A/B.
+    #[inline]
+    fn spread_frame_enabled() = "ZIPP_NO_SPREAD_FRAME"
+}
+
 /// `ZIPP_NO_APPLY_FAST=1` sends `f.apply(t, list)` back through the general
 /// method call (`Vm::fn_apply_plain_target`), for an A/B on one binary.
 #[inline]
@@ -720,6 +727,32 @@ impl<'p> Vm<'p> {
         args.clear();
         self.apply_scratch = args;
         r
+    }
+
+    /// `f(...list)` / `o.m(...list)` (`CallSpread`, `CallWithThisSpread`)
+    /// entered as `f`'s frame on this loop, as `f.apply(t, list)` enters
+    /// (`setup_apply_frame`), when `f` is a plain function of this realm:
+    /// false for anything else, which takes `call_value`. A spread call ran
+    /// its callee in a nested run loop, so a function recursing through
+    /// `f(...rest)` nested one per level: 380 ns a call, eight times node.
+    pub(crate) fn spread_call_frame(
+        &mut self,
+        callee: Value,
+        this_v: Value,
+        list: Value,
+        dst: u16,
+        caller_ip_next: usize,
+    ) -> Result<bool, Thrown> {
+        if !spread_frame_enabled() {
+            return Ok(false);
+        }
+        let Some((fid, closure)) = self.plain_fn_entry(callee) else {
+            return Ok(false);
+        };
+        if !self.realm_global_objs.is_empty() && self.get_function_realm(callee) != 0 {
+            return Ok(false);
+        }
+        self.setup_apply_frame(fid, closure, this_v, list, dst, caller_ip_next, callee)
     }
 
     /// `Array.prototype.values.call(arr)` (`arr[Symbol.iterator].call(arr)`,

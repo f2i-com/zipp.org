@@ -4013,6 +4013,9 @@ impl<'p> Vm<'p> {
             Instr::CallSpread { dst, callee, args } => {
                 let callee_v = self.get(base, callee);
                 let args_v = self.get(base, args);
+                if self.spread_call_frame(callee_v, Value::UNDEFINED, args_v, dst, ip + 1)? {
+                    return Ok(ColdFlow::Frame);
+                }
                 let arg_vec = self.array_snapshot(args_v.heap_index());
                 let result = self.call_value(callee_v, Value::UNDEFINED, &arg_vec)?;
                 self.set(base, dst, result);
@@ -4027,6 +4030,9 @@ impl<'p> Vm<'p> {
                 let callee_v = self.get(base, callee);
                 let this_v = self.get(base, this_v);
                 let args_v = self.get(base, args);
+                if self.spread_call_frame(callee_v, this_v, args_v, dst, ip + 1)? {
+                    return Ok(ColdFlow::Frame);
+                }
                 let arg_vec = self.array_snapshot(args_v.heap_index());
                 let result = self.call_value(callee_v, this_v, &arg_vec)?;
                 self.set(base, dst, result);
