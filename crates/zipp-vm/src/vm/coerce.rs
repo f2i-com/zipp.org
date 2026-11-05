@@ -2738,6 +2738,11 @@ impl<'p> Vm<'p> {
     /// position args (`charAt`/`charCodeAt`/`at`/…), which use ToInteger, not a
     /// plain number cast (so `"42".charAt(true)` is index 1, `"1"` is 1, etc).
     pub(crate) fn to_integer_or_zero(&mut self, v: Value) -> Result<i64, Thrown> {
+        // An Int is its own integer: no ToNumber, and no `trunc` (a libm call
+        // on the baseline x86-64 target, which has no `roundsd`).
+        if v.is_int() {
+            return Ok(i64::from(v.as_int()));
+        }
         let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Ok(0);

@@ -904,24 +904,40 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let HeapObj::Object(ap) = self.heap.get(self.arr_proto) else {
+        let (HeapObj::Object(ap), HeapObj::Object(ctor)) =
+            (self.heap.get(self.arr_proto), self.heap.get(self.array_ctor))
+        else {
             return false;
         };
-        let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
-            !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
-        });
-        if !constructor_ok {
-            return false;
+        let (ap_ver, ctor_ver) = (self.heap.version_of(self.arr_proto), self.heap.version_of(self.array_ctor));
+        let (mv, ms, cv, cs, getter) = self.species_memo.get();
+        if mv == ap_ver && cv == ctor_ver {
+            // The slots are where the last full check found them; their
+            // values and kinds are read again (an in-place write bumps no
+            // version), and the getter is still the SPECIES_GET native.
+            let (ms, cs) = (ms as usize, cs as usize);
+            let g = Value::from_bits(getter);
+            return ap.val_get_ref(ms).is_some_and(|v| *v == Value::heap(self.array_ctor))
+                && !ap.is_accessor_at(ms)
+                && ctor.val_get_ref(cs).is_some_and(|v| v.bits() == getter)
+                && ctor.is_accessor_at(cs)
+                && matches!(self.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET);
         }
-        let HeapObj::Object(ctor) = self.heap.get(self.array_ctor) else {
+        let Some(ms) = ap.pos("constructor").filter(|&slot| {
+            !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
+        }) else {
             return false;
         };
-        ctor.pos("@@species").is_some_and(|slot| {
+        let Some(cs) = ctor.pos("@@species").filter(|&slot| {
             let getter = ctor.val_at(slot);
             ctor.attr_at(slot).accessor
                 && getter.is_heap()
                 && matches!(self.heap.get(getter.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
-        })
+        }) else {
+            return false;
+        };
+        self.species_memo.set((ap_ver, ms as u32, ctor_ver, cs as u32, ctor.val_at(cs).bits()));
+        true
     }
 
     /// Append one concat element at the running index `n`: define it on the

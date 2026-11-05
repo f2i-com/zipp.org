@@ -3281,6 +3281,12 @@ pub struct Vm<'p> {
     /// `finalize_shapes`' direct-mapped front (`Vm::finalize_shape`):
     /// (function, plan, shape), `(u32::MAX, u16::MAX, _)` empty.
     finalize_memo: [(u32, u16, u32); natives::FINALIZE_MEMO_SLOTS],
+    /// `Vm::array_species_is_default`'s memo of where its two by-name reads
+    /// landed: (%Array.prototype% version, its `constructor` slot, %Array%
+    /// version, its @@species slot, the default getter's bits); a version of
+    /// `u32::MAX` is empty. A version guards a slot's position, never its
+    /// value: the values are re-read on every hit.
+    species_memo: core::cell::Cell<(u32, u32, u32, u32, u64)>,
     /// The shape two data appends of `value` and `done` reach, the layout of
     /// an iterator result object, made at the first result (`Vm::iter_result`).
     iter_result_shape: Option<u32>,
