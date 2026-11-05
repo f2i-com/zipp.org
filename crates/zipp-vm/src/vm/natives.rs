@@ -1576,12 +1576,19 @@ impl<'p> Vm<'p> {
     ///
     /// Write the link EXPLICITLY when a child realm's code is what created the
     /// object. `realm_global_objs` is empty until `$262.createRealm()` is called,
-    /// so this is one `is_empty` branch for every ordinary program.
-    #[inline]
+    /// so this is one `is_empty` branch for every ordinary program — inline
+    /// always: as a call it was 3% of a loop of object literals.
+    #[inline(always)]
     pub(crate) fn realm_born(&mut self, idx: u32, main_proto: u32) {
-        if self.realm_global_objs.is_empty() {
-            return;
+        if !self.realm_global_objs.is_empty() {
+            self.realm_born_child(idx, main_proto);
         }
+    }
+
+    /// [`Self::realm_born`] once a child realm exists.
+    #[cold]
+    #[inline(never)]
+    fn realm_born_child(&mut self, idx: u32, main_proto: u32) {
         let r = match self.current_realm_id() {
             Some(r) => r,
             None => return,
