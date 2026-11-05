@@ -3305,7 +3305,7 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // user code can shadow, and every user-code helper re-snapshots —
             // so region-pass granularity is exact. A shadow zeroes the
             // snapshot; the identity guard then misses to the generic route.
-            if !vm.string_method_is_intrinsic("charCodeAt") {
+            if !vm.char_code_at_is_intrinsic() {
                 return None;
             }
             return match vm.heap.get(idx) {
@@ -3999,7 +3999,7 @@ pub(crate) extern "win64" fn jit_char_code_at(
     // no conflicting borrow.
     let vm = unsafe { &mut *(vm as *mut Vm) };
     // B191: serve only the boot intrinsic (see `string_method_is_intrinsic`).
-    if !vm.string_method_is_intrinsic("charCodeAt") {
+    if !vm.char_code_at_is_intrinsic() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.heap.get(sv.heap_index()) {
@@ -4060,7 +4060,7 @@ pub(crate) extern "win64" fn jit_span_code_unit_pred(
     let vm = unsafe { &mut *(vm as *mut Vm) };
     // B191: the fused predicate embodies `source.charCodeAt(...)` — serve only
     // while that is still the boot intrinsic.
-    if !vm.string_method_is_intrinsic("charCodeAt") {
+    if !vm.char_code_at_is_intrinsic() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let vm = &*vm;
