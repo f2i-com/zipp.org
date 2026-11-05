@@ -963,6 +963,10 @@ pub(crate) mod captured_op {
     pub(crate) const SUBSTRING: u32 = 6;
     pub(crate) const SLICE: u32 = 7;
     pub(crate) const CALL: u32 = 8;
+    /// A String / Array method of `jit_str_method`'s lanes: the selector
+    /// carries the String slot in bits 16-23 and the Array slot in 24-31
+    /// (0xff for a kind the name is not served for).
+    pub(crate) const LANE: u32 = 9;
 
     /// The selector for a `recv.name(args)` site of this arity, if any. (A
     /// zero-argument call such as `m.clear()` is always fused: it has no
@@ -978,7 +982,14 @@ pub(crate) mod captured_op {
             ("substring", 1 | 2) => SUBSTRING,
             ("slice", 1 | 2) => SLICE,
             ("call", 2) => CALL,
-            _ => return None,
+            _ => {
+                let s = super::str_lane_memo(name, argc);
+                let a = super::arr_lane_memo(name, argc);
+                if s.is_none() && a.is_none() {
+                    return None;
+                }
+                LANE | (u32::from(s.unwrap_or(0xff)) << 16) | (u32::from(a.unwrap_or(0xff)) << 24)
+            }
         })
     }
 }
@@ -1019,7 +1030,7 @@ pub(crate) extern "win64" fn jit_captured_method(
 ) -> u64 {
     use crate::codegen::SELF_CALL_DEOPT;
     let op = packed & 0xFF;
-    let argc = (packed >> 8) as usize;
+    let argc = ((packed >> 8) & 0xFF) as usize;
     let recv = Value::from_bits(recv_bits);
     if vm.is_null() || args.is_null() || !recv.is_heap() {
         return SELF_CALL_DEOPT;
@@ -1036,6 +1047,8 @@ pub(crate) extern "win64" fn jit_captured_method(
         IndexOf,
         Substring(u64),
         HasOwnCall,
+        /// `jit_str_method`'s String (`false`) or Array (`true`) half, by slot.
+        Builtin(bool, u8),
     }
     let lane = {
         // SAFETY: generated code passes its exclusive live VM pointer.
@@ -1102,6 +1115,37 @@ pub(crate) extern "win64" fn jit_captured_method(
                 lane
                 }
             }
+            captured_op::INDEX_OF | captured_op::SLICE if matches!(vm.heap.get(idx), HeapObj::Array(_)) => {
+                let name = if op == captured_op::INDEX_OF { "indexOf" } else { "slice" };
+                let Some(memo) = arr_lane_memo(name, argc as u16) else {
+                    return SELF_CALL_DEOPT;
+                };
+                if vm.proto_intrinsic_bits(name, true) != Some(callee_bits) {
+                    return SELF_CALL_DEOPT;
+                }
+                Lane::Builtin(true, memo)
+            }
+            captured_op::LANE => {
+                // The receiver's kind picks the slot; the captured callee must be
+                // that kind's boot intrinsic of the name, which the half then
+                // proves is what a Get on this receiver resolves to.
+                let is_str = vm.heap.is_str_like(idx);
+                let memo = ((packed >> if is_str { 16 } else { 24 }) & 0xFF) as u8;
+                if is_str && memo == 0xff && (packed >> 24) as u8 == ARR_LANE_AT && argc == 1 && str_at_lane_enabled() {
+                    if vm.proto_intrinsic_bits("at", false) != Some(callee_bits) {
+                        return SELF_CALL_DEOPT;
+                    }
+                    return str_unit_string(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, arg(0), true);
+                }
+                let name = if is_str { str_lane_name(memo) } else { arr_lane_name(memo) };
+                let Some(name) = name else {
+                    return SELF_CALL_DEOPT;
+                };
+                if vm.proto_intrinsic_bits(name, !is_str) != Some(callee_bits) {
+                    return SELF_CALL_DEOPT;
+                }
+                Lane::Builtin(!is_str, memo)
+            }
             captured_op::INDEX_OF | captured_op::SUBSTRING | captured_op::SLICE => {
                 if !matches!(vm.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
                     return SELF_CALL_DEOPT;
@@ -1150,6 +1194,26 @@ pub(crate) extern "win64" fn jit_captured_method(
         Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
         Lane::Substring(mode) => jit_str_substring(vm, recv_bits, args as u64, mode),
         Lane::HasOwnCall => jit_has_own_call(vm, recv_bits, arg(0), arg(1)),
+        Lane::Builtin(is_arr, memo) => {
+            if argc > 4 {
+                return SELF_CALL_DEOPT;
+            }
+            // Copied out before the VM is borrowed: the registers live in the VM.
+            let mut buf = [Value::UNDEFINED; 4];
+            for (k, slot) in buf.iter_mut().enumerate().take(argc) {
+                *slot = Value::from_bits(arg(k));
+            }
+            // SAFETY: as above.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            if !vm.realm_global_objs.is_empty() {
+                return SELF_CALL_DEOPT;
+            }
+            if is_arr {
+                arr_lane_call(vm, recv, memo, &buf[..argc])
+            } else {
+                str_lane_call(vm, recv, memo, &buf[..argc])
+            }
+        }
     }
 }
 
@@ -4053,13 +4117,15 @@ pub(crate) fn str_unit_helper(key: &str) -> Option<usize> {
 /// Left out: the ones whose pattern argument is consulted for a
 /// `Symbol.replace`/`split`/`match`/`search`/`matchAll` method even when it is
 /// a primitive string (user code a deopt could repeat), and the ones that
-/// have their own helpers (charCodeAt, charAt, indexOf, at).
+/// have their own helpers (charCodeAt, charAt, one-argument indexOf, at).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn str_lane_memo(key: &str, argc: u16) -> Option<u8> {
     if !str_method_lane_enabled() || argc > 4 {
         return None;
     }
     Some(match key {
+        // The one-argument form has `jit_str_index_of`.
+        "indexOf" if argc != 1 => 2,
         "slice" => 3,
         "substring" => 4,
         "trim" => 6,
@@ -4082,10 +4148,67 @@ pub(crate) fn str_lane_memo(key: &str, argc: u16) -> Option<u8> {
     })
 }
 
+/// The Array.prototype methods [`jit_str_method`] also serves, by their
+/// array-memo slot (`builtins::arr_memo_id`): the ones that run no user code
+/// on a plain array with plain arguments and change nothing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn arr_lane_memo(key: &str, argc: u16) -> Option<u8> {
+    if !arr_method_lane_enabled() || argc > 4 {
+        return None;
+    }
+    Some(match (key, argc) {
+        ("indexOf" | "includes" | "lastIndexOf", 1 | 2) => match key {
+            "indexOf" => 3,
+            "includes" => 4,
+            _ => 20,
+        },
+        ("slice", 0..=2) => 5,
+        ("concat", _) => 7,
+        ("at", 1) => 27,
+        _ => return None,
+    })
+}
+
+/// [`arr_lane_memo`]'s names by slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn arr_lane_name(memo: u8) -> Option<&'static str> {
+    Some(match memo {
+        3 => "indexOf",
+        4 => "includes",
+        5 => "slice",
+        7 => "concat",
+        20 => "lastIndexOf",
+        27 => "at",
+        _ => return None,
+    })
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_ARR_METHOD_LANE=1`: compiled Array method calls take the
+    /// general method route again (`jit_str_method`'s array half).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn arr_method_lane_enabled() = "ZIPP_NO_ARR_METHOD_LANE"
+}
+
+/// The `packed` word of a compiled call to [`jit_str_method`] for method
+/// `key` with `argc` arguments: the String slot (bits 0-7), the argument
+/// count (8-15) and the Array slot (16-23), 0xff for a kind it does not
+/// serve. `None` when it serves neither.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn builtin_lane_packed(key: &str, argc: u16) -> Option<u32> {
+    let s = str_lane_memo(key, argc);
+    let a = arr_lane_memo(key, argc);
+    if s.is_none() && a.is_none() {
+        return None;
+    }
+    Some(u32::from(s.unwrap_or(0xff)) | (u32::from(argc) << 8) | (u32::from(a.unwrap_or(0xff)) << 16))
+}
+
 /// [`str_lane_memo`]'s names by slot.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn str_lane_name(memo: u8) -> Option<&'static str> {
     Some(match memo {
+        2 => "indexOf",
         3 => "slice",
         4 => "substring",
         6 => "trim",
@@ -4135,9 +4258,7 @@ pub(crate) extern "win64" fn jit_str_method(
 ) -> u64 {
     let memo = (packed & 0xff) as u8;
     let argc = ((packed >> 8) & 0xff) as usize;
-    let Some(name) = str_lane_name(memo) else {
-        return crate::codegen::SELF_CALL_DEOPT;
-    };
+    let arr_memo = ((packed >> 16) & 0xff) as u8;
     if argc > 4 {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -4150,10 +4271,30 @@ pub(crate) extern "win64" fn jit_str_method(
     let recv = Value::from_bits(recv_bits);
     // SAFETY: the running region holds no conflicting borrow.
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    if !recv.is_heap() || !vm.heap.is_str_like(recv.heap_index()) || !vm.realm_global_objs.is_empty() {
+    if !recv.is_heap() || !vm.realm_global_objs.is_empty() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let args = &buf[..argc];
+    if !vm.heap.is_str_like(recv.heap_index()) {
+        return arr_lane_call(vm, recv, arr_memo, &buf[..argc]);
+    }
+    if memo == 0xff && arr_memo == ARR_LANE_AT && str_at_lane_enabled() {
+        // A string's `at` (the String lane leaves it to `jit_str_at`): served
+        // here so a site that also sees arrays makes one call, not two.
+        return str_unit_string(vm as *mut Vm as *mut core::ffi::c_void, recv_bits, buf[0].bits(), true);
+    }
+    str_lane_call(vm, recv, memo, &buf[..argc])
+}
+
+/// [`arr_lane_memo`]'s slot for `at`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const ARR_LANE_AT: u8 = 27;
+
+/// [`jit_str_method`]'s String half, for a string receiver.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn str_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 {
+    let Some(name) = str_lane_name(memo) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
     if args.iter().any(|a| a.is_heap() && !vm.heap.is_str_like(a.heap_index())) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -4161,6 +4302,48 @@ pub(crate) extern "win64" fn jit_str_method(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.string_method(recv.heap_index(), name, args) {
+        Ok(Some(v)) => v.bits(),
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// [`jit_str_method`]'s Array half: `array_method` called directly for a
+/// plain array (no own named property, %Array.prototype% its prototype, no
+/// indexed property on the prototypes for a hole to read through, the
+/// default species for `slice`/`concat`) when the method is still the boot
+/// intrinsic and no argument can run user code: a search element of any kind
+/// (compared, never coerced), a number or `undefined` for every position,
+/// and for `concat` primitives or plain arrays.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn arr_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 {
+    let Some(name) = arr_lane_name(memo) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let idx = recv.heap_index();
+    if !matches!(vm.heap.get(idx), HeapObj::Array(_))
+        || vm.array_proto_has_index
+        || vm.proto_of.contains_key(&idx)
+        || vm.arr_props.contains_key(&idx)
+        || vm.arguments_objs.contains_key(&idx)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let numeric = |v: &Value| v.is_number() || *v == Value::UNDEFINED;
+    let ok = match name {
+        "indexOf" | "includes" | "lastIndexOf" => args.iter().skip(1).all(numeric),
+        "at" => args.iter().all(numeric),
+        "slice" => args.iter().all(numeric) && vm.array_species_is_default(recv),
+        _ => {
+            vm.array_species_is_default(recv)
+                && args.iter().all(|a| {
+                    !a.is_heap() || vm.heap.is_str_like(a.heap_index()) || vm.array_spreadable_by_default(*a)
+                })
+        }
+    };
+    if !ok || !vm.array_memo_is_intrinsic(memo as usize, name) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.array_method(idx, name, args) {
         Ok(Some(v)) => v.bits(),
         _ => crate::codegen::SELF_CALL_DEOPT,
     }

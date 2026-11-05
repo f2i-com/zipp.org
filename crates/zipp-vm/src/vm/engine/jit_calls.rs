@@ -2045,8 +2045,25 @@ impl<'p> Vm<'p> {
             _ => {
                 let callee = self.get(base, a);
                 let args = self.get(base, b);
-                let argv = self.array_snapshot(args.heap_index());
-                self.call_value(callee, Value::UNDEFINED, &argv)
+                // A short argument list is copied to the stack: the Vec's
+                // malloc/free was a sizeable part of a recursive `f(...xs)`.
+                let mut buf = [Value::UNDEFINED; 8];
+                let small = match self.heap.get(args.heap_index()) {
+                    HeapObj::Array(items) if items.len() <= buf.len() => {
+                        for (slot, &v) in buf.iter_mut().zip(items.iter()) {
+                            *slot = if v.is_hole() { Value::UNDEFINED } else { v };
+                        }
+                        Some(items.len())
+                    }
+                    _ => None,
+                };
+                match small {
+                    Some(n) => self.call_value(callee, Value::UNDEFINED, &buf[..n]),
+                    None => {
+                        let argv = self.array_snapshot(args.heap_index());
+                        self.call_value(callee, Value::UNDEFINED, &argv)
+                    }
+                }
             }
         };
         self.jit_call_depth -= 1;

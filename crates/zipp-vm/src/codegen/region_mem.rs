@@ -3097,17 +3097,22 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; jmp => done ; => general);
                     lane_done = Some(done);
                 }
-                // Any other String method of `jit_str_method`'s set: called
-                // directly, past the whole builtin call chain. Metered regions
-                // keep the helper route (interpreter-parity charging).
-                let str_memo = crate::vm::str_lane_memo(key, argc).filter(|_| lane_done.is_none() && blocks.is_none());
-                if let Some(memo) = str_memo {
+                // A String or Array method of `jit_str_method`'s sets: called
+                // directly, past the whole builtin call chain, as the decline of
+                // any dedicated helper above (an array's `slice`, `indexOf`) and
+                // ahead of the general route. Metered regions keep the helper
+                // route (interpreter-parity charging).
+                // (`at`/`charAt` try their String helper first, below, and
+                // this lane as its decline.)
+                if let Some(packed) = crate::vm::builtin_lane_packed(key, argc)
+                    .filter(|_| blocks.is_none() && crate::vm::str_unit_helper(key).is_none())
+                {
                     let general = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                          // vm
                         ; mov rdx, [rbx + dreg(obj)]            // receiver bits
                         ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
-                        ; mov r9d, (memo as i32) | ((argc as i32) << 8)
+                        ; mov r9d, packed as i32
                         ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -3120,7 +3125,7 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
-                    let done = ops.new_dynamic_label();
+                    let done = lane_done.unwrap_or_else(|| ops.new_dynamic_label());
                     dynasm!(ops ; jmp => done ; => general);
                     lane_done = Some(done);
                 }
@@ -3372,6 +3377,12 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                     let general = ops.new_dynamic_label();
+                    // An array's `at`, which the String helper declines, tries
+                    // `jit_str_method`'s Array half before the general route.
+                    let arr_retry = crate::vm::str_unit_helper(key)
+                        .and(crate::vm::builtin_lane_packed(key, argc))
+                        .filter(|p| (p >> 16) & 0xff != 0xff && blocks.is_none());
+                    let decline = if arr_retry.is_some() { ops.new_dynamic_label() } else { general };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -3380,7 +3391,7 @@ pub(crate) fn compile_region_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => general                       // not the builtin: a user method
+                        ; je => decline                       // not the builtin: a user method
                         ; mov [rbx + dreg(dst)], rax
                     );
                     // `arr.push(x)` GROWS the array's `Vec` (reallocating its
@@ -3398,7 +3409,26 @@ pub(crate) fn compile_region_mem(
                         dynasm!(ops ; => cc_done);
                     }
                     let lane_done = ops.new_dynamic_label();
-                    dynasm!(ops ; jmp => lane_done ; => general);
+                    dynasm!(ops ; jmp => lane_done);
+                    if let Some(packed) = arr_retry {
+                        dynasm!(ops
+                            ; => decline
+                            ; mov rcx, rdi                          // vm
+                            ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
+                            ; mov r9d, packed as i32
+                            ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                            // An array's `at` reads an element: nothing is
+                            // allocated, so no pinned pointer moves.
+                            ; jmp => lane_done
+                        );
+                    }
+                    dynasm!(ops ; => general);
                     emit_region_general_method(
                         &mut ops,
                         ip,

@@ -972,7 +972,7 @@ impl<'p> Vm<'p> {
     }
 
     #[inline(always)]
-    fn array_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
+    pub(crate) fn array_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
         if self.realm_global_objs.is_empty() {
             if let Some((ver, slot, fn_bits)) = self.arr_intrinsic_memo[memo_id] {
                 let proto = self.arr_proto;

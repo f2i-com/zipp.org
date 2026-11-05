@@ -1105,7 +1105,7 @@ impl<'p> Vm<'p> {
     /// %Object.prototype%) where neither prototype holds the flag: the Get
     /// finds `undefined` and IsArray is true, so it is spreadable with
     /// nothing read. Each concat argument walked that chain by name.
-    fn array_spreadable_by_default(&self, v: Value) -> bool {
+    pub(crate) fn array_spreadable_by_default(&self, v: Value) -> bool {
         let idx = v.heap_index();
         if self.arr_proto == 0
             || self.obj_proto == 0

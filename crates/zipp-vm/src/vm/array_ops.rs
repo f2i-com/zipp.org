@@ -893,7 +893,7 @@ impl<'p> Vm<'p> {
     /// `filter`, `splice` and `concat` read both by name and called the
     /// getter: a recursion through `f(...rest.slice(0, 3))` spent a fifth of
     /// its time there.
-    fn array_species_is_default(&self, original: Value) -> bool {
+    pub(crate) fn array_species_is_default(&self, original: Value) -> bool {
         if !original.is_heap() || self.arr_proto == 0 || self.array_ctor == 0 {
             return false;
         }

@@ -7081,6 +7081,11 @@ pub(crate) fn compile_proto_mem(
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
                     let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
+                    // Whatever the String helper declines (an array's `slice`,
+                    // a non-ASCII string) tries `jit_str_method` next.
+                    let retry_packed = crate::vm::builtin_lane_packed(key, argc).filter(|_| meter.is_none());
+                    let retry = ops.new_dynamic_label();
+                    let decline = if retry_packed.is_some() { retry } else { general };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -7090,12 +7095,30 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => general
+                        ; je => decline
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    if let Some(packed) = retry_packed {
+                        let stored = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; jmp => stored
+                            ; => retry
+                            ; mov rcx, rdi                    // vm
+                            ; mov rdx, [rbx + dreg(obj)]      // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]  // &args[0..argc]
+                            ; mov r9d, packed as i32
+                            ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => stored
+                        );
+                    }
                     // The result allocation can move the heap versions Vec.
-                    // This helper cannot run user code or compile nested code,
-                    // so only r13 (not r14) needs re-deriving.
+                    // These helpers cannot run user code or compile nested
+                    // code, so only r13 (not r14) needs re-deriving.
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
@@ -7152,6 +7175,12 @@ pub(crate) fn compile_proto_mem(
                         "charCodeAt" => heap.char_code_at,
                         _ => crate::vm::str_unit_helper(key).expect("matched above"),
                     };
+                    // An array's `indexOf`/`at`, which the String helper
+                    // declines, tries `jit_str_method`'s Array half next.
+                    let arr_retry = crate::vm::builtin_lane_packed(key, argc)
+                        .filter(|p| (p >> 16) & 0xff != 0xff && meter.is_none());
+                    let retry = ops.new_dynamic_label();
+                    let decline = if arr_retry.is_some() { retry } else { general };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -7160,19 +7189,41 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => general
+                        ; je => decline
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    if let Some(packed) = arr_retry {
+                        let ok = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; jmp => ok
+                            ; => retry
+                            ; mov rcx, rdi                    // vm
+                            ; mov rdx, [rbx + dreg(obj)]      // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]  // &args[0..argc]
+                            ; mov r9d, packed as i32
+                            ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops ; => ok);
+                    }
                     lane = true;
-                } else if let Some(memo) = crate::vm::str_lane_memo(key, argc).filter(|_| meter.is_none()) {
-                    // Any other String method of `jit_str_method`'s set, called
-                    // directly past the builtin call chain (metered bodies keep
-                    // the helper route for interpreter-parity charging).
+                } else if let Some(packed) = crate::vm::builtin_lane_packed(key, argc).filter(|_| meter.is_none()) {
+                    // Any other String or Array method of `jit_str_method`'s
+                    // sets, called directly past the builtin call chain
+                    // (metered bodies keep the helper route for
+                    // interpreter-parity charging).
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
                         ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
-                        ; mov r9d, (memo as i32) | ((argc as i32) << 8)
+                        ; mov r9d, packed as i32
                         ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
