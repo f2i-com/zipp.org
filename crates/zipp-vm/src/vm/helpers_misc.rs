@@ -5748,6 +5748,28 @@ fn jit_direct_miss_gate(vm: &mut Vm, site_idx: u32) -> crate::codegen::DirectMis
 
 /// Record a `(site, shape) -> slot` memo entry and its site.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// Remember that `site_idx`'s miss on a receiver of layout `shape` resolved
+/// to an accessor, once the site's ways thrash (a site that does not keeps
+/// its identity accessor ways, which its probe serves without this helper).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_acc_route_note(vm: &mut Vm, site_idx: u32, shape: u32) {
+    if shape != crate::shape::DICT
+        && jit_acc_route_enabled()
+        && vm.jit.ic_thrashing(site_idx)
+        && vm.jit_acc_route.len() < JIT_SHAPE_SLOT_MAX
+    {
+        vm.jit_acc_route.insert((site_idx, shape));
+    }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_ACC_ROUTE=1`: a thrashing accessor site's misses walk the
+    /// receiver every time (no `jit_acc_route` memo).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_acc_route_enabled() = "ZIPP_NO_ACC_ROUTE"
+}
+
 #[inline]
 fn jit_shape_slot_put(vm: &mut Vm, site_idx: u32, shape: u32, slot: u32) {
     if vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX {
@@ -6251,6 +6273,17 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     if !vm.ic_obj_ok(idx) {
         return crate::codegen::PROP_VIA_IC;
     }
+    // A thrashing site already found this receiver layout's key to be an
+    // accessor (`jit_acc_route_note`): the walk below would end in the same
+    // route, after a key scan and a chain probe.
+    if !vm.jit_acc_route.is_empty() {
+        if let HeapObj::Object(map) = vm.heap.get(idx) {
+            let sh = map.shape();
+            if sh != crate::shape::DICT && vm.jit_acc_route.contains(&(site_idx, sh)) {
+                return crate::codegen::PROP_VIA_IC;
+            }
+        }
+    }
     // ── shape memo ──────────────────────────────────────────────────────────
     // Before the key scan: if this site has already resolved this SHAPE, the slot
     // is known. That is the whole cost of a site whose receivers share a layout
@@ -6363,6 +6396,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         vm.jit.set_ic(site_idx, e);
                     }
                 }
+                let sh = map.shape();
+                jit_acc_route_note(vm, site_idx, sh);
                 return crate::codegen::PROP_VIA_IC;
             }
             Some(s) => (map.val_at(s), map.vals_ptr_raw() as u64, s as u32),
@@ -6442,6 +6477,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                             vm.jit.set_ic(site_idx, e);
                                         }
                                     }
+                                    let sh = map.shape();
+                                    jit_acc_route_note(vm, site_idx, sh);
                                     return crate::codegen::PROP_VIA_IC;
                                 }
                                 let v = m2.val_at(i);

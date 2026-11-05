@@ -2199,6 +2199,12 @@ pub struct Vm<'p> {
     /// dropped freely.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// (site, receiver shape) pairs whose property miss resolved to an
+    /// accessor while the site's ways thrashed: the next miss there takes
+    /// `PROP_VIA_IC` straight away. A hint only (that route serves every
+    /// property); bounded like `jit_shape_slot`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_acc_route: rustc_hash::FxHashSet<(u32, u32)>,
     /// The sites `jit_shape_slot` holds an entry for, kept with it (neither
     /// ever drops one): the direct-miss gate's proof set.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
