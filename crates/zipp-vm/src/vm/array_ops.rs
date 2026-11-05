@@ -382,8 +382,23 @@ impl<'p> Vm<'p> {
     where
         F: FnOnce(&mut Self) -> Result<Option<Value>, Thrown>,
     {
-        if self.array_stringify_active.contains(&idx) {
+        if !self.enter_array_stringify(idx)? {
             return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+        }
+        let result = stringify(self);
+        let popped = self.array_stringify_active.pop();
+        debug_assert_eq!(popped, Some(idx));
+        result
+    }
+
+    /// [`Vm::with_array_stringify_guard`]'s entry, out of the generic body:
+    /// `false` when `idx` is already being stringified (its element reads as
+    /// empty), else `idx` pushed onto the active path after the depth and
+    /// allocation checks.
+    #[inline(never)]
+    fn enter_array_stringify(&mut self, idx: u32) -> Result<bool, Thrown> {
+        if self.array_stringify_active.contains(&idx) {
+            return Ok(false);
         }
         #[cfg(feature = "safe-sandbox")]
         let max_depth = self.sandbox_caps.array_stringify_depth;
@@ -398,10 +413,7 @@ impl<'p> Vm<'p> {
             .try_reserve(1)
             .map_err(|_| Thrown::from_static("RangeError: array stringification allocation failed"))?;
         self.array_stringify_active.push(idx);
-        let result = stringify(self);
-        let popped = self.array_stringify_active.pop();
-        debug_assert_eq!(popped, Some(idx));
-        result
+        Ok(true)
     }
 
     /// Admit `additional` more bytes onto a guest-visible join buffer: the

@@ -3814,15 +3814,21 @@ impl<'p> Vm<'p> {
         f: impl FnOnce(&mut Self) -> Result<T, Thrown>,
     ) -> Result<T, Thrown> {
         if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH {
-            return Err(Thrown(
-                "RangeError: Maximum call stack size exceeded".into(),
-            ));
+            return Err(native_recursion_exceeded());
         }
         self.native_recursion_depth += 1;
         let result = f(self);
         self.native_recursion_depth -= 1;
         result
     }
+}
+
+/// [`Vm::with_native_recursion_guard`]'s refusal, out of the generic body:
+/// one copy of the message's construction, not one per caller.
+#[cold]
+#[inline(never)]
+fn native_recursion_exceeded() -> Thrown {
+    Thrown("RangeError: Maximum call stack size exceeded".into())
 }
 
 /// The recorder for a mutable use outside the dispatch hook: the hook's
