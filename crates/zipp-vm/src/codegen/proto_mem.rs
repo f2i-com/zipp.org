@@ -4196,7 +4196,16 @@ pub(crate) fn compile_proto_mem(
     }
     // A clean return, which leaves a lazy body with nothing to push.
     let clean_exit = epilogue;
+    let loop_align = crate::codegen::emit_misc::jit_loop_align();
+    let loop_heads = if loop_align != 0 && n != 0 {
+        crate::codegen::emit_misc::loop_heads(&proto.code, 0, n - 1)
+    } else {
+        Vec::new()
+    };
     for ip in 0..n {
+        if loop_align != 0 && loop_heads[ip] {
+            crate::codegen::emit_misc::align_loop_head(&mut ops, loop_align);
+        }
         dynasm!(ops ; => labels[ip]);
         // Every way out of a lazy `try`'s body, for this op's arms below.
         let epilogue = lazy_at[ip].unwrap_or(epilogue);

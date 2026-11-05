@@ -485,6 +485,76 @@ env_off_switch! {
     fn const_cmp_enabled() = "ZIPP_NO_CONST_CMP"
 }
 
+/// The byte boundary a compiled loop head starts on: 32, the fetch window.
+/// A loop head left where it fell ran some tight loops 10-30% slower
+/// (call_closure, arr_read, i32_rw, glob_loop) than the same code placed on a
+/// boundary; over every scoreboard row, 32 measured 0.980 on the micro probes
+/// and 0.995 on the workloads (16: 0.985 and 1.003), with a few loops that
+/// happened to sit well unaligned losing (try_catch, dv_get). The padding is
+/// at most a few long NOPs (`align_loop_head`), run once per loop entry when
+/// the code before the head falls into it (the integer region's prologue
+/// jumps over it). `ZIPP_JIT_LOOP_ALIGN=0` places heads where they fall (also
+/// 16 or 64).
+pub(crate) fn jit_loop_align() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static V: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let v = V.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let n = std::env::var("ZIPP_JIT_LOOP_ALIGN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| matches!(n, 0 | 16 | 32 | 64))
+        .unwrap_or(32);
+    V.store(n, Ordering::Relaxed);
+    n
+}
+
+/// Pad `ops` to the next multiple of `align` bytes with at most two long
+/// NOPs (the recommended 1- to 9-byte forms), so a loop head that is also
+/// reached by falling through runs one or two NOP instructions, not up to
+/// fifteen single-byte ones.
+pub(crate) fn align_loop_head(ops: &mut dynasmrt::x64::Assembler, align: usize) {
+    use dynasmrt::DynasmApi;
+    const NOPS: [&[u8]; 10] = [
+        &[],
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0F, 0x1F, 0x00],
+        &[0x0F, 0x1F, 0x40, 0x00],
+        &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+        &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+        &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let off = ops.offset().0;
+    let mut pad = (align - off % align) % align;
+    while pad > 0 {
+        let n = pad.min(9);
+        for &b in NOPS[n] {
+            ops.push(b);
+        }
+        pad -= n;
+    }
+}
+
+/// The instructions of `code[s..=e]` some later instruction of the range
+/// jumps back to (loop heads), by offset from `s`.
+pub(crate) fn loop_heads(code: &[crate::bytecode::Instr], s: usize, e: usize) -> Vec<bool> {
+    let mut heads = vec![false; e + 1 - s];
+    for ip in s..=e {
+        if let Some(t) = crate::codegen::fn_int::bytecode_control_target(&code[ip]) {
+            let t = t as usize;
+            if t >= s && t <= ip {
+                heads[t - s] = true;
+            }
+        }
+    }
+    heads
+}
+
 /// Resolve a jump `target` to a label: an in-region ip uses its own label; an
 /// out-of-region ip gets (or reuses) an exit stub label.
 pub(crate) fn region_target(

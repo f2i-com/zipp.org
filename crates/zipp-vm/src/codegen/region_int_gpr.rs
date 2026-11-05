@@ -2960,9 +2960,14 @@ pub(crate) fn compile_region_int_gpr(
 
     // ── body ── same fusion/DCE/metering structure as the xmm emitter.
     let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
+    let loop_align = crate::codegen::emit_misc::jit_loop_align();
+    let loop_heads = crate::codegen::emit_misc::loop_heads(&proto.code, s, e);
     for ip in s..=e {
         let rip_at = rip(ip);
         let rip_after = rip(ip + 1);
+        if loop_align != 0 && loop_heads[ip - s] {
+            crate::codegen::emit_misc::align_loop_head(&mut ops, loop_align);
+        }
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {

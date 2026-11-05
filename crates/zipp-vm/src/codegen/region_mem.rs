@@ -688,7 +688,12 @@ pub(crate) fn compile_region_mem(
     };
     // The k-th GetProp/SetProp in the region uses inline-cache site `ic_site`.
     let mut ic_site = heap.ic_base_idx;
+    let loop_align = crate::codegen::emit_misc::jit_loop_align();
+    let loop_heads = crate::codegen::emit_misc::loop_heads(&proto.code, s, e);
     for ip in s..=e {
+        if loop_align != 0 && loop_heads[ip - s] {
+            crate::codegen::emit_misc::align_loop_head(&mut ops, loop_align);
+        }
         // Skip the hoisted `.length` GetProp — its dst already holds the value
         // (computed once in the prologue). The label is still emitted so jumps
         // into this ip resolve; the op itself is elided.
