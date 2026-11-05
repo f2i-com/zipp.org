@@ -2003,10 +2003,24 @@ impl<'p> Vm<'p> {
         // recursive functions all call themselves that way, and every such
         // call took the generic cross-call helper (`ZIPP_NO_CROSS3_SELF_GLOBAL=1`
         // leaves them out again).
+        // A wide body (> 64 registers) qualifies when its wide fill mask is
+        // empty, as the non-self `wide_empty` admission below: the lane zeroes
+        // nothing. The masks are this proto's own analysis, the same calls the
+        // compile makes before `set_cross_entry`; raytracer's 87-register
+        // `trace` reached its own recursion through the helper only.
+        let self_wide_empty = fid == caller_fid
+            && reg_count > 64
+            && crate::codegen::crosscall2_enabled()
+            && crate::codegen::crosscall_wide_mask_enabled()
+            && crate::codegen::cross3_wide_enabled()
+            && crate::codegen::cross_uninit_mask(callee) == u64::MAX
+            && crate::codegen::cross_uninit_wide_mask(callee).is_some_and(|m| {
+                m.len() == (reg_count as usize).div_ceil(64) && m.iter().all(|&w| w == 0)
+            });
         let self_arm = fid == caller_fid
             && whole_body
             && crate::codegen::cross3_self_enabled()
-            && reg_count <= 64
+            && (reg_count <= 64 || self_wide_empty)
             && crate::codegen::markdown_inline_plan(callee).is_none()
             && (crate::codegen::cross3_self_global_enabled() || callee.name_global.is_none_or(|own| {
                 !callee
@@ -2015,10 +2029,23 @@ impl<'p> Vm<'p> {
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
         let parked = self.jit.cross_parked_mask(fid);
+        let mut self_wide = false;
         let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry_lane(fid)
         {
             Some((_entry, mask, json, markdown)) => {
                 (mask, json, markdown, self.jit.cross_mask_gen(fid))
+            }
+            None if self_arm && self_wide_empty => {
+                // The install records the inline mask as MAX (a wide body's
+                // always is) and, with no live entry before it, does not bump
+                // for the wide words: the generation it leaves is this one.
+                self_wide = true;
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[cross] fn{caller_fid}@{call_ip} CROSS3 wide self arm (regs={reg_count}, empty wide mask)"
+                    );
+                }
+                (0, None, None, self.jit.cross_mask_gen_after_set(fid, u64::MAX))
             }
             None if self_arm => {
                 let mask = if crate::codegen::crosscall2_enabled() {
@@ -2061,7 +2088,7 @@ impl<'p> Vm<'p> {
         if json_walk.is_some()
             || markdown_inline.is_some()
             || uninit_mask == u64::MAX
-            || (reg_count > 64 && !wide_empty)
+            || (reg_count > 64 && !wide_empty && !self_wide)
         {
             if crate::jitlog_enabled() {
                 eprintln!(

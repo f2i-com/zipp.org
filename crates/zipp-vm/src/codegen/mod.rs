@@ -2270,7 +2270,7 @@ pub(crate) fn crosscall2_enabled() -> bool {
 /// The wide analysis remains subordinate to `ZIPP_NO_CROSSCALL2`: disabling
 /// W7 still restores the pre-W7 full-fill path for every function.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn crosscall_wide_mask_enabled() -> bool {
+pub(crate) fn crosscall_wide_mask_enabled() -> bool {
     std::env::var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
 }
 
