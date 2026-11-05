@@ -3554,6 +3554,9 @@ pub(crate) fn build_typed_lane_guarded(
     global_route_guard: Option<u32>,
     math_imul_guard: Option<MathIntrinsicGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
+    // A leaf's global writes join the lane's transactional exit commits
+    // (`gbuffer`), as a method lane's do: the route guard proved the slots
+    // direct, and nothing is written before every guard has passed.
     build_lane_inner(
         body,
         param_count,
@@ -3566,9 +3569,15 @@ pub(crate) fn build_typed_lane_guarded(
         nested,
         None,
         global_route_guard,
-        false,
+        global_route_guard.is_some() && leaf_lane_global_stores_enabled(),
         math_imul_guard,
     )
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_LANE_GLOBAL_STORE=1`: a leaf splice's typed lane declines
+    /// a body that writes a global again (the generic emitter runs it).
+    fn leaf_lane_global_stores_enabled() = "ZIPP_NO_LEAF_LANE_GLOBAL_STORE"
 }
 
 #[allow(clippy::too_many_arguments)]
