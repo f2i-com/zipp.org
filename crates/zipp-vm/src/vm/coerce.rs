@@ -1088,6 +1088,9 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(v) {
             return Ok(false);
         }
+        if self.array_spreadable_by_default(v) {
+            return Ok(true);
+        }
         let flag = self.get_prop(v, "@@isConcatSpreadable")?;
         if flag != Value::UNDEFINED {
             return Ok(self.truthy(flag));
@@ -1095,6 +1098,29 @@ impl<'p> Vm<'p> {
         // Step 4 is the REAL IsArray: it pierces Proxy targets (a proxy over an
         // array IS spreadable) and throws on a revoked proxy.
         self.value_is_array_throwing(v)
+    }
+
+    /// IsConcatSpreadable of a plain array of the main realm with no own
+    /// named property, on the default chain (%Array.prototype%, then
+    /// %Object.prototype%) where neither prototype holds the flag: the Get
+    /// finds `undefined` and IsArray is true, so it is spreadable with
+    /// nothing read. Each concat argument walked that chain by name.
+    fn array_spreadable_by_default(&self, v: Value) -> bool {
+        let idx = v.heap_index();
+        if self.arr_proto == 0
+            || self.obj_proto == 0
+            || !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+            || self.proto_of.contains_key(&self.arr_proto)
+        {
+            return false;
+        }
+        let holds_flag = |o: u32| match self.heap.get(o) {
+            HeapObj::Object(m) => m.pos("@@isConcatSpreadable").is_some(),
+            _ => true,
+        };
+        !holds_flag(self.arr_proto) && !holds_flag(self.obj_proto)
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors
