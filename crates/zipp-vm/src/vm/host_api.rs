@@ -1437,13 +1437,23 @@ impl<'p> Vm<'p> {
         roots: &[Value],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let base = self.host_result_roots.len();
-        self.host_result_roots
-            .extend(roots.iter().copied().filter(|value| value.is_heap()));
+        let base = self.enter_host_roots(roots);
         let result = f(self);
         debug_assert!(self.host_result_roots.len() >= base);
         self.host_result_roots.truncate(base);
         result
+    }
+
+    /// [`Vm::with_host_roots`]' entry, out of the generic body: the root
+    /// stack's length before `roots`' heap values are pushed. One copy of
+    /// the filtering push instead of one per caller's closure type (19 in
+    /// the WebAssembly module).
+    #[inline(never)]
+    fn enter_host_roots(&mut self, roots: &[Value]) -> usize {
+        let base = self.host_result_roots.len();
+        self.host_result_roots
+            .extend(roots.iter().copied().filter(|value| value.is_heap()));
+        base
     }
 
     /// Root one more temporary in the innermost [`Vm::with_host_roots`]
