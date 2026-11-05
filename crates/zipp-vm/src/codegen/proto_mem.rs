@@ -7164,6 +7164,28 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     lane = true;
+                } else if let Some(memo) = crate::vm::str_lane_memo(key, argc).filter(|_| meter.is_none()) {
+                    // Any other String method of `jit_str_method`'s set, called
+                    // directly past the builtin call chain (metered bodies keep
+                    // the helper route for interpreter-parity charging).
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                        ; mov r9d, (memo as i32) | ((argc as i32) << 8)
+                        ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => general
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // A result allocates a Heap slot, whose versions Vec may
+                    // move; no user code runs, so only r13 is re-derived.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
+                    lane = true;
                 } else {
                     // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
                     // the region arm, which declines before any effect; the

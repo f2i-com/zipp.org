@@ -3097,6 +3097,33 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; jmp => done ; => general);
                     lane_done = Some(done);
                 }
+                // Any other String method of `jit_str_method`'s set: called
+                // directly, past the whole builtin call chain. Metered regions
+                // keep the helper route (interpreter-parity charging).
+                let str_memo = crate::vm::str_lane_memo(key, argc).filter(|_| lane_done.is_none() && blocks.is_none());
+                if let Some(memo) = str_memo {
+                    let general = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
+                        ; mov r9d, (memo as i32) | ((argc as i32) << 8)
+                        ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => general
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // A result allocates a Heap slot, whose parallel versions
+                    // Vec may move; no user code runs.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops ; jmp => done ; => general);
+                    lane_done = Some(done);
+                }
                 if (argc == 1 || argc == 2) && dv_get_kind(key).is_some() {
                     // Whitelisted DataView `get*(pos[, littleEndian])`.
                     // ── pinned-DataView fast path ── when the OSR plan pinned

@@ -4048,6 +4048,124 @@ pub(crate) fn str_unit_helper(key: &str) -> Option<usize> {
     }
 }
 
+/// The String.prototype methods compiled code calls through
+/// [`jit_str_method`], by their string-memo slot (`builtins::str_memo_id`).
+/// Left out: the ones whose pattern argument is consulted for a
+/// `Symbol.replace`/`split`/`match`/`search`/`matchAll` method even when it is
+/// a primitive string (user code a deopt could repeat), and the ones that
+/// have their own helpers (charCodeAt, charAt, indexOf, at).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn str_lane_memo(key: &str, argc: u16) -> Option<u8> {
+    if !str_method_lane_enabled() || argc > 4 {
+        return None;
+    }
+    Some(match key {
+        "slice" => 3,
+        "substring" => 4,
+        "trim" => 6,
+        "includes" => 8,
+        "startsWith" => 9,
+        "endsWith" => 10,
+        "padStart" => 11,
+        "padEnd" => 12,
+        "codePointAt" => 13,
+        "repeat" => 14,
+        "lastIndexOf" => 15,
+        "trimStart" => 16,
+        "trimEnd" => 17,
+        "toUpperCase" => 19,
+        "toLowerCase" => 20,
+        "concat" => 21,
+        "normalize" => 25,
+        "substr" => 28,
+        _ => return None,
+    })
+}
+
+/// [`str_lane_memo`]'s names by slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn str_lane_name(memo: u8) -> Option<&'static str> {
+    Some(match memo {
+        3 => "slice",
+        4 => "substring",
+        6 => "trim",
+        8 => "includes",
+        9 => "startsWith",
+        10 => "endsWith",
+        11 => "padStart",
+        12 => "padEnd",
+        13 => "codePointAt",
+        14 => "repeat",
+        15 => "lastIndexOf",
+        16 => "trimStart",
+        17 => "trimEnd",
+        19 => "toUpperCase",
+        20 => "toLowerCase",
+        21 => "concat",
+        25 => "normalize",
+        28 => "substr",
+        _ => return None,
+    })
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_STR_METHOD_LANE=1`: compiled String method calls take the
+    /// general method route again (`jit_str_method`), for an A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn str_method_lane_enabled() = "ZIPP_NO_STR_METHOD_LANE"
+}
+
+/// Win64 helper for a compiled `s.m(args…)` whose `m` is one of
+/// [`str_lane_memo`]'s String methods: `string_method` called directly when
+/// the receiver is a primitive string, every argument a primitive other than
+/// a Symbol or BigInt (no coercion runs user code), no child realm exists and
+/// `m` is still the boot intrinsic. The general route reached the same call
+/// through the method IC, the region call, `try_builtin_method` and
+/// `dispatch_builtin_method`: about 35 ns before a 10 ns trim. Anything else,
+/// and any error the method raises, returns `SELF_CALL_DEOPT`; the general
+/// route then runs the call (and throws) exactly once, nothing having been
+/// observable. `packed` = slot | argc << 8; `args` points at the argc
+/// argument registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_method(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    args: *const u64,
+    packed: u64,
+) -> u64 {
+    let memo = (packed & 0xff) as u8;
+    let argc = ((packed >> 8) & 0xff) as usize;
+    let Some(name) = str_lane_name(memo) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if argc > 4 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // Copied out before the VM is borrowed: the registers live in the VM.
+    let mut buf = [Value::UNDEFINED; 4];
+    for (k, slot) in buf.iter_mut().enumerate().take(argc) {
+        // SAFETY: the emitter passes the address of `argc` argument registers.
+        *slot = Value::from_bits(unsafe { *args.add(k) });
+    }
+    let recv = Value::from_bits(recv_bits);
+    // SAFETY: the running region holds no conflicting borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    if !recv.is_heap() || !vm.heap.is_str_like(recv.heap_index()) || !vm.realm_global_objs.is_empty() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let args = &buf[..argc];
+    if args.iter().any(|a| a.is_heap() && !vm.heap.is_str_like(a.heap_index())) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if !vm.string_memo_is_intrinsic(memo as usize, name) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.string_method(recv.heap_index(), name, args) {
+        Ok(Some(v)) => v.bits(),
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// [`jit_str_at`] for `charAt`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_str_char_at(vm: *mut core::ffi::c_void, str_bits: u64, i_bits: u64) -> u64 {
