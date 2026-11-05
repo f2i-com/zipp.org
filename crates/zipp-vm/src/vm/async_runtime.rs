@@ -312,12 +312,16 @@ env_off_switch! {
 
 /// The register window a run of reaction jobs calling one compiled callback
 /// shares (`Vm::run_job_windowed`): the callback, its native entry and where
-/// the window starts in the register file.
+/// the window starts in the register file. The entry is kept as the
+/// `Option` `run_cb_elem` takes, always `Some`, and each job passes it by
+/// reference: rebuilt per job, the 72-byte entry was copied twice, which the
+/// PGO build (its training runs no job window) did with two `rep movsq`, a
+/// sixth of a promise chain's drain.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
 struct JobWindow {
     callee: Value,
-    native: super::misc_methods::NativeCb,
+    native: Option<super::misc_methods::NativeCb>,
     at: usize,
 }
 
@@ -4619,15 +4623,15 @@ impl<'p> Vm<'p> {
                 };
                 *window = Some(JobWindow {
                     callee: callback,
-                    native,
+                    native: Some(native),
                     at,
                 });
             }
-            let Some(w) = *window else {
+            let Some(w) = window.as_ref() else {
                 return false;
             };
             asyncstats::job_window_call();
-            match self.run_cb_elem(&Some(w.native), w.at, callback, &[arg], Value::UNDEFINED) {
+            match self.run_cb_elem(&w.native, w.at, callback, &[arg], Value::UNDEFINED) {
                 Ok(ret) => self.resolve(dependent, ret),
                 Err(_) => {
                     let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
