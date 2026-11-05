@@ -3283,15 +3283,20 @@ pub(crate) fn compile_region_mem(
                         ta_refetch,
                     );
                     dynasm!(ops ; => pop_done);
-                } else if argc == 1 && matches!(key, "push" | "charCodeAt") {
+                } else if argc == 1
+                    && (matches!(key, "push" | "charCodeAt")
+                        || crate::vm::str_unit_helper(key).is_some())
+                {
                     // The whitelisted 1-arg builtins keep their dedicated win64
                     // helpers: receiver + arg0 bits in, result bits out, deopt
                     // sentinel → bail. Neither allocates a heap OBJECT (push
                     // grows the array's own Vec; the versions array is
-                    // untouched), so no pinned-pointer re-fetch is needed.
+                    // untouched; `at`/`charAt` answer only interned slots), so
+                    // no pinned-pointer re-fetch is needed.
                     let helper = match key {
                         "push" => heap.array_push,
-                        _ => heap.char_code_at,
+                        "charCodeAt" => heap.char_code_at,
+                        _ => crate::vm::str_unit_helper(key).expect("matched above"),
                     };
                     // ── pinned-string charCodeAt fast path ── when the OSR plan
                     // pinned this receiver as a flat ASCII string (snapshot

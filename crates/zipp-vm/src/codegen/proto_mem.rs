@@ -7140,12 +7140,17 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     lane = true;
-                } else if matches!(key, "charCodeAt" | "indexOf" | "push") && argc == 1 {
-                    // charCodeAt / indexOf / push — one-arg dedicated helpers.
+                } else if argc == 1
+                    && (matches!(key, "charCodeAt" | "indexOf" | "push")
+                        || crate::vm::str_unit_helper(key).is_some())
+                {
+                    // charCodeAt / indexOf / push / at / charAt — one-arg
+                    // dedicated helpers.
                     let helper = match key {
                         "indexOf" => heap.str_index_of,
                         "push" => heap.array_push,
-                        _ => heap.char_code_at,
+                        "charCodeAt" => heap.char_code_at,
+                        _ => crate::vm::str_unit_helper(key).expect("matched above"),
                     };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm

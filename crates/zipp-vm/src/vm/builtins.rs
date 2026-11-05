@@ -79,13 +79,15 @@ env_off_switch! {
 
 /// `charCodeAt`'s index in the B191 memo (`str_memo_id`).
 const STR_MEMO_CHAR_CODE_AT: usize = 0;
+const STR_MEMO_CHAR_AT: usize = 1;
 const STR_MEMO_INDEX_OF: usize = 2;
+const STR_MEMO_AT: usize = 18;
 
 /// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
 fn str_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "charCodeAt" => STR_MEMO_CHAR_CODE_AT,
-        "charAt" => 1,
+        "charAt" => STR_MEMO_CHAR_AT,
         "indexOf" => STR_MEMO_INDEX_OF,
         "slice" => 3,
         "substring" => 4,
@@ -102,7 +104,7 @@ fn str_memo_id(name: &str) -> Option<usize> {
         "lastIndexOf" => 15,
         "trimStart" => 16,
         "trimEnd" => 17,
-        "at" => 18,
+        "at" => STR_MEMO_AT,
         "toUpperCase" => 19,
         "toLowerCase" => 20,
         "concat" => 21,
@@ -1001,6 +1003,20 @@ impl<'p> Vm<'p> {
     #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     pub(crate) fn index_of_is_intrinsic(&mut self) -> bool {
         self.string_memo_is_intrinsic(STR_MEMO_INDEX_OF, "indexOf")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for `charAt` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn char_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_CHAR_AT, "charAt")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for String `at` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn str_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_AT, "at")
     }
 
     #[inline(always)]

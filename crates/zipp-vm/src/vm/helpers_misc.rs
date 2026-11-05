@@ -4013,6 +4013,86 @@ pub(crate) extern "win64" fn jit_char_code_at(
     }
 }
 
+/// Win64 helpers for a JIT'd `str.at(i)` / `str.charAt(i)`, the dedicated
+/// one-argument shape of [`jit_char_code_at`]: the one-unit string at an
+/// Int index of a flat string, when that unit is ASCII (an interned slot, so
+/// nothing allocates). `at` counts a negative index from the end and answers
+/// `undefined` out of range; `charAt` answers `""` out of range. Anything
+/// else (a rope, a non-ASCII unit, a non-Int index, a method no longer the
+/// boot intrinsic) returns `SELF_CALL_DEOPT`, and the call takes the general
+/// route, which paid ~35 ns of builtin dispatch for each (`p.at(-1) +
+/// p.at(3)` in a short-string loop ran 8x node).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_at(vm: *mut core::ffi::c_void, str_bits: u64, i_bits: u64) -> u64 {
+    str_unit_string(vm, str_bits, i_bits, true)
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_STR_AT_LANE=1`: compiled `s.at(i)` / `s.charAt(i)` take the
+    /// general method route again (`jit_str_at`), for an A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn str_at_lane_enabled() = "ZIPP_NO_STR_AT_LANE"
+}
+
+/// The `jit_str_at` / `jit_str_char_at` helper for method `key`, when it is
+/// one of the two and the lane is on.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn str_unit_helper(key: &str) -> Option<usize> {
+    if !str_at_lane_enabled() {
+        return None;
+    }
+    match key {
+        "at" => Some(jit_str_at as *const () as usize),
+        "charAt" => Some(jit_str_char_at as *const () as usize),
+        _ => None,
+    }
+}
+
+/// [`jit_str_at`] for `charAt`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_char_at(vm: *mut core::ffi::c_void, str_bits: u64, i_bits: u64) -> u64 {
+    str_unit_string(vm, str_bits, i_bits, false)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn str_unit_string(vm: *mut core::ffi::c_void, str_bits: u64, i_bits: u64, at: bool) -> u64 {
+    let (sv, iv) = (Value::from_bits(str_bits), Value::from_bits(i_bits));
+    if !sv.is_heap() || !iv.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view (the memo may refill); the running code holds no
+    // conflicting borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let intrinsic = if at {
+        vm.str_at_is_intrinsic()
+    } else {
+        vm.char_at_is_intrinsic()
+    };
+    if !intrinsic {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let HeapObj::Str(js) = vm.heap.get(sv.heap_index()) else {
+        return crate::codegen::SELF_CALL_DEOPT; // rope/non-string → interpreter
+    };
+    let len = js.units() as i64;
+    let mut i = iv.as_int() as i64;
+    if at && i < 0 {
+        i += len;
+    }
+    if i < 0 || i >= len {
+        return if at {
+            Value::UNDEFINED.bits()
+        } else {
+            Value::heap(crate::heap::INTERN_EMPTY).bits()
+        };
+    }
+    match js.unit_at(i as usize) {
+        Some(u) if u < 128 => Value::heap(u32::from(u)).bits(),
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Evaluate the exact pure leaf shape
 ///
 /// `tags[i] === 4 && ends[i] - starts[i] === 1 &&
