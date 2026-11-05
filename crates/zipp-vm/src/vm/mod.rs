@@ -1048,6 +1048,51 @@ impl std::ops::Deref for JitGuardedMap {
 ///
 /// The checked profile has its own definition below: it emits no code, so it
 /// has no window to revive and no layout to keep.
+/// `v` into `p[i..end]`: the fill of a register window's slots past its
+/// arguments, on every interpreted call. Explicit 16-byte stores on x86-64.
+/// As a plain loop, the PGO build vectorized it with a masked tail (its
+/// profile saw short windows, and SSE2 has no masked store, so each pass of
+/// two slots ran about twenty instructions and a branch per slot): a quarter
+/// of a React render's interpreter time, where 0.0.32 had run two plain
+/// stores per four slots. The loop vectorizer leaves a loop of vector stores
+/// as written.
+///
+/// # Safety
+/// `p[i..end]` must be initialized storage of one allocation.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline(always)]
+unsafe fn fill_values(p: *mut Value, mut i: usize, end: usize, v: Value) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the caller's range; SSE2 is part of the x86-64 baseline.
+    unsafe {
+        use std::arch::x86_64::{__m128i, _mm_set1_epi64x, _mm_storeu_si128};
+        let pair = _mm_set1_epi64x(v.bits() as i64);
+        // Four slots a pass: windows of dozens of registers are common (a
+        // function's every temporary has one), and two a pass ran 3-5% more
+        // instructions than the plain build's vectorized loop on those calls.
+        while i + 4 <= end {
+            _mm_storeu_si128(p.add(i).cast::<__m128i>(), pair);
+            _mm_storeu_si128(p.add(i + 2).cast::<__m128i>(), pair);
+            i += 4;
+        }
+        if i + 2 <= end {
+            _mm_storeu_si128(p.add(i).cast::<__m128i>(), pair);
+            i += 2;
+        }
+        if i < end {
+            p.add(i).write(v);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: the caller's range.
+    unsafe {
+        while i < end {
+            p.add(i).write(v);
+            i += 1;
+        }
+    }
+}
+
 #[cfg(not(feature = "safe-sandbox"))]
 #[repr(C)]
 pub(crate) struct RegisterFile {
@@ -1196,7 +1241,9 @@ impl RegisterFile {
     pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
         let old_logical = self.logical_len;
         if new_len > old_logical && new_len <= self.storage.len() {
-            self.storage[old_logical..new_len].fill(fill);
+            // SAFETY: `old_logical < new_len <= storage.len()`: initialized
+            // storage.
+            unsafe { fill_values(self.storage.as_mut_ptr(), old_logical, new_len, fill) };
             self.logical_len = new_len;
             return;
         }
@@ -1240,11 +1287,7 @@ impl RegisterFile {
                 }
                 _ => std::ptr::copy_nonoverlapping(s, d, n),
             }
-            let mut i = base + 1 + n;
-            while i < end {
-                p.add(i).write(Value::UNDEFINED);
-                i += 1;
-            }
+            fill_values(p, base + 1 + n, end, Value::UNDEFINED);
         }
         self.logical_len = end;
     }
@@ -1286,11 +1329,7 @@ impl RegisterFile {
                 p.add(base + 1 + i).write(p.add(src + i).read());
                 i += 1;
             }
-            let mut i = base + 1 + n;
-            while i < end {
-                p.add(i).write(Value::UNDEFINED);
-                i += 1;
-            }
+            fill_values(p, base + 1 + n, end, Value::UNDEFINED);
         }
         self.logical_len = end;
         true
