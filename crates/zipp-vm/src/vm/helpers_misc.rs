@@ -561,7 +561,7 @@ pub(crate) extern "win64" fn jit_str_index_of(
     let vm = unsafe { &mut *(vm as *mut Vm) };
     // B191: serve only while `indexOf` is still the boot intrinsic on
     // %String.prototype% — a shadow routes to the generic Get.
-    if !vm.string_method_is_intrinsic("indexOf") {
+    if !vm.index_of_is_intrinsic() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let (r, n) = (Value::from_bits(recv_bits), Value::from_bits(needle_bits));
@@ -3340,7 +3340,7 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // before the region body can materialise it.  Unknown method bits
             // fail closed.
             if method_mask & !1 != 0
-                || (method_mask & 1 != 0 && !vm.array_method_is_intrinsic("push"))
+                || (method_mask & 1 != 0 && !vm.array_push_is_intrinsic())
                 || vm.arr_props.contains_key(&idx)
                 || vm.array_js_len.contains_key(&idx)
                 || vm.arguments_objs.contains_key(&idx)
@@ -3599,7 +3599,7 @@ pub(crate) extern "win64" fn jit_array_push(
     // so the interpreter's length-aware push runs.
     // B191: `push` must still be the boot intrinsic — checked per call (the
     // hoisted eligibility gate below cannot see a mid-region shadow).
-    if !vm.array_method_is_intrinsic("push") {
+    if !vm.array_push_is_intrinsic() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     if vm.array_js_len.contains_key(&arr.heap_index()) {
@@ -3671,7 +3671,7 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
     let idx = arr.heap_index();
     if !matches!(vm.heap.get(idx), HeapObj::Array(items)
             if !items.last().is_some_and(|v| v.is_hole()))
-        || !vm.array_method_is_intrinsic("pop")
+        || !vm.array_pop_is_intrinsic()
         || vm.arr_props.contains_key(&idx)
         || vm.array_js_len.contains_key(&idx)
         || vm.array_length_nonwritable.contains(&idx)

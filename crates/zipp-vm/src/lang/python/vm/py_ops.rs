@@ -1213,7 +1213,7 @@ impl<'p> Vm<'p> {
             || self.array_js_len.contains_key(&idx)
             || self.proto_of.contains_key(&idx)
             || self.array_proto_has_index
-            || !self.array_method_is_intrinsic("pop")
+            || !self.array_pop_is_intrinsic()
         {
             return None;
         }

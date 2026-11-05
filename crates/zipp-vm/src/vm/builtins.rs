@@ -79,13 +79,14 @@ env_off_switch! {
 
 /// `charCodeAt`'s index in the B191 memo (`str_memo_id`).
 const STR_MEMO_CHAR_CODE_AT: usize = 0;
+const STR_MEMO_INDEX_OF: usize = 2;
 
 /// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
 fn str_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "charCodeAt" => STR_MEMO_CHAR_CODE_AT,
         "charAt" => 1,
-        "indexOf" => 2,
+        "indexOf" => STR_MEMO_INDEX_OF,
         "slice" => 3,
         "substring" => 4,
         "split" => 5,
@@ -925,13 +926,13 @@ impl<'p> Vm<'p> {
     /// still holds the intrinsic's bits), without the name match and the
     /// call. Anything else takes the full proof, which also fills the memo.
     #[inline(always)]
-    fn array_push_is_intrinsic(&mut self) -> bool {
+    pub(crate) fn array_push_is_intrinsic(&mut self) -> bool {
         self.array_memo_is_intrinsic(ARR_MEMO_PUSH, "push")
     }
 
     /// [`Vm::array_push_is_intrinsic`] for `pop`.
     #[inline(always)]
-    fn array_pop_is_intrinsic(&mut self) -> bool {
+    pub(crate) fn array_pop_is_intrinsic(&mut self) -> bool {
         self.array_memo_is_intrinsic(ARR_MEMO_POP, "pop")
     }
 
@@ -959,8 +960,20 @@ impl<'p> Vm<'p> {
     /// the other proofs of the same call).
     #[inline(always)]
     pub(crate) fn char_code_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_CHAR_CODE_AT, "charCodeAt")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for `indexOf` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn index_of_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_INDEX_OF, "indexOf")
+    }
+
+    #[inline(always)]
+    fn string_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
         if self.realm_global_objs.is_empty() {
-            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[STR_MEMO_CHAR_CODE_AT] {
+            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[memo_id] {
                 let proto = self.str_proto;
                 if self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get_for_ic(proto) {
@@ -971,7 +984,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.string_method_is_intrinsic("charCodeAt")
+        self.string_method_is_intrinsic(name)
     }
 
     /// Whether a CAPTURED callee `bits` is the boot intrinsic `name` of
