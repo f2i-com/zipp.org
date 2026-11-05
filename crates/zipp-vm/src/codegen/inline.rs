@@ -4146,7 +4146,7 @@ fn build_lane_inner(
                 }
                 returned = true;
             }
-            // The closed set is deliberately small: anything else (Mod, Neg,
+            // The closed set is deliberately small: anything else (Neg,
             // comparisons, heap loads/stores, non-Imul MathOps, StoreGlobal,
             // ReturnUndefined, …) keeps the generic boxed loop.
             _ => return Err("op-outside-lane-set"),
@@ -4928,7 +4928,7 @@ mod lane_tests {
     /// Ops outside the closed numeric set decline (fail-closed).
     #[test]
     fn out_of_set_op_declines() {
-        let body = vec![Instr::Mod { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
+        let body = vec![Instr::Neg { dst: 3, a: 1 }, Instr::Return { src: 3 }];
         let r = build_typed_lane(
             &body,
             2,
