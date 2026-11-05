@@ -245,6 +245,12 @@ impl<'p> Vm<'p> {
                     if let Some(bits) = self.try_method_inline(fid, recv, base, 0, 0) {
                         return bits;
                     }
+                    // A leaf getter (straight-line arithmetic over own data
+                    // reads, `leaf_scan`) runs frameless, as the interpreter's
+                    // accessor reads run it.
+                    if let Some(v) = self.leaf_getter(fid, closure, recv) {
+                        return v.bits();
+                    }
                     self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
                 }
                 GetAct::None => self.jit_get_prop_complete(func_id, recv, key),

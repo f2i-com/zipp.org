@@ -491,6 +491,13 @@ env_off_switch! {
     fn leaf_callback_enabled() = "ZIPP_NO_LEAF_CALLBACK"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_LEAF_GETTER=1`: compiled code frame-calls every getter its
+    /// fast paths decline (the same-binary A/B for `leaf_getter`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_leaf_getter_enabled() = "ZIPP_NO_JIT_LEAF_GETTER"
+}
+
 impl Default for LiteState<'_> {
     fn default() -> Self {
         LiteState {
@@ -635,6 +642,22 @@ impl<'p> Vm<'p> {
             return None;
         }
         self.leaf_callback_try(fid, closure, this_arg, args)
+    }
+
+    /// A getter compiled code reached (`jit_prop_slow_impl`) run as a leaf
+    /// (`leaf_scan`) with `recv` as its `this`: its result, or `None` when it
+    /// is not one or this run declined, and the getter takes its frame as
+    /// before. In a VM that also compiles: a leaf getter (`get area() {
+    /// return this.w * this.h }`) cost a frame push, an entry and a pop from
+    /// compiled code where the interpreter's own accessor reads ran it
+    /// frameless, and accessor-heavy rows ran slower with the JIT than
+    /// without it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn leaf_getter(&mut self, fid: u32, closure: u32, recv: Value) -> Option<Value> {
+        if !jit_leaf_getter_enabled() || self.lite.leaf.get(fid as usize) == Some(&LEAF_NO) {
+            return None;
+        }
+        self.leaf_callback_try(fid, closure, recv, &[])
     }
 
     #[inline(never)]
