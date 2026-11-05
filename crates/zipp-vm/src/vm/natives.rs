@@ -1598,24 +1598,60 @@ impl<'p> Vm<'p> {
     /// transition tree never reissues ids, so an entry stays valid for the
     /// VM's life; the fold's result is deterministic in tree state, which only
     /// grows, so recomputation could never disagree with the memo.
+    ///
+    /// A direct-mapped memo (`finalize_memo`) answers first: every object
+    /// literal a loop makes asked the hash map, an out-of-line call and a
+    /// group probe, 15% of a loop of two-key literals.
+    #[inline]
     pub(crate) fn finalize_shape(
         &mut self,
         func_id: u32,
         plan_idx: u16,
         plan: &crate::bytecode::StaticKeyPlan,
     ) -> u32 {
-        if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+        let slot = finalize_memo_slot(func_id, plan_idx);
+        let (f, p, shape) = self.finalize_memo[slot];
+        if f == func_id && p == plan_idx {
             return shape;
         }
-        let data = crate::shape::attr_bits(true, true, true, false);
-        let mut shape = crate::shape::EMPTY;
-        for key in plan.keys() {
-            shape = crate::shape::add(shape, key, data);
-        }
-        self.finalize_shapes.insert((func_id, plan_idx), shape);
+        self.finalize_shape_slow(func_id, plan_idx, plan, slot)
+    }
+
+    #[inline(never)]
+    fn finalize_shape_slow(
+        &mut self,
+        func_id: u32,
+        plan_idx: u16,
+        plan: &crate::bytecode::StaticKeyPlan,
+        slot: usize,
+    ) -> u32 {
+        let shape = if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+            shape
+        } else {
+            let data = crate::shape::attr_bits(true, true, true, false);
+            let mut shape = crate::shape::EMPTY;
+            for key in plan.keys() {
+                shape = crate::shape::add(shape, key, data);
+            }
+            self.finalize_shapes.insert((func_id, plan_idx), shape);
+            shape
+        };
+        self.finalize_memo[slot] = (func_id, plan_idx, shape);
         shape
     }
 
+}
+
+/// Entries of `Vm::finalize_memo` (a power of two).
+pub(crate) const FINALIZE_MEMO_SLOTS: usize = 64;
+
+/// `Vm::finalize_memo`'s slot for a (function, plan) pair.
+#[inline(always)]
+fn finalize_memo_slot(func_id: u32, plan_idx: u16) -> usize {
+    ((func_id.wrapping_mul(0x9E37_79B1) >> 26) as usize ^ plan_idx as usize) & (FINALIZE_MEMO_SLOTS - 1)
+}
+
+impl<'p> Vm<'p> {
     /// Allocate a `FinalizeObject` literal from `plan`, an entry of one of
     /// this VM's own `FuncProto` plan tables. Those outlive the VM and the
     /// heap it owns, so the object's keys borrow the plan instead of counting
