@@ -2365,12 +2365,37 @@ impl<'a> FnCompiler<'a> {
     /// Consumed by `CallSpread` / `CallMethodSpread`.
     pub(crate) fn build_spread_args(&mut self, args: &[Arg]) -> R<Reg> {
         let args_arr = self.temp();
+        // The plain arguments before the first spread are evaluated into one
+        // contiguous block and become the array's initial elements, so only
+        // the spread and what follows it is appended one by one. Allocating
+        // the array after evaluating them instead of before is not
+        // observable. `f(a, b, c, ...xs)` made an `ArrayAppend` (a helper
+        // call in compiled code, and a Vec regrowth) per plain argument.
+        let lead: Vec<&Expr> = args
+            .iter()
+            .map_while(|a| match a {
+                Arg::Expr(e) => Some(e),
+                Arg::Spread(_) => None,
+            })
+            .collect();
+        let n_lead = if self.next_reg as usize + lead.len() <= Reg::MAX as usize && lead.len() <= u16::MAX as usize {
+            lead.len()
+        } else {
+            0
+        };
+        let save = self.next_reg;
+        let base = if n_lead > 0 {
+            self.eval_contiguous(&lead[..n_lead])?
+        } else {
+            self.next_reg
+        };
         self.emit(Instr::NewArray {
             dst: args_arr,
-            arg_base: self.next_reg,
-            argc: 0,
+            arg_base: base,
+            argc: n_lead as u16,
         });
-        for a in args {
+        self.set_next_reg(save);
+        for a in &args[n_lead..] {
             let save = self.next_reg;
             // `Arg` has exactly the two forms, so the old
             // "unsupported spread-call argument" arm (oxc's `Argument` could be
