@@ -6013,19 +6013,23 @@ fn emit_cross3_invoke(
             ; add r8, iv.callee_regs as i32
             ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
             ; ja => hw_miss
-            ; mov [rsp + c3 + 24], rdx
             // A frame-free prior needs a visible duplicate while the callee
             // runs. High-water and root capacity are checked before mutation.
+            // The flag joins the base in the register, so the word is ONE
+            // 8-byte store: a byte `or` into the stored word made every later
+            // 8-byte load of it a failed store-forward (most of a recursive
+            // call's cycles).
             ; cmp WORD [rdi + act], 0x0101
             ; jne => inline_noroot
             ; cmp DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32],
                 crate::vm::native_call_cap() as i32 - 2
             ; jae => fb
-            ; or BYTE [rsp + c3 + 24], 2
+            ; or rdx, 2
             ; => inline_noroot
+            ; mov [rsp + c3 + 24], rdx
             // Expose the already-initialised window.
             ; mov [rdi + regs_len], r8
-            ; test BYTE [rsp + c3 + 24], 2
+            ; test dl, 2
             ; jz => inline_entered
             // slots[depth] = prior. 24 bytes/slot = (depth * 3) * 8.
             ; mov eax, DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
