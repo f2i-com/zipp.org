@@ -207,14 +207,14 @@ fn restricted_name(n: &str) -> bool {
 fn duplicate_params(p: &ast::Params) -> bool {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut dup = false;
-    visit::params(p, &mut |n| {
+    visit::params(p, visit::arg(&mut |n| {
         if let Node::Pattern(ast::Pattern::Ident(name)) = n {
             if !seen.insert(&**name) {
                 dup = true;
             }
         }
         (!dup).into()
-    });
+    }));
     dup
 }
 
@@ -513,8 +513,8 @@ impl Compiler {
             }
         };
         match node {
-            FnNode::Function(f) => visit::function(f, &mut offer),
-            FnNode::Arrow(a) => visit::arrow(a, &mut offer),
+            FnNode::Function(f) => visit::function(f, visit::arg(&mut offer)),
+            FnNode::Arrow(a) => visit::arrow(a, visit::arg(&mut offer)),
         };
         for c in children {
             if !facts.ok {
@@ -598,7 +598,7 @@ pub(super) struct ProgramIndex<'a> {
 impl<'a> ProgramIndex<'a> {
     pub(super) fn of(prog: &'a ast::Program) -> ProgramIndex<'a> {
         let mut index = ProgramIndex { nodes: rustc_hash::FxHashMap::default(), regexes: Vec::new() };
-        visit::stmts(&prog.body, &mut |n| {
+        visit::stmts(&prog.body, visit::arg(&mut |n| {
             match n {
                 Node::Function(f) => {
                     index.nodes.insert((f.span.start, f.span.end), FnNode::Function(f));
@@ -610,7 +610,7 @@ impl<'a> ProgramIndex<'a> {
                 _ => {}
             }
             visit::Flow::Go
-        });
+        }));
         index
     }
 

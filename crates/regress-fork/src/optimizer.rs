@@ -114,7 +114,7 @@ pub enum PassAction {
 #[derive(Debug)]
 struct Pass<'a, F>
 where
-    F: FnMut(&mut Node, &Walk) -> PassAction,
+    F: FnMut(&mut Node, &Walk) -> PassAction + ?Sized,
 {
     // The function.
     func: &'a mut F,
@@ -128,7 +128,7 @@ where
 
 impl<'a, F> Pass<'a, F>
 where
-    F: FnMut(&mut Node, &Walk) -> PassAction,
+    F: FnMut(&mut Node, &Walk) -> PassAction + ?Sized,
 {
     fn new(func: &'a mut F, unicode: bool) -> Self {
         Pass {
@@ -178,6 +178,10 @@ fn run_pass<F>(r: &mut Regex, func: &mut F) -> bool
 where
     F: FnMut(&mut Node, &Walk) -> PassAction,
 {
+    // WebAssembly: one Pass for every pass function (module size), called
+    // through `dyn`; native code keeps each monomorphized.
+    #[cfg(target_arch = "wasm32")]
+    let func: &mut dyn FnMut(&mut Node, &Walk) -> PassAction = func;
     let mut p = Pass::new(func, r.flags.unicode_mode());
     p.run_to_fixpoint(&mut r.node);
     p.changed

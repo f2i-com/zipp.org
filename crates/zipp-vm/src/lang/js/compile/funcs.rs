@@ -2291,7 +2291,7 @@ fn fields_inline_ok(
     for p in &ctor.params.items {
         crate::capture::collect_pattern_names(p, &mut bound);
     }
-    visit::stmts(&ctor.body.stmts, &mut |n| {
+    visit::stmts(&ctor.body.stmts, visit::arg(&mut |n| {
         match n {
             Node::Pattern(ast::Pattern::Ident(name)) => {
                 bound.insert(name.to_string());
@@ -2309,15 +2309,15 @@ fn fields_inline_ok(
             _ => {}
         }
         Flow::Go
-    });
+    }));
     inits.iter().all(|e| {
         let refs = crate::capture::expr_refs_all(e);
         if refs.iter().any(|n| bound.contains(n) || n == "eval") {
             return false;
         }
-        visit::expr(e, &mut |n| match n {
+        visit::expr(e, visit::arg(&mut |n| match n {
             Node::Expr(ast::Expr::NewTarget) => Flow::Stop,
             _ => Flow::Go,
-        })
+        }))
     })
 }

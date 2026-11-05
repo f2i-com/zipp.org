@@ -45,12 +45,28 @@ pub(crate) enum Node<'a> {
     Class(&'a Class),
 }
 
+/// A walk's callback as the walk takes it. In WebAssembly a `dyn`, so every
+/// caller shares one copy of the walk (module size); natively the closure
+/// itself, so the walk is compiled for it.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub(crate) fn arg<'a, 'f>(f: &'f mut (impl FnMut(Node<'a>) -> Flow + 'f)) -> &'f mut (dyn FnMut(Node<'a>) -> Flow + 'f) {
+    f
+}
+
+/// See the WebAssembly form above.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub(crate) fn arg<'a, F: FnMut(Node<'a>) -> Flow>(f: &mut F) -> &mut F {
+    f
+}
+
 /// Walk `stmts` and everything under them.
-pub(crate) fn stmts<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn stmts<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(stmts: &'a [Stmt], f: &mut F) -> bool {
     stmts.iter().all(|s| stmt(s, f))
 }
 
-pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn stmt<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(s: &'a Stmt, f: &mut F) -> bool {
     match f(Node::Stmt(s)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -109,13 +125,13 @@ pub(crate) fn stmt<'a>(s: &'a Stmt, f: &mut impl FnMut(Node<'a>) -> Flow) -> boo
     }
 }
 
-fn var_decl<'a>(d: &'a VarDecl, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+fn var_decl<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(d: &'a VarDecl, f: &mut F) -> bool {
     d.decls
         .iter()
         .all(|x| pattern(&x.id, f) && x.init.as_ref().is_none_or(|e| expr(e, f)))
 }
 
-pub(crate) fn expr<'a>(e: &'a Expr, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn expr<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(e: &'a Expr, f: &mut F) -> bool {
     match f(Node::Expr(e)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -170,17 +186,17 @@ pub(crate) fn expr<'a>(e: &'a Expr, f: &mut impl FnMut(Node<'a>) -> Flow) -> boo
     }
 }
 
-fn call<'a>(c: &'a CallExpr, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+fn call<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(c: &'a CallExpr, f: &mut F) -> bool {
     expr(&c.callee, f) && args_(&c.args, f)
 }
 
-fn args_<'a>(args: &'a [Arg], f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+fn args_<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(args: &'a [Arg], f: &mut F) -> bool {
     args.iter().all(|a| match a {
         Arg::Expr(e) | Arg::Spread(e) => expr(e, f),
     })
 }
 
-fn member<'a>(m: &'a Member, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+fn member<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(m: &'a Member, f: &mut F) -> bool {
     expr(&m.object, f)
         && match &m.prop {
             MemberProp::Computed(e) => expr(e, f),
@@ -188,7 +204,7 @@ fn member<'a>(m: &'a Member, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
         }
 }
 
-pub(crate) fn pattern<'a>(p: &'a Pattern, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn pattern<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(p: &'a Pattern, f: &mut F) -> bool {
     match f(Node::Pattern(p)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -206,7 +222,7 @@ pub(crate) fn pattern<'a>(p: &'a Pattern, f: &mut impl FnMut(Node<'a>) -> Flow) 
     }
 }
 
-pub(crate) fn target<'a>(t: &'a Target, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn target<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(t: &'a Target, f: &mut F) -> bool {
     match f(Node::Target(t)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -230,7 +246,7 @@ pub(crate) fn target<'a>(t: &'a Target, f: &mut impl FnMut(Node<'a>) -> Flow) ->
     }
 }
 
-fn prop_key<'a>(k: &'a PropKey, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+fn prop_key<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(k: &'a PropKey, f: &mut F) -> bool {
     match f(Node::PropKey(k)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -242,11 +258,11 @@ fn prop_key<'a>(k: &'a PropKey, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
     }
 }
 
-pub(crate) fn params<'a>(p: &'a Params, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn params<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(p: &'a Params, f: &mut F) -> bool {
     p.items.iter().all(|p| pattern(p, f))
 }
 
-pub(crate) fn function<'a>(func: &'a Function, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn function<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(func: &'a Function, f: &mut F) -> bool {
     match f(Node::Function(func)) {
         Flow::Go => params(&func.params, f) && stmts(&func.body.stmts, f),
         Flow::Skip => true,
@@ -254,7 +270,7 @@ pub(crate) fn function<'a>(func: &'a Function, f: &mut impl FnMut(Node<'a>) -> F
     }
 }
 
-pub(crate) fn arrow<'a>(a: &'a Arrow, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn arrow<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(a: &'a Arrow, f: &mut F) -> bool {
     match f(Node::Arrow(a)) {
         Flow::Go => {}
         Flow::Skip => return true,
@@ -267,7 +283,7 @@ pub(crate) fn arrow<'a>(a: &'a Arrow, f: &mut impl FnMut(Node<'a>) -> Flow) -> b
         }
 }
 
-pub(crate) fn class<'a>(c: &'a Class, f: &mut impl FnMut(Node<'a>) -> Flow) -> bool {
+pub(crate) fn class<'a, F: FnMut(Node<'a>) -> Flow + ?Sized>(c: &'a Class, f: &mut F) -> bool {
     match f(Node::Class(c)) {
         Flow::Go => {}
         Flow::Skip => return true,

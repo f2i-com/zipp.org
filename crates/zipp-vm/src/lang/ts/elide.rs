@@ -118,12 +118,12 @@ fn count_references(body: &[Stmt], used: &mut rustc_hash::FxHashMap<usize, bool>
             }
         }
     }
-    visit::stmts(body, &mut |node| {
+    visit::stmts(body, visit::arg(&mut |node| {
         match node {
             Node::Expr(Expr::Ident(n)) => mark(n),
             Node::Target(Target::Ident { name, .. }) => mark(name),
             _ => {}
         }
         visit::Flow::Go
-    });
+    }));
 }
