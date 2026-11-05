@@ -3934,24 +3934,32 @@ impl<'p> Vm<'p> {
         if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
             return None;
         }
-        self.ic_call_method_mirror_ways(func_id, ip, idx, mir)
+        let bits = self.ic_call_method_mirror_ways(func_id, ip, idx, mir);
+        if bits == Value::UNDEFINED.bits() {
+            return None;
+        }
+        let callee = Value::from_bits(bits);
+        self.ic_plain_fn(callee).map(|(fid, closure)| (fid, closure, callee))
     }
 
     /// [`Self::ic_call_method_mirror`]'s site and ways, out of line: the
-    /// dispatch loop keeps one call.
+    /// dispatch loop keeps one call. It answers with the plain user function's
+    /// bits alone (`undefined`'s for none), which come back in a register:
+    /// as `Option<(u32, u32, Value)>` the answer came back through memory,
+    /// stored in pieces and read back as one 16-byte load, a failed
+    /// store-forward that held a fifth of a polymorphic `o.area()` loop's
+    /// cycles. The caller re-derives `(fid, closure)` with `ic_plain_fn`,
+    /// which is what a class-method way stored them from at its fill.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
-    fn ic_call_method_mirror_ways(
-        &self,
-        func_id: u32,
-        ip: usize,
-        idx: u32,
-        mir: crate::heap::HotMirror,
-    ) -> Option<(u32, u32, Value)> {
+    fn ic_call_method_mirror_ways(&self, func_id: u32, ip: usize, idx: u32, mir: crate::heap::HotMirror) -> u64 {
+        const NONE: u64 = Value::UNDEFINED.bits();
         if !self.deferred_ns_state.is_empty() || !self.ic_func_eligible(func_id) {
-            return None;
+            return NONE;
         }
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        let Some(site) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()) else {
+            return NONE;
+        };
         let sh = mir.shape;
         for e in &site.entries[..site.n as usize] {
             match *e {
@@ -3959,22 +3967,21 @@ impl<'p> Vm<'p> {
                     // SAFETY: the matching shape proves `vals` is the map's
                     // live value column and that it holds `slot`.
                     let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
-                    return self.ic_plain_fn(v).map(|(fid, closure)| (fid, closure, v));
+                    return if self.ic_plain_fn(v).is_some() { v.bits() } else { NONE };
                 }
                 IcEntry::ClassMethod {
                     class,
                     ver,
                     epoch,
                     callee,
-                    fid,
-                    closure,
                     recv_shape,
+                    ..
                 } if recv_shape == sh => {
                     if mir.fid == crate::heap::FID_MIRROR_CLASS | class
                         && self.heap.version_of(class) == ver
                         && self.class_proto_epoch == epoch
                     {
-                        return Some((fid, closure, callee));
+                        return callee.bits();
                     }
                 }
                 IcEntry::ProtoData {
@@ -3985,15 +3992,15 @@ impl<'p> Vm<'p> {
                 } if recv_shape == sh && slot != u32::MAX && mir.fid == crate::heap::FID_MIRROR_NONE => {
                     if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
                         let v = hm.val_at(slot as usize);
-                        if let Some((fid, closure)) = self.ic_plain_fn(v) {
-                            return Some((fid, closure, v));
+                        if self.ic_plain_fn(v).is_some() {
+                            return v.bits();
                         }
                     }
                 }
                 _ => {}
             }
         }
-        None
+        NONE
     }
 
     /// IC lookup + fill for a `CallMethod` site: resolves `recv.key` to a
