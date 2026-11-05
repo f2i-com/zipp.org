@@ -833,6 +833,10 @@ pub(crate) fn emit_inline_leaf_call(
     // Pending captured-variable writes: upvalue index → the scratch register
     // holding the value to commit after the body. See the `UpvalSet` arm.
     let mut upval_buf: FxHashMap<u16, u16> = FxHashMap::default();
+    // Pending global writes, the same way (`leaf_global_stores_buffered`):
+    // global slot → the scratch register holding the value to commit.
+    let buffer_globals = crate::codegen::leaf_global_stores_buffered(&plan.body);
+    let mut global_buf: FxHashMap<u32, u16> = FxHashMap::default();
     for (bi, instr) in plan.body.iter().enumerate() {
         dynasm!(ops ; => blabels[bi]);
         match *instr {
@@ -876,18 +880,31 @@ pub(crate) fn emit_inline_leaf_call(
                 );
             }
             Instr::LoadGlobal { dst: d, idx } => {
-                dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
-                    ; mov [rbx + dreg(rg(d))], rax
-                );
+                // A slot this body has written reads the pending value.
+                if let Some(&buf) = global_buf.get(&idx) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(buf)]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rax, [r12 + (idx as i32) * 8]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                }
             }
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src } => {
-                dynasm!(ops
-                    ; mov rax, [rbx + dreg(rg(src))]
-                    ; mov [r12 + (idx as i32) * 8], rax
-                );
+                if buffer_globals {
+                    // Committed after the last op (see the commit below).
+                    global_buf.insert(idx, rg(src));
+                } else {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(rg(src))]
+                        ; mov [r12 + (idx as i32) * 8], rax
+                    );
+                }
             }
             Instr::Add { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
@@ -1410,6 +1427,17 @@ pub(crate) fn emit_inline_leaf_call(
     // sound to inline a body whose upvalue write precedes deopt-capable ops.
     // Bodies that reach here are branch-free (`callee_leaf_ok`), so each write is
     // unconditional. `jit_cell_set` cannot fail: a cell is one heap slot.
+    // Buffered global writes commit first, as the raw slot stores they were.
+    if !global_buf.is_empty() {
+        let mut pending: Vec<(u32, u16)> = global_buf.iter().map(|(&i, &r)| (i, r)).collect();
+        pending.sort_unstable(); // deterministic emission order
+        for (idx, src) in pending {
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(src)]
+                ; mov [r12 + (idx as i32) * 8], rax
+            );
+        }
+    }
     if !upval_buf.is_empty() {
         let mut pending: Vec<(u16, u16)> = upval_buf.iter().map(|(&i, &r)| (i, r)).collect();
         pending.sort_unstable(); // deterministic emission order

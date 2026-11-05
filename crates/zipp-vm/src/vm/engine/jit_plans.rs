@@ -3144,6 +3144,17 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            // A body that can bail after a global write is a leaf only because
+            // the emitter buffers its writes; it decides that on this very body,
+            // so the two must agree (the span helper's path buffers nothing).
+            if crate::codegen::leaf_store_then_bail(&body)
+                && (span_code_unit_pred.is_some() || !crate::codegen::leaf_global_stores_buffered(&body))
+            {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (unbuffered global write before a bail)");
+                }
+                continue;
+            }
             // A flattened wrapper owns no captures (enforced by
             // `splice_nested_leaf`), so the nested callee's biased body indices
             // exclusively address this returned map. Merge it before the write
@@ -3999,6 +4010,13 @@ impl<'p> Vm<'p> {
             nested_reject("inner-not-leaf");
             return None;
         };
+        // A body that bails after a global write is a leaf only because the
+        // emitter buffers its writes, which it does not do in a wrapper's
+        // flat body (it holds the wrapper's `Call`).
+        if crate::codegen::leaf_store_then_bail(&inner_body) {
+            nested_reject("inner-buffered-global-write");
+            return None;
+        }
         // `splice_uninit_mask`, parameter aliasing and the typed-lane planner
         // encode register sets in u64. The historical 32+32 leaf caps made
         // this bound implicit; the guarded wider leaf cap needs it explicit.

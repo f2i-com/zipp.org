@@ -1220,6 +1220,124 @@ env_off_switch! {
     fn leaf_getprop_enabled() = "ZIPP_NO_LEAF_GETPROP"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_TX_GLOBAL_STORE=1`: an inlined leaf's global write commits
+    /// where it stands again, so no deopt-capable op may follow it
+    /// (`leaf_global_stores_buffered`), for an A/B.
+    fn tx_global_store_enabled() = "ZIPP_NO_TX_GLOBAL_STORE"
+}
+
+/// The register an op of the leaf whitelist writes, `Some(None)` for one that
+/// writes none, and `None` for an op outside the list (assumed to write
+/// anything).
+fn leaf_op_writes(i: &Instr) -> Option<Option<u16>> {
+    Some(match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::LoadUndefined { dst }
+        | Instr::Move { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::MathOp { dst, .. } => Some(dst),
+        Instr::StoreGlobal { .. }
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined => None,
+        _ => return None,
+    })
+}
+
+/// Whether the inline emitters BUFFER every global write of leaf body `body`
+/// (as they buffer an `UpvalSet`): written nowhere until the body's last op,
+/// a later `LoadGlobal` of the slot reading the pending value. Then a write is
+/// no effect for the ordering rule, and deopt-capable ops may follow it: a
+/// PRNG helper (`seed = (imul(seed, a) + c) | 0; return (seed >>> 0) / 2**32`)
+/// writes its global first, so it was not a leaf at all and a hot loop paid a
+/// full call for it (1.4M calls in numbers-format-parse, 1.05M in
+/// strings-build-slice). Only a branch-free body with no captured-variable
+/// write and no nested call, and only when no write's source register is
+/// written again before the end, so the register still holds the value at the
+/// commit.
+pub(crate) fn leaf_global_stores_buffered(body: &[Instr]) -> bool {
+    if !tx_global_store_enabled() {
+        return false;
+    }
+    let mut any = false;
+    for (i, ins) in body.iter().enumerate() {
+        match *ins {
+            Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::UpvalSet { .. }
+            | Instr::Call { .. } => return false,
+            Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } | Instr::StoreGlobalResolved { src, .. } => {
+                any = true;
+                for later in &body[i + 1..] {
+                    match leaf_op_writes(later) {
+                        Some(Some(r)) if r == src => return false,
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    any
+}
+
+/// Whether leaf body `body` has a deopt-capable op after a global write: a
+/// body the ordering rule admits only because its writes are buffered
+/// (`leaf_global_stores_buffered`). Spliced into a wrapper's flat body, which
+/// the emitter does not buffer (it holds the wrapper's `Call`), such a body
+/// would commit the write and then bail.
+pub(crate) fn leaf_store_then_bail(body: &[Instr]) -> bool {
+    let Some(k) = body.iter().position(|i| {
+        matches!(
+            i,
+            Instr::StoreGlobal { .. } | Instr::StoreGlobalStrict { .. } | Instr::StoreGlobalResolved { .. }
+        )
+    }) else {
+        return false;
+    };
+    !body[k + 1..].iter().all(|i| {
+        matches!(
+            i,
+            Instr::LoadInt { .. }
+                | Instr::LoadConst { .. }
+                | Instr::LoadBool { .. }
+                | Instr::Move { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        )
+    })
+}
+
 fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
     if callee.is_generator || callee.is_async {
         return None;
@@ -1284,6 +1402,8 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
         )
     });
     let mut seen_effect = false;
+    // Global writes the emitters buffer are no effect for the ordering rule.
+    let buffered_globals = leaf_global_stores_buffered(&code);
     let mut call_at: Option<usize> = None;
     for (i, instr) in code.iter().enumerate() {
         let is_last = i == code.len() - 1;
@@ -1450,7 +1570,9 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. } => {
-                seen_effect = true;
+                if !buffered_globals {
+                    seen_effect = true;
+                }
             }
             // Anything else (calls, heap writes, closures, throw, …) declines —
             // the inline emitter doesn't implement it. Under `ZIPP_JITDECLINE=1`,
