@@ -834,6 +834,9 @@ impl<'p> Vm<'p> {
         original: Value,
         len: u64,
     ) -> Result<Option<Value>, Thrown> {
+        if self.array_species_is_default(original) {
+            return Ok(None);
+        }
         // ArraySpeciesCreate step 1-2: if IsArray(originalArray) is false, return
         // ArrayCreate(length) — `constructor`/`@@species` are NOT consulted for a
         // non-array receiver (e.g. `Array.prototype.map.call(typedArray | plainObj)`).
@@ -880,6 +883,45 @@ impl<'p> Vm<'p> {
             ));
         }
         Ok(Some(self.construct(species, &[Value::num(len as f64)])?))
+    }
+
+    /// Whether ArraySpeciesCreate on `original` is ArrayCreate with nothing
+    /// observable run: a plain array of the main realm with no own named
+    /// property and no prototype of its own, %Array.prototype%'s
+    /// `constructor` a data slot holding %Array%, and %Array%'s @@species the
+    /// default getter (which answers its receiver). Every `slice`, `map`,
+    /// `filter`, `splice` and `concat` read both by name and called the
+    /// getter: a recursion through `f(...rest.slice(0, 3))` spent a fifth of
+    /// its time there.
+    fn array_species_is_default(&self, original: Value) -> bool {
+        if !original.is_heap() || self.arr_proto == 0 || self.array_ctor == 0 {
+            return false;
+        }
+        let idx = original.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+        {
+            return false;
+        }
+        let HeapObj::Object(ap) = self.heap.get(self.arr_proto) else {
+            return false;
+        };
+        let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
+            !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
+        });
+        if !constructor_ok {
+            return false;
+        }
+        let HeapObj::Object(ctor) = self.heap.get(self.array_ctor) else {
+            return false;
+        };
+        ctor.pos("@@species").is_some_and(|slot| {
+            let getter = ctor.val_at(slot);
+            ctor.attr_at(slot).accessor
+                && getter.is_heap()
+                && matches!(self.heap.get(getter.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
+        })
     }
 
     /// Append one concat element at the running index `n`: define it on the
