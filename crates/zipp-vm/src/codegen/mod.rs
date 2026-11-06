@@ -556,6 +556,12 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// `ZIPP_NO_MIRROR_HAS=1` compiles Tier-C `key in obj` without the
+    /// array-mirror lane (`emit_arr_mirror_has`). Compile-time.
+    fn arr_mirror_has_enabled() = "ZIPP_NO_MIRROR_HAS"
+);
+
+env_off_switch!(
     /// `ZIPP_NO_ACC_LANE=1` compiles property sites without the
     /// shape-keyed accessor lane (`AccLanePlan`). Plan-time.
     fn acc_lane_enabled() = "ZIPP_NO_ACC_LANE"

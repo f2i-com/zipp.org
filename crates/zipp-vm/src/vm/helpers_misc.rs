@@ -3813,6 +3813,109 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
     value.bits()
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_ARR_MUTATE_LANE=1`: compiled `shift`/`unshift`/`splice`/
+    /// `reverse` calls take the general method route again, for an A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn arr_mutate_lane_enabled() = "ZIPP_NO_ARR_MUTATE_LANE"
+}
+
+/// [`jit_array_mutate`]'s operations, by the method name and argument count
+/// of a compiled call (`None` for any other, or with the lane off).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn arr_mutate_op(key: &str, argc: u16) -> Option<u8> {
+    if !arr_mutate_lane_enabled() {
+        return None;
+    }
+    Some(match (key, argc) {
+        ("shift", 0) => 0,
+        ("unshift", 1..=8) => 1,
+        ("splice", 1..=8) => 2,
+        ("reverse", 0) => 3,
+        _ => return None,
+    })
+}
+
+/// Win64 helper for a compiled `arr.shift()`, `arr.unshift(…)`,
+/// `arr.splice(…)` or `arr.reverse()`: the operation (bits 0-7 of `packed`,
+/// [`arr_mutate_op`]) with `argc` arguments (bits 8-15) read from `args`, run
+/// by `array_method` directly, past the builtin call chain
+/// (`jit_method_builtin_fallback`, `try_builtin_method`,
+/// `dispatch_builtin_method_inner`) a third of such a call spent in. Or
+/// `SELF_CALL_DEOPT`, having done nothing, wherever that chain could do
+/// anything else or the arm could run user code: [`jit_array_pop`]'s
+/// declines (not a plain Array, the method shadowed or replaced, any side
+/// table, a virtual or non-writable length, an indexed or replaced
+/// prototype), an arguments object or a second realm, a hole in the first
+/// slot for `shift` (its Get reads through the prototype), and for `splice`
+/// a start or count that is not a Number or `undefined` (ToIntegerOrInfinity
+/// would run `valueOf`) or a non-default species. With those excluded the
+/// arm cannot throw, so an error is a decline before any effect too.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `args` addresses `argc` argument registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_mutate(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    args: *const u64,
+    packed: u64,
+) -> u64 {
+    const DEOPT: u64 = crate::codegen::SELF_CALL_DEOPT;
+    let op = (packed & 0xff) as u8;
+    let argc = ((packed >> 8) & 0xff) as usize;
+    let arr = Value::from_bits(arr_bits);
+    if argc > 8 || !arr.is_heap() {
+        return DEOPT;
+    }
+    // Copied out before the VM is borrowed: the registers live in the VM.
+    let mut buf = [Value::UNDEFINED; 8];
+    for (k, slot) in buf.iter_mut().enumerate().take(argc) {
+        // SAFETY: the emitter passes the address of `argc` argument registers.
+        *slot = Value::from_bits(unsafe { *args.add(k) });
+    }
+    let args = &buf[..argc];
+    let name = match op {
+        0 => "shift",
+        1 => "unshift",
+        2 => "splice",
+        3 => "reverse",
+        _ => return DEOPT,
+    };
+    // SAFETY: exclusive view; the array's Vec is not cached across the call.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = arr.heap_index();
+    let first_hole = match vm.heap.get(idx) {
+        HeapObj::Array(items) => items.first().is_some_and(|v| v.is_hole()),
+        _ => return DEOPT,
+    };
+    let Some(memo) = crate::vm::builtins::arr_memo_id(name) else {
+        return DEOPT;
+    };
+    if (op == 0 && first_hole)
+        || !vm.realm_global_objs.is_empty()
+        || vm.arr_props.contains_key(&idx)
+        || vm.array_js_len.contains_key(&idx)
+        || vm.array_length_nonwritable.contains(&idx)
+        || vm.array_proto_has_index
+        || vm.proto_of.contains_key(&idx)
+        || vm.arguments_objs.contains_key(&idx)
+        || !vm.array_memo_is_intrinsic(memo, name)
+    {
+        return DEOPT;
+    }
+    if op == 2
+        && (!args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
+            || !vm.array_species_is_default(arr))
+    {
+        return DEOPT;
+    }
+    match vm.array_method(idx, name, args) {
+        Ok(Some(v)) => v.bits(),
+        _ => DEOPT,
+    }
+}
+
 /// Win64 helper: may `arr` take the register tier's inline `push` lane for the
 /// WHOLE life of a compiled region? Returns 1 (yes) or 0 (take `entry_bail`).
 ///
@@ -8303,12 +8406,30 @@ impl<'p> Vm<'p> {
         at
     }
 
-    /// Duplicate a suspended frame-free activation as a GC root, leaving two
-    /// levels under this VM's call cap. `false`, with nothing done, when full.
+    /// Duplicate a suspended frame-free activation, given as its words, as a
+    /// GC root, leaving two levels under this VM's call cap. `false`, with
+    /// nothing done, when full.
     #[inline(always)]
-    fn root_activation(&mut self, prior: TiercActivationState) -> bool {
+    fn root_activation(&mut self, prior: [u64; 3]) -> bool {
         self.jit_tierc_activation_stack.len() + 2 < self.jit_call_cap as usize
-            && self.jit_tierc_activation_stack.push(prior)
+            && self.jit_tierc_activation_stack.push_words(prior)
+    }
+
+    /// The running activation's state as its three words, read whole (see
+    /// `TiercActivationState::_pad0`).
+    #[inline(always)]
+    fn tierc_activation_words(&self) -> [u64; 3] {
+        let p = &self.jit_tierc_activation as *const TiercActivationState as *const [u64; 3];
+        // SAFETY: `repr(C)`, 24 bytes at 8-byte alignment, every byte a field.
+        unsafe { p.read() }
+    }
+
+    /// Install an activation state, written as three whole words.
+    #[inline(always)]
+    fn set_tierc_activation_words(&mut self, w: [u64; 3]) {
+        let p = &mut self.jit_tierc_activation as *mut TiercActivationState as *mut [u64; 3];
+        // SAFETY: as `tierc_activation_words`; `w` is a valid state's words.
+        unsafe { p.write(w) };
     }
 
     #[inline(always)]
@@ -8324,8 +8445,9 @@ impl<'p> Vm<'p> {
         // the native-call limit so a chain that starts in such a real Frame
         // still reaches this cap while the cross-call helper can decline cleanly
         // before native entry. Deep recursion is cold and semantics stay exact.
-        let prior = self.jit_tierc_activation;
-        let rooted_prior = prior.active && prior.frame_free;
+        let prior = self.tierc_activation_words();
+        // `active && frame_free`: bytes 0 and 1 of the first word.
+        let rooted_prior = prior[0] & 0x0101 == 0x0101;
         if rooted_prior {
             // The token is a Rust local and is invisible to VM GC. Duplicate
             // only a suspended frame-free state here; a frame-backed prior is
@@ -8342,17 +8464,10 @@ impl<'p> Vm<'p> {
             }
             activationrootstats::nested_under_frame_free();
         }
-        self.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free,
-            closure,
-            callee,
-            upvals_raw,
-        };
-        Some(TiercActivationToken {
-            prior: prior.to_words(),
-            rooted_prior,
-        })
+        self.set_tierc_activation_words(
+            TiercActivationState::new(true, frame_free, closure, callee, upvals_raw).to_words(),
+        );
+        Some(TiercActivationToken { prior, rooted_prior })
     }
 
     /// Restore the state replaced by [`Vm::enter_tierc_activation`]. Called
@@ -8360,12 +8475,15 @@ impl<'p> Vm<'p> {
     /// metering continuation can re-enter the VM.
     #[inline(always)]
     pub(crate) fn leave_tierc_activation(&mut self, token: TiercActivationToken) {
-        let prior = TiercActivationState::from_words(token.prior);
         if token.rooted_prior {
             let rooted = self.jit_tierc_activation_stack.pop();
-            debug_assert_eq!(rooted, Some(prior), "Tier-C activation-root stack imbalance");
+            debug_assert_eq!(
+                rooted,
+                Some(TiercActivationState::from_words(token.prior)),
+                "Tier-C activation-root stack imbalance"
+            );
         }
-        self.jit_tierc_activation = prior;
+        self.set_tierc_activation_words(token.prior);
     }
 }
 
@@ -8380,13 +8498,7 @@ mod tierc_activation_root_tests {
     }
 
     fn state(closure: u32, callee: u32, frame_free: bool) -> TiercActivationState {
-        TiercActivationState {
-            active: true,
-            frame_free,
-            closure,
-            callee,
-            upvals_raw: 0,
-        }
+        TiercActivationState::new(true, frame_free, closure, callee, 0)
     }
 
     #[test]
@@ -8473,16 +8585,15 @@ mod tierc_activation_root_tests {
             TiercActivationState::EMPTY,
             state(0, 0, false),
             state(u32::MAX - 1, 7, true),
-            TiercActivationState {
-                active: false,
-                frame_free: true,
-                closure: 0x8000_0001,
-                callee: u32::MAX,
-                upvals_raw: 0xFFFF_8000_1234_5678,
-            },
+            TiercActivationState::new(false, true, 0x8000_0001, u32::MAX, 0xFFFF_8000_1234_5678),
         ];
         for s in states {
             assert_eq!(TiercActivationState::from_words(s.to_words()), s);
+            // The words are the state's bytes as they lie: what the whole-word
+            // reads and writes move.
+            // SAFETY: `repr(C)`, 24 bytes at 8-byte alignment, every byte a field.
+            let raw = unsafe { (&s as *const TiercActivationState as *const [u64; 3]).read() };
+            assert_eq!(raw, s.to_words());
         }
         // A restore through a token gives back exactly the state it replaced.
         let program = fixture();
@@ -8553,21 +8664,19 @@ pub(crate) extern "win64" fn jit_cross3_enter(
     if vm.regs_would_overflow(needed) {
         return 0;
     }
-    let prior = vm.jit_tierc_activation;
-    let rooted = prior.active && prior.frame_free;
+    let prior = vm.tierc_activation_words();
+    // `active && frame_free`, as `enter_tierc_activation` reads them.
+    let rooted = prior[0] & 0x0101 == 0x0101;
     if rooted {
         if !vm.root_activation(prior) {
             return 0;
         }
         activationrootstats::nested_under_frame_free();
     }
-    vm.jit_tierc_activation = TiercActivationState {
-        active: true,
-        frame_free: true,
-        closure: callee_idx,
-        callee: callee_idx,
-        upvals_raw: vm.heap.upvals_mirror_of(callee_idx),
-    };
+    let upvals_raw = vm.heap.upvals_mirror_of(callee_idx);
+    vm.set_tierc_activation_words(
+        TiercActivationState::new(true, true, callee_idx, callee_idx, upvals_raw).to_words(),
+    );
     let mut out = new_base_ptr as u64;
     if needed <= vm.regs_hw {
         // SAFETY: needed ≤ regs_hw ≤ capacity; [0..regs_hw] was initialized by
@@ -10061,8 +10170,31 @@ pub(crate) extern "win64" fn jit_has_property(
     obj_bits: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // A present element of a dense array, from the store alone: settle the
+    // array's mirror entry under `jit_get_index`'s conditions, so the emitted
+    // Tier-C lane (`emit_arr_mirror_has`) answers the next probes. An array
+    // only ever probed with `in` was never settled, as only element reads
+    // and for-of steps did that.
+    let (key, obj) = (Value::from_bits(key_bits), Value::from_bits(obj_bits));
+    if key.is_int() && obj.is_heap() {
+        let aidx = obj.heap_index();
+        if let HeapObj::Array(items) = vm.heap.get(aidx) {
+            let present = usize::try_from(key.as_int())
+                .ok()
+                .and_then(|i| items.get(i))
+                .is_some_and(|v| !v.is_hole());
+            if present
+                && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&aidx))
+                && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
+                && (vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&aidx))
+            {
+                vm.heap.repair_arr_mirror(aidx);
+                return Value::bool(true).bits();
+            }
+        }
+    }
     let _guard = vm.gc_lock_guard();
-    match vm.has_property_jit(Value::from_bits(obj_bits), Value::from_bits(key_bits)) {
+    match vm.has_property_jit(obj, key) {
         Some(present) => Value::bool(present).bits(),
         None => crate::codegen::SELF_CALL_DEOPT,
     }

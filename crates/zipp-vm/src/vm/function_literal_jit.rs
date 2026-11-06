@@ -245,13 +245,7 @@ mod tests {
             .alloc(HeapObj::EvalScope(std::collections::HashMap::new()));
         vm.closure_eval_scope.insert(active, scope);
         vm.obj_realm.insert(active, 7);
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee: active,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, active, 0);
         vm.gc_stress = true;
 
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;

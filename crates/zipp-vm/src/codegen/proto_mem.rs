@@ -5300,6 +5300,12 @@ pub(crate) fn compile_proto_mem(
                 // interpreter on the served chains; a Proxy anywhere, an
                 // object key's observable ToString, or a non-object RHS
                 // declines so the interpreter re-executes. PURE — no refetch.
+                // A present element of a dense array answers first, through
+                // the array mirror the helper settles.
+                let done = ops.new_dynamic_label();
+                if arr_mirror_has_enabled() {
+                    emit_arr_mirror_has(&mut ops, dst, obj, key, done);
+                }
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
                     ; mov rdx, [rbx + dreg(key)]         // key bits
@@ -5312,6 +5318,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
             }
             Instr::HasProp {
                 dst,
@@ -7443,6 +7450,37 @@ pub(crate) fn compile_proto_mem(
                         );
                         done
                     });
+                    // `arr.shift()`, `unshift(…)`, `splice(…)` and `reverse()`
+                    // on a plain dense Array: `jit_array_mutate`, which runs the
+                    // dense arm past the builtin call chain or declines, having
+                    // done nothing, as `pop` above. Metered bodies keep the
+                    // route below (interpreter-parity charging).
+                    let mut_done = crate::vm::arr_mutate_op(key, argc).filter(|_| meter.is_none()).map(|op| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                            ; mov r9d, (op as i32) | ((argc as i32) << 8)
+                            ; mov rax, QWORD crate::vm::jit_array_mutate as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        // `splice`'s result allocates a Heap slot, which can
+                        // move the versions Vec; no user code runs.
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
                     // `view.getUint32(pos, le)` and the other DataView accessors
                     // on a pristine view: the interpreter's own lanes, run from
                     // here (`jit_dv_method_call`). The route below reached them
@@ -7633,6 +7671,9 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => leaf_done);
                     }
                     if let Some(done) = pop_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = mut_done {
                         dynasm!(ops ; => done);
                     }
                     if let Some(done) = dv_done {

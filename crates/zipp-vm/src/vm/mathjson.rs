@@ -1184,7 +1184,7 @@ impl<'p> Vm<'p> {
                         || self.arguments_objs.contains_key(&idx)
                         || self.array_elements_overlaid(idx)
                         || self.array_js_len.contains_key(&idx)
-                        || items.iter().any(|v| v.is_hole())
+                        || Value::any_hole(&items)
                     {
                         return None;
                     }

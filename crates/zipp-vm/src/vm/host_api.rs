@@ -239,10 +239,14 @@ const _: () = {
     use crate::vm::TiercActivationState as A;
     assert!(core::mem::offset_of!(A, active) == 0);
     assert!(core::mem::offset_of!(A, frame_free) == 1);
+    assert!(core::mem::offset_of!(A, _pad0) == 2);
     assert!(core::mem::offset_of!(A, closure) == 4);
     assert!(core::mem::offset_of!(A, callee) == 8);
+    assert!(core::mem::offset_of!(A, _pad1) == 12);
     assert!(core::mem::offset_of!(A, upvals_raw) == 16);
     assert!(core::mem::size_of::<A>() == 24);
+    // The whole-word moves (`Vm::tierc_activation_words`) read it as `[u64; 3]`.
+    assert!(core::mem::align_of::<A>() == 8);
 };
 /// B189b mirrors for the emitted call lane: a Closure occupant's captured
 /// `this` bits and (B243, emitted again) its upvalue base, which the inline

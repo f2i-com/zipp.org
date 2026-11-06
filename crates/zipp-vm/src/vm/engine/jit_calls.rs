@@ -3155,7 +3155,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) => {
                     // A HOLE element would take CreateListFromArrayLike through
                     // a proto-chain Get; ≤ 32 keeps the per-call scan bounded.
-                    if items.len() > 32 || items.iter().any(|v| v.is_hole()) {
+                    if items.len() > 32 || Value::any_hole(&items) {
                         return None;
                     }
                     let n = items.len().min(Self::MI_MAX_REGS);

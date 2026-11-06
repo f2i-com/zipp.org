@@ -2166,7 +2166,7 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => items.clone(),
             _ => return Ok(Vec::new()),
         };
-        if !items.iter().any(|x| x.is_hole()) {
+        if !Value::any_hole(&items) {
             return Ok(items);
         }
         // Resolving a hole can run a getter installed on `Array.prototype`, i.e.

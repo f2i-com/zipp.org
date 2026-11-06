@@ -148,7 +148,7 @@ pub(crate) fn is_pop_name(key: &str) -> bool {
 }
 
 /// B191 memo indices for the hot array names (see `ARR_MEMO_NAMES`).
-fn arr_memo_id(name: &str) -> Option<usize> {
+pub(crate) fn arr_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "push" => ARR_MEMO_PUSH,
         "pop" => ARR_MEMO_POP,
@@ -651,7 +651,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         let n = items.len();
-        if items.iter().any(|v| v.is_hole()) {
+        if Value::any_hole(&items) {
             return false;
         }
         if !self.arguments_objs.contains_key(&idx) {
@@ -2526,7 +2526,7 @@ impl<'p> Vm<'p> {
                     let elements_are_arrs = arr.is_heap()
                         && !self.arr_props.contains_key(&arr.heap_index())
                         && matches!(self.heap.get(arr.heap_index()),
-                            HeapObj::Array(items) if !items.iter().any(|v| v.is_hole()));
+                            HeapObj::Array(items) if !Value::any_hole(&items));
                     let callargs = if arr.is_nullish() {
                         Vec::new()
                     } else {

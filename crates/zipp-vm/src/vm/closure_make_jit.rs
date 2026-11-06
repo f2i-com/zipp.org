@@ -606,13 +606,7 @@ mod tests {
         let cell = vm.heap.alloc_cell(Value::int(41));
         vm.regs[cell_reg as usize] = Value::heap(cell);
         let callee = vm.heap.alloc(HeapObj::Func(fid));
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, callee, 0);
 
         let packed = ((fid as u64) << 32) | ip as u64;
         let regs = vm.regs.as_mut_ptr() as *mut u64;
@@ -649,13 +643,7 @@ mod tests {
         vm.regs = vec![Value::UNDEFINED; cell_regs].into();
         vm.regs[reg as usize] = Value::int(9);
         let cell_callee = vm.heap.alloc(HeapObj::Func(cell_fid));
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee: cell_callee,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, cell_callee, 0);
         let packed_cell = ((cell_fid as u64) << 32) | cell_ip as u64;
         let regs = vm.regs.as_mut_ptr() as *mut u64;
         let n = vm.regs.len() as u64;

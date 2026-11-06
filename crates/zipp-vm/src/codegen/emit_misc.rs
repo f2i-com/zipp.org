@@ -1903,6 +1903,55 @@ pub(crate) fn emit_arr_mirror_get(
     );
 }
 
+/// `dst = key in obj` answered `true` for a present element of a dense Array
+/// at a non-negative int key, read through the array mirror with no call (an
+/// in-range element that is not a hole is an own property, whatever the
+/// prototype chain holds). Jumps to `done` with `dst` written; a hole, an
+/// index past the entry, a negative or non-int key, a cleared entry and any
+/// other receiver fall through to the caller's helper, which proves an
+/// absent answer and repairs the entry. Clobbers rax, rcx, rdx, r9 and r10.
+pub(crate) fn emit_arr_mirror_has(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    obj: u16,
+    key: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    let slow = ops.new_dynamic_label();
+    let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+    let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => slow
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, 0x7FF9                    // Value TAG_INT >> 48
+        ; jne => slow
+        ; mov edx, edx                        // a negative int is huge
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + arr_len]
+        ; jae => slow
+        ; mov r9, [rdi + arr_raw]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; cmp rdx, [r9 + 8]
+        ; jae => slow
+        ; mov r9, [r9]
+        ; mov rax, [r9 + rdx*8]
+        ; mov r10, QWORD ARR_HOLE_BITS as i64
+        ; cmp rax, r10
+        ; je => slow
+        ; mov r10, QWORD BOOL_TRUE_BITS as i64
+        ; mov [rbx + dreg(dst)], r10
+        ; jmp => done
+        ; => slow
+    );
+}
+
 /// `dst = obj.length` for a dense Array through its array mirror entry, with
 /// no call: heap tag, the mirror's bounds, a live entry (a cleared one is
 /// `[0, 0]`; a live one's base is never null, an empty Vec's included), and

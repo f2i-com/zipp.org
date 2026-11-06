@@ -350,6 +350,7 @@ impl<'p> Vm<'p> {
             const_string_dense: Vec::new(),
             const_string_texts: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),
+            index_key_strs: Vec::new(),
             key_value_front: (0..crate::vm::props::KEY_VALUE_FRONT_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::props::KeyValueFront::EMPTY))
                 .collect(),

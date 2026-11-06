@@ -178,8 +178,16 @@ const NO_CLOSURE: u32 = u32::MAX;
 struct TiercActivationState {
     active: bool,
     frame_free: bool,
+    /// The padding, as fields that are always zero: with every byte a field,
+    /// the state moves as three whole qwords (`Vm::tierc_activation_words`,
+    /// `ActivationRootStack::push_words`). Copied field by field, its 8-byte
+    /// reads spanned the 1- and 4-byte stores that wrote it, which
+    /// store-to-load forwarding cannot serve: a stall in every callback a
+    /// builtin ran under a frame-free caller, half of `forEach`'s time.
+    _pad0: u16,
     closure: u32,
     callee: u32,
+    _pad1: u32,
     /// Raw base of `closure`'s `upvalues` slice (0 when there is none), cached
     /// once per entry so the emitted `UpvalGet` needs no closure resolution
     /// (B189). Valid for exactly the activation's lifetime: the closure is
@@ -222,15 +230,19 @@ impl ActivationRootStack {
         slots: [TiercActivationState::EMPTY; TIER_C_ACTIVATION_ROOT_STACK_MAX],
     };
 
-    /// `false` when full: the caller declines before native entry, exactly
-    /// as the `len() >= MAX` check it replaces.
+    /// Push a state given as its words, stored as three qwords (see
+    /// `TiercActivationState::_pad0`). `false` when full: the caller declines
+    /// before native entry, exactly as the `len() >= MAX` check it replaces.
     #[inline]
-    fn push(&mut self, s: TiercActivationState) -> bool {
+    fn push_words(&mut self, w: [u64; 3]) -> bool {
         let d = self.depth as usize;
         if d >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
             return false;
         }
-        self.slots[d] = s;
+        let p = &mut self.slots[d] as *mut TiercActivationState as *mut [u64; 3];
+        // SAFETY: the state is `repr(C)`, 24 bytes at 8-byte alignment, with
+        // every byte a field; `w` is a valid state's words (its bools 0 or 1).
+        unsafe { p.write(w) };
         self.depth += 1;
         true
     }
@@ -282,21 +294,33 @@ pub(crate) struct TiercActivationToken {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 impl TiercActivationState {
-    const EMPTY: Self = Self {
-        active: false,
-        frame_free: false,
-        closure: NO_CLOSURE,
-        callee: NO_CLOSURE,
-        upvals_raw: 0,
-    };
+    const EMPTY: Self = Self::new(false, false, NO_CLOSURE, NO_CLOSURE, 0);
 
-    /// The state as three words: `active | frame_free << 8 | closure << 32`,
-    /// `callee`, `upvals_raw`.
+    /// A state, its padding zero.
+    #[inline(always)]
+    const fn new(active: bool, frame_free: bool, closure: u32, callee: u32, upvals_raw: u64) -> Self {
+        Self {
+            active,
+            frame_free,
+            _pad0: 0,
+            closure,
+            callee,
+            _pad1: 0,
+            upvals_raw,
+        }
+    }
+
+    /// The state as three words, its bytes as they lie: `active |
+    /// frame_free << 8 | closure << 32`, `callee`, `upvals_raw` (the
+    /// padding is zero).
     #[inline(always)]
     fn to_words(self) -> [u64; 3] {
         [
-            self.active as u64 | (self.frame_free as u64) << 8 | (self.closure as u64) << 32,
-            self.callee as u64,
+            self.active as u64
+                | (self.frame_free as u64) << 8
+                | (self._pad0 as u64) << 16
+                | (self.closure as u64) << 32,
+            self.callee as u64 | (self._pad1 as u64) << 32,
             self.upvals_raw,
         ]
     }
@@ -304,13 +328,7 @@ impl TiercActivationState {
     /// The inverse of [`TiercActivationState::to_words`].
     #[inline(always)]
     fn from_words(w: [u64; 3]) -> Self {
-        Self {
-            active: w[0] & 1 != 0,
-            frame_free: (w[0] >> 8) & 1 != 0,
-            closure: (w[0] >> 32) as u32,
-            callee: w[1] as u32,
-            upvals_raw: w[2],
-        }
+        Self::new(w[0] & 1 != 0, (w[0] >> 8) & 1 != 0, (w[0] >> 32) as u32, w[1] as u32, w[2])
     }
 }
 
@@ -1923,6 +1941,12 @@ pub struct Vm<'p> {
     /// values are roots (`Vm::mark_roots`) and frozen, since many holders
     /// name each one.
     pub(crate) key_str_cache: rustc_hash::FxHashMap<Box<str>, Value>,
+    /// `key_str_cache`'s strings for the array indices `0..len`, by index
+    /// (`Vm::index_key_strs_upto`): an array's keys are its index texts, and
+    /// formatting each one to find it in the table was most of what
+    /// `Object.keys` of an array cost. Every entry is held by
+    /// `key_str_cache`, which roots it and never drops it.
+    pub(crate) index_key_strs: Vec<Value>,
     /// `key_str_cache`'s answers for short keys, direct-mapped by the key's
     /// words (`Vm::cached_key_str_front`).
     pub(crate) key_value_front: Box<[std::cell::Cell<props::KeyValueFront>]>,

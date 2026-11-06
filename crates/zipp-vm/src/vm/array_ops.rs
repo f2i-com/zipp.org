@@ -1282,7 +1282,7 @@ impl<'p> Vm<'p> {
         // below would do is unobservable here.)
         if depth <= 0 && mapper.is_none() && dense {
             let clean = matches!(self.heap.get(sidx), HeapObj::Array(items)
-                    if items.len() as u64 == source_len && !items.iter().any(|v| v.is_hole()));
+                    if items.len() as u64 == source_len && !Value::any_hole(&items));
             if clean {
                 // (`clean` proved it the length of a Vec, so it fits.)
                 self.reserve_array_result(out, source_len as usize, false)?;
@@ -3240,12 +3240,14 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 } as usize;
+                // A hole fails HasProperty (no proto index can cover it on
+                // this gated plain-chain path) — spec skips it, and it matches
+                // nothing in the scan.
                 let pos = match self.heap.get(idx) {
-                    HeapObj::Array(items) => (from..items.len()).find(|&i| {
-                        // A hole fails HasProperty (no proto index can cover it
-                        // on this gated plain-chain path) — spec skips it.
-                        !items[i].is_hole() && self.values_strict_eq(items[i], arg0)
-                    }),
+                    HeapObj::Array(items) if from < items.len() => {
+                        super::collections::strict_eq_position(&self.heap, &items[from..], arg0, false)
+                            .map(|p| p + from)
+                    }
                     _ => None,
                 };
                 Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
@@ -3337,13 +3339,15 @@ impl<'p> Vm<'p> {
                     if let HeapObj::Array(items) = self.heap.get(idx) {
                         if !items.is_empty() {
                             let hi = (from as usize).min(items.len() - 1);
-                            for i in (0..=hi).rev() {
-                                // A hole fails HasProperty on this plain-chain
-                                // path — spec skips it (see "indexOf").
-                                if !items[i].is_hole() && self.values_strict_eq(items[i], arg0) {
-                                    result = i as i32;
-                                    break;
-                                }
+                            // A hole fails HasProperty on this plain-chain
+                            // path — spec skips it (see "indexOf").
+                            if let Some(p) = super::collections::strict_eq_position(
+                                &self.heap,
+                                &items[..=hi],
+                                arg0,
+                                true,
+                            ) {
+                                result = p as i32;
                             }
                         }
                     }
@@ -3557,7 +3561,7 @@ impl<'p> Vm<'p> {
                     && !self.arr_props.contains_key(&idx)
                     && match self.heap.get(idx) {
                         HeapObj::Array(items) => {
-                            start >= end || !items[start as usize..end as usize].iter().any(|v| v.is_hole())
+                            start >= end || !Value::any_hole(&items[start as usize..end as usize])
                         }
                         _ => false,
                     };

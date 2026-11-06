@@ -1350,7 +1350,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) if !items.is_empty() && items.len() <= MAX_ARMS => items,
                 _ => continue,
             };
-            if items.iter().any(|v| v.is_hole()) {
+            if Value::any_hole(&items) {
                 continue;
             }
 

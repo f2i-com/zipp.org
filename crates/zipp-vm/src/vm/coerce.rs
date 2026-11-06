@@ -941,7 +941,7 @@ impl<'p> Vm<'p> {
     /// path. O(n), but only consulted by methods that are already O(n) (and whose
     /// per-element JS callback dominates).
     pub(crate) fn array_has_holes(&self, idx: u32) -> bool {
-        matches!(self.heap.get(idx), HeapObj::Array(items) if items.iter().any(|v| v.is_hole()))
+        matches!(self.heap.get(idx), HeapObj::Array(items) if Value::any_hole(&items))
     }
 
     /// IsArray(v) (ES 7.2.2): true for an Array exotic, recursing through Proxy
@@ -1033,7 +1033,7 @@ impl<'p> Vm<'p> {
             let idx = obj.heap_index();
             if !self.arguments_objs.contains_key(&idx)
                 && self.js_array_len(idx) == items.len()
-                && !items.iter().any(|v| v.is_hole())
+                && !Value::any_hole(&items)
                 && !self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
             {
                 self.preflight_native_iteration_work(items.len() as u64)?;
