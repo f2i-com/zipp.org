@@ -3721,6 +3721,8 @@ impl<'p> Vm<'p> {
         use crate::codegen::MethodInlinePlan;
         use crate::heap::HeapObj;
         const MAX_ARMS: usize = crate::codegen::JIT_IC_WAYS; // = 8
+        // Elements of an `arr[i]` receiver's array looked at for candidates.
+        const MI_ARRAY_CAND_SCAN: usize = 256;
         let mut plan = rustc_hash::FxHashMap::default();
         if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
             return plan; // kill-switch (live through all stages)
@@ -3889,8 +3891,14 @@ impl<'p> Vm<'p> {
                 if let Some(&av) = self.regs.get(base + arr_reg as usize) {
                     if av.is_heap() {
                         if let HeapObj::Array(items) = self.heap.get(av.heap_index()) {
-                            let snapshot: Vec<Value> = items.iter().copied().collect();
-                            for el in snapshot {
+                            // Its first few distinct objects are the guesses: the
+                            // whole array was copied and walked, for at most eight
+                            // arms, at every such site of every compile (4% of a
+                            // row holding 100K-element arrays).
+                            for &el in items.iter().take(MI_ARRAY_CAND_SCAN) {
+                                if cands.len() >= MAX_ARMS {
+                                    break;
+                                }
                                 push_cand(el, &mut cands, &mut cand_bits);
                             }
                         }
