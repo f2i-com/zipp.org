@@ -6,8 +6,9 @@
 //! `undefined`, as the arrow's own frame has none) and that arrow called
 //! twice, `Reflect.construct` with a foreign `newTarget`, `extends null`, a
 //! plain-function parent, throws from a parent constructor and a field
-//! initializer, and a recursive constructor 60 deep. In the
-//! interpreter, by default and with every function compiled at once.
+//! initializer, and a recursive constructor 20 deep (each level nests a run
+//! loop, and the safe-sandbox builds allow 32). In the interpreter, by
+//! default and with every function compiled at once.
 
 const SOURCE: &str = r##""use strict";
 // Derived-class constructors (super(), this-TDZ, new.target) run hot enough to compile.
@@ -57,15 +58,15 @@ const w7 = hot(3000, (i) => {
   return (n instanceof Nul ? 1 : 0) + w.fp;
 });
 out.push("W " + w7 + " " + e7.join(","));
-// 8. a recursive derived constructor, 60 deep
+// 8. a recursive derived constructor, 20 deep
 class Deep extends A { constructor(n) { super(n); this.next = n > 0 ? new Deep(n - 1) : null; } }
 let depth = 0;
-for (let i = 0; i < 50; i++) { let d = new Deep(60); depth = 0; while (d) { depth++; d = d.next; } }
+for (let i = 0; i < 50; i++) { let d = new Deep(20); depth = 0; while (d) { depth++; d = d.next; } }
 out.push("D " + depth);
 console.log(out.join("\n"));
 "##;
 
-const EXPECTED: &str = "H 16052000\nR 4537500\nT T1:ReferenceError T2:ReferenceError T3:TypeError T4:ReferenceError T5:obj\nU 21000 ReferenceError\nN 40500\nW 9000000 150,0\nD 61";
+const EXPECTED: &str = "H 16052000\nR 4537500\nT T1:ReferenceError T2:ReferenceError T3:TypeError T4:ReferenceError T5:obj\nU 21000 ReferenceError\nN 40500\nW 9000000 150,0\nD 21";
 
 #[test]
 fn derived_ctor_semantics_worker() {
