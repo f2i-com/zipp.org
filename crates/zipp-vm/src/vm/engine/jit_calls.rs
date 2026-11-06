@@ -19,6 +19,14 @@ env_off_switch! {
     fn static_cross_enabled() = "ZIPP_NO_STATIC_CROSS"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_PRIVATE_CROSS=1`: compiled `this.#m` reads and `this.#m()`
+    /// calls take the generic private paths, as before
+    /// (`jit_private_method_callee`, the way-0 method read).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn private_cross_enabled() = "ZIPP_NO_PRIVATE_CROSS"
+}
+
 impl<'p> Vm<'p> {
     /// A callee the compiled call fallback completes through `call_value`, as
     /// the interpreter's Call op does: a native function (`parseInt`), or a
@@ -1134,7 +1142,15 @@ impl<'p> Vm<'p> {
         // The interpreter's own lane (`class_static_data_read`) resolves it
         // where it lies; a getter, a non-function or an excluded key keeps
         // the old path.
-        let callee = if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
+        let callee = if crate::vm::helpers_misc::is_private_key(key) {
+            // `recv.#m(...)`: the private method, brand-checked, as the
+            // interpreter resolves it (`jit_private_method_callee`); anything
+            // else the private call can be keeps the generic helper.
+            match self.jit_private_method_callee(func_id, ip, base, recv, name, key) {
+                Some(f) => f,
+                None => return SELF_CALL_DEOPT,
+            }
+        } else if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
             match self.jit_class_static_callee(recv, key) {
                 Some(f) => f,
                 None => return SELF_CALL_DEOPT,
@@ -1146,8 +1162,53 @@ impl<'p> Vm<'p> {
             callee
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);
-        let _ = name; // validated above through the live instruction/key lookup
         self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
+    }
+
+    /// The plain user function `recv.#m(...)` calls (`key` the private name,
+    /// `name` its string constant) from compiled code running `func_id` over
+    /// the window at `base`: the site's way-0 private method
+    /// (`ic_private_method_way0`), else PrivateMethodCall's resolution for
+    /// the running callee (`private_member_from_owner` once the brand check
+    /// `private_receiver_ok` passes), which fills that way as the
+    /// interpreter's CallMethod does. `None`, with nothing observable done,
+    /// for a name that is a private accessor or field, a receiver that fails
+    /// the brand check (the generic path throws its TypeError) and a callee
+    /// that is not a plain function. The generic helper resolved the method
+    /// without the site on every call and ran it through `call_value`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_private_method_callee(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        recv: Value,
+        name: u32,
+        key: &str,
+    ) -> Option<Value> {
+        if !private_cross_enabled() || !recv.is_heap() {
+            return None;
+        }
+        let ctx = self.jit_running_callee(func_id, base)?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(m) = self.ic_private_method_way0(func_id, ip, ctx, recv.heap_index()) {
+            return self.ic_plain_fn(m).map(|_| m);
+        }
+        let site = super::values::private_site(func_id, name);
+        let (brand, kind, owner, _) = match self.private_memo_hit(ctx, site) {
+            Some(hit) => hit,
+            None => self.resolve_private_site(ctx, site, key)?,
+        };
+        if kind & 1 == 0 || !self.private_receiver_ok(recv, brand, kind, owner) {
+            return None;
+        }
+        let m = self.private_member_from_owner(owner, key, (kind & 8) | 1)?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        if kind & 8 == 0 && m.is_heap() {
+            self.ic_private_method_fill(func_id, ip, ctx, brand, m, recv);
+        }
+        let _ = ip;
+        self.ic_plain_fn(m).map(|_| m)
     }
 
     /// The plain user function a class value `recv` holds as its static data
@@ -1771,8 +1832,16 @@ impl<'p> Vm<'p> {
             return None;
         }
         let ctx = self.jit_running_callee(func_id, base)?;
-        let (brand, id, pos) = self.ic_private_way0(func_id, ip, ctx)?;
         let idx = o.heap_index();
+        let Some((brand, id, pos)) = self.ic_private_way0(func_id, ip, ctx) else {
+            // A read of a private method (`this.#m` ahead of its call): the
+            // method the site's way 0 remembers, under the same guards as the
+            // interpreter's hit.
+            if op == 0 && private_cross_enabled() {
+                return self.ic_private_method_way0(func_id, ip, ctx, idx).map(|m| m.bits());
+            }
+            return None;
+        };
         let (at, v) = self.private_field_at(idx, brand, id, pos)?;
         if op == 0 {
             return Some(v.bits());
@@ -2503,6 +2572,21 @@ impl<'p> Vm<'p> {
             let recv = self.get(base, obj);
             // `func()` borrows &'p (program lifetime) — outlives `&mut self`.
             let key: &str = &self.func(func_id as usize).string_constants[name as usize];
+            // `recv.#m()` of a private METHOD: resolved through the site's
+            // way 0 (filled on a miss) and called as a resolved method below,
+            // instead of being looked up without the site and run through
+            // `call_value` by the miss arm. A private accessor or field, or a
+            // receiver without the brand, keeps that arm.
+            let private = if crate::vm::is_private_key(key) {
+                self.jit_private_method_callee(func_id, ip, base, recv, name, key)
+                    .and_then(|m| self.ic_plain_fn(m).map(|(f, c)| (f, c, m)))
+                    .filter(|&(f, _, _)| !self.func(f as usize).lexical_this)
+            } else {
+                None
+            };
+            if let Some((fid, closure, m)) = private {
+                (fid, closure, recv, m)
+            } else {
             match self.ic_call_method(func_id, ip, recv, key) {
                 // An ARROW binds `this` LEXICALLY: reg 0 is its captured
                 // `this_val`, and the receiver is ignored entirely. This arm
@@ -2582,6 +2666,7 @@ impl<'p> Vm<'p> {
                     return self
                         .jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
                 }
+            }
             }
         } else {
             let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;

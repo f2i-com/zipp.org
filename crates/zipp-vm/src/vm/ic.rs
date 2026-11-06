@@ -1899,6 +1899,34 @@ impl<'p> Vm<'p> {
         (self.private_memo_key(ctx) == Some(head)).then_some((brand, id, pos))
     }
 
+    /// The site's way-0 private METHOD (`IcEntry::PrivateMethod`) for code
+    /// running as `ctx` and the receiver at heap `idx`: what
+    /// [`Self::ic_private_method_tail`] answers for the top frame's callee,
+    /// for compiled code, whose running callee is not the top frame's. A
+    /// compiled `this.#m` read only ever tried the field way, so every one
+    /// resolved the method again and refilled this way.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn ic_private_method_way0(&self, func_id: u32, ip: usize, ctx: Value, idx: u32) -> Option<Value> {
+        let Some(IcEntry::PrivateMethod {
+            head,
+            brand,
+            method,
+            epoch,
+            pos,
+        }) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()).map(|s| s.entries[0])
+        else {
+            return None;
+        };
+        if epoch != self.private_epoch
+            || self.private_memo_key(ctx) != Some(head)
+            || matches!(self.heap.get(idx), HeapObj::Class(_))
+        {
+            return None;
+        }
+        self.brand_entry_at(idx, brand, pos).is_some().then_some(method)
+    }
+
     /// [`Self::ic_private_get_tail`] for a write of the field, which must
     /// already be there (PrivateSet; an add takes the uncached path). The
     /// own hit hands over only the site: its way 0 is read again here, which
