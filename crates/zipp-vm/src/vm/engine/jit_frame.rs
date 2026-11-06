@@ -526,8 +526,10 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
             if let Some(live) = live {
+                // An arrow accessor (lexical `this`) is the slow path's,
+                // which deopts it: only the interpreter's call binds it.
                 let callee = if own {
-                    self.ic_plain_fn(live)
+                    self.ic_plain_fn(live).filter(|&(fid, _)| !self.func(fid as usize).lexical_this)
                 } else {
                     (live.bits() == lane.fn_bits).then_some((lane.fid, lane.closure))
                 };

@@ -846,6 +846,11 @@ impl<'p> Vm<'p> {
                 }
                 let f = if set { hm.attr_at(s).setter } else { hm.val_at(s) };
                 let (fid, closure) = self.ic_plain_fn(f)?;
+                // An arrow's `this` is its captured one, which only the
+                // interpreter's call binds (`jit_prop_slow_impl` deopts it).
+                if self.func(fid as usize).lexical_this {
+                    return None;
+                }
                 lane.recv_shape = recv_shape;
                 lane.first = hops.0[0].0;
                 lane.nhops = n as u8;
