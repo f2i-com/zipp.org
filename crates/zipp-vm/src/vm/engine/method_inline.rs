@@ -862,6 +862,11 @@ impl<'p> Vm<'p> {
             return None;
         }
         let c = &p.code;
+        // The store must be the whole body: the instruction after it returns.
+        // (Only its first instructions were matched once, and a setter that
+        // began `this.k = v; if (…) …` ran its store alone off-frame, its
+        // rest never.) A setter's result is discarded, so any return is one.
+        let returns_at = |i: usize| matches!(c.get(i), Some(Instr::ReturnUndefined | Instr::Return { .. }));
         // Plain `this.field = arg` (val register == the formal param, reg 1).
         if let Instr::SetProp {
             obj: 0,
@@ -870,6 +875,9 @@ impl<'p> Vm<'p> {
             strict: _,
         } = c.first()?
         {
+            if !returns_at(1) {
+                return None;
+            }
             return Some((&p.string_constants[*name as usize], false));
         }
         // `this.field = (arg | 0)`: LoadInt 0 → Bitwise Or(arg, 0) → SetProp.
@@ -895,7 +903,7 @@ impl<'p> Vm<'p> {
                 name,
                 val,
                 strict: _,
-            } if *val == or_dst => Some((&p.string_constants[*name as usize], true)),
+            } if *val == or_dst && returns_at(3) => Some((&p.string_constants[*name as usize], true)),
             _ => None,
         }
     }
