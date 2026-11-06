@@ -622,7 +622,26 @@ pub(crate) mod pc {
         let end = start + len as u64;
         if let Ok(mut r) = RANGES.lock() {
             r.retain(|e| e.1 <= start || e.0 >= end);
-            r.push((start, end, label()));
+            let label = label();
+            // `ZIPP_PROF_PC_CODE=<dir>`: each body's bytes as `<start>.bin` and
+            // a `ranges.txt` line, so the dump's absolute samples can be laid
+            // over a disassembly instruction by instruction.
+            if let Some(dir) = crate::env_var_os("ZIPP_PROF_PC_CODE") {
+                let dir = std::path::PathBuf::from(dir);
+                // SAFETY: the JIT registers a mapped, readable body of `len`
+                // bytes, which stays mapped (parked) while sampling runs.
+                let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+                let _ = std::fs::write(dir.join(format!("{start:x}.bin")), bytes);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("ranges.txt"))
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(f, "{start:x} {end:x} {label}");
+                }
+            }
+            r.push((start, end, label));
         }
     }
 
