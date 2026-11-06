@@ -5806,8 +5806,6 @@ fn jit_direct_miss_gate(vm: &mut Vm, site_idx: u32) -> crate::codegen::DirectMis
     vm.jit.direct_miss_gate(site_idx, &vm.jit_shape_slot_sites)
 }
 
-/// Record a `(site, shape) -> slot` memo entry and its site.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 /// Remember that `site_idx`'s miss on a receiver of layout `shape` resolved
 /// to an accessor, once the site's ways thrash (a site that does not keeps
 /// its identity accessor ways, which its probe serves without this helper).
@@ -5830,6 +5828,8 @@ env_off_switch! {
     fn jit_acc_route_enabled() = "ZIPP_NO_ACC_ROUTE"
 }
 
+/// Record a `(site, shape) -> slot` memo entry and its site.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn jit_shape_slot_put(vm: &mut Vm, site_idx: u32, shape: u32, slot: u32) {
     if vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX {
