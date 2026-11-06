@@ -4272,7 +4272,9 @@ mod fused_code_tests {
     /// superinstruction: the dispatch really runs them.
     #[test]
     fn warm_code_runs_fused() {
-        if !interp_fuse_enabled() {
+        // A metered build never runs the copy (`Vm::interp_fuse_ok`): it
+        // would charge one step for two instructions.
+        if !interp_fuse_enabled() || cfg!(feature = "meter-only") {
             return;
         }
         let src = "var g = 1, h = 2, t = 0; \
