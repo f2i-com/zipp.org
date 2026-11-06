@@ -1799,7 +1799,20 @@ impl<'p> Vm<'p> {
                             ip += 2;
                         }
                     }
-                    Instr::FuseGlobalInc { .. } | Instr::FuseGlobalIntBitwise { .. } => {
+                    Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op } => {
+                        let g = self.globals[idx as usize];
+                        if g.is_int() && self.global_route_epoch == 0 {
+                            let val = Value::int(val as i32);
+                            self.set(base, gdst, g);
+                            self.set(base, ldst, val);
+                            let r = self.fused_bitwise(g, val, op)?;
+                            self.set(base, dst, r);
+                            ip += 3;
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, true)?;
+                        }
+                    }
+                    Instr::FuseGlobalInc { .. } => {
                         ip = self.global_run(*instr, base, func_id, ip, true)?;
                     }
                     Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 } => {
