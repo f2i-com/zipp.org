@@ -12,6 +12,13 @@ env_off_switch! {
     fn jit_ctor_call_enabled() = "ZIPP_NO_JIT_CTOR_CALL"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_STATIC_CROSS=1`: a compiled `C.m()` on a class value declines
+    /// to the generic method helper, as before `jit_class_static_callee`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn static_cross_enabled() = "ZIPP_NO_STATIC_CROSS"
+}
+
 impl<'p> Vm<'p> {
     /// A callee the compiled call fallback completes through `call_value`, as
     /// the interpreter's Call op does: a native function (`parseInt`), or a
@@ -1119,12 +1126,75 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
         }
-        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-            return SELF_CALL_DEOPT;
+        // A class value's static data method (`Probe.make(s)`,
+        // `Entity.isEntity(o)`): the method cache keeps no way for a class
+        // receiver (`ic_recv_map` wants an object), so these declined to the
+        // generic helper, whose member walk and `call_value` ran each call
+        // in a nested interpreter loop (43 ns against 4 for a plain call).
+        // The interpreter's own lane (`class_static_data_read`) resolves it
+        // where it lies; a getter, a non-function or an excluded key keeps
+        // the old path.
+        let callee = if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
+            match self.jit_class_static_callee(recv, key) {
+                Some(f) => f,
+                None => return SELF_CALL_DEOPT,
+            }
+        } else {
+            let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
+                return SELF_CALL_DEOPT;
+            };
+            callee
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);
         let _ = name; // validated above through the live instruction/key lookup
         self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
+    }
+
+    /// The plain user function a class value `recv` holds as its static data
+    /// method `key`, own or through its `extends` chain, as the interpreter's
+    /// class-static lane reads it (`class_static_data_read`); `None` for an
+    /// accessor, a getter or setter of the name, a generator, async or
+    /// non-function value, and while that lane is off.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_class_static_callee(&self, recv: Value, key: &str) -> Option<Value> {
+        // A private name (`this.#m()` in a static method) is a private
+        // method call: its brand check, not a member read. A class keeps its
+        // static private methods in `statics` under the name's text, where
+        // the `extends` walk below would find a parent's for a subclass
+        // receiver that has no such brand (the interpreter reaches its
+        // class-static lane only after its private arms).
+        if !static_cross_enabled() || crate::vm::helpers_misc::is_private_key(key) {
+            return None;
+        }
+        let f = self.class_static_data_read(recv, key)?;
+        self.ic_plain_fn(f).map(|_| f)
+    }
+
+    /// The plain user function class `c` holds as its own static data
+    /// `[Symbol.hasInstance]`, read as `instance_of_op` reads it (no static
+    /// getter or setter of the name, not an accessor); `None` for anything
+    /// else, which keeps that path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_own_has_instance(&self, c: Value) -> Option<Value> {
+        if !c.is_heap() || !static_cross_enabled() {
+            return None;
+        }
+        let HeapObj::Class(cc) = self.heap.get(c.heap_index()) else {
+            return None;
+        };
+        if cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
+            || cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance")
+        {
+            return None;
+        }
+        let i = cc.statics.pos("@@hasInstance")?;
+        if cc.statics.attr_at(i).accessor {
+            return None;
+        }
+        let h = cc.statics.val_at(i);
+        self.ic_plain_fn(h).map(|_| h)
     }
 
     /// A semantics-guarded `CallMethodComputed` fast path for native MEMORY
@@ -2120,9 +2190,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn jit_region_instanceof_impl(
         &mut self,
         caller_base_ptr: *const u64,
+        packed_fip: u64,
         packed_args: u64,
     ) -> u64 {
-        use crate::codegen::SELF_CALL_DEOPT;
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
         if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
@@ -2132,6 +2203,36 @@ impl<'p> Vm<'p> {
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
         let c = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
         let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        // A class with its own static `[Symbol.hasInstance]` method: what
+        // `instance_of_op` calls (with `c` as `this` and `v` its argument,
+        // the result made a boolean), called native to native from this
+        // window, where `v` already sits in its register. Through
+        // `call_value` each test ran the method in a nested interpreter
+        // loop (105 ns a test). A decline has done nothing.
+        if let Some(h) = self.jit_own_has_instance(c) {
+            let func_id = (packed_fip >> 32) as usize;
+            let val_reg = packed_args & 0xFFFF;
+            if func_id < self.main_func_count.saturating_add(self.eval_funcs.len()) {
+                let caller_regs = self.func(func_id).reg_count.max(1) as u64;
+                if val_reg < caller_regs {
+                    // SAFETY: `val_reg` is a register of this window.
+                    let args = unsafe { caller_base_ptr.add(val_reg as usize) };
+                    let r = self.jit_cross_call_impl::<false>(
+                        caller_base_ptr,
+                        args,
+                        1 | (caller_regs << 16),
+                        h.bits(),
+                        Some(c),
+                    );
+                    if r == CALL_THREW {
+                        return r;
+                    }
+                    if r != SELF_CALL_DEOPT {
+                        return Value::bool(self.truthy(Value::from_bits(r))).bits();
+                    }
+                }
+            }
+        }
         self.jit_call_depth += 1;
         let r = self.instance_of_op(c, v);
         self.jit_call_depth -= 1;

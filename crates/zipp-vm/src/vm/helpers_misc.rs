@@ -2144,13 +2144,13 @@ pub(crate) extern "win64" fn jit_to_str_ic(
 pub(crate) extern "win64" fn jit_instanceof_ic(
     vm: *mut core::ffi::c_void,
     caller_base_ptr: *const u64,
-    _packed_fip: u64,
+    packed_fip: u64,
     packed_args: u64,
     _argc: u32,
 ) -> u64 {
     catch_effectful_jit_u64(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
-        vm.jit_region_instanceof_impl(caller_base_ptr, packed_args)
+        vm.jit_region_instanceof_impl(caller_base_ptr, packed_fip, packed_args)
     })
 }
 
