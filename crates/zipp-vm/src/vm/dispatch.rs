@@ -4824,16 +4824,6 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // The other dense mutators and the read-only
-                            // methods compiled code calls directly
-                            // (`array_mutate_fast`, `array_read_fast`): the
-                            // same declines, the same arms.
-                            #[cfg(not(feature = "meter-only"))]
-                            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
                         }
                         // Pristine non-BigInt DataView getters are a sufficiently
                         // hot interpreter primitive to bypass the generic
@@ -4956,6 +4946,20 @@ impl<'p> Vm<'p> {
                                 self.try_array_copy_len_reduce(func_id, ip, base, recv, key, None)
                             {
                                 ip = exit;
+                                continue;
+                            }
+                        }
+                        // The array methods compiled code calls directly
+                        // (`array_mutate_fast`, `array_read_fast`): the same
+                        // declines, the same arms. After the reduction above,
+                        // which a loop that only wants the copy's length takes
+                        // first: placed ahead of it, the lane built every copy
+                        // the reduction skips (sparse-array-v2 +13%).
+                        #[cfg(not(feature = "meter-only"))]
+                        if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
+                            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
+                                self.set(base, dst, v);
+                                ip += 1;
                                 continue;
                             }
                         }
