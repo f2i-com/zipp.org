@@ -7923,7 +7923,34 @@ impl<'p> Vm<'p> {
     /// `SuperCtor` at `ip` (`super(...)`), out of `dispatch_body` as
     /// [`Self::new_construct`] is.
     #[inline(never)]
-    fn super_ctor_call(
+    /// `super(...args)` (`SuperCtorSpread`) on the top frame at `base`: as
+    /// [`Self::super_ctor_call`], the arguments the elements of the array in
+    /// register `args`. The interpreter's arm and Tier C's
+    /// (`jit_class_ctor_op_impl`).
+    pub(crate) fn super_ctor_spread_call(
+        &mut self,
+        base: usize,
+        ip: usize,
+        ctor: u16,
+        home_class_id: u32,
+        args: u16,
+    ) -> Result<(), Thrown> {
+        let parent = self.get(base, ctor);
+        self.sync_top_ip(ip);
+        if !self.is_constructor(parent) {
+            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+        }
+        let this = self.get(base, 0);
+        let args_v = self.get(base, args);
+        let arg_vec = self.array_snapshot(args_v.heap_index());
+        // As `super_ctor_call`: an arrow's `super(...)` passes the captured
+        // `new.target`.
+        let nt = self.frame_new_target();
+        let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
+        self.super_ctor_complete(base, this, produced, home_class_id)
+    }
+
+    pub(crate) fn super_ctor_call(
         &mut self,
         base: usize,
         ip: usize,
@@ -7943,12 +7970,12 @@ impl<'p> Vm<'p> {
         let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
         let mut big = Vec::new();
         let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
-        // `super(...)` keeps the derived activation's new.target.
-        let nt = self
-            .frames
-            .last()
-            .map(|f| f.new_target)
-            .unwrap_or(Value::UNDEFINED);
+        // `super(...)` keeps the derived activation's new.target: an ARROW
+        // calling it (`() => super(x)`) has no own, and reads the one it
+        // captured inside the construction, as `new.target` does
+        // (`frame_new_target`); its frame's own is undefined, which the
+        // parent constructor saw as its `new.target`.
+        let nt = self.frame_new_target();
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.

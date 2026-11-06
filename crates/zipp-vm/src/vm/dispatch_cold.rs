@@ -1329,23 +1329,7 @@ impl<'p> Vm<'p> {
                 home_class_id,
                 args,
             } => {
-                let parent = self.get(base, ctor);
-                self.sync_top_ip(ip);
-                if !self.is_constructor(parent) {
-                    return Err(Thrown(
-                        "TypeError: superclass is not a constructor".into(),
-                    ));
-                }
-                let this = self.get(base, 0);
-                let args_v = self.get(base, args);
-                let arg_vec = self.array_snapshot(args_v.heap_index());
-                let nt = self
-                    .frames
-                    .last()
-                    .map(|f| f.new_target)
-                    .unwrap_or(Value::UNDEFINED);
-                let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
-                self.super_ctor_complete(base, this, produced, home_class_id)?;
+                self.super_ctor_spread_call(base, ip, ctor, home_class_id, args)?;
                 ip += 1;
             }
             Instr::SuperMethodSpread {
