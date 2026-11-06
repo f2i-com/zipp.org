@@ -226,6 +226,7 @@ fn dataview_big_bits_index(slot: usize) -> usize {
 impl<'p> Vm<'p> {
     /// The boot accessor's bits for the `DV_PROTO_METHODS` entry `slot` (as
     /// `dataview_proto_slot` numbers them), once the boot recorded them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn dataview_intrinsic_bits(&self, slot: usize) -> Option<u64> {
         let bits = match slot {
             0..=7 => self.dataview_numeric_getter_bits[slot],
