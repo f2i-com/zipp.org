@@ -6473,6 +6473,32 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Jump { target } => {
+                // A back-edge is the interpreter's GC safe point; here it is
+                // one when a collection is requested (`jit_loop_gc_poll`), as
+                // in a loop region. Not in a body whose string-append cursor
+                // proof is of a loop with no helper call (nothing there
+                // allocates, so nothing it does requests a collection).
+                if (target as usize) <= ip
+                    && str_append_cursor.is_none()
+                    && crate::codegen::loop_gc_poll_enabled()
+                    && crate::codegen::loop_needs_gc_poll(&proto.code, target as usize, ip)
+                {
+                    use crate::vm::host_api::JIT_GC_REQUESTED_OFFSET;
+                    let poll = ops.new_dynamic_label();
+                    let t = labels[target as usize];
+                    dynasm!(ops
+                        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+                        ; jne => poll
+                        ; jmp => t
+                        ; => poll
+                        ; mov rcx, rdi
+                        ; mov rax, QWORD crate::vm::jit_loop_gc_poll as *const () as i64
+                        ; call rax
+                    );
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                }
                 dynasm!(ops ; jmp => labels[target as usize]);
             }
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {

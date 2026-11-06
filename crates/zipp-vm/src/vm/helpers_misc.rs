@@ -1597,6 +1597,25 @@ pub(crate) extern "win64" fn jit_iter_to_array_ic(
     })
 }
 
+/// Win64 helper for a compiled loop's back-edge once a collection is
+/// requested: the interpreter's back-edge safe point (`maybe_gc`). A loop
+/// whose allocations all went through helpers that do not poll (a native
+/// method's result, its capture strings) and whose calls were inlined had no
+/// safe point at all: the heap grew by every object the loop made (4M slots
+/// for a million `exec`s against the interpreter's 66K) and each allocation
+/// appended to cold memory. Every live Value is in the register file, the
+/// globals or a side table, as at the call helpers that already poll; the
+/// caller refetches its pinned bases after the call.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` and the calling code holds no borrow of it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_loop_gc_poll(vm: *mut core::ffi::c_void) {
+    // SAFETY: as documented; the poll runs no user code.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.maybe_gc();
+}
+
 /// Win64 helper for `IterToArray`'s probe (`bytecode::ITER_PROBE`): whether
 /// Array iteration is the built-in one, as a boolean Value. Reads memoized
 /// prototype slots only; no allocation and no user code, so no call protocol.

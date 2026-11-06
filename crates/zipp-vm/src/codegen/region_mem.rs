@@ -1904,6 +1904,32 @@ pub(crate) fn compile_region_mem(
             }
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                // A back-edge is the interpreter's GC safe point; here it is
+                // one when a collection is requested (`jit_loop_gc_poll`).
+                // The pins are re-derived after it as after any helper that
+                // can collect.
+                if (target as usize) <= ip
+                    && crate::codegen::loop_gc_poll_enabled()
+                    && crate::codegen::loop_needs_gc_poll(&proto.code, target as usize, ip)
+                {
+                    use crate::vm::host_api::JIT_GC_REQUESTED_OFFSET;
+                    let poll = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+                        ; jne => poll
+                        ; jmp => t
+                        ; => poll
+                        ; mov rcx, rdi
+                        ; mov rax, QWORD crate::vm::jit_loop_gc_poll as *const () as i64
+                        ; call rax
+                    );
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                    }
+                    if let Some((snap, pin_plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, pin_plan, cache);
+                    }
+                }
                 dynasm!(ops ; jmp => t);
             }
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {

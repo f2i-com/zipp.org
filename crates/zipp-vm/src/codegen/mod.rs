@@ -654,6 +654,72 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_LOOP_GC_POLL=1`: a compiled loop's back-edge (a loop region's
+    /// or a Tier C body's backward `Jump`) is a bare jump again, with no
+    /// safe point when a collection is requested (`jit_loop_gc_poll`).
+    /// Compile-time.
+    fn loop_gc_poll_enabled() = "ZIPP_NO_LOOP_GC_POLL"
+}
+
+/// Whether the loop `code[header..=backedge]` needs a GC safe point at its
+/// back-edge (`jit_loop_gc_poll`): it has an instruction outside the set
+/// whose compiled forms allocate nothing, or allocate only through helpers
+/// that poll themselves (a string `+` through `jit_concat`; a getter or
+/// setter runs in a frame, whose transitions poll). Calls, constructions and
+/// the native-method and iteration ops are outside it: a native's result is
+/// allocated with no safe point. A loop of arithmetic and property traffic
+/// (nbody's) keeps a bare back-edge.
+pub(crate) fn loop_needs_gc_poll(code: &[Instr], header: usize, backedge: usize) -> bool {
+    let Some(body) = code.get(header..=backedge) else {
+        return true;
+    };
+    !body.iter().all(|i| {
+        matches!(
+            i,
+            Instr::LoadInt { .. }
+                | Instr::LoadConst { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::Move { .. }
+                | Instr::Jump { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
+                | Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Div { .. }
+                | Instr::Mod { .. }
+                | Instr::Bitwise { .. }
+                | Instr::AddInt { .. }
+                | Instr::Neg { .. }
+                | Instr::Not { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::UpvalGet { .. }
+                | Instr::UpvalSet { .. }
+                | Instr::CellGet { .. }
+                | Instr::CellSet { .. }
+                | Instr::GetProp { .. }
+                | Instr::SetProp { .. }
+                | Instr::GetIndex { .. }
+                | Instr::SetIndex { .. }
+                | Instr::MathOp { .. }
+        )
+    })
+}
+
+env_off_switch! {
     fn same_proto_cross2_enabled() = "ZIPP_NO_SAME_PROTO_CROSS2"
 }
 
