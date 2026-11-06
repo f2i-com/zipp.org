@@ -1475,6 +1475,90 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
     )
 }
 
+/// Whether a Tier-C body never consults the running activation
+/// (`Vm::jit_tierc_activation`: closure, callee, upvalue base), so a cross
+/// call into it may leave the caller's activation installed. A WHITELIST: any
+/// op not listed — upvalue and cell access, closure creation, class values,
+/// `super`, private names, handlers, iterators, spreads — and generator,
+/// async and `arguments` bodies keep the full activation protocol. (Readers
+/// of the activation: the upvalue ops and `jit_tierc_cell`, closure creation
+/// in `closure_make_jit`/`function_literal_jit`, and `jit_running_callee`,
+/// which serves private names and declines on a function-id mismatch.)
+/// Nothing the listed ops' helpers do reads it; `Error.stack` is built from
+/// interpreter frames only.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn activation_free(proto: &FuncProto) -> bool {
+    if proto.is_generator
+        || proto.is_async
+        || proto.arguments_reg.is_some()
+        || proto.string_constants.iter().any(|s| s.starts_with('#'))
+    {
+        return false;
+    }
+    proto.code.iter().all(|i| {
+        matches!(
+            i,
+            Instr::LoadConst { .. }
+                | Instr::LoadInt { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::Move { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Div { .. }
+                | Instr::Mod { .. }
+                | Instr::Neg { .. }
+                | Instr::Not { .. }
+                | Instr::Bitwise { .. }
+                | Instr::AddInt { .. }
+                | Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
+                | Instr::LooseEq { .. }
+                | Instr::TypeOf { .. }
+                | Instr::TypeOfIs { .. }
+                | Instr::TypeOfSame { .. }
+                | Instr::StrAppendInPlace { .. }
+                | Instr::StrConcatChain { .. }
+                | Instr::StrAppendIndex { .. }
+                | Instr::AddRightPair { .. }
+                | Instr::ToStr { .. }
+                | Instr::GetProp { .. }
+                | Instr::SetProp { .. }
+                | Instr::GetIndex { .. }
+                | Instr::SetIndex { .. }
+                | Instr::LenOf { .. }
+                | Instr::NewObject { .. }
+                | Instr::NewPlannedObject { .. }
+                | Instr::FinalizeObject { .. }
+                | Instr::InitDataProp { .. }
+                | Instr::AppendDataProp { .. }
+                | Instr::NewArray { .. }
+                | Instr::Call { .. }
+                | Instr::CallMethod { .. }
+                | Instr::CallWithThis { .. }
+                | Instr::TailCall { .. }
+                | Instr::MathOp { .. }
+                | Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        )
+    })
+}
+
 /// The owned, multi-word form of [`cross_uninit_mask`] for Tier-C callees with
 /// more than 64 registers. `None` is fail-closed: the op/use table declined,
 /// an operand was outside the declared register window, or the proto was not

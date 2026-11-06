@@ -2109,6 +2109,7 @@ impl<'p> Vm<'p> {
             sloppy_this,
             mask_gen,
             uninit_mask,
+            act_free: crate::codegen::cross3_act_free_enabled() && crate::codegen::activation_free(callee),
         })
     }
 

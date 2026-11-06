@@ -589,6 +589,13 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_CROSS3_ACT_FREE=1`: every inline cross call installs its
+    /// callee's activation (and roots a frame-free prior), even when the
+    /// callee's body never reads it (`activation_free`). Plan-time.
+    fn cross3_act_free_enabled() = "ZIPP_NO_CROSS3_ACT_FREE"
+}
+
+env_off_switch! {
     fn same_proto_cross2_enabled() = "ZIPP_NO_SAME_PROTO_CROSS2"
 }
 
@@ -1148,6 +1155,11 @@ pub struct SameProtoCross3Plan {
     /// is loaded from the live table per call (B199), never baked.
     pub mask_gen: u32,
     pub uninit_mask: u64,
+    /// The callee's body never reads the running activation
+    /// ([`activation_free`]): a site whose callee value sits in a caller
+    /// register (rooted by the suspended caller's window) may skip the
+    /// activation install and its root-stack duplicate.
+    pub act_free: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

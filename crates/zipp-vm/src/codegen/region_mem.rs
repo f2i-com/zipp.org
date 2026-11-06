@@ -5780,6 +5780,13 @@ pub(crate) fn emit_cross3_call(
             dst,
             caller_regs,
             c3,
+            // Only a callee read from a register of the caller's own window
+            // (below `caller_regs`, inside the live register prefix the
+            // collector scans): the suspended caller keeps that value rooted
+            // while the callee runs without an activation naming it. A
+            // stashed callee, or one in a scratch window above the caller's,
+            // has no such root.
+            act_free: plan.act_free && matches!(callee, Cross3Callee::Reg(r) if r < caller_regs),
         },
         heap,
         bail,
@@ -5862,6 +5869,7 @@ pub(crate) fn emit_cross3_method_call(
             dst,
             caller_regs,
             c3,
+            act_free: false,
         },
         heap,
         bail,
@@ -5884,6 +5892,10 @@ pub(crate) struct Cross3Invoke {
     pub dst: u16,
     pub caller_regs: u16,
     pub c3: i32,
+    /// The inline entry leaves the caller's activation installed (no install,
+    /// no root-stack duplicate): the callee never reads it and its value is
+    /// rooted by the caller's window. See `SameProtoCross3Plan::act_free`.
+    pub act_free: bool,
 }
 
 /// The shared cross3 INVOKE tail. ENTRY CONTRACT: the callee's heap index is
@@ -6013,6 +6025,21 @@ fn emit_cross3_invoke(
             ; add r8, iv.callee_regs as i32
             ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
             ; ja => hw_miss
+        );
+        if iv.act_free {
+            // The callee never reads the activation (`activation_free`), so
+            // the caller's stays installed: no install, and no root-stack
+            // duplicate of a frame-free prior, which remains the installed,
+            // rooted activation. The callee value lives in a caller register,
+            // rooted by the suspended caller's window. The exit's restore
+            // rewrites the unchanged prior; its duplicate bit is set only by
+            // the grow helper, which installs and roots as before.
+            dynasm!(ops
+                ; mov [rsp + c3 + 24], rdx
+                ; mov [rdi + regs_len], r8
+            );
+        } else {
+        dynasm!(ops
             // A frame-free prior needs a visible duplicate while the callee
             // runs. High-water and root capacity are checked before mutation.
             // The flag joins the base in the register, so the word is ONE
@@ -6063,6 +6090,7 @@ fn emit_cross3_invoke(
             ; mov r11, [r11 + r10 * 8]
             ; mov [rdi + act + 16], r11
         );
+        }
         if let Some(addr) = fill_counter {
             dynasm!(ops
                 ; mov rax, QWORD addr as i64
