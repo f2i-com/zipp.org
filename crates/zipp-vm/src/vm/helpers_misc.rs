@@ -3834,13 +3834,13 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
 env_off_switch! {
     /// `ZIPP_NO_ARR_MUTATE_LANE=1`: compiled `shift`/`unshift`/`splice`/
     /// `reverse`/`fill` calls take the general method route again, for an A/B.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(not(feature = "meter-only"))]
     fn arr_mutate_lane_enabled() = "ZIPP_NO_ARR_MUTATE_LANE"
 }
 
 /// [`jit_array_mutate`]'s operations, by the method name and argument count
 /// of a compiled call (`None` for any other, or with the lane off).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg(not(feature = "meter-only"))]
 pub(crate) fn arr_mutate_op(key: &str, argc: u16) -> Option<u8> {
     if !arr_mutate_lane_enabled() {
         return None;
@@ -3894,56 +3894,12 @@ pub(crate) extern "win64" fn jit_array_mutate(
         // SAFETY: the emitter passes the address of `argc` argument registers.
         *slot = Value::from_bits(unsafe { *args.add(k) });
     }
-    let args = &buf[..argc];
-    // The method's name and its intrinsic-memo slot (`builtins::arr_memo_id`'s
-    // numbering, asserted in the test below): a match of the name against
-    // thirty memoised ones was a call per compiled `splice`.
-    let (name, memo) = match op {
-        0 => ("shift", 6),
-        1 => ("unshift", 19),
-        2 => ("splice", 18),
-        3 => ("reverse", 17),
-        4 => ("fill", 21),
-        _ => return DEOPT,
-    };
     // SAFETY: exclusive view; the array's Vec is not cached across the call.
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    let idx = arr.heap_index();
-    let first_hole = match vm.heap.get(idx) {
-        HeapObj::Array(items) => items.first().is_some_and(|v| v.is_hole()),
-        _ => return DEOPT,
-    };
-    if (op == 0 && first_hole)
-        || !vm.realm_global_objs.is_empty()
-        || vm.arr_props.contains_key(&idx)
-        || vm.array_js_len.contains_key(&idx)
-        || vm.array_length_nonwritable.contains(&idx)
-        || vm.array_proto_has_index
-        || vm.proto_of.contains_key(&idx)
-        || vm.arguments_objs.contains_key(&idx)
-        || !vm.array_memo_is_intrinsic(memo, name)
-    {
-        return DEOPT;
-    }
-    if op == 2 {
-        if !args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
-            || !vm.array_species_is_default(arr)
-        {
-            return DEOPT;
-        }
-        return vm.array_splice_dense(idx, args).map_or(DEOPT, Value::bits);
-    }
-    // `fill(value, start, end)`: the positions' ToIntegerOrInfinity.
-    if op == 4 && !args.iter().skip(1).all(|a| a.is_number() || *a == Value::UNDEFINED) {
-        return DEOPT;
-    }
-    match vm.array_method(idx, name, args) {
-        Ok(Some(v)) => v.bits(),
-        _ => DEOPT,
-    }
+    vm.array_mutate_fast(arr, op, &buf[..argc]).map_or(DEOPT, Value::bits)
 }
 
-#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+#[cfg(all(test, not(feature = "meter-only")))]
 mod arr_mutate_memo_tests {
     /// `jit_array_mutate` names each operation's intrinsic-memo slot by
     /// number; they must be `arr_memo_id`'s.
@@ -4353,7 +4309,7 @@ pub(crate) fn str_lane_memo(key: &str, argc: u16) -> Option<u8> {
 /// The Array.prototype methods [`jit_str_method`] also serves, by their
 /// array-memo slot (`builtins::arr_memo_id`): the ones that run no user code
 /// on a plain array with plain arguments and change nothing.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[cfg(not(feature = "meter-only"))]
 pub(crate) fn arr_lane_memo(key: &str, argc: u16) -> Option<u8> {
     if !arr_method_lane_enabled() || argc > 4 {
         return None;
@@ -4373,8 +4329,8 @@ pub(crate) fn arr_lane_memo(key: &str, argc: u16) -> Option<u8> {
 }
 
 /// [`arr_lane_memo`]'s names by slot.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn arr_lane_name(memo: u8) -> Option<&'static str> {
+#[cfg(not(feature = "meter-only"))]
+pub(crate) fn arr_lane_name(memo: u8) -> Option<&'static str> {
     Some(match memo {
         2 => "join",
         3 => "indexOf",
@@ -4390,7 +4346,7 @@ fn arr_lane_name(memo: u8) -> Option<&'static str> {
 env_off_switch! {
     /// `ZIPP_NO_ARR_METHOD_LANE=1`: compiled Array method calls take the
     /// general method route again (`jit_str_method`'s array half).
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(not(feature = "meter-only"))]
     fn arr_method_lane_enabled() = "ZIPP_NO_ARR_METHOD_LANE"
 }
 
@@ -4520,53 +4476,8 @@ fn str_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 
 /// and for `concat` primitives or plain arrays.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn arr_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 {
-    let Some(name) = arr_lane_name(memo) else {
-        return crate::codegen::SELF_CALL_DEOPT;
-    };
-    let idx = recv.heap_index();
-    if !matches!(vm.heap.get(idx), HeapObj::Array(_))
-        || vm.array_proto_has_index
-        || vm.proto_of.contains_key(&idx)
-        || vm.arr_props.contains_key(&idx)
-        || vm.arguments_objs.contains_key(&idx)
-    {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    let numeric = |v: &Value| v.is_number() || *v == Value::UNDEFINED;
-    let ok = match name {
-        "indexOf" | "includes" | "lastIndexOf" => args.iter().skip(1).all(numeric),
-        "at" => args.iter().all(numeric),
-        "slice" => args.iter().all(numeric) && vm.array_species_is_default(recv),
-        // A separator ToString'd without code, and elements whose ToString
-        // runs none: primitives only (a hole reads `undefined` here, as no
-        // prototype holds an index). A Symbol element throws, having done
-        // nothing, and the route then throws it.
-        "join" => {
-            args.iter().all(|a| *a == Value::UNDEFINED || (a.is_heap() && vm.heap.is_str_like(a.heap_index())))
-                && match vm.heap.get(idx) {
-                    HeapObj::Array(items) => items.iter().all(|v| !vm.is_object_value(*v)),
-                    _ => false,
-                }
-        }
-        _ => {
-            vm.array_species_is_default(recv)
-                && args.iter().all(|a| {
-                    !a.is_heap() || vm.heap.is_str_like(a.heap_index()) || vm.array_spreadable_by_default(*a)
-                })
-        }
-    };
-    if !ok || !vm.array_memo_is_intrinsic(memo as usize, name) {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    if name == "slice" {
-        if let Some(v) = vm.array_slice_dense(idx, args) {
-            return v.bits();
-        }
-    }
-    match vm.array_method(idx, name, args) {
-        Ok(Some(v)) => v.bits(),
-        _ => crate::codegen::SELF_CALL_DEOPT,
-    }
+    vm.array_read_fast(recv, memo, args)
+        .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits)
 }
 
 /// [`jit_str_at`] for `charAt`.

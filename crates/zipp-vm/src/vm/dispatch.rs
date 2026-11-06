@@ -4841,6 +4841,16 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                            // The other dense mutators and the read-only
+                            // methods compiled code calls directly
+                            // (`array_mutate_fast`, `array_read_fast`): the
+                            // same declines, the same arms.
+                            #[cfg(not(feature = "meter-only"))]
+                            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // Pristine non-BigInt DataView getters are a sufficiently
                         // hot interpreter primitive to bypass the generic

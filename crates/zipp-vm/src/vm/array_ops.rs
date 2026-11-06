@@ -595,14 +595,190 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
     }
 
+    /// The interpreter's `arr.m(…)` for the methods compiled code calls
+    /// directly ([`Self::array_mutate_fast`], [`Self::array_read_fast`]), past
+    /// the builtin call chain the interpreter otherwise takes for them: the
+    /// arguments copied out of the registers (which keep them rooted), the
+    /// same declines, the same arms. `None` for any other method, or a
+    /// decline, having done nothing. Out of line, as the loop's other
+    /// receiver-kind leaves are.
+    ///
+    /// Only in a VM whose JIT is off (`ZIPP_NOJIT`, and every large program,
+    /// which runs interpreted): with it on, the sites taken here before their
+    /// function compiled left the compiled `shift`/`unshift` a third slower
+    /// (32 -> 48 ns), the route below being what the compiler plans from.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(never)]
+    pub(crate) fn interp_array_lane(
+        &mut self,
+        recv: Value,
+        key: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if self.jit_enabled {
+            return None;
+        }
+        let op = super::helpers_misc::arr_mutate_op(key, argc);
+        let memo = match op {
+            Some(_) => 0,
+            None => super::helpers_misc::arr_lane_memo(key, argc)?,
+        };
+        if argc > 8 {
+            return None;
+        }
+        let mut buf = [Value::UNDEFINED; 8];
+        for (k, slot) in buf.iter_mut().enumerate().take(argc as usize) {
+            *slot = self.get(base, arg_base + k as u16);
+        }
+        let args = &buf[..argc as usize];
+        match op {
+            Some(op) => self.array_mutate_fast(recv, op, args),
+            None => self.array_read_fast(recv, memo, args),
+        }
+    }
+
+    /// The Array methods called past the builtin call chain
+    /// (`jit_method_builtin_fallback` / `try_builtin_method` /
+    /// `dispatch_builtin_method_inner`), by compiled code (`jit_str_method`'s
+    /// Array half) and the interpreter (`interp_array_lane`): `memo` is the
+    /// method's intrinsic-memo slot ([`super::helpers_misc::arr_lane_memo`]).
+    /// `array_method` runs directly for a plain array of the main realm (no
+    /// own named property, %Array.prototype% its prototype, no indexed
+    /// property on the prototypes for a hole to read through, the default
+    /// species for `slice`/`concat`) when the method is still the boot
+    /// intrinsic and no argument can run user code: a search element of any
+    /// kind (compared, never coerced), a number or `undefined` for every
+    /// position, for `concat` primitives or plain arrays, and for `join` a
+    /// string separator over primitive elements. `None`, having done nothing,
+    /// otherwise: the caller takes the chain.
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_read_fast(&mut self, recv: Value, memo: u8, args: &[Value]) -> Option<Value> {
+        let name = super::helpers_misc::arr_lane_name(memo)?;
+        if !recv.is_heap() || !self.realm_global_objs.is_empty() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+        {
+            return None;
+        }
+        let numeric = |v: &Value| v.is_number() || *v == Value::UNDEFINED;
+        let ok = match name {
+            "indexOf" | "includes" | "lastIndexOf" => args.iter().skip(1).all(numeric),
+            "at" => args.iter().all(numeric),
+            "slice" => args.iter().all(numeric) && self.array_species_is_default(recv),
+            // A separator ToString'd without code, and elements whose
+            // ToString runs none: primitives only (a hole reads `undefined`
+            // here, as no prototype holds an index). A Symbol element
+            // throws, having done nothing, and the chain then throws it.
+            "join" => {
+                args.iter().all(|a| *a == Value::UNDEFINED || (a.is_heap() && self.heap.is_str_like(a.heap_index())))
+                    && match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.iter().all(|v| !self.is_object_value(*v)),
+                        _ => false,
+                    }
+            }
+            _ => {
+                self.array_species_is_default(recv)
+                    && args.iter().all(|a| {
+                        !a.is_heap() || self.heap.is_str_like(a.heap_index()) || self.array_spreadable_by_default(*a)
+                    })
+            }
+        };
+        if !ok || !self.array_memo_is_intrinsic(memo as usize, name) {
+            return None;
+        }
+        if name == "slice" {
+            if let Some(v) = self.array_slice_dense(idx, args) {
+                return Some(v);
+            }
+        }
+        match self.array_method(idx, name, args) {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The dense mutators called past the builtin call chain, by compiled
+    /// code (`jit_array_mutate`) and the interpreter (`interp_array_lane`):
+    /// `op` is [`super::helpers_misc::arr_mutate_op`]'s. `array_method`'s
+    /// dense arm (`splice`'s through [`Self::array_splice_dense`]), or
+    /// `None`, having done nothing, wherever the chain could do anything else
+    /// or the arm could run user code: not a plain Array, the method shadowed
+    /// or replaced, any side table (attribute overrides, frozen, sealed,
+    /// non-extensible), an arguments object, a virtual or non-writable
+    /// length, an indexed or replaced prototype, a second realm, a hole in the
+    /// first slot for `shift` (its Get reads through the prototype), for
+    /// `splice` a start or count that is not a Number or `undefined`
+    /// (ToIntegerOrInfinity would run `valueOf`) or a non-default species,
+    /// and for `fill` such a start or end. With those excluded the arm cannot
+    /// throw, so an error is a decline before any effect too.
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_mutate_fast(&mut self, arr: Value, op: u8, args: &[Value]) -> Option<Value> {
+        // The method's name and its intrinsic-memo slot (`builtins::arr_memo_id`'s
+        // numbering, asserted in `arr_mutate_memo_tests`): a match of the name
+        // against thirty memoised ones was a call per compiled `splice`.
+        let (name, memo) = match op {
+            0 => ("shift", 6),
+            1 => ("unshift", 19),
+            2 => ("splice", 18),
+            3 => ("reverse", 17),
+            4 => ("fill", 21),
+            _ => return None,
+        };
+        if !arr.is_heap() {
+            return None;
+        }
+        let idx = arr.heap_index();
+        let first_hole = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.first().is_some_and(|v| v.is_hole()),
+            _ => return None,
+        };
+        if (op == 0 && first_hole)
+            || !self.realm_global_objs.is_empty()
+            || self.arr_props.contains_key(&idx)
+            || self.array_js_len.contains_key(&idx)
+            || self.array_length_nonwritable.contains(&idx)
+            || self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+            || !self.array_memo_is_intrinsic(memo, name)
+        {
+            return None;
+        }
+        if op == 2 {
+            if !args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
+                || !self.array_species_is_default(arr)
+            {
+                return None;
+            }
+            return self.array_splice_dense(idx, args);
+        }
+        // `fill(value, start, end)`: the positions' ToIntegerOrInfinity.
+        if op == 4 && !args.iter().skip(1).all(|a| a.is_number() || *a == Value::UNDEFINED) {
+            return None;
+        }
+        match self.array_method(idx, name, args) {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// `slice(start, end)` of the plain dense array `idx`, its positions
     /// Numbers or `undefined`, when its range is hole-free: the dense arm's
     /// copy, past `array_method`'s gates and its second species proof. The
-    /// caller (`arr_lane_call`) has proved what the gates would: no side
+    /// caller (`array_read_fast`) has proved what the gates would: no side
     /// table, the default species, no indexed or replaced prototype, the
     /// intrinsic method. `None`, having done nothing, for a virtual length or
     /// a hole in the range (read through the prototype by the dense arm).
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn array_slice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
         if self.array_is_virtual(idx) {
             return None;
@@ -638,13 +814,13 @@ impl<'p> Vm<'p> {
     /// `splice(start, deleteCount, ...items)` of the plain dense array `idx`
     /// whose start and count are Numbers or `undefined` (at least the start
     /// is given): the dense arm's mutation and result, past `array_method`'s
-    /// gates and its second species proof. The caller (`jit_array_mutate`)
+    /// gates and its second species proof. The caller (`array_mutate_fast`)
     /// has proved what the gates would (no side table, a writable and
     /// non-virtual length, no indexed or replaced prototype, the default
     /// species, the intrinsic method), so nothing here can run code or throw.
     /// A pure removal drains, an equal-count replacement overwrites in place,
     /// and only a resize takes `Vec::splice`.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn array_splice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
         let len = match self.heap.get(idx) {
             HeapObj::Array(items) => items.len(),
