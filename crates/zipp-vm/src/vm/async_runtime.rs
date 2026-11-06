@@ -156,6 +156,14 @@ pub use asyncstats::dump as async_stats;
 pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
 pub use asyncstats::dump_job_window_calls as async_job_window_stats;
 
+env_off_switch! {
+    /// `ZIPP_NO_PRIMITIVE_AWAIT_DIRECT=1`: a suspended `await` of a primitive
+    /// allocates the fulfilled promise PromiseResolve makes and subscribes to
+    /// it (`to_promise` + `settle_subscribe`), instead of queueing the resume
+    /// job that subscription queues.
+    fn primitive_await_direct_enabled() = "ZIPP_NO_PRIMITIVE_AWAIT_DIRECT"
+}
+
 /// Collapse the next already-settled await job into the current AsyncResume job
 /// when no older microtask is waiting. A bounded trampoline preserves FIFO job
 /// ordering while avoiding register-window parking and heap-state churn.
@@ -4265,6 +4273,18 @@ impl<'p> Vm<'p> {
                 a.state = GenState::Suspended(await_ip);
                 a.regs = back;
                 a.handlers = handlers;
+            }
+            // `await` of a primitive (`await null`): PromiseResolve makes a
+            // fresh promise fulfilled with it, and PerformPromiseThen on that
+            // settled promise queues this activation's resume at once. The
+            // promise reaches nothing else (no handler, no rejection to
+            // track), so queue the resume job itself, in the same place.
+            if primitive_await_direct_enabled() && !self.is_object_value(awaited) {
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation: idx,
+                    input: Resume::Value(awaited),
+                });
+                return;
             }
             let p = self.to_promise(awaited);
             self.settle_subscribe(p, idx);
