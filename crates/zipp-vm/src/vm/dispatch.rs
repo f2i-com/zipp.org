@@ -2903,7 +2903,8 @@ impl<'p> Vm<'p> {
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
                                 let proto_ref = unsafe { &*proto };
-                                let heap_helper_addrs = self.jit_heap_helper_addrs();
+                                let mut heap_helper_addrs = self.jit_heap_helper_addrs();
+                                heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
                                 // ── globals that are NOT slot bindings ──
                                 // An UNINITIALIZED slot is not an empty binding:
                                 // a script GlobalDeclarationInstantiation
@@ -6099,6 +6100,7 @@ impl<'p> Vm<'p> {
             is_array: jit_is_array as *const () as usize,
             len_of: jit_len_of as *const () as usize,
             forin_keys: jit_forin_keys as *const () as usize,
+            acc_lanes: None,
         }
     }
 

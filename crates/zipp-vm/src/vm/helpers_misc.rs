@@ -2354,6 +2354,47 @@ pub(crate) extern "win64" fn jit_set_prop_acc(
     })
 }
 
+/// Win64 helper: a compiled `GetProp`'s accessor lane (`codegen::AccLane`)
+/// whose emitted guards held — receiver shape, first prototype link, hop
+/// versions (`Vm::jit_acc_lane_impl`). `lane` (5th argument, on the stack)
+/// is the lane, leaked with its function's plan. Returns the value bits,
+/// `SELF_CALL_DEOPT` or `CALL_THREW`; the caller re-derives r13/r14 after.
+///
+/// # Safety
+/// As [`jit_get_prop_acc`]; `lane` points at a leaked `AccLane`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_acc_lane_get(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+    lane: *const crate::codegen::AccLane,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_acc_lane_impl(caller_base_ptr, packed_fip, packed2, &*lane, false)
+    })
+}
+
+/// The `SetProp` sibling of [`jit_acc_lane_get`]: 0 when the store
+/// completed. `packed2` = `name << 32 | obj << 16 | val`.
+///
+/// # Safety
+/// As [`jit_acc_lane_get`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_acc_lane_set(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+    lane: *const crate::codegen::AccLane,
+) -> u64 {
+    catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_acc_lane_impl(caller_base_ptr, packed_fip, packed2, &*lane, true)
+    })
+}
+
 env_off_switch! {
     /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
     /// fast path (identity + version check, direct `vals[slot]` read) only calls this

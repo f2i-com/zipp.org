@@ -562,6 +562,102 @@ pub(crate) enum IcProbe {
     Set { val: u16, gen_lane: bool },
 }
 
+/// Emit a property site's accessor lane (`AccLane`), ahead of its probe: the
+/// receiver a heap object whose live shape mirror is the lane's shape, its
+/// first prototype link the lane's (none for an own accessor) and every hop
+/// at its planned version, then the call to `helper` (`jit_acc_lane_get` /
+/// `jit_acc_lane_set`) with the lane's address as the 5th argument. A
+/// sentinel bails at `bail`; a value goes to `get_dst`, and the lane jumps to
+/// `join`, where the arm re-derives its pinned registers (the accessor ran
+/// user code). Any guard that fails falls through, having changed nothing.
+///
+/// Registers as `emit_ic_probe`'s: `rdi` the VM, `rbx` the window, `r13` the
+/// pinned version array (a hop index was a live heap slot when planned, and
+/// the array never shrinks).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_acc_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &'static AccLane,
+    obj: u16,
+    get_dst: Option<u16>,
+    packed_fip: u64,
+    packed2: u64,
+    helper: usize,
+    bail: dynasmrt::DynamicLabel,
+    join: dynasmrt::DynamicLabel,
+) {
+    let skip = ops.new_dynamic_label();
+    let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let proto_raw = crate::vm::host_api::JIT_PROTO_RAW_OFFSET as i32;
+    let proto_len = crate::vm::host_api::JIT_PROTO_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                        // a heap value
+        ; jne => skip
+        ; mov ecx, eax                            // heap idx
+        ; mov r9, [rdi + hot_off]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8], lane.recv_shape as i32  // live mirror shape
+        ; jne => skip
+    );
+    match lane.kind {
+        ACC_FIRST_HEAP => {
+            let first = crate::value::Value::heap(lane.first).bits();
+            dynasm!(ops
+                ; cmp rcx, [rdi + proto_len]
+                ; jae => skip
+                ; mov r8, [rdi + proto_raw]
+                ; mov r10, QWORD first as i64
+                ; cmp [r8 + rcx*8], r10               // proto_of[idx] = the planned link
+                ; jne => skip
+            );
+        }
+        ACC_FIRST_DEFAULT => {
+            let linked = ops.new_dynamic_label();
+            dynasm!(ops
+                ; cmp rcx, [rdi + proto_len]
+                ; jae => linked                       // past the table: no entry
+                ; mov r8, [rdi + proto_raw]
+                ; cmp QWORD [r8 + rcx*8], 0           // no entry: %Object.prototype%
+                ; jne => skip
+                ; => linked
+            );
+        }
+        _ => {}
+    }
+    for &(h, v) in &lane.hops[..lane.nhops as usize] {
+        dynasm!(ops
+            ; cmp DWORD [r13 + (h as i32) * 4], v as i32
+            ; jne => skip
+        );
+    }
+    dynasm!(ops
+        ; mov rax, QWORD lane as *const AccLane as i64
+        ; mov [rsp + 32], rax                     // 5th arg: the lane
+        ; mov rcx, rdi                            // vm
+        ; mov rdx, rbx                            // caller window base
+        ; mov r8, QWORD packed_fip as i64         // (func_id<<32)|ip
+        ; mov r9, QWORD packed2 as i64
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => bail
+    );
+    if let Some(dst) = get_dst {
+        dynasm!(ops ; mov [rbx + dreg(dst)], rax);
+    }
+    dynasm!(ops
+        ; jmp => join
+        ; => skip
+    );
+}
+
 /// Emit the 8-way inline-cache probe for one `GetProp`/`SetProp` site.
 ///
 /// On a full match this reads or writes `vals_ptr[slot]` with **no call** and

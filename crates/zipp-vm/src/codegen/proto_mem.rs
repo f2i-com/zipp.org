@@ -6750,6 +6750,26 @@ pub(crate) fn compile_proto_mem(
                     emit_prop_shape_get(&mut ops, obj, dst, shape, slot, cont, est, &zero);
                     rc_pending = FcEffect::Write(dst);
                 }
+                // An accessor the site's cache keys by the receiver's shape
+                // (`AccLane`): its guards inline, the getter through its helper.
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        Some(dst),
+                        packed_fip,
+                        ((name as u64) << 32) | obj as u64,
+                        crate::vm::jit_acc_lane_get as *const () as usize,
+                        bail,
+                        join,
+                    );
+                }
                 // A class getter (`q.size`): looked up by `jit_getter_callee`
                 // and called natively by the arm that names its fid, with the
                 // receiver as `this` and no arguments, as the class-method
@@ -6889,6 +6909,9 @@ pub(crate) fn compile_proto_mem(
                         ; => join
                     );
                 }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
+                }
                 // The miss/slow helpers may have allocated (versions Vec) or
                 // frame-called a getter (nested compile) — re-derive r13/r14.
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
@@ -6945,6 +6968,26 @@ pub(crate) fn compile_proto_mem(
                         &zero,
                     );
                     rc_pending = FcEffect::None;
+                }
+                // A setter the site's cache keys by the receiver's shape
+                // (`AccLane`), as the GetProp arm's getter lane.
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        None,
+                        packed_fip,
+                        ((name as u64) << 32) | ((obj as u64) << 16) | val as u64,
+                        crate::vm::jit_acc_lane_set as *const () as usize,
+                        bail,
+                        join,
+                    );
                 }
                 emit_ic_probe(
                     &mut ops,
@@ -7008,6 +7051,9 @@ pub(crate) fn compile_proto_mem(
                         ; je => bail
                         ; => join
                     );
+                }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
                 }
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 dynasm!(ops ; => cont);

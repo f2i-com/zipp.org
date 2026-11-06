@@ -390,7 +390,7 @@ impl<'p> Vm<'p> {
         packed2: u64,
         is_set: bool,
     ) -> Option<u64> {
-        use crate::codegen::{CALL_THREW, IC_ACC_BAKED, SELF_CALL_DEOPT};
+        use crate::codegen::IC_ACC_BAKED;
         if e.slot_nhops & IC_ACC_BAKED == 0 || !self.deferred_ns_state.is_empty() {
             return None;
         }
@@ -427,10 +427,31 @@ impl<'p> Vm<'p> {
             return None; // swapped without a bump → full re-resolution
         }
         let (fid, closure) = e.hops[4];
-        let ip = (packed_fip as u32) as usize;
         let regs_base = self.regs.as_ptr() as *const u64;
         // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        Some(self.jit_acc_dispatch(fid, closure, live, base, packed_fip, packed2, is_set))
+    }
+
+    /// Run the accessor `live` (function `fid`, `closure`) of a compiled
+    /// `GetProp` (`packed2` = `name << 32 | obj`) or `SetProp` (`name << 32 |
+    /// obj << 16 | val`) on the receiver in its register: the value bits, 0
+    /// for a completed store, `SELF_CALL_DEOPT` or `CALL_THREW`. The ladder
+    /// of `jit_prop_slow_impl`'s accessor arms.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn jit_acc_dispatch(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        live: Value,
+        base: usize,
+        packed_fip: u64,
+        packed2: u64,
+        is_set: bool,
+    ) -> u64 {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        let ip = (packed_fip as u32) as usize;
         if is_set {
             let obj_reg = ((packed2 >> 16) & 0xFFFF) as u16;
             let val_reg = (packed2 & 0xFFFF) as u16;
@@ -438,31 +459,84 @@ impl<'p> Vm<'p> {
             let val = self.get(base, val_reg);
             // Same ladder as jit_prop_slow_impl's SetAct::Setter arm.
             if let Some(r) = self.accessor_fast_set(fid, recv, val) {
-                return Some(r);
+                return r;
             }
             match self.try_method_inline(fid, recv, base, val_reg, 1) {
-                Some(CALL_THREW) | Some(SELF_CALL_DEOPT) => return Some(CALL_THREW),
-                Some(_) => return Some(0), // served — setter return discarded
+                Some(CALL_THREW) | Some(SELF_CALL_DEOPT) => return CALL_THREW,
+                Some(_) => return 0, // served — setter return discarded
                 None => {}
             }
             let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, live);
-            Some(if r == CALL_THREW || r == SELF_CALL_DEOPT {
+            if r == CALL_THREW || r == SELF_CALL_DEOPT {
                 r
             } else {
                 0
-            })
+            }
         } else {
             let obj_reg = (packed2 & 0xFFFF) as u16;
             let recv = self.get(base, obj_reg);
             // Same ladder as jit_prop_slow_impl's GetAct::Accessor arm.
             if let Some(bits) = self.accessor_fast_get(fid, recv) {
-                return Some(bits);
+                return bits;
             }
             if let Some(bits) = self.try_method_inline(fid, recv, base, 0, 0) {
-                return Some(bits);
+                return bits;
             }
-            Some(self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, live))
+            self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, live)
         }
+    }
+
+    /// The helper behind an accessor lane (`codegen::AccLane`) whose emitted
+    /// guards held: the receiver's shape, its first prototype link and every
+    /// hop's version are what the lane was planned with. The accessor is
+    /// re-read from its holder (an accessor merge replaces it without a
+    /// bump; an own one is per object) and run as an accessor-way hit runs
+    /// it; anything unexpected takes the interpreter-cache slow path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_acc_lane_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed2: u64,
+        lane: &crate::codegen::AccLane,
+        is_set: bool,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        if self.deferred_ns_state.is_empty() {
+            let regs_base = self.regs.as_ptr() as *const u64;
+            // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+            let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+            let obj_reg = if is_set {
+                ((packed2 >> 16) & 0xFFFF) as u16
+            } else {
+                (packed2 & 0xFFFF) as u16
+            };
+            let recv = self.get(base, obj_reg);
+            let own = lane.kind == crate::codegen::ACC_OWN;
+            let holder = if own { recv.heap_index() } else { lane.holder };
+            let s = lane.slot as usize;
+            let live = match self.heap.get(holder) {
+                HeapObj::Object(m) if !m.is_ctor && m.key_get(s).is_some() && m.attr_at(s).accessor => {
+                    Some(if is_set { m.attr_at(s).setter } else { m.val_at(s) })
+                }
+                _ => None,
+            };
+            if let Some(live) = live {
+                let callee = if own {
+                    self.ic_plain_fn(live)
+                } else {
+                    (live.bits() == lane.fn_bits).then_some((lane.fid, lane.closure))
+                };
+                if let Some((fid, closure)) = callee {
+                    return self.jit_acc_dispatch(fid, closure, live, base, packed_fip, packed2, is_set);
+                }
+            }
+        }
+        self.jit_prop_slow_impl(caller_base_ptr, packed_fip, packed2, is_set)
     }
 
     /// Reserve enough register-file capacity that a full JIT self-recursion

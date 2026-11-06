@@ -2078,6 +2078,26 @@ pub(crate) fn compile_region_mem(
                     }
                     dynasm!(ops ; => lookup_miss);
                 }
+                // An accessor the site's cache keys by the receiver's shape
+                // (`AccLane`): its guards inline, the getter through its helper.
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && !py && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        Some(dst),
+                        packed_fip,
+                        ((name as u64) << 32) | obj as u64,
+                        crate::vm::jit_acc_lane_get as *const () as usize,
+                        bail,
+                        join,
+                    );
+                }
                 let quick_length = quick_len_enabled()
                     && proto
                         .string_constants
@@ -2222,6 +2242,9 @@ pub(crate) fn compile_region_mem(
                         ; => join
                     );
                 }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
+                }
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 // The slow helper may have frame-called user code (accessor) —
                 // re-derive the pinned TypedArray snapshots too.
@@ -2278,6 +2301,27 @@ pub(crate) fn compile_region_mem(
                         val,
                         true,
                         method_write_cont,
+                    );
+                }
+                // A setter the site's cache keys by the receiver's shape
+                // (`AccLane`), as the GetProp arm's getter lane. It joins the
+                // full repair below (the setter ran user code).
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && !py && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        None,
+                        packed_fip,
+                        ((name as u64) << 32) | ((obj as u64) << 16) | val as u64,
+                        crate::vm::jit_acc_lane_set as *const () as usize,
+                        bail,
+                        join,
                     );
                 }
                 emit_ic_probe(
@@ -2344,6 +2388,9 @@ pub(crate) fn compile_region_mem(
                         ; je => bail
                         ; => join
                     );
+                }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
                 }
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 // The slow helper may have frame-called user code (accessor) —

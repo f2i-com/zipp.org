@@ -1483,6 +1483,32 @@ impl<'p> Vm<'p> {
         plan
     }
 
+    /// The accessor lanes (`codegen::AccLanePlan`) of `func_id`'s property
+    /// sites whose cache's first way is an accessor (`Vm::ic_acc_lane`),
+    /// leaked: the emitted code hands each lane's address to its helper.
+    /// `None` for none, and under `ZIPP_NO_ACC_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_acc_lane_plan(&self, func_id: u32) -> Option<&'static crate::codegen::AccLanePlan> {
+        if !crate::codegen::acc_lane_enabled() || self.py_plans_skipped(func_id) {
+            return None;
+        }
+        let mut plan = crate::codegen::AccLanePlan::default();
+        for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+            let (name, set) = match *instr {
+                Instr::GetProp { name, .. } => (name, false),
+                Instr::SetProp { name, .. } => (name, true),
+                _ => continue,
+            };
+            if let Some(lane) = self.ic_acc_lane(func_id, ip, name, set) {
+                plan.insert(ip, lane);
+            }
+        }
+        if plan.is_empty() {
+            return None;
+        }
+        Some(Box::leak(Box::new(plan)))
+    }
+
     /// Tier C's class-method lane (`codegen::ClassReadPlan`): for each
     /// `GetProp` or `CallMethod` whose interpreter cache's first way read a
     /// class instance's method (`Vm::ic_class_method_read`), that read and

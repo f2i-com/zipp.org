@@ -1974,6 +1974,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) len_of: usize,
     /// Tier C `ForInKeys` helper (obj bits → key-Array bits / deopt / threw).
     pub(crate) forin_keys: usize,
+    /// `HeapHelperAddrs::acc_lanes`.
+    pub(crate) acc_lanes: Option<&'static super::AccLanePlan>,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     pub(crate) ic_base_idx: u32,

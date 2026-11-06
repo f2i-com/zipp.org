@@ -440,6 +440,57 @@ pub(crate) const ARITH_FB_OTHER: u8 = 2;
 /// site's probe (`emit_prop_shape_get`, `emit_prop_shape_set`).
 pub(crate) type PropShapePlan = FxHashMap<usize, (u32, u32)>;
 
+/// [`AccLane::kind`]: an own accessor of the receiver at `slot`.
+pub(crate) const ACC_OWN: u8 = 0;
+/// [`AccLane::kind`]: an accessor on the chain, the receiver's prototype the
+/// heap object `first` (an explicit `proto_of` entry).
+pub(crate) const ACC_FIRST_HEAP: u8 = 1;
+/// [`AccLane::kind`]: an accessor on the chain, the receiver's prototype the
+/// default `%Object.prototype%` (no `proto_of` entry).
+pub(crate) const ACC_FIRST_DEFAULT: u8 = 2;
+
+/// One `GetProp`/`SetProp` site's accessor lane (`AccLanePlan`): the
+/// interpreter cache's first way when it is an accessor (`IcEntry::OwnAcc`
+/// or `IcEntry::ProtoAcc`), keyed by the receiver's SHAPE as that way is.
+/// The emitted lane (`emit_acc_lane`) checks the receiver's live shape
+/// mirror, its first prototype link and every hop's version, and then calls
+/// the accessor through `jit_acc_lane_get`/`jit_acc_lane_set`, which re-read
+/// it from the holder (an accessor merge changes it without a bump). The
+/// probe's own accessor ways are keyed by receiver IDENTITY and thrash on a
+/// site that sees many objects of one shape (`v.x` over 64 vectors).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccLane {
+    /// The site's name constant, checked against the instruction at emit.
+    pub name: u32,
+    pub recv_shape: u32,
+    /// `ACC_OWN`, `ACC_FIRST_HEAP` or `ACC_FIRST_DEFAULT`.
+    pub kind: u8,
+    /// `ACC_FIRST_HEAP`: the receiver's prototype (`hops[0]`).
+    pub first: u32,
+    pub nhops: u8,
+    /// `(heap index, version)` of each chain object, the last the holder.
+    pub hops: [(u32, u32); 6],
+    /// The chain holder's heap index (not `ACC_OWN`).
+    pub holder: u32,
+    /// The accessor's slot in the holder (or the receiver, `ACC_OWN`).
+    pub slot: u32,
+    /// The getter (`GetProp`) or setter (`SetProp`) planned, with its
+    /// function id and closure (not `ACC_OWN`, whose accessor is per object).
+    pub fn_bits: u64,
+    pub fid: u32,
+    pub closure: u32,
+}
+
+/// The accessor lanes of one function, by ip (`Vm::build_acc_lane_plan`),
+/// leaked so the emitted code can hand a lane's address to its helper.
+pub(crate) type AccLanePlan = FxHashMap<usize, AccLane>;
+
+env_off_switch!(
+    /// `ZIPP_NO_ACC_LANE=1` compiles property sites without the
+    /// shape-keyed accessor lane (`AccLanePlan`). Plan-time.
+    fn acc_lane_enabled() = "ZIPP_NO_ACC_LANE"
+);
+
 env_off_switch!(
     /// `ZIPP_NO_PROP_SHAPE_LANE=1` compiles Tier C property sites without the
     /// known-shape lane (`PropShapePlan`).
@@ -1832,6 +1883,9 @@ pub struct HeapHelperAddrs {
     /// Tier C `ForInKeys` — materialises the for-in key snapshot Array (nullish →
     /// empty). ALLOCATES; returns the Array bits / SELF_CALL_DEOPT / CALL_THREW.
     pub forin_keys: usize,
+    /// The compiling function's accessor lanes (`AccLanePlan`), when the
+    /// caller planned them.
+    pub(crate) acc_lanes: Option<&'static AccLanePlan>,
 }
 
 env_off_switch! {
@@ -1936,6 +1990,7 @@ impl HeapHelperAddrs {
             is_array: self.is_array,
             len_of: self.len_of,
             forin_keys: self.forin_keys,
+            acc_lanes: self.acc_lanes,
             ic_base_idx,
             opt_tier_up: 0,
         }

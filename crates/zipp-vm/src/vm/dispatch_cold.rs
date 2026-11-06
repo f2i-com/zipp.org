@@ -4421,7 +4421,8 @@ impl<'p> Vm<'p> {
                     .and_then(|s| self.globals.get(s as usize).copied())
                     .unwrap_or(Value::UNDEFINED)
                     .bits();
-                let heap_helper_addrs = self.jit_heap_helper_addrs();
+                let mut heap_helper_addrs = self.jit_heap_helper_addrs();
+                heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
                 let const_strs = self.jit_build_const_strs(func_id);
                 // Tier-C leaf-inline plan for the whole function (from the live
                 // ICs). Built BEFORE the &mut self.jit borrow. Opt out with

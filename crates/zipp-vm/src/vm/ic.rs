@@ -791,6 +791,76 @@ impl<'p> Vm<'p> {
         self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)
     }
 
+    /// The accessor lane (`codegen::AccLane`) of the `GetProp` (`set` false)
+    /// or `SetProp` at `(func_id, ip)`: its cache's first way when that is an
+    /// own or a chain accessor keyed by a real shape, with the chain still as
+    /// filled and, on the chain, a plain function as the getter or setter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_acc_lane(&self, func_id: u32, ip: usize, name: u32, set: bool) -> Option<crate::codegen::AccLane> {
+        use crate::codegen::{AccLane, ACC_FIRST_DEFAULT, ACC_FIRST_HEAP, ACC_OWN};
+        let site = self.ic_site(func_id, ip)?;
+        if site.n == 0 {
+            return None;
+        }
+        let mut lane = AccLane {
+            name,
+            recv_shape: 0,
+            kind: ACC_OWN,
+            first: 0,
+            nhops: 0,
+            hops: [(0, 0); 6],
+            holder: 0,
+            slot: 0,
+            fn_bits: 0,
+            fid: 0,
+            closure: 0,
+        };
+        match site.entries[0] {
+            IcEntry::OwnAcc { shape, slot } if shape != crate::shape::DICT => {
+                lane.recv_shape = shape;
+                lane.slot = slot;
+                Some(lane)
+            }
+            IcEntry::ProtoAcc {
+                recv_shape,
+                first,
+                hops,
+                slot,
+            } if recv_shape != crate::shape::DICT && hops.1 > 0 => {
+                lane.kind = match first {
+                    FIRST_HEAP => ACC_FIRST_HEAP,
+                    FIRST_DEFAULT => ACC_FIRST_DEFAULT,
+                    _ => return None,
+                };
+                let n = hops.1 as usize;
+                if n > lane.hops.len() || hops.0[..n].iter().any(|&(h, v)| self.heap.version_of(h) != v) {
+                    return None;
+                }
+                let holder = hops.0[n - 1].0;
+                let HeapObj::Object(hm) = self.heap.get(holder) else {
+                    return None;
+                };
+                let s = slot as usize;
+                if hm.is_ctor || hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
+                    return None;
+                }
+                let f = if set { hm.attr_at(s).setter } else { hm.val_at(s) };
+                let (fid, closure) = self.ic_plain_fn(f)?;
+                lane.recv_shape = recv_shape;
+                lane.first = hops.0[0].0;
+                lane.nhops = n as u8;
+                lane.hops[..n].copy_from_slice(&hops.0[..n]);
+                lane.holder = holder;
+                lane.slot = slot;
+                lane.fn_bits = f.bits();
+                lane.fid = fid;
+                lane.closure = closure;
+                Some(lane)
+            }
+            _ => None,
+        }
+    }
+
     /// The receiver shape and own data slot the property instruction at
     /// `(func_id, ip)` last found its key at (`SiteCell`), and whether a write
     /// proved the slot writable: Tier C's known-shape lane (`PropShapePlan`)
