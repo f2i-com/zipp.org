@@ -4488,6 +4488,18 @@ impl<'p> Vm<'p> {
                             opt_callees.bodies.insert(fid, (callee, self.build_prop_shape_plan(fid)));
                         }
                     }
+                } else if crate::codegen::tierc_class_const_enabled() {
+                    // Tier C bakes them too: a method naming its own class
+                    // (`return new Vec(…)`) reads a constant behind the epoch
+                    // guard instead of calling `jit_load_class_value_ic`.
+                    for instr in self.func(func_id as usize).code.iter() {
+                        if let Instr::LoadClassValue { class_id, .. } = *instr {
+                            if let Some(v) = self.class_value_fixed(class_id) {
+                                opt_callees.class_values.insert(class_id, v.bits());
+                            }
+                        }
+                    }
+                    opt_callees.class_epoch = self.mi_class_epoch;
                 }
                 self.jit.compile(
                     func_id,

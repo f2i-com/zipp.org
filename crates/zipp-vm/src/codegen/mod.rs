@@ -596,6 +596,13 @@ env_off_switch! {
 }
 
 env_off_switch! {
+    /// `ZIPP_NO_TIERC_CLASS_CONST=1`: a Tier C `LoadClassValue` always calls
+    /// `jit_load_class_value_ic`, instead of reading the class value it had
+    /// at compile time while `Vm::mi_class_epoch` has not moved. Plan-time.
+    fn tierc_class_const_enabled() = "ZIPP_NO_TIERC_CLASS_CONST"
+}
+
+env_off_switch! {
     fn same_proto_cross2_enabled() = "ZIPP_NO_SAME_PROTO_CROSS2"
 }
 
@@ -4591,6 +4598,7 @@ impl Jit {
                 arith_fb_base,
                 prop_shape,
                 class_read,
+                (&opt_callees.class_values, opt_callees.class_epoch),
             ) {
                 if crate::jitlog_enabled() {
                     eprintln!(

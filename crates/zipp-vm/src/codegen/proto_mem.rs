@@ -3409,6 +3409,9 @@ pub(crate) fn compile_proto_mem(
     prop_shape: &PropShapePlan,
     // The class-method lane's plan (`ClassReadPlan`).
     class_read: &crate::codegen::ClassReadPlan,
+    // `LoadClassValue` constants by class id (`Vm::class_value_fixed`), valid
+    // while `Vm::mi_class_epoch` is the second value.
+    class_consts: (&FxHashMap<u32, u64>, u32),
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -8039,6 +8042,24 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::LoadClassValue { dst, class_id } => {
+                // A class evaluated once (`Vm::class_value_fixed`): its value
+                // as long as no class has been evaluated since this compile
+                // (`mi_class_epoch`, which every evaluation moves). Otherwise,
+                // and on a moved epoch, the helper below.
+                let fixed = if meter.is_none() { class_consts.0.get(&class_id).copied() } else { None };
+                let done = ops.new_dynamic_label();
+                if let Some(bits) = fixed {
+                    let slow = ops.new_dynamic_label();
+                    let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
+                    dynasm!(ops
+                        ; cmp DWORD [rdi + epoch_off], class_consts.1 as i32
+                        ; jne => slow
+                        ; mov rax, QWORD bits as i64
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => slow
+                    );
+                }
                 // The class binding through `jit_load_class_value_ic`; see
                 // the region arm. The flag says the activation, not the top
                 // frame, is the running code.
@@ -8056,6 +8077,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => done);
             }
             Instr::ToStr { dst, a } => {
                 // `${a}` through `jit_to_str_ic`; see the region arm.
