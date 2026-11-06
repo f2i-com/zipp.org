@@ -1133,7 +1133,11 @@ pub(crate) fn emit_inline_leaf_call(
                     (rg(callee), rg(this_v))
                 };
                 emit_math_identity_guard(ops, op, gc, gt, bail, math_imul_guard);
-                if ac == 1 {
+                if ac == 1
+                    && matches!(op, MathFn::Clz32)
+                    && emit_math_clz32(ops, rg(ab), rg(d), bail, math_unary)
+                {
+                } else if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
                     if !emit_math_unary_inline(ops, op) {
                         dynasm!(ops

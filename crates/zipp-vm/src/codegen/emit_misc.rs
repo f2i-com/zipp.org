@@ -864,6 +864,10 @@ pub(crate) fn emit_math_op(
             ; movq xmm0, rax
         );
         emit_box_num(ops, dst);
+    } else if argc == 1
+        && matches!(op, MathFn::Clz32)
+        && emit_math_clz32(ops, arg_base, dst, bail, math_unary)
+    {
     } else if argc == 1 {
         load_num_xmm(ops, arg_base, 0, bail);
         if !emit_math_unary_inline(ops, op) {
@@ -931,8 +935,123 @@ pub(crate) fn emit_math_unary_inline(ops: &mut dynasmrt::x64::Assembler, op: Mat
         MathFn::Floor if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 9),
         MathFn::Ceil if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 10),
         MathFn::Trunc if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 11),
+        // `x as f32 as f64`: both conversions round to nearest-even under the
+        // default MXCSR, as Rust's casts do.
+        MathFn::Fround => dynasm!(ops
+            ; cvtsd2ss xmm0, xmm0
+            ; cvtss2sd xmm0, xmm0
+        ),
+        // JS round: `f = floor(x)`, plus one when `x - f >= 0.5`, then x's
+        // sign ORed in. `x - f` is exact wherever the answer depends on it,
+        // so this avoids `floor(x + 0.5)`'s rounding of the sum (the double
+        // below 0.5, odd values from 2^52 up). A nonzero result already has
+        // x's sign; a zero one takes it, which is the spec's -0 for
+        // [-0.5, -0]. ±Infinity gives NaN for `x - f` and keeps x; NaN stays
+        // NaN, which the box canonicalises.
+        MathFn::Round if sse41() => dynasm!(ops
+            ; roundsd xmm1, xmm0, 9
+            ; movapd xmm2, xmm0
+            ; subsd xmm2, xmm1
+            ; mov rax, QWORD 0x3FE0_0000_0000_0000u64 as i64
+            ; movq xmm3, rax
+            ; cmplesd xmm3, xmm2
+            ; mov rax, QWORD 0x3FF0_0000_0000_0000u64 as i64
+            ; movq xmm2, rax
+            ; andpd xmm2, xmm3
+            ; addsd xmm1, xmm2
+            ; mov rax, QWORD i64::MIN
+            ; movq xmm2, rax
+            ; andpd xmm2, xmm0
+            ; orpd xmm1, xmm2
+            ; movapd xmm0, xmm1
+        ),
+        // NaN and ±0 return x; otherwise ±1.
+        MathFn::Sign => {
+            let (keep, pos) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+            dynasm!(ops
+                ; xorpd xmm1, xmm1
+                ; ucomisd xmm0, xmm1
+                ; jp => keep
+                ; je => keep
+                ; ja => pos
+                ; mov rax, QWORD 0xBFF0_0000_0000_0000u64 as i64
+                ; movq xmm0, rax
+                ; jmp => keep
+                ; => pos
+                ; mov rax, QWORD 0x3FF0_0000_0000_0000u64 as i64
+                ; movq xmm0, rax
+                ; => keep
+            );
+        }
         _ => return false,
     }
+    true
+}
+
+/// `regs[dst] = Math.clz32(regs[arg])`: an Int argument's bits, or a double
+/// truncated to i64 whose low half is ToUint32, counted in place and boxed as
+/// an Int. A double `cvttsd2si` cannot represent (NaN, ±Infinity, beyond
+/// 2^63) goes to the shared `math_unary` helper; a non-number bails, as
+/// `load_num_xmm` does, so the interpreter runs ToNumber. False, having
+/// emitted nothing, under `ZIPP_NO_MATH_INLINE=1`.
+pub(crate) fn emit_math_clz32(
+    ops: &mut dynasmrt::x64::Assembler,
+    arg: u16,
+    dst: u16,
+    bail: dynasmrt::DynamicLabel,
+    math_unary: usize,
+) -> bool {
+    if !crate::codegen::math_inline_enabled() {
+        return false;
+    }
+    let (int_path, helper, done) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(arg)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int_path
+        ; sub r10d, (INT_TAG_HI + 1) as i32
+        ; cmp r10d, 3
+        ; jbe => bail
+        ; movq xmm0, rax
+        ; cvttsd2si rax, xmm0
+        ; mov r10, QWORD i64::MIN
+        ; cmp rax, r10
+        ; je => helper
+        ; => int_path
+    );
+    if std::arch::is_x86_feature_detected!("lzcnt") {
+        dynasm!(ops ; lzcnt eax, eax);
+    } else {
+        let zero = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov ecx, eax
+            ; mov eax, 32
+            ; test ecx, ecx
+            ; jz => zero
+            ; bsr ecx, ecx
+            ; mov eax, 31
+            ; sub eax, ecx
+            ; => zero
+        );
+    }
+    box_eax(ops, dst);
+    dynasm!(ops
+        ; jmp => done
+        ; => helper
+        ; movq rdx, xmm0
+        ; mov ecx, MathFn::Clz32 as i32
+        ; mov rax, QWORD math_unary as i64
+        ; call rax
+        ; movq xmm0, rax
+    );
+    emit_box_num(ops, dst);
+    dynasm!(ops ; => done);
     true
 }
 
