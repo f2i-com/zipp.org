@@ -1751,6 +1751,9 @@ impl<'p> Vm<'p> {
         // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →
         // the spec's mixing TypeError; otherwise Number addition (ToNumber of
         // a Symbol throws there).
+        if let Some(v) = self.bigint_big_op(crate::vm::helpers_misc::BigOp::Add, pa, pb) {
+            return Ok(v);
+        }
         let (ab, bb) = (self.bigint_val(pa), self.bigint_val(pb));
         match (ab, bb) {
             (Some(x), Some(y)) => self.bigint_op(crate::vm::helpers_misc::BigOp::Add, x, y),
@@ -2515,6 +2518,10 @@ impl<'p> Vm<'p> {
         va: Value,
         vb: Value,
     ) -> Result<Option<Option<std::cmp::Ordering>>, Thrown> {
+        // Two BigInts, ordered where they live (no copy of a Big).
+        if let Some(o) = self.bigint_ref_cmp(va, vb) {
+            return Ok(Some(Some(o)));
+        }
         let ab = self.bigint_val(va);
         let bb = self.bigint_val(vb);
         if ab.is_none() && bb.is_none() {

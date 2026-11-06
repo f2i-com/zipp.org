@@ -63,10 +63,11 @@ impl BigVal {
         }
     }
 
-    pub(crate) fn to_num(&self) -> NumBig {
+    /// The num-bigint value, consumed: a `Big` moves out, uncopied.
+    pub(crate) fn into_num(self) -> NumBig {
         match self {
-            BigVal::Small(n) => NumBig::from(*n),
-            BigVal::Big(b) => b.clone(),
+            BigVal::Small(n) => NumBig::from(n),
+            BigVal::Big(b) => b,
         }
     }
 
@@ -180,6 +181,95 @@ impl BigVal {
     }
 }
 
+/// A BigInt primitive's mathematical value without a copy: the i128 tiers
+/// by value, a `BigIntBig` borrowed from its heap slot ([`Vm::bigint_ref`]).
+#[derive(Clone, Copy)]
+pub(crate) enum BigRef<'a> {
+    Small(i128),
+    Big(&'a NumBig),
+}
+
+impl BigRef<'_> {
+    fn bits(self) -> u64 {
+        match self {
+            BigRef::Small(n) => (128 - n.unsigned_abs().leading_zeros()) as u64,
+            BigRef::Big(b) => b.bits(),
+        }
+    }
+
+    fn cmp(self, other: BigRef<'_>) -> Ordering {
+        match (self, other) {
+            (BigRef::Small(a), BigRef::Small(b)) => a.cmp(&b),
+            (BigRef::Big(a), BigRef::Big(b)) => a.cmp(b),
+            // Canonical form: a Big's magnitude is beyond every i128.
+            (BigRef::Small(_), BigRef::Big(b)) => {
+                if b.sign() == Sign::Minus {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (BigRef::Big(a), BigRef::Small(_)) => {
+                if a.sign() == Sign::Minus {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+        }
+    }
+}
+
+/// `a <op> b` where at least one operand is beyond i128, from the operands
+/// where they live, so the only allocation is the result's (`&x + &y`, or
+/// `x + n` against an i128). `None` for a case `Vm::bigint_op` owns: a zero
+/// divisor, an oversized product or shift, a negative or Big shift count,
+/// `**`, `>>>`, and an i128 dividend over a Big divisor.
+fn big_ref_op(op: BigOp, a: BigRef<'_>, b: BigRef<'_>, max_bits: u64) -> Option<NumBig> {
+    use BigRef::{Big, Small};
+    // A bitwise operand in the i128 range, as the num-bigint value the
+    // reference-by-reference operators take.
+    fn owned(r: BigRef<'_>) -> std::borrow::Cow<'_, NumBig> {
+        match r {
+            BigRef::Small(n) => std::borrow::Cow::Owned(NumBig::from(n)),
+            BigRef::Big(x) => std::borrow::Cow::Borrowed(x),
+        }
+    }
+    Some(match (op, a, b) {
+        (BigOp::Add, Big(x), Big(y)) => x + y,
+        (BigOp::Add, Big(x), Small(y)) | (BigOp::Add, Small(y), Big(x)) => x + y,
+        (BigOp::Sub, Big(x), Big(y)) => x - y,
+        (BigOp::Sub, Big(x), Small(y)) => x - y,
+        (BigOp::Sub, Small(x), Big(y)) => -(y - x),
+        (BigOp::Mul, _, _) if a.bits().saturating_add(b.bits()) > max_bits + 1 => return None,
+        (BigOp::Mul, Big(x), Big(y)) => x * y,
+        (BigOp::Mul, Big(x), Small(y)) | (BigOp::Mul, Small(y), Big(x)) => x * y,
+        (BigOp::Div | BigOp::Mod, _, Small(0)) => return None,
+        (BigOp::Div, Big(x), Big(y)) => x / y,
+        (BigOp::Div, Big(x), Small(y)) => x / y,
+        (BigOp::Mod, Big(x), Big(y)) => x % y,
+        (BigOp::Mod, Big(x), Small(y)) => x % y,
+        (BigOp::And, _, _) => owned(a).as_ref() & owned(b).as_ref(),
+        (BigOp::Or, _, _) => owned(a).as_ref() | owned(b).as_ref(),
+        (BigOp::Xor, _, _) => owned(a).as_ref() ^ owned(b).as_ref(),
+        // A shift of a Big by a non-negative i128 count: growing within the
+        // size cap, or shrinking by at most bits + 1 (an arithmetic shift,
+        // toward -Infinity, as `bigint_shift`'s).
+        (BigOp::Shl, Big(x), Small(c)) if c >= 0 => {
+            let c = u64::try_from(c).ok()?;
+            if x.bits().saturating_add(c) > max_bits {
+                return None;
+            }
+            x << (c as usize)
+        }
+        (BigOp::Shr, Big(x), Small(c)) if c >= 0 => {
+            let c = c.min(x.bits() as i128 + 1) as usize;
+            x >> c
+        }
+        _ => return None,
+    })
+}
+
 /// Exact ordering of an out-of-i128 BigInt against an f64 by mathematical
 /// value (`None` when `f` is NaN). The f64's integer part is exactly
 /// representable as a BigInt, so the comparison is precise — no rounding
@@ -254,6 +344,46 @@ impl<'p> Vm<'p> {
             }
         }
         None
+    }
+
+    /// [`Self::bigint_val`] by reference: a value beyond i128 is borrowed
+    /// from its heap slot, not copied.
+    #[inline]
+    pub(crate) fn bigint_ref(&self, v: Value) -> Option<BigRef<'_>> {
+        if let Some(n) = v.small_bigint_val() {
+            return Some(BigRef::Small(n as i128));
+        }
+        if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::BigInt(n) => return Some(BigRef::Small(*n)),
+                HeapObj::BigIntBig(b) => return Some(BigRef::Big(b)),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `va <op> vb` for two BigInt primitives at least one of which is
+    /// beyond i128, through [`big_ref_op`]: `bigint_val` copied each operand
+    /// and `bigint_op` copied it again, so `x + y` over two 200-bit values
+    /// made six allocations for its one result. `None`, nothing done, for
+    /// any other pair or a case `bigint_op` reports.
+    pub(crate) fn bigint_big_op(&mut self, op: BigOp, va: Value, vb: Value) -> Option<Value> {
+        let max = self.max_bigint_bits();
+        let r = {
+            let (a, b) = (self.bigint_ref(va)?, self.bigint_ref(vb)?);
+            if matches!((a, b), (BigRef::Small(_), BigRef::Small(_))) {
+                return None;
+            }
+            big_ref_op(op, a, b, max)?
+        };
+        Some(self.make_bigint_num(r))
+    }
+
+    /// The order of two BigInt primitives, read where they live; `None`
+    /// unless both are BigInts.
+    pub(crate) fn bigint_ref_cmp(&self, va: Value, vb: Value) -> Option<Ordering> {
+        Some(self.bigint_ref(va)?.cmp(self.bigint_ref(vb)?))
     }
 
     /// The value of a BigInt in the i128 range: an immediate or a heap
@@ -365,6 +495,10 @@ impl<'p> Vm<'p> {
             if let Some(r) = r {
                 return Ok(self.make_bigint(r));
             }
+        }
+        // Two BigInts, one beyond i128: from their heap slots, uncopied.
+        if let Some(v) = self.bigint_big_op(op, va, vb) {
+            return Ok(v);
         }
         // GC INVARIANT: `pa` (possibly a fresh primitive from va's valueOf) is
         // held in a Rust local — unrooted — while vb's coercion runs user code.
@@ -479,7 +613,7 @@ impl<'p> Vm<'p> {
             }
         }
         // Big path: exact num-bigint math, result re-canonicalized.
-        let (x, y) = (a.to_num(), b.to_num());
+        let (x, y) = (a.into_num(), b.into_num());
         let r = match op {
             BigOp::Add => x + y,
             BigOp::Sub => x - y,
@@ -543,7 +677,7 @@ impl<'p> Vm<'p> {
             if a.bits().saturating_add(count.min(u64::MAX as i128) as u64) > self.max_bigint_bits() {
                 return Err(Thrown(BIGINT_SIZE_ERR.into()));
             }
-            Ok(self.make_bigint_num(a.to_num() << (count as usize)))
+            Ok(self.make_bigint_num(a.into_num() << (count as usize)))
         } else {
             // Shrinking: arithmetic shift (rounds toward -∞ — both i128's `>>`
             // and num-bigint's `>>` do). Cap the count at bits+1 (beyond that
@@ -602,7 +736,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown(BIGINT_SIZE_ERR.into()));
         }
         // bits(a) ≥ 2 here, so e ≤ MAX_BIGINT_BITS/2 < u32::MAX.
-        Ok(self.make_bigint_num(a.to_num().pow(e as u32)))
+        Ok(self.make_bigint_num(a.into_num().pow(e as u32)))
     }
 
     /// `BigInt.asIntN(bits, x)`: x wrapped into the signed bits-bit range.
@@ -619,7 +753,7 @@ impl<'p> Vm<'p> {
                 return Ok(self.make_bigint(n));
             }
         }
-        let big = x.to_num();
+        let big = x.into_num();
         // Already in range (magnitude below 2^(bits-1)) — unchanged, no 2^bits
         // allocation (covers huge `bits` with any in-range value).
         if big.bits() < bits {
@@ -653,7 +787,7 @@ impl<'p> Vm<'p> {
                 return Ok(self.make_bigint(n));
             }
         }
-        let big = x.to_num();
+        let big = x.into_num();
         // Non-negative and already below 2^bits — unchanged, no allocation.
         if big.sign() != Sign::Minus && big.bits() <= bits {
             return Ok(self.make_bigint_num(big));
