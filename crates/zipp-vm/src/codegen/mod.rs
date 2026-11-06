@@ -479,7 +479,22 @@ pub(crate) struct AccLane {
     pub fn_bits: u64,
     pub fid: u32,
     pub closure: u32,
+    /// A chain lane whose accessor is trivial (`return this.f`, `this.f = v`
+    /// or `this.f = v | 0`): the slot of `f`, an own writable data property
+    /// of every receiver of `recv_shape`, which the lane reads or writes in
+    /// place with no call (`u32::MAX`: call the accessor). The hop versions
+    /// prove the accessor is still the planned one: every replacement of an
+    /// existing accessor bumps its holder.
+    pub field: u32,
+    /// The trivial setter's `| 0`: only an Int value stores in place.
+    pub to_int32: bool,
 }
+
+env_off_switch!(
+    /// `ZIPP_NO_ACC_INLINE=1`: an accessor lane calls even a trivial
+    /// accessor (`AccLane::field`). Plan-time.
+    fn acc_inline_enabled() = "ZIPP_NO_ACC_INLINE"
+);
 
 /// The accessor lanes of one function, by ip (`Vm::build_acc_lane_plan`),
 /// leaked so the emitted code can hand a lane's address to its helper.

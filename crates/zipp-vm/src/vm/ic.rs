@@ -814,6 +814,8 @@ impl<'p> Vm<'p> {
             fn_bits: 0,
             fid: 0,
             closure: 0,
+            field: u32::MAX,
+            to_int32: false,
         };
         match site.entries[0] {
             IcEntry::OwnAcc { shape, slot } if shape != crate::shape::DICT => {
@@ -860,6 +862,31 @@ impl<'p> Vm<'p> {
                 lane.fn_bits = f.bits();
                 lane.fid = fid;
                 lane.closure = closure;
+                // A trivial accessor of a field every receiver of the shape
+                // holds as writable data: the lane reads or writes it in place.
+                // (A metered body keeps the call, whose frame is charged.)
+                #[cfg(feature = "instrument")]
+                let metered = self.jit.metered();
+                #[cfg(not(feature = "instrument"))]
+                let metered = false;
+                if crate::codegen::acc_inline_enabled() && !metered {
+                    let trivial = if set {
+                        self.simple_setter_field(fid)
+                    } else {
+                        self.simple_getter_field(fid).map(|f| (f, false))
+                    };
+                    if let Some((field, to_int32)) = trivial {
+                        let writable_data = crate::shape::attr_bits(true, false, false, false);
+                        let accessor = crate::shape::attr_bits(false, false, false, true);
+                        if let Some(at) = crate::shape::describe(recv_shape)
+                            .iter()
+                            .position(|(k, bits)| &**k == field && bits & writable_data != 0 && bits & accessor == 0)
+                        {
+                            lane.field = at as u32;
+                            lane.to_int32 = to_int32;
+                        }
+                    }
+                }
                 Some(lane)
             }
             _ => None,

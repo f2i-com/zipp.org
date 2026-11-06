@@ -580,6 +580,7 @@ pub(crate) fn emit_acc_lane(
     lane: &'static AccLane,
     obj: u16,
     get_dst: Option<u16>,
+    set_val: Option<u16>,
     packed_fip: u64,
     packed2: u64,
     helper: usize,
@@ -631,6 +632,56 @@ pub(crate) fn emit_acc_lane(
         dynasm!(ops
             ; cmp DWORD [r13 + (h as i32) * 4], v as i32
             ; jne => skip
+        );
+    }
+    // A trivial accessor (`AccLane::field`): the field read or written in
+    // place through the receiver's mirror, whose shape (just matched) makes
+    // the slot writable data. A function's mirror, an Int-only setter given
+    // anything else and a plain setter given a heap value (its store would
+    // want the barrier) take the call below.
+    let inline_field = lane.kind != ACC_OWN
+        && lane.field != u32::MAX
+        && (lane.field as usize) < (i32::MAX as usize) / 8
+        && (get_dst.is_some() || set_val.is_some());
+    if inline_field {
+        let call = ops.new_dynamic_label();
+        let fslot = (lane.field as i32) * 8;
+        dynasm!(ops
+            ; cmp DWORD [r9 + rcx*8 + 4], crate::heap::FID_MIRROR_CLASS as i32
+            ; jb => call                              // a function's mirror
+            ; mov r8, [r9 + rcx*8 + 8]                // the receiver's values
+        );
+        match (get_dst, set_val) {
+            (Some(dst), _) => {
+                dynasm!(ops
+                    ; mov rax, [r8 + fslot]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            (None, Some(val)) => {
+                dynasm!(ops
+                    ; mov rdx, [rbx + dreg(val)]
+                    ; mov r10, rdx
+                    ; shr r10, 48
+                );
+                if lane.to_int32 {
+                    dynasm!(ops
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => call                     // `v | 0` of a non-Int
+                    );
+                } else {
+                    dynasm!(ops
+                        ; cmp r10d, 0x7FFD
+                        ; je => call                      // a heap value: barrier
+                    );
+                }
+                dynasm!(ops ; mov [r8 + fslot], rdx);
+            }
+            (None, None) => {}
+        }
+        dynasm!(ops
+            ; jmp => join
+            ; => call
         );
     }
     dynasm!(ops

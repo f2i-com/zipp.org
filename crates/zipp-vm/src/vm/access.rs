@@ -2617,7 +2617,7 @@ impl<'p> Vm<'p> {
         }
         let idx = obj.heap_index();
         // Nursery barrier: the literal is normally young, but `__defineGetter__`
-        // routes here too, and the accessor-merge write is in-place (no bump).
+        // routes here too, and the accessor-merge write is in-place.
         self.heap.write_barrier_val(idx, func);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             if let Some(i) = m.pos(key) {
@@ -2627,6 +2627,10 @@ impl<'p> Vm<'p> {
                     } else {
                         m.set_val_at(i, func);
                     }
+                    // The accessor changed: compiled lanes that serve a trivial
+                    // accessor in place (`AccLane::field`) rest on the holder's
+                    // version, as every other replacement of one bumps it.
+                    self.heap.bump_version(idx);
                     return;
                 }
             }
