@@ -8,6 +8,15 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_IN_PLAIN=1`: compiled `in` on a plain object asks
+    /// `has_property` again instead of the interpreter's key-as-it-lies arms
+    /// (`has_property_jit`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_in_plain_enabled() = "ZIPP_NO_JIT_IN_PLAIN"
+}
+
 const ERROR_MESSAGE_ATTR: PropAttr = PropAttr {
     writable: true,
     enumerable: false,
@@ -2365,6 +2374,21 @@ impl<'p> Vm<'p> {
                 break;
             }
             cur = proto;
+        }
+        // A plain object and a flat string or index key: the interpreter's
+        // `in` arm (`has_property_dyn`) answers from the key as it lies;
+        // `has_property` spelled it afresh with `key_of` and hashed it at every
+        // level (a proxy `has` trap's `k in t`, a dictionary's probes).
+        if jit_in_plain_enabled() && matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
+            let idx = obj.heap_index();
+            if let Some(found) = self.plain_string_key_has(idx, key) {
+                return Some(found);
+            }
+            if let Some(i) = array_index(key) {
+                if let Some(found) = self.plain_index_key_has(idx, i, false) {
+                    return Some(found);
+                }
+            }
         }
         Some(self.has_property(obj, key))
     }
