@@ -3895,12 +3895,15 @@ pub(crate) extern "win64" fn jit_array_mutate(
         *slot = Value::from_bits(unsafe { *args.add(k) });
     }
     let args = &buf[..argc];
-    let name = match op {
-        0 => "shift",
-        1 => "unshift",
-        2 => "splice",
-        3 => "reverse",
-        4 => "fill",
+    // The method's name and its intrinsic-memo slot (`builtins::arr_memo_id`'s
+    // numbering, asserted in the test below): a match of the name against
+    // thirty memoised ones was a call per compiled `splice`.
+    let (name, memo) = match op {
+        0 => ("shift", 6),
+        1 => ("unshift", 19),
+        2 => ("splice", 18),
+        3 => ("reverse", 17),
+        4 => ("fill", 21),
         _ => return DEOPT,
     };
     // SAFETY: exclusive view; the array's Vec is not cached across the call.
@@ -3909,9 +3912,6 @@ pub(crate) extern "win64" fn jit_array_mutate(
     let first_hole = match vm.heap.get(idx) {
         HeapObj::Array(items) => items.first().is_some_and(|v| v.is_hole()),
         _ => return DEOPT,
-    };
-    let Some(memo) = crate::vm::builtins::arr_memo_id(name) else {
-        return DEOPT;
     };
     if (op == 0 && first_hole)
         || !vm.realm_global_objs.is_empty()
@@ -3925,11 +3925,13 @@ pub(crate) extern "win64" fn jit_array_mutate(
     {
         return DEOPT;
     }
-    if op == 2
-        && (!args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
-            || !vm.array_species_is_default(arr))
-    {
-        return DEOPT;
+    if op == 2 {
+        if !args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
+            || !vm.array_species_is_default(arr)
+        {
+            return DEOPT;
+        }
+        return vm.array_splice_dense(idx, args).map_or(DEOPT, Value::bits);
     }
     // `fill(value, start, end)`: the positions' ToIntegerOrInfinity.
     if op == 4 && !args.iter().skip(1).all(|a| a.is_number() || *a == Value::UNDEFINED) {
@@ -3938,6 +3940,18 @@ pub(crate) extern "win64" fn jit_array_mutate(
     match vm.array_method(idx, name, args) {
         Ok(Some(v)) => v.bits(),
         _ => DEOPT,
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod arr_mutate_memo_tests {
+    /// `jit_array_mutate` names each operation's intrinsic-memo slot by
+    /// number; they must be `arr_memo_id`'s.
+    #[test]
+    fn mutate_ops_name_their_memo_slots() {
+        for (name, memo) in [("shift", 6), ("unshift", 19), ("splice", 18), ("reverse", 17), ("fill", 21)] {
+            assert_eq!(crate::vm::builtins::arr_memo_id(name), Some(memo), "{name}");
+        }
     }
 }
 

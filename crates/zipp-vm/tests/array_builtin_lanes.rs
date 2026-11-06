@@ -106,6 +106,13 @@ out.push("SL " + hot(3000, (i) => {
 }));
 const sv = []; sv.length = 5; sv[1] = 1; sv[3] = 3; Object.defineProperty(sv, "x", { value: 1 });
 out.push("SL2 " + JSON.stringify([sv.slice(0, 4), [, 1, 2].slice(0, 2), Object.keys([, 1, 2].slice(0, 2))]));
+out.push("SP " + hot(3000, (i) => {
+  const a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const r = [a.splice(2, 2, "a", "b"), a.splice(NaN, 1), a.splice(Infinity, 3, "z"), a.splice(-Infinity, 0, "s"), a.splice(4, Infinity),
+    a.splice(undefined, undefined), a.splice(1, -5, "n"), a.splice(-1, 1, "p", "q", "r"), a.splice(20, 2), a.splice(2.7, 1.9, i)];
+  let t = a.length * 1000; for (const x of r) t = (t * 31 + x.length * 7 + (x.length ? String(x[0]).charCodeAt(0) : 0)) | 0;
+  return (t + String(a).length) | 0;
+}));
 const cs = []; cs[Symbol.isConcatSpreadable] = false;
 out.push("CC " + hot(3000, (i) => [1, 2].concat([3], i, [[4]], cs).length) + " " + [1].concat(cs).length);
 Array.prototype[Symbol.isConcatSpreadable] = false;
@@ -115,7 +122,7 @@ out.push("CC3 " + [1, 2].concat([3, 4]).length);
 console.log(out.join("\n"));
 "##;
 
-const EXPECTED: &str = "Q -880234464\\nH -1766349952\\nP -59063680\\nC 1411967872 6000\\nS -59063680\\nF 1411967872\\nN 1411967872 1,2,3\\nO -826891520\\nR 481408768 1500\\nI 1272956672\\nD 2 1 0 0 -1 -1\\nL -1782056950\\nK -1339365184\\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\\nK3 4 6 2999 string true\\nK4 [42,2,3] [\"3\"]\\nK5 0,1,3\\nIN 1263937024\\nIN2 1293840512\\nW 204537344\\nJ -116382733 3000\\nFL -139834880 3000\\nSL 1233663033\\nSL2 [[null,1,null,3],[null,1],[\"1\"]]\\nCC -118127360 2\\nCC2 2\\nCC3 4";
+const EXPECTED: &str = "Q -880234464\\nH -1766349952\\nP -59063680\\nC 1411967872 6000\\nS -59063680\\nF 1411967872\\nN 1411967872 1,2,3\\nO -826891520\\nR 481408768 1500\\nI 1272956672\\nD 2 1 0 0 -1 -1\\nL -1782056950\\nK -1339365184\\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\\nK3 4 6 2999 string true\\nK4 [42,2,3] [\"3\"]\\nK5 0,1,3\\nIN 1263937024\\nIN2 1293840512\\nW 204537344\\nJ -116382733 3000\\nFL -139834880 3000\\nSL 1233663033\\nSL2 [[null,1,null,3],[null,1],[\"1\"]]\\nSP 1825349920\\nCC -118127360 2\\nCC2 2\\nCC3 4";
 
 #[test]
 fn array_builtin_lanes_worker() {

@@ -635,6 +635,67 @@ impl<'p> Vm<'p> {
         Some(self.alloc_array_current_realm(out))
     }
 
+    /// `splice(start, deleteCount, ...items)` of the plain dense array `idx`
+    /// whose start and count are Numbers or `undefined` (at least the start
+    /// is given): the dense arm's mutation and result, past `array_method`'s
+    /// gates and its second species proof. The caller (`jit_array_mutate`)
+    /// has proved what the gates would (no side table, a writable and
+    /// non-virtual length, no indexed or replaced prototype, the default
+    /// species, the intrinsic method), so nothing here can run code or throw.
+    /// A pure removal drains, an equal-count replacement overwrites in place,
+    /// and only a resize takes `Vec::splice`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn array_splice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
+        let len = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return None,
+        };
+        // ToIntegerOrInfinity of a Number (`undefined` is 0), in f64 so
+        // ±Infinity saturate.
+        let int = |v: Value| {
+            if v == Value::UNDEFINED {
+                0.0
+            } else {
+                let f = v.as_f64();
+                if f.is_nan() {
+                    0.0
+                } else {
+                    f.trunc()
+                }
+            }
+        };
+        let lenf = len as f64;
+        let s = int(*args.first()?);
+        let start = if s < 0.0 { (lenf + s).max(0.0) } else { s.min(lenf) } as usize;
+        let del = match args.get(1) {
+            None => len - start,
+            Some(&d) => int(d).clamp(0.0, (len - start) as f64) as usize,
+        };
+        let insert = args.get(2..).unwrap_or(&[]);
+        for &v in insert {
+            self.heap.write_barrier_val(idx, v);
+        }
+        let removed: Vec<Value> = match self.heap.get_mut(idx) {
+            HeapObj::Array(items) => {
+                let end = start + del;
+                if insert.is_empty() {
+                    items.drain(start..end).collect()
+                } else if insert.len() == del {
+                    let out = items[start..end].to_vec();
+                    items[start..end].copy_from_slice(insert);
+                    out
+                } else {
+                    let out = items[start..end].to_vec();
+                    items.splice(start..end, insert.iter().copied());
+                    out
+                }
+            }
+            _ => return None,
+        };
+        self.heap.bump_version(idx); // length/contents changed
+        Some(self.alloc_array_current_realm(removed))
+    }
+
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
