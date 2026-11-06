@@ -2582,6 +2582,7 @@ impl<'p> Vm<'p> {
         None
     }
 
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn strict_eq(&self, base: usize, a: u16, b: u16) -> bool {
         self.strict_eq_vals(self.get(base, a), self.get(base, b))
     }

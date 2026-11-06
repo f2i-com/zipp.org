@@ -1633,6 +1633,7 @@ impl<'p> Vm<'p> {
                     // ── superinstructions (`FusedCode`) ── each is its two
                     // instructions' arms run back to back: the same number
                     // paths inline, the same helpers otherwise.
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddIntMove { dst, a, imm, upd, mdst, msrc } => {
                         let va = self.get(base, a);
                         let r = self.add_int_value(va, imm, upd)?;
@@ -1641,6 +1642,7 @@ impl<'p> Vm<'p> {
                         self.set(base, mdst, v);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddIntJump { dst, a, imm, upd, target } => {
                         let va = self.get(base, a);
                         let r = self.add_int_value(va, imm, upd)?;
@@ -1657,6 +1659,7 @@ impl<'p> Vm<'p> {
                         self.maybe_gc();
                         ip = target as usize;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntCmpJump { ldst, val, a, le, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1680,6 +1683,7 @@ impl<'p> Vm<'p> {
                         };
                         ip = if r { ip + 2 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalCmpJump { gdst, idx, a, le, target } => {
                         let g = self.globals[idx as usize];
                         let g = if g.is_uninitialized()
@@ -1704,6 +1708,7 @@ impl<'p> Vm<'p> {
                         };
                         ip = if r { ip + 2 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddLoadInt { ldst, val, dst, a } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1720,6 +1725,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd } => {
                         let g = self.globals[idx as usize];
                         let g = if g.is_uninitialized()
@@ -1735,6 +1741,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddReturn { dst, a, b, src } => {
                         let r = self.add(base, a, b)?;
                         self.set(base, dst, r);
@@ -1753,6 +1760,7 @@ impl<'p> Vm<'p> {
                     // The global runs (`overlay_global_runs`): an Int global with
                     // no route here, everything else out of line (`global_run`).
                     // Whole arms inline grew every other arm's register shuffles.
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target } => {
                         let g = self.globals[idx as usize];
                         if g.is_int() && self.global_route_epoch == 0 {
@@ -1763,6 +1771,7 @@ impl<'p> Vm<'p> {
                             ip = self.global_run(*instr, base, func_id, ip, false)?;
                         }
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalIncJump { reg, idx, imm, target, .. } => {
                         let g = self.globals[idx as usize];
                         let r = if g.is_int() && self.global_store_plain(idx) {
@@ -1786,6 +1795,7 @@ impl<'p> Vm<'p> {
                             ip = self.global_run(*instr, base, func_id, ip, true)?;
                         }
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx } => {
                         let val = Value::int(val as i32);
                         self.set(base, ldst, val);
@@ -1799,6 +1809,7 @@ impl<'p> Vm<'p> {
                             ip += 2;
                         }
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op } => {
                         let g = self.globals[idx as usize];
                         if g.is_int() && self.global_route_epoch == 0 {
@@ -1812,9 +1823,11 @@ impl<'p> Vm<'p> {
                             ip = self.global_run(*instr, base, func_id, ip, true)?;
                         }
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalInc { .. } => {
                         ip = self.global_run(*instr, base, func_id, ip, true)?;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 } => {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized()
@@ -1836,6 +1849,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst2, v);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } => {
                         self.set(base, ldst, Value::int(val));
                         let (va, vb) = (self.get(base, a), self.get(base, b));
@@ -1843,6 +1857,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseEqJump { dst, a, b, ne, when, target } => {
                         let (va, vb) = (self.get(base, a), self.get(base, b));
                         let eq = self.strict_eq_fast(va, vb);
@@ -1851,6 +1866,7 @@ impl<'p> Vm<'p> {
                         // Forward only (see the variant): no back-edge here.
                         ip = if r == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntEqJump { ldst, val, a, dst, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1864,6 +1880,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r { target as usize } else { ip + 3 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntNeJump { ldst, val, a, dst, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1875,6 +1892,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r { ip + 3 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseConstEqJump { ldst, idx, a, dst, when, target } => {
                         let c = self.resolve_const_slot(func_id, idx.into());
                         self.set(base, ldst, c);
@@ -1882,17 +1900,20 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r == when { target as usize } else { ip + 3 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseTypeOfJump { dst, a, code, neg, when, target } => {
                         let va = self.get(base, a);
                         let m = (self.type_code(va) == code) != neg;
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseNotJump { dst, a, when, target } => {
                         let m = !self.truthy(self.get(base, a));
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseNullJump { ldst, a, dst, ne, when, target } => {
                         // `a == null`, as `loose_eq_nullish` decides it.
                         self.set(base, ldst, Value::NULL);
@@ -3307,6 +3328,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
                         #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
@@ -3324,6 +3346,7 @@ impl<'p> Vm<'p> {
                         self.set(base, mdst, m);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseMove2 { dst, src, dst2, src2 } => {
                         let v = self.get(base, src);
                         self.set(base, dst, v);
@@ -5259,6 +5282,7 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FusePopHandlerJump { target } => {
                         let top = self.frames.len() - 1;
                         self.frames[top].handlers.pop();
@@ -5655,6 +5679,7 @@ impl<'p> Vm<'p> {
     /// other value matches none. Answers the next ip.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn str_switch(
         &mut self,
         running: &'p crate::bytecode::FuncProto,
@@ -5713,6 +5738,7 @@ impl<'p> Vm<'p> {
     /// next ip.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn int_switch(
         &mut self,
         running: &'p crate::bytecode::FuncProto,
@@ -7110,6 +7136,7 @@ impl<'p> Vm<'p> {
     /// everything else (coercion, BigInt, the TypeErrors) through
     /// `numeric_binop`.
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn fused_bitwise(&mut self, va: Value, vb: Value, op: crate::bytecode::BitwiseOp) -> Result<Value, Thrown> {
         use crate::bytecode::BitwiseOp as B;
         let ints = if va.is_int() && vb.is_int() {
@@ -7149,6 +7176,7 @@ impl<'p> Vm<'p> {
     /// Number paths inline, a Python `for` counter's small BigInt inline as
     /// in the arm (it is every iteration's), the rest out of line.
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn add_int_value(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
         if va.is_int() {
             return Ok(match va.as_int().checked_add(imm) {
@@ -7172,6 +7200,7 @@ impl<'p> Vm<'p> {
     /// superinstruction (`Instr::FuseAddIntMove`): the arm's own code.
     #[cold]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     fn add_int_generic(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
         let p = self.numeric_prim(va)?;
         if let Some(b) = self.bigint_val(p) {
@@ -7209,6 +7238,7 @@ impl<'p> Vm<'p> {
     /// object routes, with no evalScript `const` and no pending unresolvable
     /// reference (the global runs' stores, `overlay_global_runs`).
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn global_store_plain(&self, idx: u32) -> bool {
         !self.globals[idx as usize].is_uninitialized()
             && self.eval_const_globals.is_empty()
@@ -7218,6 +7248,7 @@ impl<'p> Vm<'p> {
 
     /// Global `idx` as `LoadGlobal` reads it.
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     fn global_run_load(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
         let g = self.globals[idx as usize];
         if g.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
@@ -7235,6 +7266,7 @@ impl<'p> Vm<'p> {
     /// feeds the OSR tier). Out of line: inline, these arms cost every other
     /// arm of the loops a few percent of their instructions.
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn global_run(
         &mut self,
         instr: Instr,

@@ -445,9 +445,11 @@ impl<'p> Vm<'p> {
             // `dispatch_body`, where an arm moved rows that never run one by
             // 4-7% (ephemeral, throw-catch); the call is a sliver of the
             // compares it replaces.
+            #[cfg(not(feature = "meter-only"))]
             Instr::FuseStrSwitch { ldst, a, dst, n } => {
                 ip = self.str_switch(running, func_id, base, ip, ldst, a, dst, n);
             }
+            #[cfg(not(feature = "meter-only"))]
             Instr::FuseIntSwitch { ldst, a, dst, n } => {
                 ip = self.int_switch(running, base, ip, ldst, a, dst, n);
             }
