@@ -2018,7 +2018,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(idx) {
             HeapObj::BigInt(n) => Some(OrdKey::Int(BigVal::Small(*n))),
-            HeapObj::BigIntBig(b) => Some(OrdKey::Int(BigVal::Big((**b).clone()))),
+            HeapObj::BigIntBig(b) => Some(OrdKey::Int(BigVal::Big(b.clone()))),
             HeapObj::Array(items) if depth < 16 => {
                 let items = items.clone();
                 let mut out = Vec::with_capacity(items.len());

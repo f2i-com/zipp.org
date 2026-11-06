@@ -7200,7 +7200,7 @@ pub enum HeapObj {
     /// (vm/bigint.rs) demote on construction, so equality/ordering between the
     /// two variants never has to cross-compare (a `BigInt` and a `BigIntBig`
     /// are always unequal). Holds no heap references (GC trace is a no-op).
-    BigIntBig(Box<num_bigint::BigInt>),
+    BigIntBig(num_bigint::BigInt),
     /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
     /// property key dedupe correctly). `desc` is the description (a string Value or
     /// UNDEFINED). `prop_key` is the internal string under which the symbol is

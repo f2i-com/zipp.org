@@ -3,7 +3,7 @@
 //! Three-tier representation: an IMMEDIATE `Value` for a small value (a
 //! signed 47-bit value, see value.rs: no allocation at all),
 //! `HeapObj::BigInt(i128)` for the rest of the i128 range, and
-//! `HeapObj::BigIntBig(Box<num_bigint::BigInt>)` beyond it. `BigVal::Small`
+//! `HeapObj::BigIntBig(num_bigint::BigInt)`, held in the slot, beyond it. `BigVal::Small`
 //! covers the first two (the i128 range).
 //!
 //! CANONICAL-FORM INVARIANT: each value has exactly one representation: a
@@ -320,7 +320,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_bigint_val(&mut self, v: BigVal) -> Value {
         match v {
             BigVal::Small(n) => self.make_bigint(n),
-            BigVal::Big(b) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(Box::new(b)))),
+            BigVal::Big(b) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(b))),
         }
     }
 
@@ -339,7 +339,7 @@ impl<'p> Vm<'p> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
-                HeapObj::BigIntBig(b) => return Some(BigVal::Big((**b).clone())),
+                HeapObj::BigIntBig(b) => return Some(BigVal::Big(b.clone())),
                 _ => {}
             }
         }
@@ -411,7 +411,7 @@ impl<'p> Vm<'p> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
-                HeapObj::BigIntBig(b) => return Some(BigVal::Big((**b).clone())),
+                HeapObj::BigIntBig(b) => return Some(BigVal::Big(b.clone())),
                 HeapObj::Boxed { kind: 4, value } => return self.bigint_val(*value),
                 _ => {}
             }
