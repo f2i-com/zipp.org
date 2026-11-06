@@ -2263,6 +2263,7 @@ impl<'p> Vm<'p> {
     /// array type throws the spec TypeError, not the index error). `waitable` ⇒ the
     /// view must be Int32Array/BigInt64Array (wait/waitAsync/notify); `needs_shared`
     /// ⇒ its buffer must be a SharedArrayBuffer (wait).
+    #[cfg(not(feature = "wasm-single-agent"))]
     pub(crate) fn atomic_validate(
         &mut self,
         ta: Value,
@@ -2360,6 +2361,7 @@ impl<'p> Vm<'p> {
     /// is a RangeError. (The spec compares the byte index with the buffer's
     /// length; comparing whole elements also refuses an element the buffer
     /// now cuts in two.)
+    #[cfg(not(feature = "wasm-single-agent"))]
     fn atomic_revalidate(&self, ti: u32, i: usize) -> Result<(), Thrown> {
         match self.ta_effective_len(ti) {
             None => Err(Thrown::from_static(
@@ -2372,6 +2374,7 @@ impl<'p> Vm<'p> {
 
     /// The (buffer heap idx, byte address) a wait/notify on `(ta, index)`
     /// keys its waiter-list entry by.
+    #[cfg(not(feature = "wasm-single-agent"))]
     fn ta_wait_addr(&self, ti: u32, i: usize) -> (u32, usize) {
         match self.heap.get(ti) {
             HeapObj::TypedArray {
@@ -2390,6 +2393,7 @@ impl<'p> Vm<'p> {
     /// Execute an `Atomics.<op>` call. Single-threaded, so read-modify-write ops
     /// are plain (non-contended); `wait` never blocks (no notifier → "timed-out")
     /// and `notify` reports 0 woken.
+    #[cfg(not(feature = "wasm-single-agent"))]
     pub(crate) fn atomics_op(&mut self, op: &str, args: &[Value]) -> Result<Value, Thrown> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -3080,6 +3084,7 @@ impl<'p> Vm<'p> {
 /// value (current value for `load`), sign/zero-extended to `i64` per the
 /// element kind; the `store` return is unused (callers return the input).
 #[cfg(not(feature = "safe-sandbox"))]
+#[cfg(not(feature = "wasm-single-agent"))]
 fn sab_atomic_op(
     mem: &crate::heap::SharedMem,
     kind: u8,
@@ -3132,6 +3137,7 @@ fn sab_atomic_op(
 }
 
 #[cfg(feature = "safe-sandbox")]
+#[cfg(not(feature = "wasm-single-agent"))]
 fn sab_atomic_op(
     _mem: &crate::heap::SharedMem,
     _kind: u8,

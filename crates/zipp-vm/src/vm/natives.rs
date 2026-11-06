@@ -6160,6 +6160,10 @@ impl<'p> Vm<'p> {
                 self.arraybuffer_method(this.heap_index(), "slice", args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            // A single-agent build installs no `Atomics` global and nothing
+            // else holds the namespace (setup_globals), so none of its
+            // methods can be called there.
+            #[cfg(not(feature = "wasm-single-agent"))]
             _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
                 let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
                 self.atomics_op(name, args)?

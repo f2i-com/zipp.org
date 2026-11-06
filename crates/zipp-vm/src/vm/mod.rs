@@ -3128,6 +3128,7 @@ pub struct Vm<'p> {
     import_meta: u32,
     /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
     /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
+    #[cfg_attr(feature = "wasm-single-agent", allow(dead_code))]
     can_block: bool,
     /// The body promise of the most recent `import_module` whose top-level
     /// await SUSPENDED (still Pending on return). Taken by the dynamic-import

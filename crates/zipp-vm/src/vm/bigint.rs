@@ -117,6 +117,7 @@ impl BigVal {
         }
     }
 
+    #[cfg(not(feature = "wasm-single-agent"))]
     pub(crate) fn to_i64_wrap(&self) -> i64 {
         self.to_u64_wrap() as i64
     }
