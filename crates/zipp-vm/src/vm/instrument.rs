@@ -1178,7 +1178,11 @@ impl super::Vm<'_> {
             return Err(message);
         }
 
-        if bytes > self.instrument_regex_transient_available() {
+        // A zero-byte charge (most of the per-match reservations) can never
+        // exceed the allowance, so it skips the allowance's sum of the heap's
+        // table capacities: a global `match` over many short matches spent a
+        // seventh of its time in that sum (the browser module's regex row).
+        if bytes != 0 && bytes > self.instrument_regex_transient_available() {
             // A subject buffer kept between execs holds allowance this
             // request may need: give it back before refusing.
             self.regex_subject_units = None;
