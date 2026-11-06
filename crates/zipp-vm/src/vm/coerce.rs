@@ -2655,6 +2655,25 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// A conditional jump's test, in the interpreter loop: a comparison's
+    /// boolean, nearly always, with no call, and in the native builds a
+    /// primitive too (`if (node.x)` on an absent `x`), so only a heap value
+    /// calls `truthy`, which the loop does not inline. The WASM modules keep
+    /// the call: the inline primitive test, in each copy of the loop, was
+    /// 723 Brotli bytes of the Lite module (both modules smaller raw without
+    /// it) for about a percent of interpreted time.
+    #[inline(always)]
+    pub(crate) fn jump_condition(&self, v: Value) -> bool {
+        if v.is_bool() {
+            return v.bits() == Value::TRUE.bits();
+        }
+        #[cfg(not(feature = "meter-only"))]
+        if !v.is_heap() {
+            return v.truthy_primitive().unwrap_or(true);
+        }
+        self.truthy(v)
+    }
+
     #[inline]
     pub(crate) fn truthy(&self, v: Value) -> bool {
         if let Some(t) = v.truthy_primitive() {

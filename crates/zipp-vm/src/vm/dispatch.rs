@@ -3102,17 +3102,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
-                        // A comparison's boolean, nearly always: no call. A
-                        // primitive (`if (node.x)` on an absent `x`) is answered
-                        // here too; only a heap value calls `truthy`, which the
-                        // loop does not inline.
-                        let t = if v.is_bool() {
-                            v.bits() == Value::TRUE.bits()
-                        } else if v.is_heap() {
-                            self.truthy(v)
-                        } else {
-                            v.truthy_primitive().unwrap_or(true)
-                        };
+                        let t = self.jump_condition(v);
                         if !t {
                             // A taken BACKWARD conditional closes a loop
                             // (`do … while`): the same GC safe point as the
@@ -3128,14 +3118,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
-                        // As `JumpIfFalse`.
-                        let t = if v.is_bool() {
-                            v.bits() == Value::TRUE.bits()
-                        } else if v.is_heap() {
-                            self.truthy(v)
-                        } else {
-                            v.truthy_primitive().unwrap_or(true)
-                        };
+                        let t = self.jump_condition(v);
                         if t {
                             // See `JumpIfFalse`: a backward taken branch is a
                             // loop back-edge.
