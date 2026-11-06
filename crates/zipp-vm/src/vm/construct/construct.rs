@@ -1746,6 +1746,7 @@ impl<'p> Vm<'p> {
             let tvi = tv.heap_index();
             let cloned = self::copy_builtin_instance!(self.heap.get(tvi));
             self.heap.replace(oidx, cloned);
+            self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
             if let Some(m) = self.fn_props.remove(&tvi) {
                 self.fn_props.insert(oidx, m);
             }

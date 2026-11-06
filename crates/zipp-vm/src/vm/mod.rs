@@ -30,6 +30,30 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Slots of `Vm::instanceof_memo`, indexed by the function's heap slot.
+pub(crate) const INSTANCEOF_MEMO_SLOTS: usize = 256;
+
+/// One slot of `Vm::instanceof_memo`: the ordinary function at heap slot
+/// `idx` passed `instanceof_fast`'s right-hand side checks when its version
+/// was `ver` and `Vm::fn_props_gen` was `gen`, and its `prototype` object was
+/// `proto`.
+#[derive(Clone, Copy)]
+pub(crate) struct InstanceofMemo {
+    pub(crate) idx: u32,
+    pub(crate) ver: u32,
+    pub(crate) gen: u32,
+    pub(crate) proto: Value,
+}
+
+impl InstanceofMemo {
+    pub(crate) const EMPTY: InstanceofMemo = InstanceofMemo {
+        idx: u32::MAX,
+        ver: 0,
+        gen: 0,
+        proto: Value::UNDEFINED,
+    };
+}
+
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
 /// than growing unbounded. 100k is far beyond any non-pathological recursion
 /// and the flat register file makes each frame cheap.
@@ -3426,6 +3450,16 @@ pub struct Vm<'p> {
     /// getOwnPropertyDescriptor, so a function whose prototype was set to a
     /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
     fn_proto_override: rustc_hash::FxHashMap<u32, Value>,
+    /// `instanceof`'s right-hand side checks for an ordinary function
+    /// (`instanceof_fast`): no own `@@hasInstance` or own `prototype` in its
+    /// `fn_props`, no [[Prototype]] of its own, a constructable non-arrow, and
+    /// the `prototype` object those leave it. By heap slot, valid while the
+    /// slot's version (a `prototype` assignment bumps it) and
+    /// `fn_props_gen` (every `fn_props` write moves it) are what they were.
+    instanceof_memo: Box<[InstanceofMemo]>,
+    /// Moved by every write to `fn_props`, which keeps a function's own
+    /// properties without bumping its version (`instanceof_memo`).
+    fn_props_gen: u32,
     /// Ordinary functions whose `prototype` was made non-writable
     /// (`Object.defineProperty(f, "prototype", {writable: false})`,
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its

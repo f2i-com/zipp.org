@@ -3277,6 +3277,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::num(len)
                 };
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 let m = self
                     .fn_props
                     .entry(idx)
@@ -4178,6 +4179,7 @@ impl<'p> Vm<'p> {
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::CombinatorResolver { .. }
                             ) {
+                                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {
                                         OBJ_FREEZE => fm.freeze(),

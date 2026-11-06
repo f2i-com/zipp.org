@@ -627,6 +627,7 @@ impl<'p> Vm<'p> {
                     if let Some(m) = self.fn_props.get_mut(&idx) {
                         m.remove(key);
                     }
+                    self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                     self.heap.bump_version(idx);
                 }
                 if class_own {
@@ -764,6 +765,7 @@ impl<'p> Vm<'p> {
             | HeapObj::NativeClosure { .. }
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. } => {
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
@@ -1948,6 +1950,7 @@ impl<'p> Vm<'p> {
                 if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
                     return self.reject_write(key, strict);
                 }
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 self.fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)

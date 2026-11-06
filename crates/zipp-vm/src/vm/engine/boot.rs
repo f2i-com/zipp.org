@@ -713,6 +713,8 @@ impl<'p> Vm<'p> {
             obj_realm: crate::vm::JitGuardedMap::new(),
             realm_ctor_main: Default::default(),
             fn_proto_override: rustc_hash::FxHashMap::default(),
+            instanceof_memo: vec![crate::vm::InstanceofMemo::EMPTY; crate::vm::INSTANCEOF_MEMO_SLOTS].into_boxed_slice(),
+            fn_props_gen: 0,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),

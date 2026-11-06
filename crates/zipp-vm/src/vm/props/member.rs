@@ -621,6 +621,7 @@ impl<'p> Vm<'p> {
             return;
         }
         let nv = self.alloc_str(name);
+        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
         self.fn_props
             .entry(fi)
             .or_insert_with(ObjMap::new_side_table)

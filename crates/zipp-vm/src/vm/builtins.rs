@@ -1452,6 +1452,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         self.store_barrier_v(crate::heap::gcoracle::SET_PROP, o, v);
+        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
         if let Some(m) = self.fn_props.get_mut(&o.heap_index()) {
             m.set_val_at(i, v);
         }

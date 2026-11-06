@@ -996,6 +996,7 @@ impl<'p> Vm<'p> {
                     accessor: false,
                     setter: Value::UNDEFINED,
                 };
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 self.fn_props
                     .entry(f.heap_index())
                     .or_default()
