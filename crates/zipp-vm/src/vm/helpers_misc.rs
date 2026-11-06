@@ -9199,6 +9199,13 @@ pub(crate) extern "win64" fn jit_regexp_scalar_exec_flush(
     0
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_ITER_CROSS=1`: a compiled for-of step over a user iterator
+    /// calls its `next` through `iter_next_step` (`call_value`), as before.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn iter_cross_enabled() = "ZIPP_NO_ITER_CROSS"
+}
+
 /// Win64 helper for a region `IterNext` — the for-of step over an iterator the
 /// engine can drive INTRINSICALLY: a %RegExpStringIterator% (`s.matchAll(re)`),
 /// a live %ArrayIterator% (`a.values()`/`keys()`/`entries()`), or a Map/Set/
@@ -9214,6 +9221,10 @@ pub(crate) extern "win64" fn jit_regexp_scalar_exec_flush(
 /// `SELF_CALL_DEOPT` BEFORE any state is touched, so the
 /// interpreter re-executes the op with full semantics (repeated deopts evict
 /// the region, restoring today's interpreted loop).
+///
+/// A user iterator object whose cached `next` is a plain user function is
+/// stepped by calling it native to native above this window (its register
+/// count rides in `idx_reg`'s high half; 0 there keeps `iter_next_step`).
 ///
 /// `regs` is the region's frame-register window (`rbx`); `packed` carries the
 /// four register numbers. The step is read off `vm` and its results are
@@ -9246,6 +9257,10 @@ pub(crate) extern "win64" fn jit_iter_next(
     // The region loop's safe point (see above) — everything live is in
     // `vm.regs`, which the GC traces.
     vm.maybe_gc();
+    // `idx_reg`'s high half: the calling code's register count, for a
+    // native call above its window (0 from a caller that does not pass it).
+    let caller_regs = (idx_reg >> 16) as usize;
+    let idx_reg = idx_reg & 0xFFFF;
     let iter_reg = ((packed >> 48) & 0xFFFF) as usize;
     let next_reg = ((packed >> 32) & 0xFFFF) as usize;
     let value_dst = ((packed >> 16) & 0xFFFF) as usize;
@@ -9334,6 +9349,46 @@ pub(crate) extern "win64" fn jit_iter_next(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let (value_dst, done_dst) = (value_dst as u16, done_dst as u16);
+    // A user iterator object whose `next` (cached by IterPrime) is a plain
+    // user function: that call made native to native from this window
+    // (`jit_cross_call_impl`, `this` the iterator, no arguments), and its
+    // result taken apart where it lies (`iter_step_result`). Through
+    // `iter_next_step` each step called `next` in a nested interpreter loop
+    // and read `done` and `value` by name. A decline has done nothing;
+    // once the call ran, the step completes here and never replays.
+    if caller_regs != 0 && iter_cross_enabled() {
+        let next = Value::from_bits(unsafe { *regs.add(next_reg) });
+        if matches!(vm.heap.get(it_heap_idx), HeapObj::Object(_)) && vm.ic_plain_fn(next).is_some() {
+            return catch_effectful_jit_u64(|| {
+                let r = vm.jit_cross_call_impl::<false>(
+                    regs as *const u64,
+                    regs as *const u64,
+                    (caller_regs as u64) << 16,
+                    next.bits(),
+                    Some(it),
+                );
+                if r == crate::codegen::CALL_THREW {
+                    return r;
+                }
+                if r == crate::codegen::SELF_CALL_DEOPT {
+                    return match vm.iter_next_step(base, it, value_dst, done_dst, idx_reg as u16, next_reg as u16) {
+                        Ok(()) => {
+                            iterstats::native_step();
+                            0
+                        }
+                        Err(t) => vm.jit_thrown_to_sentinel(t),
+                    };
+                }
+                match vm.iter_step_result(base, Value::from_bits(r), value_dst, done_dst) {
+                    Ok(()) => {
+                        iterstats::native_step();
+                        0
+                    }
+                    Err(t) => vm.jit_thrown_to_sentinel(t),
+                }
+            });
+        }
+    }
     // A user `next` runs here: past this point a Rust unwind must not reach the
     // native frames, and the step must not replay.
     catch_effectful_jit_u64(|| {

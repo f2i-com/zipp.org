@@ -4981,7 +4981,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rbx                        // frame register window
                     ; mov r8, QWORD packed as i64         // iter/next/value/done regs
-                    ; mov r9d, idx as i32                 // dense-Array cursor reg
+                    ; mov r9d, (idx as u32 | (proto.reg_count.max(1) as u32) << 16) as i32 // cursor reg | window size << 16
                     ; mov rax, QWORD heap.iter_next as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64

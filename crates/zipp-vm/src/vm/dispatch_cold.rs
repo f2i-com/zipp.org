@@ -153,6 +153,41 @@ impl<'p> Vm<'p> {
     /// array or a holey Array. `it` is a heap value. Writes `value_dst`,
     /// `done_dst` and the cursor `idx` of the window at `base`.
     #[inline(never)]
+    /// A user iterator's `next()` result `res` taken apart for a for-of
+    /// step: IteratorNext's object check, IteratorComplete (the `done` Get)
+    /// and, only while not done, IteratorValue (the `value` Get, observable
+    /// through a getter). `done_dst` receives `done` as read, `value_dst` the
+    /// value or, once done, `undefined`. A result that is exactly
+    /// `{value, done}` as two own data properties (what `return { value: v,
+    /// done: false }` makes) is read where it lies (`iter_result_unwrap`):
+    /// neither Get can run code there, so reading both is the same.
+    pub(crate) fn iter_step_result(
+        &mut self,
+        base: usize,
+        res: Value,
+        value_dst: u16,
+        done_dst: u16,
+    ) -> Result<(), Thrown> {
+        if !self.is_object_value(res) {
+            return Err(Thrown("TypeError: iterator result is not an object".into()));
+        }
+        let (val, done) = match self.iter_result_unwrap(res) {
+            Some((val, done)) => (if self.truthy(done) { Value::UNDEFINED } else { val }, done),
+            None => {
+                let done = self.get_prop(res, "done")?;
+                let val = if self.truthy(done) {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(res, "value")?
+                };
+                (val, done)
+            }
+        };
+        self.set(base, value_dst, val);
+        self.set(base, done_dst, done);
+        Ok(())
+    }
+
     pub(crate) fn iter_next_step(
         &mut self,
         base: usize,
@@ -273,24 +308,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let res = self.call_value(next, it, &[])?;
-                // IteratorNext step 3: a non-Object result is a TypeError.
-                if !self.is_object_value(res) {
-                    return Err(Thrown(
-                        "TypeError: iterator result is not an object".into(),
-                    ));
-                }
-                // IteratorStep reads only `done`; IteratorValue (the
-                // `value` Get — observable via a getter) happens ONLY
-                // when the iterator is not done.
-                let done = self.get_prop(res, "done")?;
-                let val = if self.truthy(done) {
-                    Value::UNDEFINED
-                } else {
-                    self.get_prop(res, "value")?
-                };
-                self.set(base, value_dst, val);
-                self.set(base, done_dst, done);
-                return Ok(());
+                return self.iter_step_result(base, res, value_dst, done_dst);
             }
         }
         // Array/Set element, string char, or Map [k,v] at the cursor.
