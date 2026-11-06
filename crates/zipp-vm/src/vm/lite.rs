@@ -126,6 +126,12 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::Mul { .. }
             | Instr::Bitwise { .. }
             | Instr::FuseLoadIntBitwise { .. }
+            // A script's global runs (`overlay_global_runs`).
+            | Instr::FuseGlobalIntCmpJump { .. }
+            | Instr::FuseGlobalIncJump { .. }
+            | Instr::FuseGlobalInc { .. }
+            | Instr::FuseIntBitwiseStoreGlobal { .. }
+            | Instr::FuseGlobalIntBitwise { .. }
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::FuseEqJump { .. }
@@ -202,7 +208,9 @@ fn jump_target(i: &Instr) -> Option<u32> {
         | Instr::JumpIfTrue { target, .. }
         | Instr::JumpIfNotLt { target, .. }
         | Instr::JumpIfNotLe { target, .. }
-        | Instr::FuseAddIntJump { target, .. } => Some(target),
+        | Instr::FuseAddIntJump { target, .. }
+        | Instr::FuseGlobalIncJump { target, .. }
+        | Instr::FuseGlobalIntCmpJump { target, .. } => Some(target),
         _ => None,
     }
 }
@@ -1550,6 +1558,21 @@ impl<'p> Vm<'p> {
                     let r = self.fused_bitwise(va, vb, op)?;
                     self.set(base, dst, r);
                     ip += 2;
+                }
+                // The global runs, through the main loop's out-of-line arm
+                // (`Vm::global_run`); a counter's back-edge counts as one.
+                Instr::FuseGlobalIntCmpJump { .. }
+                | Instr::FuseGlobalIncJump { .. }
+                | Instr::FuseGlobalInc { .. }
+                | Instr::FuseIntBitwiseStoreGlobal { .. }
+                | Instr::FuseGlobalIntBitwise { .. }
+                    if FULL =>
+                {
+                    let next = self.global_run(code[ip], base, func_id, ip, false)?;
+                    if next <= ip {
+                        steps += LITE_LOOP_STEPS;
+                    }
+                    ip = next;
                 }
                 Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));

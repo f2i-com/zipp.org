@@ -1750,6 +1750,58 @@ impl<'p> Vm<'p> {
                         }
                         break;
                     }
+                    // The global runs (`overlay_global_runs`): an Int global with
+                    // no route here, everything else out of line (`global_run`).
+                    // Whole arms inline grew every other arm's register shuffles.
+                    Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target } => {
+                        let g = self.globals[idx as usize];
+                        if g.is_int() && self.global_route_epoch == 0 {
+                            self.set(base, gdst, g);
+                            self.set(base, ldst, Value::int(val));
+                            ip = if g.as_int() < val { ip + 3 } else { target as usize };
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, false)?;
+                        }
+                    }
+                    Instr::FuseGlobalIncJump { reg, idx, imm, target, .. } => {
+                        let g = self.globals[idx as usize];
+                        let r = if g.is_int() && self.global_store_plain(idx) {
+                            g.as_int().checked_add(imm as i32)
+                        } else {
+                            None
+                        };
+                        if let Some(r) = r {
+                            let r = Value::int(r);
+                            self.set(base, reg, r);
+                            self.globals[idx as usize] = r;
+                            // The backward `Jump` at `ip + 3`, as `FuseAddIntJump`'s.
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            if !LITE && self.jit_enabled {
+                                ip += 3;
+                                continue;
+                            }
+                            self.maybe_gc();
+                            ip = target as usize;
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, true)?;
+                        }
+                    }
+                    Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx } => {
+                        let val = Value::int(val as i32);
+                        self.set(base, ldst, val);
+                        let va = self.get(base, a);
+                        let r = self.fused_bitwise(va, val, op)?;
+                        self.set(base, dst, r);
+                        if self.global_store_plain(idx) {
+                            self.globals[idx as usize] = r;
+                            ip += 3;
+                        } else {
+                            ip += 2;
+                        }
+                    }
+                    Instr::FuseGlobalInc { .. } | Instr::FuseGlobalIntBitwise { .. } => {
+                        ip = self.global_run(*instr, base, func_id, ip, true)?;
+                    }
                     Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 } => {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized()
@@ -7136,6 +7188,116 @@ impl<'p> Vm<'p> {
         unsafe {
             *self.regs.get_unchecked_mut(index) = v;
         }
+    }
+
+    /// Whether a store to global slot `idx` is a plain write of the slot
+    /// now: what `StoreGlobal`, `StoreGlobalStrict` and `StoreGlobalResolved`
+    /// each do for an initialized slot that no own property of the global
+    /// object routes, with no evalScript `const` and no pending unresolvable
+    /// reference (the global runs' stores, `overlay_global_runs`).
+    #[inline(always)]
+    pub(crate) fn global_store_plain(&self, idx: u32) -> bool {
+        !self.globals[idx as usize].is_uninitialized()
+            && self.eval_const_globals.is_empty()
+            && self.strict_unresolvable_globals.is_empty()
+            && (self.global_route_epoch == 0 || !self.global_real_own_route(idx))
+    }
+
+    /// Global `idx` as `LoadGlobal` reads it.
+    #[inline(always)]
+    fn global_run_load(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
+        let g = self.globals[idx as usize];
+        if g.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
+            self.load_global_slow(idx, func_id)
+        } else {
+            Ok(g)
+        }
+    }
+
+    /// One global run (`overlay_global_runs`) at `ip`, in either loop: its
+    /// instructions' arms back to back, and the next position. A store that
+    /// is no plain slot write (`global_store_plain`) is left to its own arm,
+    /// which the run continues at; so is the back-edge of a counter step when
+    /// `osr_back_edge` (the main loop with the JIT on, where the `Jump` arm
+    /// feeds the OSR tier). Out of line: inline, these arms cost every other
+    /// arm of the loops a few percent of their instructions.
+    #[inline(never)]
+    pub(crate) fn global_run(
+        &mut self,
+        instr: Instr,
+        base: usize,
+        func_id: u32,
+        ip: usize,
+        osr_back_edge: bool,
+    ) -> Result<usize, Thrown> {
+        Ok(match instr {
+            Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target } => {
+                let g = self.global_run_load(idx as u32, func_id)?;
+                self.set(base, gdst, g);
+                self.set(base, ldst, Value::int(val));
+                let r = if g.is_int() {
+                    g.as_int() < val
+                } else if g.is_double() {
+                    g.as_f64() < val as f64
+                } else {
+                    self.cmp_lt(base, gdst, ldst, true)?
+                };
+                if r {
+                    ip + 3
+                } else {
+                    target as usize
+                }
+            }
+            Instr::FuseGlobalIncJump { reg, idx, imm, upd, .. } | Instr::FuseGlobalInc { reg, idx, imm, upd } => {
+                let g = self.globals[idx as usize];
+                if g.is_int() && self.global_store_plain(idx) {
+                    let r = match g.as_int().checked_add(imm as i32) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(g.as_int() as f64 + imm as f64),
+                    };
+                    self.set(base, reg, r);
+                    self.globals[idx as usize] = r;
+                    match instr {
+                        // The backward `Jump` at `ip + 3`, as `FuseAddIntJump`'s.
+                        Instr::FuseGlobalIncJump { target, .. } if !osr_back_edge => {
+                            self.maybe_gc();
+                            target as usize
+                        }
+                        _ => ip + 3,
+                    }
+                } else {
+                    // The load and the step; the store in its own arm.
+                    let g = self.global_run_load(idx, func_id)?;
+                    self.set(base, reg, g);
+                    let r = self.add_int_value(g, imm.into(), upd)?;
+                    self.set(base, reg, r);
+                    ip + 2
+                }
+            }
+            Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx } => {
+                let val = Value::int(val as i32);
+                self.set(base, ldst, val);
+                let va = self.get(base, a);
+                let r = self.fused_bitwise(va, val, op)?;
+                self.set(base, dst, r);
+                if self.global_store_plain(idx) {
+                    self.globals[idx as usize] = r;
+                    ip + 3
+                } else {
+                    ip + 2
+                }
+            }
+            Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op } => {
+                let g = self.global_run_load(idx, func_id)?;
+                self.set(base, gdst, g);
+                let val = Value::int(val as i32);
+                self.set(base, ldst, val);
+                let r = self.fused_bitwise(g, val, op)?;
+                self.set(base, dst, r);
+                ip + 3
+            }
+            _ => unreachable!("global_run is given a global run"),
+        })
     }
 
     // â”€â”€ call setup â”€â”€

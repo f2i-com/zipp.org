@@ -451,5 +451,21 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *r2 = m(*r2);
             *r3 = m(*r3);
         }
+        #[cfg(all())]
+        Instr::FuseGlobalIntCmpJump { gdst: r0, ldst: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::FuseGlobalIncJump { reg: r0, .. } | Instr::FuseGlobalInc { reg: r0, .. } => {
+            *r0 = m(*r0);
+        }
+        #[cfg(all())]
+        Instr::FuseIntBitwiseStoreGlobal { ldst: r0, dst: r1, a: r2, .. }
+        | Instr::FuseGlobalIntBitwise { gdst: r0, ldst: r1, dst: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+        }
     );
 }
