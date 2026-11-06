@@ -7,8 +7,9 @@
 //! length, named properties, a non-enumerable index, frozen, a match
 //! result, `arguments`, a long array, a getter index) and `for-in`; `in` on
 //! dense and holey arrays with negative, double, accessor and prototype
-//! keys. In the interpreter, by default and with every function compiled
-//! at once.
+//! keys; and an array only ever written by index holding young objects
+//! across collections. In the interpreter, by default and with every
+//! function compiled at once.
 
 const SOURCE: &str = r##""use strict";
 // Array builtins and `in` on their compiled lanes, hot enough to compile.
@@ -73,10 +74,16 @@ const acc = [1, , 3]; Object.defineProperty(acc, 1, { get() { return 2; } });
 Array.prototype[7] = 1;
 out.push("IN2 " + hot(3000, (i) => (1 in acc ? 1 : 0) + (7 in dense ? 2 : 0) + (7 in holey ? 4 : 0) + (70 in holey ? 8 : 0)));
 delete Array.prototype[7];
+// 8. an array only ever written by index (stores settle its mirror), holding young objects across collections
+const ring = new Array(512).fill(null);
+function put(i) { ring[i & 511] = { v: i, w: [i, -i] }; }
+for (let i = 0; i < 200000; i++) put(i);
+let rs = 0; for (let i = 0; i < 512; i++) rs = (rs + ring[i].v * 3 + ring[i].w[0] + ring[i].w[1] * 2) | 0;
+out.push("W " + rs);
 console.log(out.join("\n"));
 "##;
 
-const EXPECTED: &str = "Q -880234464\nH -1766349952\nP -59063680\nC 1411967872 6000\nS -59063680\nF 1411967872\nN 1411967872 1,2,3\nO -826891520\nR 481408768 1500\nI 1272956672\nD 2 1 0 0 -1 -1\nL -1782056950\nK -1339365184\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\nK3 4 6 2999 string true\nK4 [42,2,3] [\"3\"]\nK5 0,1,3\nIN 1263937024\nIN2 1293840512";
+const EXPECTED: &str = "Q -880234464\nH -1766349952\nP -59063680\nC 1411967872 6000\nS -59063680\nF 1411967872\nN 1411967872 1,2,3\nO -826891520\nR 481408768 1500\nI 1272956672\nD 2 1 0 0 -1 -1\nL -1782056950\nK -1339365184\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\nK3 4 6 2999 string true\nK4 [42,2,3] [\"3\"]\nK5 0,1,3\nIN 1263937024\nIN2 1293840512\nW 204537344";
 
 #[test]
 fn array_builtin_lanes_worker() {

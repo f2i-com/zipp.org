@@ -26,8 +26,12 @@ pub(crate) struct NativeCb {
     uninit_mask: u64,
     /// The global slot and value a self-calling body assumed (`try_run_jit`).
     self_binding: Option<(u32, u64)>,
-    /// A closure with captures: its cells are installed around each call.
-    capturing: bool,
+    /// A closure with captures: the base of its upvalue list, installed as
+    /// the activation's around each call, or 0. Read once: the list is fixed
+    /// at the closure's creation and the closure, the builtin's callback, is
+    /// rooted for the whole builtin, so the base cannot move under it. It was
+    /// a heap lookup per element.
+    upvals_raw: u64,
     /// The JIT's evictions when `entry` was taken (`Jit::retired_count`):
     /// after one, `entry` may be a parked body its function has replaced.
     retired: usize,
@@ -305,6 +309,7 @@ impl<'p> Vm<'p> {
         // calls compiled, and the conditions of a frame-free native call (the
         // ones an emitted cross-call site tests before it enters one).
         let capturing = !ups.is_empty();
+        let upvals_raw = if capturing { ups.as_ptr() as u64 } else { 0 };
         if capturing
             && (self.jit.cross_entry(fid).is_none()
                 || !self.closure_eval_scope.is_empty()
@@ -449,7 +454,7 @@ impl<'p> Vm<'p> {
             fid,
             uninit_mask,
             self_binding,
-            capturing,
+            upvals_raw,
             retired: self.jit.retired_count(),
         })
     }
@@ -538,18 +543,8 @@ impl<'p> Vm<'p> {
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
         }
-        // A capturing closure's cells, read from the closure each call (its
-        // list never changes, but this is the pointer native code follows).
-        let upvals_raw = if native.capturing {
-            match self.heap.get(cb.heap_index()) {
-                HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
-                    upvalues.as_ptr() as u64
-                }
-                _ => return self.call_value(cb, this_val, args),
-            }
-        } else {
-            0u64
-        };
+        // A capturing closure's cells (see `NativeCb::upvals_raw`).
+        let upvals_raw = native.upvals_raw;
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is a valid compiled win64 fn (regs, bail_out, vm)->bits

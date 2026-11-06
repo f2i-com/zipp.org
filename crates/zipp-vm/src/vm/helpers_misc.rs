@@ -2978,6 +2978,7 @@ pub(crate) extern "win64" fn jit_set_index(
             .heap
             .array_store_in_place(arr.heap_index(), i, Value::from_bits(val_bits))
     {
+        settle_arr_mirror_after_store(vm, arr.heap_index());
         return 0;
     }
     match vm.heap.get_mut(arr.heap_index()) {
@@ -2994,9 +2995,26 @@ pub(crate) extern "win64" fn jit_set_index(
                 // not across this `extern "win64"` boundary (which would be UB).
                 return crate::codegen::SELF_CALL_DEOPT;
             }
+            settle_arr_mirror_after_store(vm, arr.heap_index());
             0
         }
         _ => crate::codegen::SELF_CALL_DEOPT, // non-array → interpreter
+    }
+}
+
+/// After [`jit_set_index`] stored into the dense Array `aidx` (whose side
+/// table it has excluded): settle the array's mirror entry under
+/// `jit_get_index`'s other conditions, so emitted element writes
+/// (`emit_arr_mirror_set`) and reads serve the next ones. Only reads settled
+/// it, and an array only ever written (a ring buffer of objects, a result
+/// filled by index) sent every store through this helper and its barrier.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn settle_arr_mirror_after_store(vm: &mut Vm<'_>, aidx: u32) {
+    if (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&aidx))
+        && (vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&aidx))
+    {
+        vm.heap.repair_arr_mirror(aidx);
     }
 }
 
@@ -5585,20 +5603,27 @@ pub(crate) mod activationrootstats {
     static ON: AtomicU8 = AtomicU8::new(2);
     static NESTED_FRAME_FREE: AtomicU64 = AtomicU64::new(0);
 
-    #[inline]
+    /// Asked on every activation a builtin's callback nests under a
+    /// frame-free caller: one load and compare inline, the first ask out of
+    /// line. As an ordinary `#[inline]` it stayed a call (3% of a `forEach`).
+    #[inline(always)]
     fn enabled() -> bool {
         match ON.load(Ordering::Relaxed) {
             0 => false,
             1 => true,
-            _ => {
-                let on = crate::icstats_enabled() as u8;
-                ON.store(on, Ordering::Relaxed);
-                on == 1
-            }
+            _ => first_ask(),
         }
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
+    fn first_ask() -> bool {
+        let on = crate::icstats_enabled() as u8;
+        ON.store(on, Ordering::Relaxed);
+        on == 1
+    }
+
+    #[inline(always)]
     pub(crate) fn nested_under_frame_free() {
         if enabled() {
             NESTED_FRAME_FREE.fetch_add(1, Ordering::Relaxed);
