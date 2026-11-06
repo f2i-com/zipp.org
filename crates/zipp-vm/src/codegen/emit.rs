@@ -709,6 +709,73 @@ pub(crate) fn emit_acc_lane(
     );
 }
 
+/// A private-field lane (`PrivLane`) ahead of its site's helper: while the
+/// field's class declaration is still evaluated once (`lane.flag`), the
+/// receiver a heap object with a private list (`Vm::private_fields`, read
+/// through `l`) whose entry at `lane.pos` is `(lane.brand, lane.id)`, read
+/// that entry's value into `get_dst`, or write `set_val` over it when it is
+/// not a heap reference (a heap value goes through the helper, which records
+/// a young one for the collector), and jump to `done`. Everything else falls
+/// to `slow`: the helper. Scratch: rax, rcx, r8, r10.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_priv_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &PrivLane,
+    l: &PrivLayout,
+    obj: u16,
+    get_dst: Option<u16>,
+    set_val: Option<u16>,
+    slow: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) {
+    let at = lane.pos as i32 * l.entry_size;
+    let (brand_at, id_at, val_at) = (at + l.brand_off, at + l.id_off, at + l.val_off);
+    dynasm!(ops
+        ; mov r10, QWORD lane.flag as i64
+        ; cmp BYTE [r10], 0
+        ; je => slow
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                        // a heap value
+        ; jne => slow
+        ; mov ecx, eax                            // heap idx
+        ; cmp rcx, [rdi + l.flat_len]
+        ; jae => slow
+        ; mov r8, [rdi + l.flat_ptr]
+        ; mov r8d, DWORD [r8 + rcx*4]             // dense position
+        ; cmp r8d, -1                             // no private list
+        ; je => slow
+        ; imul r8, r8, l.list_size
+        ; add r8, [rdi + l.vals_ptr]              // the receiver's list
+        ; cmp QWORD [r8 + l.list_len], lane.pos as i32
+        ; jbe => slow
+        ; mov r8, [r8 + l.list_ptr]
+        ; mov r10, QWORD lane.brand as i64
+        ; cmp [r8 + brand_at], r10
+        ; jne => slow
+        ; cmp DWORD [r8 + id_at], lane.id as i32
+        ; jne => slow
+    );
+    if let Some(dst) = get_dst {
+        dynasm!(ops
+            ; mov rax, [r8 + val_at]
+            ; mov [rbx + dreg(dst)], rax
+            ; jmp => done
+        );
+    } else if let Some(val) = set_val {
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(val)]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, 0x7FFD
+            ; je => slow
+            ; mov [r8 + val_at], rax
+            ; jmp => done
+        );
+    }
+}
+
 /// Emit the 8-way inline-cache probe for one `GetProp`/`SetProp` site.
 ///
 /// On a full match this reads or writes `vals_ptr[slot]` with **no call** and

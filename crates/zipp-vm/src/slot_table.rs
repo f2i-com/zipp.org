@@ -60,7 +60,7 @@ const PAGE_MASK: u32 = (PAGE_LEN as u32) - 1;
 
 /// "No entry for this slot". `u32::MAX` entries would need a 4-billion-entry
 /// table to be reachable as a real position, which the heap cannot produce.
-const EMPTY: u32 = u32::MAX;
+pub(crate) const EMPTY: u32 = u32::MAX;
 
 /// One page of the slot→position index, plus a live count so the page can be
 /// released the moment its last entry goes. Without the count a program that
@@ -80,9 +80,11 @@ pub(crate) struct SlotTable<V, const FLAT: bool = false> {
     /// until some slot in that page gets an entry. Unused when `FLAT`.
     pages: Vec<Option<Page>>,
     /// The flat slot→dense-position index when `FLAT` (`EMPTY` for none).
-    flat: Vec<u32>,
-    /// Dense entry values, no holes.
-    vals: Vec<V>,
+    /// Visible for `offset_of!`: compiled code reads it in place (the
+    /// private-field lane, `vm::priv_layout`).
+    pub(crate) flat: Vec<u32>,
+    /// Dense entry values, no holes. Visible for `offset_of!`, as `flat`.
+    pub(crate) vals: Vec<V>,
     /// The owning slot of each dense entry, parallel to `vals`.
     keys: Vec<u32>,
 }

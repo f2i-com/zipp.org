@@ -13,6 +13,100 @@ fn cross3_finish_fid_fits(fid: u32) -> bool {
     fid <= 0x00FF_FFFF
 }
 
+/// Byte offsets of a `Vec<T>`'s data pointer and length inside the vector,
+/// found by laying a probe vector's words beside what it reports (`as_ptr`,
+/// `len` and `capacity`, three different numbers). `None` unless `Vec<T>` is
+/// exactly three words and each answer is in exactly one of them: Rust does
+/// not fix the field order, so compiled code that reads a vector in place
+/// asks this binary instead of assuming it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn vec_raw_offsets<T>() -> Option<(i32, i32)> {
+    const W: usize = std::mem::size_of::<usize>();
+    if std::mem::size_of::<Vec<T>>() != 3 * W || std::mem::size_of::<T>() == 0 {
+        return None;
+    }
+    let v: Vec<T> = Vec::with_capacity(5);
+    // SAFETY: `Vec<T>` is three words (checked above), all initialized.
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let (ptr, len, cap) = (v.as_ptr() as usize, v.len(), v.capacity());
+    let find = |x: usize| {
+        let mut at = (0..3).filter(|&i| words[i] == x);
+        let i = at.next()?;
+        at.next().is_none().then_some(i)
+    };
+    let (p, l, c) = (find(ptr)?, find(len)?, find(cap)?);
+    if p == l || p == c || l == c {
+        return None;
+    }
+    Some(((p * W) as i32, (l * W) as i32))
+}
+
+/// Where compiled code finds a heap slot's private list (`codegen::PrivLayout`):
+/// `Vm::private_fields`' field offsets, its vectors' probed layouts
+/// (`vec_raw_offsets`) and the entry tuple's. Worked out once; `None` when a
+/// probe fails, and then no private-field lane is planned.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn priv_layout() -> Option<&'static crate::codegen::PrivLayout> {
+    type Entry = (u64, u32, Value);
+    type List = Vec<Entry>;
+    static LAYOUT: std::sync::OnceLock<Option<crate::codegen::PrivLayout>> = std::sync::OnceLock::new();
+    LAYOUT
+        .get_or_init(|| {
+            if std::mem::size_of::<Value>() != 8 || crate::slot_table::EMPTY != u32::MAX {
+                return None;
+            }
+            let (flat_p, flat_l) = vec_raw_offsets::<u32>()?;
+            let (vals_p, _) = vec_raw_offsets::<List>()?;
+            let (list_p, list_l) = vec_raw_offsets::<Entry>()?;
+            let table = core::mem::offset_of!(Vm<'static>, private_fields);
+            let flat = table + core::mem::offset_of!(crate::slot_table::SlotTable<List, true>, flat);
+            let vals = table + core::mem::offset_of!(crate::slot_table::SlotTable<List, true>, vals);
+            let field = |x: usize| i32::try_from(x).ok();
+            Some(crate::codegen::PrivLayout {
+                flat_ptr: field(flat)? + flat_p,
+                flat_len: field(flat)? + flat_l,
+                vals_ptr: field(vals)? + vals_p,
+                list_size: field(std::mem::size_of::<List>())?,
+                list_ptr: list_p,
+                list_len: list_l,
+                entry_size: field(std::mem::size_of::<Entry>())?,
+                brand_off: field(core::mem::offset_of!(Entry, 0))?,
+                id_off: field(core::mem::offset_of!(Entry, 1))?,
+                val_off: field(core::mem::offset_of!(Entry, 2))?,
+            })
+        })
+        .as_ref()
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod priv_layout_tests {
+    /// The probe finds this binary's vector layout, and reading a live list
+    /// through it gives back what `Vec`'s own accessors say.
+    #[test]
+    fn the_probed_layout_reads_a_list_in_place() {
+        let l = super::priv_layout().expect("vectors are three words here");
+        let list: Vec<(u64, u32, crate::value::Value)> =
+            vec![(7, 9, crate::value::Value::int(5)), (11, 13, crate::value::Value::int(6))];
+        let base = &list as *const _ as *const u8;
+        // SAFETY: offsets inside the three-word vector header.
+        let (ptr, len) = unsafe {
+            (
+                *(base.add(l.list_ptr as usize) as *const usize),
+                *(base.add(l.list_len as usize) as *const usize),
+            )
+        };
+        assert_eq!(ptr, list.as_ptr() as usize);
+        assert_eq!(len, 2);
+        let e1 = ptr + l.entry_size as usize;
+        // SAFETY: entry 1 of a two-entry list.
+        unsafe {
+            assert_eq!(*((e1 + l.brand_off as usize) as *const u64), 11);
+            assert_eq!(*((e1 + l.id_off as usize) as *const u32), 13);
+            assert_eq!(*((e1 + l.val_off as usize) as *const u64), crate::value::Value::int(6).bits());
+        }
+    }
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod cross3_finish_abi_tests {
     use super::cross3_finish_fid_fits;
@@ -1507,6 +1601,72 @@ impl<'p> Vm<'p> {
             return None;
         }
         Some(Box::leak(Box::new(plan)))
+    }
+
+    /// The private-field lanes (`codegen::PrivLanePlan`) of `func_id`'s
+    /// private reads and writes whose cache's first way is a field
+    /// (`IcEntry::Private`) of a class declaration evaluated once so far,
+    /// leaked like the accessor lanes. `None` for none, without a probed
+    /// layout (`priv_layout`), under a metering recorder, and under
+    /// `ZIPP_NO_PRIV_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_priv_lane_plan(&mut self, func_id: u32) -> Option<&'static crate::codegen::PrivLanePlan> {
+        if !crate::codegen::priv_lane_enabled() || self.py_plans_skipped(func_id) {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            return None;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let layout = *priv_layout()?;
+            let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
+            let mut plan = crate::codegen::PrivLanePlan { layout, lanes: rustc_hash::FxHashMap::default() };
+            for (ip, instr) in func.code.iter().enumerate() {
+                let private = match *instr {
+                    Instr::GetProp { name, .. } => func
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k.as_bytes().first() == Some(&b'#')),
+                    Instr::SetPrivate { .. } => true,
+                    _ => false,
+                };
+                if !private {
+                    continue;
+                }
+                let Some((brand, id, pos)) = self.ic_private_field_way0_plan(func_id, ip) else {
+                    continue;
+                };
+                if pos >= 4096 {
+                    continue;
+                }
+                let Some(&owner) = self.brand_owner.get(&brand) else {
+                    continue;
+                };
+                let class_id = match self.heap.get(owner) {
+                    HeapObj::Class(c) => c.class_id,
+                    _ => continue,
+                };
+                if self.class_repeated(class_id) {
+                    continue;
+                }
+                let flag = self.jit_private_class_flags.entry(class_id).or_insert_with(|| Box::new(1));
+                if **flag == 0 {
+                    continue;
+                }
+                let flag = &**flag as *const u8 as usize;
+                plan.lanes.insert(ip, crate::codegen::PrivLane { brand, id, pos, flag });
+            }
+            if plan.lanes.is_empty() {
+                return None;
+            }
+            Some(Box::leak(Box::new(plan)))
+        }
     }
 
     /// Tier C's class-method lane (`codegen::ClassReadPlan`): for each

@@ -1074,8 +1074,20 @@ impl<'p> Vm<'p> {
                 // whether an earlier evaluation's code may still run
                 // (`class_value_for`).
                 let slot = &mut self.class_values[class_id as usize];
-                slot.repeated |= slot.latest.is_some();
+                let again = slot.latest.is_some();
+                slot.repeated |= again;
                 slot.latest = Some(v);
+                // A second evaluation mints a second brand for the same
+                // declaration, so the compiled private-field lanes that baked
+                // the first one stand down here, before this evaluation's
+                // static blocks, computed keys or initializers can run the
+                // shared compiled methods (`codegen::PrivLane::flag`).
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if again {
+                    if let Some(flag) = self.jit_private_class_flags.get_mut(&class_id) {
+                        **flag = 0;
+                    }
+                }
                 // A re-executed class declaration swaps this slot to a NEW
                 // class value (+ new prototype chain) without mutating the
                 // OLD prototype objects a JIT method-inline `super` arm's
@@ -4443,6 +4455,7 @@ impl<'p> Vm<'p> {
                     .bits();
                 let mut heap_helper_addrs = self.jit_heap_helper_addrs();
                 heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
+                heap_helper_addrs.priv_lanes = self.build_priv_lane_plan(func_id);
                 let const_strs = self.jit_build_const_strs(func_id);
                 // Tier-C leaf-inline plan for the whole function (from the live
                 // ICs). Built BEFORE the &mut self.jit borrow. Opt out with

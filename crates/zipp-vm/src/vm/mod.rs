@@ -2256,6 +2256,13 @@ pub struct Vm<'p> {
     /// memo: every hit rechecks the cache way's guards live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_method_memo: Box<[MethodMemo]>,
+    /// One byte per class declaration a compiled private-field lane baked a
+    /// brand of (`codegen::PrivLane::flag`), at an address that never moves:
+    /// 1 while that declaration has been evaluated once, cleared by the
+    /// second evaluation (`MakeClass`) before any of its code runs, since
+    /// from then on the same compiled method can run under another brand.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) jit_private_class_flags: rustc_hash::FxHashMap<u32, Box<u8>>,
     /// Per constructor body: whether it only stores its arguments and
     /// constants into `this`, and the proof of the last receiver a compiled
     /// `new` answered that way (`engine::ctor_store`).

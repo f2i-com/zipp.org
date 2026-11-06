@@ -6192,6 +6192,7 @@ impl<'p> Vm<'p> {
             len_of: jit_len_of as *const () as usize,
             forin_keys: jit_forin_keys as *const () as usize,
             acc_lanes: None,
+            priv_lanes: None,
         }
     }
 

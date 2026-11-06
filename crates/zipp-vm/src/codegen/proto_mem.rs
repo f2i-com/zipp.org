@@ -6688,9 +6688,20 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::GetProp { dst, obj, name } if !py && tierc_private_name(proto, name) => {
-                // `o.#x`: `jit_private_prop_ic` op 0 (no inline-cache way
-                // ever holds a private name). The site stays reserved.
+                // `o.#x`: the field where it lies (`PrivLane`), else
+                // `jit_private_prop_ic` op 0 (no inline-cache way ever holds
+                // a private name). The site stays reserved.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let lane_done = ops.new_dynamic_label();
+                if let Some((lane, layout)) = heap
+                    .priv_lanes
+                    .filter(|_| meter.is_none())
+                    .and_then(|p| p.lanes.get(&ip).map(|l| (l, &p.layout)))
+                {
+                    let slow = ops.new_dynamic_label();
+                    emit_priv_lane(&mut ops, lane, layout, obj, Some(dst), None, slow, lane_done);
+                    dynasm!(ops ; => slow);
+                }
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -6704,6 +6715,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => lane_done);
                 ic_site += 1;
             }
             Instr::SetProp { obj, name, val, .. } if !py && tierc_private_name(proto, name) => {
@@ -6725,8 +6737,19 @@ pub(crate) fn compile_proto_mem(
                 ic_site += 1;
             }
             Instr::SetPrivate { obj, name, val } if !py => {
-                // `o.#x = v`: op 1.
+                // `o.#x = v`: the field written where it lies for a value
+                // that is not a heap reference (`PrivLane`), else op 1.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let lane_done = ops.new_dynamic_label();
+                if let Some((lane, layout)) = heap
+                    .priv_lanes
+                    .filter(|_| meter.is_none())
+                    .and_then(|p| p.lanes.get(&ip).map(|l| (l, &p.layout)))
+                {
+                    let slow = ops.new_dynamic_label();
+                    emit_priv_lane(&mut ops, lane, layout, obj, None, Some(val), slow, lane_done);
+                    dynasm!(ops ; => slow);
+                }
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -6740,6 +6763,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => lane_done);
             }
             Instr::GetProp { dst, obj, name } => {
                 // 8-way inline cache (call-free on hit), then the miss helper,

@@ -1899,6 +1899,22 @@ impl<'p> Vm<'p> {
         (self.private_memo_key(ctx) == Some(head)).then_some((brand, id, pos))
     }
 
+    /// The private FIELD `(brand, id, pos)` a site's first way holds
+    /// (`IcEntry::Private`, not an add), whatever callee filled it: what the
+    /// private-field lane planner bakes (`Vm::build_priv_lane_plan`, which
+    /// makes the brand sound by its declaration's evaluation count).
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    pub(crate) fn ic_private_field_way0_plan(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32)> {
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::Private { brand, id, pos, .. } if pos != PRIVATE_ADD => Some((brand, id, pos)),
+            _ => None,
+        }
+    }
+
     /// The site's way-0 private METHOD (`IcEntry::PrivateMethod`) for code
     /// running as `ctx` and the receiver at heap `idx`: what
     /// [`Self::ic_private_method_tail`] answers for the top frame's callee,

@@ -500,6 +500,61 @@ env_off_switch!(
 /// leaked so the emitted code can hand a lane's address to its helper.
 pub(crate) type AccLanePlan = FxHashMap<usize, AccLane>;
 
+/// One private-field read or write site's inline lane (`PrivLanePlan`): the
+/// field the site's cache way 0 holds (`IcEntry::Private`), read or written
+/// where it lies in the receiver's private list
+/// (`Vm::private_fields`, through `PrivLayout`) when the entry at `pos` is
+/// `(brand, id)`; anything else takes the site's helper.
+///
+/// SOUNDNESS. A private name resolves lexically to one class declaration,
+/// whose brand differs per evaluation. The planner bakes `brand` only while
+/// that declaration has been evaluated once, so every closure that can run
+/// this code resolves the name to that brand; `flag` is the declaration's
+/// byte in `Vm::jit_private_class_flags`, cleared by its second evaluation
+/// before any of that evaluation's code runs, and the lane tests it first.
+/// The entry's own `(brand, id)` at `pos` is the brand check itself, as on
+/// the helper's way-0 path. Brands are never reused (a counter).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrivLane {
+    pub(crate) brand: u64,
+    pub(crate) id: u32,
+    pub(crate) pos: u32,
+    pub(crate) flag: usize,
+}
+
+/// The private-field lanes of one function, by ip, with the layout they read
+/// (`Vm::build_priv_lane_plan`).
+pub(crate) struct PrivLanePlan {
+    pub(crate) layout: PrivLayout,
+    pub(crate) lanes: FxHashMap<usize, PrivLane>,
+}
+
+/// Where compiled code finds a heap slot's private list
+/// (`Vm::private_fields`, a flat `SlotTable` of `Vec<(u64, u32, Value)>`):
+/// byte offsets from the VM pointer to the slot→position index's data
+/// pointer and length and to the dense lists' data pointer, the size of one
+/// list, a list's own data-pointer and length offsets, and one entry's
+/// size and field offsets (`vm::priv_layout`, probed once).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrivLayout {
+    pub(crate) flat_ptr: i32,
+    pub(crate) flat_len: i32,
+    pub(crate) vals_ptr: i32,
+    pub(crate) list_size: i32,
+    pub(crate) list_ptr: i32,
+    pub(crate) list_len: i32,
+    pub(crate) entry_size: i32,
+    pub(crate) brand_off: i32,
+    pub(crate) id_off: i32,
+    pub(crate) val_off: i32,
+}
+
+env_off_switch!(
+    /// `ZIPP_NO_PRIV_LANE=1` compiles private-field sites without the inline
+    /// lane (`PrivLanePlan`): every access calls its helper. Plan-time.
+    fn priv_lane_enabled() = "ZIPP_NO_PRIV_LANE"
+);
+
 env_off_switch!(
     /// `ZIPP_NO_ACC_LANE=1` compiles property sites without the
     /// shape-keyed accessor lane (`AccLanePlan`). Plan-time.
@@ -1967,6 +2022,9 @@ pub struct HeapHelperAddrs {
     /// The compiling function's accessor lanes (`AccLanePlan`), when the
     /// caller planned them.
     pub(crate) acc_lanes: Option<&'static AccLanePlan>,
+    /// The compiling function's private-field lanes (`PrivLanePlan`), when
+    /// the caller planned them.
+    pub(crate) priv_lanes: Option<&'static PrivLanePlan>,
 }
 
 env_off_switch! {
@@ -2072,6 +2130,7 @@ impl HeapHelperAddrs {
             len_of: self.len_of,
             forin_keys: self.forin_keys,
             acc_lanes: self.acc_lanes,
+            priv_lanes: self.priv_lanes,
             ic_base_idx,
             opt_tier_up: 0,
         }

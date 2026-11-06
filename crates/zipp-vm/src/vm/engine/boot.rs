@@ -435,6 +435,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_method_memo: Box::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_private_class_flags: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_store_last: Default::default(),
