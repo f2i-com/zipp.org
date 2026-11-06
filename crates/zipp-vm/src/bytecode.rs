@@ -4000,8 +4000,17 @@ mod fused_code_tests {
         assert_eq!(fused.len(), code.len());
         assert!(matches!(fused[0], Instr::FuseLoadGlobal2 { dst: 1, idx: 4, dst2: 2, idx2: 5 }));
         assert!(matches!(fused[1], Instr::LoadGlobal { dst: 2, idx: 5 }));
-        // The third load starts no pair: its partner would be a LoadInt.
-        assert!(matches!(fused[2], Instr::LoadGlobal { dst: 3, idx: 6 }));
+        // The third load starts no pair: its partner would be a LoadInt. With
+        // the global runs it starts the masked-global run over the next two,
+        // whose pair form stays at the position after it.
+        if global_runs_enabled() {
+            assert!(matches!(
+                fused[2],
+                Instr::FuseGlobalIntBitwise { gdst: 3, idx: 6, ldst: 4, val: 0, dst: 5, op: BitwiseOp::Or }
+            ));
+        } else {
+            assert!(matches!(fused[2], Instr::LoadGlobal { dst: 3, idx: 6 }));
+        }
         assert!(matches!(fused[3], Instr::FuseLoadIntBitwise { ldst: 4, val: 0, dst: 5, a: 3, b: 4, op: BitwiseOp::Or }));
         assert!(matches!(fused[4], Instr::Bitwise { dst: 5, .. }));
         assert!(matches!(fused[5], Instr::FuseAddIntMove { dst: 6, a: 6, imm: 1, upd: true, mdst: 7, msrc: 6 }));
