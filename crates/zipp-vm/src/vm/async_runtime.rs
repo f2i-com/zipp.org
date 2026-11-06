@@ -543,7 +543,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -912,12 +912,15 @@ impl<'p> Vm<'p> {
                         // Uncaught in the body: unwind_to_handler already popped the frame
                         // and truncated its window. Complete the generator and surface the
                         // throw at the `gen.throw(e)` call site (value via pending_throw).
-                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
-                            regs.clear();
                             handlers.clear();
-                        }
+                            std::mem::take(regs)
+                        } else {
+                            Vec::new()
+                        };
+                        self.give_activation_regs(spare);
                         return Err(Thrown(self.throw_message(e)));
                     }
                 }
@@ -935,12 +938,15 @@ impl<'p> Vm<'p> {
                         // complete the generator with the return value.
                         self.frames.pop();
                         self.regs.truncate(new_base);
-                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
-                            regs.clear();
                             handlers.clear();
-                        }
+                            std::mem::take(regs)
+                        } else {
+                            Vec::new()
+                        };
+                        self.give_activation_regs(spare);
                         return Ok(Some(GenStep::Done(v)));
                     }
                 }
@@ -974,22 +980,28 @@ impl<'p> Vm<'p> {
         }
         match outcome {
             Ok(ret) => {
-                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                    let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
-                    regs.clear();
                     handlers.clear();
-                }
+                    std::mem::take(regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 Ok(Some(GenStep::Done(ret)))
             }
             Err(t) => {
                 self.regs.truncate(new_base);
-                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                    let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
-                    regs.clear();
                     handlers.clear();
-                }
+                    std::mem::take(regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 Err(t)
             }
         }
@@ -1214,12 +1226,15 @@ impl<'p> Vm<'p> {
     /// Generator `idx` has completed (returned, or a throw left its body):
     /// nothing is parked any more.
     pub(crate) fn gen_complete(&mut self, idx: u32) {
-        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
             *state = GenState::Completed;
-            regs.clear();
             handlers.clear();
-        }
+            std::mem::take(regs)
+        } else {
+            Vec::new()
+        };
+        self.give_activation_regs(spare);
     }
 
     /// Complete the top frame's `IterNext`, its `next()` call (`done_dst`
@@ -2285,6 +2300,32 @@ impl<'p> Vm<'p> {
     /// Build a suspended `async function` activation and run it synchronously up
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
+    /// A register window of `n` undefined values for a new async function or
+    /// generator activation, in a finished one's storage when the pool holds
+    /// one: two allocator round trips per `await`-ing call were the
+    /// window's and its state box's.
+    #[inline]
+    fn take_activation_regs(&mut self, n: usize) -> Vec<Value> {
+        match self.activation_regs_pool.pop() {
+            Some(mut v) => {
+                v.resize(n, Value::UNDEFINED);
+                v
+            }
+            None => vec![Value::UNDEFINED; n],
+        }
+    }
+
+    /// Keep a finished activation's register storage, emptied, for
+    /// [`Self::take_activation_regs`]; a large one is simply dropped.
+    #[inline]
+    pub(crate) fn give_activation_regs(&mut self, mut v: Vec<Value>) {
+        if v.capacity() == 0 || v.capacity() > 256 || self.activation_regs_pool.len() >= 64 {
+            return;
+        }
+        v.clear();
+        self.activation_regs_pool.push(v);
+    }
+
     pub(crate) fn alloc_async(
         &mut self,
         func_id: u32,
@@ -2317,7 +2358,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -2411,7 +2452,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -4145,11 +4186,14 @@ impl<'p> Vm<'p> {
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
             // Can't make progress — abandon the activation and reject its result.
-            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+            let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                 a.state = GenState::Completed;
-                a.regs.clear();
                 a.handlers.clear();
-            }
+                std::mem::take(&mut a.regs)
+            } else {
+                Vec::new()
+            };
+            self.give_activation_regs(spare);
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             self.reject_thrown_job(result, e);
             return;
@@ -4293,11 +4337,14 @@ impl<'p> Vm<'p> {
         // Otherwise the activation finished — settle `result`.
         match outcome {
             Ok(ret) => {
-                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                     a.state = GenState::Completed;
-                    a.regs.clear();
                     a.handlers.clear();
-                }
+                    std::mem::take(&mut a.regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 if self.module_body_results.remove(&result) {
                     // Module body: the capability resolves with undefined —
                     // a thenable completion value must not be adopted
@@ -4319,11 +4366,14 @@ impl<'p> Vm<'p> {
                 };
                 // The unwind already truncated the window; keep regs consistent.
                 self.regs.truncate(new_base);
-                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                     a.state = GenState::Completed;
-                    a.regs.clear();
                     a.handlers.clear();
-                }
+                    std::mem::take(&mut a.regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 self.reject_thrown_job(result, e);
             }
         }

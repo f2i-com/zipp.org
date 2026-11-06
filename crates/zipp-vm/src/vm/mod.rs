@@ -2458,6 +2458,9 @@ pub struct Vm<'p> {
     /// Emptied `Frame::handlers` buffers for the next frame's first `try`
     /// push (see `handler_pool`). Holds no `Value`s.
     handler_pool: Vec<Vec<Handler>>,
+    /// Emptied register buffers of finished async functions and generators,
+    /// for the next activation's (`take_activation_regs`). Holds no `Value`s.
+    activation_regs_pool: Vec<Vec<Value>>,
     /// Handler pushes a frame-free Tier C activation's lazy bracket deferred
     /// on its way out (`jit_lazy_push`), keyed by the activation's window
     /// base, for the frame its bail or throw materializes
