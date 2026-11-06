@@ -30,6 +30,14 @@ pub const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
+env_off_switch! {
+    /// `ZIPP_NO_TA_DIRECT_STORE=1`: the interpreter's numeric typed-array
+    /// store builds its element bytes through `ta_encode` again (the
+    /// same-binary A/B for `ta_interp_numeric_set_fixed`).
+    #[inline]
+    fn ta_direct_store_enabled() = "ZIPP_NO_TA_DIRECT_STORE"
+}
+
 /// The `N` bytes of `data` at `off`, or `None` past its end: one bounds check
 /// and a fixed-width load, for the typed-array element reads.
 #[inline(always)]
@@ -1838,6 +1846,27 @@ impl<'p> Vm<'p> {
         i: usize,
         number: Value,
     ) -> bool {
+        // A fixed-length view (any not in `ta_tracking`) in this small
+        // frame; the general form, out of line, cost every store its
+        // register saves.
+        if (self.ta_tracking.is_empty() || !self.ta_tracking.contains(&view.ta_idx)) && ta_direct_store_enabled() {
+            return self.ta_interp_numeric_set_fixed(
+                view.buffer,
+                view.kind,
+                view.byte_offset,
+                view.stored_len,
+                i,
+                number,
+            );
+        }
+        self.ta_interp_numeric_set_general(view, i, number)
+    }
+
+    /// [`Vm::ta_interp_numeric_set_view`] for any view: a length-tracking
+    /// one's length follows its buffer.
+    #[cold]
+    #[inline(never)]
+    fn ta_interp_numeric_set_general(&mut self, view: TaInterpNumericView, i: usize, number: Value) -> bool {
         let TaInterpNumericView {
             ta_idx,
             buffer,
@@ -1845,13 +1874,13 @@ impl<'p> Vm<'p> {
             byte_offset,
             stored_len,
         } = view;
+        let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let size = native::TA_KINDS[kind as usize].1;
         let bytes = if number.is_int() {
             ta_encode_int(kind, number.as_int())
         } else {
             ta_encode(kind, number.as_f64())
         };
-        let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let data = match self.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => data,
             // A detached view's numeric element write is the specified no-op
@@ -1885,6 +1914,83 @@ impl<'p> Vm<'p> {
             2 => data[off..off + 2].copy_from_slice(&bytes[..2]),
             4 => data[off..off + 4].copy_from_slice(&bytes[..4]),
             _ => data[off..off + 8].copy_from_slice(&bytes),
+        }
+        true
+    }
+
+    /// [`Vm::ta_interp_numeric_set_view`] for a fixed-length view (not in
+    /// `ta_tracking`): the element converted and written at its kind's width
+    /// in one step. Through the general form, every store built the element
+    /// as an 8-byte array behind a jump on the kind (a call for a fraction),
+    /// multiplied the view's length with an overflow check and chose the
+    /// width again, a third of a typed-array store loop's instructions.
+    /// Same answers: a detached buffer, an index past the view or a view no
+    /// longer inside its buffer is the specified no-op (`true`); anything
+    /// but an ArrayBuffer declines (`false`).
+    #[inline(always)]
+    fn ta_interp_numeric_set_fixed(
+        &mut self,
+        buffer: u32,
+        kind: u8,
+        byte_offset: usize,
+        stored_len: usize,
+        i: usize,
+        number: Value,
+    ) -> bool {
+        let data = match self.heap.get_mut(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            HeapObj::ArrayBuffer { .. } => return true,
+            _ => return false,
+        };
+        // A product past `usize` saturates and fails the bound, as the
+        // general form's overflow did.
+        let size = native::TA_KINDS[kind as usize].1;
+        if i >= stored_len || byte_offset.saturating_add(stored_len.saturating_mul(size)) > data.len() {
+            return true;
+        }
+        let off = byte_offset + i * size;
+        // ToUint32/16/8 of a fraction: the low bits of its truncation below
+        // 2^63, `to_uint_modular` above (and for NaN, which fails the test).
+        #[inline(always)]
+        fn low_bits(number: Value) -> u64 {
+            if number.is_int() {
+                number.as_int() as i64 as u64
+            } else {
+                let f = number.as_f64();
+                if f.abs() < 9_223_372_036_854_775_808.0 {
+                    (f as i64) as u64
+                } else {
+                    super::helpers_numeric::to_uint_modular(f, 64)
+                }
+            }
+        }
+        #[inline(always)]
+        fn put<const N: usize>(data: &mut [u8], off: usize, b: [u8; N]) {
+            if let Some(d) = data.get_mut(off..off + N) {
+                d.copy_from_slice(&b);
+            }
+        }
+        let num = |v: Value| if v.is_int() { v.as_int() as f64 } else { v.as_f64() };
+        match kind {
+            8 => put(data, off, num(number).to_le_bytes()),
+            5 | 6 => put(data, off, (low_bits(number) as u32).to_le_bytes()),
+            0 | 1 => put(data, off, [low_bits(number) as u8]),
+            3 | 4 => put(data, off, (low_bits(number) as u16).to_le_bytes()),
+            7 => {
+                // An i32 rounds to f32 as its exact f64 would.
+                let f = if number.is_int() { number.as_int() as f32 } else { number.as_f64() as f32 };
+                put(data, off, f.to_le_bytes())
+            }
+            2 => {
+                let b = if number.is_int() {
+                    number.as_int().clamp(0, 255) as u8
+                } else {
+                    super::helpers_numeric::clamp_u8(number.as_f64())
+                };
+                put(data, off, [b])
+            }
+            11 => put(data, off, crate::vm::helpers_num2::f64_to_f16_bits(num(number)).to_le_bytes()),
+            _ => return false,
         }
         true
     }
