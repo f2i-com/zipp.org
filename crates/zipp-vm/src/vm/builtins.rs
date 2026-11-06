@@ -67,7 +67,7 @@ pub use bstats::dump as builtin_stats;
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub(super) fn builtin_stats_enabled_for_vm() -> bool {
-    std::env::var_os("ZIPP_BUILTINSTATS").is_some()
+    crate::env_var_os("ZIPP_BUILTINSTATS").is_some()
 }
 
 env_off_switch! {
@@ -233,12 +233,12 @@ pub(super) fn bind_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_BIND_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_BIND_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -260,12 +260,12 @@ pub(super) fn apply_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_APPLY_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_APPLY_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -284,12 +284,12 @@ pub(super) fn promise_pristine_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_PRISTINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_PRISTINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }

@@ -127,7 +127,7 @@ static COUNTS: [AtomicU64; N_PHASES] = [
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static ON: AtomicU8 = AtomicU8::new(2);
+static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
 /// Sampling interval. 200µs over a ~500ms benchmark row is ~2,500 samples —
 /// enough that a 2% subsystem is ~50 samples and visible above noise, while the
@@ -150,7 +150,7 @@ pub(crate) fn enabled() -> bool {
 /// most of it recovered by keeping the hot side to one load + compare.
 #[cold]
 fn init() -> bool {
-    let v = (std::env::var_os("ZIPP_PROF").is_some() || std::env::var_os("ZIPP_PROF_PC").is_some())
+    let v = (crate::env_var_os("ZIPP_PROF").is_some() || crate::env_var_os("ZIPP_PROF_PC").is_some())
         as u8;
     ON.store(v, Ordering::Relaxed);
     if v == 1 {
@@ -391,7 +391,7 @@ pub(crate) mod pc {
     static STACK_HI: AtomicU64 = AtomicU64::new(0);
 
     fn stack_wanted() -> bool {
-        std::env::var_os("ZIPP_PROF_STACK").is_some()
+        crate::env_var_os("ZIPP_PROF_STACK").is_some()
     }
 
     /// The executable's exception directory: `DataDirectory[3]` of the PE32+
@@ -484,7 +484,7 @@ pub(crate) mod pc {
     /// Is PC mode requested? Separate from the phase profiler so `ZIPP_PROF=1`
     /// alone keeps its old, allocation-free, suspend-free behaviour.
     fn wanted() -> bool {
-        std::env::var_os("ZIPP_PROF_PC").is_some()
+        crate::env_var_os("ZIPP_PROF_PC").is_some()
     }
 
     /// Duplicate the CALLING thread's handle into one usable from the sampler,
@@ -646,7 +646,7 @@ pub(crate) mod pc {
     /// loop) can be read. Needs a build with line tables (the `profiling`
     /// profile).
     fn lines_wanted() -> bool {
-        std::env::var_os("ZIPP_PROF_PC_LINES").is_some()
+        crate::env_var_os("ZIPP_PROF_PC_LINES").is_some()
     }
 
     /// `addr`'s `file:line` (the file's last path component), or `None`.
@@ -807,7 +807,7 @@ pub(crate) mod pc {
         // offset (or an absolute address when it is outside the image), one
         // per line, so a whole profile can be bucketed offline rather than
         // through this 25-row console view.
-        if let Some(path) = std::env::var_os("ZIPP_PROF_PC_DUMP") {
+        if let Some(path) = crate::env_var_os("ZIPP_PROF_PC_DUMP") {
             let mut out = String::with_capacity(total * 12);
             for i in 0..total {
                 // SAFETY: as above, `i < total <= MAX_SAMPLES`.
@@ -822,7 +822,7 @@ pub(crate) mod pc {
             let _ = std::fs::write(path, out);
         }
         let stacks = STACK_BUF.load(Ordering::Acquire);
-        if let (true, Some(path)) = (stacks != 0, std::env::var_os("ZIPP_PROF_STACK_DUMP")) {
+        if let (true, Some(path)) = (stacks != 0, crate::env_var_os("ZIPP_PROF_STACK_DUMP")) {
             let n = STACK_COUNT.load(Ordering::Relaxed).min(STACK_MAX_SAMPLES);
             let mut out = String::with_capacity(n * 64);
             for s in 0..n {
@@ -869,10 +869,10 @@ pub(crate) mod pc {
         {
             use std::io::Write;
             use std::sync::atomic::{AtomicU8, Ordering};
-            static ON: AtomicU8 = AtomicU8::new(2);
+            static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
             let on = match ON.load(Ordering::Relaxed) {
                 2 => {
-                    let v = std::env::var_os("ZIPP_PERF_MAP").is_some() as u8;
+                    let v = crate::env_var_os("ZIPP_PERF_MAP").is_some() as u8;
                     ON.store(v, Ordering::Relaxed);
                     v
                 }
@@ -887,7 +887,7 @@ pub(crate) mod pc {
                 // `ZIPP_PERF_MAP=dump`: the body's bytes too, for a disassembly
                 // to lay the samples over. (A sandbox build has no JIT.)
                 #[cfg(not(feature = "safe-sandbox"))]
-                if std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
+                if crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
                     // SAFETY: the JIT registers a mapped, readable code range it
                     // just emitted, `len` bytes from `start`.
                     let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };

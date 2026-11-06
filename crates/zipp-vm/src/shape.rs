@@ -250,13 +250,13 @@ fn disabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return false;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static OFF: AtomicU8 = AtomicU8::new(2);
+    use std::sync::atomic::Ordering;
+    static OFF: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match OFF.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_SHAPES").is_some() as u8;
+            let v = crate::env_var_os("ZIPP_NO_SHAPES").is_some() as u8;
             OFF.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -315,7 +315,7 @@ fn shape_max() -> usize {
     static MAX: AtomicUsize = AtomicUsize::new(0);
     match MAX.load(Ordering::Relaxed) {
         0 => {
-            let m = std::env::var("ZIPP_SHAPE_MAX")
+            let m = crate::env_var("ZIPP_SHAPE_MAX")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .map_or(SHAPE_MAX, |v| v.clamp(2, SHAPE_MAX));

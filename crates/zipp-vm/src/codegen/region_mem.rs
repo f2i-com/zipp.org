@@ -192,12 +192,12 @@ env_off_switch! {
 /// loop pays no branch when the prefix is enabled.
 #[inline]
 fn field_write_stream_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_FIELD_WRITE_STREAM").is_none()
+    crate::env_var_os("ZIPP_NO_FIELD_WRITE_STREAM").is_none()
 }
 
 #[inline]
 fn field_mixed_stream_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
+    crate::env_var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
 }
 
 /// The helper's own bytecode screen (`vm::field_stream`), as an admission
@@ -321,7 +321,7 @@ pub(crate) fn compile_region_mem(
         }
     };
 
-    if std::env::var_os("ZIPP_JITDUMP").is_some() {
+    if crate::env_var_os("ZIPP_JITDUMP").is_some() {
         for ip in s..=e {
             eprintln!("[dump] {ip}: {:?}", proto.code[ip]);
         }
@@ -1515,7 +1515,7 @@ pub(crate) fn compile_region_mem(
                 // ⇒ no refetch, and re-execution on deopt is always sound.
                 // `ZIPP_NO_TONUM_STR=1` restores the plain bail (the pre-change
                 // shape) so the string arm can be A/B'd on ONE binary.
-                let tonum_str = std::env::var_os("ZIPP_NO_TONUM_STR").is_none();
+                let tonum_str = crate::env_var_os("ZIPP_NO_TONUM_STR").is_none();
                 let is_num = ops.new_dynamic_label();
                 let tn_done = ops.new_dynamic_label();
                 dynasm!(ops

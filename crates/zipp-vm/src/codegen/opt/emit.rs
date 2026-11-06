@@ -2639,7 +2639,7 @@ pub(crate) fn emit(f: &Func, a: &Alloc) -> Option<JitFn> {
     let buf = em.ops.finalize().ok()?;
     let entry = buf.ptr(dynasmrt::AssemblyOffset(0));
     // `ZIPP_OPT_DUMP=<dir>`: the body's bytes, for a disassembler.
-    if let Some(dir) = std::env::var_os("ZIPP_OPT_DUMP") {
+    if let Some(dir) = crate::env_var_os("ZIPP_OPT_DUMP") {
         let path = std::path::Path::new(&dir).join(format!("opt_fn{}.bin", f.func_id));
         let _ = std::fs::write(path, &buf[..]);
     }

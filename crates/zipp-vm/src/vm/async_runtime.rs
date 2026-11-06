@@ -40,7 +40,7 @@ pub(crate) enum GenStep {
 mod asyncstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static REPARKS: AtomicU64 = AtomicU64::new(0);
     static REUSED: AtomicU64 = AtomicU64::new(0);
     static GREW: AtomicU64 = AtomicU64::new(0);
@@ -53,7 +53,7 @@ mod asyncstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ASYNCSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_ASYNCSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -117,7 +117,7 @@ mod asyncstats {
         JOB_WINDOW_CALLS.load(Ordering::Relaxed)
     }
 
-    static REUSE_ON: AtomicU8 = AtomicU8::new(2);
+    static REUSE_ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
     /// the rollback switch, and the two sides of the one-binary A/B (fat LTO
@@ -128,7 +128,7 @@ mod asyncstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
+                let v = crate::env_var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
                 REUSE_ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -173,12 +173,12 @@ fn async_settled_trampoline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -215,12 +215,12 @@ fn eager_combinator_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -232,12 +232,12 @@ fn promise_all_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -254,12 +254,12 @@ pub(super) fn promise_resolve_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -275,12 +275,12 @@ fn promise_capability_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_CAPABILITY_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_CAPABILITY_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -298,12 +298,12 @@ fn combinator_lean_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_COMBINATOR_LEAN").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_COMBINATOR_LEAN").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -397,12 +397,12 @@ fn promise_slot_cache_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -422,12 +422,12 @@ fn pristine_lean_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -448,12 +448,12 @@ fn gen_inline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_GEN_INLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_GEN_INLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }

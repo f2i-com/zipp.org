@@ -22,7 +22,7 @@ pub(crate) fn take_census() -> Option<Vec<(String, u64)>> {
 impl<'p> Vm<'p> {
     /// Record this VM's census when `ZIPP_CENSUS` asks for one.
     pub(crate) fn record_census(&self) {
-        if std::env::var_os("ZIPP_CENSUS").is_none() {
+        if crate::env_var_os("ZIPP_CENSUS").is_none() {
             return;
         }
         let census = self.storage_census();

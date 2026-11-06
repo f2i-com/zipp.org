@@ -86,12 +86,12 @@ fn enum_loop_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ENUM_LOOP_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ENUM_LOOP_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -104,12 +104,12 @@ fn enum_count_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ENUM_COUNT_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ENUM_COUNT_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -122,12 +122,12 @@ fn sparse_forin_fold_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPARSE_FORIN_FOLD").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_SPARSE_FORIN_FOLD").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -140,12 +140,12 @@ fn in_probe_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_IN_PROBE_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_IN_PROBE_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -158,12 +158,12 @@ fn array_copy_len_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ARRAY_COPY_LEN_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ARRAY_COPY_LEN_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }

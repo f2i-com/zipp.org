@@ -60,7 +60,7 @@ fn lazy_setting() -> u8 {
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
     let mut m = MODE.load(Ordering::Relaxed);
     if m == u8::MAX {
-        m = match std::env::var("ZIPP_LAZY").as_deref() {
+        m = match crate::env_var("ZIPP_LAZY").as_deref() {
             Ok("seeded") => 1,
             Ok("end") => 2,
             Ok("verify") => 3,

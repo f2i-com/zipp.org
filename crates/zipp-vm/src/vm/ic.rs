@@ -174,12 +174,12 @@ fn ic_mega_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_IC_MEGA").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_IC_MEGA").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -196,7 +196,7 @@ fn module_ic_enabled() -> bool {
         return true;
     }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_IC").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_MODULE_IC").is_none())
 }
 
 /// Sentinel `ret_dst` for a frame whose return value is DISCARDED (an
@@ -670,7 +670,7 @@ fn dynamic_ic_enabled() -> bool {
         return true;
     }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_DYNAMIC_IC").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_DYNAMIC_IC").is_none())
 }
 
 /// Cache storage every runtime-installed function of one VM may draw on
@@ -1067,7 +1067,7 @@ impl<'p> Vm<'p> {
         // `ZIPP_NO_IC_PROBATION=1` leaves a disabled site disabled, as before:
         // the two sides of a one-binary A/B.
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_IC_PROBATION").is_some()) {
+        if *OFF.get_or_init(|| crate::env_var_os("ZIPP_NO_IC_PROBATION").is_some()) {
             return true;
         }
         site.rot = site.rot.wrapping_add(1);

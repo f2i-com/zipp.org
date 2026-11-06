@@ -44,13 +44,13 @@ env_off_switch! {
 /// `CallWithThis`. On unless `ZIPP_PY_CALL=0` (the same-binary A/B). Read
 /// once per process.
 pub(super) fn py_call_op() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_PY_CALL").is_none_or(|v| v != "0");
+            let on = crate::env_var_os("ZIPP_PY_CALL").is_none_or(|v| v != "0");
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

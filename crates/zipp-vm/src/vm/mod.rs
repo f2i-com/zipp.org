@@ -630,12 +630,12 @@ pub(crate) fn coll_proof_cache_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_COLL_PROOF_CACHE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_COLL_PROOF_CACHE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -647,12 +647,12 @@ pub(crate) fn microtask_root_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_MICROTASK_ROOT").is_none();
+            let on = crate::env_var_os("ZIPP_NO_MICROTASK_ROOT").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -924,12 +924,12 @@ enum ClosureHomeTable {
 impl Default for ClosureHomeTable {
     fn default() -> Self {
         use std::sync::atomic::{AtomicU8, Ordering};
-        static STATE: AtomicU8 = AtomicU8::new(0);
+        static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
         let dense = match STATE.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
+                let on = crate::env_var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }

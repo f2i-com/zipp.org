@@ -149,7 +149,7 @@ pub(crate) fn wt_share_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_WT_SHARE").is_none();
+            let v = crate::env_var_os("ZIPP_NO_WT_SHARE").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -218,7 +218,7 @@ pub(crate) fn bool_reuse_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_BOOL_REUSE").is_none();
+            let v = crate::env_var_os("ZIPP_NO_BOOL_REUSE").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -264,7 +264,7 @@ pub(crate) fn int_push_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_INT_PUSH").is_none();
+            let v = crate::env_var_os("ZIPP_NO_INT_PUSH").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -277,8 +277,8 @@ pub(crate) fn int_split_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_INT_SPLIT").is_some()
-                && std::env::var_os("ZIPP_NO_INT_SPLIT").is_none();
+            let v = crate::env_var_os("ZIPP_INT_SPLIT").is_some()
+                && crate::env_var_os("ZIPP_NO_INT_SPLIT").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -300,7 +300,7 @@ pub(crate) fn arr_pin_loose() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_ARR_PIN_LOOSE").is_some();
+            let v = crate::env_var_os("ZIPP_ARR_PIN_LOOSE").is_some();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -2963,7 +2963,7 @@ fn plan_region_cold_inner(
                     | Instr::ReturnUndefined
             )
         };
-        let grdbg = std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
+        let grdbg = crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
         if !confined && grdbg {
             eprintln!("[globrange] [{s},{e}] outside-dead: NOT CONFINED");
         }
@@ -3926,7 +3926,7 @@ fn plan_region_cold_inner(
             values.push((vec![iv], NumVal::Glob(gi)));
         }
         values.sort_by_key(|v| v.0[0].0);
-        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
             for (segs, v) in &values {
                 let name = match *v {
                     NumVal::Reg(r) => format!("r{r}"),
@@ -4014,7 +4014,7 @@ fn plan_region_cold_inner(
                         .count();
                     eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                         glob_order.len(), nregs - perm);
-                    if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                    if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
                         // Which numeric registers hold a permanent home, and
                         // why: `o` = read outside the region, `i` = live-in,
                         // `h` = hoisted.
@@ -4092,7 +4092,7 @@ fn plan_region_cold_inner(
                             .count();
                         eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                             glob_order.len(), nregs - perm);
-                        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
                             let list: Vec<String> = reg_order
                                 .iter()
                                 .filter(|r| ty[r] == VTy::Num && !shareable(**r))

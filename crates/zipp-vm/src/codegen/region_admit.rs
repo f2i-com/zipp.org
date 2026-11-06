@@ -603,7 +603,7 @@ pub(crate) fn region_can_compile(
     // so a change that looked like it would unblock a region unblocked nothing.
     // Behaviour is unchanged when the flag is off (`dump` is false, and every
     // rejection returns immediately exactly as before).
-    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
     let mut ok = true;
     // The back-edge must be an unconditional jump to the header (canonical
     // while/for shape). This guarantees no fall-through past `end`, so the only

@@ -765,7 +765,7 @@ mod tests {
     fn tables_are_generated_from_the_crate() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/unorm_tables.rs");
         let expected = generated();
-        if std::env::var_os("ZIPP_REGENERATE_UNORM").is_some() {
+        if crate::env_var_os("ZIPP_REGENERATE_UNORM").is_some() {
             std::fs::write(&path, &expected).unwrap();
         }
         let current = std::fs::read_to_string(&path)

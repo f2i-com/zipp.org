@@ -300,7 +300,7 @@ pub(crate) fn tierc_upval_min_other_ops() -> usize {
     static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
     match MIN.load(Ordering::Relaxed) {
         usize::MAX => {
-            let v = std::env::var("ZIPP_TIERC_UPVAL_MIN")
+            let v = crate::env_var("ZIPP_TIERC_UPVAL_MIN")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
@@ -2150,7 +2150,7 @@ impl HeapHelperAddrs {
 /// once per `Jit::compile` call (compiles are rare relative to execution).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn fnjit_mem_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
+    crate::env_var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
 /// Whether Tier C will try `proto` (it may still decline in the emitter).
@@ -2159,7 +2159,7 @@ fn tier_c_may_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> bo
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     {
         static LEAVES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*LEAVES.get_or_init(|| std::env::var_os("ZIPP_TIER_A_LEAVES").is_some())
+        !*LEAVES.get_or_init(|| crate::env_var_os("ZIPP_TIER_A_LEAVES").is_some())
             && fnjit_mem_enabled()
             && mem_can_compile(proto, const_strs)
     }
@@ -2482,7 +2482,7 @@ env_off_switch! {
 /// rare relative to execution) — zero per-call cost either way.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn crosscall2_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
+    crate::env_var_os("ZIPP_NO_CROSSCALL2").is_none()
 }
 
 /// Same-binary A/B switch for extending W7's selective callee-window fill to
@@ -2491,7 +2491,7 @@ pub(crate) fn crosscall2_enabled() -> bool {
 /// W7 still restores the pre-W7 full-fill path for every function.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn crosscall_wide_mask_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
+    crate::env_var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
 }
 
 /// A Tier-C function whose bytecode is the compiler's exact recursive
@@ -2619,7 +2619,7 @@ pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePl
     // The name first: it rejects every function but one, and the switch is a
     // read of the process environment.
     if proto.name != "renderInline"
-        || std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
+        || crate::env_var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
         || proto.param_count != 1
         || proto.length != 1
         || !proto.is_strict
@@ -2666,7 +2666,7 @@ pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePl
 fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option<JsonWalkPlan> {
     if proto.param_count != 1
         || proto.reg_count != 43
-        || std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
+        || crate::env_var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
         || !proto.is_strict
         || !proto.simple_params
         || proto.rest_reg.is_some()
@@ -3356,13 +3356,13 @@ env_off_switch! {
 /// so the claim is a measurement rather than an argument.
 #[inline]
 pub(crate) fn boxref_miss_deopts() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    use std::sync::atomic::Ordering;
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_BOXREF_MISS")
+            let v = crate::env_var_os("ZIPP_BOXREF_MISS")
                 .is_some_and(|v| v.eq_ignore_ascii_case("deopt")) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
@@ -3848,12 +3848,12 @@ impl Jit {
         // Values below 1 are meaningless (a counter starts at 1, so `== 0` would
         // never fire and would silently disable the tier — the opposite of what
         // anyone setting this wants), so they are ignored.
-        jit.threshold_override = std::env::var("ZIPP_JIT_THRESHOLD")
+        jit.threshold_override = crate::env_var("ZIPP_JIT_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|n| *n >= 1)
             .unwrap_or(0);
-        jit.dense_backedge = std::env::var_os("ZIPP_NO_DENSE_BACKEDGE").is_none();
+        jit.dense_backedge = crate::env_var_os("ZIPP_NO_DENSE_BACKEDGE").is_none();
         jit.ic_table_raw = jit.ic_table.as_ptr() as u64;
         jit
     }
@@ -3871,7 +3871,7 @@ impl Jit {
         functions: impl IntoIterator<Item = &'a FuncProto>,
     ) {
         self.python_program = python;
-        self.python_only = python && std::env::var_os("ZIPP_PY_JIT_RUNTIME").is_none();
+        self.python_only = python && crate::env_var_os("ZIPP_PY_JIT_RUNTIME").is_none();
         // Mark what never compiles up front (the runtime's functions: every
         // body without a fused Python instruction; and, without Tier C, the
         // Python functions' whole bodies), so a call or a loop there never
@@ -5365,7 +5365,7 @@ impl Jit {
         if !self.region_int_blacklist.contains(&key)
             && local_sroa_enabled()
             && meter.is_none()
-            && std::env::var_os("ZIPP_GC_STRESS").is_none()
+            && crate::env_var_os("ZIPP_GC_STRESS").is_none()
         {
             if let Some(mut local) = plan_local_sroa(proto, start, end) {
                 if local_concat_len_enabled() {

@@ -494,7 +494,7 @@ impl ScriptState {
     pub fn enable_vm_jit(&mut self) {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
-            if std::env::var_os("ZIPP_NOJIT").is_some() {
+            if crate::env_var_os("ZIPP_NOJIT").is_some() {
                 return;
             }
             self.with_vm(|vm| vm.set_jit_enabled(true));

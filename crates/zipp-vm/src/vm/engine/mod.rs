@@ -22,7 +22,7 @@ pub(crate) enum WinArgs<'a> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jit_call_log() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_CALLLOG").is_some())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_CALLLOG").is_some())
 }
 
 /// Keep a megamorphic plain-call site inside a compiled memory region after its
@@ -33,7 +33,7 @@ fn jit_call_log() -> bool {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jit_poly_call_fallback_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_POLY_CALL_FALLBACK").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_POLY_CALL_FALLBACK").is_none())
 }
 
 /// Let loader-installed ES-module functions use the ordinary function and
@@ -48,7 +48,7 @@ fn jit_poly_call_fallback_enabled() -> bool {
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn jit_module_functions_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_JIT").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_MODULE_JIT").is_none())
 }
 
 /// Run a JavaScript frame call's compiled body straight from
@@ -57,7 +57,7 @@ fn jit_module_functions_enabled() -> bool {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn js_frame_native_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_JS_FRAME_NATIVE").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_JS_FRAME_NATIVE").is_none())
 }
 
 /// Let ordinary `eval` / `new Function` functions (every script an embedder
@@ -71,7 +71,7 @@ fn js_frame_native_enabled() -> bool {
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn jit_eval_functions_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_EVAL_JIT").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_EVAL_JIT").is_none())
 }
 
 // submodules (split out of the former monolithic engine.rs)

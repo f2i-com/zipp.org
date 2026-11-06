@@ -30,12 +30,12 @@ fn pad2_cond_fuse_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PAD2_COND_FUSE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PAD2_COND_FUSE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -59,13 +59,13 @@ fn pad2_cond_fuse_enabled() -> bool {
 #[inline]
 fn strict_call_order() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let relaxed = std::env::var_os("ZIPP_RELAXED_CALL_ORDER").is_some()
-                && std::env::var_os("ZIPP_STRICT_CALL_ORDER").is_none();
+            let relaxed = crate::env_var_os("ZIPP_RELAXED_CALL_ORDER").is_some()
+                && crate::env_var_os("ZIPP_STRICT_CALL_ORDER").is_none();
             let v = (!relaxed) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1

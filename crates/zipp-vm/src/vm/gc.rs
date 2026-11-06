@@ -2532,7 +2532,7 @@ mod gcstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_GCSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_GCSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -2694,7 +2694,7 @@ mod gcstats {
 mod shape_verify {
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -2702,7 +2702,7 @@ mod shape_verify {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -2718,7 +2718,7 @@ mod shape_verify {
 mod nursery_verify {
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -2726,7 +2726,7 @@ mod nursery_verify {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_NURSERY_VERIFY").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_NURSERY_VERIFY").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

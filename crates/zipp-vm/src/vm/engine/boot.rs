@@ -77,12 +77,12 @@ const JIT_LARGE_PROGRAM_FUNCS: usize = 256;
 /// stays interpreted already and its own bodies are what compiles.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn jit_wanted(program: &Program) -> bool {
-    if std::env::var_os("ZIPP_NOJIT").is_some() {
+    if crate::env_var_os("ZIPP_NOJIT").is_some() {
         return false;
     }
     program.python_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
-        || std::env::var_os("ZIPP_JIT_LARGE").is_some()
+        || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
 }
 
 /// Whether a VM over a JavaScript program of [`JIT_LARGE_PROGRAM_FUNCS`] or
@@ -90,7 +90,7 @@ fn jit_wanted(program: &Program) -> bool {
 /// [`jit_wanted`]).
 pub(crate) fn large_programs_run_jit() -> bool {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    return std::env::var_os("ZIPP_NOJIT").is_none() && std::env::var_os("ZIPP_JIT_LARGE").is_some();
+    return crate::env_var_os("ZIPP_NOJIT").is_none() && crate::env_var_os("ZIPP_JIT_LARGE").is_some();
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     false
 }
@@ -250,7 +250,7 @@ impl<'p> Vm<'p> {
         eval_arena: &'p crate::vm::eval_arena::EvalArena,
     ) -> Vm<'p> {
         let mut heap = Heap::new();
-        let report_unhandled = std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
+        let report_unhandled = crate::env_var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
         let fatal_rejections = crate::unhandled_rejections_fatal() && !report_unhandled;
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
@@ -359,7 +359,7 @@ impl<'p> Vm<'p> {
                 .collect(),
             enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
-            const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
+            const_string_cache_enabled: crate::env_var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             #[cfg(not(target_arch = "wasm32"))]
             builtin_stats_enabled: crate::vm::builtins::builtin_stats_enabled_for_vm(),
             heap,
@@ -533,7 +533,7 @@ impl<'p> Vm<'p> {
             module_metas: Default::default(),
             module_func_ranges: Vec::new(),
             import_meta: 0,
-            can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
+            can_block: crate::env_var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
             module_body_promise: std::collections::HashMap::new(),
@@ -723,7 +723,7 @@ impl<'p> Vm<'p> {
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),
             htmldda_idx: u32::MAX,
-            htmldda_scalar_enabled: std::env::var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
+            htmldda_scalar_enabled: crate::env_var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -790,7 +790,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit_enabled: jit_wanted(program),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            jit_refused: std::env::var_os("ZIPP_NOJIT").is_some(),
+            jit_refused: crate::env_var_os("ZIPP_NOJIT").is_some(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -829,7 +829,7 @@ impl<'p> Vm<'p> {
             gc_lock: 0,
             #[cfg(feature = "safe-sandbox")]
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
-            gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
+            gc_stress: crate::env_var_os("ZIPP_GC_STRESS").is_some(),
             weak_containers: Default::default(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
@@ -1250,7 +1250,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
-        self.jit_refused = !on || std::env::var_os("ZIPP_NOJIT").is_some();
+        self.jit_refused = !on || crate::env_var_os("ZIPP_NOJIT").is_some();
         // The first ARM64 tier has no native step-meter yet. Once a recorder or
         // budget is attached, it must remain interpreted even if a caller later
         // tries to re-enable the JIT through the differential-test hook.

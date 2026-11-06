@@ -80,7 +80,7 @@ fn ascii_char_append_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -103,7 +103,7 @@ fn str_append_index_first_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -130,7 +130,7 @@ fn str_append_index_reserve_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }

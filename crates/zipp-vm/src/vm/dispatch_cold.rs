@@ -4444,7 +4444,7 @@ impl<'p> Vm<'p> {
                 // Tier-C leaf-inline plan for the whole function (from the live
                 // ICs). Built BEFORE the &mut self.jit borrow. Opt out with
                 // ZIPP_NO_TIERC_LEAF (region leaf inlining is unaffected).
-                let mut leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+                let mut leaf_plan = if crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none() {
                     self.build_leaf_inline_plan(
                         func_id,
                         0,

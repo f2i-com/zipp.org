@@ -15,12 +15,12 @@ fn enum_hoist_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ENUM_HOIST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ENUM_HOIST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }

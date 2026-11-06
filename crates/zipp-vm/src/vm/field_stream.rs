@@ -25,7 +25,7 @@ use crate::bytecode::{BitwiseOp, Instr};
 #[cfg(test)]
 #[inline(never)]
 fn test_panic_after_first_global_commit() {
-    if std::env::var_os("ZIPP_TEST_FIELD_STREAM_POST_COMMIT_PANIC").is_some() {
+    if crate::env_var_os("ZIPP_TEST_FIELD_STREAM_POST_COMMIT_PANIC").is_some() {
         panic!("field-stream post-commit test panic");
     }
 }
@@ -1347,7 +1347,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         static MIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *MIXED.get_or_init(|| std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none())
+        if *MIXED.get_or_init(|| crate::env_var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none())
             && recognize_mixed(proto, start, end).is_some()
         {
             return self.mixed_field_loop(func_id, start, end);
@@ -1502,7 +1502,7 @@ mod panic_boundary_tests {
     /// this marker becomes visible.
     #[test]
     fn field_stream_post_commit_abort_child() {
-        if std::env::var_os("ZIPP_TEST_FIELD_STREAM_ABORT_CHILD").is_none() {
+        if crate::env_var_os("ZIPP_TEST_FIELD_STREAM_ABORT_CHILD").is_none() {
             return;
         }
         let out = crate::run(GLOBAL_FIELD_SUM).expect("fault-injection source compiles");

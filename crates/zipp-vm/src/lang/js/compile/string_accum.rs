@@ -19,12 +19,12 @@ fn append_index_fuse_enabled() -> bool {
     }
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_APPEND_INDEX_FUSE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_APPEND_INDEX_FUSE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }

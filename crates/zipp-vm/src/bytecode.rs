@@ -4335,13 +4335,13 @@ pub(crate) fn interp_fuse_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_INTERP_FUSE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_INTERP_FUSE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4385,13 +4385,13 @@ pub(crate) fn static_key_plans_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
+            let on = crate::env_var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4406,13 +4406,13 @@ pub(crate) fn home_elide_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_HOME_ELIDE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_HOME_ELIDE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4428,13 +4428,13 @@ pub(crate) fn object_finalize_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJECT_FINALIZE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_OBJECT_FINALIZE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4991,13 +4991,13 @@ pub(crate) fn regexp_literal_test_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    use std::sync::atomic::Ordering;
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_LIT_TEST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_LIT_TEST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }

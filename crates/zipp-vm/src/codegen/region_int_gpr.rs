@@ -853,7 +853,7 @@ env_off_switch! {
 /// `ZIPP_NO_GPR_SPLIT` (above) is a DIFFERENT switch one edit-distance away.
 pub(crate) fn gpr_spill_slots_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
@@ -870,8 +870,8 @@ pub(crate) fn gpr_spill_slots_enabled() -> bool {
             // representation makes the op cheaper"). Kept dark for shapes a
             // future planner cost model may admit; `ZIPP_GPR_SPILL_SLOTS=1`
             // engages it, `ZIPP_NO_GPR_SPILL_SLOTS=1` forces it off even then.
-            let on = std::env::var_os("ZIPP_GPR_SPILL_SLOTS").is_some()
-                && std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+            let on = crate::env_var_os("ZIPP_GPR_SPILL_SLOTS").is_some()
+                && crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -2586,7 +2586,7 @@ pub(crate) fn compile_region_int_gpr(
     // from symbolic home colours to the existing GPR allocator.  The global
     // spill kill switch still disables both uses, and the computed lane's own
     // switch prevents this branch from existing at all.
-    let spills_not_forced_off = std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+    let spills_not_forced_off = crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
     let computed_spill = !entry.computed_guards.is_empty() && spills_not_forced_off;
     // Spec-order member calls add a captured callee prefix and can turn an
     // otherwise seven-home DV loop into a graph-colouring shape that needs one

@@ -77,11 +77,11 @@ mod effectful_panic_boundary_tests {
     /// terminates the process while the durable `effect` marker remains.
     #[test]
     fn effectful_boundary_abort_child() {
-        if std::env::var_os(CHILD_ENV).is_none() {
+        if crate::env_var_os(CHILD_ENV).is_none() {
             return;
         }
         let marker = std::path::PathBuf::from(
-            std::env::var_os(MARKER_ENV).expect("parent supplies the marker path"),
+            crate::env_var_os(MARKER_ENV).expect("parent supplies the marker path"),
         );
         let _ = catch_effectful_jit_u64(|| {
             std::fs::write(&marker, b"effect").expect("persist pre-panic effect");

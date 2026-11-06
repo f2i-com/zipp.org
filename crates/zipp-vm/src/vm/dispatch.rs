@@ -19,7 +19,7 @@ pub(crate) mod interp_stats {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Mutex;
 
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static TABLE: Mutex<Option<HashMap<u32, (String, u64, u64)>>> = Mutex::new(None);
     /// `(func, region entry ip, resume ip) -> runs`: how often each compiled
     /// loop region was entered and where it handed control back. A resume ip
@@ -33,7 +33,7 @@ pub(crate) mod interp_stats {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_INTERPSTATS").is_some();
+                let on = crate::env_var_os("ZIPP_INTERPSTATS").is_some();
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -132,12 +132,12 @@ fn lean_calls_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_LEAN_CALL").is_none();
+            let on = crate::env_var_os("ZIPP_NO_LEAN_CALL").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4643,7 +4643,7 @@ impl<'p> Vm<'p> {
                                 // Minified code names everything `t`/`e`, so the
                                 // enclosing function's string literals are what
                                 // actually identify it. Opt-in: they are long.
-                                let strings = if std::env::var_os("ZIPP_TRACE_CALLS").is_some() {
+                                let strings = if crate::env_var_os("ZIPP_TRACE_CALLS").is_some() {
                                     let sample: Vec<&str> = f
                                         .string_constants
                                         .iter()
@@ -6046,7 +6046,7 @@ impl<'p> Vm<'p> {
         // data slot and generation, and re-read the live slot before doing any
         // arithmetic.  An accessor, deletion, relocation or in-place overwrite
         // all fail closed to the unchanged bytecode/call path.
-        if std::env::var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
+        if crate::env_var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
             return None;
         }
         self.builtin_globals

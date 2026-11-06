@@ -20,7 +20,7 @@ use std::cell::UnsafeCell;
 #[cfg(feature = "safe-sandbox")]
 use std::collections::BTreeMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Whether two property keys are the same text, compared here.
 ///
@@ -169,13 +169,13 @@ pub(crate) fn hash_once_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_HASH_ONCE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_HASH_ONCE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -532,13 +532,13 @@ fn split_propindex_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPLIT_PROPINDEX").is_none();
+            let on = crate::env_var_os("ZIPP_NO_SPLIT_PROPINDEX").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1212,13 +1212,13 @@ fn sparse_num_index_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPARSE_NUM_INDEX").is_none();
+            let on = crate::env_var_os("ZIPP_NO_SPARSE_NUM_INDEX").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1414,7 +1414,7 @@ pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
 mod static_key_stats {
     use super::*;
 
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static OBJECTS: AtomicU64 = AtomicU64::new(0);
     static APPENDS: AtomicU64 = AtomicU64::new(0);
     static MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1426,7 +1426,7 @@ mod static_key_stats {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_STATIC_KEY_STATS").is_some();
+                let on = crate::env_var_os("ZIPP_STATIC_KEY_STATS").is_some();
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -1674,7 +1674,7 @@ fn prop_holes_mode() -> u8 {
     if s != u8::MAX {
         return s;
     }
-    let mode = match std::env::var("ZIPP_PROP_HOLES").as_deref() {
+    let mode = match crate::env_var("ZIPP_PROP_HOLES").as_deref() {
         Ok("0") => 0,
         Ok("all") => 2,
         _ => 1,
@@ -6597,7 +6597,7 @@ mod gc_courier {
         static STATE: AtomicUsize = AtomicUsize::new(usize::MAX);
         match STATE.load(Ordering::Relaxed) {
             usize::MAX => {
-                let v = if std::env::var_os("ZIPP_NO_COURIER_GATE").is_some() {
+                let v = if crate::env_var_os("ZIPP_NO_COURIER_GATE").is_some() {
                     0
                 } else {
                     COURIER_MIN_BYTES
@@ -6776,12 +6776,12 @@ env_off_switch! {
 /// into [`Heap::thin_alloc`] at construction.
 #[allow(dead_code)] // the sandbox build folds it away
 pub(crate) fn thin_alloc_enabled() -> bool {
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_THIN_ALLOC").is_none();
+            let on = crate::env_var_os("ZIPP_NO_THIN_ALLOC").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -8356,7 +8356,7 @@ impl Heap {
         let resident_payload_high_water = resident_payload_charged
             .iter()
             .fold(0usize, |n, bytes| n.saturating_add(bytes.get()));
-        let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
+        let oracle = crate::env_var_os("ZIPP_GCSTATS").is_some();
         let born = if oracle {
             vec![0; objs.len()]
         } else {
@@ -8364,18 +8364,18 @@ impl Heap {
         };
         // Default-on since W9 (B122) — see the `nursery` field doc. The
         // ZIPP_NURSERY opt-in from waves 7-8 is subsumed (harmless if set).
-        let nursery = std::env::var_os("ZIPP_NO_NURSERY").is_none();
+        let nursery = crate::env_var_os("ZIPP_NO_NURSERY").is_none();
         // The pre-interned prefix is pinned and immutable — OLD from birth.
         let gen = if nursery {
             vec![GEN_OLD; objs.len()]
         } else {
             Vec::new()
         };
-        let budget_env = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
+        let budget_env = crate::env_var("ZIPP_NURSERY_YOUNG_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v >= 1024);
-        let nursery_max_minors = std::env::var("ZIPP_NURSERY_MAX_MINORS")
+        let nursery_max_minors = crate::env_var("ZIPP_NURSERY_MAX_MINORS")
             .ok()
             .as_deref()
             .and_then(parse_nursery_max_minors)
@@ -8383,12 +8383,12 @@ impl Heap {
         // W10: an explicit budget (or the adapt kill switch) PINS it — the
         // survival controller below then never moves it.
         let budget_pinned =
-            budget_env.is_some() || std::env::var_os("ZIPP_NO_NURSERY_ADAPT").is_some();
+            budget_env.is_some() || crate::env_var_os("ZIPP_NO_NURSERY_ADAPT").is_some();
         let young_budget = budget_env.unwrap_or(NURSERY_YOUNG_BUDGET);
-        let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
-        let nonyoung_cache_on = std::env::var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
-        let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
-        let valgrain_small_max = std::env::var_os("ZIPP_VALGRAIN_SMALL_MAX")
+        let pretenure_on = crate::env_var_os("ZIPP_NO_PRETENURE").is_none();
+        let nonyoung_cache_on = crate::env_var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
+        let valgrain = crate::env_var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
+        let valgrain_small_max = crate::env_var_os("ZIPP_VALGRAIN_SMALL_MAX")
             .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
             .unwrap_or(VALGRAIN_SMALL_MAX_DEFAULT);
         let mut h = Heap {

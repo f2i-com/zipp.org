@@ -951,12 +951,12 @@ fn fastok_memo_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_FASTOK_MEMO").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -982,12 +982,12 @@ fn matchall_step_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCHALL_STEP").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCHALL_STEP").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1007,12 +1007,12 @@ fn slim_exec_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_SLIM_EXEC").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_SLIM_EXEC").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1077,12 +1077,12 @@ pub(crate) fn twin_at_create_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_TWIN_AT_CREATE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_TWIN_AT_CREATE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1101,12 +1101,12 @@ fn iter_subj_units_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ITER_SUBJ_UNITS").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ITER_SUBJ_UNITS").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1124,12 +1124,12 @@ fn matchall_batch_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCHALL_BATCH").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCHALL_BATCH").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -4297,12 +4297,12 @@ impl<'p> Vm<'p> {
                 return true;
             }
             use std::sync::atomic::{AtomicU8, Ordering};
-            static STATE: AtomicU8 = AtomicU8::new(0);
+            static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
             match STATE.load(Ordering::Relaxed) {
                 1 => true,
                 2 => false,
                 _ => {
-                    let on = std::env::var_os("ZIPP_NO_ASCII_SLICE_FAST").is_none();
+                    let on = crate::env_var_os("ZIPP_NO_ASCII_SLICE_FAST").is_none();
                     STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                     on
                 }
@@ -7306,12 +7306,12 @@ pub(crate) fn match_variant_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCH_VARIANT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCH_VARIANT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7328,21 +7328,21 @@ pub(crate) fn rx_scalar_matchall_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_MATCHALL").is_none()
-                && std::env::var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none()
-                && std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none()
+            let v = (crate::env_var_os("ZIPP_NO_RX_SCALAR_MATCHALL").is_none()
+                && crate::env_var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none()
+                && crate::env_var_os("ZIPP_NO_FASTOK_MEMO").is_none()
                 && matchall_step_enabled()
                 && slim_exec_enabled()
                 && matchall_batch_enabled()
                 && match_variant_enabled()
                 && string_regexp_call_direct_enabled()
-                && std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
-                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+                && crate::env_var_os("ZIPP_NO_ITER_REGION").is_none()
+                && crate::env_var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7362,12 +7362,12 @@ pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7385,16 +7385,16 @@ pub(crate) fn rx_scalar_exec_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_EXEC").is_none()
+            let v = (crate::env_var_os("ZIPP_NO_RX_SCALAR_EXEC").is_none()
                 && regexp_call_direct_enabled()
                 && slim_exec_enabled()
                 && match_variant_enabled()
-                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+                && crate::env_var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7411,12 +7411,12 @@ pub(crate) fn regexp_call_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_CALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_CALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7433,12 +7433,12 @@ pub(crate) fn string_regexp_call_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_STRING_CALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_STRING_CALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7490,7 +7490,7 @@ pub(crate) mod rxstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_RXSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_RXSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

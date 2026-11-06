@@ -914,7 +914,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     // three functions were also using `UpvalSet`, `join` and `push` — which the
     // first-only report had never shown. Behaviour is unchanged when the flag is
     // off.
-    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
     let mut ok = true;
     macro_rules! reject {
         ($($arg:tt)*) => {{
@@ -2262,7 +2262,7 @@ fn plan_tierc_block_sroa(
     const MAX_SITES: usize = 16;
 
     let mut out = TiercBlockSroaPlan::default();
-    if std::env::var_os("ZIPP_GC_STRESS").is_some()
+    if crate::env_var_os("ZIPP_GC_STRESS").is_some()
         || !proto.eval_sites.is_empty()
         || proto.code.iter().any(|instr| {
             matches!(
@@ -3774,7 +3774,7 @@ pub(crate) fn compile_proto_mem(
         .code
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    let precise_entry_pins = std::env::var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
+    let precise_entry_pins = crate::env_var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
     let leaf_needs_version_pins = leaf_plan
         .values()
         .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
@@ -3828,7 +3828,7 @@ pub(crate) fn compile_proto_mem(
     // at their sole growth sites. Loading them rdi-relative avoids three Win64
     // helper round-trips on every tiny Tier-C entry. The off-switch restores
     // the historical helper prologue for a same-binary process A/B.
-    let direct_entry_bases = std::env::var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
+    let direct_entry_bases = crate::env_var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
     if precise_entry_pins && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={} bases={}",
@@ -10273,7 +10273,7 @@ fn emit_recv_cached_set(
 
 /// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).
 fn perf_map_ops() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops")
+    cfg!(target_os = "linux") && crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops")
 }
 
 /// Append `func_id body_start ip offset op` lines for one Tier C body to

@@ -464,7 +464,7 @@ impl<'p> Vm<'p> {
                 // (a UTF-16 conversion and a system call on Windows) was a
                 // tenth of such a call's time.
                 static DECLLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *DECLLOG.get_or_init(|| std::env::var_os("ZIPP_DECLLOG").is_some()) {
+                if *DECLLOG.get_or_init(|| crate::env_var_os("ZIPP_DECLLOG").is_some()) {
                     eprintln!(
                         "[decl] no-entry fid={fid} compiled={} sp2={}",
                         self.jit.get(fid).is_some(),

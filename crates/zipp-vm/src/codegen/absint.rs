@@ -196,18 +196,18 @@ pub(crate) fn analyze_int_guards_strict(
         }
         match analyze_run(proto, s, e, seeded, dv) {
             None => {
-                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
                     eprintln!("[absint] [{s},{e}] analyze_run=None (unsupported op or no convergence)");
                 }
                 strict_globs.clear();
                 return FxHashSet::default();
             }
             Some((states, elide)) => {
-                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
                     let mut c: Vec<u32> = cands.iter().copied().collect();
                     c.sort_unstable();
                     eprintln!("[absint] [{s},{e}] cands={c:?} elided={}", elide.len());
-                    if let Some(g) = std::env::var("ZIPP_ABSINT_GLOB").ok().and_then(|v| v.parse::<u32>().ok()) {
+                    if let Some(g) = crate::env_var("ZIPP_ABSINT_GLOB").ok().and_then(|v| v.parse::<u32>().ok()) {
                         for (off, i) in proto.code[s..=e].iter().enumerate() {
                             let ip = s + off;
                             match states[off].as_ref() {

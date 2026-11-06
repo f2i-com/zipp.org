@@ -777,7 +777,7 @@ fn set_and_dict_behavior_matches_the_runtime() {
         let indented: String = body.lines().map(|l| format!("    {l}\n")).collect();
         program.push_str(&format!("def sc{n}():\n{indented}sc{n}()\n"));
     }
-    if let Some(p) = std::env::var_os("PYTABLE_DUMP") { std::fs::write(p, &src).unwrap(); }
+    if let Some(p) = crate::env_var_os("PYTABLE_DUMP") { std::fs::write(p, &src).unwrap(); }
     let lines = run_python(src);
 
     let mut env = Env::new();

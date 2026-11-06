@@ -188,7 +188,7 @@ pub(crate) fn stress_every() -> u32 {
     use std::sync::OnceLock;
     static N: OnceLock<u32> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ZIPP_OPT_DEOPT_EVERY")
+        crate::env_var("ZIPP_OPT_DEOPT_EVERY")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
@@ -201,7 +201,7 @@ fn only_fns() -> Option<&'static [u32]> {
     use std::sync::OnceLock;
     static ONLY: OnceLock<Option<Vec<u32>>> = OnceLock::new();
     ONLY.get_or_init(|| {
-        let s = std::env::var("ZIPP_OPT_ONLY").ok()?;
+        let s = crate::env_var("ZIPP_OPT_ONLY").ok()?;
         Some(s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
     })
     .as_deref()

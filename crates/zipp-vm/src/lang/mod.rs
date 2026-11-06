@@ -162,7 +162,7 @@ fn python_jit_default(state: &mut ScriptState) {
 }
 /// `ZIPP_PY_JIT`: `Some(true)` for `1`, `Some(false)` for `0`, else `None`.
 pub fn python_jit_env() -> Option<bool> {
-    match std::env::var_os("ZIPP_PY_JIT")?.to_str()? {
+    match crate::env_var_os("ZIPP_PY_JIT")?.to_str()? {
         "1" => Some(true),
         "0" => Some(false),
         _ => None,

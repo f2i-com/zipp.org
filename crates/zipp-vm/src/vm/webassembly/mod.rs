@@ -57,7 +57,7 @@ mod stats {
     use std::cell::Cell;
     use std::time::{Duration, Instant};
     thread_local! {
-        static ON: bool = std::env::var_os("ZIPP_WASM_STATS").is_some();
+        static ON: bool = crate::env_var_os("ZIPP_WASM_STATS").is_some();
         static OPS: Cell<(u64, Duration)> = const { Cell::new((0, Duration::ZERO)) };
         static CALLS: Cell<(u64, Duration)> = const { Cell::new((0, Duration::ZERO)) };
         static IMPORTS: Cell<(u64, Duration)> = const { Cell::new((0, Duration::ZERO)) };
@@ -264,7 +264,7 @@ fn table_bytes(elements: usize) -> usize {
 #[cfg(all(feature = "wasm-jit", feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn wasm_interp_forced() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ZIPP_WASM_INTERP").is_some())
+    *ON.get_or_init(|| crate::env_var_os("ZIPP_WASM_INTERP").is_some())
 }
 
 impl<'p> Vm<'p> {

@@ -119,12 +119,12 @@ pub(crate) fn int_arr_length_kind(kind: u8) -> bool {
         return true; // pre-existing path remains live under the off switch
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     let on = match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_DENSE_ARRAY_LENGTH").is_none();
+            let on = crate::env_var_os("ZIPP_NO_INT_DENSE_ARRAY_LENGTH").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -307,7 +307,7 @@ fn int_push3_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = int_push_enabled() && std::env::var_os("ZIPP_NO_INT_PUSH3").is_none();
+            let v = int_push_enabled() && crate::env_var_os("ZIPP_NO_INT_PUSH3").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -2476,7 +2476,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         // Regression-only fault injection for the otherwise
                         // defensive atomic-decline path. It changes emitted
                         // code only in an explicitly marked child process.
-                        | if std::env::var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
+                        | if crate::env_var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
                             1 << 31
                         } else {
                             0

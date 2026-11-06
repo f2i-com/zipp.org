@@ -42,12 +42,12 @@ fn prefix_end_finalize_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_PREFIX_FINALIZE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_PREFIX_FINALIZE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -85,7 +85,7 @@ pub(crate) fn interp_only_bytecode() -> bool {
         return true;
     }
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    !*KEEP.get_or_init(|| std::env::var_os("ZIPP_KEEP_COPIES").is_some())
+    !*KEEP.get_or_init(|| crate::env_var_os("ZIPP_KEEP_COPIES").is_some())
 }
 
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
@@ -162,12 +162,12 @@ fn spread_inline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_SPREAD_INLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_SPREAD_INLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -207,12 +207,12 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_FUSED_CMPJUMP").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_FUSED_CMPJUMP").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -229,12 +229,12 @@ pub(crate) fn typeof_same_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_TYPEOF_SAME").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -270,12 +270,12 @@ pub(crate) fn concat_fuse_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_CONCAT_FUSE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_CONCAT_FUSE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -291,12 +291,12 @@ pub(crate) fn pad2_cache_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PAD2_CACHE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PAD2_CACHE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -3765,7 +3765,7 @@ mod static_key_plan_tests {
 
     #[test]
     fn compiler_off_child() {
-        if std::env::var_os("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD").is_none() {
+        if crate::env_var_os("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD").is_none() {
             return;
         }
         let program = compile("function build(v){return {a:v,b:2}} build(1);");

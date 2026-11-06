@@ -22,12 +22,12 @@ fn json_leaf_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_JSON_LEAF_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_JSON_LEAF_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -46,12 +46,12 @@ fn json_plain_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_JSON_PLAIN_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_JSON_PLAIN_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -206,12 +206,12 @@ fn json_quote_fastlen_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_JSON_QUOTE_FASTLEN").is_none();
+            let on = crate::env_var_os("ZIPP_NO_JSON_QUOTE_FASTLEN").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -353,12 +353,12 @@ fn json_key_plans_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_JSON_KEY_PLANS").is_none();
+            let on = crate::env_var_os("ZIPP_NO_JSON_KEY_PLANS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

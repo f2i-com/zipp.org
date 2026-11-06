@@ -8,11 +8,11 @@ use super::*;
 /// Same-binary escape hatch for the guarded pure cyclic field-read reducer.
 /// Read only while compiling a hot loop; there is no per-iteration switch cost.
 pub(crate) fn field_read_stream_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_FIELD_READ_STREAM").is_none()
+    crate::env_var_os("ZIPP_NO_FIELD_READ_STREAM").is_none()
 }
 
 fn field_sum_stream_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none()
+    crate::env_var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none()
 }
 
 /// The helper's own bytecode screen (`vm::field_stream`), as an admission

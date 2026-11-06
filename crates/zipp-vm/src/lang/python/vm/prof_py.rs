@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
-static ON: AtomicU8 = AtomicU8::new(2);
+static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
 /// Whether `ZIPP_PY_PROF` is set (read once). Never in the WebAssembly
 /// build, which has no environment to set it in and no exit report: there
@@ -51,7 +51,7 @@ pub(crate) fn on() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 #[cold]
 fn init() -> bool {
-    let v = std::env::var_os("ZIPP_PY_PROF").is_some_and(|v| v != "0");
+    let v = crate::env_var_os("ZIPP_PY_PROF").is_some_and(|v| v != "0");
     ON.store(v as u8, Ordering::Relaxed);
     v
 }

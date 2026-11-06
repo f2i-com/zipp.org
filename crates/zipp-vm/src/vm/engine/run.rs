@@ -86,7 +86,7 @@ console.log("module-rec:" + sum);
 
     #[test]
     fn module_pin_child() {
-        if std::env::var_os(CHILD_ENV).is_none() {
+        if crate::env_var_os(CHILD_ENV).is_none() {
             return;
         }
         let direct_capacity = direct_module();

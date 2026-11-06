@@ -502,7 +502,7 @@ pub(crate) fn jit_loop_align() -> usize {
     if v != usize::MAX {
         return v;
     }
-    let n = std::env::var("ZIPP_JIT_LOOP_ALIGN")
+    let n = crate::env_var("ZIPP_JIT_LOOP_ALIGN")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| matches!(n, 0 | 16 | 32 | 64))
@@ -2407,7 +2407,7 @@ mod int32_trunc_tests {
     /// Every truncation idiom admits its producer, and a chain admits both.
     #[test]
     fn truncation_only_producers_are_members() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return; // the latch pins the analysis empty by design
         }
         let src = r#"
@@ -2455,7 +2455,7 @@ mod int32_trunc_tests {
     /// consumer, a loop-carried accumulator (least fixpoint), direct eval.
     #[test]
     fn observed_producers_are_not_members() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return;
         }
         let src = r#"
@@ -2476,7 +2476,7 @@ mod int32_trunc_tests {
     /// the handler; a mapped `arguments` object declines parameter dsts.
     #[test]
     fn handler_edges_and_mapped_arguments_decline() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return;
         }
         let base = named_proto("function f(a, b) { return (a + b) | 0; }", "f");

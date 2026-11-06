@@ -815,7 +815,7 @@ impl<'p> Vm<'p> {
             // reject the arbitrary Call itself, while the MEM tier owns the
             // post-call refresh contract used here.
             let call_result_candidate = matches!(recv, Recv::Str | Recv::Len)
-                && std::env::var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
+                && crate::env_var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
                 && writer.is_some_and(|wip| matches!(proto.code[wip], Instr::Call { .. }));
             let call_written = call_result_candidate
                 && call_result_reaches_lookup_on_all_paths(&proto.code, s, e, lookup_ip, obj);
@@ -2380,7 +2380,7 @@ impl<'p> Vm<'p> {
         let mut pending: Vec<u32> = Vec::new();
         // B229: callees this plan BAKES a lane against (see `note_cross_baked`).
         let mut baked: Vec<u32> = Vec::new();
-        if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
+        if crate::env_var_os("ZIPP_NO_CROSSCALL").is_some() {
             return (plan, pending, baked);
         }
         let caller = self.func(func_id as usize);
@@ -3128,7 +3128,7 @@ impl<'p> Vm<'p> {
             // polymorphic site only when every filled way names the same
             // FuncProto; later gates require that proto to be capture-free and
             // non-arrow, and emitted code re-checks the LIVE callee's proto.
-            let poly_on = std::env::var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
+            let poly_on = crate::env_var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
             let upval_rep = (poly_on && !with_this)
                 .then(|| {
                     self.leaf_upval_callee_representative(func_id, start as usize, ip, callee_reg)
@@ -3884,7 +3884,7 @@ impl<'p> Vm<'p> {
         // Elements of an `arr[i]` receiver's array looked at for candidates.
         const MI_ARRAY_CAND_SCAN: usize = 256;
         let mut plan = rustc_hash::FxHashMap::default();
-        if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
+        if crate::env_var_os("ZIPP_NO_METHOD_INLINE").is_some() {
             return plan; // kill-switch (live through all stages)
         }
         #[cfg(feature = "instrument")]
