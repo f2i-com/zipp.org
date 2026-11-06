@@ -15,6 +15,13 @@ env_off_switch! {
     fn kernel_upvals_enabled() = "ZIPP_NO_KERNEL_UPVALS"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_SCAN_KERNEL=1`: `find`/`findIndex`/`some`/`every` call their
+    /// predicate per element, without the fused scan kernel.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn scan_kernel_enabled() = "ZIPP_NO_SCAN_KERNEL"
+}
+
 /// Arrays nested in one join in the ordinary engine. The hardened profile
 /// allows 4 by default and lets the host move it
 /// (`SandboxCaps::array_stringify_depth`).
@@ -263,7 +270,101 @@ mod array_numeric_callback_shape_tests {
     }
 }
 
+/// What `Vm::scan_kernel_run` left `find`/`findIndex`/`some`/`every`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+enum ScanRun {
+    /// The method's result: the predicate stopped, or it ran over every
+    /// element without stopping.
+    Answer(Value),
+    /// The per-element loop goes on from this index (0: no kernel ran).
+    From(usize),
+}
+
 impl<'p> Vm<'p> {
+    /// `find`/`findIndex`/`some`/`every` (`name`) on Array `idx` with
+    /// predicate `cb`: its scan kernel over the elements while each result
+    /// is a Bool short of the one that answers (`compile_scan_kernel`), when
+    /// `cb` is eligible, there is no `thisArg` and no index overlay. The
+    /// predicate runs no code that could change the array, so the elements
+    /// are read in place.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn scan_kernel_run(&mut self, name: &str, idx: u32, cb: Value, this_arg: Value, len: usize) -> ScanRun {
+        if !scan_kernel_enabled()
+            || !this_arg.is_undefined()
+            || !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !cb.is_heap()
+            || len == 0
+            || len > i32::MAX as usize
+            || self.arr_props.contains_key(&idx)
+        {
+            return ScanRun::From(0);
+        }
+        let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) else {
+            return ScanRun::From(0);
+        };
+        let Some((upv, n_up)) = self.kernel_upvals(ups) else {
+            return ScanRun::From(0);
+        };
+        let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
+        // SAFETY: program functions are immutable during execution (as the
+        // map/filter drivers).
+        let proto_ref = unsafe { &*proto };
+        // The array (3rd) parameter and `arguments` would see the receiver.
+        if proto_ref.param_count >= 3 || proto_ref.arguments_reg.is_some() {
+            return ScanRun::From(0);
+        }
+        let stop_on = name != "every";
+        let Some(entry) = self.jit.scan_kernel(fid, proto_ref, stop_on) else {
+            return ScanRun::From(0);
+        };
+        let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + upv_base + n_up) {
+            return ScanRun::From(0);
+        }
+        self.regs.resize(win + upv_base + n_up, Value::UNDEFINED);
+        for (k, &v) in upv[..n_up].iter().enumerate() {
+            self.regs[win + upv_base + k] = v;
+        }
+        let (elems, n) = match self.heap.get(idx) {
+            HeapObj::Array(items) => (items.as_ptr() as *const u64, items.len().min(len)),
+            _ => (std::ptr::null(), 0),
+        };
+        let mut status: u64 = 2;
+        let mut reached = 0usize;
+        if n != 0 {
+            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+            // SAFETY: `entry` is a scan kernel of this callback's code; the
+            // window holds its registers and captured values; `elems` points
+            // at `n` live elements that nothing moves while the call-free
+            // kernel runs.
+            let kernel: extern "win64" fn(*mut u64, *const u64, usize, *mut u64) -> usize =
+                unsafe { core::mem::transmute(entry) };
+            reached = kernel(window_ptr, elems, n, &mut status);
+        }
+        self.regs.truncate(win);
+        match status {
+            0 => ScanRun::Answer(match name {
+                "find" => match self.heap.get(idx) {
+                    HeapObj::Array(items) => items[reached],
+                    _ => Value::UNDEFINED,
+                },
+                "findIndex" => Value::int(reached as i32),
+                "some" => Value::bool(true),
+                _ => Value::bool(false),
+            }),
+            1 if n == len => ScanRun::Answer(match name {
+                "find" => Value::UNDEFINED,
+                "findIndex" => Value::int(-1),
+                "some" => Value::bool(false),
+                _ => Value::bool(true),
+            }),
+            1 => ScanRun::From(n),
+            _ => ScanRun::From(reached),
+        }
+    }
+
     /// The values of a fused kernel callback's captured cells (`ups`), which
     /// its driver stores past the callback's registers
     /// (`codegen::kernel_upv_base`): the kernel body reads them and runs
@@ -3527,11 +3628,22 @@ impl<'p> Vm<'p> {
                 // length: `find`/`findIndex` still visit it with `undefined` (they do
                 // not HasProperty-skip), while `some`/`every` skip it.
                 let len = self.array_snapshot(idx).len();
+                // A kernel-eligible predicate (`compile_scan_kernel`) over a
+                // dense Array with no index overlay runs the leading elements
+                // natively; the loop below goes on where it stopped short
+                // (a hole, a non-number, a non-Bool result).
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let start = match self.scan_kernel_run(name, idx, cb, this_arg, len) {
+                    ScanRun::Answer(v) => return Ok(Some(v)),
+                    ScanRun::From(i) => i,
+                };
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let start = 0usize;
                 // A compiled predicate runs over one reused window, as the
                 // all-elements driver's callback does; every exit releases it.
                 let (native, win) = self.open_cb_window(cb, this_arg);
                 let mut found: Result<Option<Value>, Thrown> = Ok(None);
-                for i in 0..len {
+                for i in start..len {
                     let v = match self.array_dense_or_proto_get(idx, i) {
                         Ok(Some(v)) => v,
                         Ok(None) => {

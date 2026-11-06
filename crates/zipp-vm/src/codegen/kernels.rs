@@ -723,6 +723,131 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
     })
 }
 
+/// Compile a fused predicate-scan kernel for `find` / `findIndex` / `some`
+/// (`stop_on` true) or `every` (false): the predicate `proto` runs over the
+/// array's elements in order until its Bool result is `stop_on`. A hole, a
+/// non-number operand or a non-Bool result bails at that element, where the
+/// caller's per-element loop goes on (holes and truthiness are its). `None`
+/// if ineligible.
+///
+/// ABI: `fn(window, elements, len, status: *mut u64) -> usize`. Returns the
+/// index reached; `*status` is 0 when the predicate stopped there, 1 when
+/// every element ran (the index is `len`), 2 when it bailed there.
+pub(crate) fn compile_scan_kernel(proto: &FuncProto, stop_on: bool) -> Option<JitFn> {
+    if proto.param_count == 0 || proto.param_count > 2 || !can_kernel_body(proto) {
+        return None;
+    }
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let loop_top = ops.new_dynamic_label();
+    let loop_continue = ops.new_dynamic_label();
+    let loop_done = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
+    let kernel_bail = ops.new_dynamic_label();
+    let epilogue = ops.new_dynamic_label();
+    let want_index = proto.param_count >= 2;
+    // ── prologue ── window=rbx, elements=r13, len=r14, status=r15, i=r12. 5
+    // callee-saved pushes from an 8-mod-16 entry; no calls, no shadow space.
+    dynasm!(ops
+        ; push rbx
+        ; push r12
+        ; push r13
+        ; push r14
+        ; push r15
+        ; mov rbx, rcx
+        ; mov r13, rdx
+        ; mov r14, r8
+        ; mov r15, r9
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [rbx], rax                        // window[0] = this = undefined
+        ; xor r12, r12
+        ; => loop_top
+        ; cmp r12, r14
+        ; jae => loop_done
+        ; mov rax, [r13 + r12*8]
+        ; mov rcx, QWORD Value::HOLE.bits() as i64
+        ; cmp rax, rcx                          // a hole: the loop's (skip / undefined)
+        ; je => kernel_bail
+        ; mov [rbx + 8], rax                    // window[1] = element
+    );
+    if want_index {
+        dynasm!(ops
+            ; mov eax, r12d
+            ; mov rcx, QWORD INT_TAG as i64
+            ; or rax, rcx
+            ; mov [rbx + 16], rax               // window[2] = Int(i)
+        );
+    }
+    let mut returned = false;
+    for instr in &proto.code {
+        match emit_kernel_arith(&mut ops, instr, kernel_bail, kernel_upv_base(proto))? {
+            KBody::Plain => {}
+            KBody::Ret(src) => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, (INT_TAG_HI + 1) as i32   // the Bool tag
+                    ; jne => kernel_bail
+                    ; test eax, eax
+                );
+                if stop_on {
+                    dynasm!(ops ; jnz => found ; jmp => loop_continue);
+                } else {
+                    dynasm!(ops ; jz => found ; jmp => loop_continue);
+                }
+                returned = true;
+                break;
+            }
+            KBody::RetUndef => {
+                // undefined is falsy: `every` stops, the others go on.
+                if stop_on {
+                    dynasm!(ops ; jmp => loop_continue);
+                } else {
+                    dynasm!(ops ; jmp => found);
+                }
+                returned = true;
+                break;
+            }
+        }
+    }
+    if !returned && !stop_on {
+        // Falling off the end returns undefined: falsy.
+        dynasm!(ops ; jmp => found);
+    }
+    dynasm!(ops
+        ; => loop_continue
+        ; inc r12
+        ; jmp => loop_top
+        ; => loop_done
+        ; mov QWORD [r15], 1
+        ; mov rax, r12
+        ; jmp => epilogue
+        ; => found
+        ; mov QWORD [r15], 0
+        ; mov rax, r12
+        ; jmp => epilogue
+        ; => kernel_bail
+        ; mov QWORD [r15], 2
+        ; mov rax, r12
+        ; => epilogue
+        ; pop r15
+        ; pop r14
+        ; pop r13
+        ; pop r12
+        ; pop rbx
+        ; ret
+    );
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+        int_tier: false,
+        osr_heads: Box::default(),
+    })
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // OSR loop-region JIT (double / SSE2)
 //

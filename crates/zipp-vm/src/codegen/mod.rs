@@ -3659,6 +3659,9 @@ pub struct Jit {
     reduce_kernels: FxHashMap<u32, Option<JitFn>>,
     /// Compiled fused `filter` kernels, keyed by predicate `func_id` (as above).
     filter_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Compiled predicate-scan kernels (`find`/`findIndex`/`some`: stop on
+    /// true; `every`: stop on false), keyed by `(func_id, stop_on)`.
+    scan_kernels: FxHashMap<(u32, bool), Option<JitFn>>,
     /// Where compiled code charges the step budget, when this VM is metered.
     /// Set once by `Vm::set_instrumentation`; `None` means every emitter is
     /// byte-for-byte what an uninstrumented build produces.
@@ -3977,6 +3980,7 @@ impl Jit {
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
+        self.scan_kernels.clear();
     }
 
     /// Whether this VM meters native code. The fused array kernels and the
@@ -4841,6 +4845,23 @@ impl Jit {
             crate::vm::prof::pc::register(a, n, || format!("fn{func_id} filter-kernel"));
         }
         self.filter_kernels.insert(func_id, compiled);
+        entry
+    }
+
+    /// Native entry for the predicate-scan kernel of `func_id` stopping on
+    /// `stop_on` (`compile_scan_kernel`), compiling and caching on first
+    /// request. `None` if ineligible.
+    pub fn scan_kernel(&mut self, func_id: u32, proto: &FuncProto, stop_on: bool) -> Option<*const u8> {
+        if let Some(slot) = self.scan_kernels.get(&(func_id, stop_on)) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_scan_kernel(proto, stop_on);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} scan-kernel"));
+        }
+        self.scan_kernels.insert((func_id, stop_on), compiled);
         entry
     }
 
@@ -6267,7 +6288,12 @@ impl Jit {
         let fns = || self.compiled.values().chain(self.retired_fns.iter());
         let regions = || self.regions.values().chain(self.retired.iter()).map(|r| &r.code);
         let kernels = || {
-            self.map_kernels.values().chain(self.reduce_kernels.values()).chain(self.filter_kernels.values()).flatten()
+            self.map_kernels
+                .values()
+                .chain(self.reduce_kernels.values())
+                .chain(self.filter_kernels.values())
+                .chain(self.scan_kernels.values())
+                .flatten()
         };
         let code = |it: &mut dyn Iterator<Item = &JitFn>| it.fold((0u64, 0u64, 0u64), |(n, b, m), f| (n + 1, b + f._buf.len() as u64, m + mapped(f._buf.len())));
         let (fn_n, fn_b, fn_m) = code(&mut fns());
