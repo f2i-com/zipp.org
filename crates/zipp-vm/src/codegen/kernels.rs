@@ -28,6 +28,7 @@ pub(crate) fn can_kernel_body(proto: &FuncProto) -> bool {
             instr,
             Instr::LoadInt { .. }
                 | Instr::Move { .. }
+                | Instr::UpvalGet { .. }
                 | Instr::AddInt { .. }
                 | Instr::Add { .. }
                 | Instr::Sub { .. }
@@ -280,6 +281,14 @@ pub(crate) fn kmap_bitwise(
     box_eax(ops, dst);
 }
 
+/// The first window register past a kernel callback's own, where its driver
+/// stores the values of the closure's captured cells (`UpvalGet idx` reads
+/// register `kernel_upv_base + idx`): every driver's window is at least three
+/// registers, and the callback's own may be more.
+pub(crate) fn kernel_upv_base(proto: &FuncProto) -> usize {
+    (proto.reg_count as usize).max(3)
+}
+
 /// How a kernel callback body op classifies: a value op already emitted, or a
 /// `Return` the kernel must turn into its own result-commit.
 pub(crate) enum KBody {
@@ -296,8 +305,17 @@ pub(crate) fn emit_kernel_arith(
     ops: &mut dynasmrt::x64::Assembler,
     instr: &Instr,
     bail: dynasmrt::DynamicLabel,
+    upv_base: usize,
 ) -> Option<KBody> {
     match *instr {
+        // A captured variable: the value its driver stored past the
+        // callback's registers before the loop. The body runs no code that
+        // could assign it (no call, no `UpvalSet`), so it stays that value.
+        Instr::UpvalGet { dst, idx } => {
+            let src = u16::try_from(upv_base + idx as usize).ok()?;
+            dynasm!(ops ; mov rax, [rbx + dreg(src)] ; mov [rbx + dreg(dst)], rax);
+            Some(KBody::Plain)
+        }
         Instr::LoadInt { dst, val } => {
             // A small integer constant; load_num_xmm will cvtsi2sd it on use.
             let boxed = INT_TAG | (val as u32 as u64);
@@ -427,7 +445,7 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
     // ── callback body (straight-line); each Return stores out[i] and continues.
     let mut returned = false;
     for instr in &proto.code {
-        match emit_kernel_arith(&mut ops, instr, kernel_bail)? {
+        match emit_kernel_arith(&mut ops, instr, kernel_bail, kernel_upv_base(proto))? {
             KBody::Plain => {}
             KBody::Ret(src) => {
                 dynasm!(ops
@@ -530,7 +548,7 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let mut returned = false;
     for instr in &proto.code {
-        match emit_kernel_arith(&mut ops, instr, kernel_bail)? {
+        match emit_kernel_arith(&mut ops, instr, kernel_bail, kernel_upv_base(proto))? {
             KBody::Plain => {}
             KBody::Ret(src) => {
                 dynasm!(ops ; mov rax, [rbx + dreg(src)] ; mov r15, rax ; jmp => loop_continue);
@@ -637,7 +655,7 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let mut returned = false;
     for instr in &proto.code {
-        match emit_kernel_arith(&mut ops, instr, kernel_bail)? {
+        match emit_kernel_arith(&mut ops, instr, kernel_bail, kernel_upv_base(proto))? {
             KBody::Plain => {}
             KBody::Ret(src) => {
                 // Predicate result must be a Bool (high16 == 0x7FFA); a non-Bool

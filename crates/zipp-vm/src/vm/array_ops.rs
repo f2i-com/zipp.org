@@ -7,6 +7,14 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+env_off_switch! {
+    /// `ZIPP_NO_KERNEL_UPVALS=1`: a `map`/`filter`/`reduce` callback that
+    /// captures a variable takes the per-element path again, as before the
+    /// fused kernels read captured values (`Vm::kernel_upvals`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn kernel_upvals_enabled() = "ZIPP_NO_KERNEL_UPVALS"
+}
+
 /// Arrays nested in one join in the ordinary engine. The hardened profile
 /// allows 4 by default and lets the host move it
 /// (`SandboxCaps::array_stringify_depth`).
@@ -256,6 +264,28 @@ mod array_numeric_callback_shape_tests {
 }
 
 impl<'p> Vm<'p> {
+    /// The values of a fused kernel callback's captured cells (`ups`), which
+    /// its driver stores past the callback's registers
+    /// (`codegen::kernel_upv_base`): the kernel body reads them and runs
+    /// nothing that could assign one. `None` (the per-element path) for more
+    /// than eight, or for one still in its temporal dead zone, whose read
+    /// throws.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn kernel_upvals(&self, ups: &[u32]) -> Option<([Value; 8], usize)> {
+        if ups.len() > 8 || !kernel_upvals_enabled() && !ups.is_empty() {
+            return None;
+        }
+        let mut out = [Value::UNDEFINED; 8];
+        for (slot, &cell) in out.iter_mut().zip(ups) {
+            let v = self.heap.cell_get(cell);
+            if v.is_uninitialized() {
+                return None;
+            }
+            *slot = v;
+        }
+        Some((out, ups.len()))
+    }
+
     /// Recognise one exact, capture-free arrow callback.  Requiring both the
     /// immutable proto metadata and the live callable's empty upvalue vector
     /// keeps this fail-closed for defaults/rest/arguments/eval, generators,
@@ -570,14 +600,15 @@ impl<'p> Vm<'p> {
             && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                if ups.is_empty() {
+                if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                     let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: program functions are immutable during execution;
                     // the raw ptr dodges the self.jit (&mut) vs self.program (&)
                     // borrow conflict (same pattern as native_cb_entry).
                     let proto_ref = unsafe { &*proto };
-                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
-                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    // The callback's registers, then its captured values.
+                    let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                    let reg_count = upv_base + n_up;
                     // A callback that declares the 3rd (array) param or uses
                     // `arguments` must see the receiver — not the kernel's path.
                     let kernel_entry =
@@ -590,6 +621,9 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            for (k, &v) in upv[..n_up].iter().enumerate() {
+                                self.regs[win + upv_base + k] = v;
+                            }
                             let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
@@ -628,12 +662,13 @@ impl<'p> Vm<'p> {
             && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                if ups.is_empty() {
+                if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                     let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: as the map branch above.
                     let proto_ref = unsafe { &*proto };
-                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
-                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    // The callback's registers, then its captured values.
+                    let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                    let reg_count = upv_base + n_up;
                     // Skip the kernel when the predicate could observe the 3rd
                     // (array) param or `arguments` (see the map branch).
                     let kernel_entry =
@@ -646,6 +681,9 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            for (k, &v) in upv[..n_up].iter().enumerate() {
+                                self.regs[win + upv_base + k] = v;
+                            }
                             let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
@@ -3591,12 +3629,14 @@ impl<'p> Vm<'p> {
                     && start < snapshot_len
                 {
                     if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                        if ups.is_empty() {
+                        if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                             // SAFETY: immutable program functions; raw ptr dodges
                             // the jit-vs-program borrow conflict (as elsewhere).
                             let proto_ref = unsafe { &*proto };
-                            let reg_count = (proto_ref.reg_count as usize).max(3);
+                            // The callback's registers, then its captured values.
+                            let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                            let reg_count = upv_base + n_up;
                             // The reduce kernel passes only (acc, element); a
                             // callback that declares the 3rd (index) / 4th (array)
                             // param or uses `arguments` must take the per-element
@@ -3612,6 +3652,9 @@ impl<'p> Vm<'p> {
                                 let win = self.regs.len();
                                 if !self.regs_would_overflow(win + reg_count) {
                                     self.regs.resize(win + reg_count, Value::UNDEFINED);
+                                    for (k, &v) in upv[..n_up].iter().enumerate() {
+                                        self.regs[win + upv_base + k] = v;
+                                    }
                                     let count = snapshot_len - start;
                                     let window_ptr =
                                         unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
