@@ -837,6 +837,7 @@ impl<'p> Vm<'p> {
     /// constructors are recognised as constructors (`is_ctor`) so they serve as a
     /// foreign `newTarget` for `Reflect.construct`/`super` (the dominant
     /// cross-realm test shape); they are not yet independently functional.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn create_realm(&mut self) -> Value {
         let ne = PropAttr {
             writable: false,
@@ -1873,6 +1874,7 @@ impl<'p> Vm<'p> {
     /// so `OSymbol.for !== Symbol.for` while the shared registry still works),
     /// realm-TAGGED so GetFunctionRealm and error-identity adoption see the
     /// child; everything else (well-known symbol values, data) is shared by value.
+    #[cfg(not(target_arch = "wasm32"))]
     fn realm_copy_value(&mut self, v: Value, r: u32) -> Value {
         if v.is_heap() {
             if let HeapObj::Native(id) = self.heap.get(v.heap_index()) {
@@ -5228,6 +5230,9 @@ impl<'p> Vm<'p> {
                 self.pending_throw = Some(reason);
                 return Err(Thrown(self.throw_message(reason)));
             }
+            // Not in a WASM module: its VMs come only from the embedding API,
+            // which never installs `$262` (embed.rs `from_program`).
+            #[cfg(not(target_arch = "wasm32"))]
             DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
