@@ -35,9 +35,12 @@ compile_error!("ZIPP Lite omits Python; build the python variant separately");
 
 /// Rust's bare WASM target has no process environment. Lite resolves native
 /// benchmark switches to their existing absent-variable defaults, removing
-/// cached checks and unreachable alternatives. Keep the full build's code
-/// layout: specializing its switches did not consistently preserve throughput.
-/// Native and WASI targets retain the original environment-controlled paths.
+/// cached checks and unreachable alternatives. (An earlier full-build attempt
+/// did not consistently preserve throughput; since `env_var_os` and
+/// `EnvSwitchCell` fold every switch in both modules anyway, which measured
+/// neutral on the steady WASM harness, 2026-11-07 geomean 1.001 / 0.987,
+/// this is now a shortcut, not a difference.) Native and WASI targets retain
+/// the original environment-controlled paths.
 pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
     target_arch = "wasm32",
     target_os = "unknown",
