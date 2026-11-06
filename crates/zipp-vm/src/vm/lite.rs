@@ -352,9 +352,13 @@ const LEAF_BAIL_LIMIT: u8 = 32;
 /// `arguments` only for its length (`args_count_only`): its register holds
 /// the count, as a frame's setup writes it. A captured variable's write
 /// (`UpvalSet`) is the one effect a leaf may have, and so it must be its
-/// last chance to decline: only in a body without jumps, and followed by
-/// nothing that can decline (constants, moves, a read of a cell it wrote,
-/// the return).
+/// last chance to decline: every instruction after it is one that cannot
+/// decline (constants, moves, a read of a cell it wrote, an unconditional
+/// forward jump, the return). Branches before it may jump over it (`if (v
+/// === k) n++`): every jump is forward, so a path that skips the write has
+/// committed nothing, and what it reaches past the write cannot decline
+/// either. A conditional branch after it can (a heap condition), so none
+/// may follow it.
 fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
     if p.is_generator
         || p.is_async
@@ -365,10 +369,6 @@ fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
     {
         return LEAF_NO;
     }
-    let has_jumps = p
-        .code
-        .iter()
-        .any(|i| matches!(i, Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }));
     // The cells written so far, once a write has committed.
     let mut written: Option<Vec<u16>> = None;
     let mut reads_this = false;
@@ -385,6 +385,7 @@ fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
                 | Instr::ReturnUndefined => true,
                 Instr::LoadConst { idx, .. } => p.constants.get(idx as usize).is_some_and(|c| c.is_number()),
                 Instr::UpvalGet { idx, .. } => w.contains(&idx),
+                Instr::Jump { target } => target as usize > ip && (target as usize) < p.code.len(),
                 _ => false,
             };
             if !ok {
@@ -396,9 +397,6 @@ fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
             continue;
         }
         if let Instr::UpvalSet { idx, src } = *i {
-            if has_jumps {
-                return LEAF_NO;
-            }
             reads_this |= src == 0;
             written = Some(vec![idx]);
             continue;
@@ -1482,11 +1480,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::JumpIfFalse { cond, target } if FULL => {
                     let v = self.get(base, cond);
-                    let t = if v.is_bool() {
-                        v.bits() == Value::TRUE.bits()
-                    } else {
-                        self.truthy(v)
-                    };
+                    let t = self.jump_condition(v);
                     if !t {
                         // A taken backward branch closes a loop (`do … while`).
                         if (target as usize) < ip {
@@ -1499,11 +1493,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::JumpIfTrue { cond, target } if FULL => {
                     let v = self.get(base, cond);
-                    let t = if v.is_bool() {
-                        v.bits() == Value::TRUE.bits()
-                    } else {
-                        self.truthy(v)
-                    };
+                    let t = self.jump_condition(v);
                     if t {
                         if (target as usize) < ip {
                             self.maybe_gc();
