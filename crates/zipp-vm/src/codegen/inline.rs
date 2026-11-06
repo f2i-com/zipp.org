@@ -202,6 +202,7 @@ pub(crate) fn captured_builtin_lane(
     let op = crate::vm::captured_op::from_name(key, argc)?;
     use crate::vm::captured_op as cop;
     let on = match op {
+        _ if op & 0xFF == cop::DV => super::proto_mem::tierc_dv_lane_enabled(),
         cop::SET | cop::ADD | cop::DELETE => super::proto_mem::tierc_coll_mutate_enabled(),
         cop::SUBSTRING | cop::SLICE => argc == 2 || substring1_intrinsic_enabled(),
         cop::CALL => super::region_mem::has_own_call_intrinsic_enabled(),

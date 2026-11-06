@@ -10273,7 +10273,7 @@ fn emit_recv_cached_set(
 
 /// Whether `ZIPP_PERF_MAP=ops` (Linux) or `ZIPP_PROF_PC_CODE` (the sampler's
 /// code dump) asks for per-op offsets (`write_op_offsets`).
-fn perf_map_ops() -> bool {
+pub(crate) fn perf_map_ops() -> bool {
     (cfg!(target_os = "linux") && crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops"))
         || crate::env_var_os("ZIPP_PROF_PC_CODE").is_some()
 }
@@ -10281,7 +10281,7 @@ fn perf_map_ops() -> bool {
 /// Append `func_id body_start ip offset op` lines for one Tier C body to
 /// `/tmp/zipp-ops-<pid>.txt`, or to `ops.txt` in `ZIPP_PROF_PC_CODE`'s
 /// directory.
-fn write_op_offsets(func_id: u32, start: u64, code: &[Instr], offsets: &[(usize, usize)]) {
+pub(crate) fn write_op_offsets(func_id: u32, start: u64, code: &[Instr], offsets: &[(usize, usize)]) {
     use std::io::Write;
     let path = match crate::env_var_os("ZIPP_PROF_PC_CODE") {
         Some(dir) => std::path::PathBuf::from(dir).join("ops.txt"),

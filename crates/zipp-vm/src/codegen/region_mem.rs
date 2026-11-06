@@ -5565,8 +5565,20 @@ pub(crate) fn compile_region_mem(
         ; ret
     );
 
+    // Where each op's code begins (`ZIPP_PERF_MAP=ops`, `ZIPP_PROF_PC_CODE`),
+    // as Tier C writes it.
+    let op_offsets: Vec<(usize, usize)> = if super::proto_mem::perf_map_ops() {
+        (s..=e)
+            .filter_map(|ip| ops.labels().resolve_dynamic(in_region[ip - s]).ok().map(|o| (ip, o.0)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    if !op_offsets.is_empty() {
+        super::proto_mem::write_op_offsets(heap.func_id, entry_ptr as u64, &proto.code, &op_offsets);
+    }
     Some(JitFn {
         _buf: buf,
         entry: entry_ptr,

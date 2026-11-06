@@ -224,6 +224,18 @@ fn dataview_big_bits_index(slot: usize) -> usize {
 }
 
 impl<'p> Vm<'p> {
+    /// The boot accessor's bits for the `DV_PROTO_METHODS` entry `slot` (as
+    /// `dataview_proto_slot` numbers them), once the boot recorded them.
+    pub(crate) fn dataview_intrinsic_bits(&self, slot: usize) -> Option<u64> {
+        let bits = match slot {
+            0..=7 => self.dataview_numeric_getter_bits[slot],
+            10..=17 => self.dataview_numeric_setter_bits[slot - 10],
+            8 | 9 | 18 | 19 => self.dataview_bigint_bits[dataview_big_bits_index(slot)],
+            _ => return None,
+        };
+        (bits != Value::UNDEFINED.bits()).then_some(bits)
+    }
+
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
             .then(|| v.heap_index())
@@ -704,6 +716,19 @@ impl<'p> Vm<'p> {
         let Some((method, _)) = dataview_get_kind(name) else {
             return Ok(None);
         };
+        self.dataview_interp_get_slot(view_idx, method, position, little_endian)
+    }
+
+    /// [`Self::dataview_interp_get_fast`] for the getter at `DV_PROTO_METHODS`
+    /// entry `method` (0 to 7), named by its entry rather than its name.
+    #[inline(always)]
+    pub(crate) fn dataview_interp_get_slot(
+        &self,
+        view_idx: u32,
+        method: usize,
+        position: Value,
+        little_endian: Value,
+    ) -> Result<Option<Value>, Thrown> {
         let pristine_version = match self.heap.get(view_idx) {
             HeapObj::DataView {
                 pristine_version, ..
@@ -807,9 +832,27 @@ impl<'p> Vm<'p> {
         value: Value,
         little_endian: Value,
     ) -> Result<Option<()>, Thrown> {
-        let Some((slot, kind)) = dataview_set_kind(name) else {
-            return Ok(None);
-        };
+        match dataview_proto_slot(name) {
+            Some(slot @ 10..=17) => self.dataview_interp_set_slot(view_idx, slot, position, value, little_endian),
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::dataview_interp_set_fast`] for the setter at `DV_PROTO_METHODS`
+    /// entry `slot` (10 to 17), named by its entry rather than its name.
+    #[inline(always)]
+    pub(crate) fn dataview_interp_set_slot(
+        &mut self,
+        view_idx: u32,
+        slot: usize,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        // The setters' kinds are the getters' (`setInt8` is entry 10 to
+        // `getInt8`'s 0).
+        let kind = DV_GET_KINDS[slot - 10];
+        let name = native::DV_PROTO_METHODS[slot];
         let pristine_version = match self.heap.get(view_idx) {
             HeapObj::DataView {
                 pristine_version, ..
@@ -1070,14 +1113,33 @@ impl<'p> Vm<'p> {
                 "RangeError: Offset is outside the bounds of the DataView",
             ));
         }
-        let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
-        if !self.truthy(little_endian) {
-            bytes[..size].reverse();
+        // An Int's low bits are its ToUintN; a double takes the modular path.
+        let bytes = if value.is_int() {
+            crate::vm::helpers_numeric::ta_encode_int(kind, value.as_int())
+        } else {
+            crate::vm::helpers_numeric::ta_encode(kind, value.as_f64())
+        };
+        // `le === 1` and an absent flag are primitives: no out-of-line call.
+        let little = match little_endian.truthy_primitive() {
+            Some(t) => t,
+            None => self.truthy(little_endian),
+        };
+        // The element's bytes as one little-endian word, swapped within its
+        // width for a big-endian write, then stored at that fixed width: the
+        // variable-length copy was a `memcpy` call per write.
+        let mut word = u64::from_le_bytes(bytes);
+        if !little {
+            word = word.swap_bytes() >> (64 - 8 * size as u32);
         }
         let abs = byte_offset + pos;
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
-            if abs + size <= data.len() {
-                data[abs..abs + size].copy_from_slice(&bytes[..size]);
+            if let Some(dst) = data.get_mut(abs..abs + size) {
+                match size {
+                    1 => dst[0] = word as u8,
+                    2 => dst.copy_from_slice(&(word as u16).to_le_bytes()),
+                    4 => dst.copy_from_slice(&(word as u32).to_le_bytes()),
+                    _ => dst.copy_from_slice(&word.to_le_bytes()),
+                }
             }
         }
         Ok(Some(()))

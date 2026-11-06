@@ -967,11 +967,17 @@ pub(crate) mod captured_op {
     /// carries the String slot in bits 16-23 and the Array slot in 24-31
     /// (0xff for a kind the name is not served for).
     pub(crate) const LANE: u32 = 9;
+    /// A DataView accessor of `jit_dv_method_call`'s lanes: the selector
+    /// carries its `DV_PROTO_METHODS` entry in bits 16-23.
+    pub(crate) const DV: u32 = 10;
 
     /// The selector for a `recv.name(args)` site of this arity, if any. (A
     /// zero-argument call such as `m.clear()` is always fused: it has no
     /// argument to order against the callee Get.)
     pub(crate) fn from_name(name: &str, argc: u16) -> Option<u32> {
+        if let Some(slot) = crate::vm::typedarray::dataview_proto_slot(name).filter(|_| (1..=3).contains(&argc)) {
+            return Some(DV | ((slot as u32) << 16));
+        }
         Some(match (name, argc) {
             ("get", 1) => GET,
             ("has", 1) => HAS,
@@ -1049,6 +1055,8 @@ pub(crate) extern "win64" fn jit_captured_method(
         HasOwnCall,
         /// `jit_str_method`'s String (`false`) or Array (`true`) half, by slot.
         Builtin(bool, u8),
+        /// A DataView accessor, by its `DV_PROTO_METHODS` entry.
+        DataView(u32),
     }
     let lane = {
         // SAFETY: generated code passes its exclusive live VM pointer.
@@ -1171,6 +1179,19 @@ pub(crate) extern "win64" fn jit_captured_method(
                 }
                 Lane::HasOwnCall
             }
+            // `dv.setUint32(pos, v, le)` with its callee captured ahead of the
+            // arguments: the captured value must be the boot accessor of that
+            // entry, after which the accessor lane (which proves the view
+            // pristine and declines before any observable action) is the call.
+            captured_op::DV => {
+                let slot = (packed >> 16) & 0xFF;
+                if !matches!(vm.heap.get(idx), HeapObj::DataView { .. })
+                    || vm.dataview_intrinsic_bits(slot as usize) != Some(callee_bits)
+                {
+                    return SELF_CALL_DEOPT;
+                }
+                Lane::DataView(slot)
+            }
             _ => return SELF_CALL_DEOPT,
         }
     };
@@ -1194,6 +1215,7 @@ pub(crate) extern "win64" fn jit_captured_method(
         Lane::IndexOf => jit_str_index_of(vm, recv_bits, arg(0)),
         Lane::Substring(mode) => jit_str_substring(vm, recv_bits, args as u64, mode),
         Lane::HasOwnCall => jit_has_own_call(vm, recv_bits, arg(0), arg(1)),
+        Lane::DataView(slot) => jit_dv_method_call(vm, recv_bits, args, slot | ((argc as u32) << 8)),
         Lane::Builtin(is_arr, memo) => {
             if argc > 4 {
                 return SELF_CALL_DEOPT;
@@ -6253,9 +6275,6 @@ pub(crate) extern "win64" fn jit_dv_method_call(
         return decline;
     }
     let argc = (packed >> 8) as usize;
-    let Some(&name) = crate::vm::native::DV_PROTO_METHODS.get((packed & 0xff) as usize) else {
-        return decline;
-    };
     // SAFETY: generated code passes the call's argument window, `argc` long.
     let arg = |i: usize| {
         if i < argc {
@@ -6265,13 +6284,19 @@ pub(crate) extern "win64" fn jit_dv_method_call(
         }
     };
     let view = recv.heap_index();
-    let big = name.len() > 6 && name.as_bytes()[3..6] == *b"Big";
-    let done = if big {
-        vm.dataview_interp_big_fast(view, name, arg(0), arg(1), arg(2))
-    } else if name.starts_with('g') {
-        vm.dataview_interp_get_fast(view, name, arg(0), arg(1))
-    } else {
-        vm.dataview_interp_set_fast(view, name, arg(0), arg(1), arg(2)).map(|o| o.map(|()| Value::UNDEFINED))
+    // By the entry: 0-7 the numeric getters, 10-17 the setters, the rest
+    // the BigInt accessors (whose lane still takes the name).
+    let slot = (packed & 0xff) as usize;
+    let done = match slot {
+        0..=7 => vm.dataview_interp_get_slot(view, slot, arg(0), arg(1)),
+        10..=17 => vm
+            .dataview_interp_set_slot(view, slot, arg(0), arg(1), arg(2))
+            .map(|o| o.map(|()| Value::UNDEFINED)),
+        8 | 9 | 18 | 19 => {
+            let name = crate::vm::native::DV_PROTO_METHODS[slot];
+            vm.dataview_interp_big_fast(view, name, arg(0), arg(1), arg(2))
+        }
+        _ => return decline,
     };
     match done {
         Ok(Some(v)) => v.bits(),
