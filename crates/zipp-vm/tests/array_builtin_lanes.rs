@@ -7,9 +7,11 @@
 //! length, named properties, a non-enumerable index, frozen, a match
 //! result, `arguments`, a long array, a getter index) and `for-in`; `in` on
 //! dense and holey arrays with negative, double, accessor and prototype
-//! keys; and an array only ever written by index holding young objects
-//! across collections. In the interpreter, by default and with every
-//! function compiled at once.
+//! keys; an array only ever written by index holding young objects across
+//! collections; `join` over primitives, holes and objects, `fill` with
+//! coercing positions, `slice` edge positions and holes, and `concat` with
+//! an `@@isConcatSpreadable` flag on an array and on the prototype. In the
+//! interpreter, by default and with every function compiled at once.
 
 const SOURCE: &str = r##""use strict";
 // Array builtins and `in` on their compiled lanes, hot enough to compile.
@@ -80,10 +82,40 @@ function put(i) { ring[i & 511] = { v: i, w: [i, -i] }; }
 for (let i = 0; i < 200000; i++) put(i);
 let rs = 0; for (let i = 0; i < 512; i++) rs = (rs + ring[i].v * 3 + ring[i].w[0] + ring[i].w[1] * 2) | 0;
 out.push("W " + rs);
+// 9. join over primitives, holes, -0, BigInt, separators; objects with toString, a Symbol; fill and concat
+let ts = 0; const tobj = { toString() { ts++; return "T"; } };
+const sym = Symbol("s");
+out.push("J " + hot(3000, (i) => {
+  const a = [1, -0, "x", null, undefined, true, 2.5, 3n, , i];
+  const r = a.join() + a.join("-") + a.join("") + [tobj, 1].join("+") + [[1, 2], [3]].join(";");
+  let e = 0; try { [1, sym].join(); } catch (err) { e = err instanceof TypeError ? 1 : 2; }
+  return r.length * 3 + e + r.charCodeAt(i % r.length);
+}) + " " + ts);
+let fv = 0; const fvo = { valueOf() { fv++; return 2; } };
+out.push("FL " + hot(3000, (i) => {
+  const f = new Array(8).fill(i); f.fill(-1, 2, 4); f.fill(7, -2); f.fill(9, fvo, 3); const g = [1, , 3].fill(0, 1, 2);
+  let fe = 0; try { Object.freeze([1, 2]).fill(0); } catch (err) { fe = err instanceof TypeError ? 1 : 2; }
+  return f.join("").length * 11 + f[3] + f[7] + f[2] + (1 in g ? 100 : 0) + fe;
+}) + " " + fv);
+const s10 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+out.push("SL " + hot(3000, (i) => {
+  const parts = [s10.slice(), s10.slice(3), s10.slice(-3), s10.slice(2, -2), s10.slice(-0, 4), s10.slice(NaN, 5), s10.slice(1, Infinity),
+    s10.slice(-Infinity, 2), s10.slice(undefined, undefined), s10.slice(8, 2), s10.slice(2.9, 6.1), s10.slice(i % 12, (i * 7) % 13)];
+  let t = 0; for (const p of parts) t = (t * 7 + p.length * 13 + (p.length ? p[0] + p[p.length - 1] : 0)) | 0;
+  return t;
+}));
+const sv = []; sv.length = 5; sv[1] = 1; sv[3] = 3; Object.defineProperty(sv, "x", { value: 1 });
+out.push("SL2 " + JSON.stringify([sv.slice(0, 4), [, 1, 2].slice(0, 2), Object.keys([, 1, 2].slice(0, 2))]));
+const cs = []; cs[Symbol.isConcatSpreadable] = false;
+out.push("CC " + hot(3000, (i) => [1, 2].concat([3], i, [[4]], cs).length) + " " + [1].concat(cs).length);
+Array.prototype[Symbol.isConcatSpreadable] = false;
+out.push("CC2 " + [1, 2].concat([3, 4]).length);
+delete Array.prototype[Symbol.isConcatSpreadable];
+out.push("CC3 " + [1, 2].concat([3, 4]).length);
 console.log(out.join("\n"));
 "##;
 
-const EXPECTED: &str = "Q -880234464\nH -1766349952\nP -59063680\nC 1411967872 6000\nS -59063680\nF 1411967872\nN 1411967872 1,2,3\nO -826891520\nR 481408768 1500\nI 1272956672\nD 2 1 0 0 -1 -1\nL -1782056950\nK -1339365184\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\nK3 4 6 2999 string true\nK4 [42,2,3] [\"3\"]\nK5 0,1,3\nIN 1263937024\nIN2 1293840512\nW 204537344";
+const EXPECTED: &str = "Q -880234464\\nH -1766349952\\nP -59063680\\nC 1411967872 6000\\nS -59063680\\nF 1411967872\\nN 1411967872 1,2,3\\nO -826891520\\nR 481408768 1500\\nI 1272956672\\nD 2 1 0 0 -1 -1\\nL -1782056950\\nK -1339365184\\nK2 [[\"0\",\"1\",\"3\"],[1,2,4],[\"0\",\"1\",\"2\",\"x\"],[\"0\",\"2\"],[\"0\",\"1\",\"2\",\"index\",\"input\",\"groups\"]]\\nK3 4 6 2999 string true\\nK4 [42,2,3] [\"3\"]\\nK5 0,1,3\\nIN 1263937024\\nIN2 1293840512\\nW 204537344\\nJ -116382733 3000\\nFL -139834880 3000\\nSL 1233663033\\nSL2 [[null,1,null,3],[null,1],[\"1\"]]\\nCC -118127360 2\\nCC2 2\\nCC3 4";
 
 #[test]
 fn array_builtin_lanes_worker() {

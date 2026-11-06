@@ -595,6 +595,46 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
     }
 
+    /// `slice(start, end)` of the plain dense array `idx`, its positions
+    /// Numbers or `undefined`, when its range is hole-free: the dense arm's
+    /// copy, past `array_method`'s gates and its second species proof. The
+    /// caller (`arr_lane_call`) has proved what the gates would: no side
+    /// table, the default species, no indexed or replaced prototype, the
+    /// intrinsic method. `None`, having done nothing, for a virtual length or
+    /// a hole in the range (read through the prototype by the dense arm).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn array_slice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
+        if self.array_is_virtual(idx) {
+            return None;
+        }
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        let len = items.len() as f64;
+        // ToIntegerOrInfinity of a Number (or the default for `undefined`),
+        // then the relative clamp, in f64 so ±Infinity saturate.
+        let pos = |v: Option<&Value>, dflt: f64| match v {
+            Some(v) if *v != Value::UNDEFINED => {
+                let f = v.as_f64();
+                let t = if f.is_nan() { 0.0 } else { f.trunc() };
+                if t < 0.0 {
+                    (len + t).max(0.0)
+                } else {
+                    t.min(len)
+                }
+            }
+            _ => dflt,
+        };
+        let start = pos(args.first(), 0.0) as usize;
+        let end = pos(args.get(1), len) as usize;
+        let range: &[Value] = if start < end { &items[start..end] } else { &[] };
+        if Value::any_hole(range) {
+            return None;
+        }
+        let out = range.to_vec();
+        Some(self.alloc_array_current_realm(out))
+    }
+
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
@@ -3160,10 +3200,29 @@ impl<'p> Vm<'p> {
                     // lossy `String` form turned every lone surrogate into
                     // U+FFFD, which is the everyday corruption behind
                     // `split('').reverse().join('')` on emoji text.
-                    let sep = if name == "toString" || arg0 == Value::UNDEFINED {
-                        crate::heap::JsStr::new(",".to_string())
-                    } else {
-                        vm.to_js_str_owned(arg0)?
+                    // A short flat separator (and the default ",") is copied
+                    // to the stack: an owned copy per call was a malloc and a
+                    // free on every `join`.
+                    let mut sep_inline = [0u8; 32];
+                    let mut sep_inline_len = None;
+                    if name == "toString" || arg0 == Value::UNDEFINED {
+                        sep_inline[0] = b',';
+                        sep_inline_len = Some(1);
+                    } else if arg0.is_heap() {
+                        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
+                            if b.len() <= sep_inline.len() {
+                                sep_inline[..b.len()].copy_from_slice(b);
+                                sep_inline_len = Some(b.len());
+                            }
+                        }
+                    }
+                    let sep_owned = match sep_inline_len {
+                        Some(_) => None,
+                        None => Some(vm.to_js_str_owned(arg0)?),
+                    };
+                    let sep: &[u8] = match (&sep_owned, sep_inline_len) {
+                        (Some(s), _) => s.as_bytes(),
+                        (None, n) => &sep_inline[..n.unwrap_or(0)],
                     };
                     // Get(O,k) and ToString(element) interleave. The active-path
                     // guard is shared across nested ToString calls. Built as
@@ -3178,7 +3237,7 @@ impl<'p> Vm<'p> {
                         };
                         let v = v.unwrap_or(Value::UNDEFINED);
                         if k != 0 {
-                            vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                            vm.append_guest_wtf8(&mut out, sep)?;
                         }
                         if !v.is_nullish() {
                             vm.append_guest_tostring(&mut out, v)?;

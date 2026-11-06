@@ -3833,7 +3833,7 @@ pub(crate) extern "win64" fn jit_array_pop(vm: *mut core::ffi::c_void, arr_bits:
 
 env_off_switch! {
     /// `ZIPP_NO_ARR_MUTATE_LANE=1`: compiled `shift`/`unshift`/`splice`/
-    /// `reverse` calls take the general method route again, for an A/B.
+    /// `reverse`/`fill` calls take the general method route again, for an A/B.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn arr_mutate_lane_enabled() = "ZIPP_NO_ARR_MUTATE_LANE"
 }
@@ -3850,12 +3850,13 @@ pub(crate) fn arr_mutate_op(key: &str, argc: u16) -> Option<u8> {
         ("unshift", 1..=8) => 1,
         ("splice", 1..=8) => 2,
         ("reverse", 0) => 3,
+        ("fill", 1..=3) => 4,
         _ => return None,
     })
 }
 
 /// Win64 helper for a compiled `arr.shift()`, `arr.unshift(…)`,
-/// `arr.splice(…)` or `arr.reverse()`: the operation (bits 0-7 of `packed`,
+/// `arr.splice(…)`, `arr.reverse()` or `arr.fill(…)`: the operation (bits 0-7 of `packed`,
 /// [`arr_mutate_op`]) with `argc` arguments (bits 8-15) read from `args`, run
 /// by `array_method` directly, past the builtin call chain
 /// (`jit_method_builtin_fallback`, `try_builtin_method`,
@@ -3865,9 +3866,10 @@ pub(crate) fn arr_mutate_op(key: &str, argc: u16) -> Option<u8> {
 /// declines (not a plain Array, the method shadowed or replaced, any side
 /// table, a virtual or non-writable length, an indexed or replaced
 /// prototype), an arguments object or a second realm, a hole in the first
-/// slot for `shift` (its Get reads through the prototype), and for `splice`
-/// a start or count that is not a Number or `undefined` (ToIntegerOrInfinity
-/// would run `valueOf`) or a non-default species. With those excluded the
+/// slot for `shift` (its Get reads through the prototype), for `splice` a
+/// start or count that is not a Number or `undefined` (ToIntegerOrInfinity
+/// would run `valueOf`) or a non-default species, and for `fill` such a start
+/// or end. With those excluded the
 /// arm cannot throw, so an error is a decline before any effect too.
 ///
 /// # Safety
@@ -3898,6 +3900,7 @@ pub(crate) extern "win64" fn jit_array_mutate(
         1 => "unshift",
         2 => "splice",
         3 => "reverse",
+        4 => "fill",
         _ => return DEOPT,
     };
     // SAFETY: exclusive view; the array's Vec is not cached across the call.
@@ -3926,6 +3929,10 @@ pub(crate) extern "win64" fn jit_array_mutate(
         && (!args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
             || !vm.array_species_is_default(arr))
     {
+        return DEOPT;
+    }
+    // `fill(value, start, end)`: the positions' ToIntegerOrInfinity.
+    if op == 4 && !args.iter().skip(1).all(|a| a.is_number() || *a == Value::UNDEFINED) {
         return DEOPT;
     }
     match vm.array_method(idx, name, args) {
@@ -4346,6 +4353,7 @@ pub(crate) fn arr_lane_memo(key: &str, argc: u16) -> Option<u8> {
         ("slice", 0..=2) => 5,
         ("concat", _) => 7,
         ("at", 1) => 27,
+        ("join", 0 | 1) => 2,
         _ => return None,
     })
 }
@@ -4354,6 +4362,7 @@ pub(crate) fn arr_lane_memo(key: &str, argc: u16) -> Option<u8> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn arr_lane_name(memo: u8) -> Option<&'static str> {
     Some(match memo {
+        2 => "join",
         3 => "indexOf",
         4 => "includes",
         5 => "slice",
@@ -4514,6 +4523,17 @@ fn arr_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 
         "indexOf" | "includes" | "lastIndexOf" => args.iter().skip(1).all(numeric),
         "at" => args.iter().all(numeric),
         "slice" => args.iter().all(numeric) && vm.array_species_is_default(recv),
+        // A separator ToString'd without code, and elements whose ToString
+        // runs none: primitives only (a hole reads `undefined` here, as no
+        // prototype holds an index). A Symbol element throws, having done
+        // nothing, and the route then throws it.
+        "join" => {
+            args.iter().all(|a| *a == Value::UNDEFINED || (a.is_heap() && vm.heap.is_str_like(a.heap_index())))
+                && match vm.heap.get(idx) {
+                    HeapObj::Array(items) => items.iter().all(|v| !vm.is_object_value(*v)),
+                    _ => false,
+                }
+        }
         _ => {
             vm.array_species_is_default(recv)
                 && args.iter().all(|a| {
@@ -4523,6 +4543,11 @@ fn arr_lane_call(vm: &mut Vm<'_>, recv: Value, memo: u8, args: &[Value]) -> u64 
     };
     if !ok || !vm.array_memo_is_intrinsic(memo as usize, name) {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if name == "slice" {
+        if let Some(v) = vm.array_slice_dense(idx, args) {
+            return v.bits();
+        }
     }
     match vm.array_method(idx, name, args) {
         Ok(Some(v)) => v.bits(),

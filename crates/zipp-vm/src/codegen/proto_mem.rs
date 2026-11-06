@@ -7450,8 +7450,8 @@ pub(crate) fn compile_proto_mem(
                         );
                         done
                     });
-                    // `arr.shift()`, `unshift(…)`, `splice(…)` and `reverse()`
-                    // on a plain dense Array: `jit_array_mutate`, which runs the
+                    // `arr.shift()`, `unshift(…)`, `splice(…)`, `reverse()` and
+                    // `fill(…)` on a plain dense Array: `jit_array_mutate`, which runs the
                     // dense arm past the builtin call chain or declines, having
                     // done nothing, as `pop` above. Metered bodies keep the
                     // route below (interpreter-parity charging).

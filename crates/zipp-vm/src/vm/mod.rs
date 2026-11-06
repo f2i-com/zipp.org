@@ -3349,6 +3349,10 @@ pub struct Vm<'p> {
     /// `u32::MAX` is empty. A version guards a slot's position, never its
     /// value: the values are re-read on every hit.
     species_memo: core::cell::Cell<(u32, u32, u32, u32, u64)>,
+    /// The versions of %Array.prototype% and %Object.prototype% at which
+    /// neither held `@@isConcatSpreadable` (`array_spreadable_by_default`);
+    /// `u32::MAX` is not proved.
+    spreadable_memo: core::cell::Cell<(u32, u32)>,
     /// The shape two data appends of `value` and `done` reach, the layout of
     /// an iterator result object, made at the first result (`Vm::iter_result`).
     iter_result_shape: Option<u32>,

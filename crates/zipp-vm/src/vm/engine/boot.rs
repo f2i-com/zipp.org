@@ -675,6 +675,7 @@ impl<'p> Vm<'p> {
             finalize_shapes: rustc_hash::FxHashMap::default(),
             finalize_memo: [(u32::MAX, u16::MAX, 0); crate::vm::natives::FINALIZE_MEMO_SLOTS],
             species_memo: core::cell::Cell::new((u32::MAX, 0, u32::MAX, 0, 0)),
+            spreadable_memo: core::cell::Cell::new((u32::MAX, u32::MAX)),
             iter_result_shape: None,
             step_tokens: vec![(u32::MAX, 0, 0); crate::vm::STEP_TOKEN_SLOTS].into_boxed_slice(),
             from_async_fn: None,

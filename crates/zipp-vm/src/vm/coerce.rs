@@ -1116,11 +1116,22 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
+        // Whether a prototype holds the flag changes only with a key added or
+        // deleted, which bumps its version: proved once per pair of versions
+        // (`spreadable_memo`), not hashed into both maps per argument.
+        let vers = (self.heap.version_of(self.arr_proto), self.heap.version_of(self.obj_proto));
+        if self.spreadable_memo.get() == vers {
+            return true;
+        }
         let holds_flag = |o: u32| match self.heap.get(o) {
             HeapObj::Object(m) => m.pos("@@isConcatSpreadable").is_some(),
             _ => true,
         };
-        !holds_flag(self.arr_proto) && !holds_flag(self.obj_proto)
+        let clear = !holds_flag(self.arr_proto) && !holds_flag(self.obj_proto);
+        if clear {
+            self.spreadable_memo.set(vers);
+        }
+        clear
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors

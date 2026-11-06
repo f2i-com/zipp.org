@@ -1342,7 +1342,24 @@ impl super::Vm<'_> {
     /// the stride made a builder's walks quadratic in its parts: a
     /// 150,000-part join of 22 MB preflighted about 1.7 TB and walked the
     /// heap at each window of it, 1.76 s against 18 ms without a ceiling.
+    ///
+    /// The run with no recorder answers inline: every part a join, a
+    /// builder or a replacement appends asks, and the call was 2% of a
+    /// small `join`.
+    #[inline(always)]
     pub(crate) fn instrument_preflight_builder_growth(
+        &mut self,
+        in_flight: usize,
+        fresh: usize,
+    ) -> Tick {
+        if self.instr_rec.is_none() {
+            return Ok(());
+        }
+        self.instrument_preflight_builder_growth_recorded(in_flight, fresh)
+    }
+
+    #[inline(never)]
+    fn instrument_preflight_builder_growth_recorded(
         &mut self,
         in_flight: usize,
         fresh: usize,

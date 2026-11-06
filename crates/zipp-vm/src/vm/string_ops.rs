@@ -474,6 +474,13 @@ impl<'p> Vm<'p> {
             let sv = self.to_str_value(v)?;
             return self.append_guest_heap_str(out, sv.heap_index());
         }
+        // An Int's digits from a stack buffer: `to_js_string` built a
+        // `String` for each, a malloc and a free per number a `join` printed.
+        if v.is_int() {
+            let mut buf = [0u8; 11];
+            let n = fmt_i32_into(v.as_int(), &mut buf);
+            return self.append_guest_wtf8(out, &buf[buf.len() - n..]);
+        }
         let s = self.to_js_string(v)?;
         self.append_guest_wtf8(out, s.as_bytes())
     }
@@ -2479,6 +2486,27 @@ impl<'p> Vm<'p> {
 
 fn invalid_string_length() -> Thrown {
     Thrown::from_static("RangeError: Invalid string length")
+}
+
+/// `i`'s decimal text (ToString of an Int), right-aligned in `buf`, and its
+/// length: `i32::MIN` takes all 11 bytes.
+#[inline]
+pub(crate) fn fmt_i32_into(i: i32, buf: &mut [u8; 11]) -> usize {
+    let mut u = (i as i64).unsigned_abs();
+    let mut p = buf.len();
+    loop {
+        p -= 1;
+        buf[p] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        p -= 1;
+        buf[p] = b'-';
+    }
+    buf.len() - p
 }
 
 /// A `split` receiver at most this long never takes the counting pass: its
