@@ -6972,6 +6972,16 @@ pub struct TextCodec {
     pub pending: [u8; 4],
 }
 
+/// A BigInt beyond i128 as [`HeapObj::BigIntBig`] holds it: in the slot
+/// natively (one allocation fewer per value), behind a `Box` in the
+/// meter-only (browser) builds, where the inline form grew the module.
+/// `NumBig::clone(b)` and `.into()` serve both.
+#[cfg(not(feature = "meter-only"))]
+pub type BigIntCell = num_bigint::BigInt;
+/// See the native definition.
+#[cfg(feature = "meter-only")]
+pub type BigIntCell = Box<num_bigint::BigInt>;
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -7200,7 +7210,7 @@ pub enum HeapObj {
     /// (vm/bigint.rs) demote on construction, so equality/ordering between the
     /// two variants never has to cross-compare (a `BigInt` and a `BigIntBig`
     /// are always unequal). Holds no heap references (GC trace is a no-op).
-    BigIntBig(num_bigint::BigInt),
+    BigIntBig(BigIntCell),
     /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
     /// property key dedupe correctly). `desc` is the description (a string Value or
     /// UNDEFINED). `prop_key` is the internal string under which the symbol is

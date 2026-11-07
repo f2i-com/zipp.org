@@ -325,7 +325,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_bigint_val(&mut self, v: BigVal) -> Value {
         match v {
             BigVal::Small(n) => self.make_bigint(n),
-            BigVal::Big(b) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(b))),
+            BigVal::Big(b) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(b.into()))),
         }
     }
 
@@ -344,7 +344,7 @@ impl<'p> Vm<'p> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
-                HeapObj::BigIntBig(b) => return Some(BigVal::Big(b.clone())),
+                HeapObj::BigIntBig(b) => return Some(BigVal::Big(NumBig::clone(b))),
                 _ => {}
             }
         }
@@ -419,7 +419,7 @@ impl<'p> Vm<'p> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::BigInt(n) => return Some(BigVal::Small(*n)),
-                HeapObj::BigIntBig(b) => return Some(BigVal::Big(b.clone())),
+                HeapObj::BigIntBig(b) => return Some(BigVal::Big(NumBig::clone(b))),
                 HeapObj::Boxed { kind: 4, value } => return self.bigint_val(*value),
                 _ => {}
             }

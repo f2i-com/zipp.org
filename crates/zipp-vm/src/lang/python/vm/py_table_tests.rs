@@ -41,7 +41,7 @@ impl Env {
         match i128::try_from(&n) {
             // Canonical, as `Vm::make_bigint` builds it: a small value is an immediate.
             Ok(v) => Value::small_bigint(v).unwrap_or_else(|| Value::heap(self.heap.alloc(HeapObj::BigInt(v)))),
-            Err(_) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(n))),
+            Err(_) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(n.into()))),
         }
     }
     fn str_units(&mut self, units: &[u16]) -> Value {
