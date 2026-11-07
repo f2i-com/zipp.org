@@ -353,6 +353,11 @@ pub(crate) fn plan_int_splice(
         if matches!(proto.code[c], Instr::New { .. }) != lp.new_lane.is_some() {
             decline!("@{c} a `new` without its lane");
         }
+        // An allocating leaf (`Vm::plan_alloc_leaf`) makes heap objects, which
+        // have no integer home; only the boxed leaf emitter serves it.
+        if !lp.inner_new.is_empty() || !lp.class_values.is_empty() {
+            decline!("@{c} an allocating leaf body");
+        }
         // A flattened region runs nothing else, so nothing else can touch a
         // captured cell while it does: the cell's value lives in a pool global
         // for the run, an integer home like any other.

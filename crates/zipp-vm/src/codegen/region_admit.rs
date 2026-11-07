@@ -1075,7 +1075,18 @@ env_off_switch! {
 ///   so an effect that already ran would double-apply. (For v1 the only effect
 ///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
 pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
-    leaf_ok_impl(callee, false).map(|(body, _)| body)
+    leaf_ok_impl(callee, false, false).map(|(body, _)| body)
+}
+
+/// [`callee_leaf_ok_for_call`] that also admits `LoadClassValue` and `New`
+/// (an ALLOCATING leaf, `return new Vec(…)`), for the planner that supplies
+/// each `New`'s lane (`Vm::plan_alloc_leaf`). Only the generic boxed leaf
+/// emitter implements those two ops; the integer splice declines such a plan.
+pub fn callee_leaf_ok_for_call_alloc(callee: &FuncProto, _argc: u16) -> Option<(Vec<Instr>, u64)> {
+    if !callee.simple_params || callee.args_count_only {
+        return None;
+    }
+    leaf_ok_impl(callee, false, true).map(|(body, _)| (body, 0))
 }
 
 /// Call-site specialization for ordinary default parameters. A non-simple
@@ -1162,7 +1173,7 @@ pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Ins
         }
         *target -= at as u32;
     }
-    leaf_ok_impl(&specialized, false).map(|(body, _)| (body, arg_mask))
+    leaf_ok_impl(&specialized, false, false).map(|(body, _)| (body, arg_mask))
 }
 
 /// A body whose `arguments` is only ever counted, at a call that knows the
@@ -1208,7 +1219,7 @@ fn with_known_count(callee: &FuncProto, argc: u16) -> Option<FuncProto> {
 /// applied yet. The body must also be branch-free: the splice renumbers ops, and
 /// v1 does not remap branch targets.
 pub fn callee_leaf_ok_one_call(callee: &FuncProto) -> Option<(Vec<Instr>, usize)> {
-    let (body, call_at) = leaf_ok_impl(callee, true)?;
+    let (body, call_at) = leaf_ok_impl(callee, true, false)?;
     Some((body, call_at?))
 }
 
@@ -1338,7 +1349,7 @@ pub(crate) fn leaf_store_then_bail(body: &[Instr]) -> bool {
     })
 }
 
-fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
+fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool, allow_new: bool) -> Option<(Vec<Instr>, Option<usize>)> {
     if callee.is_generator || callee.is_async {
         return None;
     }
@@ -1455,6 +1466,16 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             // helper defers accessors, class chains and exotic receivers), so it
             // obeys the same effect-ordering rule.
             Instr::GetProp { .. } if leaf_getprop_enabled() => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // An ALLOCATING leaf (`callee_leaf_ok_for_call_alloc` only): the
+            // class constant and a `new` its planner gave a lane. Either can
+            // leave for the real call (an epoch, identity, guard or empty
+            // ready pool), so both obey the effect rule; the instance made
+            // before such an exit is garbage nothing can reach.
+            Instr::LoadClassValue { .. } | Instr::New { .. } if allow_new => {
                 if seen_effect {
                     return None;
                 }

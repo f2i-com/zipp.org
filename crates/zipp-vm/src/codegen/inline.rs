@@ -1412,6 +1412,35 @@ pub(crate) fn emit_inline_leaf_call(
                 let bail = ops.new_dynamic_label();
                 dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge, true);
             }
+            // An allocating leaf (`Vm::plan_alloc_leaf`): the class as Tier C
+            // reads a class evaluated once, under the class epoch, and a `new`
+            // through its lane. Each miss takes the real call: nothing has been
+            // committed, and an instance made before it is unreachable.
+            Instr::LoadClassValue { dst: d, class_id } => {
+                let Some(&bits) = plan.class_values.get(&class_id) else {
+                    unreachable!("an allocating leaf's class constant was not planned")
+                };
+                let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
+                dynasm!(ops
+                    ; cmp DWORD [rdi + epoch_off], plan.class_epoch as i32
+                    ; jne => fallback
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::New {
+                dst: d,
+                callee: c,
+                arg_base: ab,
+                ..
+            } => {
+                let Some(&lane) = plan.inner_new.get(&bi) else {
+                    unreachable!("an allocating leaf's `new` has no lane")
+                };
+                // The arguments are body temporaries past the parameters
+                // (`plan_alloc_leaf`), so `rg` maps them consecutively.
+                crate::codegen::emit_new_lane_into(ops, lane, rg(c), rg(ab), rg(d), fallback);
+            }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
             }
