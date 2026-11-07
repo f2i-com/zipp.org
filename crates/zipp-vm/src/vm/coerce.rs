@@ -1751,6 +1751,7 @@ impl<'p> Vm<'p> {
         // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →
         // the spec's mixing TypeError; otherwise Number addition (ToNumber of
         // a Symbol throws there).
+        #[cfg(not(feature = "meter-only"))]
         if let Some(v) = self.bigint_big_op(crate::vm::helpers_misc::BigOp::Add, pa, pb) {
             return Ok(v);
         }
@@ -2519,6 +2520,7 @@ impl<'p> Vm<'p> {
         vb: Value,
     ) -> Result<Option<Option<std::cmp::Ordering>>, Thrown> {
         // Two BigInts, ordered where they live (no copy of a Big).
+        #[cfg(not(feature = "meter-only"))]
         if let Some(o) = self.bigint_ref_cmp(va, vb) {
             return Ok(Some(Some(o)));
         }

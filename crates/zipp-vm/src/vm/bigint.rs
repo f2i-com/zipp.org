@@ -183,12 +183,16 @@ impl BigVal {
 
 /// A BigInt primitive's mathematical value without a copy: the i128 tiers
 /// by value, a `BigIntBig` borrowed from its heap slot ([`Vm::bigint_ref`]).
+/// Speed only, so not in the meter-only (browser) builds, whose modules it
+/// grew: they keep `bigint_val`'s copies.
+#[cfg(not(feature = "meter-only"))]
 #[derive(Clone, Copy)]
 pub(crate) enum BigRef<'a> {
     Small(i128),
     Big(&'a NumBig),
 }
 
+#[cfg(not(feature = "meter-only"))]
 impl BigRef<'_> {
     fn bits(self) -> u64 {
         match self {
@@ -225,6 +229,7 @@ impl BigRef<'_> {
 /// `x + n` against an i128). `None` for a case `Vm::bigint_op` owns: a zero
 /// divisor, an oversized product or shift, a negative or Big shift count,
 /// `**`, `>>>`, and an i128 dividend over a Big divisor.
+#[cfg(not(feature = "meter-only"))]
 fn big_ref_op(op: BigOp, a: BigRef<'_>, b: BigRef<'_>, max_bits: u64) -> Option<NumBig> {
     use BigRef::{Big, Small};
     // A bitwise operand in the i128 range, as the num-bigint value the
@@ -348,6 +353,7 @@ impl<'p> Vm<'p> {
 
     /// [`Self::bigint_val`] by reference: a value beyond i128 is borrowed
     /// from its heap slot, not copied.
+    #[cfg(not(feature = "meter-only"))]
     #[inline]
     pub(crate) fn bigint_ref(&self, v: Value) -> Option<BigRef<'_>> {
         if let Some(n) = v.small_bigint_val() {
@@ -368,6 +374,7 @@ impl<'p> Vm<'p> {
     /// and `bigint_op` copied it again, so `x + y` over two 200-bit values
     /// made six allocations for its one result. `None`, nothing done, for
     /// any other pair or a case `bigint_op` reports.
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn bigint_big_op(&mut self, op: BigOp, va: Value, vb: Value) -> Option<Value> {
         let max = self.max_bigint_bits();
         let r = {
@@ -382,6 +389,7 @@ impl<'p> Vm<'p> {
 
     /// The order of two BigInt primitives, read where they live; `None`
     /// unless both are BigInts.
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn bigint_ref_cmp(&self, va: Value, vb: Value) -> Option<Ordering> {
         Some(self.bigint_ref(va)?.cmp(self.bigint_ref(vb)?))
     }
@@ -497,6 +505,7 @@ impl<'p> Vm<'p> {
             }
         }
         // Two BigInts, one beyond i128: from their heap slots, uncopied.
+        #[cfg(not(feature = "meter-only"))]
         if let Some(v) = self.bigint_big_op(op, va, vb) {
             return Ok(v);
         }
