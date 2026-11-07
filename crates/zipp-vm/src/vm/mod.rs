@@ -2397,6 +2397,15 @@ pub struct Vm<'p> {
     /// nesting is capped (see MAX_RUN_LOOP_DEPTH) and surfaces as a catchable
     /// RangeError instead.
     run_loop_depth: u32,
+    /// The lowest stack address a nested re-entry may start from: below it
+    /// `run_loop` (and every other native re-entry and recursion edge) throws
+    /// the same RangeError as the depth caps. Taken from the stack the host
+    /// declared on the thread that made this VM
+    /// ([`set_native_stack_bytes`]); 0 when none was declared, so only the
+    /// depth caps apply. The caps alone assumed a level's native frames fit
+    /// `stack / cap` bytes, which a target or compiler with larger frames
+    /// does not promise.
+    stack_floor: usize,
     /// Active Rust recursion edges through guest-controlled Proxy/prototype
     /// meta-operations. Unlike `run_loop_depth`, this covers transparent native
     /// forwarding that never re-enters the bytecode loop.
@@ -3892,6 +3901,16 @@ impl<'p> Vm<'p> {
 }
 
 impl<'p> Vm<'p> {
+    /// May another native re-entry (a nested `run_loop`, a compiled callback's
+    /// native entry) not start here? Past the depth cap, or below the floor
+    /// of the stack the host declared (`stack_floor`). Every site that either
+    /// re-enters or leaves the refusal to `run_loop` asks this one question,
+    /// so a fast path never carries on below a floor `run_loop` would refuse.
+    #[inline(always)]
+    pub(crate) fn reentry_exhausted(&self) -> bool {
+        self.run_loop_depth >= MAX_RUN_LOOP_DEPTH || helpers_misc::stack_addr() < self.stack_floor
+    }
+
     /// Execute one guest-controlled native recursion edge under the shared
     /// stack budget. Keeping the increment/decrement in this closure wrapper is
     /// deliberate: both `Ok` and ordinary abrupt completion (`Err`) restore the
@@ -3901,7 +3920,9 @@ impl<'p> Vm<'p> {
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, Thrown>,
     ) -> Result<T, Thrown> {
-        if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH {
+        if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH
+            || helpers_misc::stack_addr() < self.stack_floor
+        {
             return Err(native_recursion_exceeded());
         }
         self.native_recursion_depth += 1;

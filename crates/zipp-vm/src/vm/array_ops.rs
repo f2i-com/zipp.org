@@ -427,7 +427,7 @@ impl<'p> Vm<'p> {
         // later numeric elements may use the direct path.
         let needed = self.regs.len().checked_add(plan.registers())?;
         if self.frames.len() >= MAX_FRAMES
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
             // A real callback would push and later pop one Frame.  If that
             // push would grow the retained frame Vec, let the ordinary path do
             // it so heap accounting and a tight memory ceiling stay identical;
@@ -4745,7 +4745,7 @@ impl<'p> Vm<'p> {
         // allocation boundary, so decline unless one slot is already resident.
         let needed = self.regs.len().checked_add((p.reg_count as usize).max(1))?;
         if self.frames.len() >= MAX_FRAMES
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
             || self.frames.len() == self.frames.capacity()
             || self.regs_would_overflow(needed)
         {

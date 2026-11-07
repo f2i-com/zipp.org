@@ -163,9 +163,10 @@ impl<'p> Vm<'p> {
         // Native re-entry guard: a NESTED run_loop (builtin callback, generator
         // resume, direct eval, JIT bail) is a real Rust frame, and runaway
         // recursion through such re-entries would exhaust the OS stack before
-        // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
-        // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
-        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+        // MAX_FRAMES ever fires. Cap the nesting, by depth and by the floor of
+        // the stack the host declared, so it throws a catchable RangeError
+        // (staging/sm/extensions/recursion.js) instead of crashing.
+        if self.reentry_exhausted() {
             return Err(self.run_loop_depth_exceeded(stop_depth));
         }
         self.run_loop_depth += 1;

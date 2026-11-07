@@ -197,14 +197,46 @@ thread_local! {
 /// may recurse that much deeper before it falls back to interpreted frames.
 /// Recursion past 64 levels ran interpreted, whatever the program, without
 /// this.
+///
+/// It also bounds native re-entry by the stack itself, on every target: a VM
+/// made on this thread throws the catchable RangeError for a nested run loop,
+/// a native callback entry or a meta-operation recursion edge once it would
+/// start below [`declared_stack_floor`]. Without that, only the re-entry depth
+/// caps applied, and a target whose levels are larger than `bytes / cap` (the
+/// Arm build's run loop, nested 4096 deep by `staging/sm/extensions/
+/// recursion.js`) overflowed the stack and aborted.
 pub fn set_native_stack_bytes(bytes: usize) {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     {
         let cap = (bytes / JIT_STACK_PER_CALL).clamp(JIT_CALL_CAP_DEFAULT as usize, JIT_REGION_CALL_MAX as usize);
         JIT_CALL_CAP.with(|c| c.set(cap as u32));
     }
-    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-    let _ = bytes;
+    // What stays unused below the floor: the last level's own frames, the
+    // RangeError's construction, a collection and the handler that catches it,
+    // none of which pass a check. An eighth of the stack, at least 1 MiB, and
+    // at most half of it.
+    let reserve = (bytes / 8).max(1 << 20).min(bytes / 2);
+    let floor = if bytes == 0 { 0 } else { stack_addr().saturating_sub(bytes - reserve) };
+    STACK_FLOOR.with(|f| f.set(floor));
+}
+
+// As the call cap: a stack is a thread's.
+thread_local! {
+    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The stack floor declared on this thread (0: none, no stack check).
+pub(crate) fn declared_stack_floor() -> usize {
+    STACK_FLOOR.with(|f| f.get())
+}
+
+/// An address in the caller's stack frame, for the floor check. Stacks grow
+/// down on every target the engine builds for (x86-64, AArch64, Armv7 and
+/// WebAssembly's shadow stack).
+#[inline(always)]
+pub(crate) fn stack_addr() -> usize {
+    let probe = 0u8;
+    core::hint::black_box(&probe) as *const u8 as usize
 }
 
 /// How deep native calls go in a VM made on this thread now.

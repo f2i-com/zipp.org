@@ -1399,7 +1399,7 @@ impl<'p> Vm<'p> {
             || !self.obj_realm.is_empty()
             || !self.realm_global_objs.is_empty()
             // The cap on native re-entry is `run_loop`'s to raise.
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
         {
             return NOT_RUN;
         }
@@ -1547,7 +1547,7 @@ impl<'p> Vm<'p> {
             || self.jit.get(fid).is_none()
             || !self.jit_func_eligible(fid)
             // The cap on native re-entry is `run_loop`'s to raise.
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
         {
             return None;
         }

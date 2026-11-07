@@ -468,6 +468,7 @@ impl<'p> Vm<'p> {
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
             run_loop_depth: 0,
+            stack_floor: super::super::helpers_misc::declared_stack_floor(),
             native_recursion_depth: 0,
             tail_reuse_streak: 0,
             array_stringify_active: Vec::new(),

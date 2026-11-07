@@ -559,7 +559,7 @@ impl<'p> Vm<'p> {
         // `visit` over a cyclic graph) nested native frames with no budget until
         // the OS stack overflowed and the process aborted. Charge it against the
         // same re-entry cap so it throws the interpreter's catchable RangeError.
-        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+        if self.reentry_exhausted() {
             return Err(Thrown::from_static(
                 "RangeError: Maximum call stack size exceeded",
             ));
