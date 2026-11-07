@@ -6304,16 +6304,20 @@ pub(crate) fn compile_proto_mem(
                 heap.math_two,
                 heap.math_imul_guard,
             ),
+            // Exactly one argument, as admission requires: `String()` and
+            // `String(a, b)` are admitted as generic global calls and take the
+            // call-IC arm below. Matching them here read the argument
+            // register of a zero-argument call, whatever stale value it held,
+            // and returned that value once the helper accepted strings.
             Instr::GlobalFn {
                 dst,
                 op: crate::bytecode::GlobalFn::String,
                 callee,
                 arg_base,
-                argc,
+                argc: 1,
             } => {
-                debug_assert_eq!(argc, 1);
-                // The helper implements exactly primitive tagged-Int ToString.
-                // Any other live value declines before effects and resumes the
+                // The helper implements ToString of a tagged Int, a double and
+                // a primitive string. Any other value declines before effects and resumes the
                 // interpreter at this GlobalFn bytecode, preserving Symbol and
                 // observable object-coercion semantics.
                 let helper = crate::vm::jit_int_string as *const () as usize;

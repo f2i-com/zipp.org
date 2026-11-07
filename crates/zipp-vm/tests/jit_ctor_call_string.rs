@@ -45,6 +45,14 @@ const obj = { valueOf() { calls++; return 41; } };
 let nsum = 0;
 for (let r = 0; r < 2000; r++) nsum += Number(obj) + Number(BigInt(r & 7));
 log("valueOf", nsum, calls);
+// `String()` has no argument to convert and `String(a, b)` ignores `b`: only
+// the one-argument form takes Tier C's String lane. A zero-argument call that
+// read its argument register returned whatever stale value sat there.
+function str0(n) { const a = (n + 1) | 0; return String() + "|" + String(a, n) + "|" + String(); }
+function str0s(n) { const t = "x" + n; return String() + t.length + String(); }
+let z0 = "", z1 = "";
+for (let r = 0; r < 3000; r++) { z0 = str0(r); z1 = str0s(r); }
+log("str argc", JSON.stringify(z0), JSON.stringify(z1), String(), String(1, 2, 3));
 console.log(out.join("\n"));
 "##;
 
