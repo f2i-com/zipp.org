@@ -1115,6 +1115,23 @@ impl<'p> Vm<'p> {
             ));
         }
         // An Int's low bits are its ToUintN; a double takes the modular path.
+        // The browser (meter-only) builds keep the smaller original write.
+        #[cfg(feature = "meter-only")]
+        {
+            let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
+            if !self.truthy(little_endian) {
+                bytes[..size].reverse();
+            }
+            let abs = byte_offset + pos;
+            if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+                if abs + size <= data.len() {
+                    data[abs..abs + size].copy_from_slice(&bytes[..size]);
+                }
+            }
+            Ok(Some(()))
+        }
+        #[cfg(not(feature = "meter-only"))]
+        {
         let bytes = if value.is_int() {
             crate::vm::helpers_numeric::ta_encode_int(kind, value.as_int())
         } else {
@@ -1144,6 +1161,7 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(Some(()))
+        }
     }
 
     /// What `Get(view, name)` finds when `name` is one of the numeric getters

@@ -2306,6 +2306,11 @@ impl<'p> Vm<'p> {
     /// window's and its state box's.
     #[inline]
     fn take_activation_regs(&mut self, n: usize) -> Vec<Value> {
+        // Speed only: the browser (meter-only) builds allocate each window,
+        // without the pool's code.
+        if cfg!(feature = "meter-only") {
+            return vec![Value::UNDEFINED; n];
+        }
         match self.activation_regs_pool.pop() {
             Some(mut v) => {
                 v.resize(n, Value::UNDEFINED);
@@ -2319,7 +2324,11 @@ impl<'p> Vm<'p> {
     /// [`Self::take_activation_regs`]; a large one is simply dropped.
     #[inline]
     pub(crate) fn give_activation_regs(&mut self, mut v: Vec<Value>) {
-        if v.capacity() == 0 || v.capacity() > 256 || self.activation_regs_pool.len() >= 64 {
+        if cfg!(feature = "meter-only")
+            || v.capacity() == 0
+            || v.capacity() > 256
+            || self.activation_regs_pool.len() >= 64
+        {
             return;
         }
         v.clear();
