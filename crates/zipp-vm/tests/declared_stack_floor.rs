@@ -10,6 +10,11 @@
 //! The thread here has 64 MiB and declares 4: the floor must stop both
 //! recursions well before the 4096-level cap, in every mode, with the error
 //! still catchable and the program still running after it.
+//!
+//! Native builds only: the sandbox profile's own caps (32 nested run loops,
+//! 4,096 frames) stop both recursions long before any floor, and refuse the
+//! 5,000-deep plain recursion the program ends with.
+#![cfg(not(feature = "safe-sandbox"))]
 
 const PROGRAM: &str = r#"var r, depth = 0, maxDepth = 0, err = "";
 function* f() { r = arguments; test(); yield 170; }
