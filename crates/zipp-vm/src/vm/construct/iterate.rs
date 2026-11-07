@@ -57,22 +57,12 @@ pub(crate) struct ArrayIterWitness {
     next_bits: u64,
 }
 
-/// `ZIPP_NO_ARRAY_ITER_WITNESS=1` checks Array iteration through the memos
-/// alone again, without [`ArrayIterWitness`].
-#[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-#[inline]
-fn array_iter_witness_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_ARRAY_ITER_WITNESS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_ARRAY_ITER_WITNESS=1` checks Array iteration through the memos
+    /// alone again, without [`ArrayIterWitness`].
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    fn array_iter_witness_enabled() = "ZIPP_NO_ARRAY_ITER_WITNESS"
 }
 
 impl<'p> Vm<'p> {
@@ -2176,7 +2166,7 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => items.clone(),
             _ => return Ok(Vec::new()),
         };
-        if !items.iter().any(|x| x.is_hole()) {
+        if !Value::any_hole(&items) {
             return Ok(items);
         }
         // Resolving a hole can run a getter installed on `Array.prototype`, i.e.
@@ -2868,18 +2858,8 @@ impl<'p> Vm<'p> {
     }
 }
 
-/// `ZIPP_NO_ASSIGN_PLAIN=1` sends every `Object.assign` source through the
-/// general loop again (`Vm::object_assign_plain`'s same-binary A/B).
-fn assign_plain_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_ASSIGN_PLAIN").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_ASSIGN_PLAIN=1` sends every `Object.assign` source through the
+    /// general loop again (`Vm::object_assign_plain`'s same-binary A/B).
+    fn assign_plain_enabled() = "ZIPP_NO_ASSIGN_PLAIN"
 }

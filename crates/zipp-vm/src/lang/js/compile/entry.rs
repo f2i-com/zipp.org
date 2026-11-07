@@ -551,6 +551,6 @@ fn sorted_slots(set: &rustc_hash::FxHashSet<u32>) -> Vec<u32> {
 /// replayed in order, so alphabetical is only about determinism.
 fn sorted_names(set: &rustc_hash::FxHashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = set.iter().cloned().collect();
-    v.sort_unstable();
+    crate::cold_sort::sort(&mut v);
     v
 }

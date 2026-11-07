@@ -276,148 +276,71 @@ mod str_append_cursor_proof_tests {
     }
 }
 
-/// Admit numeric remainder into Tier C.  The emitted prefix handles only
-/// integer-valued Number operands; zero divisors, fractional values, BigInts,
-/// and observable ToNumeric coercions decline before doing any work and resume
-/// at the original bytecode.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_mod_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_MOD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit numeric remainder into Tier C.  The emitted prefix handles only
+    /// integer-valued Number operands; zero divisors, fractional values, BigInts,
+    /// and observable ToNumeric coercions decline before doing any work and resume
+    /// at the original bytecode.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_mod_enabled() = "ZIPP_NO_TIERC_MOD"
 }
 
-/// Admit RequireObjectCoercible into Tier C.  It is a no-op for every value
-/// except null/undefined; those two exact bit patterns exit before effects so
-/// the interpreter remains responsible for constructing and throwing the
-/// TypeError.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_check_coercible_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_CHECK_COERCIBLE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit RequireObjectCoercible into Tier C.  It is a no-op for every value
+    /// except null/undefined; those two exact bit patterns exit before effects so
+    /// the interpreter remains responsible for constructing and throwing the
+    /// TypeError.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_check_coercible_enabled() = "ZIPP_NO_TIERC_CHECK_COERCIBLE"
 }
 
-/// Admit the two non-callback Map mutations used by warm application code.
-/// Generated code still proves the live receiver resolves to the main-realm
-/// intrinsic before the helper performs any mutation.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_coll_mutate_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_COLL_MUTATE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit the two non-callback Map mutations used by warm application code.
+    /// Generated code still proves the live receiver resolves to the main-realm
+    /// intrinsic before the helper performs any mutation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_coll_mutate_enabled() = "ZIPP_NO_TIERC_COLL_MUTATE"
 }
 
-/// Admit guarded primitive-string `toUpperCase()` into Tier C.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_string_upper_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_STRING_UPPER").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit guarded primitive-string `toUpperCase()` into Tier C.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_string_upper_enabled() = "ZIPP_NO_TIERC_STRING_UPPER"
 }
 
-/// Admit the dynamically-resolved zero-argument `random` method into Tier C.
-/// This deliberately remains a `CallMethod`: the helper re-reads the live
-/// property on every IC miss, so replacing `Math.random` is still observable.
-/// The same-binary switch isolates the whole-function-entry benefit from the
-/// arrow-local/string changes used by the NanoID workload.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_random_method_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_RANDOM_METHOD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit the dynamically-resolved zero-argument `random` method into Tier C.
+    /// This deliberately remains a `CallMethod`: the helper re-reads the live
+    /// property on every IC miss, so replacing `Math.random` is still observable.
+    /// The same-binary switch isolates the whole-function-entry benefit from the
+    /// arrow-local/string changes used by the NanoID workload.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_random_method_enabled() = "ZIPP_NO_TIERC_RANDOM_METHOD"
 }
 
-/// Native-to-native prefix for an admitted Tier-C `CallMethod`. The helper
-/// resolves the live data property through the interpreter IC and declines to
-/// the unchanged generic call helper unless the current callee has a Tier-C
-/// entry. Kept separately switchable from admission for direct A/B evidence.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_method_crosscall_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_METHOD_CROSSCALL").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Native-to-native prefix for an admitted Tier-C `CallMethod`. The helper
+    /// resolves the live data property through the interpreter IC and declines to
+    /// the unchanged generic call helper unless the current callee has a Tier-C
+    /// entry. Kept separately switchable from admission for direct A/B evidence.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_method_crosscall_enabled() = "ZIPP_NO_METHOD_CROSSCALL"
 }
 
-/// Bounded own-data `CallMethod` prefix: consume an already-filled guardable
-/// `OwnData { shape, slot }` IC way without cloning/hashing the property name.
-/// The runtime helper revalidates exact shape/slot/key/descriptor and re-reads
-/// the live callee before delegating to the unchanged Tier-C cross-call.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_method_own_slot_direct_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_METHOD_OWN_SLOT_DIRECT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Bounded own-data `CallMethod` prefix: consume an already-filled guardable
+    /// `OwnData { shape, slot }` IC way without cloning/hashing the property name.
+    /// The runtime helper revalidates exact shape/slot/key/descriptor and re-reads
+    /// the live callee before delegating to the unchanged Tier-C cross-call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_method_own_slot_direct_enabled() = "ZIPP_NO_METHOD_OWN_SLOT_DIRECT"
 }
 
 env_off_switch! {
@@ -436,157 +359,101 @@ env_off_switch! {
     fn tierc_block_sroa_enabled() = "ZIPP_NO_TIERC_BLOCK_SROA"
 }
 
-/// Admit unary numeric negation into Tier C. The emitted path flips the f64
-/// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
-/// declines non-numeric operands to the exact interpreter instruction.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_neg_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_NEG").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_YIELD_ENTRY=1`: a Tier C body bails at every yield
+    /// head, as before `jit_tierc_run_region`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_yield_entry_enabled() = "ZIPP_NO_TIERC_YIELD_ENTRY"
 }
 
-/// Admit a statically named property delete as a deliberately cold exact-ip
-/// exit from Tier C.  The common path keeps the surrounding function native;
-/// if execution reaches the delete, generated code performs no part of the
-/// operation and resumes the interpreter at that bytecode.  This preserves
-/// ToObject, configurability, strict-mode throwing and proxy semantics without
-/// duplicating any of them in native code.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_cold_delete_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_COLD_DELETE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_DV_LANE=1`: a Tier C DataView accessor call takes the
+    /// general method route, as before `jit_dv_method_call`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_dv_lane_enabled() = "ZIPP_NO_TIERC_DV_LANE"
 }
 
-/// Forward an immediately preceding captured read/write into the next read of
-/// the same upvalue. There is no call, allocation, branch target, or other VM
-/// action between the two bytecodes, so the source register and the cell must
-/// still contain identical `Value` bits. This removes one win64 helper crossing
-/// per hostile-pipeline activation while retaining an exact-ip TDZ guard.
-/// `ZIPP_NO_TIERC_UPVAL_FORWARD=1` restores the helper call for A/B evidence.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_forward_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_FORWARD").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_BITWISE_SLOW=1`: a Tier C bitwise op whose operand is
+    /// off the inline path bails, as before `jit_bitwise_slow`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_bitwise_slow_enabled() = "ZIPP_NO_TIERC_BITWISE_SLOW"
 }
 
-/// Fuse the compiler's exact captured-counter lowering
-/// `get; 1; add; 0; or; set` through one resolved-cell helper. Disabled for a
-/// metered VM by the planner below: skipping five bytecodes must never reduce a
-/// sandbox's instruction charge. `ZIPP_NO_TIERC_UPVAL_INC_I32=1` restores the
-/// unfused sequence for a same-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_inc_i32_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INC_I32").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit unary numeric negation into Tier C. The emitted path flips the f64
+    /// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
+    /// declines non-numeric operands to the exact interpreter instruction.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_neg_enabled() = "ZIPP_NO_TIERC_NEG"
 }
 
-/// B189: emit `UpvalGet` as three inline loads (activation upvalue base →
-/// cell index → cell-value mirror) instead of the resolving helper call.
-/// `ZIPP_NO_TIERC_UPVAL_INLINE=1` restores the helper for a same-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INLINE").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Admit a statically named property delete as a deliberately cold exact-ip
+    /// exit from Tier C.  The common path keeps the surrounding function native;
+    /// if execution reaches the delete, generated code performs no part of the
+    /// operation and resumes the interpreter at that bytecode.  This preserves
+    /// ToObject, configurability, strict-mode throwing and proxy semantics without
+    /// duplicating any of them in native code.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_cold_delete_enabled() = "ZIPP_NO_TIERC_COLD_DELETE"
 }
 
-/// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
-/// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
-/// every accepted step may use an arbitrary constant count and any of `<<`,
-/// `>>`, or `>>>` in the generic expression `x ^= x SHIFT count`.
-///
-/// The planner declines under instruction metering because one helper replaces
-/// several bytecodes. `ZIPP_NO_TIERC_UPVAL_XORSHIFT=1` keeps a same-binary
-/// unfused route for performance and semantic differential testing.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_upval_xorshift_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_XORSHIFT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// Forward an immediately preceding captured read/write into the next read of
+    /// the same upvalue. There is no call, allocation, branch target, or other VM
+    /// action between the two bytecodes, so the source register and the cell must
+    /// still contain identical `Value` bits. This removes one win64 helper crossing
+    /// per hostile-pipeline activation while retaining an exact-ip TDZ guard.
+    /// `ZIPP_NO_TIERC_UPVAL_FORWARD=1` restores the helper call for A/B evidence.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_forward_enabled() = "ZIPP_NO_TIERC_UPVAL_FORWARD"
 }
 
-/// Direct-slot counterpart used by module/top-level lexical bindings. It has a
-/// distinct switch because a real workload may exercise the global shape while
-/// a closure microbenchmark exercises only the captured-cell helper.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn tierc_global_xorshift_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
+env_off_switch! {
+    /// Fuse the compiler's exact captured-counter lowering
+    /// `get; 1; add; 0; or; set` through one resolved-cell helper. Disabled for a
+    /// metered VM by the planner below: skipping five bytecodes must never reduce a
+    /// sandbox's instruction charge. `ZIPP_NO_TIERC_UPVAL_INC_I32=1` restores the
+    /// unfused sequence for a same-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_inc_i32_enabled() = "ZIPP_NO_TIERC_UPVAL_INC_I32"
+}
 
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_GLOBAL_XORSHIFT").is_none() as u8;
-            ON.store(on, Ordering::Relaxed);
-            on == 1
-        }
-    }
+env_off_switch! {
+    /// B189: emit `UpvalGet` as three inline loads (activation upvalue base →
+    /// cell index → cell-value mirror) instead of the resolving helper call.
+    /// `ZIPP_NO_TIERC_UPVAL_INLINE=1` restores the helper for a same-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_inline_enabled() = "ZIPP_NO_TIERC_UPVAL_INLINE"
+}
+
+env_off_switch! {
+    /// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
+    /// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
+    /// every accepted step may use an arbitrary constant count and any of `<<`,
+    /// `>>`, or `>>>` in the generic expression `x ^= x SHIFT count`.
+    ///
+    /// The planner declines under instruction metering because one helper replaces
+    /// several bytecodes. `ZIPP_NO_TIERC_UPVAL_XORSHIFT=1` keeps a same-binary
+    /// unfused route for performance and semantic differential testing.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_upval_xorshift_enabled() = "ZIPP_NO_TIERC_UPVAL_XORSHIFT"
+}
+
+env_off_switch! {
+    /// Direct-slot counterpart used by module/top-level lexical bindings. It has a
+    /// distinct switch because a real workload may exercise the global shape while
+    /// a closure microbenchmark exercises only the captured-cell helper.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_global_xorshift_enabled() = "ZIPP_NO_TIERC_GLOBAL_XORSHIFT"
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -975,39 +842,19 @@ fn emit_tierc_xorshift_registers(
     }
 }
 
-/// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
-/// uses `arguments` out of Tier C again (it then runs interpreted, as every
-/// such function did).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn tierc_arguments_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_ARGUMENTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary switch: `ZIPP_NO_TIERC_ARGUMENTS=1` keeps every function that
+    /// uses `arguments` out of Tier C again (it then runs interpreted, as every
+    /// such function did).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_arguments_enabled() = "ZIPP_NO_TIERC_ARGUMENTS"
 }
 
-/// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
-/// parameter out of Tier C again (and so out of every frame-free entry).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn tierc_rest_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_REST").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary switch: `ZIPP_NO_TIERC_REST=1` keeps every function with a rest
+    /// parameter out of Tier C again (and so out of every frame-free entry).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn tierc_rest_enabled() = "ZIPP_NO_TIERC_REST"
 }
 
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
@@ -1067,7 +914,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     // three functions were also using `UpvalSet`, `join` and `push` — which the
     // first-only report had never shown. Behaviour is unchanged when the flag is
     // off.
-    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
     let mut ok = true;
     macro_rules! reject {
         ($($arg:tt)*) => {{
@@ -1232,6 +1079,18 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // region's `jit_iter_to_array_ic`, with the call protocol (a
             // non-array iterator is user code).
             Instr::IterToArray { count, .. } if !py && count <= 0xFFFF => {}
+            // An object rest and a spread `Math` call: the interpreter's arms
+            // through `jit_cold_op_ic` (a getter, a replaced `Math` method is
+            // user code).
+            Instr::ObjectRest {
+                exclude_start,
+                exclude_count,
+                ..
+            } if !py && (exclude_start as u64) <= 0xFFFF && (exclude_count as u64) <= 0xFFFF => {}
+            Instr::MathSpread { .. } if !py => {}
+            // `Object.values(o)` / `Object.entries(o)`: the region's
+            // `jit_obj_enum_ic` (a getter, a replaced builtin is user code).
+            Instr::ObjectValues { .. } | Instr::ObjectEntries { .. } if !py => {}
             // A destructuring's close of an unexhausted iterator, and its
             // error-path form: the region's `jit_iter_op_ic` (`return()` is
             // user code).
@@ -1328,6 +1187,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] op HasProp (disabled)");
                 }
             }
+            // `#x in obj`: the brand check through `jit_private_in_ic`, which
+            // declines whatever the private memo cannot resolve.
+            Instr::HasProp { brand: true, .. } if !py => {}
             Instr::GlobalFn {
                 op: crate::bytecode::GlobalFn::String,
                 argc: 1,
@@ -1433,6 +1295,12 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // A method naming its own class (`new C(...)` inside `class C`):
             // the binding's helper, with the call protocol for its TDZ.
             Instr::LoadClassValue { .. } => {}
+            // `super.name` (the read half of `super.m()`): the interpreter's
+            // super-property cache and walk through `jit_super_get_ic`, with
+            // the call protocol for an inherited getter. A method calling
+            // its parent's was kept out of compiled code by this op alone,
+            // and every call into it from compiled code crossed tiers.
+            Instr::SuperGet { .. } if !py => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1607,6 +1475,90 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
     )
 }
 
+/// Whether a Tier-C body never consults the running activation
+/// (`Vm::jit_tierc_activation`: closure, callee, upvalue base), so a cross
+/// call into it may leave the caller's activation installed. A WHITELIST: any
+/// op not listed — upvalue and cell access, closure creation, class values,
+/// `super`, private names, handlers, iterators, spreads — and generator,
+/// async and `arguments` bodies keep the full activation protocol. (Readers
+/// of the activation: the upvalue ops and `jit_tierc_cell`, closure creation
+/// in `closure_make_jit`/`function_literal_jit`, and `jit_running_callee`,
+/// which serves private names and declines on a function-id mismatch.)
+/// Nothing the listed ops' helpers do reads it; `Error.stack` is built from
+/// interpreter frames only.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn activation_free(proto: &FuncProto) -> bool {
+    if proto.is_generator
+        || proto.is_async
+        || proto.arguments_reg.is_some()
+        || proto.string_constants.iter().any(|s| s.starts_with('#'))
+    {
+        return false;
+    }
+    proto.code.iter().all(|i| {
+        matches!(
+            i,
+            Instr::LoadConst { .. }
+                | Instr::LoadInt { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::Move { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Div { .. }
+                | Instr::Mod { .. }
+                | Instr::Neg { .. }
+                | Instr::Not { .. }
+                | Instr::Bitwise { .. }
+                | Instr::AddInt { .. }
+                | Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
+                | Instr::LooseEq { .. }
+                | Instr::TypeOf { .. }
+                | Instr::TypeOfIs { .. }
+                | Instr::TypeOfSame { .. }
+                | Instr::StrAppendInPlace { .. }
+                | Instr::StrConcatChain { .. }
+                | Instr::StrAppendIndex { .. }
+                | Instr::AddRightPair { .. }
+                | Instr::ToStr { .. }
+                | Instr::GetProp { .. }
+                | Instr::SetProp { .. }
+                | Instr::GetIndex { .. }
+                | Instr::SetIndex { .. }
+                | Instr::LenOf { .. }
+                | Instr::NewObject { .. }
+                | Instr::NewPlannedObject { .. }
+                | Instr::FinalizeObject { .. }
+                | Instr::InitDataProp { .. }
+                | Instr::AppendDataProp { .. }
+                | Instr::NewArray { .. }
+                | Instr::Call { .. }
+                | Instr::CallMethod { .. }
+                | Instr::CallWithThis { .. }
+                | Instr::TailCall { .. }
+                | Instr::MathOp { .. }
+                | Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        )
+    })
+}
+
 /// The owned, multi-word form of [`cross_uninit_mask`] for Tier-C callees with
 /// more than 64 registers. `None` is fail-closed: the op/use table declined,
 /// an operand was outside the declared register window, or the proto was not
@@ -1773,6 +1725,10 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             // A private write: `val`'s own bits come back into its register.
             Instr::SetPrivate { obj, val, .. } => (u2(obj, val), Some(val)),
             Instr::IterToArray { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::ObjectRest { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::MathSpread {
+                dst, callee, this_v, args, ..
+            } => (u3(callee, this_v, args), Some(dst)),
             // The iterator's own bits come back into its register.
             Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => (u1(iter), Some(iter)),
             Instr::NewRegExp {
@@ -1835,16 +1791,26 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 obj,
                 callee,
                 this_v,
-            } => (u3(obj, callee, this_v), Some(dst)),
-            Instr::HasProp {
+            }
+            | Instr::ObjectValues {
                 dst,
-                key,
                 obj,
-                brand: false,
-            } => (u2(key, obj), Some(dst)),
+                callee,
+                this_v,
+            }
+            | Instr::ObjectEntries {
+                dst,
+                obj,
+                callee,
+                this_v,
+            } => (u3(obj, callee, this_v), Some(dst)),
+            Instr::HasProp { dst, key, obj, .. } => (u2(key, obj), Some(dst)),
             // The finally bracket manipulates frame state only; EndFinally and
             // IterCloseFinally read their completion registers on either path.
             Instr::PushFinally { .. } | Instr::PopFinally | Instr::JumpFinally { .. } => (u0(), None),
+            // A catch's bracket too (`catch_reg` is the unwinder's to write
+            // before the catch runs; read there, it only counts as unwritten).
+            Instr::PushHandler { .. } | Instr::PopHandler => (u0(), None),
             Instr::EndFinally { kind_reg, val_reg } => (u2(kind_reg, val_reg), None),
             Instr::IterCloseFinally { iter, kind_reg } => (u2(iter, kind_reg), None),
             // IterNext writes three registers, which does not fit the
@@ -1900,6 +1866,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             ),
             Instr::ToStr { dst, a } => (u1(a), Some(dst)),
             Instr::LoadClassValue { dst, .. } => (u0(), Some(dst)),
+            // `super.name` reads the receiver, register 0, for a getter.
+            Instr::SuperGet { dst, .. } => (u1(0), Some(dst)),
             Instr::CallWithThis {
                 dst,
                 callee,
@@ -2294,7 +2262,7 @@ fn plan_tierc_block_sroa(
     const MAX_SITES: usize = 16;
 
     let mut out = TiercBlockSroaPlan::default();
-    if std::env::var_os("ZIPP_GC_STRESS").is_some()
+    if crate::env_var_os("ZIPP_GC_STRESS").is_some()
         || !proto.eval_sites.is_empty()
         || proto.code.iter().any(|instr| {
             matches!(
@@ -2973,6 +2941,433 @@ fn do_wide_mask_passes(
     Some(mask.into_boxed_slice())
 }
 
+/// A `try` or a `finally` bracket whose body compiled code runs with no
+/// handler pushed.
+struct LazyTry {
+    push: usize,
+    /// The last pop; `pops` holds every one (all skipped).
+    pop: usize,
+    pops: Vec<usize>,
+    /// A `finally` bracket's target and completion registers.
+    finally: Option<(u32, u16, u16)>,
+    /// The pushes the exit stub makes, outermost first, each with whether it
+    /// is a `finally` bracket's (`jit_push_finally`) or a catch's
+    /// (`jit_push_catch`): the lazy brackets this one is nested in, whose
+    /// bodies are left with its own, then its own.
+    chain: Vec<(u64, bool)>,
+}
+
+/// The lazy brackets of a body, and where compiled code may run with a
+/// handler on its frame.
+struct LazyPlan {
+    tries: Vec<LazyTry>,
+    /// Per ip: in the body of a bracket that keeps its push, so the frame may
+    /// hold a handler there (every ip when the brackets are not analysed).
+    pushed: Vec<bool>,
+    /// Every bracket, lazy or not, in push order; empty when not analysed.
+    brackets: Vec<PlanBracket>,
+}
+
+/// A bracket as `LazyPlan::jump_route` walks them.
+struct PlanBracket {
+    push: usize,
+    pop: usize,
+    finally: Option<(u32, u16, u16)>,
+    /// A `finally` bracket's closing `EndFinally`.
+    end: Option<usize>,
+    lazy: bool,
+}
+
+/// Where a `break`/`continue` routing goes next (`LazyPlan::jump_route`).
+#[derive(Clone, Copy)]
+enum JumpRoute {
+    /// Every bracket it leaves is done with: the jump's own target.
+    Target,
+    /// A lazy `finally` it leaves runs first, entered with the jump
+    /// completion: its target and completion registers.
+    Finally(u32, u16, u16),
+    /// A bracket that keeps its push is next: the frame's routing helper
+    /// takes it from here (the lazy ones inside it are done with).
+    Helper,
+}
+
+impl LazyPlan {
+    fn none(n: usize) -> Self {
+        LazyPlan { tries: Vec::new(), pushed: vec![true; n], brackets: Vec::new() }
+    }
+
+    /// The next step of a jump to `target` from `ip` (a `JumpFinally`, or an
+    /// `EndFinally` going on with its jump completion): the brackets whose
+    /// body holds `ip` and that do not hold `target` are left, innermost
+    /// first. A lazy catch's handler is only discarded; a lazy `finally` runs.
+    fn jump_route(&self, ip: usize, target: usize) -> JumpRoute {
+        if self.brackets.is_empty() {
+            return JumpRoute::Helper;
+        }
+        let mut left: Vec<&PlanBracket> = self
+            .brackets
+            .iter()
+            .filter(|b| b.push < ip && ip < b.pop && !(b.push < target && target <= b.pop))
+            .collect();
+        left.sort_by_key(|b| std::cmp::Reverse(b.push));
+        for b in left {
+            if !b.lazy {
+                return JumpRoute::Helper;
+            }
+            if let Some((t, k, v)) = b.finally {
+                return JumpRoute::Finally(t, k, v);
+            }
+        }
+        JumpRoute::Target
+    }
+
+    /// The closing `EndFinally` of the lazy `finally` bracket whose target is
+    /// `target`.
+    fn finally_end(&self, target: u32) -> Option<usize> {
+        self.brackets
+            .iter()
+            .find(|b| b.lazy && b.finally.is_some_and(|(t, _, _)| t == target))
+            .and_then(|b| b.end)
+    }
+}
+
+env_off_switch! {
+    fn return_route_enabled() = "ZIPP_NO_RETURN_ROUTE"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_TRY=1` pushes every handler (the same-binary A/B).
+    fn lazy_try_enabled() = "ZIPP_NO_LAZY_TRY"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_NEST=1`: a lazy bracket holds no other, a catch's body
+    /// no return, and every `EndFinally` routes through the helper (the
+    /// same-binary A/B).
+    fn lazy_nest_enabled() = "ZIPP_NO_LAZY_NEST"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_JUMP=1`: a `break`/`continue` leaving a bracket keeps it
+    /// pushed and routes through the frame (the same-binary A/B).
+    fn lazy_jump_enabled() = "ZIPP_NO_LAZY_JUMP"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LAZY_FRAME_FREE=1`: a body whose brackets are all lazy keeps
+    /// the frame-backed entry every handler body takes (the same-binary A/B).
+    fn lazy_frame_free_enabled() = "ZIPP_NO_LAZY_FRAME_FREE"
+}
+
+/// Whether `proto`'s unmetered Tier C body may run with no frame of its own:
+/// every bracket is lazy, so compiled code never holds a handler (the exit
+/// stubs defer a push that finds no frame of the body's, `jit_lazy_push`), no
+/// `break`/`continue` routes through a frame's handlers, and every return a
+/// `finally` protects is a lazy body's. Iterators stay out: their helpers have
+/// only ever run over the body's own frame.
+pub(crate) fn lazy_frame_free(proto: &crate::bytecode::FuncProto) -> bool {
+    if proto.is_generator
+        || proto.is_async
+        || has_py_ops(&proto.code)
+        || !lazy_try_enabled()
+        || !lazy_nest_enabled()
+        || !lazy_frame_free_enabled()
+    {
+        return false;
+    }
+    let mut brackets = 0;
+    for i in proto.code.iter() {
+        match i {
+            Instr::PushHandler { .. } | Instr::PushFinally { .. } => brackets += 1,
+            // A routed `break`/`continue` stays off the frame's routing when
+            // every bracket is lazy (`LazyPlan::jump_route`).
+            Instr::JumpFinally { .. } if !lazy_jump_enabled() => return false,
+            Instr::TailCall { .. }
+            | Instr::IterDelegate { .. }
+            | Instr::IterNext { .. }
+            | Instr::IterPrime { .. }
+            | Instr::IterClose { .. }
+            | Instr::IterCloseQuiet { .. }
+            | Instr::IterCloseFinally { .. }
+            | Instr::IterToArray { .. }
+            | Instr::GetIterator { .. }
+            | Instr::GetIteratorObj { .. }
+            | Instr::GetAsyncIterator { .. } => return false,
+            _ => {}
+        }
+    }
+    brackets != 0 && lazy_tries(&proto.code).tries.len() == brackets
+}
+
+/// The innermost lazy `finally` bracket `ip` is in the body of: where a return
+/// there goes, and the completion registers it fills. A lazy catch in between
+/// is left on the way, as the routing discards its handler.
+fn lazy_finally(lazy: &[LazyTry], ip: usize) -> Option<(u32, u16, u16)> {
+    lazy.iter()
+        .filter(|t| t.finally.is_some() && t.push < ip && ip < t.pop)
+        .max_by_key(|t| t.push)
+        .and_then(|t| t.finally)
+}
+
+/// The handler of a `try` is only ever read by what happens after the body is
+/// left some way other than its `PopHandler`: a throw unwinding this frame, or
+/// a bail, whose interpreter must find the frame as it would have left it. Both
+/// leave compiled code through the epilogue, so the push can wait there and a
+/// body that finishes costs nothing.
+///
+/// That takes a body with one way in and one way out: nothing outside jumps into
+/// it, every branch in it stays in it and runs forward (a loop head is an entry
+/// from the interpreter, which has pushed), and no `break` or `continue` that
+/// routes through it, which reads the frame's handlers.
+///
+/// A `finally` bracket (`try ... finally`, a for-of's body, which paid a push and
+/// a pop per iteration) is the same, and may also return: a return is a jump to
+/// the innermost lazy `finally` with the completion the routing would deposit,
+/// or through the frame's routing when the `finally` around it is pushed. A
+/// catch's body may return too: its handler is only left on the way.
+///
+/// A bracket may hold others when they are lazy too, their `finally` blocks
+/// included: the exit stub of an inner one pushes the outer handlers first, as
+/// the interpreter would hold them, and an inner `EndFinally` resuming a return
+/// goes on to the next lazy `finally` out (see `pushed`, which tells where no
+/// handler can be on the frame for such a static routing).
+fn lazy_tries(code: &[Instr]) -> LazyPlan {
+    let n = code.len();
+    let nest = lazy_nest_enabled();
+    struct Bracket {
+        push: usize,
+        /// The last pop: the body is `(push, pop)`.
+        pop: usize,
+        /// Every pop, in order: `try ... catch ... finally` pops its `finally`
+        /// once on the way out of the `try` and again out of the catch.
+        pops: Vec<usize>,
+        packed: u64,
+        finally: Option<(u32, u16, u16)>,
+        /// A `finally` bracket's closing `EndFinally`.
+        end: Option<usize>,
+        parent: Option<usize>,
+    }
+    // Pair each push with its pops: the brackets nest as the statements do.
+    // A catch block runs under the `finally` of its `try ... catch ...
+    // finally`, which the `try`'s way out has already popped: it opens again
+    // at the catch, for the catch's own way out to pop.
+    let mut brs: Vec<Bracket> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut reopen: FxHashMap<usize, usize> = FxHashMap::default();
+    for (ip, ins) in code.iter().enumerate() {
+        if let Some(&f) = reopen.get(&ip) {
+            if !open.contains(&f) && !brs[f].pops.is_empty() {
+                open.push(f);
+            }
+        }
+        let (packed, finally) = match *ins {
+            Instr::PushHandler { catch_target, catch_reg } => {
+                (((catch_target as u64) << 16) | catch_reg as u64, None)
+            }
+            Instr::PushFinally { target, kind_reg, val_reg } => (
+                ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64,
+                Some((target, kind_reg, val_reg)),
+            ),
+            Instr::PopHandler | Instr::PopFinally => {
+                let fin = matches!(ins, Instr::PopFinally);
+                match open.pop() {
+                    Some(b) if brs[b].finally.is_some() == fin => {
+                        brs[b].pop = ip;
+                        brs[b].pops.push(ip);
+                    }
+                    _ => return LazyPlan::none(n),
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let end = finally.and_then(|(target, k, v)| {
+            (target as usize..n).find(|&e| {
+                matches!(code[e], Instr::EndFinally { kind_reg, val_reg } if kind_reg == k && val_reg == v)
+            })
+        });
+        let parent = open.last().copied();
+        if let (Instr::PushHandler { catch_target, .. }, Some(p)) = (*ins, parent) {
+            if brs[p].finally.is_some_and(|(t, _, _)| catch_target < t) {
+                reopen.insert(catch_target as usize, p);
+            }
+        }
+        open.push(brs.len());
+        brs.push(Bracket { push: ip, pop: usize::MAX, pops: Vec::new(), packed, finally, end, parent });
+    }
+    if !open.is_empty() || brs.iter().any(|b| b.finally.is_some_and(|(t, _, _)| b.pop >= t as usize)) {
+        return LazyPlan::none(n);
+    }
+    let mut push_of = vec![None; n];
+    let mut pop_of = vec![None; n];
+    let mut end_of = vec![None; n];
+    for (b, br) in brs.iter().enumerate() {
+        push_of[br.push] = Some(b);
+        for &p in &br.pops {
+            pop_of[p] = Some(b);
+        }
+        if let Some(e) = br.end {
+            end_of[e] = Some(b);
+        }
+    }
+    // Inner brackets first: a body may hold only lazy ones. A bracket whose
+    // push, pop or `EndFinally` is in this body is nested in it (they pair as
+    // the statements nest), and a lazy one's own nested brackets, `finally`
+    // blocks included, lie inside its body.
+    let mut lazy = vec![false; brs.len()];
+    // A `break`/`continue` routed statically (`LazyPlan::jump_route`): the
+    // brackets enclosing both it and its target must be exactly the `floor`
+    // its loop recorded, and it may not jump back into the body it is in.
+    let jumps = nest && lazy_jump_enabled();
+    let jump_ok = |b: usize, ip: usize, target: u32, floor: u16| {
+        let t = target as usize;
+        let enclosing = brs.iter().filter(|c| c.push < ip && ip < c.pop && c.push < t && t <= c.pop).count();
+        jumps && enclosing == floor as usize && !(brs[b].push < t && t <= ip)
+    };
+    for b in (0..brs.len()).rev() {
+        let (push, pop) = (brs[b].push, brs[b].pop);
+        let child = |c: Option<usize>| c.is_some_and(|c| nest && lazy[c]);
+        let closed = (push + 1..pop).all(|ip| match code[ip] {
+            Instr::TailCall { .. } => false,
+            Instr::JumpFinally { target, floor } => jump_ok(b, ip, target, floor),
+            Instr::PushHandler { .. } | Instr::PushFinally { .. } => {
+                child(push_of[ip])
+                    && push_of[ip].is_some_and(|c| brs[c].finally.is_none() || brs[c].end.is_some_and(|e| e < pop))
+            }
+            // Its own first pop (out of the `try`, before the catch) too.
+            Instr::PopHandler | Instr::PopFinally => pop_of[ip] == Some(b) || child(pop_of[ip]),
+            Instr::EndFinally { .. } => child(end_of[ip]),
+            // A return goes to the innermost lazy `finally` around it, or
+            // through the frame's routing to the pushed one, which a lazy
+            // bracket never encloses; a catch on the way is only left.
+            Instr::Return { .. } | Instr::ReturnUndefined => brs[b].finally.is_some() || nest,
+            _ => true,
+        }) && code.iter().enumerate().all(|(at, i)| {
+            // A routed jump leaves the body (`jump_ok`), forward or back; so
+            // does the jump to this bracket's own `finally` after its first
+            // pop (the `try`'s way out, before the catch block).
+            let leaves = jumps && matches!(i, Instr::JumpFinally { .. });
+            let own_exit = at > 0 && pop_of[at - 1] == Some(b) && matches!(i, Instr::Jump { .. });
+            control_targets(i).into_iter().flatten().all(|target| {
+                let target = target as usize;
+                let inside = at > push && at < pop;
+                if inside {
+                    (target > at && (target <= pop || leaves))
+                        || (leaves && target <= push)
+                        || (own_exit && brs[b].finally.is_some_and(|(t, _, _)| t as usize == target))
+                } else {
+                    at == push || target <= push || target > pop
+                }
+            })
+        });
+        lazy[b] = closed;
+    }
+    let mut pushed = vec![false; n];
+    let mut tries = Vec::new();
+    let mut brackets = Vec::with_capacity(brs.len());
+    for (b, br) in brs.iter().enumerate() {
+        brackets.push(PlanBracket { push: br.push, pop: br.pop, finally: br.finally, end: br.end, lazy: lazy[b] });
+        if !lazy[b] {
+            pushed[br.push + 1..br.pop].fill(true);
+            continue;
+        }
+        let mut chain = vec![(br.packed, br.finally.is_some())];
+        let mut up = br.parent;
+        while let Some(p) = up.filter(|&p| lazy[p]) {
+            chain.push((brs[p].packed, brs[p].finally.is_some()));
+            up = brs[p].parent;
+        }
+        chain.reverse();
+        tries.push(LazyTry { push: br.push, pop: br.pop, pops: br.pops.clone(), finally: br.finally, chain });
+    }
+    if !nest {
+        // The former rule: no `EndFinally` is routed statically.
+        pushed.fill(true);
+    }
+    if !jumps {
+        // ...and no `break`/`continue` either.
+        brackets.clear();
+    }
+    LazyPlan { tries, pushed, brackets }
+}
+
+/// B206 direct entry: whether the loop headed at a yield head `head` may run
+/// its region straight from the Tier C body (`jit_tierc_run_region`), and the
+/// clean exits the body can resume at. The loop `[head, back]` (`back` the
+/// last `Jump` to `head`) must hold only ops that neither call (except the
+/// pure `charCodeAt` and DataView accessor lanes) nor reach a captured
+/// variable, so the region needs no interpreter frame: a frame-free Tier C
+/// activation has none. The exits are the loop's jump targets outside it and
+/// `back + 1`, kept only where they are jump targets of the body (where the
+/// emitted code assumes nothing cached). Any other resume ip leaves through a
+/// dynamic bail. `None`: the plain yield bail.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn yield_entry_exits(proto: &FuncProto, head: usize, targeted: &[bool]) -> Option<Vec<u32>> {
+    let code = &proto.code;
+    let back = code
+        .iter()
+        .enumerate()
+        .skip(head)
+        .filter(|(_, i)| matches!(i, Instr::Jump { target } if *target as usize == head))
+        .map(|(ip, _)| ip)
+        .max()?;
+    let mut exits = vec![back as u32 + 1];
+    for ip in head..=back {
+        let ins = &code[ip];
+        let pure = match *ins {
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadBool { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::Move { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Not { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::GetIndex { .. }
+            | Instr::SetIndex { .. }
+            | Instr::GetProp { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::MathOp { .. } => true,
+            Instr::CallMethod { name, .. } => {
+                let key = proto.string_constants.get(name as usize).map(String::as_str).unwrap_or("");
+                key == "charCodeAt" || crate::vm::typedarray::dataview_proto_slot(key).is_some()
+            }
+            _ => false,
+        };
+        if !pure {
+            return None;
+        }
+        if let Some(t) = bytecode_control_target(ins) {
+            if (t as usize) < head || t as usize > back {
+                exits.push(t);
+            }
+        }
+    }
+    exits.retain(|&e| targeted.get(e as usize) == Some(&true));
+    exits.sort_unstable();
+    exits.dedup();
+    Some(exits)
+}
+
 /// Compile the WHOLE body of `proto` to native code via the memory-path op
 /// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
 /// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/
@@ -3014,6 +3409,9 @@ pub(crate) fn compile_proto_mem(
     prop_shape: &PropShapePlan,
     // The class-method lane's plan (`ClassReadPlan`).
     class_read: &crate::codegen::ClassReadPlan,
+    // `LoadClassValue` constants by class id (`Vm::class_value_fixed`), valid
+    // while `Vm::mi_class_epoch` is the second value.
+    class_consts: (&FxHashMap<u32, u64>, u32),
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -3055,6 +3453,9 @@ pub(crate) fn compile_proto_mem(
     // A Python body (see `codegen::py`).
     let py = has_py_ops(&proto.code);
     let protected_returns = tierc_protected_return_map(&proto.code);
+    // `ZIPP_NO_RETURN_ROUTE=1`: a `return` inside `try … finally` bails (the
+    // same-binary A/B).
+    let route_returns = meter.is_none() && !py && return_route_enabled();
     let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
     if method_own_slot_direct && crate::jitlog_enabled() {
         let sites = proto
@@ -3150,6 +3551,13 @@ pub(crate) fn compile_proto_mem(
     let mut rc_pending = FcEffect::Clear;
     if rc_slots != 0 && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C receiver cache slots={rc_slots}");
+    }
+    // Typed-array receivers kept across calls (`emit_ta_cache_get`).
+    let ta_regs = ta_cache_regs(proto, meter.is_some());
+    let ta_read_stub = ops.new_dynamic_label();
+    let ta_write_stub = ops.new_dynamic_label();
+    if !ta_regs.is_empty() && crate::jitlog_enabled() {
+        eprintln!("[jit] fn{func_id} Tier-C typed-array cache regs={ta_regs:?}");
     }
     if !class_read.is_empty() && crate::jitlog_enabled() {
         eprintln!("[jit] fn{func_id} Tier-C class-read lanes={}", class_read.len());
@@ -3331,7 +3739,13 @@ pub(crate) fn compile_proto_mem(
     // receiver cache's slots above them (rounded up to 16 bytes).
     let fc_save_off = frame_core;
     let rc_off = fc_save_off + 16 * fc_slots as i32;
-    let frame: i32 = rc_off + (8 * rc_slots as i32 + 15) / 16 * 16;
+    // The typed-array cache's records above the receiver cache, 48 bytes each
+    // (40 used) so the frame keeps its alignment.
+    let ta_off = rc_off + (8 * rc_slots as i32 + 15) / 16 * 16;
+    let frame: i32 = ta_off + TA_CACHE_STRIDE * ta_regs.len() as i32;
+    let ta_slot_of = |reg: u16| -> Option<i32> {
+        ta_regs.iter().position(|&r| r == reg).map(|k| ta_off + TA_CACHE_STRIDE * k as i32)
+    };
     let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
     let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
     let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
@@ -3360,7 +3774,7 @@ pub(crate) fn compile_proto_mem(
         .code
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    let precise_entry_pins = std::env::var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
+    let precise_entry_pins = crate::env_var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
     let leaf_needs_version_pins = leaf_plan
         .values()
         .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
@@ -3414,7 +3828,7 @@ pub(crate) fn compile_proto_mem(
     // at their sole growth sites. Loading them rdi-relative avoids three Win64
     // helper round-trips on every tiny Tier-C entry. The off-switch restores
     // the historical helper prologue for a same-binary process A/B.
-    let direct_entry_bases = std::env::var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
+    let direct_entry_bases = crate::env_var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
     if precise_entry_pins && crate::jitlog_enabled() {
         eprintln!(
             "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={} bases={}",
@@ -3442,9 +3856,31 @@ pub(crate) fn compile_proto_mem(
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
     );
+    // Tier O's tier-up: the entry that takes the count to zero asks for it
+    // (`jit_opt_tier_up`) and runs on, here.
+    if heap.opt_tier_up != 0 {
+        let past = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rax, QWORD heap.opt_tier_up as i64
+            ; sub DWORD [rax], 1
+            ; jnz => past
+            ; mov rcx, rdi
+            ; mov edx, func_id as i32
+            ; mov rax, QWORD crate::vm::jit_opt_tier_up as *const () as i64
+            ; call rax
+            ; => past
+        );
+    }
     for k in 0..fc_slots {
         let off = fc_save_off + 16 * k as i32;
         dynasm!(ops ; movdqu [rsp + off], Rx(FloatCache::FIRST_XMM + k as u8));
+    }
+    // Every typed-array record starts with epoch word 0, which matches no
+    // epoch (they start at 1): whatever the other words hold, a read
+    // through it either goes the general way (a count of 0) or fills.
+    for k in 0..ta_regs.len() {
+        let off = ta_off + TA_CACHE_STRIDE * k as i32;
+        dynasm!(ops ; mov QWORD [rsp + off + 32], 0);
     }
     if str_append_cursor.is_some() {
         dynasm!(ops
@@ -3585,6 +4021,55 @@ pub(crate) fn compile_proto_mem(
         v
     };
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
+    // Each lazy `try`, the exit its body takes, and for each ip the one it is
+    // in. The metered exits are out of line, on the real epilogue.
+    // (A suspension leaves a body in a generator or an async function and comes
+    // back into it, with the handler pushed and no pop to come.)
+    let lazy_plan = if py || meter.is_some() || proto.is_generator || proto.is_async || !lazy_try_enabled() {
+        LazyPlan::none(n)
+    } else {
+        lazy_tries(&proto.code)
+    };
+    let lazy_try = &lazy_plan.tries;
+    // The jump completions (target, floor) each lazy `finally`'s `EndFinally`
+    // can resume with: every routed `break`/`continue` that runs it.
+    let mut jump_ends: FxHashMap<usize, Vec<(u32, u16)>> = FxHashMap::default();
+    if !lazy_plan.brackets.is_empty() {
+        for (ip, i) in proto.code.iter().enumerate() {
+            let Instr::JumpFinally { target, floor } = *i else {
+                continue;
+            };
+            let mut at = ip;
+            for _ in 0..lazy_plan.brackets.len() {
+                let JumpRoute::Finally(ft, _, _) = lazy_plan.jump_route(at, target as usize) else {
+                    break;
+                };
+                let Some(end) = lazy_plan.finally_end(ft) else {
+                    break;
+                };
+                let resumes = jump_ends.entry(end).or_default();
+                if !resumes.contains(&(target, floor)) {
+                    resumes.push((target, floor));
+                }
+                at = end;
+            }
+        }
+    }
+    if crate::jitlog_enabled() {
+        let brackets = proto
+            .code
+            .iter()
+            .filter(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }))
+            .count();
+        if brackets != 0 {
+            eprintln!("[jit] fn{func_id} lazy brackets {}/{brackets}", lazy_try.len());
+        }
+    }
+    let lazy_exit: Vec<dynasmrt::DynamicLabel> = lazy_try.iter().map(|_| ops.new_dynamic_label()).collect();
+    let mut lazy_at: Vec<Option<dynasmrt::DynamicLabel>> = vec![None; n];
+    for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
+        lazy_at[t.push + 1..t.pop].fill(Some(exit));
+    }
     // B118 fused compare→branch (the region rule, Tier-C shape): `cmp {dst} ;
     // JumpIfTrue/False{cond: dst}` at the very next ip fuses (see
     // `emit_fused_cmp_branch_head`). Detection only — the JumpIf stays emitted
@@ -3601,6 +4086,55 @@ pub(crate) fn compile_proto_mem(
             Instr::JumpIfFalse { cond, target } if cond == dst => Some((true, target)),
             Instr::JumpIfTrue { cond, target } if cond == dst => Some((false, target)),
             _ => None,
+        }
+    };
+    // Where control can arrive other than from the previous instruction:
+    // every jump, `finally` and `catch` target (the entry, the loop heads
+    // `run_at` enters at and the `finally` routings' landings are among
+    // them, or ip 0).
+    let mut jump_target = vec![false; n];
+    for i in &proto.code {
+        if let Some(t) = crate::codegen::fn_int::bytecode_control_target(i) {
+            if let Some(slot) = jump_target.get_mut(t as usize) {
+                *slot = true;
+            }
+        }
+    }
+    // The Int constant register `reg` holds at `ip` because the instruction
+    // before it, the only way to `ip`, was `LoadInt` into it.
+    let prev_load_int = |ip: usize, reg: u16| -> Option<i32> {
+        if ip == 0 || jump_target[ip] || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        match proto.code[ip - 1] {
+            Instr::LoadInt { dst, val } if dst == reg => Some(val),
+            _ => None,
+        }
+    };
+    // A fused compare whose other operand the previous instruction set to an
+    // Int constant, reached only from it: `(register, constant, comparison
+    // as register CMP constant)`, the constant compared as an immediate.
+    let cmp_const_operand = |ip: usize, a: u16, b: u16, cmp: Cmp| -> Option<(u16, i32, Cmp)> {
+        if ip == 0 || jump_target[ip] || a == b || !crate::codegen::emit_misc::const_cmp_enabled() {
+            return None;
+        }
+        let Instr::LoadInt { dst, val } = proto.code[ip - 1] else {
+            return None;
+        };
+        if dst == b {
+            Some((a, val, cmp))
+        } else if dst == a {
+            // `c CMP b` is `b CMP' c` with the operands swapped.
+            let flipped = match cmp {
+                Cmp::Lt => Cmp::Gt,
+                Cmp::Le => Cmp::Ge,
+                Cmp::Gt => Cmp::Lt,
+                Cmp::Ge => Cmp::Le,
+                other => other,
+            };
+            Some((b, val, flipped))
+        } else {
+            None
         }
     };
     // The loop heads the interpreter's back-edge may enter this body at
@@ -3716,8 +4250,52 @@ pub(crate) fn compile_proto_mem(
             ; jmp => epilogue
         );
     }
+    // B206 direct entry plans: yield head -> the exits it may continue at, and
+    // each of its back-edge `Jump`s -> the head (`yield_entry_exits`). A head
+    // whose loop has no plain back-edge, or sits in a lazy `try`, keeps the
+    // plain yield bail.
+    let mut yield_entry: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+    let mut yield_backedge: FxHashMap<usize, usize> = FxHashMap::default();
+    // A body that may run frame-free with handler ops (`lazy_frame_free`)
+    // keeps the plain yield bail: a region's handler push writes the top
+    // frame, which would be its caller's.
+    let frame_free_body = meter.is_none() && lazy_frame_free(proto);
+    if tierc_yield_entry_enabled() && !frame_free_body {
+        for &h in yield_heads {
+            let h = h as usize;
+            if h >= n || lazy_at[h].is_some() {
+                continue;
+            }
+            let Some(exits) = yield_entry_exits(proto, h, &targeted) else {
+                continue;
+            };
+            let backs: Vec<usize> = (h + 1..n)
+                .filter(|&j| matches!(proto.code[j], Instr::Jump { target } if target as usize == h))
+                .collect();
+            if backs.is_empty() || backs.iter().any(|&j| lazy_at[j].is_some()) {
+                continue;
+            }
+            for j in backs {
+                yield_backedge.insert(j, h);
+            }
+            yield_entry.insert(h, exits);
+        }
+    }
+    // A clean return, which leaves a lazy body with nothing to push.
+    let clean_exit = epilogue;
+    let loop_align = crate::codegen::emit_misc::jit_loop_align();
+    let loop_heads = if loop_align != 0 && n != 0 {
+        crate::codegen::emit_misc::loop_heads(&proto.code, 0, n - 1)
+    } else {
+        Vec::new()
+    };
     for ip in 0..n {
+        if loop_align != 0 && loop_heads[ip] {
+            crate::codegen::emit_misc::align_loop_head(&mut ops, loop_align);
+        }
         dynasm!(ops ; => labels[ip]);
+        // Every way out of a lazy `try`'s body, for this op's arms below.
+        let epilogue = lazy_at[ip].unwrap_or(epilogue);
         if fc_slots != 0 {
             // What the previous op did to the registers the cache holds, then
             // this op's entry: a jump target starts with nothing cached.
@@ -3749,11 +4327,69 @@ pub(crate) fn compile_proto_mem(
         // the bail; the ops after it still emit (dead but label-linked).
         // Metered bodies never carry heads (the caller passes none): a
         // charge-then-bail would double-charge on replay.
-        if !yield_heads.is_empty() && yield_heads.contains(&(ip as u32)) {
+        if !yield_heads.is_empty() && yield_heads.contains(&(ip as u32)) && !yield_entry.contains_key(&ip) {
             dynasm!(ops
                 ; mov DWORD [rsi], ip as i32
                 ; jmp => epilogue
             );
+        }
+        // B206 direct entry (`yield_entry`): this body runs the loop's first
+        // iteration itself and, at the back-edge, hands the loop to its
+        // region as the interpreter's back-edge would. The helper answers the
+        // ip the region resumed at: a clean exit (or the head, an entry the
+        // region refused) continues in this body, anything else leaves there
+        // as a bail. `u32::MAX`: nothing ran, and the jump below takes the
+        // next iteration here. A frame-free activation paid an interpreter
+        // frame plus the back-edge entry per call: a crc32 over a 64-byte
+        // frame, an `fnv` over a short string.
+        if let Some(&head) = yield_backedge.get(&ip) {
+            let exits = &yield_entry[&head];
+            let not_run = ops.new_dynamic_label();
+            let helper = crate::vm::jit_tierc_run_region as *const () as usize;
+            dynasm!(ops
+                ; mov rcx, rdi                        // vm
+                ; mov rdx, rbx                        // this activation's window
+                ; mov r8d, head as i32                // loop head
+                ; mov r9d, func_id as i32
+                ; mov rax, QWORD helper as i64
+                ; call rax
+                ; cmp eax, -1
+                ; je => not_run
+            );
+            // A region exit can run a materialization that allocates. The
+            // resume ip waits in the bail slot across the refetch (a callee
+            // may spill into its home space, so not on the stack); the slot
+            // holds `NO_BAIL` again before the body goes on.
+            if refetch_pinned {
+                dynasm!(ops ; mov DWORD [rsi], eax);
+                emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                dynasm!(ops
+                    ; mov eax, DWORD [rsi]
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                );
+            }
+            // Bit 31: a throw is pending; leave at the resume ip.
+            let leave = ops.new_dynamic_label();
+            dynasm!(ops
+                ; test eax, eax
+                ; js => leave
+            );
+            for &e in exits.iter().chain(std::iter::once(&(head as u32))) {
+                dynasm!(ops
+                    ; cmp eax, e as i32
+                    ; je => labels[e as usize]
+                );
+            }
+            dynasm!(ops
+                ; => leave
+                ; and eax, 0x7FFF_FFFF
+                ; mov DWORD [rsi], eax
+                ; jmp => epilogue
+                ; => not_run
+            );
+        }
+        if lazy_try.iter().any(|t| t.push == ip || t.pops.contains(&ip)) {
+            continue;
         }
         // These bytecodes were materialized exactly by the fused captured-int
         // helper at their only predecessor. No internal jump may target them
@@ -4196,6 +4832,11 @@ pub(crate) fn compile_proto_mem(
                 if crate::codegen::arr_set_mirror_enabled() {
                     emit_arr_mirror_set(&mut ops, obj, key, val, heap.inline_store_lane_ok, set_done);
                 }
+                // Then a typed array this register held before.
+                let after_call = ops.new_dynamic_label();
+                if let Some(slot) = ta_slot_of(obj) {
+                    emit_ta_cache_set(&mut ops, slot, obj, key, val, ta_write_stub, set_done, after_call);
+                }
                 // The region path's generic element write: dense store/grow and
                 // unpinned-TypedArray number stores; observable coercion or
                 // exotic receivers deopt. A grow REALLOCATES the dense Vec, so
@@ -4207,6 +4848,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov r9, [rbx + dreg(val)]
                     ; mov rax, QWORD heap.set_index as i64
                     ; call rax
+                    ; => after_call
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
@@ -4322,11 +4964,9 @@ pub(crate) fn compile_proto_mem(
                 idx,
                 next,
             } => {
-                // The REGION path's `jit_iter_next` verbatim: the dense-array
-                // positional walk plus the intrinsic array/collection/regexp
-                // iterator steps; everything else deopts before state moves.
-                // The helper runs the loop safe point and can allocate, so
-                // pinned tables re-derive afterwards.
+                // The REGION path's `jit_iter_next` verbatim. The helper runs
+                // the loop safe point, can allocate, and a user `next` runs
+                // anything, so pinned tables re-derive afterwards.
                 let packed = ((iter as u64) << 48)
                     | ((next as u64) << 32)
                     | ((value_dst as u64) << 16)
@@ -4341,7 +4981,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rbx                        // frame register window
                     ; mov r8, QWORD packed as i64         // iter/next/value/done regs
-                    ; mov r9d, idx as i32                 // dense-Array cursor reg
+                    ; mov r9d, (idx as u32 | (proto.reg_count.max(1) as u32) << 16) as i32 // cursor reg | window size << 16
                     ; mov rax, QWORD heap.iter_next as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -4483,11 +5123,96 @@ pub(crate) fn compile_proto_mem(
                 );
             }
             Instr::EndFinally { kind_reg, val_reg } => {
-                // A normal completion goes on to the next op and a
-                // `break`/`continue` jump goes on routing toward its target
-                // (`jit_end_finally_route`); a return or a throw declines into
-                // the interpreter's unwinding.
-                let helper = crate::vm::jit_end_finally_route as *const () as usize;
+                // A return resuming in a lazy body goes to that body's
+                // `finally`, whose handler the frame does not hold; with none
+                // and no handler on the frame either (`LazyPlan::pushed`), it
+                // returns. Lazy brackets hold only lazy ones, so no pushed
+                // `finally` comes first.
+                let next_finally = lazy_finally(lazy_try, ip);
+                let static_return = next_finally.is_some() || !lazy_plan.pushed[ip];
+                let resumes = jump_ends.get(&ip);
+                if static_return || resumes.is_some() {
+                    // A normal completion goes on, a return as above, a routed
+                    // `break`/`continue` this `finally` was entered for goes on
+                    // statically (`LazyPlan::jump_route`); the rest (a throw)
+                    // takes the helper below, or bails inside a lazy body,
+                    // whose exit pushes the handlers the interpreter needs.
+                    let routed = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(kind_reg)]
+                        ; mov r10, QWORD Value::int(0).bits() as i64
+                        ; cmp rax, r10
+                        ; je => labels[ip + 1]
+                    );
+                    if static_return {
+                        let not_return = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov r10, QWORD Value::int(1).bits() as i64
+                            ; cmp rax, r10
+                            ; jne => not_return
+                            ; mov rax, [rbx + dreg(val_reg)]
+                        );
+                        if let Some((target, k, v)) = next_finally {
+                            dynasm!(ops
+                                ; mov [rbx + dreg(v)], rax
+                                ; mov rax, QWORD Value::int(1).bits() as i64
+                                ; mov [rbx + dreg(k)], rax
+                                ; jmp => labels[target as usize]
+                            );
+                        } else {
+                            dynasm!(ops
+                                ; mov DWORD [rsi], NO_BAIL as i32
+                                ; jmp => clean_exit
+                            );
+                        }
+                        dynasm!(ops ; => not_return);
+                    }
+                    for &(target, floor) in resumes.into_iter().flatten() {
+                        let other = ops.new_dynamic_label();
+                        let kind = Value::int(3 | ((floor as i32) << 2)).bits();
+                        dynasm!(ops
+                            ; mov r10, QWORD kind as i64
+                            ; cmp rax, r10
+                            ; jne => other
+                            ; mov r11, [rbx + dreg(val_reg)]
+                            ; mov r10, QWORD Value::int(target as i32).bits() as i64
+                            ; cmp r11, r10
+                            ; jne => other
+                        );
+                        match lazy_plan.jump_route(ip, target as usize) {
+                            JumpRoute::Target => {
+                                dynasm!(ops ; jmp => labels[target as usize]);
+                            }
+                            JumpRoute::Finally(ft, k, v) => {
+                                dynasm!(ops
+                                    ; mov [rbx + dreg(k)], rax
+                                    ; mov [rbx + dreg(v)], r11
+                                    ; jmp => labels[ft as usize]
+                                );
+                            }
+                            JumpRoute::Helper => {
+                                dynasm!(ops ; jmp => routed);
+                            }
+                        }
+                        dynasm!(ops ; => other);
+                    }
+                    // The helper reads the top frame, which a frame-free
+                    // activation does not own.
+                    if frame_free_body || lazy_try.iter().any(|t| t.push < ip && ip < t.pop) {
+                        dynasm!(ops ; jmp => bail);
+                    }
+                    dynasm!(ops ; => routed);
+                }
+                // A normal completion goes on to the next op, a `break` or
+                // `continue` jump and a return go on routing toward their
+                // target (`jit_end_finally_route`, `jit_end_finally_returns`);
+                // a throw declines into the interpreter's unwinding.
+                let helper = if route_returns {
+                    crate::vm::jit_end_finally_returns as *const () as usize
+                } else {
+                    crate::vm::jit_end_finally_route as *const () as usize
+                };
+                let returns = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(kind_reg)]
@@ -4500,8 +5225,40 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, -1                         // END_FINALLY_NEXT
                     ; je => labels[ip + 1]
                 );
+                if route_returns {
+                    dynasm!(ops
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                }
                 emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                dynasm!(ops
+                    ; => returns
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                    ; mov rax, [rbx + dreg(val_reg)]
+                    ; jmp => clean_exit
+                );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::JumpFinally { target, floor } if !matches!(lazy_plan.jump_route(ip, target as usize), JumpRoute::Helper) => {
+                // Out of lazy brackets only (`LazyPlan::jump_route`): straight
+                // to the target, or into the first lazy `finally` on the way
+                // with the jump completion the routing would deposit.
+                match lazy_plan.jump_route(ip, target as usize) {
+                    JumpRoute::Finally(ft, k, v) => {
+                        let kind = Value::int(3 | ((floor as i32) << 2)).bits();
+                        dynasm!(ops
+                            ; mov rax, QWORD kind as i64
+                            ; mov [rbx + dreg(k)], rax
+                            ; mov rax, QWORD Value::int(target as i32).bits() as i64
+                            ; mov [rbx + dreg(v)], rax
+                            ; jmp => labels[ft as usize]
+                        );
+                    }
+                    _ => {
+                        dynasm!(ops ; jmp => labels[target as usize]);
+                    }
+                }
             }
             Instr::JumpFinally { target, floor } => {
                 // The interpreter arm's routing (`jit_jump_finally`): the
@@ -4543,6 +5300,12 @@ pub(crate) fn compile_proto_mem(
                 // interpreter on the served chains; a Proxy anywhere, an
                 // object key's observable ToString, or a non-object RHS
                 // declines so the interpreter re-executes. PURE — no refetch.
+                // A present element of a dense array answers first, through
+                // the array mirror the helper settles.
+                let done = ops.new_dynamic_label();
+                if arr_mirror_has_enabled() {
+                    emit_arr_mirror_has(&mut ops, dst, obj, key, done);
+                }
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
                     ; mov rdx, [rbx + dreg(key)]         // key bits
@@ -4555,6 +5318,30 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
+            }
+            Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: true,
+            } => {
+                // `#x in obj` for the running callee: no user code, no
+                // allocation; anything unresolved declines purely.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_private_in_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (key as u64) << 16,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::ObjectKeys {
                 dst,
@@ -4584,6 +5371,36 @@ pub(crate) fn compile_proto_mem(
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ObjectValues {
+                dst,
+                obj,
+                callee,
+                this_v,
+            }
+            | Instr::ObjectEntries {
+                dst,
+                obj,
+                callee,
+                this_v,
+            } if !py => {
+                // `Object.values(o)` / `Object.entries(o)`: the region's
+                // `jit_obj_enum_ic`, with the call protocol.
+                let op: u64 = if matches!(proto.code[ip], Instr::ObjectValues { .. }) { 1 } else { 2 };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_obj_enum_ic as *const () as usize,
+                    packed_fip,
+                    obj as u64 | (callee as u64) << 16 | (this_v as u64) << 32 | op << 56,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::NewObject { dst, hint } => {
                 // Allocation is a GC safe point.  The native frame's Values
@@ -4720,6 +5537,7 @@ pub(crate) fn compile_proto_mem(
                 // (same fold, same thread-local transition tree), so the two
                 // forms are observably identical; the baked helper keeps only
                 // the checks a compile cannot freeze (window bounds, GC poll).
+                let mut ready_done = None;
                 let baked = if super::finalize_baked_enabled() {
                     proto
                         .static_key_plans
@@ -4751,6 +5569,7 @@ pub(crate) fn compile_proto_mem(
                     let thin = crate::heap::thin_alloc_enabled()
                         && (val_base as usize + count as usize) <= proto.reg_count as usize;
                     if thin {
+                        ready_done = emit_ready_literal(&mut ops, proto, plan, shape, val_base, count, dst);
                         let helper = crate::vm::jit_finalize_object_thin as *const () as usize;
                         dynasm!(ops
                             ; mov rcx, rdi
@@ -4800,6 +5619,9 @@ pub(crate) fn compile_proto_mem(
                 }
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                if let Some(done) = ready_done {
+                    dynasm!(ops ; =>done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -5211,10 +6033,32 @@ pub(crate) fn compile_proto_mem(
                 // (boxed Int) except `>>>`, whose u32 result may exceed
                 // i32::MAX and is then boxed as an (exact) double.
                 use crate::bytecode::BitwiseOp as B;
-                load_toint32(&mut ops, a, bail);
-                dynasm!(ops ; mov r8d, eax); // stash a
-                load_toint32(&mut ops, b, bail);
-                dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                // An operand off the inline path (a BigInt, NaN/±Inf, a double
+                // past 2^63, a non-number) asks `jit_bitwise_slow`, which
+                // answers two Numbers or two BigInts and declines the rest
+                // into the bail. `decode`'s `big & 0xffffn` bailed once per
+                // call and left the call's loop to the interpreter.
+                let use_slow = tierc_bitwise_slow_enabled();
+                let slow = if use_slow { ops.new_dynamic_label() } else { bail };
+                let done_b = ops.new_dynamic_label();
+                // An operand the previous `LoadInt` set is its constant, with
+                // no load or conversion (`x | 0`, `i & 15`, `h >>> 0`).
+                match (prev_load_int(ip, a).filter(|_| a != b), prev_load_int(ip, b).filter(|_| a != b)) {
+                    (_, Some(cb)) => {
+                        load_toint32(&mut ops, a, slow);
+                        dynasm!(ops ; mov ecx, cb); // eax = a, ecx = b
+                    }
+                    (Some(ca), None) => {
+                        load_toint32(&mut ops, b, slow);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, ca); // eax = a, ecx = b
+                    }
+                    (None, None) => {
+                        load_toint32(&mut ops, a, slow);
+                        dynasm!(ops ; mov r8d, eax); // stash a
+                        load_toint32(&mut ops, b, slow);
+                        dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                    }
+                }
                 match op {
                     B::And => {
                         dynasm!(ops ; and eax, ecx);
@@ -5256,6 +6100,32 @@ pub(crate) fn compile_proto_mem(
                         );
                     }
                 }
+                if use_slow {
+                    let code = match op {
+                        B::And => 0,
+                        B::Or => 1,
+                        B::Xor => 2,
+                        B::Shl => 3,
+                        B::Shr => 4,
+                        B::Ushr => 5,
+                    };
+                    let helper = crate::vm::jit_bitwise_slow as *const () as usize;
+                    dynasm!(ops
+                        ; jmp => done_b
+                        ; => slow
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(b)]
+                        ; mov r9d, code
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+                dynasm!(ops ; => done_b);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Not { dst, a } => {
@@ -5434,16 +6304,20 @@ pub(crate) fn compile_proto_mem(
                 heap.math_two,
                 heap.math_imul_guard,
             ),
+            // Exactly one argument, as admission requires: `String()` and
+            // `String(a, b)` are admitted as generic global calls and take the
+            // call-IC arm below. Matching them here read the argument
+            // register of a zero-argument call, whatever stale value it held,
+            // and returned that value once the helper accepted strings.
             Instr::GlobalFn {
                 dst,
                 op: crate::bytecode::GlobalFn::String,
                 callee,
                 arg_base,
-                argc,
+                argc: 1,
             } => {
-                debug_assert_eq!(argc, 1);
-                // The helper implements exactly primitive tagged-Int ToString.
-                // Any other live value declines before effects and resumes the
+                // The helper implements ToString of a tagged Int, a double and
+                // a primitive string. Any other value declines before effects and resumes the
                 // interpreter at this GlobalFn bytecode, preserving Symbol and
                 // observable object-coercion semantics.
                 let helper = crate::vm::jit_int_string as *const () as usize;
@@ -5575,7 +6449,12 @@ pub(crate) fn compile_proto_mem(
                 if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
                     let t = labels[tgt as usize];
                     let ft = labels[ip + 2];
-                    emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
+                    match cmp_const_operand(ip, a, b, cmp) {
+                        Some((reg, imm, c)) => crate::codegen::emit_misc::emit_fused_cmp_imm_branch_head(
+                            &mut ops, dst, reg, imm, c, iff, t, ft,
+                        ),
+                        None => emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft),
+                    }
                 }
                 match cmp {
                     Cmp::Eq => region_poly_eq(
@@ -5600,10 +6479,37 @@ pub(crate) fn compile_proto_mem(
                         true,
                         heap.strict_eq,
                     ),
-                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
+                    // The append cursor's proof is of a body with no helper call.
+                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp, str_append_cursor.is_none()),
                 }
             }
             Instr::Jump { target } => {
+                // A back-edge is the interpreter's GC safe point; here it is
+                // one when a collection is requested (`jit_loop_gc_poll`), as
+                // in a loop region. Not in a body whose string-append cursor
+                // proof is of a loop with no helper call (nothing there
+                // allocates, so nothing it does requests a collection).
+                if (target as usize) <= ip
+                    && str_append_cursor.is_none()
+                    && crate::codegen::loop_gc_poll_enabled()
+                    && crate::codegen::loop_needs_gc_poll(&proto.code, target as usize, ip)
+                {
+                    use crate::vm::host_api::JIT_GC_REQUESTED_OFFSET;
+                    let poll = ops.new_dynamic_label();
+                    let t = labels[target as usize];
+                    dynasm!(ops
+                        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+                        ; jne => poll
+                        ; jmp => t
+                        ; => poll
+                        ; mov rcx, rdi
+                        ; mov rax, QWORD crate::vm::jit_loop_gc_poll as *const () as i64
+                        ; call rax
+                    );
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                }
                 dynasm!(ops ; jmp => labels[target as usize]);
             }
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
@@ -5643,6 +6549,7 @@ pub(crate) fn compile_proto_mem(
                     b,
                     Cmp::Lt,
                     labels[target as usize],
+                    str_append_cursor.is_none(),
                 );
             }
             Instr::JumpIfNotLe { a, b, target } => {
@@ -5655,12 +6562,17 @@ pub(crate) fn compile_proto_mem(
                     b,
                     Cmp::Le,
                     labels[target as usize],
+                    str_append_cursor.is_none(),
                 );
             }
             Instr::GetIndex { dst, obj, key } => {
                 // A present dense element first, through the array mirror.
                 let done = ops.new_dynamic_label();
                 emit_arr_mirror_get(&mut ops, dst, obj, key, done);
+                // Then a typed array this register held before.
+                if let Some(slot) = ta_slot_of(obj) {
+                    emit_ta_cache_get(&mut ops, slot, dst, obj, key, ta_read_stub, bail, done);
+                }
                 // Generic element read `a[i]` via the win64 helper (dense arrays,
                 // flat-ASCII strings, unpinned TypedArrays); `undefined` for
                 // out-of-range, deopt sentinel for receivers/keys needing
@@ -5787,9 +6699,20 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::GetProp { dst, obj, name } if !py && tierc_private_name(proto, name) => {
-                // `o.#x`: `jit_private_prop_ic` op 0 (no inline-cache way
-                // ever holds a private name). The site stays reserved.
+                // `o.#x`: the field where it lies (`PrivLane`), else
+                // `jit_private_prop_ic` op 0 (no inline-cache way ever holds
+                // a private name). The site stays reserved.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let lane_done = ops.new_dynamic_label();
+                if let Some((lane, layout)) = heap
+                    .priv_lanes
+                    .filter(|_| meter.is_none())
+                    .and_then(|p| p.lanes.get(&ip).map(|l| (l, &p.layout)))
+                {
+                    let slow = ops.new_dynamic_label();
+                    emit_priv_lane(&mut ops, lane, layout, obj, Some(dst), None, slow, lane_done);
+                    dynasm!(ops ; => slow);
+                }
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -5803,6 +6726,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => lane_done);
                 ic_site += 1;
             }
             Instr::SetProp { obj, name, val, .. } if !py && tierc_private_name(proto, name) => {
@@ -5824,8 +6748,19 @@ pub(crate) fn compile_proto_mem(
                 ic_site += 1;
             }
             Instr::SetPrivate { obj, name, val } if !py => {
-                // `o.#x = v`: op 1.
+                // `o.#x = v`: the field written where it lies for a value
+                // that is not a heap reference (`PrivLane`), else op 1.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let lane_done = ops.new_dynamic_label();
+                if let Some((lane, layout)) = heap
+                    .priv_lanes
+                    .filter(|_| meter.is_none())
+                    .and_then(|p| p.lanes.get(&ip).map(|l| (l, &p.layout)))
+                {
+                    let slow = ops.new_dynamic_label();
+                    emit_priv_lane(&mut ops, lane, layout, obj, None, Some(val), slow, lane_done);
+                    dynasm!(ops ; => slow);
+                }
                 emit_region_call_ic(
                     &mut ops,
                     ip,
@@ -5839,6 +6774,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => lane_done);
             }
             Instr::GetProp { dst, obj, name } => {
                 // 8-way inline cache (call-free on hit), then the miss helper,
@@ -5874,6 +6810,27 @@ pub(crate) fn compile_proto_mem(
                     let zero: Vec<i32> = rc.live().map(|k| rc_off + 8 * k as i32).collect();
                     emit_prop_shape_get(&mut ops, obj, dst, shape, slot, cont, est, &zero);
                     rc_pending = FcEffect::Write(dst);
+                }
+                // An accessor the site's cache keys by the receiver's shape
+                // (`AccLane`): its guards inline, the getter through its helper.
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        Some(dst),
+                        None,
+                        packed_fip,
+                        ((name as u64) << 32) | obj as u64,
+                        crate::vm::jit_acc_lane_get as *const () as usize,
+                        bail,
+                        join,
+                    );
                 }
                 // A class getter (`q.size`): looked up by `jit_getter_callee`
                 // and called natively by the arm that names its fid, with the
@@ -6014,6 +6971,9 @@ pub(crate) fn compile_proto_mem(
                         ; => join
                     );
                 }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
+                }
                 // The miss/slow helpers may have allocated (versions Vec) or
                 // frame-called a getter (nested compile) — re-derive r13/r14.
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
@@ -6070,6 +7030,27 @@ pub(crate) fn compile_proto_mem(
                         &zero,
                     );
                     rc_pending = FcEffect::None;
+                }
+                // A setter the site's cache keys by the receiver's shape
+                // (`AccLane`), as the GetProp arm's getter lane.
+                let acc_lane = heap
+                    .acc_lanes
+                    .and_then(|p| p.get(&ip))
+                    .filter(|l| meter.is_none() && l.name == name);
+                let acc_lane_join = acc_lane.map(|_| ops.new_dynamic_label());
+                if let (Some(lane), Some(join)) = (acc_lane, acc_lane_join) {
+                    emit_acc_lane(
+                        &mut ops,
+                        lane,
+                        obj,
+                        None,
+                        Some(val),
+                        packed_fip,
+                        ((name as u64) << 32) | ((obj as u64) << 16) | val as u64,
+                        crate::vm::jit_acc_lane_set as *const () as usize,
+                        bail,
+                        join,
+                    );
                 }
                 emit_ic_probe(
                     &mut ops,
@@ -6133,6 +7114,9 @@ pub(crate) fn compile_proto_mem(
                         ; je => bail
                         ; => join
                     );
+                }
+                if let Some(join) = acc_lane_join {
+                    dynasm!(ops ; => join);
                 }
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 dynasm!(ops ; => cont);
@@ -6293,6 +7277,11 @@ pub(crate) fn compile_proto_mem(
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
                     let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
+                    // Whatever the String helper declines (an array's `slice`,
+                    // a non-ASCII string) tries `jit_str_method` next.
+                    let retry_packed = crate::vm::builtin_lane_packed(key, argc).filter(|_| meter.is_none());
+                    let retry = ops.new_dynamic_label();
+                    let decline = if retry_packed.is_some() { retry } else { general };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -6302,12 +7291,30 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
-                        ; je => general
+                        ; je => decline
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    if let Some(packed) = retry_packed {
+                        let stored = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; jmp => stored
+                            ; => retry
+                            ; mov rcx, rdi                    // vm
+                            ; mov rdx, [rbx + dreg(obj)]      // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]  // &args[0..argc]
+                            ; mov r9d, packed as i32
+                            ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => stored
+                        );
+                    }
                     // The result allocation can move the heap versions Vec.
-                    // This helper cannot run user code or compile nested code,
-                    // so only r13 (not r14) needs re-deriving.
+                    // These helpers cannot run user code or compile nested
+                    // code, so only r13 (not r14) needs re-deriving.
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, None);
                     }
@@ -6352,13 +7359,24 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     lane = true;
-                } else if matches!(key, "charCodeAt" | "indexOf" | "push") && argc == 1 {
-                    // charCodeAt / indexOf / push — one-arg dedicated helpers.
+                } else if argc == 1
+                    && (matches!(key, "charCodeAt" | "indexOf" | "push")
+                        || crate::vm::str_unit_helper(key).is_some())
+                {
+                    // charCodeAt / indexOf / push / at / charAt — one-arg
+                    // dedicated helpers.
                     let helper = match key {
                         "indexOf" => heap.str_index_of,
                         "push" => heap.array_push,
-                        _ => heap.char_code_at,
+                        "charCodeAt" => heap.char_code_at,
+                        _ => crate::vm::str_unit_helper(key).expect("matched above"),
                     };
+                    // An array's `indexOf`/`at`, which the String helper
+                    // declines, tries `jit_str_method`'s Array half next.
+                    let arr_retry = crate::vm::builtin_lane_packed(key, argc)
+                        .filter(|p| (p >> 16) & 0xff != 0xff && meter.is_none());
+                    let retry = ops.new_dynamic_label();
+                    let decline = if arr_retry.is_some() { retry } else { general };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -6367,9 +7385,53 @@ pub(crate) fn compile_proto_mem(
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
+                        ; je => decline
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some(packed) = arr_retry {
+                        let ok = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; jmp => ok
+                            ; => retry
+                            ; mov rcx, rdi                    // vm
+                            ; mov rdx, [rbx + dreg(obj)]      // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]  // &args[0..argc]
+                            ; mov r9d, packed as i32
+                            ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops ; => ok);
+                    }
+                    lane = true;
+                } else if let Some(packed) = crate::vm::builtin_lane_packed(key, argc).filter(|_| meter.is_none()) {
+                    // Any other String or Array method of `jit_str_method`'s
+                    // sets, called directly past the builtin call chain
+                    // (metered bodies keep the helper route for
+                    // interpreter-parity charging).
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                        ; mov r9d, packed as i32
+                        ; mov rax, QWORD crate::vm::jit_str_method as *const () as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
                         ; je => general
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    // A result allocates a Heap slot, whose versions Vec may
+                    // move; no user code runs, so only r13 is re-derived.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
                     lane = true;
                 } else {
                     // `arr.pop()` on a plain dense Array: `jit_array_pop`, as
@@ -6387,6 +7449,72 @@ pub(crate) fn compile_proto_mem(
                             ; cmp rax, r10
                             ; je => general
                             ; mov [rbx + dreg(dst)], rax
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
+                    // `arr.shift()`, `unshift(…)`, `splice(…)`, `reverse()` and
+                    // `fill(…)` on a plain dense Array: `jit_array_mutate`, which runs the
+                    // dense arm past the builtin call chain or declines, having
+                    // done nothing, as `pop` above. Metered bodies keep the
+                    // route below (interpreter-parity charging).
+                    let mut_done = crate::vm::arr_mutate_op(key, argc).filter(|_| meter.is_none()).map(|op| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                            ; mov r9d, (op as i32) | ((argc as i32) << 8)
+                            ; mov rax, QWORD crate::vm::jit_array_mutate as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        // `splice`'s result allocates a Heap slot, which can
+                        // move the versions Vec; no user code runs.
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops
+                            ; jmp => done
+                            ; => general
+                        );
+                        done
+                    });
+                    // `view.getUint32(pos, le)` and the other DataView accessors
+                    // on a pristine view: the interpreter's own lanes, run from
+                    // here (`jit_dv_method_call`). The route below reached them
+                    // only after the method cross-call prefixes and the live
+                    // method IC had each declined. A decline (not a pristine
+                    // DataView, an argument needing coercion, an error to
+                    // throw) did nothing, and the route below redoes the call.
+                    let dv_slot = crate::vm::typedarray::dataview_proto_slot(key)
+                        .filter(|_| (1..=3).contains(&argc) && tierc_dv_lane_enabled());
+                    let dv_done = dv_slot.map(|slot| {
+                        let general = ops.new_dynamic_label();
+                        let done = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rcx, rdi                        // vm
+                            ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                            ; mov r9d, (slot as i32) | ((argc as i32) << 8)
+                            ; mov rax, QWORD crate::vm::jit_dv_method_call as *const () as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => general
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        // A BigInt getter allocates its result, which can move
+                        // the heap's versions Vec; no user code runs.
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                        }
+                        dynasm!(ops
                             ; jmp => done
                             ; => general
                         );
@@ -6547,6 +7675,12 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; => leaf_done);
                     }
                     if let Some(done) = pop_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = mut_done {
+                        dynasm!(ops ; => done);
+                    }
+                    if let Some(done) = dv_done {
                         dynasm!(ops ; => done);
                     }
                 }
@@ -6780,6 +7914,51 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
+            Instr::ObjectRest {
+                dst,
+                src,
+                exclude_start,
+                exclude_count,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed = src as u64 | (exclude_start as u64) << 16 | (exclude_count as u64) << 32;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    packed,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::MathSpread {
+                dst,
+                op,
+                callee,
+                this_v,
+                args,
+            } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed = callee as u64 | (this_v as u64) << 16 | (args as u64) << 32 | (op as u64) << 48;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    packed,
+                    1,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
             Instr::IterToArray { dst, src, count } if !py => {
                 // A plain Array first: itself, with no call protocol.
                 let general = ops.new_dynamic_label();
@@ -6983,7 +8162,47 @@ pub(crate) fn compile_proto_mem(
                     None,
                 );
             }
+            Instr::SuperGet {
+                dst,
+                home_class_id,
+                name,
+            } => {
+                // `super.name` through `jit_super_get_ic`: the class id low,
+                // the name's string constant high.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_super_get_ic as *const () as usize,
+                    packed_fip,
+                    home_class_id as u64 | (name as u64) << 32,
+                    0,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
             Instr::LoadClassValue { dst, class_id } => {
+                // A class evaluated once (`Vm::class_value_fixed`): its value
+                // as long as no class has been evaluated since this compile
+                // (`mi_class_epoch`, which every evaluation moves). Otherwise,
+                // and on a moved epoch, the helper below.
+                let fixed = if meter.is_none() { class_consts.0.get(&class_id).copied() } else { None };
+                let done = ops.new_dynamic_label();
+                if let Some(bits) = fixed {
+                    let slow = ops.new_dynamic_label();
+                    let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
+                    dynasm!(ops
+                        ; cmp DWORD [rdi + epoch_off], class_consts.1 as i32
+                        ; jne => slow
+                        ; mov rax, QWORD bits as i64
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => slow
+                    );
+                }
                 // The class binding through `jit_load_class_value_ic`; see
                 // the region arm. The flag says the activation, not the top
                 // frame, is the running code.
@@ -7001,6 +8220,7 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                dynasm!(ops ; => done);
             }
             Instr::ToStr { dst, a } => {
                 // `${a}` through `jit_to_str_ic`; see the region arm.
@@ -7064,21 +8284,55 @@ pub(crate) fn compile_proto_mem(
             } => {
                 // `new F(args…)` through `jit_new_ic`, with the call
                 // protocol; see the region arm.
+                let lane_done = cross_plan
+                    .get(&ip)
+                    .and_then(|site| site.new_lane)
+                    .map(|lane| emit_new_lane(&mut ops, lane, callee, arg_base, dst));
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    crate::vm::jit_new_ic as *const () as usize,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    refetch,
-                    None,
-                );
+                match leaf_plan.get(&ip) {
+                    Some(lp) => emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        heap.math_imul_guard,
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
+                        crate::vm::jit_new_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        refetch,
+                        None,
+                        None,
+                        None,
+                    ),
+                    None => emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        crate::vm::jit_new_ic as *const () as usize,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch,
+                        None,
+                    ),
+                }
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; =>done);
+                }
             }
             Instr::RegExpMethod {
                 dst,
@@ -7648,10 +8902,37 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Return { src } => {
-                if protected_returns[ip] {
+                if let Some((target, kind_reg, val_reg)) = lazy_finally(&lazy_try, ip) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov [rbx + dreg(val_reg)], rax
+                        ; mov rax, QWORD Value::int(1).bits() as i64
+                        ; mov [rbx + dreg(kind_reg)], rax
+                        ; jmp => labels[target as usize]
+                    );
+                } else if protected_returns[ip] && route_returns {
                     // A return completion must traverse every still-active
-                    // for-of/user finally. Resume on the untouched Return so
-                    // `route_through_finally` deposits and propagates it.
+                    // for-of/user finally: `jit_return_finally` deposits it and
+                    // answers the first one, or that none is left.
+                    let returns = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(src)]
+                        ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                        ; call rax
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                    emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                    dynasm!(ops
+                        ; => returns
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, [rbx + dreg(src)]
+                        ; jmp => clean_exit
+                    );
+                } else if protected_returns[ip] {
+                    // Resume on the untouched Return: a metered run's charges
+                    // and a Python body's completions stay the interpreter's.
                     dynasm!(ops
                         ; mov DWORD [rsi], ip as i32
                         ; jmp => epilogue
@@ -7662,12 +8943,37 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, [rbx + dreg(src)]
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 }
             }
             Instr::ReturnUndefined => {
-                if protected_returns[ip] {
+                if let Some((target, kind_reg, val_reg)) = lazy_finally(&lazy_try, ip) {
+                    dynasm!(ops
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; mov [rbx + dreg(val_reg)], rax
+                        ; mov rax, QWORD Value::int(1).bits() as i64
+                        ; mov [rbx + dreg(kind_reg)], rax
+                        ; jmp => labels[target as usize]
+                    );
+                } else if protected_returns[ip] && route_returns {
+                    let returns = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, QWORD Value::UNDEFINED.bits() as i64
+                        ; mov rax, QWORD crate::vm::jit_return_finally as *const () as i64
+                        ; call rax
+                        ; cmp rax, -2                     // FINALLY_RETURN
+                        ; je => returns
+                    );
+                    emit_ip_dispatch(&mut ops, &labels, &route_landings, epilogue);
+                    dynasm!(ops
+                        ; => returns
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; jmp => clean_exit
+                    );
+                } else if protected_returns[ip] {
                     dynasm!(ops
                         ; mov DWORD [rsi], ip as i32
                         ; jmp => epilogue
@@ -7676,7 +8982,7 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops
                         ; mov DWORD [rsi], NO_BAIL as i32
                         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-                        ; jmp => epilogue
+                        ; jmp => clean_exit
                     );
                 }
             }
@@ -7696,7 +9002,7 @@ pub(crate) fn compile_proto_mem(
                 let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
                 dynasm!(ops
                     ; mov eax, [rdi + depth_off]
-                    ; cmp eax, crate::vm::JIT_REGION_CALL_MAX as i32
+                    ; cmp eax, crate::vm::native_call_cap() as i32
                     ; jae => bail
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
@@ -7720,6 +9026,39 @@ pub(crate) fn compile_proto_mem(
             ; => stub
             ; mov DWORD [rsi], ip as i32
             ; xor rax, rax
+            ; jmp => epilogue
+        );
+    }
+
+    // ── lazy `try` exits ── the pushes the body skipped, the enclosing lazy
+    // brackets' first, for whoever reads the frame next: the interpreter
+    // resuming inside the body, or unwinding from it.
+    for (t, &exit) in lazy_try.iter().zip(&lazy_exit) {
+        dynasm!(ops
+            ; => exit
+            ; sub rsp, 48
+            ; mov [rsp + 32], rax
+        );
+        for &(packed, finally) in &t.chain {
+            // On this activation's frame, or deferred for the frame a
+            // frame-free one's bail or throw materializes (`jit_lazy_push`).
+            let packed = if finally {
+                packed | crate::vm::LAZY_PUSH_FINALLY
+            } else {
+                packed
+            };
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, QWORD packed as i64
+                ; mov r8, rbx
+                ; mov r9d, func_id as i32
+                ; mov rax, QWORD crate::vm::jit_lazy_push as *const () as i64
+                ; call rax
+            );
+        }
+        dynasm!(ops
+            ; mov rax, [rsp + 32]
+            ; add rsp, 48
             ; jmp => epilogue
         );
     }
@@ -7752,6 +9091,10 @@ pub(crate) fn compile_proto_mem(
         ; pop rbx
         ; ret
     );
+    if !ta_regs.is_empty() {
+        emit_ta_read_stub(&mut ops, ta_read_stub);
+        emit_ta_write_stub(&mut ops, ta_write_stub);
+    }
 
     // The IC-site cursor must have consumed exactly the sites `Jit::compile`
     // reserved (one per GetProp/SetProp). A mismatch ⇒ a GetProp's `[r14+off]`
@@ -7872,6 +9215,372 @@ impl FloatCache {
         self.held[k] = Some(reg);
         Some(Self::FIRST_XMM + k as u8)
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_TIERC_TA_CACHE=1`: every Tier C typed-array read calls
+    /// `jit_get_index`, as before the receiver cache (`emit_ta_cache_get`).
+    #[inline]
+    fn tierc_ta_cache_enabled() = "ZIPP_NO_TIERC_TA_CACHE"
+}
+
+/// Bytes of one typed-array cache record in a Tier C frame (40 used).
+const TA_CACHE_STRIDE: i32 = 48;
+
+/// The registers whose typed arrays a Tier C body keeps (`emit_ta_cache_get`):
+/// the receivers of its element reads, the most read first, at most four.
+fn ta_cache_regs(proto: &FuncProto, metered: bool) -> Vec<u16> {
+    if metered || !tierc_ta_cache_enabled() {
+        return Vec::new();
+    }
+    let mut counts: Vec<(u16, u32)> = Vec::new();
+    for instr in &proto.code {
+        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+            match counts.iter_mut().find(|(r, _)| *r == obj) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((obj, 1)),
+            }
+        }
+    }
+    crate::cold_sort::sort_by(&mut counts, |a, b| b.1.cmp(&a.1));
+    counts.into_iter().take(4).map(|(r, _)| r).collect()
+}
+
+/// `dst = obj[key]` through the typed array `obj`'s register held when this
+/// body last read through it, with no call: the record at `[rsp + slot]`
+/// (`jit_get_index_ta_fill`) is trusted while the register holds the same
+/// object (bits, then its slot version, as a freed slot's reuse bumps it) and
+/// no buffer has moved since (`TA_DATA_EPOCH`); then an Int key below the
+/// recorded count reads its element through `stub` (`emit_ta_read_stub`).
+/// A record that does not match is filled again by the helper, which does
+/// the read; a key that is no Int, an index past the count and a receiver
+/// the helper declined (count 0) fall through to the caller's `jit_get_index`
+/// call. Clobbers rax, rcx, rdx, r8-r11, xmm0, xmm1, as that call does.
+#[allow(clippy::too_many_arguments)]
+fn emit_ta_cache_get(
+    ops: &mut dynasmrt::x64::Assembler,
+    slot: i32,
+    dst: u16,
+    obj: u16,
+    key: u16,
+    stub: dynasmrt::DynamicLabel,
+    bail: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+) {
+    let fill = ops.new_dynamic_label();
+    let general = ops.new_dynamic_label();
+    let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
+    let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let helper = crate::vm::jit_get_index_ta_fill as *const () as i64;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; cmp rax, [rsp + slot]
+        ; jne => fill
+        // A receiver the helper declined (count 0) goes straight on, before
+        // the guards that license the base: the general path is right for
+        // any receiver, and most that reach here (strings, dense Arrays the
+        // mirror missed) are such.
+        ; mov r11, [rsp + slot + 16]
+        ; test r11, r11
+        ; jz => general
+        ; mov r10, QWORD epoch
+        ; mov r10, [r10]
+        ; cmp r10, [rsp + slot + 32]
+        ; jne => fill
+        ; mov r10, [rdi + versions]
+        ; mov ecx, eax
+        ; mov r10d, [r10 + rcx * 4]
+        ; cmp r10d, [rsp + slot + 28]
+        ; jne => fill
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; mov edx, edx                         // a negative index is huge
+        ; cmp rdx, r11
+        ; jae => general
+        ; mov r9, [rsp + slot + 8]
+        ; movzx ecx, BYTE [rsp + slot + 24]
+        ; call => stub
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => fill
+        ; mov rcx, rdi
+        ; mov rdx, rax
+        ; mov r8, [rbx + dreg(key)]
+        ; lea r9, [rsp + slot]
+        ; mov rax, QWORD helper
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => general
+    );
+}
+
+/// `obj[key] = val` through the typed array `obj`'s register held when this
+/// body last went through it, as [`emit_ta_cache_get`] reads: the same
+/// record and guards, a writable buffer (the record's byte 25), an Int key
+/// below the count, and a Number `stub` (`emit_ta_write_stub`) can store
+/// without ToNumber or a modular conversion. A record that does not match is
+/// filled again by `jit_set_index_ta_fill`, which makes the write, and the
+/// code continues at `after_call`, the caller's handling of its own
+/// `jit_set_index` call's result; everything the stub declines falls through
+/// to that call.
+#[allow(clippy::too_many_arguments)]
+fn emit_ta_cache_set(
+    ops: &mut dynasmrt::x64::Assembler,
+    slot: i32,
+    obj: u16,
+    key: u16,
+    val: u16,
+    stub: dynasmrt::DynamicLabel,
+    done: dynasmrt::DynamicLabel,
+    after_call: dynasmrt::DynamicLabel,
+) {
+    let fill = ops.new_dynamic_label();
+    let general = ops.new_dynamic_label();
+    let epoch = &crate::heap::TA_DATA_EPOCH as *const _ as i64;
+    let versions = crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32;
+    let helper = crate::vm::jit_set_index_ta_fill as *const () as i64;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; cmp rax, [rsp + slot]
+        ; jne => fill
+        ; mov r11, [rsp + slot + 16]
+        ; test r11, r11
+        ; jz => general
+        ; mov r10, QWORD epoch
+        ; mov r10, [r10]
+        ; cmp r10, [rsp + slot + 32]
+        ; jne => fill
+        ; mov r10, [rdi + versions]
+        ; mov ecx, eax
+        ; mov r10d, [r10 + rcx * 4]
+        ; cmp r10d, [rsp + slot + 28]
+        ; jne => fill
+        ; cmp BYTE [rsp + slot + 25], 0
+        ; je => general
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => general
+        ; mov edx, edx
+        ; cmp rdx, r11
+        ; jae => general
+        ; mov r9, [rsp + slot + 8]
+        ; movzx ecx, BYTE [rsp + slot + 24]
+        ; mov r8, [rbx + dreg(val)]
+        ; call => stub
+        ; test eax, eax
+        ; jnz => done
+        ; jmp => general
+        ; => fill
+        ; lea r10, [rsp + slot]
+        ; mov [rsp + 32], r10                   // 5th arg: the record
+        ; mov rcx, rdi
+        ; mov rdx, rax
+        ; mov r8, [rbx + dreg(key)]
+        ; mov r9, [rbx + dreg(val)]
+        ; mov rax, QWORD helper
+        ; call rax
+        ; jmp => after_call
+        ; => general
+    );
+}
+
+/// The element write `emit_ta_cache_set` calls: `ecx` the kind, `r9` the
+/// element base, `rdx` the index, in bounds, `r8` the Value. Stores what
+/// `ta_element_set` stores for an Int into any kind (its low bits, clamped
+/// for Uint8Clamped, converted for the float kinds) and for a double into
+/// a float kind, and returns 1 in `eax`; anything else (a double into an
+/// integer kind, a non-Number) stores nothing and returns 0. Clobbers r10,
+/// xmm0.
+pub(crate) fn emit_ta_write_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+    let (int, dbl, fail, ok) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    let (i8_, i16_, i32_, clamp, f32i, f64i, f32d, f64d) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; => stub
+        ; mov r10, r8
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int
+        ; sub r10d, (INT_TAG_HI + 1) as i32
+        ; cmp r10d, 3                           // Bool/Null/Undefined/Heap
+        ; jbe => fail
+        ; jmp => dbl
+        // An Int: its low bits for the integer kinds (ToInt8 and the rest of
+        // an int32 are its truncation), clamped for Uint8Clamped.
+        ; => int
+        ; cmp ecx, 1 ; je => i8_
+        ; cmp ecx, 0 ; je => i8_
+        ; cmp ecx, 5 ; je => i32_
+        ; cmp ecx, 6 ; je => i32_
+        ; cmp ecx, 3 ; je => i16_
+        ; cmp ecx, 4 ; je => i16_
+        ; cmp ecx, 2 ; je => clamp
+        ; cmp ecx, 7 ; je => f32i
+        ; jmp => f64i
+        ; => i8_
+        ; mov BYTE [r9 + rdx], r8b
+        ; jmp => ok
+        ; => i16_
+        ; mov WORD [r9 + rdx * 2], r8w
+        ; jmp => ok
+        ; => i32_
+        ; mov DWORD [r9 + rdx * 4], r8d
+        ; jmp => ok
+        ; => clamp
+        ; mov r10d, r8d
+        ; test r10d, r10d
+        ; jns >nonneg
+        ; xor r10d, r10d
+        ; nonneg:
+        ; cmp r10d, 255
+        ; jle >store
+        ; mov r10d, 255
+        ; store:
+        ; mov BYTE [r9 + rdx], r10b
+        ; jmp => ok
+        ; => f32i
+        ; cvtsi2ss xmm0, r8d
+        ; movss DWORD [r9 + rdx * 4], xmm0
+        ; jmp => ok
+        ; => f64i
+        ; cvtsi2sd xmm0, r8d
+        ; movsd QWORD [r9 + rdx * 8], xmm0
+        ; jmp => ok
+        // A double: only into a float kind.
+        ; => dbl
+        ; cmp ecx, 8 ; je => f64d
+        ; cmp ecx, 7 ; je => f32d
+        ; jmp => fail
+        ; => f32d
+        ; movq xmm0, r8
+        ; cvtsd2ss xmm0, xmm0
+        ; movss DWORD [r9 + rdx * 4], xmm0
+        ; jmp => ok
+        ; => f64d
+        ; mov QWORD [r9 + rdx * 8], r8
+        ; => ok
+        ; mov eax, 1
+        ; ret
+        ; => fail
+        ; xor eax, eax
+        ; ret
+    );
+}
+
+/// The element read `emit_ta_cache_get` calls: `ecx` the kind (a numeric
+/// `TA_KINDS` index, 0 to 8), `r9` the element base, `rdx` the index, in
+/// bounds; the element's Value in `rax`, boxed as `ta_interp_numeric_get_view`
+/// boxes it (an integer kind as an Int, a u32 past i32 and the float kinds
+/// through `Value::num`'s narrowing, NaN canonical). Clobbers rcx, r10,
+/// xmm0, xmm1.
+pub(crate) fn emit_ta_read_stub(ops: &mut dynasmrt::x64::Assembler, stub: dynasmrt::DynamicLabel) {
+    let (u8_, i8_, i16_, u16_, i32_, u32_, f32_, f64_) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    let (int, num, as_dbl, canon) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; => stub
+        ; cmp ecx, 1 ; je => u8_
+        ; cmp ecx, 2 ; je => u8_
+        ; cmp ecx, 5 ; je => i32_
+        ; cmp ecx, 6 ; je => u32_
+        ; cmp ecx, 8 ; je => f64_
+        ; cmp ecx, 0 ; je => i8_
+        ; cmp ecx, 3 ; je => i16_
+        ; cmp ecx, 4 ; je => u16_
+        ; jmp => f32_
+        ; => u8_
+        ; movzx eax, BYTE [r9 + rdx]
+        ; jmp => int
+        ; => i8_
+        ; movsx eax, BYTE [r9 + rdx]
+        ; jmp => int
+        ; => i16_
+        ; movsx eax, WORD [r9 + rdx * 2]
+        ; jmp => int
+        ; => u16_
+        ; movzx eax, WORD [r9 + rdx * 2]
+        ; jmp => int
+        ; => i32_
+        ; mov eax, [r9 + rdx * 4]
+        ; jmp => int
+        ; => u32_
+        ; mov eax, [r9 + rdx * 4]
+        ; test eax, eax
+        ; jns => int
+        ; mov eax, eax
+        ; cvtsi2sd xmm0, rax                    // exact below 2^32, never integral i32
+        ; movq rax, xmm0
+        ; ret
+        ; => f32_
+        ; movss xmm0, [r9 + rdx * 4]
+        ; cvtss2sd xmm0, xmm0
+        ; jmp => num
+        ; => f64_
+        ; movsd xmm0, [r9 + rdx * 8]
+        ; => num
+        // `Value::num`: an exact i32 other than -0 is an Int, NaN canonical.
+        ; cvttsd2si ecx, xmm0
+        ; xorps xmm1, xmm1
+        ; cvtsi2sd xmm1, ecx
+        ; ucomisd xmm1, xmm0
+        ; jp => as_dbl
+        ; jne => as_dbl
+        ; test ecx, ecx
+        ; jnz >narrow
+        ; movq rax, xmm0
+        ; bt rax, 63
+        ; jc => as_dbl
+        ; narrow:
+        ; mov eax, ecx
+        ; => int
+        ; mov eax, eax
+        ; mov r10, QWORD INT_TAG as i64
+        ; or rax, r10
+        ; ret
+        ; => as_dbl
+        ; ucomisd xmm0, xmm0
+        ; jp => canon
+        ; movq rax, xmm0
+        ; ret
+        ; => canon
+        ; mov rax, QWORD QNAN_BITS as i64
+        ; ret
+    );
 }
 
 /// Tier C's receiver cache: for a VM register whose object a known-shape lane
@@ -8566,16 +10275,22 @@ fn emit_recv_cached_set(
     dynasm!(ops ; => full);
 }
 
-/// Whether `ZIPP_PERF_MAP=ops` asks for per-op offsets (`write_op_offsets`).
-fn perf_map_ops() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops")
+/// Whether `ZIPP_PERF_MAP=ops` (Linux) or `ZIPP_PROF_PC_CODE` (the sampler's
+/// code dump) asks for per-op offsets (`write_op_offsets`).
+pub(crate) fn perf_map_ops() -> bool {
+    (cfg!(target_os = "linux") && crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "ops"))
+        || crate::env_var_os("ZIPP_PROF_PC_CODE").is_some()
 }
 
 /// Append `func_id body_start ip offset op` lines for one Tier C body to
-/// `/tmp/zipp-ops-<pid>.txt`.
-fn write_op_offsets(func_id: u32, start: u64, code: &[Instr], offsets: &[(usize, usize)]) {
+/// `/tmp/zipp-ops-<pid>.txt`, or to `ops.txt` in `ZIPP_PROF_PC_CODE`'s
+/// directory.
+pub(crate) fn write_op_offsets(func_id: u32, start: u64, code: &[Instr], offsets: &[(usize, usize)]) {
     use std::io::Write;
-    let path = format!("/tmp/zipp-ops-{}.txt", std::process::id());
+    let path = match crate::env_var_os("ZIPP_PROF_PC_CODE") {
+        Some(dir) => std::path::PathBuf::from(dir).join("ops.txt"),
+        None => std::path::PathBuf::from(format!("/tmp/zipp-ops-{}.txt", std::process::id())),
+    };
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         for &(ip, off) in offsets {
             let op = format!("{:?}", code[ip]);

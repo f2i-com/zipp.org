@@ -5,39 +5,19 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// `ZIPP_NO_SPAN_CODEUNIT_PRED=1` restores the generic boxed leaf expansion.
-/// Read once while plans are built; never consulted by emitted hot code.
-#[inline]
-pub(crate) fn span_code_unit_pred_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PRED").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SPAN_CODEUNIT_PRED=1` restores the generic boxed leaf expansion.
+    /// Read once while plans are built; never consulted by emitted hot code.
+    #[inline]
+    fn span_code_unit_pred_enabled() = "ZIPP_NO_SPAN_CODEUNIT_PRED"
 }
 
-/// `ZIPP_NO_SPAN_CODEUNIT_PAIR=1` keeps the single-predicate fusion but drops
-/// the caller-level `pred(i, a) || pred(i, b)` collapse.  Like the parent gate,
-/// this is latched once at plan time and is absent from emitted hot code.
-#[inline]
-pub(crate) fn span_code_unit_pair_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PAIR").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SPAN_CODEUNIT_PAIR=1` keeps the single-predicate fusion but drops
+    /// the caller-level `pred(i, a) || pred(i, b)` collapse.  Like the parent gate,
+    /// this is latched once at plan time and is absent from emitted hot code.
+    #[inline]
+    fn span_code_unit_pair_enabled() = "ZIPP_NO_SPAN_CODEUNIT_PAIR"
 }
 
 env_off_switch! {
@@ -222,6 +202,7 @@ pub(crate) fn captured_builtin_lane(
     let op = crate::vm::captured_op::from_name(key, argc)?;
     use crate::vm::captured_op as cop;
     let on = match op {
+        _ if op & 0xFF == cop::DV => super::proto_mem::tierc_dv_lane_enabled(),
         cop::SET | cop::ADD | cop::DELETE => super::proto_mem::tierc_coll_mutate_enabled(),
         cop::SUBSTRING | cop::SLICE => argc == 2 || substring1_intrinsic_enabled(),
         cop::CALL => super::region_mem::has_own_call_intrinsic_enabled(),
@@ -606,6 +587,9 @@ pub(crate) fn emit_inline_leaf_call(
             ; jne => fallback
         );
     }
+    if let Some(lane) = plan.new_lane {
+        emit_new_guards(ops, lane, fallback);
+    }
     let body_has_direct_global = plan.body.iter().any(|ins| {
         matches!(
             ins,
@@ -850,6 +834,10 @@ pub(crate) fn emit_inline_leaf_call(
     // Pending captured-variable writes: upvalue index → the scratch register
     // holding the value to commit after the body. See the `UpvalSet` arm.
     let mut upval_buf: FxHashMap<u16, u16> = FxHashMap::default();
+    // Pending global writes, the same way (`leaf_global_stores_buffered`):
+    // global slot → the scratch register holding the value to commit.
+    let buffer_globals = crate::codegen::leaf_global_stores_buffered(&plan.body);
+    let mut global_buf: FxHashMap<u32, u16> = FxHashMap::default();
     for (bi, instr) in plan.body.iter().enumerate() {
         dynasm!(ops ; => blabels[bi]);
         match *instr {
@@ -893,18 +881,31 @@ pub(crate) fn emit_inline_leaf_call(
                 );
             }
             Instr::LoadGlobal { dst: d, idx } => {
-                dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
-                    ; mov [rbx + dreg(rg(d))], rax
-                );
+                // A slot this body has written reads the pending value.
+                if let Some(&buf) = global_buf.get(&idx) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(buf)]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rax, [r12 + (idx as i32) * 8]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                }
             }
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src } => {
-                dynasm!(ops
-                    ; mov rax, [rbx + dreg(rg(src))]
-                    ; mov [r12 + (idx as i32) * 8], rax
-                );
+                if buffer_globals {
+                    // Committed after the last op (see the commit below).
+                    global_buf.insert(idx, rg(src));
+                } else {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(rg(src))]
+                        ; mov [r12 + (idx as i32) * 8], rax
+                    );
+                }
             }
             Instr::Add { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
@@ -1133,7 +1134,11 @@ pub(crate) fn emit_inline_leaf_call(
                     (rg(callee), rg(this_v))
                 };
                 emit_math_identity_guard(ops, op, gc, gt, bail, math_imul_guard);
-                if ac == 1 {
+                if ac == 1
+                    && matches!(op, MathFn::Clz32)
+                    && emit_math_clz32(ops, rg(ab), rg(d), bail, math_unary)
+                {
+                } else if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
                     if !emit_math_unary_inline(ops, op) {
                         dynasm!(ops
@@ -1202,18 +1207,19 @@ pub(crate) fn emit_inline_leaf_call(
                     dynasm!(ops ; jnz => t);
                 }
             }
-            // ── fused compare-and-branch ── same number guard as the `Lt`/`Le`
-            // dcmp arms below (a non-numeric operand bails, re-running the whole
-            // call), no boolean materialised. Mirrors the region_mem arm.
+            // ── fused compare-and-branch ── same guard as the `Lt`/`Le` dcmp
+            // arms below (two strings compare in a helper, and anything else
+            // bails, re-running the whole call), no boolean materialised.
+            // Mirrors the region_mem arm.
             Instr::JumpIfNotLt { a, b, target } => {
                 let bail = ops.new_dynamic_label();
                 let t = blabels[target as usize];
-                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Lt, t);
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Lt, t, true);
             }
             Instr::JumpIfNotLe { a, b, target } => {
                 let bail = ops.new_dynamic_label();
                 let t = blabels[target as usize];
-                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Le, t);
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Le, t, true);
             }
             // ── dense-array / string element read `a[i]` ── generic win64 helper
             // (read-only, no alloc, no user code → no r13/r14/TA refetch; matches
@@ -1392,19 +1398,19 @@ pub(crate) fn emit_inline_leaf_call(
             }
             Instr::Lt { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Lt);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Lt, true);
             }
             Instr::Le { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Le);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Le, true);
             }
             Instr::Gt { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Gt);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Gt, true);
             }
             Instr::Ge { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge);
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge, true);
             }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
@@ -1426,6 +1432,17 @@ pub(crate) fn emit_inline_leaf_call(
     // sound to inline a body whose upvalue write precedes deopt-capable ops.
     // Bodies that reach here are branch-free (`callee_leaf_ok`), so each write is
     // unconditional. `jit_cell_set` cannot fail: a cell is one heap slot.
+    // Buffered global writes commit first, as the raw slot stores they were.
+    if !global_buf.is_empty() {
+        let mut pending: Vec<(u32, u16)> = global_buf.iter().map(|(&i, &r)| (i, r)).collect();
+        pending.sort_unstable(); // deterministic emission order
+        for (idx, src) in pending {
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(src)]
+                ; mov [r12 + (idx as i32) * 8], rax
+            );
+        }
+    }
     if !upval_buf.is_empty() {
         let mut pending: Vec<(u16, u16)> = upval_buf.iter().map(|(&i, &r)| (i, r)).collect();
         pending.sort_unstable(); // deterministic emission order
@@ -1440,13 +1457,15 @@ pub(crate) fn emit_inline_leaf_call(
             );
         }
     }
-    // ── store the return value into the caller's `dst` ──
-    match ret_reg {
-        Some(r) => dynasm!(ops
+    // ── store the return value into the caller's `dst` ── or at a `New`
+    // site, make the instance from the body's stores.
+    match (plan.new_lane, ret_reg) {
+        (Some(lane), _) => emit_new_instance(ops, lane, arg_base, rg, dst, fallback),
+        (None, Some(r)) => dynasm!(ops
             ; mov rax, [rbx + dreg(r)]
             ; mov [rbx + dreg(dst)], rax
         ),
-        None => dynasm!(ops
+        (None, None) => dynasm!(ops
             ; mov rax, QWORD Value::UNDEFINED.bits() as i64
             ; mov [rbx + dreg(dst)], rax
         ),
@@ -2376,6 +2395,20 @@ pub(crate) enum LaneOp32 {
     I(i32),
 }
 
+/// A 64-bit operand of a lane op: a GPR home's exact integer or an
+/// immediate.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LaneOp64 {
+    R(u8),
+    I(i64),
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LANE_MOD=1`: a typed lane declines `%` again
+    /// (`op-outside-lane-set`), for an A/B.
+    fn lane_mod_enabled() = "ZIPP_NO_LANE_MOD"
+}
+
 /// One scheduled lane instruction. Emission is a dumb match — every decision
 /// (types, homes, folds, in-place forms) was made by `build_typed_lane`.
 pub(crate) enum LaneStep {
@@ -2478,6 +2511,16 @@ pub(crate) enum LaneStep {
         d: u8,
         a: LaneOp32,
         b: LaneOp32,
+    },
+    /// `a % b` of two exact integers: `idiv`'s remainder (the dividend's
+    /// sign, as JS has it). Falls back on a zero divisor (`zero_check`: NaN)
+    /// and on a zero remainder of a negative dividend (`neg0_check`: -0).
+    Mod64 {
+        d: u8,
+        a: LaneOp64,
+        b: LaneOp64,
+        zero_check: bool,
+        neg0_check: bool,
     },
     /// `movsxd Rq(d), low32(s)` — the `|0` wrap of a wide exact integer.
     SignExt {
@@ -3540,6 +3583,9 @@ pub(crate) fn build_typed_lane_guarded(
     global_route_guard: Option<u32>,
     math_imul_guard: Option<MathIntrinsicGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
+    // A leaf's global writes join the lane's transactional exit commits
+    // (`gbuffer`), as a method lane's do: the route guard proved the slots
+    // direct, and nothing is written before every guard has passed.
     build_lane_inner(
         body,
         param_count,
@@ -3552,9 +3598,15 @@ pub(crate) fn build_typed_lane_guarded(
         nested,
         None,
         global_route_guard,
-        false,
+        global_route_guard.is_some() && leaf_lane_global_stores_enabled(),
         math_imul_guard,
     )
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_LANE_GLOBAL_STORE=1`: a leaf splice's typed lane declines
+    /// a body that writes a global again (the generic emitter runs it).
+    fn leaf_lane_global_stores_enabled() = "ZIPP_NO_LEAF_LANE_GLOBAL_STORE"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3960,6 +4012,52 @@ fn build_lane_inner(
                 };
                 b.bind_int(dst, d, iv);
             }
+            // JS `%` of two exact integers is the truncated remainder with the
+            // dividend's sign: `idiv`. A zero divisor (NaN) and a zero
+            // remainder of a negative dividend (-0) are doubles the lane does
+            // not hold, so those fall back, each checked only where the
+            // operand ranges allow it. `((seed >>> 0) % n) | 0` in a PRNG
+            // helper took the generic boxed emitter for this one op.
+            Instr::Mod { dst, a, b: rb } if lane_mod_enabled() => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                let int_of = |av: Av| match av {
+                    Av::Int { h, lo, hi } => Some((LaneOp64::R(h), lo, hi)),
+                    Av::ImmI(v) => Some((LaneOp64::I(v), v, v)),
+                    _ => None,
+                };
+                let (Some((oa, alo, ahi)), Some((ob, blo, bhi))) = (int_of(b.slots[sa]), int_of(b.slots[sb])) else {
+                    return Err("mod-non-int");
+                };
+                if let (LaneOp64::I(va), LaneOp64::I(vb)) = (oa, ob) {
+                    if vb == 0 || (va < 0 && va % vb == 0) {
+                        return Err("mod-const-not-int");
+                    }
+                    let sid = b.push_slot(Av::ImmI(va % vb));
+                    b.binds.insert(dst, sid);
+                    continue;
+                }
+                // |a % b| < |b| and |a % b| <= |a|, with a's sign (or zero).
+                let m = blo.unsigned_abs().max(bhi.unsigned_abs()).saturating_sub(1).min(i64::MAX as u64) as i64;
+                let iv = if alo >= 0 {
+                    (0, ahi.min(m))
+                } else if ahi <= 0 {
+                    (alo.max(-m), 0)
+                } else {
+                    (alo.max(-m), ahi.min(m))
+                };
+                b.binds.remove(&dst);
+                let prefer = b.dying_homes(i, &[sa, sb], true);
+                let d = b.alloc_gpr(i + 1, &prefer, None)?;
+                b.steps.push(LaneStep::Mod64 {
+                    d,
+                    a: oa,
+                    b: ob,
+                    zero_check: blo <= 0 && bhi >= 0,
+                    neg0_check: alo < 0,
+                });
+                b.bind_int(dst, d, iv);
+            }
             Instr::MathOp {
                 dst,
                 op: MathFn::Imul,
@@ -4053,7 +4151,7 @@ fn build_lane_inner(
                 }
                 returned = true;
             }
-            // The closed set is deliberately small: anything else (Mod, Neg,
+            // The closed set is deliberately small: anything else (Neg,
             // comparisons, heap loads/stores, non-Imul MathOps, StoreGlobal,
             // ReturnUndefined, …) keeps the generic boxed loop.
             _ => return Err("op-outside-lane-set"),
@@ -4189,7 +4287,7 @@ fn emit_typed_lane(
                 let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
                 dynasm!(ops
                     ; mov eax, [rdi + depth_off]
-                    ; cmp eax, crate::vm::JIT_REGION_CALL_MAX as i32
+                    ; cmp eax, crate::vm::native_call_cap() as i32
                     ; jae => fallback
                 );
             }
@@ -4421,6 +4519,49 @@ fn emit_typed_lane(
                     LaneOp32::I(v) => dynasm!(ops ; mov ecx, v ; imul eax, ecx),
                 }
                 dynasm!(ops ; movsxd Rq(d), eax);
+            }
+            LaneStep::Mod64 {
+                d,
+                a,
+                b,
+                zero_check,
+                neg0_check,
+            } => {
+                // `idiv` writes rdx, a value home: park it in xmm0 (operand
+                // scratch, free between steps) across the divide. Exact lane
+                // integers are within 2^53, so the i64 divide cannot fault.
+                match b {
+                    LaneOp64::R(r) => dynasm!(ops ; mov rcx, Rq(r)),
+                    LaneOp64::I(v) => dynasm!(ops ; mov rcx, QWORD v),
+                }
+                if zero_check {
+                    dynasm!(ops ; test rcx, rcx ; jz => fallback);
+                }
+                match a {
+                    LaneOp64::R(r) => dynasm!(ops ; mov rax, Rq(r)),
+                    LaneOp64::I(v) => dynasm!(ops ; mov rax, QWORD v),
+                }
+                dynasm!(ops
+                    ; movq xmm0, rdx
+                    ; cqo
+                    ; idiv rcx
+                    ; mov rcx, rdx
+                    ; movq rdx, xmm0
+                );
+                if neg0_check {
+                    let ok = ops.new_dynamic_label();
+                    dynasm!(ops ; test rcx, rcx ; jnz => ok);
+                    match a {
+                        LaneOp64::R(r) => dynasm!(ops ; test Rq(r), Rq(r) ; js => fallback),
+                        LaneOp64::I(v) => {
+                            if v < 0 {
+                                dynasm!(ops ; jmp => fallback);
+                            }
+                        }
+                    }
+                    dynasm!(ops ; => ok);
+                }
+                dynasm!(ops ; mov Rq(d), rcx);
             }
             LaneStep::SignExt { d, s } => {
                 dynasm!(ops ; movsxd Rq(d), Rd(s));
@@ -4792,7 +4933,7 @@ mod lane_tests {
     /// Ops outside the closed numeric set decline (fail-closed).
     #[test]
     fn out_of_set_op_declines() {
-        let body = vec![Instr::Mod { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
+        let body = vec![Instr::Neg { dst: 3, a: 1 }, Instr::Return { src: 3 }];
         let r = build_typed_lane(
             &body,
             2,

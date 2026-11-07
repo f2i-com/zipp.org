@@ -8,6 +8,7 @@
 //! `_stream_readable` name, a Readable's `map`/`toArray`, and a
 //! `pipeline` into `process.stdout`, which stays writable. The expected
 //! lines are Node 24's.
+#![cfg(feature = "node")]
 
 #[test]
 fn node_streams_and_readline_behave_as_node() {

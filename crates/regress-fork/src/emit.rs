@@ -447,6 +447,8 @@ pub(crate) fn emit_limited(n: &ir::Regex, max_bytes: usize) -> Result<CompiledRe
             flags: n.flags,
             start_pred: startpredicate::predicate_for_re(n),
             suffix_start: None,
+            #[cfg(feature = "utf16")]
+            unit_start: startpredicate::unit_filter_for_re(n),
             skip_hint_ip: None,
             #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
             rxjit: Default::default(),

@@ -109,7 +109,10 @@ fn main() -> ExitCode {
     // the stack headroom guest-driven native re-entry needs to reach the VM's
     // catchable depth guards.
     #[cfg(windows)]
-    let (r, shape) = (run(&args), stats.then(zipp_vm::shape_stats));
+    let (r, shape) = {
+        zipp_vm::set_native_stack_bytes(256 * 1024 * 1024);
+        (run(&args), stats.then(zipp_vm::shape_stats))
+    };
 
     // Other platforms have no equivalent binary-local, portable main-stack
     // contract. Retain the proven dedicated-thread path there.
@@ -120,7 +123,10 @@ fn main() -> ExitCode {
         // on the thread that ran the engine — reading it back here reported a
         // freshly constructed table (`nodes=2 max_fanout=0 edges=0`) for every
         // program. The other stats exports are process-global statics.
-        .spawn(move || (run(&args), stats.then(zipp_vm::shape_stats)))
+        .spawn(move || {
+            zipp_vm::set_native_stack_bytes(256 * 1024 * 1024);
+            (run(&args), stats.then(zipp_vm::shape_stats))
+        })
         .expect("spawn zipp worker thread")
         .join()
         .expect("zipp worker thread panicked");
@@ -156,7 +162,10 @@ fn main() -> ExitCode {
     if std::env::var_os("ZIPP_PROF_PC").is_some() {
         let (rows, total) = zipp_vm::prof_pc_stats();
         eprintln!("[profpc] {total} instruction-pointer samples");
-        for (name, n, pct) in rows.iter().take(25) {
+        // `ZIPP_PROF_PC_ROWS=N` shows more than the first 25, as a per-line
+        // profile (`ZIPP_PROF_PC_LINES`) wants.
+        let shown = std::env::var("ZIPP_PROF_PC_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
+        for (name, n, pct) in rows.iter().take(shown) {
             eprintln!("[profpc] {n:>8}  {pct:>5.1}%  {name}");
         }
     }

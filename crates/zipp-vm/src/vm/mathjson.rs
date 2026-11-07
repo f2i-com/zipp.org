@@ -22,12 +22,12 @@ fn json_leaf_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_JSON_LEAF_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_JSON_LEAF_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -46,12 +46,12 @@ fn json_plain_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_JSON_PLAIN_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_JSON_PLAIN_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -206,12 +206,12 @@ fn json_quote_fastlen_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_JSON_QUOTE_FASTLEN").is_none();
+            let on = crate::env_var_os("ZIPP_NO_JSON_QUOTE_FASTLEN").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -353,12 +353,12 @@ fn json_key_plans_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_JSON_KEY_PLANS").is_none();
+            let on = crate::env_var_os("ZIPP_NO_JSON_KEY_PLANS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -481,7 +481,7 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
         .map_err(|_| JsonOutputError)?;
     for (index, key) in map.slot_keys() {
         match canonical_u32_key(key) {
-            Some(number) => integers.push((number, index)),
+            Some(number) => integers.push(int_key_slot(number, index)),
             None => rest.push(index),
         }
     }
@@ -492,14 +492,14 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
             .ok_or(JsonOutputError)?;
         return Ok((rest, allocated));
     }
-    integers.sort_unstable_by_key(|&(number, _)| number);
+    integers.sort_unstable();
     let mut ordered = Vec::new();
     ordered
         .try_reserve_exact(map.live_len())
         .map_err(|_| JsonOutputError)?;
     let allocated = integers
         .capacity()
-        .checked_mul(std::mem::size_of::<(u32, usize)>())
+        .checked_mul(std::mem::size_of::<u64>())
         .and_then(|bytes| {
             rest.capacity()
                 .checked_mul(std::mem::size_of::<usize>())
@@ -512,7 +512,7 @@ fn json_spec_key_order_bounded(map: &ObjMap) -> Result<(Vec<usize>, usize), Json
                 .and_then(|ordered_bytes| bytes.checked_add(ordered_bytes))
         })
         .ok_or(JsonOutputError)?;
-    ordered.extend(integers.into_iter().map(|(_, index)| index));
+    ordered.extend(integers.into_iter().map(slot_of_int_key));
     ordered.extend(rest);
     Ok((ordered, allocated))
 }
@@ -771,8 +771,10 @@ impl<'p> Vm<'p> {
     /// serializer's per-node `toJSON` lookup, key snapshot, version probe and
     /// generic Array length/index dispatch. `None` is a side-effect-free
     /// decline, never the JavaScript `undefined` result.
-    pub(crate) fn json_plain_stringify(&mut self, root: Value) -> Option<String> {
-        if !json_plain_fast_enabled() || self.current_realm_id().is_some() {
+    pub(crate) fn json_plain_stringify(&mut self, root: Value, gap: &str) -> Option<String> {
+        // A gap holding a lone surrogate carries `json_indent`'s markers,
+        // which only `json_stringify_result` decodes.
+        if !json_plain_fast_enabled() || self.current_realm_id().is_some() || gap.contains('\u{1}') {
             return None;
         }
 
@@ -812,7 +814,8 @@ impl<'p> Vm<'p> {
         if shapes.by_shape.len() > JSON_SHAPES_MAX {
             shapes.by_shape.clear();
         }
-        let done = self.json_plain_value_into(root, 0, &mut active, &mut shapes, &mut out);
+        let mut pad = String::new();
+        let done = self.json_plain_value_into(root, 0, &mut active, &mut shapes, &mut out, gap, &mut pad);
         self.json_shapes = shapes;
         if !done {
             return None;
@@ -835,6 +838,11 @@ impl<'p> Vm<'p> {
     /// Recursive emitter for [`Self::json_plain_stringify`]. Depth is capped
     /// below the ordinary engine stack limit so the iterative-looking fast
     /// path cannot hide the generic serializer's stack overflow behaviour.
+    /// A non-empty `gap` (the `space` argument's indent) lays a non-empty
+    /// object or array out as SerializeJSONObject/Array do: each member on
+    /// its own line at `pad` plus one `gap`, `": "` after a key, the closing
+    /// bracket on its own line at `pad`; an empty one stays `{}`/`[]`.
+    #[allow(clippy::too_many_arguments)]
     fn json_plain_value_into(
         &self,
         value: Value,
@@ -842,6 +850,8 @@ impl<'p> Vm<'p> {
         active: &mut Vec<u32>,
         shapes: &mut JsonShapes,
         out: &mut String,
+        gap: &str,
+        pad: &mut String,
     ) -> bool {
         // Past it the generic serializer takes over (and enforces the cap).
         #[cfg(feature = "safe-sandbox")]
@@ -891,12 +901,30 @@ impl<'p> Vm<'p> {
                     active.pop();
                     return false;
                 }
+                // (A decline returns false all the way up and the caller drops
+                // `out` and `pad`, so neither is restored on that path.)
+                let pretty = !gap.is_empty() && !items.is_empty();
+                let outer = pad.len();
+                if pretty {
+                    pad.push_str(gap);
+                }
                 for (i, &item) in items.iter().enumerate() {
-                    if i != 0 && json_push_char_bounded(out, ',').is_err() {
+                    if (i != 0 && json_push_char_bounded(out, ',').is_err())
+                        || (pretty
+                            && (json_push_char_bounded(out, '\n').is_err()
+                                || json_push_str_bounded(out, pad).is_err()))
+                    {
                         active.pop();
                         return false;
                     }
-                    if !self.json_plain_value_into(item, depth + 1, active, shapes, out) {
+                    if !self.json_plain_value_into(item, depth + 1, active, shapes, out, gap, pad) {
+                        active.pop();
+                        return false;
+                    }
+                }
+                if pretty {
+                    pad.truncate(outer);
+                    if json_push_char_bounded(out, '\n').is_err() || json_push_str_bounded(out, pad).is_err() {
                         active.pop();
                         return false;
                     }
@@ -936,11 +964,27 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
+                    let pretty = !gap.is_empty() && !members.is_empty();
+                    let outer = pad.len();
+                    if pretty {
+                        pad.push_str(gap);
+                    }
                     for (k, (slot, prefix)) in members.iter().enumerate() {
                         if (k != 0 && json_push_char_bounded(out, ',').is_err())
+                            || (pretty
+                                && (json_push_char_bounded(out, '\n').is_err()
+                                    || json_push_str_bounded(out, pad).is_err()))
                             || json_push_str_bounded(out, prefix).is_err()
-                            || !self.json_plain_value_into(map.val_at(*slot), depth + 1, active, shapes, out)
+                            || (pretty && json_push_char_bounded(out, ' ').is_err())
+                            || !self.json_plain_value_into(map.val_at(*slot), depth + 1, active, shapes, out, gap, pad)
                         {
+                            active.pop();
+                            return false;
+                        }
+                    }
+                    if pretty {
+                        pad.truncate(outer);
+                        if json_push_char_bounded(out, '\n').is_err() || json_push_str_bounded(out, pad).is_err() {
                             active.pop();
                             return false;
                         }
@@ -961,6 +1005,10 @@ impl<'p> Vm<'p> {
                     return false;
                 }
                 let mut any = false;
+                let outer = pad.len();
+                if !gap.is_empty() {
+                    pad.push_str(gap);
+                }
                 for i in map.slots() {
                     let key = map.key_at(i);
                     if is_hidden_key(key) || !map.attr_at(i).enumerable {
@@ -972,15 +1020,32 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if json_member_prefix_bounded(out, any, guest_key_text(key)).is_err() {
+                    let prefixed = if gap.is_empty() {
+                        json_member_prefix_bounded(out, any, guest_key_text(key)).is_ok()
+                    } else {
+                        (!any || json_push_char_bounded(out, ',').is_ok())
+                            && json_push_char_bounded(out, '\n').is_ok()
+                            && json_push_str_bounded(out, pad).is_ok()
+                            && json_member_prefix_bounded(out, false, guest_key_text(key)).is_ok()
+                            && json_push_char_bounded(out, ' ').is_ok()
+                    };
+                    if !prefixed {
                         active.pop();
                         return false;
                     }
-                    if !self.json_plain_value_into(map.val_at(i), depth + 1, active, shapes, out) {
+                    if !self.json_plain_value_into(map.val_at(i), depth + 1, active, shapes, out, gap, pad) {
                         active.pop();
                         return false;
                     }
                     any = true;
+                }
+                pad.truncate(outer);
+                if any
+                    && !gap.is_empty()
+                    && (json_push_char_bounded(out, '\n').is_err() || json_push_str_bounded(out, pad).is_err())
+                {
+                    active.pop();
+                    return false;
                 }
                 if json_push_char_bounded(out, '}').is_err() {
                     active.pop();
@@ -1119,7 +1184,7 @@ impl<'p> Vm<'p> {
                         || self.arguments_objs.contains_key(&idx)
                         || self.array_elements_overlaid(idx)
                         || self.array_js_len.contains_key(&idx)
-                        || items.iter().any(|v| v.is_hole())
+                        || Value::any_hole(&items)
                     {
                         return None;
                     }
@@ -1272,47 +1337,7 @@ impl<'p> Vm<'p> {
                 for (slot, &v) in nums.iter_mut().zip(args) {
                     *slot = self.to_number_strict(v)?;
                 }
-                if matches!(op, M::Hypot) {
-                    return Ok(crate::vm::helpers_num2::hypot_scaled(nums));
-                }
-                let mut acc = match op {
-                    M::Min => f64::INFINITY,
-                    _ => f64::NEG_INFINITY,
-                };
-                for &v in nums.iter() {
-                    acc = match op {
-                        // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
-                        // so tie-break on the sign (Min prefers -0, Max prefers +0).
-                        M::Min => {
-                            if v.is_nan() || acc.is_nan() {
-                                f64::NAN
-                            } else if v == acc {
-                                if v.is_sign_negative() {
-                                    v
-                                } else {
-                                    acc
-                                }
-                            } else {
-                                acc.min(v)
-                            }
-                        }
-                        // Max (Hypot returned above).
-                        _ => {
-                            if v.is_nan() || acc.is_nan() {
-                                f64::NAN
-                            } else if v == acc {
-                                if v.is_sign_positive() {
-                                    v
-                                } else {
-                                    acc
-                                }
-                            } else {
-                                acc.max(v)
-                            }
-                        }
-                    };
-                }
-                acc
+                crate::vm::helpers_num2::math_reduce(op, nums)
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
             M::Pow | M::Atan2 | M::Imul => {
@@ -1903,7 +1928,10 @@ impl<'p> Vm<'p> {
         // A function `replacer` is applied after `toJSON`: replacer(key, value)
         // with `this` = the holder. Its result is what gets serialized.
         let v = if self.is_callable(replacer) {
-            let kv = self.alloc_key_str(key.to_string());
+            let kv = match self.cached_key_str_front(key) {
+                Some(kv) => kv,
+                None => self.alloc_key_str(key.to_string()),
+            };
             self.call_value(replacer, holder, &[kv, v])?
         } else {
             v
@@ -2647,6 +2675,9 @@ impl<'p> Vm<'p> {
     /// defineProperty trap may throw (propagated); an ordinary object that REJECTS the
     /// define (e.g. a non-configurable existing prop) just returns false — no throw.
     fn json_create_data(&mut self, target: Value, key: &str, value: Value) -> Result<(), Thrown> {
+        if self.json_create_data_in_place(target, key, value) {
+            return Ok(());
+        }
         let is_proxy =
             target.is_heap() && matches!(self.heap.get(target.heap_index()), HeapObj::Proxy { .. });
         let mut m = crate::heap::ObjMap::new();
@@ -2662,6 +2693,63 @@ impl<'p> Vm<'p> {
             let _ = r; // ordinary [[DefineOwnProperty]] never throws; a reject is false
             Ok(())
         }
+    }
+
+    /// CreateDataProperty(target, key, value) when it can only replace a
+    /// value: `target` is an ordinary object with no exotic slot semantics
+    /// (`ic_obj_ok`) holding `key` as a writable, enumerable, configurable
+    /// data property, where ValidateAndApplyPropertyDescriptor keeps every
+    /// attribute and sets the value. The reviver walk writes back every
+    /// member of the tree it just parsed, and the full define built and
+    /// re-read a four-field descriptor object for each one. False declines
+    /// with nothing done.
+    fn json_create_data_in_place(&mut self, target: Value, key: &str, value: Value) -> bool {
+        if !target.is_heap() || !self.deferred_ns_state.is_empty() {
+            return false;
+        }
+        let idx = target.heap_index();
+        if !self.ic_obj_ok(idx) {
+            return false;
+        }
+        match self.heap.get_mut(idx) {
+            HeapObj::Object(m) if !m.frozen && !m.sealed => match m.pos(key) {
+                Some(i) => {
+                    let a = m.attr_at(i);
+                    if a.accessor || !a.writable || !a.enumerable || !a.configurable {
+                        return false;
+                    }
+                    m.set_val_at(i, value);
+                }
+                None => return false,
+            },
+            _ => return false,
+        }
+        self.heap.write_barrier_val(idx, value);
+        true
+    }
+
+    /// [`Self::json_create_data_in_place`] for element `i` of a plain dense
+    /// Array (no attribute side table, so every element is a default data
+    /// property and the array is neither sealed nor frozen) where the
+    /// element is present.
+    fn json_create_element_in_place(&mut self, target: Value, i: u64, value: Value) -> bool {
+        if !target.is_heap() {
+            return false;
+        }
+        let idx = target.heap_index();
+        if !self.ic_obj_ok(idx) || self.arr_props.contains_key(&idx) {
+            return false;
+        }
+        let present = matches!(self.heap.get(idx), HeapObj::Array(items)
+            if usize::try_from(i).ok().and_then(|i| items.get(i)).is_some_and(|v| !v.is_hole()));
+        if !present {
+            return false;
+        }
+        if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+            items[i as usize] = value;
+        }
+        self.heap.write_barrier_val(idx, value);
+        true
     }
 
     /// InternalizeJSONProperty: walk the parsed tree bottom-up, replacing each
@@ -2763,7 +2851,7 @@ impl<'p> Vm<'p> {
                             self.internalize_json_at(val, &k, reviver, child, depth + 1, active)?;
                         if nv.is_undefined() {
                             self.delete_property(val, &k)?; // ? val.[[Delete]](ToString(I))
-                        } else {
+                        } else if !self.json_create_element_in_place(val, i, nv) {
                             self.json_create_data(val, &k, nv)?; // ? CreateDataProperty
                         }
                         i += 1;
@@ -2800,7 +2888,10 @@ impl<'p> Vm<'p> {
             walk?;
         }
         let context = self.make_json_context(src);
-        let kv = self.alloc_key_str(key.to_string());
+        let kv = match self.cached_key_str_front(key) {
+            Some(kv) => kv,
+            None => self.alloc_key_str(key.to_string()),
+        };
         self.call_value(reviver, holder, &[kv, val, context])
     }
 

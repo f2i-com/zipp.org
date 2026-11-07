@@ -41,7 +41,7 @@ impl Env {
         match i128::try_from(&n) {
             // Canonical, as `Vm::make_bigint` builds it: a small value is an immediate.
             Ok(v) => Value::small_bigint(v).unwrap_or_else(|| Value::heap(self.heap.alloc(HeapObj::BigInt(v)))),
-            Err(_) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(Box::new(n)))),
+            Err(_) => Value::heap(self.heap.alloc(HeapObj::BigIntBig(n.into()))),
         }
     }
     fn str_units(&mut self, units: &[u16]) -> Value {
@@ -777,7 +777,7 @@ fn set_and_dict_behavior_matches_the_runtime() {
         let indented: String = body.lines().map(|l| format!("    {l}\n")).collect();
         program.push_str(&format!("def sc{n}():\n{indented}sc{n}()\n"));
     }
-    if let Some(p) = std::env::var_os("PYTABLE_DUMP") { std::fs::write(p, &src).unwrap(); }
+    if let Some(p) = crate::env_var_os("PYTABLE_DUMP") { std::fs::write(p, &src).unwrap(); }
     let lines = run_python(src);
 
     let mut env = Env::new();

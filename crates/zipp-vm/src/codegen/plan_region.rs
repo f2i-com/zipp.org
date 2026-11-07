@@ -149,7 +149,7 @@ pub(crate) fn wt_share_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_WT_SHARE").is_none();
+            let v = crate::env_var_os("ZIPP_NO_WT_SHARE").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -218,7 +218,7 @@ pub(crate) fn bool_reuse_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_BOOL_REUSE").is_none();
+            let v = crate::env_var_os("ZIPP_NO_BOOL_REUSE").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -264,7 +264,7 @@ pub(crate) fn int_push_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_INT_PUSH").is_none();
+            let v = crate::env_var_os("ZIPP_NO_INT_PUSH").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -277,8 +277,8 @@ pub(crate) fn int_split_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_INT_SPLIT").is_some()
-                && std::env::var_os("ZIPP_NO_INT_SPLIT").is_none();
+            let v = crate::env_var_os("ZIPP_INT_SPLIT").is_some()
+                && crate::env_var_os("ZIPP_NO_INT_SPLIT").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -300,80 +300,40 @@ pub(crate) fn arr_pin_loose() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_ARR_PIN_LOOSE").is_some();
+            let v = crate::env_var_os("ZIPP_ARR_PIN_LOOSE").is_some();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
     }
 }
 
-pub(crate) fn double_bitwise_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DOUBLE_BITWISE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    fn double_bitwise_enabled() = "ZIPP_NO_DOUBLE_BITWISE"
 }
 
-/// `ZIPP_NO_DOUBLE_MOD=1` restores the pre-Mod emitter on the DOUBLE path: an
-/// `Instr::Mod` falls through to the emitter's catch-all and the whole region
-/// declines to the memory tier again (the named `regalloc-emit-unhandled: Mod`
-/// decline B113 documented). Cached — read once per process, never on the
-/// generated hot path.
-pub(crate) fn double_mod_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DOUBLE_MOD").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_DOUBLE_MOD=1` restores the pre-Mod emitter on the DOUBLE path: an
+    /// `Instr::Mod` falls through to the emitter's catch-all and the whole region
+    /// declines to the memory tier again (the named `regalloc-emit-unhandled: Mod`
+    /// decline B113 documented). Cached — read once per process, never on the
+    /// generated hot path.
+    fn double_mod_enabled() = "ZIPP_NO_DOUBLE_MOD"
 }
 
-/// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
-/// whitelisted DataView `get*` CallMethod declines the whole region to the
-/// memory tier again (helper call, boxed operands). Cached — read once per
-/// process, never on the generated hot path.
-pub(crate) fn dv_double_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_DV_DOUBLE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
+    /// whitelisted DataView `get*` CallMethod declines the whole region to the
+    /// memory tier again (helper call, boxed operands). Cached — read once per
+    /// process, never on the generated hot path.
+    fn dv_double_enabled() = "ZIPP_NO_DV_DOUBLE"
 }
 
-/// `ZIPP_NO_GUARD_HOIST=1` disables W7 pinned-guard hoisting: `hoist_pins` /
-/// `hoist_len_ips` stay empty, so every pinned access re-emits its per-access
-/// identity compare and the length GetProp stays a body op — the pre-wave
-/// emission, byte-identical. Cached once per process, never on the hot path.
-pub(crate) fn guard_hoist_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_GUARD_HOIST").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_GUARD_HOIST=1` disables W7 pinned-guard hoisting: `hoist_pins` /
+    /// `hoist_len_ips` stay empty, so every pinned access re-emits its per-access
+    /// identity compare and the length GetProp stays a body op — the pre-wave
+    /// emission, byte-identical. Cached once per process, never on the hot path.
+    fn guard_hoist_enabled() = "ZIPP_NO_GUARD_HOIST"
 }
 
 /// W7: the pin slots whose per-access identity guard can be hoisted to region
@@ -1113,6 +1073,13 @@ fn plan_region_cold_inner(
                     // stores need per-dtype wrap/clamp emission; only the landed
                     // Int32 and Float64 store arms qualify here.
                     if (!admit_bitwise && k == 8) || (admit_bitwise && k == 5) {
+                        return true;
+                    }
+                    // A dense all-Int Array's in-place Int store on the int path
+                    // (`region_int`'s guarded arm: in bounds, over an Int, an i32
+                    // value, else a deopt AT the op), so it never grows the Vec or
+                    // allocates and the staleness argument below still holds.
+                    if admit_bitwise && k == ARR_INT_PIN_KIND && crate::codegen::region_int::int_arr_store_on() {
                         return true;
                     }
                 }
@@ -2996,7 +2963,7 @@ fn plan_region_cold_inner(
                     | Instr::ReturnUndefined
             )
         };
-        let grdbg = std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
+        let grdbg = crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
         if !confined && grdbg {
             eprintln!("[globrange] [{s},{e}] outside-dead: NOT CONFINED");
         }
@@ -3041,13 +3008,6 @@ fn plan_region_cold_inner(
                             arg_base,
                             argc,
                             ..
-                        }
-                        | Instr::Print {
-                            callee,
-                            this_v,
-                            arg_base,
-                            argc,
-                            ..
                         } => r == callee || r == this_v || (r >= arg_base && (r - arg_base) < argc),
                         Instr::NewArray { arg_base, argc, .. }
                         | Instr::ArrayCtor { arg_base, argc, .. }
@@ -3065,7 +3025,6 @@ fn plan_region_cold_inner(
                             | Instr::ArrayCtor { .. }
                             | Instr::GlobalFn { .. }
                             | Instr::StaticFn { .. }
-                            | Instr::Print { .. }
                     );
                     if call_family {
                         if !win_use {
@@ -3087,8 +3046,7 @@ fn plan_region_cold_inner(
                             | Instr::NewArray { dst, .. }
                             | Instr::ArrayCtor { dst, .. }
                             | Instr::GlobalFn { dst, .. }
-                            | Instr::StaticFn { dst, .. }
-                            | Instr::Print { dst, .. } if dst == r)
+                            | Instr::StaticFn { dst, .. } if dst == r)
                     };
                     let Some(d) = ((e + 1)..uip).rev().find(|&j| defines(j)) else {
                         if grdbg {
@@ -3968,7 +3926,7 @@ fn plan_region_cold_inner(
             values.push((vec![iv], NumVal::Glob(gi)));
         }
         values.sort_by_key(|v| v.0[0].0);
-        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
             for (segs, v) in &values {
                 let name = match *v {
                     NumVal::Reg(r) => format!("r{r}"),
@@ -4056,7 +4014,7 @@ fn plan_region_cold_inner(
                         .count();
                     eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                         glob_order.len(), nregs - perm);
-                    if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                    if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
                         // Which numeric registers hold a permanent home, and
                         // why: `o` = read outside the region, `i` = live-in,
                         // `h` = hoisted.
@@ -4134,7 +4092,7 @@ fn plan_region_cold_inner(
                             .count();
                         eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                             glob_order.len(), nregs - perm);
-                        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                        if crate::env_var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
                             let list: Vec<String> = reg_order
                                 .iter()
                                 .filter(|r| ty[r] == VTy::Num && !shareable(**r))
@@ -5329,7 +5287,13 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::FuseAddIntMove { a, msrc, .. } => vec![a, msrc],
         Instr::FuseUpvalGetMove { msrc, .. } => vec![msrc],
         Instr::FuseMove2 { src, src2, .. } => vec![src, src2],
-        Instr::FuseLoadGlobal2 { .. } | Instr::FusePopHandlerJump { .. } => vec![],
+        Instr::FuseLoadGlobal2 { .. }
+        | Instr::FusePopHandlerJump { .. }
+        | Instr::FuseGlobalIntCmpJump { .. }
+        | Instr::FuseGlobalIncJump { .. }
+        | Instr::FuseGlobalInc { .. }
+        | Instr::FuseGlobalIntBitwise { .. } => vec![],
+        Instr::FuseIntBitwiseStoreGlobal { a, .. } => vec![a],
         Instr::FuseLoadIntBitwise { a, b, .. } | Instr::FuseEqJump { a, b, .. } => vec![a, b],
         Instr::FuseTypeOfJump { a, .. }
         | Instr::FuseNotJump { a, .. }
@@ -5512,13 +5476,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::NewArray { arg_base, argc, .. }
         | Instr::DateNew { arg_base, argc, .. }
         | Instr::DateUTC { arg_base, argc, .. } => win(&[], arg_base, argc),
-        Instr::Print {
-            callee,
-            this_v,
-            arg_base,
-            argc,
-            ..
-        } => win(&[callee, this_v], arg_base, argc),
         // Python-only fast paths; no JIT tier admits them.
         Instr::PyArith { a, b, .. } | Instr::PyCompare { a, b, .. } | Instr::PyJumpCompare { a, b, .. } => vec![a, b],
         Instr::PyAddImm { a, .. } => vec![a],
@@ -5887,7 +5844,7 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::FinalizeObject { dst, .. }
         | Instr::NewArray { dst, .. }
         | Instr::LoadGlobal { dst, .. }
-        | Instr::Print { dst, .. } => Some(dst),
+        | Instr::CallMethod { dst, .. } => Some(dst),
         _ => None,
     }
 }
@@ -5916,10 +5873,10 @@ fn local_sroa_supported_instr(i: &Instr) -> bool {
             | Instr::GetProp { .. }
             | Instr::NewArray { .. }
             | Instr::GetIndex { .. }
-            // `console.log(...)` reads `console` (a global) and its method
-            // before the print.
+            // `console.log(...)` after the loop. The proof below never
+            // admits a call inside the region.
             | Instr::LoadGlobal { .. }
-            | Instr::Print { .. }
+            | Instr::CallMethod { .. }
             | Instr::ReturnUndefined
     )
 }
@@ -5991,7 +5948,9 @@ pub(crate) fn plan_local_sroa(
     if e <= s || e >= code.len() {
         return None;
     }
-    match code[s] {
+    // The test, after the reload of a literal bound when it has one.
+    let head = if matches!(code[s], Instr::LoadInt { .. }) { s + 1 } else { s };
+    match code[head] {
         Instr::JumpIfNotLt { target, .. } if target as usize == e + 1 => {}
         _ => return None,
     }
@@ -5999,7 +5958,7 @@ pub(crate) fn plan_local_sroa(
         Instr::Jump { target } if target == start => {}
         _ => return None,
     }
-    if code[s + 1..e].iter().any(|i| {
+    if code[head + 1..e].iter().any(|i| {
         matches!(
             i,
             Instr::Jump { .. }
@@ -7410,13 +7369,17 @@ mod local_sroa_tests {
                 _ => None,
             })
             .expect("new object");
+        // The first post-loop register write, made to read the elided object
+        // instead. (`console.log(checksum)` passes `checksum`'s own register
+        // as its argument window now, so the `Move` there is gone; the
+        // receiver's `LoadGlobal` serves.)
         let post_move = proto.code[end as usize + 1..]
             .iter()
-            .position(|i| matches!(i, Instr::Move { .. }))
+            .position(|i| matches!(i, Instr::Move { .. } | Instr::LoadGlobal { .. }))
             .map(|off| end as usize + 1 + off)
-            .expect("post-loop move");
+            .expect("post-loop register write");
         let dst = match proto.code[post_move] {
-            Instr::Move { dst, .. } => dst,
+            Instr::Move { dst, .. } | Instr::LoadGlobal { dst, .. } => dst,
             _ => unreachable!(),
         };
         proto.code[post_move] = Instr::Move {

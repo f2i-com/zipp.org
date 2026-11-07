@@ -33,12 +33,12 @@ fn arrow_lexical_unbox_enabled() -> bool {
     }
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ARROW_LEXICAL_UNBOX").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ARROW_LEXICAL_UNBOX").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -55,12 +55,12 @@ fn copy_box_enabled() -> bool {
     }
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_COPY_BOX").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_COPY_BOX").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -168,7 +168,7 @@ impl Compiler {
         // Sorted for the same reason the emitted Program fields are: these come
         // from HashSets, and `RandomState` reseeds per INSTANCE, so the order
         // differs between two sets in one process, not merely between runs.
-        v.sort_unstable();
+        crate::cold_sort::sort(&mut v);
         v
     }
 
@@ -545,6 +545,13 @@ impl Compiler {
         // earlier eval) may bind any name.
         if is_script && fc.cx.eval_fn_context {
             fc.box_all_locals = true;
+        }
+        if !fc.box_all_locals && !fc.script_eval_lexicals && numeric_locals_enabled() {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.extend(self_name);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, params_ast, body);
         }
         // The eval ROOT closes over the caller bindings: seed them as upvalues
         // (the runtime hands the cells to the manually-built eval closure).
@@ -1069,6 +1076,11 @@ impl Compiler {
             for s in body {
                 collect_hoisted_vars(s, &mut hv);
             }
+        // A `var arguments` shares the binding's register and is written in
+        // place, past `resolve`: the object stays, whatever reads it.
+        if hv.contains("arguments") && fc.arguments_reg.is_some() {
+            fc.uses_arguments = true;
+        }
             // Pre-declare EVERY hoisted var at entry (not just captured ones):
             // (1) a `var` declared inside a BLOCK must occupy a register BELOW
             // the block scope's, or the block's pop reclaims register space
@@ -1204,6 +1216,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1213,11 +1226,8 @@ impl Compiler {
                 .map(expected_arg_count)
                 .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator,
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
@@ -1315,6 +1325,14 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         if cls_body_refs_eval {
             fc.box_all_locals = true;
+        }
+        // Not where field initializers compile into the body: the walk sees
+        // the body only.
+        if !cls_body_refs_eval && fields.is_empty() && computed_inits.is_empty() && numeric_locals_enabled() {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, params_ast, body);
         }
         fc.in_derived_ctor = fc.cx.in_derived_ctor;
         fc.cx.in_strict = true;
@@ -1562,6 +1580,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1571,11 +1590,8 @@ impl Compiler {
                 .map(expected_arg_count)
                 .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator,
             is_async,
             // A class method/getter/setter is non-constructable. The class
@@ -1645,6 +1661,12 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         if arrow_refs_eval {
             fc.box_all_locals = true;
+        }
+        if let (false, ast::ArrowBody::Block(b), true) = (arrow_refs_eval, &a.body, numeric_locals_enabled()) {
+            let mut excluded: Vec<&str> = params.iter().map(String::as_str).collect();
+            excluded.extend(rest);
+            excluded.push("arguments");
+            fc.num_locals = capture::numeric_locals(&excluded, Some(&a.params), &b.stmts);
         }
         fc.cx.in_strict = is_strict;
         // An arrow has no `super` binding of its own: `super.x` / `super.m()` inside
@@ -1856,6 +1878,7 @@ impl Compiler {
         fc.typeof_alias_finish();
         fc.check_regs()?;
         let call_sites = fc.take_call_sites();
+        let (arguments_reg, args_count_only) = fc.settle_arguments();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -1863,11 +1886,8 @@ impl Compiler {
             param_count: params.len() as u16,
             length: expected_arg_count(&a.params),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments {
-                fc.arguments_reg
-            } else {
-                None
-            },
+            arguments_reg,
+            args_count_only,
             is_generator: false,
             is_async: a.is_async,
             non_constructable: true, // arrow functions have no [[Construct]]

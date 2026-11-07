@@ -5,6 +5,26 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// A [`RegexAuditEntry`] for a program's identity and resident bytes.
+#[cfg(target_pointer_width = "32")]
+fn regex_audit_entry(identity: usize, bytes: usize) -> RegexAuditEntry {
+    (identity as u64) << 32 | bytes as u64
+}
+#[cfg(not(target_pointer_width = "32"))]
+fn regex_audit_entry(identity: usize, bytes: usize) -> RegexAuditEntry {
+    (identity, bytes)
+}
+
+/// The identity and resident bytes of a [`RegexAuditEntry`].
+#[cfg(target_pointer_width = "32")]
+fn regex_audit_parts(entry: RegexAuditEntry) -> (usize, usize) {
+    ((entry >> 32) as usize, entry as u32 as usize)
+}
+#[cfg(not(target_pointer_width = "32"))]
+fn regex_audit_parts(entry: RegexAuditEntry) -> (usize, usize) {
+    entry
+}
+
 /// The global slots that the program's bytecode stores can reach: the
 /// fail-closed set `slot_guard_key` keys on (eval and Function registration
 /// extend it at run time, in `eval_prog`).
@@ -57,12 +77,12 @@ const JIT_LARGE_PROGRAM_FUNCS: usize = 256;
 /// stays interpreted already and its own bodies are what compiles.
 #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn jit_wanted(program: &Program) -> bool {
-    if std::env::var_os("ZIPP_NOJIT").is_some() {
+    if crate::env_var_os("ZIPP_NOJIT").is_some() {
         return false;
     }
     program.python_natives
         || program.functions.len() < JIT_LARGE_PROGRAM_FUNCS
-        || std::env::var_os("ZIPP_JIT_LARGE").is_some()
+        || crate::env_var_os("ZIPP_JIT_LARGE").is_some()
 }
 
 /// Whether a VM over a JavaScript program of [`JIT_LARGE_PROGRAM_FUNCS`] or
@@ -70,7 +90,7 @@ fn jit_wanted(program: &Program) -> bool {
 /// [`jit_wanted`]).
 pub(crate) fn large_programs_run_jit() -> bool {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    return std::env::var_os("ZIPP_NOJIT").is_none() && std::env::var_os("ZIPP_JIT_LARGE").is_some();
+    return crate::env_var_os("ZIPP_NOJIT").is_none() && crate::env_var_os("ZIPP_JIT_LARGE").is_some();
     #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     false
 }
@@ -230,7 +250,7 @@ impl<'p> Vm<'p> {
         eval_arena: &'p crate::vm::eval_arena::EvalArena,
     ) -> Vm<'p> {
         let mut heap = Heap::new();
-        let report_unhandled = std::env::var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
+        let report_unhandled = crate::env_var("ZIPP_REPORT_UNHANDLED").is_ok_and(|v| v == "1");
         let fatal_rejections = crate::unhandled_rejections_fatal() && !report_unhandled;
         // Pre-load string constants of every function into the heap so
         // `LoadConst` of a string resolves to a stable heap index. We rewrite
@@ -278,6 +298,9 @@ impl<'p> Vm<'p> {
             program,
             eval_funcs: Vec::new(),
             funcs: program.functions.iter().collect(),
+            entered_code: Vec::new(),
+            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+            frame_descs: Vec::new(),
             lazy: None,
             lazy_gmap: Vec::new(),
             static_key_plan_sites,
@@ -327,6 +350,7 @@ impl<'p> Vm<'p> {
             const_string_dense: Vec::new(),
             const_string_texts: rustc_hash::FxHashMap::default(),
             key_str_cache: rustc_hash::FxHashMap::default(),
+            index_key_strs: Vec::new(),
             key_value_front: (0..crate::vm::props::KEY_VALUE_FRONT_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::props::KeyValueFront::EMPTY))
                 .collect(),
@@ -335,7 +359,7 @@ impl<'p> Vm<'p> {
                 .collect(),
             enum_key_cache: Vec::new(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
-            const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
+            const_string_cache_enabled: crate::env_var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             #[cfg(not(target_arch = "wasm32"))]
             builtin_stats_enabled: crate::vm::builtins::builtin_stats_enabled_for_vm(),
             heap,
@@ -395,10 +419,12 @@ impl<'p> Vm<'p> {
             fatal_rejections,
             uncaught_in_promise: false,
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
-            template_raws: std::collections::HashMap::new(),
+            template_raws: Default::default(),
             template_cache: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_acc_route: rustc_hash::FxHashSet::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot_sites: rustc_hash::FxHashSet::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -409,6 +435,8 @@ impl<'p> Vm<'p> {
             jit_leaf_reads: Box::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_method_memo: Box::default(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_private_class_flags: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             ctor_stores: rustc_hash::FxHashMap::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -440,6 +468,7 @@ impl<'p> Vm<'p> {
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
             run_loop_depth: 0,
+            stack_floor: super::super::helpers_misc::declared_stack_floor(),
             native_recursion_depth: 0,
             tail_reuse_streak: 0,
             array_stringify_active: Vec::new(),
@@ -452,6 +481,9 @@ impl<'p> Vm<'p> {
             json_key_plans: Default::default(),
             regex_twin_defer: rustc_hash::FxHashMap::default(),
             handler_pool: Vec::new(),
+            activation_regs_pool: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            lazy_handlers: Vec::new(),
             regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
@@ -476,10 +508,10 @@ impl<'p> Vm<'p> {
             fn_props: crate::slot_table::SlotTable::default(),
             arr_props: crate::slot_table::SlotTable::default(),
             regexp_result_props: crate::slot_table::SlotTable::default(),
-            ab_max: std::collections::HashMap::new(),
-            ta_tracking: std::collections::HashSet::new(),
+            ab_max: Default::default(),
+            ta_tracking: Default::default(),
             async_activations: Vec::new(),
-            dv_tracking: std::collections::HashSet::new(),
+            dv_tracking: Default::default(),
             deleted_callable_intrinsics: rustc_hash::FxHashSet::default(),
             deleted_globals: std::collections::HashSet::new(),
             global_route_epoch: 0,
@@ -496,19 +528,19 @@ impl<'p> Vm<'p> {
             private_name_ids: rustc_hash::FxHashMap::default(),
             eval_fn_idx: 0,
             closure_eval_scope: crate::vm::JitGuardedMap::new(),
-            eval_scope_parent: std::collections::HashMap::new(),
+            eval_scope_parent: Default::default(),
             module_ambiguous: std::collections::HashMap::new(),
             module_ns_slots: std::collections::HashMap::new(),
             module_source_slots: std::collections::HashMap::new(),
-            module_metas: std::collections::HashMap::new(),
+            module_metas: Default::default(),
             module_func_ranges: Vec::new(),
             import_meta: 0,
-            can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
+            can_block: crate::env_var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
             module_body_promise: std::collections::HashMap::new(),
             pending_module_body_marker: false,
-            module_body_results: std::collections::HashSet::new(),
+            module_body_results: Default::default(),
             link_pending_deps: Vec::new(),
             deferred_ns_cache: std::collections::HashMap::new(),
             deferred_ns_state: std::collections::HashMap::new(),
@@ -527,7 +559,7 @@ impl<'p> Vm<'p> {
             realm_global_objs: crate::vm::JitGuardedMap::new(),
             realm_fns: std::collections::HashMap::new(),
             native_callee_realm: None,
-            realm_throw_type_errors: std::collections::HashMap::new(),
+            realm_throw_type_errors: Default::default(),
             async_waiters: Vec::new(),
             timer_queue: Vec::new(),
             timer_unref: rustc_hash::FxHashSet::default(),
@@ -605,15 +637,17 @@ impl<'p> Vm<'p> {
             dataview_bigint_bits: [Value::UNDEFINED.bits(); 4],
             sab_ctor: 0,
             sab_proto: 0,
-            shared_buffers: std::collections::HashSet::new(),
-            immutable_buffers: std::collections::HashSet::new(),
-            pinned_buffers: std::collections::HashSet::new(),
+            shared_buffers: Default::default(),
+            immutable_buffers: Default::default(),
+            pinned_buffers: Default::default(),
             error_data: crate::slot_table::SlotSet::default(),
             error_stacks: Default::default(),
             script_name: None,
             jit_new_site: (super::super::error_stack::NO_JIT_SITE, 0),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             new_class_memo: (0, 0, 0, 0, 0),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            new_stored_memo: (0, 0, 0, 0, 0),
             fn_name_cells: crate::slot_table::SlotSet::default(),
             const_cells: crate::slot_table::SlotSet::default(),
             const_cells_nonempty: 0,
@@ -622,12 +656,12 @@ impl<'p> Vm<'p> {
             pending_gen_callee: Value::UNDEFINED,
             gen_callee: crate::slot_table::SlotTable::default(),
             eval_script_gdi: false,
-            eval_lexical_globals: std::collections::HashSet::new(),
-            eval_const_globals: std::collections::HashSet::new(),
-            eval_var_globals: std::collections::HashSet::new(),
+            eval_lexical_globals: Default::default(),
+            eval_const_globals: Default::default(),
+            eval_var_globals: Default::default(),
             eval_prelude_mode: false,
             arguments_objs: crate::slot_table::SlotTable::default(),
-            gen_args_obj: std::collections::HashMap::new(),
+            gen_args_obj: Default::default(),
             gen_inline_ok: Vec::new(),
             module_base_dir: None,
             module_root: None,
@@ -641,6 +675,9 @@ impl<'p> Vm<'p> {
             closure_home: ClosureHomeTable::default(),
             closure_new_target: crate::slot_table::SlotTable::default(),
             finalize_shapes: rustc_hash::FxHashMap::default(),
+            finalize_memo: [(u32::MAX, u16::MAX, 0); crate::vm::natives::FINALIZE_MEMO_SLOTS],
+            species_memo: core::cell::Cell::new((u32::MAX, 0, u32::MAX, 0, 0)),
+            spreadable_memo: core::cell::Cell::new((u32::MAX, u32::MAX)),
             iter_result_shape: None,
             step_tokens: vec![(u32::MAX, 0, 0); crate::vm::STEP_TOKEN_SLOTS].into_boxed_slice(),
             from_async_fn: None,
@@ -660,13 +697,13 @@ impl<'p> Vm<'p> {
             dispose_async_state: std::collections::HashMap::new(),
             asyncdisposablestack_ctor: 0,
             asyncdisposablestack_proto: 0,
-            async_stacks: std::collections::HashSet::new(),
+            async_stacks: Default::default(),
             suppressederror_ctor: 0,
             suppressederror_proto: 0,
             shadowrealm_ctor: 0,
             shadowrealm_proto: 0,
-            shadow_realms: std::collections::HashSet::new(),
-            shadow_fn_realm: std::collections::HashMap::new(),
+            shadow_realms: Default::default(),
+            shadow_fn_realm: Default::default(),
             abstractmodulesource_ctor: 0,
             abstractmodulesource_proto: 0,
             module_source_proto: 0,
@@ -680,13 +717,15 @@ impl<'p> Vm<'p> {
             matchall_fast_slots: None,
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: crate::vm::JitGuardedMap::new(),
-            realm_ctor_main: std::collections::HashMap::new(),
+            realm_ctor_main: Default::default(),
             fn_proto_override: rustc_hash::FxHashMap::default(),
+            instanceof_memo: vec![crate::vm::InstanceofMemo::EMPTY; crate::vm::INSTANCEOF_MEMO_SLOTS].into_boxed_slice(),
+            fn_props_gen: 0,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
-            is_htmldda: std::collections::HashSet::new(),
+            is_htmldda: Default::default(),
             htmldda_idx: u32::MAX,
-            htmldda_scalar_enabled: std::env::var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
+            htmldda_scalar_enabled: crate::env_var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -705,12 +744,12 @@ impl<'p> Vm<'p> {
             plainmonthday_proto: 0,
             zoneddatetime_ctor: 0,
             zoneddatetime_proto: 0,
-            zdt_tz: std::collections::HashMap::new(),
-            temporal_cal: std::collections::HashMap::new(),
+            zdt_tz: Default::default(),
+            temporal_cal: Default::default(),
             intl_ns: 0,
             intl_ctors: [0; crate::vm::native::INTL_KINDS],
             intl_protos: [0; crate::vm::native::INTL_KINDS],
-            intl_fallback_syms: std::collections::HashMap::new(),
+            intl_fallback_syms: Default::default(),
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -753,11 +792,13 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit_enabled: jit_wanted(program),
             #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            jit_refused: std::env::var_os("ZIPP_NOJIT").is_some(),
+            jit_refused: crate::env_var_os("ZIPP_NOJIT").is_some(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_call_depth: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_call_cap: super::super::native_call_cap(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_tierc_activation: TiercActivationState::EMPTY,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -775,6 +816,10 @@ impl<'p> Vm<'p> {
             ta_len_base: (0, 0, 0),
             ta_len_kind_ver: [0; 12],
             ta_len_kinds: 0,
+            ta_meth_kind_ver: [0; 12],
+            ta_meth_kinds: 0,
+            ta_meth_slots: vec![(u32::MAX, 0); crate::vm::native::TA_PROTO_METHODS.len()].into_boxed_slice(),
+            ta_species_memo: [(u32::MAX, u32::MAX, u32::MAX, 0, 0); 12],
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -786,16 +831,25 @@ impl<'p> Vm<'p> {
             gc_lock: 0,
             #[cfg(feature = "safe-sandbox")]
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
-            gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
-            weak_containers: std::collections::HashSet::new(),
+            gc_stress: crate::env_var_os("ZIPP_GC_STRESS").is_some(),
+            weak_containers: Default::default(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            new_sites: Vec::new(),
+            #[cfg(feature = "node")]
             node_installed: false,
+            #[cfg(feature = "node")]
             node_partial: [String::new(), String::new()],
+            #[cfg(feature = "node")]
             node_exit_hook: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_tick_hook: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_tick_pending: false,
+            #[cfg(feature = "node")]
             node_host: Value::UNDEFINED,
+            #[cfg(feature = "node")]
             node_cjs: Value::UNDEFINED,
             #[cfg(feature = "webassembly")]
             wasm: None,
@@ -926,7 +980,7 @@ impl<'p> Vm<'p> {
                 self.regex_program_audit_scratch
                     .borrow()
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+                    .saturating_mul(std::mem::size_of::<RegexAuditEntry>()),
             )
             .saturating_add(self.sloppy_eval_memo.capacity())
             .saturating_add(
@@ -1015,13 +1069,13 @@ impl<'p> Vm<'p> {
         let mut programs = self.regex_program_audit_scratch.borrow_mut();
         programs.clear();
         self.heap.visit_regexp_programs(|program| {
-            programs.push((
+            programs.push(regex_audit_entry(
                 std::sync::Arc::as_ptr(program) as usize,
                 program.resident_bytes(),
             ));
         });
         for program in self.regex_compile_cache.values() {
-            programs.push((
+            programs.push(regex_audit_entry(
                 std::sync::Arc::as_ptr(program) as usize,
                 program.resident_bytes(),
             ));
@@ -1029,11 +1083,13 @@ impl<'p> Vm<'p> {
         // The standard sort, not `cold_sort`: the periodic heap audit runs
         // this over every compiled program into a reused scratch buffer, and
         // the shared sort's two allocations and indirect comparisons made
-        // RegExp compilation 1.6-2.7x slower in the WebAssembly screen.
-        programs.sort_unstable_by_key(|&(identity, _)| identity);
-        programs.dedup_by_key(|entry| entry.0);
-        programs.iter().fold(0usize, |bytes, &(_, program_bytes)| {
-            bytes.saturating_add(program_bytes)
+        // RegExp compilation 1.6-2.7x slower in the WebAssembly screen. One
+        // `Arc` always reports the same size, so ordering by (identity, size)
+        // groups each program's references together.
+        programs.sort_unstable();
+        programs.dedup_by_key(|entry| regex_audit_parts(*entry).0);
+        programs.iter().fold(0usize, |bytes, &entry| {
+            bytes.saturating_add(regex_audit_parts(entry).1)
         })
     }
 
@@ -1196,7 +1252,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
-        self.jit_refused = !on || std::env::var_os("ZIPP_NOJIT").is_some();
+        self.jit_refused = !on || crate::env_var_os("ZIPP_NOJIT").is_some();
         // The first ARM64 tier has no native step-meter yet. Once a recorder or
         // budget is attached, it must remain interpreted even if a caller later
         // tries to re-enable the JIT through the differential-test hook.

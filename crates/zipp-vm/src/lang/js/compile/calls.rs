@@ -30,12 +30,12 @@ fn pad2_cond_fuse_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PAD2_COND_FUSE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PAD2_COND_FUSE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -59,13 +59,13 @@ fn pad2_cond_fuse_enabled() -> bool {
 #[inline]
 fn strict_call_order() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let relaxed = std::env::var_os("ZIPP_RELAXED_CALL_ORDER").is_some()
-                && std::env::var_os("ZIPP_STRICT_CALL_ORDER").is_none();
+            let relaxed = crate::env_var_os("ZIPP_RELAXED_CALL_ORDER").is_some()
+                && crate::env_var_os("ZIPP_STRICT_CALL_ORDER").is_none();
             let v = (!relaxed) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
@@ -751,6 +751,10 @@ impl<'a> FnCompiler<'a> {
     ) -> R<(Reg, Reg)> {
         let stable = match &m.object {
             Expr::Ident(id) => self.stable_register_receiver(id, args),
+            // `this` is never assigned: outside a derived constructor (where
+            // `super()` initializes it) and a redirected `this`, its register
+            // already is the snapshot (`this.scale(1 / this.length)`).
+            Expr::This => !self.in_derived_ctor && self.this_override.is_none() && this_receiver_enabled(),
             _ => false,
         };
         // Only a NAMED member call gets the above-high-water callee register:
@@ -1456,62 +1460,6 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // console.log(...) → Print opcode. The method is read before the
-        // arguments, as for any call, so a replaced one is what runs.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    if &**obj == "console"
-                        && matches!(&**prop, "log" | "info" | "warn" | "error" | "debug")
-                        && self.builtin_unshadowed("console")
-                        && !c.args.iter().any(|a| matches!(a, Arg::Spread(_)))
-                    {
-                        let save = self.next_reg;
-                        if dst >= self.next_reg {
-                            self.set_next_reg(dst.saturating_add(1));
-                        }
-                        let this_v = self.alloc_reg();
-                        let receiver = self.expr_into(&m.object, this_v)?;
-                        if receiver != this_v {
-                            self.emit(Instr::Move {
-                                dst: this_v,
-                                src: receiver,
-                            });
-                        }
-                        // The method goes in the call's own result register
-                        // when that is a temporary no argument reads, so the
-                        // call takes one frame register more than the print
-                        // it replaced, not two: the local-SROA lane keeps its
-                        // scalars in the registers a function never names.
-                        let named = dst < 2
-                            || self
-                                .scopes
-                                .iter()
-                                .flatten()
-                                .any(|(_, r)| *r == Slot::Reg(dst))
-                            || self.self_name.as_ref().is_some_and(|(_, r)| *r == dst);
-                        let callee = if named { self.alloc_reg() } else { dst };
-                        let name = self.string_name(prop);
-                        self.emit(Instr::GetProp {
-                            dst: callee,
-                            obj: this_v,
-                            name,
-                        });
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Print {
-                            dst,
-                            callee,
-                            this_v,
-                            arg_base,
-                            argc,
-                        });
-                        self.set_next_reg(save.max(dst.saturating_add(1)));
-                        return Ok(dst);
-                    }
-                }
-            }
-        }
-
         // `JSON.parse(text)` / `JSON.stringify(value)` → fast ops. The forms with
         // a reviver / replacer (2+ args) fall through to the generic call so the
         // `JSON_PARSE` / `JSON_STRINGIFY` natives can honour them.
@@ -2163,8 +2111,15 @@ impl<'a> FnCompiler<'a> {
             Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
             Expr::Ident(id) => {
                 let name: &str = id;
-                matches!(name, "undefined" | "NaN" | "Infinity")
+                if matches!(name, "undefined" | "NaN" | "Infinity") {
+                    return self.ident_order_transparent(name, false);
+                }
+                // A register local that only ever holds a number, undefined,
+                // null or a boolean (`capture::numeric_locals`): the read is
+                // the register, and the value has nothing to coerce.
+                self.num_locals.contains(name)
                     && self.ident_order_transparent(name, false)
+                    && matches!(self.resolve(name), Binding::Local(_) | Binding::Spill(_))
             }
             Expr::Unary {
                 op: UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Void,
@@ -2348,7 +2303,7 @@ impl<'a> FnCompiler<'a> {
 
     /// Evaluate call arguments into a contiguous run of registers and return
     /// (first register, count). The run MUST be contiguous because the
-    /// `Call`/`Print`/`NewArray` opcodes address args as
+    /// `Call`/`NewArray` opcodes address args as
     /// `[arg_base, arg_base+argc)`.
     ///
     /// Correctness subtlety: evaluating one argument may itself allocate scratch
@@ -2410,12 +2365,37 @@ impl<'a> FnCompiler<'a> {
     /// Consumed by `CallSpread` / `CallMethodSpread`.
     pub(crate) fn build_spread_args(&mut self, args: &[Arg]) -> R<Reg> {
         let args_arr = self.temp();
+        // The plain arguments before the first spread are evaluated into one
+        // contiguous block and become the array's initial elements, so only
+        // the spread and what follows it is appended one by one. Allocating
+        // the array after evaluating them instead of before is not
+        // observable. `f(a, b, c, ...xs)` made an `ArrayAppend` (a helper
+        // call in compiled code, and a Vec regrowth) per plain argument.
+        let lead: Vec<&Expr> = args
+            .iter()
+            .map_while(|a| match a {
+                Arg::Expr(e) => Some(e),
+                Arg::Spread(_) => None,
+            })
+            .collect();
+        let n_lead = if self.next_reg as usize + lead.len() <= Reg::MAX as usize && lead.len() <= u16::MAX as usize {
+            lead.len()
+        } else {
+            0
+        };
+        let save = self.next_reg;
+        let base = if n_lead > 0 {
+            self.eval_contiguous(&lead[..n_lead])?
+        } else {
+            self.next_reg
+        };
         self.emit(Instr::NewArray {
             dst: args_arr,
-            arg_base: self.next_reg,
-            argc: 0,
+            arg_base: base,
+            argc: n_lead as u16,
         });
-        for a in args {
+        self.set_next_reg(save);
+        for a in &args[n_lead..] {
             let save = self.next_reg;
             // `Arg` has exactly the two forms, so the old
             // "unsupported spread-call argument" arm (oxc's `Argument` could be

@@ -118,7 +118,10 @@ console.log(breakWide, breakNegative, breakAt, typeof breakWide);
 
 /// The typed-array benchmark spells its loop bound as a constant multiply.
 /// V1 admits Mul only when the existing range proof has already elided its
-/// guard, keeping every raw result inside the sentinel-safe i53 domain.
+/// guard, keeping every raw result inside the sentinel-safe i53 domain. The
+/// compiler now folds `256 * 4` to the literal (a04713dd), so the region sees
+/// a literal bound; the census below pins that shape (one more shadowed
+/// register write than the multiply had).
 #[test]
 fn shadow_parity_elided_mul_loop_bound() {
     assert_matches_node(
@@ -278,7 +281,7 @@ fn shadow_mechanism_engages_and_switch_falls_back() {
             ),
             (
                 "shadow_parity_elided_mul_loop_bound",
-                "regs=2 globs=2 reg-writes=2 glob-writes=2 recv-resets=0",
+                "regs=2 globs=2 reg-writes=3 glob-writes=2 recv-resets=0",
                 None,
             ),
             (
@@ -370,7 +373,7 @@ fn shadow_mechanism_type_split_guard_under_legacy_alloc() {
             ),
             (
                 "shadow_parity_elided_mul_loop_bound",
-                "regs=3 globs=2 reg-writes=3 glob-writes=2 recv-resets=1",
+                "regs=3 globs=2 reg-writes=4 glob-writes=2 recv-resets=1",
                 None,
             ),
             (

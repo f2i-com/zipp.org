@@ -40,7 +40,7 @@ pub(crate) enum GenStep {
 mod asyncstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     static REPARKS: AtomicU64 = AtomicU64::new(0);
     static REUSED: AtomicU64 = AtomicU64::new(0);
     static GREW: AtomicU64 = AtomicU64::new(0);
@@ -53,7 +53,7 @@ mod asyncstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_ASYNCSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_ASYNCSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -117,7 +117,7 @@ mod asyncstats {
         JOB_WINDOW_CALLS.load(Ordering::Relaxed)
     }
 
-    static REUSE_ON: AtomicU8 = AtomicU8::new(2);
+    static REUSE_ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
     /// the rollback switch, and the two sides of the one-binary A/B (fat LTO
@@ -128,7 +128,7 @@ mod asyncstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
+                let v = crate::env_var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
                 REUSE_ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -156,6 +156,14 @@ pub use asyncstats::dump as async_stats;
 pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
 pub use asyncstats::dump_job_window_calls as async_job_window_stats;
 
+env_off_switch! {
+    /// `ZIPP_NO_PRIMITIVE_AWAIT_DIRECT=1`: a suspended `await` of a primitive
+    /// allocates the fulfilled promise PromiseResolve makes and subscribes to
+    /// it (`to_promise` + `settle_subscribe`), instead of queueing the resume
+    /// job that subscription queues.
+    fn primitive_await_direct_enabled() = "ZIPP_NO_PRIMITIVE_AWAIT_DIRECT"
+}
+
 /// Collapse the next already-settled await job into the current AsyncResume job
 /// when no older microtask is waiting. A bounded trampoline preserves FIFO job
 /// ordering while avoiding register-window parking and heap-state churn.
@@ -165,12 +173,12 @@ fn async_settled_trampoline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -207,12 +215,12 @@ fn eager_combinator_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -224,12 +232,12 @@ fn promise_all_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -246,12 +254,12 @@ pub(super) fn promise_resolve_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -267,12 +275,12 @@ fn promise_capability_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_CAPABILITY_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_CAPABILITY_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -290,44 +298,38 @@ fn combinator_lean_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_COMBINATOR_LEAN").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_COMBINATOR_LEAN").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
     }
 }
 
-/// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
-/// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-fn job_window_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_JOB_WINDOW").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_JOB_WINDOW=1` runs every reaction job through `run_microtask`
+    /// again (see `Vm::run_job_windowed`). The two sides of a one-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn job_window_enabled() = "ZIPP_NO_JOB_WINDOW"
 }
 
 /// The register window a run of reaction jobs calling one compiled callback
 /// shares (`Vm::run_job_windowed`): the callback, its native entry and where
-/// the window starts in the register file.
+/// the window starts in the register file. The entry is kept as the
+/// `Option` `run_cb_elem` takes, always `Some`, and each job passes it by
+/// reference: rebuilt per job, the 72-byte entry was copied twice, which the
+/// PGO build (its training runs no job window) did with two `rep movsq`, a
+/// sixth of a promise chain's drain.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
 struct JobWindow {
     callee: Value,
-    native: super::misc_methods::NativeCb,
+    native: Option<super::misc_methods::NativeCb>,
     at: usize,
 }
 
@@ -395,12 +397,12 @@ fn promise_slot_cache_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -420,12 +422,12 @@ fn pristine_lean_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -446,12 +448,12 @@ fn gen_inline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_GEN_INLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_GEN_INLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -541,7 +543,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -910,12 +912,15 @@ impl<'p> Vm<'p> {
                         // Uncaught in the body: unwind_to_handler already popped the frame
                         // and truncated its window. Complete the generator and surface the
                         // throw at the `gen.throw(e)` call site (value via pending_throw).
-                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
-                            regs.clear();
                             handlers.clear();
-                        }
+                            std::mem::take(regs)
+                        } else {
+                            Vec::new()
+                        };
+                        self.give_activation_regs(spare);
                         return Err(Thrown(self.throw_message(e)));
                     }
                 }
@@ -933,12 +938,15 @@ impl<'p> Vm<'p> {
                         // complete the generator with the return value.
                         self.frames.pop();
                         self.regs.truncate(new_base);
-                        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                             *state = GenState::Completed;
-                            regs.clear();
                             handlers.clear();
-                        }
+                            std::mem::take(regs)
+                        } else {
+                            Vec::new()
+                        };
+                        self.give_activation_regs(spare);
                         return Ok(Some(GenStep::Done(v)));
                     }
                 }
@@ -972,22 +980,28 @@ impl<'p> Vm<'p> {
         }
         match outcome {
             Ok(ret) => {
-                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                    let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
-                    regs.clear();
                     handlers.clear();
-                }
+                    std::mem::take(regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 Ok(Some(GenStep::Done(ret)))
             }
             Err(t) => {
                 self.regs.truncate(new_base);
-                if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+                let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+                    let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
                     *state = GenState::Completed;
-                    regs.clear();
                     handlers.clear();
-                }
+                    std::mem::take(regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 Err(t)
             }
         }
@@ -1212,12 +1226,15 @@ impl<'p> Vm<'p> {
     /// Generator `idx` has completed (returned, or a throw left its body):
     /// nothing is parked any more.
     pub(crate) fn gen_complete(&mut self, idx: u32) {
-        if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
-                let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
+        let spare = if let HeapObj::Generator(g) = self.heap.get_mut(idx) {
+            let crate::heap::GeneratorData { state, regs, handlers, .. } = &mut **g;
             *state = GenState::Completed;
-            regs.clear();
             handlers.clear();
-        }
+            std::mem::take(regs)
+        } else {
+            Vec::new()
+        };
+        self.give_activation_regs(spare);
     }
 
     /// Complete the top frame's `IterNext`, its `next()` call (`done_dst`
@@ -2283,6 +2300,41 @@ impl<'p> Vm<'p> {
     /// Build a suspended `async function` activation and run it synchronously up
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
+    /// A register window of `n` undefined values for a new async function or
+    /// generator activation, in a finished one's storage when the pool holds
+    /// one: two allocator round trips per `await`-ing call were the
+    /// window's and its state box's.
+    #[inline]
+    fn take_activation_regs(&mut self, n: usize) -> Vec<Value> {
+        // Speed only: the browser (meter-only) builds allocate each window,
+        // without the pool's code.
+        if cfg!(feature = "meter-only") {
+            return vec![Value::UNDEFINED; n];
+        }
+        match self.activation_regs_pool.pop() {
+            Some(mut v) => {
+                v.resize(n, Value::UNDEFINED);
+                v
+            }
+            None => vec![Value::UNDEFINED; n],
+        }
+    }
+
+    /// Keep a finished activation's register storage, emptied, for
+    /// [`Self::take_activation_regs`]; a large one is simply dropped.
+    #[inline]
+    pub(crate) fn give_activation_regs(&mut self, mut v: Vec<Value>) {
+        if cfg!(feature = "meter-only")
+            || v.capacity() == 0
+            || v.capacity() > 256
+            || self.activation_regs_pool.len() >= 64
+        {
+            return;
+        }
+        v.clear();
+        self.activation_regs_pool.push(v);
+    }
+
     pub(crate) fn alloc_async(
         &mut self,
         func_id: u32,
@@ -2315,7 +2367,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -2409,7 +2461,7 @@ impl<'p> Vm<'p> {
         } else {
             this
         };
-        let mut regs = vec![Value::UNDEFINED; reg_count];
+        let mut regs = self.take_activation_regs(reg_count);
         regs[0] = this;
         let n = args.len().min(param_count);
         regs[1..1 + n].copy_from_slice(&args[..n]);
@@ -4143,11 +4195,14 @@ impl<'p> Vm<'p> {
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
             // Can't make progress — abandon the activation and reject its result.
-            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+            let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                 a.state = GenState::Completed;
-                a.regs.clear();
                 a.handlers.clear();
-            }
+                std::mem::take(&mut a.regs)
+            } else {
+                Vec::new()
+            };
+            self.give_activation_regs(spare);
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             self.reject_thrown_job(result, e);
             return;
@@ -4272,6 +4327,18 @@ impl<'p> Vm<'p> {
                 a.regs = back;
                 a.handlers = handlers;
             }
+            // `await` of a primitive (`await null`): PromiseResolve makes a
+            // fresh promise fulfilled with it, and PerformPromiseThen on that
+            // settled promise queues this activation's resume at once. The
+            // promise reaches nothing else (no handler, no rejection to
+            // track), so queue the resume job itself, in the same place.
+            if primitive_await_direct_enabled() && !self.is_object_value(awaited) {
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation: idx,
+                    input: Resume::Value(awaited),
+                });
+                return;
+            }
             let p = self.to_promise(awaited);
             self.settle_subscribe(p, idx);
             return;
@@ -4279,11 +4346,14 @@ impl<'p> Vm<'p> {
         // Otherwise the activation finished — settle `result`.
         match outcome {
             Ok(ret) => {
-                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                     a.state = GenState::Completed;
-                    a.regs.clear();
                     a.handlers.clear();
-                }
+                    std::mem::take(&mut a.regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 if self.module_body_results.remove(&result) {
                     // Module body: the capability resolves with undefined —
                     // a thenable completion value must not be adopted
@@ -4305,11 +4375,14 @@ impl<'p> Vm<'p> {
                 };
                 // The unwind already truncated the window; keep regs consistent.
                 self.regs.truncate(new_base);
-                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                let spare = if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                     a.state = GenState::Completed;
-                    a.regs.clear();
                     a.handlers.clear();
-                }
+                    std::mem::take(&mut a.regs)
+                } else {
+                    Vec::new()
+                };
+                self.give_activation_regs(spare);
                 self.reject_thrown_job(result, e);
             }
         }
@@ -4507,6 +4580,7 @@ impl<'p> Vm<'p> {
     pub fn drain_microtasks(&mut self) {
         // `process.nextTick`'s callbacks run first at a checkpoint, and again
         // after the microtasks while those queued more (Node's order).
+        #[cfg(feature = "node")]
         loop {
             if self.node_tick_pending {
                 self.node_run_ticks();
@@ -4516,6 +4590,8 @@ impl<'p> Vm<'p> {
                 break;
             }
         }
+        #[cfg(not(feature = "node"))]
+        self.drain_microtasks_queue();
     }
 
     /// [`Self::drain_microtasks`]'s promise jobs.
@@ -4626,15 +4702,15 @@ impl<'p> Vm<'p> {
                 };
                 *window = Some(JobWindow {
                     callee: callback,
-                    native,
+                    native: Some(native),
                     at,
                 });
             }
-            let Some(w) = *window else {
+            let Some(w) = window.as_ref() else {
                 return false;
             };
             asyncstats::job_window_call();
-            match self.run_cb_elem(&Some(w.native), w.at, callback, &[arg], Value::UNDEFINED) {
+            match self.run_cb_elem(&w.native, w.at, callback, &[arg], Value::UNDEFINED) {
                 Ok(ret) => self.resolve(dependent, ret),
                 Err(_) => {
                     let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);

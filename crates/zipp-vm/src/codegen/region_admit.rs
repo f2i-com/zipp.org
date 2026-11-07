@@ -603,7 +603,7 @@ pub(crate) fn region_can_compile(
     // so a change that looked like it would unblock a region unblocked nothing.
     // Behaviour is unchanged when the flag is off (`dump` is false, and every
     // rejection returns immediately exactly as before).
-    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let dump = crate::env_var_os("ZIPP_JITDUMP").is_some();
     let mut ok = true;
     // The back-edge must be an unconditional jump to the header (canonical
     // while/for shape). This guarantees no fall-through past `end`, so the only
@@ -700,7 +700,7 @@ pub(crate) fn region_op_admitted(
         | Instr::JumpIfNotLe { .. }
         // Heap property ops — handled by the MEMORY path via win64 helper
         // calls (the int/regalloc paths decline, so heap regions take the
-        // mem path). A `Print`/etc. anywhere still rejects the region.
+        // mem path). Any other op still rejects the region.
         // A strict-FORCED SetProp (a strict ClassTail region inside a
         // sloppy function) declines: the JIT slow path derives strictness
         // from the proto flag, which cannot see that region.
@@ -797,9 +797,10 @@ pub(crate) fn region_op_admitted(
         // interpreter — which runs ToNumber coercion — if not) and calls the
         // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
         // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
-        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
-        // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
-        // the interpreter handles it. The helpers run no user code and never
+        // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`, and
+        // `min`/`max`/`hypot` of up to eight numbers `jit_math_many`. Any other
+        // arity declines -- the interpreter handles it, and a single such call
+        // keeps its whole loop there. The helpers run no user code and never
         // allocate (a non-numeric arg already bailed), so no pinned-pointer
         // re-fetch is needed.
         Instr::MathOp { op, argc, .. } => {
@@ -839,6 +840,11 @@ pub(crate) fn region_op_admitted(
         // helper handles the non-heap-argument fast path (no user code, no
         // microtask) and deopts a heap argument to the interpreter's
         // identity/thenable protocol. Every other StaticFn keeps declining.
+        // `Number(x)`, `String(x)`, `parseInt(s)`, `isNaN(x)` and their
+        // siblings: `jit_global_fn_ic`, with the call protocol (a replaced
+        // global or an object's `valueOf` is user code). MEM path only. Each
+        // one kept the loop around it interpreted.
+        Instr::GlobalFn { .. } if const_strs.is_some() => {}
         Instr::StaticFn { op, argc, .. } => {
             let inline = static_fn_region_inline(op, argc);
             // Every other static (`Object.assign`, `String.fromCharCode`, …)
@@ -1082,6 +1088,9 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
 /// residual binding opcode remains in the specialized suffix and is rejected by
 /// `leaf_ok_impl`, while rest/`arguments` are rejected before the scan.
 pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Instr>, u64)> {
+    if callee.args_count_only {
+        return callee_leaf_ok_for_call(&with_known_count(callee, argc)?, argc);
+    }
     if callee.simple_params {
         return callee_leaf_ok(callee).map(|body| (body, 0));
     }
@@ -1156,6 +1165,32 @@ pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Ins
     leaf_ok_impl(&specialized, false).map(|(body, _)| (body, arg_mask))
 }
 
+/// A body whose `arguments` is only ever counted, at a call that knows the
+/// count: its register is a constant, and the body is an ordinary function.
+fn with_known_count(callee: &FuncProto, argc: u16) -> Option<FuncProto> {
+    let mut known = callee.clone();
+    let dst = known.arguments_reg.take()?;
+    known.args_count_only = false;
+    for instr in &mut known.code {
+        if let Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. } = instr
+        {
+            *target += 1;
+        }
+    }
+    known.code.insert(
+        0,
+        Instr::LoadInt {
+            dst,
+            val: i32::from(argc),
+        },
+    );
+    Some(known)
+}
+
 /// Like `callee_leaf_ok`, but admits ONE `Call` in the body and reports its
 /// index. Used for the nested (wrapper) inline: a one-line forwarder such as
 ///
@@ -1183,6 +1218,124 @@ env_off_switch! {
     /// removes the fat-LTO code-layout confound that §2 warns about and that B70 had to
     /// reason around.
     fn leaf_getprop_enabled() = "ZIPP_NO_LEAF_GETPROP"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_TX_GLOBAL_STORE=1`: an inlined leaf's global write commits
+    /// where it stands again, so no deopt-capable op may follow it
+    /// (`leaf_global_stores_buffered`), for an A/B.
+    fn tx_global_store_enabled() = "ZIPP_NO_TX_GLOBAL_STORE"
+}
+
+/// The register an op of the leaf whitelist writes, `Some(None)` for one that
+/// writes none, and `None` for an op outside the list (assumed to write
+/// anything).
+fn leaf_op_writes(i: &Instr) -> Option<Option<u16>> {
+    Some(match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::LoadUndefined { dst }
+        | Instr::Move { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::MathOp { dst, .. } => Some(dst),
+        Instr::StoreGlobal { .. }
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined => None,
+        _ => return None,
+    })
+}
+
+/// Whether the inline emitters BUFFER every global write of leaf body `body`
+/// (as they buffer an `UpvalSet`): written nowhere until the body's last op,
+/// a later `LoadGlobal` of the slot reading the pending value. Then a write is
+/// no effect for the ordering rule, and deopt-capable ops may follow it: a
+/// PRNG helper (`seed = (imul(seed, a) + c) | 0; return (seed >>> 0) / 2**32`)
+/// writes its global first, so it was not a leaf at all and a hot loop paid a
+/// full call for it (1.4M calls in numbers-format-parse, 1.05M in
+/// strings-build-slice). Only a branch-free body with no captured-variable
+/// write and no nested call, and only when no write's source register is
+/// written again before the end, so the register still holds the value at the
+/// commit.
+pub(crate) fn leaf_global_stores_buffered(body: &[Instr]) -> bool {
+    if !tx_global_store_enabled() {
+        return false;
+    }
+    let mut any = false;
+    for (i, ins) in body.iter().enumerate() {
+        match *ins {
+            Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::UpvalSet { .. }
+            | Instr::Call { .. } => return false,
+            Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } | Instr::StoreGlobalResolved { src, .. } => {
+                any = true;
+                for later in &body[i + 1..] {
+                    match leaf_op_writes(later) {
+                        Some(Some(r)) if r == src => return false,
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    any
+}
+
+/// Whether leaf body `body` has a deopt-capable op after a global write: a
+/// body the ordering rule admits only because its writes are buffered
+/// (`leaf_global_stores_buffered`). Spliced into a wrapper's flat body, which
+/// the emitter does not buffer (it holds the wrapper's `Call`), such a body
+/// would commit the write and then bail.
+pub(crate) fn leaf_store_then_bail(body: &[Instr]) -> bool {
+    let Some(k) = body.iter().position(|i| {
+        matches!(
+            i,
+            Instr::StoreGlobal { .. } | Instr::StoreGlobalStrict { .. } | Instr::StoreGlobalResolved { .. }
+        )
+    }) else {
+        return false;
+    };
+    !body[k + 1..].iter().all(|i| {
+        matches!(
+            i,
+            Instr::LoadInt { .. }
+                | Instr::LoadConst { .. }
+                | Instr::LoadBool { .. }
+                | Instr::Move { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        )
+    })
 }
 
 fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
@@ -1249,6 +1402,8 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
         )
     });
     let mut seen_effect = false;
+    // Global writes the emitters buffer are no effect for the ordering rule.
+    let buffered_globals = leaf_global_stores_buffered(&code);
     let mut call_at: Option<usize> = None;
     for (i, instr) in code.iter().enumerate() {
         let is_last = i == code.len() - 1;
@@ -1415,7 +1570,9 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. } => {
-                seen_effect = true;
+                if !buffered_globals {
+                    seen_effect = true;
+                }
             }
             // Anything else (calls, heap writes, closures, throw, …) declines —
             // the inline emitter doesn't implement it. Under `ZIPP_JITDECLINE=1`,
@@ -1817,34 +1974,31 @@ pub(crate) struct HeapHelpers {
     pub(crate) len_of: usize,
     /// Tier C `ForInKeys` helper (obj bits → key-Array bits / deopt / threw).
     pub(crate) forin_keys: usize,
+    /// `HeapHelperAddrs::acc_lanes`.
+    pub(crate) acc_lanes: Option<&'static super::AccLanePlan>,
+    /// `HeapHelperAddrs::priv_lanes`.
+    pub(crate) priv_lanes: Option<&'static super::PrivLanePlan>,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     pub(crate) ic_base_idx: u32,
+    /// The address of the entry count a Tier C body counts down before it
+    /// asks for Tier O (`Jit::opt_tier_up`), 0 for none.
+    pub(crate) opt_tier_up: u64,
 }
 
-/// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
-/// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
-/// append. If that tier later declines, however, the memory emitter cannot use
-/// that push-only snapshot: it still calls the generic push helper, then used to
-/// re-snapshot every pin in the region after every append. On tokenizer-shaped
-/// loops that turned a failed INTEGER offer into substantial boxed-tier work.
-///
-/// Keep the switch local to planning so one binary can reproduce the old
-/// fallback byte stream. The full push-inclusive plan has already been consumed
-/// by the INTEGER attempt before this module is called; this filter affects only
-/// REGALLOC/MEM fallback compilation.
-fn push_pin_filter_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_PUSH_PIN_FILTER").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
+    /// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
+    /// append. If that tier later declines, however, the memory emitter cannot use
+    /// that push-only snapshot: it still calls the generic push helper, then used to
+    /// re-snapshot every pin in the region after every append. On tokenizer-shaped
+    /// loops that turned a failed INTEGER offer into substantial boxed-tier work.
+    ///
+    /// Keep the switch local to planning so one binary can reproduce the old
+    /// fallback byte stream. The full push-inclusive plan has already been consumed
+    /// by the INTEGER attempt before this module is called; this filter affects only
+    /// REGALLOC/MEM fallback compilation.
+    fn push_pin_filter_enabled() = "ZIPP_NO_PUSH_PIN_FILTER"
 }
 
 #[derive(Default)]

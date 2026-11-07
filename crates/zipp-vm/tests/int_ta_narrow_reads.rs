@@ -1,7 +1,7 @@
 //! Fixed-width integer TypedArray reads on the unboxed INTEGER tiers.
 //!
-//! The widening is read-only and deliberately excludes Uint32, floats and
-//! BigInt arrays.  Every native access still uses the existing live receiver,
+//! The widening is read-only and excludes floats and BigInt arrays (Uint32
+//! reads have their own switch and tests in `int_ta_u32_reads.rs`).  Every native access still uses the existing live receiver,
 //! kind, buffer, effective-length and bounds snapshot guards; a miss resumes at
 //! the GetIndex bytecode so the interpreter supplies the complete exotic-key
 //! semantics.
@@ -63,8 +63,8 @@ fn kernel_source(ctor: &str, values: &str) -> String {
 }
 
 /// Signedness, zero-extension and the Uint8Clamped read representation all
-/// match Node at boundary values. Uint32/float/BigInt cases are included as
-/// differential decline controls: they must stay correct on their lower tier.
+/// match Node at boundary values. Uint32 rides the same kernel; float/BigInt
+/// cases are differential decline controls that stay on their lower tier.
 #[test]
 fn narrow_ta_parity_kind_matrix() {
     for (ctor, values) in [
@@ -145,8 +145,7 @@ fn narrow_ta_parity_mechanism_probe() {
 }
 
 /// Default mode must actually compile a narrow TA read on the INTEGER tier;
-/// the kill switch must restore the old decline. Uint32 remains a decline even
-/// with the widening enabled.
+/// the kill switch must restore the old decline.
 #[test]
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn narrow_ta_mechanism_and_decline_controls() {

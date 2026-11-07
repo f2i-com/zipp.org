@@ -89,7 +89,8 @@ pub const ITER_PROBE: u32 = 0x8000;
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
 /// and the JIT will consume this same structured form rather than re-decoding
 /// bytes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), derive(Debug))]
 pub enum Instr {
     /// `dst = <constant pool[idx]>`
     LoadConst {
@@ -2132,20 +2133,6 @@ pub enum Instr {
     /// Return undefined.
     ReturnUndefined,
 
-    /// `console.log(...)` and its siblings: `callee` and `this_v` hold the
-    /// method and receiver read before the arguments. When `callee` is one of
-    /// the intrinsic console methods, print the `argc` values at `arg_base`
-    /// (to stderr for `error`/`warn`, as node does) and set `dst` to
-    /// undefined; otherwise call it, as the program replaced it, and set
-    /// `dst` to its result.
-    Print {
-        dst: Reg,
-        callee: Reg,
-        this_v: Reg,
-        arg_base: Reg,
-        argc: u16,
-    },
-
     // ---- Python frontend fast paths ---------------------------------------
     // Emitted only by `lang::python::frontend`. Each is the fused form of a guarded
     // inline sequence the Python emitter used to spell out (`typeof` tests,
@@ -2824,12 +2811,76 @@ pub enum Instr {
         b: Reg,
         src: Reg,
     },
+    // ── runs over a script's globals, laid over the pairs above ──
+    // A `var` at a script's top level is a global slot, so its loops read and
+    // write every counter and accumulator through `LoadGlobal`/`StoreGlobal`
+    // (twice the dispatches of the same loop in a function). Each of these
+    // stands for three or four instructions at the position of the first;
+    // the positions after it keep what the pair pass put there, so a jump
+    // into the run, and a fallback that runs only its first instruction or
+    // two, continue through the pair forms.
+    /// `LoadGlobal { dst: gdst, idx }`, `LoadInt { dst: ldst, val }`, then
+    /// `JumpIfNotLt { a: gdst, b: ldst, target }`: the head of a loop over a
+    /// global counter. Only a slot below 65536 (an instruction is 16 bytes).
+    FuseGlobalIntCmpJump {
+        gdst: Reg,
+        idx: u16,
+        ldst: Reg,
+        val: i32,
+        target: u32,
+    },
+    /// `LoadGlobal { dst: reg, idx }`, `AddInt { dst: reg, a: reg, imm, upd }`,
+    /// a store of `reg` to the same global (`StoreGlobal`, `StoreGlobalStrict`
+    /// or `StoreGlobalResolved`), then a backward `Jump { target }`: a global
+    /// loop counter's step and the back-edge. A store any of the three would
+    /// not make as a plain slot write runs in its own arm, after the first two.
+    FuseGlobalIncJump {
+        reg: Reg,
+        idx: u32,
+        imm: i16,
+        upd: bool,
+        target: u32,
+    },
+    /// [`Instr::FuseGlobalIncJump`] without the back-edge: `count++` on a
+    /// global.
+    FuseGlobalInc { reg: Reg, idx: u32, imm: i16, upd: bool },
+    /// `LoadInt { dst: ldst, val }`, `Bitwise { dst, a, b: ldst, op }`, then a
+    /// store of `dst` to a global (as [`Instr::FuseGlobalInc`]'s): `g = (…) | 0`.
+    FuseIntBitwiseStoreGlobal {
+        ldst: Reg,
+        val: i16,
+        dst: Reg,
+        a: Reg,
+        op: BitwiseOp,
+        idx: u32,
+    },
+    /// `LoadGlobal { dst: gdst, idx }`, `LoadInt { dst: ldst, val }`, then
+    /// `Bitwise { dst, a: gdst, b: ldst, op }`: a global masked or shifted by
+    /// a literal (`o & 255`, `o >> 2`).
+    FuseGlobalIntBitwise {
+        gdst: Reg,
+        idx: u32,
+        ldst: Reg,
+        val: i16,
+        dst: Reg,
+        op: BitwiseOp,
+    },
     /// The whole body of a function whose body has not been compiled yet
     /// (`compile::lazy`): compile it, put it in this function's place, and
     /// run it from its first instruction in the frame this call pushed. The
     /// stub it stands in carries the function's real call interface, so the
     /// frame was set up as the body expects.
     LazyCompile,
+}
+
+/// The derived text of an instruction is 24 KB of a browser module, and nothing
+/// there prints it: `compile_to_text` is a command-line and test path, and `Program`
+/// needs `Debug` only for the errors that carry one.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl std::fmt::Debug for Instr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Instr")
+    }
 }
 
 /// [`Instr::LoadBigInt`]'s value: an `i64` as two `u32` words, lowest first.
@@ -3040,6 +3091,10 @@ pub struct FuncProto {
     /// built at call setup, when the (non-arrow) function references `arguments`.
     /// `None` if unused.
     pub arguments_reg: Option<u16>,
+    /// The function reads `arguments` only as `arguments.length`: register
+    /// `arguments_reg` receives the argument count instead of an object, and
+    /// those reads are `Move`s of it.
+    pub args_count_only: bool,
     /// True for a `function*` generator body: calling it builds a suspended
     /// Generator object instead of running, and it is never whole-function JITed.
     pub is_generator: bool,
@@ -3815,7 +3870,86 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
             None => i += 1,
         }
     }
+    if global_runs_enabled() {
+        overlay_global_runs(code, &mut out);
+    }
     out.map(Vec::into_boxed_slice)
+}
+
+/// The global slot and source register of a store to a global that, with
+/// its slot initialized and nothing special about the global, is a plain
+/// slot write (each of these arms' fast path).
+fn plain_global_store(i: &Instr) -> Option<(u32, Reg)> {
+    match *i {
+        Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } | Instr::StoreGlobalResolved { idx, src } => {
+            Some((idx, src))
+        }
+        _ => None,
+    }
+}
+
+/// The second pass of [`fuse_for_interpreter`]: the three- and four-
+/// instruction runs over a script's globals (see `FuseGlobalIntCmpJump`),
+/// each written over the first position of its run when the pair pass left
+/// there the run's own first instruction or the pair that begins it.
+fn overlay_global_runs(code: &[Instr], out: &mut Option<Vec<Instr>>) {
+    let mut i = 0;
+    while i + 2 < code.len() {
+        let run = match (code[i], code[i + 1], code[i + 2]) {
+            (
+                Instr::LoadGlobal { dst: gdst, idx },
+                Instr::LoadInt { dst: ldst, val },
+                Instr::JumpIfNotLt { a, b, target },
+            ) if a == gdst && b == ldst && gdst != ldst => u16::try_from(idx)
+                .ok()
+                .map(|idx| (Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target }, 3)),
+            (Instr::LoadGlobal { dst: reg, idx }, Instr::AddInt { dst, a, imm, upd }, store)
+                if dst == reg && a == reg && plain_global_store(&store) == Some((idx, reg)) =>
+            {
+                match (i16::try_from(imm).ok(), code.get(i + 3)) {
+                    (Some(imm), Some(&Instr::Jump { target })) if target as usize <= i => {
+                        Some((Instr::FuseGlobalIncJump { reg, idx, imm, upd, target }, 4))
+                    }
+                    (Some(imm), _) => Some((Instr::FuseGlobalInc { reg, idx, imm, upd }, 3)),
+                    (None, _) => None,
+                }
+            }
+            (Instr::LoadInt { dst: ldst, val }, Instr::Bitwise { dst, a, b, op }, store)
+                if b == ldst && a != ldst && plain_global_store(&store).is_some_and(|(_, src)| src == dst) =>
+            {
+                let idx = plain_global_store(&store).map_or(0, |(idx, _)| idx);
+                i16::try_from(val)
+                    .ok()
+                    .map(|val| (Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx }, 3))
+            }
+            (
+                Instr::LoadGlobal { dst: gdst, idx },
+                Instr::LoadInt { dst: ldst, val },
+                Instr::Bitwise { dst, a, b, op },
+            ) if a == gdst && b == ldst && gdst != ldst => i16::try_from(val)
+                .ok()
+                .map(|val| (Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op }, 3)),
+            _ => None,
+        };
+        let Some((f, n)) = run else {
+            i += 1;
+            continue;
+        };
+        // Over the run's own first instruction, or the pair that begins it.
+        let first_ok = match out.as_ref().map(|o| o[i]) {
+            None => true,
+            Some(cur) => {
+                std::mem::discriminant(&cur) == std::mem::discriminant(&code[i])
+                    || matches!(cur, Instr::FuseLoadGlobalAddInt { .. } | Instr::FuseLoadIntBitwise { .. })
+            }
+        };
+        if first_ok {
+            out.get_or_insert_with(|| code.to_vec())[i] = f;
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3866,8 +4000,17 @@ mod fused_code_tests {
         assert_eq!(fused.len(), code.len());
         assert!(matches!(fused[0], Instr::FuseLoadGlobal2 { dst: 1, idx: 4, dst2: 2, idx2: 5 }));
         assert!(matches!(fused[1], Instr::LoadGlobal { dst: 2, idx: 5 }));
-        // The third load starts no pair: its partner would be a LoadInt.
-        assert!(matches!(fused[2], Instr::LoadGlobal { dst: 3, idx: 6 }));
+        // The third load starts no pair: its partner would be a LoadInt. With
+        // the global runs it starts the masked-global run over the next two,
+        // whose pair form stays at the position after it.
+        if global_runs_enabled() {
+            assert!(matches!(
+                fused[2],
+                Instr::FuseGlobalIntBitwise { gdst: 3, idx: 6, ldst: 4, val: 0, dst: 5, op: BitwiseOp::Or }
+            ));
+        } else {
+            assert!(matches!(fused[2], Instr::LoadGlobal { dst: 3, idx: 6 }));
+        }
         assert!(matches!(fused[3], Instr::FuseLoadIntBitwise { ldst: 4, val: 0, dst: 5, a: 3, b: 4, op: BitwiseOp::Or }));
         assert!(matches!(fused[4], Instr::Bitwise { dst: 5, .. }));
         assert!(matches!(fused[5], Instr::FuseAddIntMove { dst: 6, a: 6, imm: 1, upd: true, mdst: 7, msrc: 6 }));
@@ -3900,6 +4043,64 @@ mod fused_code_tests {
         let none = FusedCode::default();
         assert!(none.entered(&[Instr::Return { src: 0 }]).is_none());
         assert!(none.code.get().is_some() && none.get().is_none());
+    }
+
+    /// A script's global loop: its header, a masked global, an accumulator's
+    /// `| 0` store, a counter's step and the loop counter's step with its
+    /// back-edge become the global runs, laid over the pairs, and the
+    /// positions after each keep the pair forms a jump or a fallback runs.
+    #[test]
+    fn global_runs_overlay_the_pairs() {
+        if !global_runs_enabled() {
+            return;
+        }
+        let code = [
+            Instr::LoadGlobal { dst: 1, idx: 7 },
+            Instr::LoadInt { dst: 2, val: 100 },
+            Instr::JumpIfNotLt { a: 1, b: 2, target: 16 },
+            Instr::LoadGlobal { dst: 3, idx: 8 },
+            Instr::LoadInt { dst: 4, val: 255 },
+            Instr::Bitwise { dst: 5, a: 3, b: 4, op: BitwiseOp::And },
+            Instr::LoadInt { dst: 6, val: 0 },
+            Instr::Bitwise { dst: 7, a: 5, b: 6, op: BitwiseOp::Or },
+            Instr::StoreGlobalStrict { idx: 9, src: 7 },
+            Instr::LoadGlobal { dst: 8, idx: 10 },
+            Instr::AddInt { dst: 8, a: 8, imm: 1, upd: true },
+            Instr::StoreGlobal { idx: 10, src: 8 },
+            Instr::LoadGlobal { dst: 9, idx: 7 },
+            Instr::AddInt { dst: 9, a: 9, imm: 1, upd: true },
+            Instr::StoreGlobalResolved { idx: 7, src: 9 },
+            Instr::Jump { target: 0 },
+            Instr::ReturnUndefined,
+        ];
+        let fused = fuse_for_interpreter(&code).expect("runs fuse");
+        assert_eq!(fused.len(), code.len());
+        assert!(matches!(fused[0], Instr::FuseGlobalIntCmpJump { gdst: 1, idx: 7, ldst: 2, val: 100, target: 16 }));
+        assert!(matches!(fused[1], Instr::FuseIntCmpJump { ldst: 2, val: 100, a: 1, le: false, target: 16 }));
+        assert!(matches!(
+            fused[3],
+            Instr::FuseGlobalIntBitwise { gdst: 3, idx: 8, ldst: 4, val: 255, dst: 5, op: BitwiseOp::And }
+        ));
+        assert!(matches!(fused[4], Instr::FuseLoadIntBitwise { ldst: 4, dst: 5, .. }));
+        assert!(matches!(
+            fused[6],
+            Instr::FuseIntBitwiseStoreGlobal { ldst: 6, val: 0, dst: 7, a: 5, op: BitwiseOp::Or, idx: 9 }
+        ));
+        assert!(matches!(fused[7], Instr::Bitwise { .. }));
+        assert!(matches!(fused[9], Instr::FuseGlobalInc { reg: 8, idx: 10, imm: 1, upd: true }));
+        assert!(matches!(fused[10], Instr::AddInt { .. }) && matches!(fused[11], Instr::StoreGlobal { .. }));
+        assert!(matches!(fused[12], Instr::FuseGlobalIncJump { reg: 9, idx: 7, imm: 1, upd: true, target: 0 }));
+        assert!(matches!(fused[15], Instr::Jump { target: 0 }));
+        // A step stored to another global, or a counter the step does not
+        // write back, keeps the pair form.
+        let other = [
+            Instr::LoadGlobal { dst: 1, idx: 3 },
+            Instr::AddInt { dst: 1, a: 1, imm: 1, upd: true },
+            Instr::StoreGlobal { idx: 4, src: 1 },
+            Instr::ReturnUndefined,
+        ];
+        let fused = fuse_for_interpreter(&other).expect("the pair fuses");
+        assert!(matches!(fused[0], Instr::FuseLoadGlobalAddInt { .. }));
     }
 
     /// `!x` and the forward branch on it fuse, the fused op writing the
@@ -4071,7 +4272,9 @@ mod fused_code_tests {
     /// superinstruction: the dispatch really runs them.
     #[test]
     fn warm_code_runs_fused() {
-        if !interp_fuse_enabled() {
+        // A metered build never runs the copy (`Vm::interp_fuse_ok`): it
+        // would charge one step for two instructions.
+        if !interp_fuse_enabled() || cfg!(feature = "meter-only") {
             return;
         }
         let src = "var g = 1, h = 2, t = 0; \
@@ -4104,65 +4307,41 @@ mod fused_code_tests {
     }
 }
 
-/// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
-/// same-binary A/B for [`FusedCode`]).
-#[inline]
-/// `ZIPP_NO_MOVE_FUSE=1` keeps `Move` pairs and `UpvalGet; Move` apart.
-fn move_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_MOVE_FUSE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_INTERP_FUSE=1` dispatches every function's original code (the
+    /// same-binary A/B for [`FusedCode`]).
+    #[inline]
+    /// `ZIPP_NO_MOVE_FUSE=1` keeps `Move` pairs and `UpvalGet; Move` apart.
+    fn move_fuse_enabled() = "ZIPP_NO_MOVE_FUSE"
 }
 
-/// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
-fn null_jump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_NULL_JUMP").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NULL_JUMP=1` keeps `x == null` and its branch apart.
+    fn null_jump_enabled() = "ZIPP_NO_NULL_JUMP"
 }
 
-/// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
-fn int_switch_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_SWITCH").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_INT_SWITCH=1` keeps integer case runs as a compare each.
+    fn int_switch_enabled() = "ZIPP_NO_INT_SWITCH"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_GLOBAL_RUNS=1` leaves a script's global runs to the pair
+    /// forms (`overlay_global_runs`).
+    fn global_runs_enabled() = "ZIPP_NO_GLOBAL_RUNS"
 }
 
 pub(crate) fn interp_fuse_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_INTERP_FUSE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_INTERP_FUSE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4206,13 +4385,13 @@ pub(crate) fn static_key_plans_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
+            let on = crate::env_var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4227,13 +4406,13 @@ pub(crate) fn home_elide_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_HOME_ELIDE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_HOME_ELIDE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4249,13 +4428,13 @@ pub(crate) fn object_finalize_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJECT_FINALIZE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_OBJECT_FINALIZE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4425,6 +4604,12 @@ impl PlanHandle {
         } else {
             Self::owned(plan.clone())
         }
+    }
+
+    /// The word a borrowed handle on `plan` is, for compiled code to store.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn borrowed_bits(plan: &StaticKeyPlan) -> u64 {
+        std::sync::Arc::as_ptr(&plan.0).expose_provenance() as u64 | Self::BORROWED as u64
     }
 
     #[inline]
@@ -4627,22 +4812,12 @@ impl PlanHandle {
     }
 }
 
-/// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
-/// same-binary comparator for borrowed handles).
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-pub(crate) fn plan_borrow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PLAN_BORROW").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PLAN_BORROW=1` mints owned plan handles everywhere (the
+    /// same-binary comparator for borrowed handles).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn plan_borrow_enabled() = "ZIPP_NO_PLAN_BORROW"
 }
 
 // The sizes are a 64-bit host's.
@@ -4816,13 +4991,13 @@ pub(crate) fn regexp_literal_test_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    use std::sync::atomic::Ordering;
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_LIT_TEST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_LIT_TEST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }

@@ -5,40 +5,20 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// `ZIPP_NO_POLYEQ_FAST=1` restores the pre-B88 `region_poly_eq`, where either
-/// operand being a double jumped to the numeric path unconditionally — and that
-/// path bails for a tagged non-number, so `x !== undefined` deopted the region
-/// on every iteration whenever `x` held a double. Read once per region compile.
-#[inline]
-fn poly_eq_fast_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_POLYEQ_FAST").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_POLYEQ_FAST=1` restores the pre-B88 `region_poly_eq`, where either
+    /// operand being a double jumped to the numeric path unconditionally — and that
+    /// path bails for a tagged non-number, so `x !== undefined` deopted the region
+    /// on every iteration whenever `x` held a double. Read once per region compile.
+    #[inline]
+    fn poly_eq_fast_enabled() = "ZIPP_NO_POLYEQ_FAST"
 }
 
-/// `ZIPP_NO_TYPEOF_IS_INLINE=1` restores the helper-only `TypeOfIs` arm
-/// (`emit_typeof_is` calls `jit_typeof_is` for every value). Read once.
-#[inline]
-fn typeof_is_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_TYPEOF_IS_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_TYPEOF_IS_INLINE=1` restores the helper-only `TypeOfIs` arm
+    /// (`emit_typeof_is` calls `jit_typeof_is` for every value). Read once.
+    #[inline]
+    fn typeof_is_inline_enabled() = "ZIPP_NO_TYPEOF_IS_INLINE"
 }
 
 env_off_switch! {
@@ -46,6 +26,211 @@ env_off_switch! {
     /// (immediate) BigInt to `jit_typeof_is`, as before (the same-binary
     /// A/B for its inline answer).
     fn typeof_small_bigint_enabled() = "ZIPP_NO_TYPEOF_SMALL_BIGINT"
+}
+
+/// A baked literal's allocation without a call: take the next ready object of
+/// its slab class (`Heap::ready`) and fill it, as `ObjMap::ready_fill` does.
+/// There is no safe point, so no value moves and nothing needs refetching.
+/// Falls through to the helper the caller emits next when the class has none
+/// ready, and the helper's refill and poll are what make a loop of these
+/// collect; the caller binds the returned label after that helper's tail.
+/// `None`: the caller emits the helper alone.
+pub(crate) fn emit_ready_literal(
+    ops: &mut dynasmrt::x64::Assembler,
+    proto: &crate::bytecode::FuncProto,
+    plan: u16,
+    shape: u32,
+    val_base: u16,
+    count: u16,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
+    let plan = proto.static_key_plans.get(plan as usize)?;
+    emit_ready_literal_of(ops, plan, shape, val_base, count, dst)
+}
+
+/// `emit_ready_literal` for the literal's plan itself (Tier O, which keeps
+/// the plan's address rather than its function).
+pub(crate) fn emit_ready_literal_of(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &crate::bytecode::StaticKeyPlan,
+    shape: u32,
+    val_base: u16,
+    count: u16,
+    dst: u16,
+) -> Option<dynasmrt::DynamicLabel> {
+    if !crate::heap::ready_objects_enabled() {
+        return None;
+    }
+    let class = crate::heap::val_slab_class(count as usize)? as usize;
+    let handle = crate::bytecode::PlanHandle::borrowed_bits(plan);
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    emit_ready_take(ops, class, miss);
+    for i in 0..count {
+        dynasm!(ops
+            ; mov r8, [rbx + dreg(val_base + i)]
+            ; mov [rcx + i as i32 * 8], r8
+        );
+    }
+    emit_ready_fill(ops, handle, shape, count as i32, None, dst);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    Some(done)
+}
+
+/// Take the next ready object of slab class `class`, or jump to `miss`:
+/// rdx = its map, rcx = its value cell, rax = its slot.
+fn emit_ready_take(ops: &mut dynasmrt::x64::Assembler, class: usize, miss: dynasmrt::DynamicLabel) {
+    use crate::heap::{ReadyClass, ReadyObj};
+    let next = (crate::vm::host_api::JIT_READY_OFFSET + class * std::mem::size_of::<ReadyClass>()) as i32;
+    dynasm!(ops
+        ; mov rax, [rdi + next]
+        ; cmp rax, [rdi + next + 8]
+        ; je =>miss
+        ; lea rcx, [rax + std::mem::size_of::<ReadyObj>() as i32]
+        ; mov [rdi + next], rcx
+        ; mov rdx, [rax]
+        ; mov rcx, [rax + 8]
+        ; mov eax, [rax + 16]
+    );
+}
+
+/// Finish the object [`emit_ready_take`] took, `n` values in its cell, with
+/// the key list `handle` and `shape`, and put it in `dst`. `class`: the
+/// instance's class, for its map and its hot record.
+fn emit_ready_fill(
+    ops: &mut dynasmrt::x64::Assembler,
+    handle: u64,
+    shape: u32,
+    n: i32,
+    class: Option<u32>,
+    dst: u16,
+) {
+    let l = crate::heap::ready_layout();
+    dynasm!(ops
+        ; mov DWORD [rdx + l.shape], shape as i32
+        ; mov r8, QWORD handle as i64
+        ; mov [rdx + l.keys_all], r8
+        ; mov QWORD [rdx + l.keys_len], n
+        ; mov DWORD [rdx + l.attrs_len], n
+        ; add QWORD [rdx + l.vals_owner_len], n
+        ; mov r8, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; mov rcx, rax
+        ; shl rcx, 4
+        ; mov DWORD [r8 + rcx], shape as i32
+    );
+    if let Some(class) = class {
+        let (word, fid) = crate::heap::class_words(class);
+        dynasm!(ops
+            ; mov DWORD [r8 + rcx + crate::vm::host_api::JIT_HOT_FID_OFF as i32], fid as i32
+            ; mov r8, QWORD word as i64
+            ; mov [rdx + l.class], r8
+        );
+    }
+    dynasm!(ops
+        ; mov r8, QWORD crate::value::Value::heap(0).bits() as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
+/// `lane`'s instance in `dst`, or a fall through to the helper the caller
+/// emits next, nothing done; the caller binds the returned label after it.
+pub(crate) fn emit_new_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    callee: u16,
+    arg_base: u16,
+    dst: u16,
+) -> dynasmrt::DynamicLabel {
+    use crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET;
+    let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]
+        ; mov r10, QWORD lane.callee_bits as i64
+        ; cmp rax, r10
+        ; jne =>miss
+        ; mov ecx, eax
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + rcx * 4], lane.callee_ver as i32
+        ; jne =>miss
+    );
+    emit_new_guards(ops, lane, miss);
+    emit_new_instance(ops, lane, arg_base, |r| r, dst, miss);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    done
+}
+
+/// `lane`'s proof, or a jump to `miss`: nothing on the chain the proof read
+/// has moved, and its prototype is one a collection has seen.
+pub(crate) fn emit_new_guards(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_GEN_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET};
+    dynasm!(ops
+        ; mov r11, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; cmp DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32], lane.epoch as i32
+        ; jne =>miss
+    );
+    for &(slot, ver) in &lane.hops {
+        dynasm!(ops
+            ; cmp DWORD [r11 + slot as i32 * 4], ver as i32
+            ; jne =>miss
+        );
+    }
+    // A prototype no collection has seen must be logged for the next one
+    // (`ProtoTable::fresh`): the helper's store does that, once.
+    if let Some(proto) = lane.proto {
+        dynasm!(ops
+            ; mov r8, [rdi + JIT_GEN_RAW_OFFSET as i32]
+            ; test BYTE [r8 + proto as i32], crate::heap::GEN_STATE as i8
+            ; jz =>miss
+        );
+    }
+}
+
+/// Take a ready object for `lane` and fill it, or jump to `miss` with nothing
+/// done: the finished instance in `dst`. `rg` maps a body register to the
+/// caller's window.
+pub(crate) fn emit_new_instance(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    arg_base: u16,
+    rg: impl Fn(u16) -> u16,
+    dst: u16,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{JIT_PROTO_COUNT_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET};
+    let n = lane.vals.len();
+    let Some(class) = crate::heap::val_slab_class(n) else {
+        unreachable!("the planner took a slab class's worth of stores")
+    };
+    emit_ready_take(ops, class as usize, miss);
+    if let Some(proto) = lane.proto {
+        dynasm!(ops
+            ; cmp rax, [rdi + JIT_PROTO_LEN_OFFSET as i32]
+            ; jae =>miss
+            ; mov r8, [rdi + JIT_PROTO_RAW_OFFSET as i32]
+            ; mov r9, QWORD crate::value::Value::heap(proto).bits() as i64
+            ; mov [r8 + rax * 8], r9
+            ; inc QWORD [rdi + JIT_PROTO_COUNT_OFFSET as i32]
+        );
+    }
+    for (i, v) in lane.vals.iter().enumerate() {
+        match *v {
+            NewLaneVal::Arg(a) => dynasm!(ops ; mov r8, [rbx + dreg(arg_base + a)]),
+            NewLaneVal::Bits(b) => dynasm!(ops ; mov r8, QWORD b as i64),
+            NewLaneVal::Reg(r) => dynasm!(ops ; mov r8, [rbx + dreg(rg(r))]),
+        }
+        dynasm!(ops ; mov [rcx + i as i32 * 8], r8);
+    }
+    emit_ready_fill(ops, lane.keys, lane.shape, n as i32, lane.class, dst);
 }
 
 /// `TypeOfIs { dst, a, code, neg }` — `dst = (typeof a === TYPEOF_NAMES[code])
@@ -157,41 +342,21 @@ pub(crate) fn emit_typeof_is(
     );
 }
 
-/// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
-/// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
-/// byte-identically. Read once per region compile.
-#[inline]
-pub(crate) fn mem_cmp_fuse_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_MEM_CMPJUMP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
+    /// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
+    /// byte-identically. Read once per region compile.
+    #[inline]
+    fn mem_cmp_fuse_enabled() = "ZIPP_NO_MEM_CMPJUMP"
 }
 
-/// Fast Int/Int head for the memory-path fused relational jumps. The generic
-/// path below has to convert both numeric operands to f64 for mixed Int/double
-/// semantics; two tagged Ints can compare their signed i32 payloads directly.
-/// `ZIPP_NO_MEM_INT_CMPJUMP=1` restores the conversion-only emission.
-#[inline]
-fn mem_int_cmpjump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_MEM_INT_CMPJUMP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Fast Int/Int head for the memory-path fused relational jumps. The generic
+    /// path below has to convert both numeric operands to f64 for mixed Int/double
+    /// semantics; two tagged Ints can compare their signed i32 payloads directly.
+    /// `ZIPP_NO_MEM_INT_CMPJUMP=1` restores the conversion-only emission.
+    #[inline]
+    fn mem_int_cmpjump_enabled() = "ZIPP_NO_MEM_INT_CMPJUMP"
 }
 
 /// Fused compare→branch fast head for the MEMORY path (B118): when a
@@ -261,6 +426,133 @@ pub(crate) fn emit_fused_cmp_branch_head(
         ; jmp => fallthrough                  // not taken → skip the JumpIf ip
         ; => generic
     );
+}
+
+/// [`emit_fused_cmp_branch_head`] for `a CMP imm`, where the other operand
+/// is a register the instruction just before set to the Int `imm`
+/// (`LoadInt`) and no jump lands between the two: the register is not read
+/// or tag-tested. A non-Int `a` falls to the same generic sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_fused_cmp_imm_branch_head(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    imm: i32,
+    cmp: Cmp,
+    if_false: bool,
+    target: dynasmrt::DynamicLabel,
+    fallthrough: dynasmrt::DynamicLabel,
+) {
+    let generic = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => generic                      // a not Int → generic pair
+        ; cmp eax, imm                        // signed i32 payload compare
+    );
+    match cmp {
+        Cmp::Eq => dynasm!(ops ; sete dl),
+        Cmp::Ne => dynasm!(ops ; setne dl),
+        Cmp::Lt => dynasm!(ops ; setl dl),
+        Cmp::Le => dynasm!(ops ; setle dl),
+        Cmp::Gt => dynasm!(ops ; setg dl),
+        Cmp::Ge => dynasm!(ops ; setge dl),
+    }
+    dynasm!(ops
+        ; movzx edx, dl
+        ; mov r10, QWORD BOOL_TAG as i64
+        ; or r10, rdx
+        ; mov [rbx + dreg(dst)], r10          // dst gets the Bool Value regardless
+        ; test dl, dl
+    );
+    if if_false {
+        dynasm!(ops ; jz => target);
+    } else {
+        dynasm!(ops ; jnz => target);
+    }
+    dynasm!(ops
+        ; jmp => fallthrough
+        ; => generic
+    );
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_CONST_CMP=1`: a fused compare against a register the
+    /// previous `LoadInt` set reads and tag-tests that register again.
+    #[inline]
+    fn const_cmp_enabled() = "ZIPP_NO_CONST_CMP"
+}
+
+/// The byte boundary a compiled loop head starts on: 32, the fetch window.
+/// A loop head left where it fell ran some tight loops 10-30% slower
+/// (call_closure, arr_read, i32_rw, glob_loop) than the same code placed on a
+/// boundary; over every scoreboard row, 32 measured 0.980 on the micro probes
+/// and 0.995 on the workloads (16: 0.985 and 1.003), with a few loops that
+/// happened to sit well unaligned losing (try_catch, dv_get). The padding is
+/// at most a few long NOPs (`align_loop_head`), run once per loop entry when
+/// the code before the head falls into it (the integer region's prologue
+/// jumps over it). `ZIPP_JIT_LOOP_ALIGN=0` places heads where they fall (also
+/// 16 or 64).
+pub(crate) fn jit_loop_align() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static V: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let v = V.load(Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let n = crate::env_var("ZIPP_JIT_LOOP_ALIGN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| matches!(n, 0 | 16 | 32 | 64))
+        .unwrap_or(32);
+    V.store(n, Ordering::Relaxed);
+    n
+}
+
+/// Pad `ops` to the next multiple of `align` bytes with at most two long
+/// NOPs (the recommended 1- to 9-byte forms), so a loop head that is also
+/// reached by falling through runs one or two NOP instructions, not up to
+/// fifteen single-byte ones.
+pub(crate) fn align_loop_head(ops: &mut dynasmrt::x64::Assembler, align: usize) {
+    use dynasmrt::DynasmApi;
+    const NOPS: [&[u8]; 10] = [
+        &[],
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0F, 0x1F, 0x00],
+        &[0x0F, 0x1F, 0x40, 0x00],
+        &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+        &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+        &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    let off = ops.offset().0;
+    let mut pad = (align - off % align) % align;
+    while pad > 0 {
+        let n = pad.min(9);
+        for &b in NOPS[n] {
+            ops.push(b);
+        }
+        pad -= n;
+    }
+}
+
+/// The instructions of `code[s..=e]` some later instruction of the range
+/// jumps back to (loop heads), by offset from `s`.
+pub(crate) fn loop_heads(code: &[crate::bytecode::Instr], s: usize, e: usize) -> Vec<bool> {
+    let mut heads = vec![false; e + 1 - s];
+    for ip in s..=e {
+        if let Some(t) = crate::codegen::fn_int::bytecode_control_target(&code[ip]) {
+            let t = t as usize;
+            if t >= s && t <= ip {
+                heads[t - s] = true;
+            }
+        }
+    }
+    heads
 }
 
 /// Resolve a jump `target` to a label: an in-region ip uses its own label; an
@@ -537,9 +829,8 @@ pub(crate) fn emit_math_identity_guard(
 /// ("the emitter exists in TWO byte-identical copies — factor before editing"),
 /// so it is factored here instead.
 ///
-/// The caller must have gated the op/arity set (`argc == 1` and not `Imul`, or
-/// `argc == 2` and one of Pow/Atan2/Imul/Min/Max/Hypot) — the arms below assume
-/// it, exactly as the region admission check guarantees.
+/// The caller must have gated the op/arity set with [`math_op_emittable`]: the
+/// arms below assume it, exactly as the region admission check guarantees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_math_op(
     ops: &mut dynasmrt::x64::Assembler,
@@ -557,7 +848,27 @@ pub(crate) fn emit_math_op(
     math_imul_guard: Option<MathIntrinsicGuard>,
 ) {
     emit_math_identity_guard(ops, op, callee, this_v, bail, math_imul_guard);
-    if argc == 1 {
+    if argc > 2 {
+        // `Math.min(a, b, c)`: every argument a number, or the interpreter
+        // runs ToNumber on them in order; the helper reads them from the frame.
+        for k in 0..argc {
+            load_num_xmm(ops, arg_base + k, 0, bail);
+        }
+        let many = crate::vm::jit_math_many as *const () as i64;
+        dynasm!(ops
+            ; mov ecx, op as i32
+            ; lea rdx, [rbx + dreg(arg_base)]
+            ; mov r8d, argc as i32
+            ; mov rax, QWORD many
+            ; call rax
+            ; movq xmm0, rax
+        );
+        emit_box_num(ops, dst);
+    } else if argc == 1
+        && matches!(op, MathFn::Clz32)
+        && emit_math_clz32(ops, arg_base, dst, bail, math_unary)
+    {
+    } else if argc == 1 {
         load_num_xmm(ops, arg_base, 0, bail);
         if !emit_math_unary_inline(ops, op) {
             dynasm!(ops
@@ -624,8 +935,123 @@ pub(crate) fn emit_math_unary_inline(ops: &mut dynasmrt::x64::Assembler, op: Mat
         MathFn::Floor if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 9),
         MathFn::Ceil if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 10),
         MathFn::Trunc if sse41() => dynasm!(ops ; roundsd xmm0, xmm0, 11),
+        // `x as f32 as f64`: both conversions round to nearest-even under the
+        // default MXCSR, as Rust's casts do.
+        MathFn::Fround => dynasm!(ops
+            ; cvtsd2ss xmm0, xmm0
+            ; cvtss2sd xmm0, xmm0
+        ),
+        // JS round: `f = floor(x)`, plus one when `x - f >= 0.5`, then x's
+        // sign ORed in. `x - f` is exact wherever the answer depends on it,
+        // so this avoids `floor(x + 0.5)`'s rounding of the sum (the double
+        // below 0.5, odd values from 2^52 up). A nonzero result already has
+        // x's sign; a zero one takes it, which is the spec's -0 for
+        // [-0.5, -0]. ±Infinity gives NaN for `x - f` and keeps x; NaN stays
+        // NaN, which the box canonicalises.
+        MathFn::Round if sse41() => dynasm!(ops
+            ; roundsd xmm1, xmm0, 9
+            ; movapd xmm2, xmm0
+            ; subsd xmm2, xmm1
+            ; mov rax, QWORD 0x3FE0_0000_0000_0000u64 as i64
+            ; movq xmm3, rax
+            ; cmplesd xmm3, xmm2
+            ; mov rax, QWORD 0x3FF0_0000_0000_0000u64 as i64
+            ; movq xmm2, rax
+            ; andpd xmm2, xmm3
+            ; addsd xmm1, xmm2
+            ; mov rax, QWORD i64::MIN
+            ; movq xmm2, rax
+            ; andpd xmm2, xmm0
+            ; orpd xmm1, xmm2
+            ; movapd xmm0, xmm1
+        ),
+        // NaN and ±0 return x; otherwise ±1.
+        MathFn::Sign => {
+            let (keep, pos) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+            dynasm!(ops
+                ; xorpd xmm1, xmm1
+                ; ucomisd xmm0, xmm1
+                ; jp => keep
+                ; je => keep
+                ; ja => pos
+                ; mov rax, QWORD 0xBFF0_0000_0000_0000u64 as i64
+                ; movq xmm0, rax
+                ; jmp => keep
+                ; => pos
+                ; mov rax, QWORD 0x3FF0_0000_0000_0000u64 as i64
+                ; movq xmm0, rax
+                ; => keep
+            );
+        }
         _ => return false,
     }
+    true
+}
+
+/// `regs[dst] = Math.clz32(regs[arg])`: an Int argument's bits, or a double
+/// truncated to i64 whose low half is ToUint32, counted in place and boxed as
+/// an Int. A double `cvttsd2si` cannot represent (NaN, ±Infinity, beyond
+/// 2^63) goes to the shared `math_unary` helper; a non-number bails, as
+/// `load_num_xmm` does, so the interpreter runs ToNumber. False, having
+/// emitted nothing, under `ZIPP_NO_MATH_INLINE=1`.
+pub(crate) fn emit_math_clz32(
+    ops: &mut dynasmrt::x64::Assembler,
+    arg: u16,
+    dst: u16,
+    bail: dynasmrt::DynamicLabel,
+    math_unary: usize,
+) -> bool {
+    if !crate::codegen::math_inline_enabled() {
+        return false;
+    }
+    let (int_path, helper, done) = (
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+        ops.new_dynamic_label(),
+    );
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(arg)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int_path
+        ; sub r10d, (INT_TAG_HI + 1) as i32
+        ; cmp r10d, 3
+        ; jbe => bail
+        ; movq xmm0, rax
+        ; cvttsd2si rax, xmm0
+        ; mov r10, QWORD i64::MIN
+        ; cmp rax, r10
+        ; je => helper
+        ; => int_path
+    );
+    if std::arch::is_x86_feature_detected!("lzcnt") {
+        dynasm!(ops ; lzcnt eax, eax);
+    } else {
+        let zero = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov ecx, eax
+            ; mov eax, 32
+            ; test ecx, ecx
+            ; jz => zero
+            ; bsr ecx, ecx
+            ; mov eax, 31
+            ; sub eax, ecx
+            ; => zero
+        );
+    }
+    box_eax(ops, dst);
+    dynasm!(ops
+        ; jmp => done
+        ; => helper
+        ; movq rdx, xmm0
+        ; mov ecx, MathFn::Clz32 as i32
+        ; mov rax, QWORD math_unary as i64
+        ; call rax
+        ; movq xmm0, rax
+    );
+    emit_box_num(ops, dst);
+    dynasm!(ops ; => done);
     true
 }
 
@@ -642,9 +1068,14 @@ pub(crate) fn math_op_emittable(op: MathFn, argc: u16) -> bool {
             op,
             MathFn::Pow | MathFn::Atan2 | MathFn::Imul | MathFn::Min | MathFn::Max | MathFn::Hypot
         ),
+        3..=MATH_MANY_MAX => matches!(op, MathFn::Min | MathFn::Max | MathFn::Hypot),
         _ => false,
     }
 }
+
+/// The most arguments `Math.min`, `max` or `hypot` takes in compiled code: one
+/// such call past it, or a zero-argument one, keeps its loop in the interpreter.
+pub(crate) const MATH_MANY_MAX: u16 = 8;
 
 /// `regs[dst] = regs[a] <op> regs[b]`. Add/Sub/Mul take an INT fast path when
 /// both operands are Int-tagged (32-bit op + overflow check, result boxed Int —
@@ -1348,6 +1779,81 @@ pub(crate) fn region_poly_eq(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_STR_CMP=1`: a relational op on anything but numbers bails
+    /// (the same-binary A/B for `dcmp`'s string arm).
+    fn jit_str_cmp_enabled() = "ZIPP_NO_JIT_STR_CMP"
+}
+
+/// Where `dcmp` and `djump_if_not_cmp` send a non-number: their string arm, or
+/// `bail` when the caller's code around them cannot take a call.
+fn not_number_label(
+    ops: &mut dynasmrt::x64::Assembler,
+    strings: bool,
+    bail: dynasmrt::DynamicLabel,
+) -> dynasmrt::DynamicLabel {
+    if strings && jit_str_cmp_enabled() {
+        ops.new_dynamic_label()
+    } else {
+        bail
+    }
+}
+
+/// The end of a relational op: a jump over its cold arms, then those. Two
+/// strings get their answer from `jit_str_relational` (0/1 in rax, which
+/// `answer` takes); it reads the heap and allocates nothing on it, so there is
+/// nothing to refetch. Anything else, with a user `valueOf` or a BigInt to
+/// consider, goes to the interpreter from `bail`. `a < b` on strings used to
+/// bail on every run, and a function comparing strings stayed interpreted, with
+/// its caller resuming in the interpreter after each call.
+#[allow(clippy::too_many_arguments)]
+fn emit_relational_tail(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    not_number: dynasmrt::DynamicLabel,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+    answer: impl FnOnce(&mut dynasmrt::x64::Assembler),
+) {
+    if not_number == bail {
+        emit_region_bail(ops, ip, bail, epilogue);
+        return;
+    }
+    let done = ops.new_dynamic_label();
+    let op = match cmp {
+        Cmp::Lt => 0,
+        Cmp::Le => 1,
+        Cmp::Gt => 2,
+        _ => 3,
+    };
+    dynasm!(ops
+        ; jmp => done
+        ; => not_number
+        ; mov rcx, rdi                        // vm
+        ; mov rdx, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
+        ; mov r9d, op
+        ; mov rax, QWORD crate::vm::jit_str_relational as *const () as i64
+        ; call rax
+        ; cmp eax, 2
+        ; je => bail
+    );
+    answer(ops);
+    dynasm!(ops
+        ; jmp => done
+        ; => bail
+        ; mov DWORD [rsi], ip as i32
+        ; jmp => epilogue
+        ; => done
+    );
+}
+
+/// `dst = regs[a] <cmp> regs[b]` for the four relational ops. `strings`: the
+/// emitter around it can take a helper call in the cold arm.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dcmp(
     ops: &mut dynasmrt::x64::Assembler,
     ip: usize,
@@ -1357,28 +1863,18 @@ pub(crate) fn dcmp(
     a: u16,
     b: u16,
     cmp: Cmp,
+    strings: bool,
 ) {
-    load_num_xmm(ops, a, 0, bail);
-    load_num_xmm(ops, b, 1, bail);
+    let not_number = not_number_label(ops, strings, bail);
+    load_num_xmm(ops, a, 0, not_number);
+    load_num_xmm(ops, b, 1, not_number);
     // Compute the boolean into al. ucomisd sets CF/ZF/PF; ordering tricks below
     // keep NaN-false semantics (see jump variant for the rationale).
     match cmp {
         Cmp::Lt => dynasm!(ops ; ucomisd xmm1, xmm0 ; seta al), // a<b  ⇔ b>a ordered
         Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; setae al), // a<=b ⇔ b>=a ordered
         Cmp::Gt => dynasm!(ops ; ucomisd xmm0, xmm1 ; seta al), // a>b
-        Cmp::Ge => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al), // a>=b
-        Cmp::Eq => dynasm!(ops
-            ; ucomisd xmm0, xmm1
-            ; sete al            // ZF=1 (equal OR unordered)
-            ; setnp cl           // PF=0 (ordered)
-            ; and al, cl         // equal AND ordered
-        ),
-        Cmp::Ne => dynasm!(ops
-            ; ucomisd xmm0, xmm1
-            ; setne al           // ZF=0 (a≠b)
-            ; setp cl            // PF=1 (unordered)
-            ; or al, cl          // a≠b OR NaN
-        ),
+        _ => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al), // a>=b
     }
     dynasm!(ops
         ; movzx rax, al
@@ -1386,7 +1882,13 @@ pub(crate) fn dcmp(
         ; or rax, r8
         ; mov [rbx + dreg(dst)], rax
     );
-    emit_region_bail(ops, ip, bail, epilogue);
+    emit_relational_tail(ops, ip, bail, epilogue, not_number, a, b, cmp, |ops| {
+        dynasm!(ops
+            ; mov r8, QWORD BOOL_TAG as i64
+            ; or rax, r8
+            ; mov [rbx + dreg(dst)], rax
+        );
+    });
 }
 
 /// Fused `if !(regs[a] <cmp> regs[b]) goto target` in f64. Guards both numbers.
@@ -1401,6 +1903,7 @@ pub(crate) fn djump_if_not_cmp(
     b: u16,
     cmp: Cmp,
     target: dynasmrt::DynamicLabel,
+    strings: bool,
 ) {
     let generic = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -1436,8 +1939,9 @@ pub(crate) fn djump_if_not_cmp(
         // or any fast-head instructions.
         dynasm!(ops ; => generic);
     }
-    load_num_xmm(ops, a, 0, bail);
-    load_num_xmm(ops, b, 1, bail);
+    let not_number = not_number_label(ops, strings, bail);
+    load_num_xmm(ops, a, 0, not_number);
+    load_num_xmm(ops, b, 1, not_number);
     // Jump when the comparison is FALSE. ucomisd(b,a): CF=1 ⇔ b<a OR unordered.
     match cmp {
         // !(a<b): b<=a or NaN. ucomisd(b,a) then jbe (CF|ZF). NaN sets CF ⇒ jumps.
@@ -1447,7 +1951,12 @@ pub(crate) fn djump_if_not_cmp(
         _ => {}
     }
     dynasm!(ops ; => done);
-    emit_region_bail(ops, ip, bail, epilogue);
+    emit_relational_tail(ops, ip, bail, epilogue, not_number, a, b, cmp, |ops| {
+        dynasm!(ops
+            ; test eax, eax
+            ; jz => target
+        );
+    });
 }
 
 /// `dst = obj[key]` for a present element of a dense Array at an int key,
@@ -1508,6 +2017,55 @@ pub(crate) fn emit_arr_mirror_get(
         ; cmp rax, r10
         ; je => slow
         ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        ; => slow
+    );
+}
+
+/// `dst = key in obj` answered `true` for a present element of a dense Array
+/// at a non-negative int key, read through the array mirror with no call (an
+/// in-range element that is not a hole is an own property, whatever the
+/// prototype chain holds). Jumps to `done` with `dst` written; a hole, an
+/// index past the entry, a negative or non-int key, a cleared entry and any
+/// other receiver fall through to the caller's helper, which proves an
+/// absent answer and repairs the entry. Clobbers rax, rcx, rdx, r9 and r10.
+pub(crate) fn emit_arr_mirror_has(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    obj: u16,
+    key: u16,
+    done: dynasmrt::DynamicLabel,
+) {
+    let slow = ops.new_dynamic_label();
+    let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
+    let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+        ; jne => slow
+        ; mov rdx, [rbx + dreg(key)]
+        ; mov r10, rdx
+        ; shr r10, 48
+        ; cmp r10d, 0x7FF9                    // Value TAG_INT >> 48
+        ; jne => slow
+        ; mov edx, edx                        // a negative int is huge
+        ; mov ecx, eax                        // heap idx (low 32)
+        ; cmp ecx, [rdi + arr_len]
+        ; jae => slow
+        ; mov r9, [rdi + arr_raw]
+        ; shl rcx, 4
+        ; add r9, rcx                         // the slot's [base, len]
+        ; cmp rdx, [r9 + 8]
+        ; jae => slow
+        ; mov r9, [r9]
+        ; mov rax, [r9 + rdx*8]
+        ; mov r10, QWORD ARR_HOLE_BITS as i64
+        ; cmp rax, r10
+        ; je => slow
+        ; mov r10, QWORD BOOL_TRUE_BITS as i64
+        ; mov [rbx + dreg(dst)], r10
         ; jmp => done
         ; => slow
     );
@@ -1968,7 +2526,7 @@ mod int32_trunc_tests {
     /// Every truncation idiom admits its producer, and a chain admits both.
     #[test]
     fn truncation_only_producers_are_members() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return; // the latch pins the analysis empty by design
         }
         let src = r#"
@@ -2016,7 +2574,7 @@ mod int32_trunc_tests {
     /// consumer, a loop-carried accumulator (least fixpoint), direct eval.
     #[test]
     fn observed_producers_are_not_members() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return;
         }
         let src = r#"
@@ -2037,7 +2595,7 @@ mod int32_trunc_tests {
     /// the handler; a mapped `arguments` object declines parameter dsts.
     #[test]
     fn handler_edges_and_mapped_arguments_decline() {
-        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+        if crate::env_var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
             return;
         }
         let base = named_proto("function f(a, b) { return (a + b) | 0; }", "f");

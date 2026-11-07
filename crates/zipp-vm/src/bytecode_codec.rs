@@ -340,6 +340,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
         length,
         rest_reg,
         arguments_reg,
+        args_count_only,
         is_generator,
         is_async,
         non_constructable,
@@ -372,6 +373,7 @@ fn encode_func(w: &mut Writer, f: &FuncProto, sources: &mut Sources) {
     w.opt_u16(*rest_reg);
     w.opt_u16(*arguments_reg);
     for b in [
+        *args_count_only,
         *is_generator,
         *is_async,
         *non_constructable,
@@ -456,6 +458,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
     let length = r.u16()?;
     let rest_reg = r.opt_u16()?;
     let arguments_reg = r.opt_u16()?;
+    let args_count_only = r.bool()?;
     let is_generator = r.bool()?;
     let is_async = r.bool()?;
     let non_constructable = r.bool()?;
@@ -532,6 +535,7 @@ fn decode_func(r: &mut Reader, sources: &Sources) -> R<FuncProto> {
         length,
         rest_reg,
         arguments_reg,
+        args_count_only,
         is_generator,
         is_async,
         non_constructable,

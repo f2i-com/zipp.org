@@ -50,7 +50,7 @@ mod bstats {
             Some(m) => m.iter().map(|((k, n), c)| (*k, n.clone(), *c)).collect(),
             None => Vec::new(),
         };
-        v.sort_by(|a, b| {
+        crate::cold_sort::sort_by(&mut v, |a, b| {
             b.2.cmp(&a.2)
                 .then_with(|| a.0.cmp(b.0))
                 .then_with(|| a.1.cmp(&b.1))
@@ -67,18 +67,28 @@ pub use bstats::dump as builtin_stats;
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub(super) fn builtin_stats_enabled_for_vm() -> bool {
-    std::env::var_os("ZIPP_BUILTINSTATS").is_some()
+    crate::env_var_os("ZIPP_BUILTINSTATS").is_some()
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_CAPTURED_OWN=1`: a captured prototype-method native runs only
+    /// after the proof by the call site's name (`captured_is_boot_intrinsic`),
+    /// not by its own identity (`captured_own_method`), for A/B.
+    fn captured_own_enabled() = "ZIPP_NO_CAPTURED_OWN"
 }
 
 /// `charCodeAt`'s index in the B191 memo (`str_memo_id`).
 const STR_MEMO_CHAR_CODE_AT: usize = 0;
+const STR_MEMO_CHAR_AT: usize = 1;
+const STR_MEMO_INDEX_OF: usize = 2;
+const STR_MEMO_AT: usize = 18;
 
 /// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
 fn str_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "charCodeAt" => STR_MEMO_CHAR_CODE_AT,
-        "charAt" => 1,
-        "indexOf" => 2,
+        "charAt" => STR_MEMO_CHAR_AT,
+        "indexOf" => STR_MEMO_INDEX_OF,
         "slice" => 3,
         "substring" => 4,
         "split" => 5,
@@ -94,7 +104,7 @@ fn str_memo_id(name: &str) -> Option<usize> {
         "lastIndexOf" => 15,
         "trimStart" => 16,
         "trimEnd" => 17,
-        "at" => 18,
+        "at" => STR_MEMO_AT,
         "toUpperCase" => 19,
         "toLowerCase" => 20,
         "concat" => 21,
@@ -138,7 +148,7 @@ pub(crate) fn is_pop_name(key: &str) -> bool {
 }
 
 /// B191 memo indices for the hot array names (see `ARR_MEMO_NAMES`).
-fn arr_memo_id(name: &str) -> Option<usize> {
+pub(crate) fn arr_memo_id(name: &str) -> Option<usize> {
     Some(match name {
         "push" => ARR_MEMO_PUSH,
         "pop" => ARR_MEMO_POP,
@@ -223,16 +233,23 @@ pub(super) fn bind_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_BIND_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_BIND_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
     }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_SPREAD_FRAME=1`: a spread call to a plain function runs it in
+    /// a nested run loop again (`Vm::spread_call_frame`), for an A/B.
+    #[inline]
+    fn spread_frame_enabled() = "ZIPP_NO_SPREAD_FRAME"
 }
 
 /// `ZIPP_NO_APPLY_FAST=1` sends `f.apply(t, list)` back through the general
@@ -243,12 +260,12 @@ pub(super) fn apply_fast_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_APPLY_FAST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_APPLY_FAST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -267,12 +284,12 @@ pub(super) fn promise_pristine_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PROMISE_PRISTINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PROMISE_PRISTINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -634,7 +651,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         let n = items.len();
-        if items.iter().any(|v| v.is_hole()) {
+        if Value::any_hole(&items) {
             return false;
         }
         if !self.arguments_objs.contains_key(&idx) {
@@ -712,6 +729,32 @@ impl<'p> Vm<'p> {
         args.clear();
         self.apply_scratch = args;
         r
+    }
+
+    /// `f(...list)` / `o.m(...list)` (`CallSpread`, `CallWithThisSpread`)
+    /// entered as `f`'s frame on this loop, as `f.apply(t, list)` enters
+    /// (`setup_apply_frame`), when `f` is a plain function of this realm:
+    /// false for anything else, which takes `call_value`. A spread call ran
+    /// its callee in a nested run loop, so a function recursing through
+    /// `f(...rest)` nested one per level: 380 ns a call, eight times node.
+    pub(crate) fn spread_call_frame(
+        &mut self,
+        callee: Value,
+        this_v: Value,
+        list: Value,
+        dst: u16,
+        caller_ip_next: usize,
+    ) -> Result<bool, Thrown> {
+        if !spread_frame_enabled() {
+            return Ok(false);
+        }
+        let Some((fid, closure)) = self.plain_fn_entry(callee) else {
+            return Ok(false);
+        };
+        if !self.realm_global_objs.is_empty() && self.get_function_realm(callee) != 0 {
+            return Ok(false);
+        }
+        self.setup_apply_frame(fid, closure, this_v, list, dst, caller_ip_next, callee)
     }
 
     /// `Array.prototype.values.call(arr)` (`arr[Symbol.iterator].call(arr)`,
@@ -918,18 +961,18 @@ impl<'p> Vm<'p> {
     /// still holds the intrinsic's bits), without the name match and the
     /// call. Anything else takes the full proof, which also fills the memo.
     #[inline(always)]
-    fn array_push_is_intrinsic(&mut self) -> bool {
+    pub(crate) fn array_push_is_intrinsic(&mut self) -> bool {
         self.array_memo_is_intrinsic(ARR_MEMO_PUSH, "push")
     }
 
     /// [`Vm::array_push_is_intrinsic`] for `pop`.
     #[inline(always)]
-    fn array_pop_is_intrinsic(&mut self) -> bool {
+    pub(crate) fn array_pop_is_intrinsic(&mut self) -> bool {
         self.array_memo_is_intrinsic(ARR_MEMO_POP, "pop")
     }
 
     #[inline(always)]
-    fn array_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
+    pub(crate) fn array_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
         if self.realm_global_objs.is_empty() {
             if let Some((ver, slot, fn_bits)) = self.arr_intrinsic_memo[memo_id] {
                 let proto = self.arr_proto;
@@ -952,8 +995,34 @@ impl<'p> Vm<'p> {
     /// the other proofs of the same call).
     #[inline(always)]
     pub(crate) fn char_code_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_CHAR_CODE_AT, "charCodeAt")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for `indexOf` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn index_of_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_INDEX_OF, "indexOf")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for `charAt` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn char_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_CHAR_AT, "charAt")
+    }
+
+    /// [`Vm::char_code_at_is_intrinsic`] for String `at` (compiled code's).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn str_at_is_intrinsic(&mut self) -> bool {
+        self.string_memo_is_intrinsic(STR_MEMO_AT, "at")
+    }
+
+    #[inline(always)]
+    pub(crate) fn string_memo_is_intrinsic(&mut self, memo_id: usize, name: &str) -> bool {
         if self.realm_global_objs.is_empty() {
-            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[STR_MEMO_CHAR_CODE_AT] {
+            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[memo_id] {
                 let proto = self.str_proto;
                 if self.heap.version_of(proto) == ver {
                     if let HeapObj::Object(map) = self.heap.get_for_ic(proto) {
@@ -964,7 +1033,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.string_method_is_intrinsic("charCodeAt")
+        self.string_method_is_intrinsic(name)
     }
 
     /// Whether a CAPTURED callee `bits` is the boot intrinsic `name` of
@@ -1047,6 +1116,8 @@ impl<'p> Vm<'p> {
             }
             // `dv.getUint32` on a default-constructed DataView.
             HeapObj::DataView { .. } => return self.dataview_proto_read(idx, name),
+            // `ta.subarray` on a view with its kind's intrinsic chain.
+            HeapObj::TypedArray { .. } => return self.ta_proto_method_read(idx, name),
             _ => return None,
         };
         self.proto_intrinsic_bits(name, is_arr)
@@ -1381,6 +1452,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         self.store_barrier_v(crate::heap::gcoracle::SET_PROP, o, v);
+        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
         if let Some(m) = self.fn_props.get_mut(&o.heap_index()) {
             m.set_val_at(i, v);
         }
@@ -1785,6 +1857,15 @@ impl<'p> Vm<'p> {
             }
             _ => return Ok(None),
         };
+        // The captured callee says what it is: with one realm there is one
+        // function object per native, and a prototype-method native of the
+        // receiver's kind IS `Array.prototype.<m>` / `String.prototype.<m>`.
+        // It runs by its own name, with no proof of what the prototype holds
+        // now (the Get that captured it read that) and none by the site's
+        // name, which was two name matches and a memo probe per call.
+        if let Some(own) = self.captured_own_method(native_id, is_arr) {
+            return self.captured_own_call(recv, own, is_arr, base, arg_base, argc);
+        }
         if !self.captured_is_boot_intrinsic(key, is_arr, callee.bits()) {
             return Ok(None);
         }
@@ -1803,6 +1884,52 @@ impl<'p> Vm<'p> {
             }
         }
         self.try_builtin_method(recv, key, base, arg_base, argc)
+    }
+
+    /// [`Vm::captured_intrinsic_lane`]'s call of a captured method by its own
+    /// name `own` (see [`Vm::captured_own_method`]). Out of line: inlined into
+    /// the interpreter's `CallWithThis` arm, it moved the profile-guided layout
+    /// of the loop's hot code (parse-large-js 10% slower interpreted).
+    #[inline(never)]
+    fn captured_own_call(
+        &mut self,
+        recv: Value,
+        own: &'static str,
+        is_arr: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if argc == 1 && !is_arr && own == "charCodeAt" {
+            let arg = self.regs[base + arg_base as usize];
+            if let Some(unit) = self.captured_char_code_at(recv, arg) {
+                return Ok(Some(unit));
+            }
+        } else if argc == 1 && is_arr && is_push_name(own) {
+            let arg = self.regs[base + arg_base as usize];
+            if let Some(len) = self.interp_array_push_fast(recv, arg) {
+                return Ok(Some(len));
+            }
+        }
+        self.try_builtin_method(recv, own, base, arg_base, argc)
+    }
+
+    /// The method a captured native `native_id` is, for a call on an Array
+    /// (`is_arr`) or a primitive string while only the main realm exists:
+    /// `Array.prototype.push` or a `PROTO_METHODS` row of the receiver's
+    /// kind. `None` for anything else.
+    #[inline(always)]
+    fn captured_own_method(&self, native_id: u16, is_arr: bool) -> Option<&'static str> {
+        if !self.realm_global_objs.is_empty() || !captured_own_enabled() {
+            return None;
+        }
+        if is_arr && native_id == native::ARR_PUSH {
+            return Some("push");
+        }
+        match native::proto_method(native_id) {
+            Some((m, kind, _)) if kind == u8::from(!is_arr) => Some(m),
+            _ => None,
+        }
     }
 
     /// What `Get(s, name)` finds on a primitive string `s` when `name` is one
@@ -2399,7 +2526,7 @@ impl<'p> Vm<'p> {
                     let elements_are_arrs = arr.is_heap()
                         && !self.arr_props.contains_key(&arr.heap_index())
                         && matches!(self.heap.get(arr.heap_index()),
-                            HeapObj::Array(items) if !items.iter().any(|v| v.is_hole()));
+                            HeapObj::Array(items) if !Value::any_hole(&items));
                     let callargs = if arr.is_nullish() {
                         Vec::new()
                     } else {
@@ -3068,7 +3195,14 @@ impl<'p> Vm<'p> {
     /// %TypedArray%'s `@@species` the intrinsic getter (which returns
     /// `this`). Its two Gets would read exactly those and run nothing else,
     /// so a caller may skip them for the default path.
-    fn ta_species_default(&self, idx: u32, kind: u8) -> bool {
+    ///
+    /// The prototype half is memoized per kind (`ta_species_memo`): the
+    /// versions of the kind's prototype, its constructor and %TypedArray%
+    /// cover every key add, delete, redefinition and `setPrototypeOf`; the
+    /// two slots' values are re-read on every use, since an in-place
+    /// overwrite advances no version. `subarray` and `slice` asked the three
+    /// objects for their keys by name on every call.
+    fn ta_species_default(&mut self, idx: u32, kind: u8) -> bool {
         let (proto, ctor, base) = (self.ta_protos[kind as usize], self.ta_ctors[kind as usize], self.ta_base_ctor);
         if proto == 0 || ctor == 0 || base == 0 {
             return false;
@@ -3076,9 +3210,32 @@ impl<'p> Vm<'p> {
         if !self.arr_props.is_empty() && self.arr_props.get(&idx).is_some_and(|m| m.pos("constructor").is_some()) {
             return false;
         }
-        if self.proto_of.get_copied(idx) != Some(Value::heap(proto))
-            || self.proto_of.get_copied(ctor) != Some(Value::heap(base))
-        {
+        if self.proto_of.get_copied(idx) != Some(Value::heap(proto)) {
+            return false;
+        }
+        let vers = (self.heap.version_of(proto), self.heap.version_of(ctor), self.heap.version_of(base));
+        let species_getter = |vm: &Self, bm: &crate::heap::ObjMap, s: usize| {
+            let g = bm.val_at(s);
+            bm.attr_at(s).accessor
+                && g.is_heap()
+                && matches!(vm.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
+        };
+        if let Some(&(pv, cv, bv, cs, ss)) = self.ta_species_memo.get(kind as usize) {
+            if (pv, cv, bv) == vers {
+                if let (HeapObj::Object(pm), HeapObj::Object(bm)) = (self.heap.get(proto), self.heap.get(base)) {
+                    let (cs, ss) = (cs as usize, ss as usize);
+                    if cs < pm.slot_len()
+                        && ss < bm.slot_len()
+                        && !pm.attr_at(cs).accessor
+                        && pm.val_at(cs) == Value::heap(ctor)
+                        && species_getter(self, bm, ss)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if self.proto_of.get_copied(ctor) != Some(Value::heap(base)) {
             return false;
         }
         let (HeapObj::Object(pm), HeapObj::Object(cm), HeapObj::Object(bm)) =
@@ -3086,14 +3243,20 @@ impl<'p> Vm<'p> {
         else {
             return false;
         };
-        pm.pos("constructor").is_some_and(|s| !pm.attr_at(s).accessor && pm.val_at(s) == Value::heap(ctor))
-            && cm.pos("@@species").is_none()
-            && bm.pos("@@species").is_some_and(|s| {
-                let g = bm.val_at(s);
-                bm.attr_at(s).accessor
-                    && g.is_heap()
-                    && matches!(self.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
-            })
+        let Some(cs) = pm.pos("constructor").filter(|&s| !pm.attr_at(s).accessor && pm.val_at(s) == Value::heap(ctor))
+        else {
+            return false;
+        };
+        if cm.pos("@@species").is_some() {
+            return false;
+        }
+        let Some(ss) = bm.pos("@@species").filter(|&s| species_getter(self, bm, s)) else {
+            return false;
+        };
+        if let Some(memo) = self.ta_species_memo.get_mut(kind as usize) {
+            *memo = (vers.0, vers.1, vers.2, cs as u32, ss as u32);
+        }
+        true
     }
 
     /// TypedArraySpeciesCreate(exemplar, «count»): the result TypedArray that
@@ -3426,7 +3589,8 @@ impl<'p> Vm<'p> {
                 let dest = self.ta_species_create(idx, len)?;
                 for i in 0..len {
                     let e = self.ta_element_get(idx, i);
-                    let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
+                    // A leaf callback runs without a frame (`run_cb_elem`).
+                    let r = self.run_cb_elem(&None, 0, a0, &[e, Value::num(i as f64), recv], a1)?;
                     self.ta_element_set(dest.heap_index(), i, r)?;
                 }
                 Ok(Some(dest))
@@ -3452,7 +3616,7 @@ impl<'p> Vm<'p> {
                     // callback that mutates the TypedArray is observed — values are
                     // not cached before iteration).
                     let e = self.ta_element_get(idx, i);
-                    let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
+                    let r = self.run_cb_elem(&None, 0, a0, &[e, Value::num(i as f64), recv], a1)?;
                     match name {
                         "forEach" => {}
                         "filter" => {
@@ -3533,11 +3697,7 @@ impl<'p> Vm<'p> {
                 for &i in &order[start..] {
                     // Read each element fresh (not cached) per the spec.
                     let e = self.ta_element_get(idx, i);
-                    acc = self.call_value(
-                        a0,
-                        Value::UNDEFINED,
-                        &[acc, e, Value::num(i as f64), recv],
-                    )?;
+                    acc = self.run_cb_elem(&None, 0, a0, &[acc, e, Value::num(i as f64), recv], Value::UNDEFINED)?;
                 }
                 Ok(Some(acc))
             }

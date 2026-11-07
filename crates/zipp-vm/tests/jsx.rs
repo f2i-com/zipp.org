@@ -4,7 +4,7 @@
 //! lowering itself, not only what a renderer would make of it. They are
 //! what Node prints for tsc's output of the same files (`transpileModule`
 //! with each directory's `tsconfig.json`).
-#![cfg(feature = "typescript")]
+#![cfg(all(feature = "typescript", feature = "node"))]
 
 use std::path::Path;
 

@@ -837,6 +837,7 @@ impl<'p> Vm<'p> {
     /// constructors are recognised as constructors (`is_ctor`) so they serve as a
     /// foreign `newTarget` for `Reflect.construct`/`super` (the dominant
     /// cross-realm test shape); they are not yet independently functional.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn create_realm(&mut self) -> Value {
         let ne = PropAttr {
             writable: false,
@@ -1349,6 +1350,8 @@ impl<'p> Vm<'p> {
         // (active_realm / realm_globals) and the get/set interception that makes
         // `other.x` read/write the same binding a bare `x` sees inside the realm.
         self.realm_global_objs.insert(g_idx, r);
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.ready_disable();
         // Excluded receiver (ic_obj_ok): defines continue on this map after
         // alloc with no version bump, so its mirror must never be guardable.
         self.heap.pin_mirror_dict(g_idx);
@@ -1574,12 +1577,19 @@ impl<'p> Vm<'p> {
     ///
     /// Write the link EXPLICITLY when a child realm's code is what created the
     /// object. `realm_global_objs` is empty until `$262.createRealm()` is called,
-    /// so this is one `is_empty` branch for every ordinary program.
-    #[inline]
+    /// so this is one `is_empty` branch for every ordinary program — inline
+    /// always: as a call it was 3% of a loop of object literals.
+    #[inline(always)]
     pub(crate) fn realm_born(&mut self, idx: u32, main_proto: u32) {
-        if self.realm_global_objs.is_empty() {
-            return;
+        if !self.realm_global_objs.is_empty() {
+            self.realm_born_child(idx, main_proto);
         }
+    }
+
+    /// [`Self::realm_born`] once a child realm exists.
+    #[cold]
+    #[inline(never)]
+    fn realm_born_child(&mut self, idx: u32, main_proto: u32) {
         let r = match self.current_realm_id() {
             Some(r) => r,
             None => return,
@@ -1596,24 +1606,60 @@ impl<'p> Vm<'p> {
     /// transition tree never reissues ids, so an entry stays valid for the
     /// VM's life; the fold's result is deterministic in tree state, which only
     /// grows, so recomputation could never disagree with the memo.
+    ///
+    /// A direct-mapped memo (`finalize_memo`) answers first: every object
+    /// literal a loop makes asked the hash map, an out-of-line call and a
+    /// group probe, 15% of a loop of two-key literals.
+    #[inline]
     pub(crate) fn finalize_shape(
         &mut self,
         func_id: u32,
         plan_idx: u16,
         plan: &crate::bytecode::StaticKeyPlan,
     ) -> u32 {
-        if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+        let slot = finalize_memo_slot(func_id, plan_idx);
+        let (f, p, shape) = self.finalize_memo[slot];
+        if f == func_id && p == plan_idx {
             return shape;
         }
-        let data = crate::shape::attr_bits(true, true, true, false);
-        let mut shape = crate::shape::EMPTY;
-        for key in plan.keys() {
-            shape = crate::shape::add(shape, key, data);
-        }
-        self.finalize_shapes.insert((func_id, plan_idx), shape);
+        self.finalize_shape_slow(func_id, plan_idx, plan, slot)
+    }
+
+    #[inline(never)]
+    fn finalize_shape_slow(
+        &mut self,
+        func_id: u32,
+        plan_idx: u16,
+        plan: &crate::bytecode::StaticKeyPlan,
+        slot: usize,
+    ) -> u32 {
+        let shape = if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+            shape
+        } else {
+            let data = crate::shape::attr_bits(true, true, true, false);
+            let mut shape = crate::shape::EMPTY;
+            for key in plan.keys() {
+                shape = crate::shape::add(shape, key, data);
+            }
+            self.finalize_shapes.insert((func_id, plan_idx), shape);
+            shape
+        };
+        self.finalize_memo[slot] = (func_id, plan_idx, shape);
         shape
     }
 
+}
+
+/// Entries of `Vm::finalize_memo` (a power of two).
+pub(crate) const FINALIZE_MEMO_SLOTS: usize = 64;
+
+/// `Vm::finalize_memo`'s slot for a (function, plan) pair.
+#[inline(always)]
+fn finalize_memo_slot(func_id: u32, plan_idx: u16) -> usize {
+    ((func_id.wrapping_mul(0x9E37_79B1) >> 26) as usize ^ plan_idx as usize) & (FINALIZE_MEMO_SLOTS - 1)
+}
+
+impl<'p> Vm<'p> {
     /// Allocate a `FinalizeObject` literal from `plan`, an entry of one of
     /// this VM's own `FuncProto` plan tables. Those outlive the VM and the
     /// heap it owns, so the object's keys borrow the plan instead of counting
@@ -1828,6 +1874,7 @@ impl<'p> Vm<'p> {
     /// so `OSymbol.for !== Symbol.for` while the shared registry still works),
     /// realm-TAGGED so GetFunctionRealm and error-identity adoption see the
     /// child; everything else (well-known symbol values, data) is shared by value.
+    #[cfg(not(target_arch = "wasm32"))]
     fn realm_copy_value(&mut self, v: Value, r: u32) -> Value {
         if v.is_heap() {
             if let HeapObj::Native(id) = self.heap.get(v.heap_index()) {
@@ -3232,6 +3279,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::num(len)
                 };
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 let m = self
                     .fn_props
                     .entry(idx)
@@ -3655,7 +3703,7 @@ impl<'p> Vm<'p> {
                 ))
             }
             GLOBAL_PRINT => {
-                // Mirrors the Print instruction (console.log): inspect each
+                // As console.log: inspect each
                 // argument into one bounded buffer, append one stdout line.
                 let line = self.inspect_line(args.len(), |i| args[i]);
                 #[cfg(feature = "instrument")]
@@ -4133,6 +4181,7 @@ impl<'p> Vm<'p> {
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::CombinatorResolver { .. }
                             ) {
+                                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {
                                         OBJ_FREEZE => fm.freeze(),
@@ -4714,8 +4763,8 @@ impl<'p> Vm<'p> {
                 let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;
                 // Hold un-rooted Values across toJSON/replacer re-entry; suspend GC.
                 let _gc = self.gc_lock_guard();
-                if indent.is_empty() && replacer_fn.is_undefined() && allowlist.is_none() {
-                    if let Some(s) = self.json_plain_stringify(a0) {
+                if replacer_fn.is_undefined() && allowlist.is_none() {
+                    if let Some(s) = self.json_plain_stringify(a0, &indent) {
                         return Ok(self.alloc_str(s));
                     }
                 }
@@ -4901,6 +4950,7 @@ impl<'p> Vm<'p> {
             WS_DELETE => self.weakset_method(this, "delete", args)?,
             TE_ENCODE | TE_ENCODE_INTO | TE_ENCODING_GET | TD_DECODE | TD_ENCODING_GET
             | TD_FATAL_GET | TD_IGNORE_BOM_GET => self.text_codec_native(id, this, args)?,
+            #[cfg(feature = "node")]
             NODE_HOST_WRITE..=NODE_HOST_TIMER => self.node_host_native(id, args)?,
             #[cfg(feature = "webassembly")]
             WASM_HOST_OP => self.wasm_host_op(args)?,
@@ -5180,6 +5230,9 @@ impl<'p> Vm<'p> {
                 self.pending_throw = Some(reason);
                 return Err(Thrown(self.throw_message(reason)));
             }
+            // Not in a WASM module: its VMs come only from the embedding API,
+            // which never installs `$262` (embed.rs `from_program`).
+            #[cfg(not(target_arch = "wasm32"))]
             DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
@@ -6107,6 +6160,10 @@ impl<'p> Vm<'p> {
                 self.arraybuffer_method(this.heap_index(), "slice", args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            // A single-agent build installs no `Atomics` global and nothing
+            // else holds the namespace (setup_globals), so none of its
+            // methods can be called there.
+            #[cfg(not(feature = "wasm-single-agent"))]
             _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
                 let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
                 self.atomics_op(name, args)?
@@ -6672,7 +6729,7 @@ impl<'p> Vm<'p> {
                 // the result against its own `.sort()`.
                 let mut sorted: Vec<String> =
                     vals.iter().map(|s| s.to_string()).chain(zones).collect();
-                sorted.sort_unstable();
+                crate::cold_sort::sort(&mut sorted);
                 let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
                 self.alloc_array_current_realm(items)
             }

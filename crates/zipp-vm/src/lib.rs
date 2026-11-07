@@ -35,14 +35,138 @@ compile_error!("ZIPP Lite omits Python; build the python variant separately");
 
 /// Rust's bare WASM target has no process environment. Lite resolves native
 /// benchmark switches to their existing absent-variable defaults, removing
-/// cached checks and unreachable alternatives. Keep the full build's code
-/// layout: specializing its switches did not consistently preserve throughput.
-/// Native and WASI targets retain the original environment-controlled paths.
+/// cached checks and unreachable alternatives. (An earlier full-build attempt
+/// did not consistently preserve throughput; since `env_var_os` and
+/// `EnvSwitchCell` fold every switch in both modules anyway, which measured
+/// neutral on the steady WASM harness, 2026-11-07 geomean 1.001 / 0.987,
+/// this is now a shortcut, not a difference.) Native and WASI targets retain
+/// the original environment-controlled paths.
 pub(crate) const WASM_STATIC_SWITCHES: bool = cfg!(all(
     target_arch = "wasm32",
     target_os = "unknown",
     feature = "wasm-lite"
 ));
+
+/// `std::env::var_os(name)`, the one way this crate reads its environment. A
+/// browser module (`wasm32-unknown-unknown`) has none, so there the answer is
+/// the constant `None`: through `std` it was a call the optimizer could not
+/// see through, and every diagnostic, statistic and switch behind a read
+/// stayed in the module (a shape verifier, a census, per-op counters).
+#[inline(always)]
+pub(crate) fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let _ = name;
+        None
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        std::env::var_os(name)
+    }
+}
+
+/// The cache a hand-rolled environment switch keeps its first answer in
+/// (`static S: EnvSwitchCell = EnvSwitchCell::new(UNDECIDED)`, loaded, and
+/// stored once after the read). Native builds: an `AtomicU8`. A browser
+/// module: an immutable cell whose every load is its initial (undecided)
+/// value and whose stores do nothing, so each ask recomputes from the
+/// constant environment ([`env_var_os`]) and folds to a constant. Through an
+/// atomic, which the optimizer cannot see through, both arms of every such
+/// switch stayed in the modules.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) type EnvSwitchCell = std::sync::atomic::AtomicU8;
+
+/// See the native [`EnvSwitchCell`].
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) struct EnvSwitchCell(u8);
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl EnvSwitchCell {
+    pub(crate) const fn new(v: u8) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    pub(crate) fn load(&self, _: std::sync::atomic::Ordering) -> u8 {
+        self.0
+    }
+    #[inline(always)]
+    pub(crate) fn store(&self, _: u8, _: std::sync::atomic::Ordering) {}
+}
+
+/// `std::env::var(name)`, as [`env_var_os`]: not present in a browser module.
+#[inline(always)]
+pub(crate) fn env_var(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let _ = name;
+        Err(std::env::VarError::NotPresent)
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        std::env::var(name)
+    }
+}
+
+/// A same-binary A/B switch: on unless the variable is set, read once. Every
+/// optimization keeps one, so a suspect change can be turned off without a
+/// rebuild.
+///
+/// A browser module has no process environment, so there it is the constant, and
+/// the compiler drops the path behind the switch: read at run time, it kept every
+/// replaced path in the module and paid an atomic load to choose.
+macro_rules! env_off_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                true
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::sync::atomic::Ordering;
+                static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
+                match STATE.load(Ordering::Relaxed) {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let on = crate::env_var_os($var).is_none();
+                        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                        on
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// [`env_off_switch`] for a diagnostic: off unless the variable is set.
+#[allow(unused_macros)] // Only the native tiers keep such a switch today.
+macro_rules! env_on_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                false
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::sync::atomic::Ordering;
+                static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
+                match STATE.load(Ordering::Relaxed) {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let on = crate::env_var_os($var).is_some();
+                        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                        on
+                    }
+                }
+            }
+        }
+    };
+}
 
 mod bytecode;
 #[cfg(not(any(target_arch = "wasm32", feature = "wasm-lite")))]
@@ -167,6 +291,14 @@ pub fn set_unhandled_rejections_fatal(on: bool) {
     UNHANDLED_REJECTIONS_FATAL.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// This thread's stack holds at least `bytes`, so compiled code in a VM made on
+/// it may recurse deeper before it falls back to interpreted frames. A thread
+/// that says nothing, an agent's worker among them, keeps a depth any default
+/// stack holds.
+pub fn set_native_stack_bytes(bytes: usize) {
+    vm::set_native_stack_bytes(bytes);
+}
+
 pub(crate) fn unhandled_rejections_fatal() -> bool {
     UNHANDLED_REJECTIONS_FATAL.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -183,15 +315,24 @@ macro_rules! env_set_once {
         $(#[$attr])*
         #[allow(dead_code)]
         pub(crate) fn $name() -> bool {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static STATE: AtomicU8 = AtomicU8::new(0);
-            match STATE.load(Ordering::Relaxed) {
-                1 => true,
-                2 => false,
-                _ => {
-                    let on = std::env::var_os($var).is_some();
-                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-                    on
+            // No environment in a browser module: the constant, so what the
+            // flag gates compiles out (as `env_on_switch`).
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                false
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                use std::sync::atomic::Ordering;
+                static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
+                match STATE.load(Ordering::Relaxed) {
+                    1 => true,
+                    2 => false,
+                    _ => {
+                        let on = crate::env_var_os($var).is_some();
+                        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                        on
+                    }
                 }
             }
         }
@@ -734,6 +875,7 @@ pub fn run_file_then_exit(
 /// can be cleared), with `argv` as `process.argv`: for a host that runs a
 /// program as `node` would, such as the `zipp` command. A run with a harness
 /// prelude never has them.
+#[cfg(feature = "node")]
 pub fn set_node_runtime(on: bool, argv: Vec<String>) {
     vm::node::set_enabled(on, argv);
 }
@@ -741,12 +883,14 @@ pub fn set_node_runtime(on: bool, argv: Vec<String>) {
 /// Write what a program run with Node's globals prints as it prints it, to
 /// this process's stdout and stderr, instead of into its `Outcome` (the
 /// command's runs; see `set_node_runtime`).
+#[cfg(feature = "node")]
 pub fn set_node_live_output(on: bool) {
     vm::node::set_live_output(on);
 }
 
 /// The exit status a program run with Node's globals asked for
 /// (`process.exitCode`), 0 when it set none.
+#[cfg(feature = "node")]
 pub fn node_exit_code() -> i32 {
     vm::node::exit_code()
 }
@@ -875,7 +1019,7 @@ fn run_program<'a>(
     // running (so the JIT-able regions can be inspected).
     // Browser WASM has no process environment or stderr bytecode dump.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    if std::env::var_os("ZIPP_VM_DUMP").is_some() {
+    if crate::env_var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(
                 "── fn {fid} (regs={}, params={}) ──",
@@ -900,7 +1044,7 @@ fn run_program<'a>(
     #[cfg(feature = "census")]
     vm.record_census();
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    if std::env::var_os("ZIPP_LAZY_STATS").is_some() {
+    if crate::env_var_os("ZIPP_LAZY_STATS").is_some() {
         if let Some((compiled, waiting)) = vm.lazy_counts() {
             eprintln!("[lazy-stat] first calls compiled {compiled} bodies; {waiting} never ran");
         }
@@ -1061,7 +1205,7 @@ pub fn run_module_with_base(
     }
     // Browser WASM has no process environment or stderr bytecode dump.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    if std::env::var_os("ZIPP_VM_DUMP").is_some() {
+    if crate::env_var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(
                 "── fn {fid} (regs={}, params={}) ──",
@@ -2197,7 +2341,7 @@ mod tests {
             false,
         )
         .expect("source compiles");
-        if std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
+        if crate::env_var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
             assert!(text.contains("TypeOfSame"), "fusion missing:\n{text}");
         } else {
             assert!(!text.contains("TypeOfSame"), "switch ignored:\n{text}");
@@ -2208,7 +2352,7 @@ mod tests {
             false,
         )
         .expect("cell source compiles");
-        if std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
+        if crate::env_var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
             assert!(
                 cell_text.contains("TypeOfSame"),
                 "LocalCell fusion missing:\n{cell_text}"

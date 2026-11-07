@@ -7,6 +7,34 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `Math.min`, `Math.max` or `Math.hypot` of numbers already coerced, for the
+/// interpreter and for compiled code, so the two cannot answer differently.
+pub(crate) fn math_reduce(op: crate::bytecode::MathFn, nums: &[f64]) -> f64 {
+    use crate::bytecode::MathFn as M;
+    if matches!(op, M::Hypot) {
+        return hypot_scaled(nums);
+    }
+    let min = matches!(op, M::Min);
+    let mut acc = if min { f64::INFINITY } else { f64::NEG_INFINITY };
+    for &v in nums {
+        acc = if v.is_nan() || acc.is_nan() {
+            f64::NAN
+        } else if v == acc {
+            // f64 min/max treat -0 and +0 as equal; the spec orders -0 < +0.
+            if v.is_sign_negative() == min {
+                v
+            } else {
+                acc
+            }
+        } else if min {
+            acc.min(v)
+        } else {
+            acc.max(v)
+        };
+    }
+    acc
+}
+
 /// `Math.hypot` over ALREADY-COERCED arguments, in spec order: any ±Infinity
 /// gives +Infinity (even beside a NaN), then any NaN gives NaN, then all zeros
 /// give +0.
@@ -1522,6 +1550,38 @@ pub(crate) fn normalize_zero(v: Value) -> Value {
     }
 }
 
+/// JS `%` on two Numbers (Number::remainder): the truncating remainder, with
+/// the dividend's sign and -0 kept. Two integral operands under 2^53 take the
+/// exact integer remainder: `f64 % f64` is a call to a software `fmod`, and
+/// `(x >>> 0) % n` (an index past 2^31, a hash) is a double on both sides.
+/// The rest (a fraction, a zero divisor, NaN, an infinity) is the IEEE fmod.
+#[inline]
+pub(crate) fn js_rem(x: f64, y: f64) -> f64 {
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    if y != 0.0 && x.abs() < EXACT && y.abs() < EXACT && x == x.trunc() && y == y.trunc() {
+        let r = (x as i64) % (y as i64);
+        if r != 0 {
+            r as f64
+        } else if x.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
+    } else {
+        x % y
+    }
+}
+
+/// [`js_rem`] of two Int-tagged operands: the i32 remainder when it is one,
+/// else the double (a zero divisor's NaN, a negative dividend's -0).
+#[inline]
+pub(crate) fn js_rem_int(x: i32, y: i32) -> Value {
+    match x.checked_rem(y) {
+        Some(r) if r != 0 || x >= 0 => Value::int(r),
+        _ => Value::num(js_rem(x as f64, y as f64)),
+    }
+}
+
 /// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.
 /// NaN/±Infinity → 0. Used by the bitwise operators.
 pub(crate) fn to_int32(n: f64) -> i32 {
@@ -1539,7 +1599,8 @@ pub(crate) fn to_uint32(n: f64) -> u32 {
 }
 
 pub(crate) fn fmt_f64(n: f64) -> String {
-    let mut out = String::new();
+    // Room for the longest text (25 bytes), so no number grows it.
+    let mut out = String::with_capacity(25);
     fmt_f64_into(&mut out, n);
     out
 }
@@ -1551,14 +1612,101 @@ pub(crate) fn fmt_f64(n: f64) -> String {
 /// Rust's `{:e}` supplies the digits. When two equally short strings are
 /// equally close to the value it keeps the upper one, where the spec keeps the
 /// even one: 600479950316068.25 printed …068.3 for node's …068.2.
-pub(crate) fn shortest_digits(abs: f64) -> (String, i32) {
-    let sci = format!("{abs:e}"); // e.g. "1.2345e2", "1e21", "5e-1"
-    let (mant, exp) = sci.split_once('e').expect("{:e} always has an exponent");
-    let e: i32 = exp.parse().expect("valid exponent");
-    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+///
+/// Everything stays on the stack: `{:e}` wrote into a fresh `String`, growing
+/// it piece by piece, and the digits were collected into another, three
+/// allocations of the 250 ns a random double took to print.
+pub(crate) fn shortest_digits(abs: f64) -> (Digits, i32) {
+    use std::fmt::Write;
+    // "1.2345e2", "1e21", "5e-1": at most 17 digits, a point and "e-324".
+    let mut sci = Digits::new::<32>();
+    let _ = write!(sci, "{abs:e}");
+    let text = sci.bytes();
+    let at_e = text.iter().position(|&c| c == b'e').unwrap_or(text.len());
+    let mut digits = Digits::new::<17>();
+    for &c in &text[..at_e] {
+        if c != b'.' {
+            digits.push_byte(c);
+        }
+    }
+    let (minus, exp) = match text.get(at_e + 1..) {
+        Some([b'-', rest @ ..]) => (true, rest),
+        Some(rest) => (false, rest),
+        None => (false, &[][..]),
+    };
+    let e = exp.iter().fold(0i32, |e, &c| e * 10 + i32::from(c - b'0'));
+    let e = if minus { -e } else { e };
     match shortest_tie_neighbour(abs, &digits, e) {
         Some(even) => (even, e),
         None => (digits, e),
+    }
+}
+
+/// A number's text on the stack: the digits [`shortest_digits`] returns (at
+/// most 17) or a whole formatted number (at most 25 bytes, as in
+/// `-1.2345678901234567e-308` or `-0.0000012345678901234567`). Only ASCII is
+/// ever written. A write past the capacity is dropped, never a panic; no caller
+/// comes near it.
+#[derive(Clone, Copy)]
+pub(crate) struct Digits {
+    buf: [u8; 32],
+    len: u8,
+    cap: u8,
+}
+
+impl Digits {
+    pub(crate) fn new<const CAP: usize>() -> Digits {
+        Digits { buf: [0; 32], len: 0, cap: CAP.min(32) as u8 }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    fn push_byte(&mut self, c: u8) {
+        if self.len < self.cap && c.is_ascii() {
+            self.buf[self.len as usize] = c;
+            self.len += 1;
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        let (at, end) = (self.len as usize, self.len as usize + s.len());
+        if end <= self.cap as usize && s.is_ascii() {
+            self.buf[at..end].copy_from_slice(s.as_bytes());
+            self.len = end as u8;
+        }
+    }
+}
+
+impl std::fmt::Write for Digits {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Digits {
+    type Target = str;
+    fn deref(&self) -> &str {
+        ascii_text(self.bytes())
+    }
+}
+
+/// Bytes every writer above keeps ASCII, as text: unchecked where the
+/// profile allows it, since validating them cost as much as composing them.
+#[inline]
+fn ascii_text(bytes: &[u8]) -> &str {
+    debug_assert!(bytes.is_ascii());
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        // SAFETY: ASCII is valid UTF-8; `Digits` and the general path's
+        // buffer only ever hold ASCII bytes.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+    #[cfg(feature = "safe-sandbox")]
+    {
+        std::str::from_utf8(bytes).unwrap_or_default()
     }
 }
 
@@ -1572,7 +1720,7 @@ pub(crate) fn shortest_digits(abs: f64) -> (String, i32) {
 /// on the odd half of all non-integral conversions. `p - 1 < 0` always: a
 /// midpoint `5 × 10^(p-1)` from both candidates fits within half an ulp of
 /// `abs` only below the units digit.
-fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<String> {
+fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<Digits> {
     let last = *digits.as_bytes().last()?;
     if (last - b'0') % 2 == 0 {
         return None;
@@ -1614,7 +1762,12 @@ fn shortest_tie_neighbour(abs: f64, digits: &str, e: i32) -> Option<String> {
         return None;
     }
     let back = crate::num_parse::parse_f64(&format!("{text}e{}", s + 1))?;
-    (back == abs).then_some(text)
+    if back != abs {
+        return None;
+    }
+    let mut even = Digits::new::<17>();
+    even.push_str(&text);
+    Some(even)
 }
 
 /// Print `abs` when it is `n / 2^d` for an odd `n` and `1 <= d <= 7`: a half,
@@ -1843,39 +1996,59 @@ fn fmt_f64_general_into(out: &mut String, neg: bool, abs: f64) {
     // round-trip, ties settled as the spec says in `shortest_digits`), then format
     // with JS's exponential cutoffs (n > 21 or n ≤ -6).
     let (digits, e) = shortest_digits(abs);
-    let s = digits.as_str();
-    let k = s.len() as i32;
+    let s = digits.bytes();
+    let k = s.len();
     let np = e + 1; // decimal-point position (value ≈ 0.s × 10^np)
-    if neg {
-        out.push('-');
-    }
-    if k <= np && np <= 21 {
+    // Composed on the stack and appended once: piece by piece, `out` grew
+    // two or three times for one number. The buffer starts as zeros, so the
+    // padding zeros are only skipped over. The longest text is 25 bytes
+    // (`-0.00000` and 17 digits).
+    let mut buf = [b'0'; 32];
+    let mut n = usize::from(neg);
+    buf[0] = if neg { b'-' } else { b'0' };
+    if (k as i32) <= np && np <= 21 {
         // Integer: all digits, then (np-k) trailing zeros.
-        out.push_str(s);
-        out.extend(std::iter::repeat('0').take((np - k) as usize));
+        buf[n..n + k].copy_from_slice(s);
+        n += np as usize;
     } else if 0 < np && np <= 21 {
         // Point inside the digits.
-        out.push_str(&s[..np as usize]);
-        out.push('.');
-        out.push_str(&s[np as usize..]);
+        let p = np as usize;
+        buf[n..n + p].copy_from_slice(&s[..p]);
+        buf[n + p] = b'.';
+        buf[n + p + 1..n + k + 1].copy_from_slice(&s[p..]);
+        n += k + 1;
     } else if -6 < np && np <= 0 {
         // Leading "0." then (-np) zeros then the digits.
-        out.push_str("0.");
-        out.extend(std::iter::repeat('0').take((-np) as usize));
-        out.push_str(s);
+        buf[n + 1] = b'.';
+        n += 2 + (-np) as usize;
+        buf[n..n + k].copy_from_slice(s);
+        n += k;
     } else {
         // Exponential: first digit, optional ".rest", then e±(np-1).
-        out.push_str(&s[..1]);
+        buf[n] = s[0];
+        n += 1;
         if k > 1 {
-            out.push('.');
-            out.push_str(&s[1..]);
+            buf[n] = b'.';
+            buf[n + 1..n + k].copy_from_slice(&s[1..]);
+            n += k;
         }
         let e2 = np - 1;
-        out.push('e');
-        out.push(if e2 >= 0 { '+' } else { '-' });
-        use std::fmt::Write;
-        let _ = write!(out, "{}", e2.abs());
+        buf[n] = b'e';
+        buf[n + 1] = if e2 >= 0 { b'+' } else { b'-' };
+        n += 2;
+        let e2 = e2.unsigned_abs();
+        if e2 >= 100 {
+            buf[n] = b'0' + (e2 / 100) as u8;
+            n += 1;
+        }
+        if e2 >= 10 {
+            buf[n] = b'0' + (e2 / 10 % 10) as u8;
+            n += 1;
+        }
+        buf[n] = b'0' + (e2 % 10) as u8;
+        n += 1;
     }
+    out.push_str(ascii_text(&buf[..n]));
 }
 
 #[cfg(test)]
@@ -1925,6 +2098,88 @@ mod fmt_short_decimal_tests {
         let mut out = String::new();
         assert!(fmt_short_decimal_into(&mut out, false, 42.17));
         assert_eq!(out, "42.17");
+    }
+}
+
+#[cfg(test)]
+mod fmt_general_stack_tests {
+    use super::fmt_f64_general_into;
+
+    /// The general path as it was written before it composed on the stack:
+    /// `{:e}`'s digits through a `String`, the tie settled by the same probe.
+    fn reference(neg: bool, abs: f64) -> String {
+        let sci = format!("{abs:e}");
+        let (mant, exp) = sci.split_once('e').unwrap();
+        let e: i32 = exp.parse().unwrap();
+        let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+        if let Some(even) = super::shortest_tie_neighbour(abs, &digits, e) {
+            digits = even.to_string();
+        }
+        let s = digits.as_str();
+        let k = s.len() as i32;
+        let np = e + 1;
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        if k <= np && np <= 21 {
+            out.push_str(s);
+            out.extend(std::iter::repeat('0').take((np - k) as usize));
+        } else if 0 < np && np <= 21 {
+            out.push_str(&s[..np as usize]);
+            out.push('.');
+            out.push_str(&s[np as usize..]);
+        } else if -6 < np && np <= 0 {
+            out.push_str("0.");
+            out.extend(std::iter::repeat('0').take((-np) as usize));
+            out.push_str(s);
+        } else {
+            out.push_str(&s[..1]);
+            if k > 1 {
+                out.push('.');
+                out.push_str(&s[1..]);
+            }
+            let e2 = np - 1;
+            out.push('e');
+            out.push(if e2 >= 0 { '+' } else { '-' });
+            out.push_str(&e2.abs().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn stack_composition_matches_the_string_composition() {
+        let check = |abs: f64| {
+            if !(abs.is_finite() && abs > 0.0) {
+                return;
+            }
+            for neg in [false, true] {
+                let mut got = String::new();
+                fmt_f64_general_into(&mut got, neg, abs);
+                assert_eq!(got, reference(neg, abs), "{abs:e}");
+            }
+        };
+        // Every bit pattern class: random mantissas at every exponent.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..400_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            check(f64::from_bits(s & 0x7FFF_FFFF_FFFF_FFFF));
+        }
+        // Each layout's edges: the 1e21 and 1e-6 cutoffs, integers with
+        // trailing zeros, subnormals, the extremes, the spec's ties.
+        for e in -325..=309 {
+            let p = 10f64.powi(e);
+            for m in [1.0, 1.5, 9.999_999_999_999_999, 1.234_567_890_123_456_7, 5.0, 7.25] {
+                check(m * p);
+                check(f64::from_bits((m * p).to_bits() + 1));
+                check(f64::from_bits((m * p).to_bits().saturating_sub(1)));
+            }
+        }
+        for abs in [5e-324, 2.2250738585072014e-308, f64::MAX, 1e21, 1e-7, 1e-6, 123e18, 600479950316068.25, 0.3] {
+            check(abs);
+        }
     }
 }
 

@@ -29,6 +29,11 @@ pub(crate) struct IntEntry<'a> {
     /// Read-only dense computed-call proofs run once before any region op.
     /// They validate exact receiver/element identities and ABA versions.
     pub(crate) computed_guards: &'a [DenseComputedEntryGuard],
+    /// Callees the flattened body was planned against, read where the dropped
+    /// `Move` or `LoadGlobal` would have read them.
+    pub(crate) values: &'a [EntryValueGuard],
+    /// The proofs of the `new`s flattened away (see [`NewLanePlan`]).
+    pub(crate) lanes: &'a [&'static NewLanePlan],
     /// `(jit_regs_fits address, highest scratch slot used above rbx)`. The
     /// flattened body writes the callee window above the caller frame, and
     /// `flush_exit` stores every home back to `[rbx + dreg(r)]`; a `0` address
@@ -59,6 +64,9 @@ pub(crate) struct IntSplice {
     pub(crate) guards: Vec<(u64, u32)>,
     pub(crate) route_epoch: Option<u32>,
     pub(crate) computed_guards: Vec<DenseComputedEntryGuard>,
+    pub(crate) values: Vec<EntryValueGuard>,
+    pub(crate) lanes: Vec<&'static NewLanePlan>,
+    pub(crate) cells: Vec<CellSync>,
     pub(crate) regs_fits: (usize, u64),
     pub(crate) scratch_base: Option<u16>,
 }
@@ -70,10 +78,20 @@ impl IntSplice {
             guards: &self.guards,
             route_epoch: self.route_epoch,
             computed_guards: &self.computed_guards,
+            values: &self.values,
+            lanes: &self.lanes,
             regs_fits: self.regs_fits,
             scratch_base: self.scratch_base,
         }
     }
+}
+
+/// A value and its slot's version, compared once at region entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntryValueGuard {
+    pub(crate) src: TaPinSrc,
+    pub(crate) bits: u64,
+    pub(crate) ver: u32,
 }
 
 /// One native-entry validation bundle for a bounded dense computed-call site.
@@ -102,6 +120,14 @@ struct Site<'a> {
     /// a live range spanning the whole region — 5 more permanent homes on the
     /// mix loop, which overflows the pool before any emitter runs.
     win: u16,
+    /// The last op an exit replays from `def_ip`: the call, or for a `new` the
+    /// last read of its instance.
+    last: usize,
+    /// For a `new`: each read of the instance, which is never made, as the op
+    /// and the value it finds.
+    reads: Vec<(usize, u16, NewLaneVal)>,
+    /// The pool global holding each upvalue the body touches.
+    cell_slots: Vec<(u16, u32)>,
     /// Callee-local registers that take a DEDICATED caller slot instead of
     /// `win + reg`: the captured `Math` receiver/callee pairs of a computed
     /// arm. The pair holds boxed identities that the region planner keeps out
@@ -251,6 +277,8 @@ pub(crate) fn plan_int_splice(
     computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
     regs_fits_helper: usize,
     metered: bool,
+    // The pool globals a captured variable may live in: `(base, count)`.
+    pool: (u32, u32),
 ) -> Option<IntSplice> {
     if !int_splice_enabled() {
         return None;
@@ -260,7 +288,7 @@ pub(crate) fn plan_int_splice(
         return None;
     }
     let calls: Vec<usize> = (s..=e)
-        .filter(|&ip| matches!(proto.code[ip], Instr::Call { .. }))
+        .filter(|&ip| matches!(proto.code[ip], Instr::Call { .. } | Instr::New { .. }))
         .collect();
     let computed: Vec<usize> = (s..=e)
         .filter(|&ip| computed_call_site(proto, s, ip).is_some())
@@ -298,31 +326,70 @@ pub(crate) fn plan_int_splice(
     let mut sites: Vec<Site> = Vec::with_capacity(calls.len());
     let mut win_top = 0u64; // highest scratch slot used, as a caller reg number
     let mut guards: Vec<(u64, u32)> = Vec::new();
+    let mut values: Vec<EntryValueGuard> = Vec::new();
+    let mut lanes: Vec<&'static NewLanePlan> = Vec::new();
+    let mut cells: Vec<CellSync> = Vec::new();
     let mut route_epoch: Option<u32> = None;
     let mut prev_end = s; // spans must not overlap
     for &c in &calls {
-        let Instr::Call {
+        let (Instr::Call {
             dst,
             callee,
             arg_base,
             argc,
-        } = proto.code[c]
+        }
+        | Instr::New {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        }) = proto.code[c]
         else {
             unreachable!()
         };
         let Some(lp) = leaf_plan.get(&c) else {
             decline!("@{c} no leaf plan (not monomorphic / not inline-eligible)");
         };
-        if !lp.upvals.is_empty() {
-            // An upvalue read is `jit_cell_get`, an FFI call the INT emitters
-            // have no arm for.
-            decline!("@{c} callee reads upvalues");
+        if matches!(proto.code[c], Instr::New { .. }) != lp.new_lane.is_some() {
+            decline!("@{c} a `new` without its lane");
+        }
+        // A flattened region runs nothing else, so nothing else can touch a
+        // captured cell while it does: the cell's value lives in a pool global
+        // for the run, an integer home like any other.
+        let mut cell_slots: Vec<(u16, u32)> = Vec::new();
+        for ins in &lp.body {
+            let (idx, written) = match *ins {
+                Instr::UpvalGet { idx, .. } => (idx, false),
+                Instr::UpvalSet { idx, .. } => (idx, true),
+                _ => continue,
+            };
+            let Some(&bits) = lp.upvals.get(&idx) else {
+                decline!("@{c} upvalue {idx} has no cell");
+            };
+            let cell = Value::from_bits(bits).heap_index();
+            let slot = match cells.iter_mut().find(|known| known.cell == cell) {
+                Some(known) => {
+                    known.written |= written;
+                    known.slot
+                }
+                None => {
+                    if cells.len() as u32 == pool.1 {
+                        decline!("@{c} more captured cells than pool globals");
+                    }
+                    let slot = pool.0 + cells.len() as u32;
+                    cells.push(CellSync { cell, slot, written });
+                    slot
+                }
+            };
+            if !cell_slots.iter().any(|&(known, _)| known == idx) {
+                cell_slots.push((idx, slot));
+            }
         }
         if !lp.nested.is_empty() {
             decline!("@{c} nested (wrapper) splice");
         }
-        if argc != lp.param_count {
-            decline!("@{c} argc {argc} != param_count {}", lp.param_count);
+        if argc < lp.param_count {
+            decline!("@{c} argc {argc} < param_count {}", lp.param_count);
         }
         if lp.uninit_mask != 0 {
             // A local read before it is written would read `undefined` (and reg
@@ -332,12 +399,6 @@ pub(crate) fn plan_int_splice(
                 lp.uninit_mask
             );
         }
-        let Some(guard) = lp.slot_guard else {
-            // Without the slot-generation proof there is nothing to hoist: the
-            // per-execution bits+version guard reads the callee REGISTER, whose
-            // defining LoadGlobal this flatten drops.
-            decline!("@{c} no slot_guard (callee identity not hoistable)");
-        };
         if lp.body.iter().any(|i| {
             matches!(
                 i,
@@ -364,24 +425,68 @@ pub(crate) fn plan_int_splice(
                 Some(_) => {}
             }
         }
-        let Some(def_ip) = def_ip else {
-            decline!("@{c} callee register r{callee} is a region live-in");
+        // A callee the region never loads is its own span: nothing to drop.
+        let def_ip = def_ip.unwrap_or(c);
+        // What the flatten drops, and the once-only check that stands for it.
+        // A slot generation answers for a global; failing that, the value
+        // itself, in a place the region never writes.
+        let unwritten = |src: TaPinSrc| {
+            !proto.code[s..=e].iter().any(|i| match src {
+                TaPinSrc::Global(g) => matches!(*i,
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } if idx == g),
+                TaPinSrc::Reg(r) => splice_ud(i).is_none_or(|(_, d)| d == Some(r)),
+            })
         };
-        if !matches!(proto.code[def_ip], Instr::LoadGlobal { dst: d, .. } if d == callee) {
-            decline!("@{c} callee def @{def_ip} is not a LoadGlobal");
+        let by_value = match proto.code[def_ip] {
+            _ if def_ip == c => Some(TaPinSrc::Reg(callee)),
+            Instr::LoadGlobal { dst: d, .. } if d == callee && lp.slot_guard.is_some() => None,
+            Instr::LoadGlobal { dst: d, idx } if d == callee => Some(TaPinSrc::Global(idx)),
+            Instr::Move { dst: d, src } if d == callee => Some(TaPinSrc::Reg(src)),
+            _ => decline!("@{c} callee def @{def_ip} is neither a LoadGlobal nor a Move"),
+        };
+        match by_value {
+            None => {
+                let guard = lp.slot_guard?;
+                if !guards.contains(&guard) {
+                    guards.push(guard);
+                }
+            }
+            Some(src) => {
+                if lp.same_proto_fid.is_some() || !unwritten(src) {
+                    decline!("@{c} callee is not one value across the region");
+                }
+                let guard = EntryValueGuard {
+                    src,
+                    bits: lp.callee_bits,
+                    ver: lp.callee_ver,
+                };
+                if !values.contains(&guard) {
+                    values.push(guard);
+                }
+            }
         }
         if def_ip <= prev_end && !sites.is_empty() {
             decline!("@{c} callee-def span overlaps the previous site");
         }
-        span_is_replayable(proto, ta_plan, def_ip, c, s, e)?;
-        prev_end = c;
+        let (reads, last) = match lp.new_lane {
+            Some(lane) => {
+                let reads = virtual_reads(proto, c, s, e, dst, lane, lp)?;
+                let last = reads.last().map_or(c, |r| r.0);
+                if !lanes.iter().any(|l| std::ptr::eq(*l, lane)) {
+                    lanes.push(lane);
+                }
+                (reads, last)
+            }
+            None => (Vec::new(), c),
+        };
+        span_is_replayable(proto, ta_plan, def_ip, last, c, s, e)?;
+        prev_end = last;
         let win = win_top.max(lp.reg_window as u64);
         win_top = win + lp.callee_reg_count as u64;
         if win_top > MAX_SPLICE_WINDOW_TOP {
             decline!("@{c} scratch windows exceed the register-file headroom");
-        }
-        if !guards.contains(&guard) {
-            guards.push(guard);
         }
         let body_has_direct_global = lp.body.iter().any(|ins| {
             matches!(
@@ -417,6 +522,9 @@ pub(crate) fn plan_int_splice(
             dst,
             arg_base,
             win: win as u16,
+            last,
+            reads,
+            cell_slots,
             pair_map: Vec::new(),
             plan: lp,
         });
@@ -431,14 +539,15 @@ pub(crate) fn plan_int_splice(
     let reads_outside = reads_outside_region(proto, s, e)?;
     let live_out = region_live_out(proto, s, e, &sites, &reads_outside)?;
     for site in &sites {
-        let Instr::LoadGlobal { dst: callee, .. } = proto.code[site.def_ip] else {
-            unreachable!()
-        };
-        if live_out[site.def_ip - s].contains(&callee) {
-            decline!(
-                "@{} callee register r{callee} is live past its def",
-                site.call_ip
-            );
+        if let Instr::LoadGlobal { dst: callee, .. } | Instr::Move { dst: callee, .. } =
+            proto.code[site.def_ip]
+        {
+            if live_out[site.def_ip - s].contains(&callee) {
+                decline!(
+                    "@{} callee register r{callee} is live past its def",
+                    site.call_ip
+                );
+            }
         }
         if matches!(site.plan.body.last(), Some(Instr::ReturnUndefined))
             && live_out[site.call_ip - s].contains(&site.dst)
@@ -467,7 +576,7 @@ pub(crate) fn plan_int_splice(
     let mut span_resume: FxHashMap<usize, u32> = FxHashMap::default();
     for site in &sites {
         site_at.insert(site.call_ip, site);
-        for ip in site.def_ip..=site.call_ip {
+        for ip in site.def_ip..=site.last {
             span_resume.insert(ip, site.def_ip as u32);
         }
     }
@@ -487,6 +596,25 @@ pub(crate) fn plan_int_splice(
         }
         if sites.iter().any(|st| st.def_ip == o) {
             continue; // the callee LoadGlobal — dropped, replayed on any exit
+        }
+        // A read of an instance that is not there is the value it would hold.
+        if let Some((site, &(_, get_dst, val))) = sites
+            .iter()
+            .find_map(|st| st.reads.iter().find(|read| read.0 == o).map(|read| (st, read)))
+        {
+            flat.push(match val {
+                NewLaneVal::Reg(reg) => Instr::Move {
+                    dst: get_dst,
+                    src: site.win + reg,
+                },
+                NewLaneVal::Bits(bits) => Instr::LoadInt {
+                    dst: get_dst,
+                    val: Value::from_bits(bits).as_int(),
+                },
+                NewLaneVal::Arg(_) => return None,
+            });
+            resume.push(r);
+            continue;
         }
         if let Some(&j) = ta_plan.access.get(&o) {
             access.insert(base + flat.len(), j);
@@ -574,9 +702,58 @@ pub(crate) fn plan_int_splice(
         guards,
         route_epoch,
         computed_guards: Vec::new(),
+        values,
+        lanes,
+        cells,
         regs_fits: (regs_fits_helper, win_top),
         scratch_base: None,
     })
+}
+
+/// The reads of a `new`'s instance, when reading is all that happens to it: an
+/// instance nothing else sees need not exist. Each read names a field the lane
+/// stored, so it finds that field and consults no prototype, and what it finds
+/// is an int, or a register of the body. Any other use of `dst` in the region,
+/// or a read past the next `new` into it, declines; the liveness pass answers
+/// for uses outside the region.
+fn virtual_reads(
+    proto: &FuncProto,
+    c: usize,
+    s: usize,
+    e: usize,
+    dst: u16,
+    lane: &NewLanePlan,
+    lp: &LeafInlinePlan,
+) -> Option<Vec<(usize, u16, NewLaneVal)>> {
+    let mut reads = Vec::new();
+    let mut killed = false;
+    for ip in s..=e {
+        if ip == c {
+            continue;
+        }
+        let (uses, def) = splice_ud(&proto.code[ip])?;
+        if uses.contains(&dst) {
+            let Instr::GetProp { dst: get_dst, obj, name } = proto.code[ip] else {
+                decline!("@{c} instance used @{ip}");
+            };
+            if obj != dst || ip < c || killed {
+                decline!("@{c} instance read @{ip} is not this one");
+            }
+            let key = proto.string_constants.get(name as usize)?;
+            let Some(at) = lane.names.iter().position(|k| k == key) else {
+                decline!("@{c} read of {key} is not a stored field");
+            };
+            let val = lane.vals[at];
+            match val {
+                NewLaneVal::Reg(reg) if reg < lp.callee_reg_count => {}
+                NewLaneVal::Bits(bits) if Value::from_bits(bits).is_int() => {}
+                _ => decline!("@{c} field {key} has no integer home"),
+            }
+            reads.push((ip, get_dst, val));
+        }
+        killed |= ip > c && def == Some(dst);
+    }
+    Some(reads)
 }
 
 /// Computed-call-only sibling of the ordinary Call splice. Every dense arm was
@@ -616,7 +793,7 @@ fn plan_int_computed_splice(
     if !(s..=call_ip).contains(&fallback) {
         decline!("@{call_ip} fallback @{fallback} outside pure region prefix");
     }
-    span_is_replayable(proto, ta_plan, fallback, call_ip, s, e)?;
+    span_is_replayable(proto, ta_plan, fallback, call_ip, call_ip, s, e)?;
 
     // Two dispatch temporaries plus one SHARED callee window. Arms are mutually
     // exclusive and every success jumps to the common continuation, so no arm's
@@ -741,6 +918,9 @@ fn plan_int_computed_splice(
                 dst,
                 arg_base,
                 win,
+                last: call_ip,
+                reads: Vec::new(),
+                cell_slots: Vec::new(),
                 pair_map: pair_maps[index].clone(),
                 plan: lp,
             };
@@ -865,6 +1045,9 @@ fn plan_int_computed_splice(
         guards: Vec::new(),
         route_epoch,
         computed_guards: vec![computed_guard],
+        values: Vec::new(),
+        lanes: Vec::new(),
+        cells: Vec::new(),
         regs_fits: (regs_fits_helper, win_top),
         scratch_base: Some(proto.reg_count),
     })
@@ -917,6 +1100,7 @@ fn emit_splice(
             Instr::StoreGlobal { .. }
                 | Instr::StoreGlobalStrict { .. }
                 | Instr::StoreGlobalResolved { .. }
+                | Instr::UpvalSet { .. }
         )
     });
     if let Some(k) = effect_at {
@@ -924,8 +1108,14 @@ fn emit_splice(
             decline!("@{} body can exit after a StoreGlobal", site.call_ip);
         }
     }
+    let slot = |idx: u16| site.cell_slots.iter().find(|(known, _)| *known == idx).map(|c| c.1);
     for ins in body {
-        let Some(m) = map_body_instr(ins, &map, constants, string_constants, lp) else {
+        let mapped = match *ins {
+            Instr::UpvalGet { dst, idx } => slot(idx).map(|idx| Instr::LoadGlobal { dst: map(dst), idx }),
+            Instr::UpvalSet { idx, src } => slot(idx).map(|idx| Instr::StoreGlobal { idx, src: map(src) }),
+            _ => map_body_instr(ins, &map, constants, string_constants, lp),
+        };
+        let Some(m) = mapped else {
             decline!("@{} body op {ins:?} is not flattenable", site.call_ip);
         };
         flat.push(m);
@@ -1103,6 +1293,7 @@ fn int_op_can_exit(i: &Instr) -> bool {
             | Instr::LoadInt { .. }
             | Instr::LoadConst { .. }
             | Instr::LoadGlobal { .. }
+            | Instr::UpvalGet { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
@@ -1149,19 +1340,9 @@ fn span_pinned_charcodeat(proto: &FuncProto, ta_plan: &TaPinPlan, ip: usize) -> 
             .is_some_and(|&j| ta_plan.pins[j as usize].kind == crate::codegen::STR_PIN_KIND)
 }
 
-/// B223 latch: see `span_pinned_charcodeat`.
-fn splice_charcodeat_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SPLICE_CCA").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B223 latch: see `span_pinned_charcodeat`.
+    fn splice_charcodeat_enabled() = "ZIPP_NO_SPLICE_CCA"
 }
 
 /// Every exit inside `[def_ip, call_ip]` resumes at `def_ip`, so the whole span
@@ -1173,6 +1354,9 @@ fn span_is_replayable(
     ta_plan: &TaPinPlan,
     def_ip: usize,
     call_ip: usize,
+    // The call or `new` inside the span: what the flatten makes of it is
+    // proved by its own plan, not the allowlist below.
+    site_ip: usize,
     s: usize,
     e: usize,
 ) -> Option<()> {
@@ -1187,7 +1371,7 @@ fn span_is_replayable(
         // replay it in the interpreter.  Keep calls, construction, printing,
         // appends, throws and every store-like opcode out by using a pure
         // allowlist instead of trying to enumerate today's effectful variants.
-        if !matches!(
+        if ip != site_ip && !matches!(
             proto.code[ip],
             Instr::LoadConst { .. }
                 | Instr::LoadInt { .. }
@@ -1287,7 +1471,9 @@ fn region_live_out(
     for ip in s..=e {
         let mut t = splice_ud(&proto.code[ip])?;
         if let Some(site) = sites.iter().find(|st| st.call_ip == ip) {
-            let Instr::Call { arg_base, argc, .. } = proto.code[ip] else {
+            let (Instr::Call { arg_base, argc, .. } | Instr::New { arg_base, argc, .. }) =
+                proto.code[ip]
+            else {
                 unreachable!()
             };
             t.0 = (0..argc).map(|k| arg_base + k).collect();
@@ -1297,6 +1483,8 @@ fn region_live_out(
             };
         } else if sites.iter().any(|st| st.def_ip == ip) {
             t = (Vec::new(), None);
+        } else if sites.iter().any(|st| st.reads.iter().any(|read| read.0 == ip)) {
+            t.0.clear();
         }
         ud.push(t);
     }
@@ -1373,6 +1561,13 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::LoadGlobal { dst, .. }
         | Instr::LoadGlobalOrUndefined { dst, .. } => r(vec![], Some(dst)),
         Instr::Move { dst, src } => r(vec![src], Some(dst)),
+        Instr::MakeClass { dst, parent, .. } => r(parent.into_iter().collect(), Some(dst)),
+        // A closure reads the cells it captures, and each of those registers
+        // is a use here, at the `MakeCell` that made it one.
+        Instr::MakeCell { reg } | Instr::MakeCellTdz { reg } => r(vec![reg], Some(reg)),
+        Instr::MakeClosure { dst, .. } => r(vec![], Some(dst)),
+        Instr::CellGet { dst, cell } => r(vec![cell], Some(dst)),
+        Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => r(vec![cell, src], None),
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
         | Instr::StoreGlobalResolved { src, .. } => r(vec![src], None),
@@ -1588,18 +1783,6 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             v.push(key);
             r(v, Some(dst))
         }
-        Instr::Print {
-            dst,
-            callee,
-            this_v,
-            arg_base,
-            argc,
-        } => {
-            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
-            v.push(callee);
-            v.push(this_v);
-            r(v, Some(dst))
-        }
         Instr::ArrayAppend { arr, val, .. } => r(vec![arr, val], None),
         Instr::Jump { .. } | Instr::ReturnUndefined | Instr::GenStart => r(vec![], None),
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => r(vec![cond], None),
@@ -1655,6 +1838,36 @@ pub(crate) fn emit_int_splice_entry_guards(
             ; cmp DWORD [rax], gen as i32
             ; jne => entry_bail
         );
+    }
+    if !entry.values.is_empty() || !entry.lanes.is_empty() {
+        use crate::vm::host_api::{JIT_CLASS_PROTO_EPOCH_OFFSET, JIT_VERSIONS_RAW_OFFSET};
+        dynasm!(ops ; mov rdx, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]);
+        for guard in entry.values {
+            match guard.src {
+                TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+            }
+            dynasm!(ops
+                ; mov rcx, QWORD guard.bits as i64
+                ; cmp rax, rcx
+                ; jne => entry_bail
+                ; mov eax, eax
+                ; cmp DWORD [rdx + rax * 4], guard.ver as i32
+                ; jne => entry_bail
+            );
+        }
+        for lane in entry.lanes {
+            dynasm!(ops
+                ; cmp DWORD [rdi + JIT_CLASS_PROTO_EPOCH_OFFSET as i32], lane.epoch as i32
+                ; jne => entry_bail
+            );
+            for &(slot, ver) in &lane.hops {
+                dynasm!(ops
+                    ; cmp DWORD [rdx + slot as i32 * 4], ver as i32
+                    ; jne => entry_bail
+                );
+            }
+        }
     }
     if !entry.computed_guards.is_empty() {
         // Win64 shadow/alignment exactly like `jit_regs_fits` above. These

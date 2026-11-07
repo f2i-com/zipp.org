@@ -11,78 +11,38 @@ use super::*;
 
 use crate::bytecode::FINALIZE_STAGE_SLOTS;
 
-/// Same-binary ablation for the Tier-C object-literal lane.
-///
-/// Latching once keeps environment access out of both compilation and native
-/// execution.  The feature is default-on; `ZIPP_NO_TIERC_OBJECT_LITERAL=1`
-/// restores the old whole-function rejection.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_object_literal_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_OBJECT_LITERAL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary ablation for the Tier-C object-literal lane.
+    ///
+    /// Latching once keeps environment access out of both compilation and native
+    /// execution.  The feature is default-on; `ZIPP_NO_TIERC_OBJECT_LITERAL=1`
+    /// restores the old whole-function rejection.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_object_literal_enabled() = "ZIPP_NO_TIERC_OBJECT_LITERAL"
 }
 
-/// Independent same-binary ablation for the exact planned-next absence proof
-/// in `jit_append_data_prop`. Off restores the historical unconditional
-/// `ObjMap::pos` probe without disabling Tier C or static-key plans themselves.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_planned_append_probe_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_PLANNED_APPEND_PROBE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Independent same-binary ablation for the exact planned-next absence proof
+    /// in `jit_append_data_prop`. Off restores the historical unconditional
+    /// `ObjMap::pos` probe without disabling Tier C or static-key plans themselves.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_planned_append_probe_enabled() = "ZIPP_NO_TIERC_PLANNED_APPEND_PROBE"
 }
 
-/// Independent ablation for fixed-block array literals in Tier C.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_new_array_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_NEW_ARRAY").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Independent ablation for fixed-block array literals in Tier C.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_new_array_enabled() = "ZIPP_NO_TIERC_NEW_ARRAY"
 }
 
-/// Independent ablation for the exact null/undefined subset of loose equality.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_loose_null_eq_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_LOOSE_NULL_EQ").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Independent ablation for the exact null/undefined subset of loose equality.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_loose_null_eq_enabled() = "ZIPP_NO_TIERC_LOOSE_NULL_EQ"
 }
 
 /// Call-free Tier-C implementation of the already-admitted adjacent
@@ -94,12 +54,12 @@ pub(crate) fn tierc_loose_null_eq_enabled() -> bool {
 #[inline]
 pub(crate) fn tierc_loose_null_inline_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_LOOSE_NULL_INLINE").is_none()
+            let on = crate::env_var_os("ZIPP_NO_TIERC_LOOSE_NULL_INLINE").is_none()
                 && !crate::icstats_enabled();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
@@ -107,22 +67,12 @@ pub(crate) fn tierc_loose_null_inline_enabled() -> bool {
     }
 }
 
-/// Independent same-binary ablation for Tier C's primitive tagged-Int
-/// `String(value)` lane.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_int_string_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_INT_STRING").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Independent same-binary ablation for Tier C's primitive tagged-Int
+    /// `String(value)` lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_int_string_enabled() = "ZIPP_NO_TIERC_INT_STRING"
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -533,6 +483,26 @@ pub(crate) extern "win64" fn jit_int_string(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let value = Value::from_bits(value_bits);
+    // A primitive string is its own ToString.
+    if value.is_heap() && matches!(vm.heap.get(value.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+        return value_bits;
+    }
+    // A double: Number::toString, as the interpreter's `String(x)` gives it.
+    // `addParsed`'s `String(v)` of a parsed float bailed here on every call
+    // and left the rest of the call to the interpreter.
+    if value.is_double() {
+        let n = value.as_f64();
+        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // As below: the argument is immediate and every other live Value
+            // is in the frame's window, so a collection here is safe.
+            vm.maybe_gc();
+            let text = crate::heap::JsStr::from_ascii(crate::vm::helpers_num2::fmt_f64(n).into_bytes());
+            Value::heap(vm.heap.alloc_js(text)).bits()
+        })) {
+            Ok(bits) => bits,
+            Err(_) => std::process::abort(),
+        };
+    }
     if !value.is_int() {
         return crate::codegen::SELF_CALL_DEOPT;
     }

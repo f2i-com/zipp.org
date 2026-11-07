@@ -248,7 +248,6 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::CallMethodComputedSpread { dst: r0, obj: r1, key: r2, args: r3, .. }
         | Instr::MathOp { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::StaticFn { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
-        | Instr::Print { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. }
         | Instr::MathSpread { dst: r0, callee: r1, this_v: r2, args: r3, .. }
         | Instr::ObjectKeys { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
         | Instr::ObjectValues { dst: r0, obj: r1, callee: r2, this_v: r3, .. }
@@ -451,6 +450,22 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
             *r1 = m(*r1);
             *r2 = m(*r2);
             *r3 = m(*r3);
+        }
+        #[cfg(all())]
+        Instr::FuseGlobalIntCmpJump { gdst: r0, ldst: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::FuseGlobalIncJump { reg: r0, .. } | Instr::FuseGlobalInc { reg: r0, .. } => {
+            *r0 = m(*r0);
+        }
+        #[cfg(all())]
+        Instr::FuseIntBitwiseStoreGlobal { ldst: r0, dst: r1, a: r2, .. }
+        | Instr::FuseGlobalIntBitwise { gdst: r0, ldst: r1, dst: r2, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
         }
     );
 }

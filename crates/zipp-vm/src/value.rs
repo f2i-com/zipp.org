@@ -275,6 +275,26 @@ impl Value {
         self.0 == Value::HOLE.0
     }
 
+    /// Whether any of `items` is a hole: `items.iter().any(is_hole)`, eight
+    /// elements to a step with no exit inside the step, so the compare
+    /// vectorizes. The early-exit form compared and branched once an element,
+    /// and every `slice`, `map` and `forEach` of a dense array paid it over
+    /// the whole range (the largest part of `slice`'s own time).
+    #[inline]
+    pub fn any_hole(items: &[Value]) -> bool {
+        let mut chunks = items.chunks_exact(8);
+        for c in &mut chunks {
+            let mut hit = false;
+            for v in c {
+                hit |= v.0 == Value::HOLE.0;
+            }
+            if hit {
+                return true;
+            }
+        }
+        chunks.remainder().iter().any(|v| v.0 == Value::HOLE.0)
+    }
+
     #[inline(always)]
     pub fn is_nullish(self) -> bool {
         self.0 == TAG_NULL || self.0 == TAG_UNDEFINED

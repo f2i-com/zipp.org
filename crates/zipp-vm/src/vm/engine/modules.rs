@@ -607,6 +607,7 @@ impl<'p> Vm<'p> {
         }
         // Node's builtins and CommonJS files, for a program run with Node's
         // globals: a namespace over what they export.
+        #[cfg(feature = "node")]
         if self.node_installed {
             if let Some(ns) = self.node_import_special(&path)? {
                 return Ok(ns);
@@ -661,10 +662,8 @@ impl<'p> Vm<'p> {
         // aliases the module's OWN exported local by COMPILE slot — resolved
         // to the live slot inside prepare's second pass. Other in-flight
         // cycles are guarded (no recursion blowup).
-        let mut import_aliases: std::collections::HashMap<u32, u32> =
-            std::collections::HashMap::new();
-        let mut self_aliases: std::collections::HashMap<u32, u32> =
-            std::collections::HashMap::new();
+        let mut import_aliases: rustc_hash::FxHashMap<u32, u32> = Default::default();
+        let mut self_aliases: rustc_hash::FxHashMap<u32, u32> = Default::default();
         let mut ns_writes: Vec<(u32, Value)> = Vec::new();
         // Own (exported name -> compile slot), for self-import aliasing.
         let own_cslot = |name: &str| -> Option<u32> {
@@ -752,14 +751,14 @@ impl<'p> Vm<'p> {
         // pre-allocates live slots for the declared exports (prepare reuses
         // them). An export whose local is itself an IMPORT binding resolves
         // through its dependency; its map entry is patched after prepare.
-        let import_locals: std::collections::HashSet<u32> = imports
+        let import_locals: rustc_hash::FxHashSet<u32> = imports
             .iter()
             .filter(|e| e.local_slot != u32::MAX)
             .map(|e| e.local_slot)
             .collect();
-        let decl_set: std::collections::HashSet<u32> =
+        let decl_set: rustc_hash::FxHashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
-        let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut prealloc: rustc_hash::FxHashMap<u32, u32> = Default::default();
         let mut own_pre = super::super::ExportSlots::default();
         // A `var` export is `undefined` from instantiation on (InitializeEnvironment
         // step 21), not in a TDZ: a cycle member that reads it before this
@@ -817,7 +816,7 @@ impl<'p> Vm<'p> {
         if early_prepare {
             // Exports a cycle member already bound (`module_forward`) keep
             // those slots.
-            let mut forward: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            let mut forward: rustc_hash::FxHashMap<u32, u32> = Default::default();
             if !self.module_forward.is_empty() {
                 for (exported, local) in &exports {
                     if let Some(slot) = self.module_forward.remove(&(path.clone(), exported.clone())) {

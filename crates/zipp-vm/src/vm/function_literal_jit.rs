@@ -8,21 +8,11 @@
 
 use super::*;
 
-/// Same-binary ablation for capture-free `MakeFunc` and `SetHomeObject`.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_makefunc_home_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_MAKEFUNC_HOME").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary ablation for capture-free `MakeFunc` and `SetHomeObject`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_makefunc_home_enabled() = "ZIPP_NO_TIERC_MAKEFUNC_HOME"
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -255,13 +245,7 @@ mod tests {
             .alloc(HeapObj::EvalScope(std::collections::HashMap::new()));
         vm.closure_eval_scope.insert(active, scope);
         vm.obj_realm.insert(active, 7);
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee: active,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, active, 0);
         vm.gc_stress = true;
 
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;

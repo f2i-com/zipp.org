@@ -11,33 +11,20 @@
 //! order. The result is the stable order `slice::sort_by` gives: equal
 //! elements keep their relative order because ties compare by position. The
 //! work is still `O(n log n)` comparisons, which matters where the length is
-//! the guest's to choose (the locale parser meters exactly that bound).
+//! the guest's to choose (the locale parser meters exactly that bound). The
+//! instantiation lives in the regex fork (`regress::cold_sort_by`), whose
+//! derived Unicode tables and `\q{...}` class strings sort through it too.
 //!
 //! Not for a hot path, and not for one that must survive an allocation
 //! failure: every comparison is an indirect call, and a sort of two or more
 //! elements allocates twice. `Array.prototype.sort`, the TypedArray sorts, the
 //! collector's pool sort, the integer-key orderings, the RegExp-program heap
-//! audit and the event loop's fired-timer batch keep their own instantiations.
-
-use core::cmp::Ordering;
-
-/// Sort `order` (a permutation of positions) by `cmp`, ties by position.
-#[inline(never)]
-fn sort_positions(order: &mut [usize], cmp: &mut dyn FnMut(usize, usize) -> Ordering) {
-    order.sort_unstable_by(|&a, &b| cmp(a, b).then(a.cmp(&b)));
-}
+//! audit and the event loop's fired-timer batch use the standard sorts
+//! directly. Where they can, those sort plain `u32`s or `u64`s (an integer key
+//! packed above its slot, for one), which all share one instantiation per type.
 
 /// `v.sort_by(cmp)`, stable, through the shared instantiation.
-pub(crate) fn sort_by<T>(v: &mut Vec<T>, mut cmp: impl FnMut(&T, &T) -> Ordering) {
-    let n = v.len();
-    if n < 2 {
-        return;
-    }
-    let mut order: Vec<usize> = (0..n).collect();
-    sort_positions(&mut order, &mut |a, b| cmp(&v[a], &v[b]));
-    let mut slots: Vec<Option<T>> = v.drain(..).map(Some).collect();
-    v.extend(order.into_iter().filter_map(|i| slots[i].take()));
-}
+pub(crate) use regress::cold_sort_by as sort_by;
 
 /// `v.sort_by_key(key)`, stable, through the shared instantiation.
 pub(crate) fn sort_by_key<T, K: Ord>(v: &mut Vec<T>, mut key: impl FnMut(&T) -> K) {

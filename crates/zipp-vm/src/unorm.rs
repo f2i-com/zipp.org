@@ -328,6 +328,16 @@ impl<'a> Decompositions<'a> {
     /// The next character with its canonical combining class.
     #[inline]
     fn next_classed(&mut self) -> Option<(u8, char)> {
+        // An ASCII character with nothing buffered: a starter with no
+        // decomposition in any form, given out as it is read.
+        if self.ready == 0 && self.buffer.is_empty() {
+            if let Some(&b) = self.source.as_str().as_bytes().first() {
+                if b < 0x80 {
+                    self.source.next();
+                    return Some((0, char::from(b)));
+                }
+            }
+        }
         while self.ready == 0 {
             let Some(c) = self.source.next() else {
                 if self.buffer.is_empty() {
@@ -755,7 +765,7 @@ mod tests {
     fn tables_are_generated_from_the_crate() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/unorm_tables.rs");
         let expected = generated();
-        if std::env::var_os("ZIPP_REGENERATE_UNORM").is_some() {
+        if crate::env_var_os("ZIPP_REGENERATE_UNORM").is_some() {
             std::fs::write(&path, &expected).unwrap();
         }
         let current = std::fs::read_to_string(&path)

@@ -3,10 +3,11 @@
 //!
 //! This is intentionally a bytecode-slice recognizer, not a source/name
 //! heuristic.  The focused benchmark and the comparison wrapper have different
-//! prologues and tails, but lower the loop itself to the same 15-instruction
+//! prologues and tails, but lower the loop itself to the same 14-instruction
 //! cycle (17 while the compiler copied the discarded values of `s += o.c` and
-//! `i++` into scratch registers; a build without the JIT, the only kind this
-//! module is compiled into, no longer emits those copies).  Every immutable
+//! `i++` into scratch registers, which a build without the JIT, the only kind
+//! this module is compiled into, no longer emits; 15 while the statement
+//! `o.a = i;` stored from a copy of `i`, which is still accepted).  Every immutable
 //! operand relationship, live register type, object
 //! layout, descriptor and meter balance is checked before any state is changed;
 //! every miss leaves the ordinary interpreter path untouched.
@@ -14,7 +15,10 @@
 use super::*;
 
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
-const LOOP_BODY_AND_NEXT_HEADER_STEPS: i64 = 15;
+/// The cycle's instructions, header included, without the copy of `i` that
+/// `o.a = i;` stored from before a discarded store took the counter's own
+/// register (`assign_discarded`): 14, or 15 with the copy.
+const LOOP_CYCLE_STEPS: usize = 14;
 
 #[cfg(test)]
 static FAST_FORWARD_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -26,7 +30,10 @@ struct ObjectLoop {
     limit: u16,
     sum: u16,
     index: u16,
-    value_a: u16,
+    /// The copy of `i` that `o.a` was stored from, when the cycle has one.
+    value_a: Option<u16>,
+    /// Instructions per iteration, the header included.
+    steps: i64,
     read_a: u16,
     one: u16,
     value_b: u16,
@@ -52,10 +59,19 @@ struct ObjectLoopValues {
 /// the bytecode rather than hard-coded: the comparison wrapper has two extra
 /// prologue temporaries, while the focused `w(n)` case does not.
 fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLoop> {
-    if head < 6 || head.checked_add(15)? >= proto.code.len() {
+    if head < 6 || head.checked_add(LOOP_CYCLE_STEPS)? >= proto.code.len() {
         return None;
     }
     let c = &proto.code;
+    // The store of `i` into `o.a`, from a copy of `i` (`o` = 1) or from `i`'s
+    // own register (`o` = 0); every later position shifts by `o`.
+    let (value_a, o) = match c[head + 1] {
+        Instr::Move { dst, src } => (Some((dst, src)), 1),
+        _ => (None, 0),
+    };
+    if head.checked_add(LOOP_CYCLE_STEPS + o)? >= c.len() {
+        return None;
+    }
 
     let (stage0, plan, object) = match (&c[head - 6], &c[head - 3]) {
         (
@@ -90,38 +106,40 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         Instr::LoadInt { dst, val: 0 } => dst,
         _ => return None,
     };
+    let steps = LOOP_CYCLE_STEPS + o;
     let (limit, exit) = match c[head] {
-        Instr::JumpIfNotLt { a, b, target } if a == index && target as usize == head + 15 => {
+        Instr::JumpIfNotLt { a, b, target } if a == index && target as usize == head + steps => {
             (b, target as usize)
         }
         _ => return None,
     };
-    let value_a = match c[head + 1] {
-        Instr::Move { dst, src } if src == index => dst,
-        _ => return None,
+    let value_a = match value_a {
+        Some((dst, src)) if src == index => Some(dst),
+        Some(_) => return None,
+        None => None,
     };
-    let name_a_set = match c[head + 2] {
+    let name_a_set = match c[head + 1 + o] {
         Instr::SetProp {
             obj,
             name,
             val,
             strict: false,
-        } if obj == object && val == value_a => name,
+        } if obj == object && val == value_a.unwrap_or(index) => name,
         _ => return None,
     };
-    let (read_a, name_a_get) = match c[head + 3] {
+    let (read_a, name_a_get) = match c[head + 2 + o] {
         Instr::GetProp { dst, obj, name } if obj == object => (dst, name),
         _ => return None,
     };
-    let one = match c[head + 4] {
+    let one = match c[head + 3 + o] {
         Instr::LoadInt { dst, val: 1 } => dst,
         _ => return None,
     };
-    let value_b = match c[head + 5] {
+    let value_b = match c[head + 4 + o] {
         Instr::Add { dst, a, b } if a == read_a && b == one => dst,
         _ => return None,
     };
-    let name_b_set = match c[head + 6] {
+    let name_b_set = match c[head + 5 + o] {
         Instr::SetProp {
             obj,
             name,
@@ -130,19 +148,19 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         } if obj == object && val == value_b => name,
         _ => return None,
     };
-    let (read_b, name_b_get) = match c[head + 7] {
+    let (read_b, name_b_get) = match c[head + 6 + o] {
         Instr::GetProp { dst, obj, name } if obj == object => (dst, name),
         _ => return None,
     };
-    let two = match c[head + 8] {
+    let two = match c[head + 7 + o] {
         Instr::LoadInt { dst, val: 2 } => dst,
         _ => return None,
     };
-    let value_c = match c[head + 9] {
+    let value_c = match c[head + 8 + o] {
         Instr::Mul { dst, a, b } if a == read_b && b == two => dst,
         _ => return None,
     };
-    let name_c_set = match c[head + 10] {
+    let name_c_set = match c[head + 9 + o] {
         Instr::SetProp {
             obj,
             name,
@@ -151,31 +169,30 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         } if obj == object && val == value_c => name,
         _ => return None,
     };
-    let (read_c, name_c_get) = match c[head + 11] {
+    let (read_c, name_c_get) = match c[head + 10 + o] {
         Instr::GetProp { dst, obj, name } if obj == object => (dst, name),
         _ => return None,
     };
     if !matches!(
-        c[head + 12],
+        c[head + 11 + o],
         Instr::Add { dst, a, b } if dst == sum && a == sum && b == read_c
     ) {
         return None;
     }
     if !matches!(
-        c[head + 13],
+        c[head + 12 + o],
         Instr::AddInt { dst, a, imm: 1, upd: true } if dst == index && a == index
     ) {
         return None;
     }
-    if !matches!(c[head + 14], Instr::Jump { target } if target as usize == head) {
+    if !matches!(c[head + 13 + o], Instr::Jump { target } if target as usize == head) {
         return None;
     }
 
     // A compiler-produced instance uses disjoint state/scratch registers.  Do
     // not try to model adversarial aliasing in a hand-built Program.
-    let registers = [
-        object, limit, sum, index, value_a, read_a, one, value_b, read_b, two, value_c, read_c,
-    ];
+    let mut registers = vec![object, limit, sum, index, read_a, one, value_b, read_b, two, value_c, read_c];
+    registers.extend(value_a);
     if registers
         .iter()
         .enumerate()
@@ -191,6 +208,7 @@ fn recognize(proto: &crate::bytecode::FuncProto, head: usize) -> Option<ObjectLo
         sum,
         index,
         value_a,
+        steps: steps as i64,
         read_a,
         one,
         value_b,
@@ -237,7 +255,7 @@ fn exact_keys<'a>(
 /// additions/multiplications, including the Int-to-Double representation
 /// transition.  Larger totals retain the bytecode loop rather than accepting a
 /// reassociation rounding change.
-fn project(index: Value, limit: Value, sum: Value) -> Option<ObjectLoopValues> {
+fn project(index: Value, limit: Value, sum: Value, steps: i64) -> Option<ObjectLoopValues> {
     if !index.is_int() || !limit.is_int() || !sum.is_number() {
         return None;
     }
@@ -264,7 +282,7 @@ fn project(index: Value, limit: Value, sum: Value) -> Option<ObjectLoopValues> {
         return None;
     }
     let iterations = n.checked_sub(i)?;
-    let charge = iterations.checked_mul(LOOP_BODY_AND_NEXT_HEADER_STEPS)?;
+    let charge = iterations.checked_mul(steps)?;
     let n_i32 = i32::try_from(n).ok()?;
     let last_i32 = n_i32.checked_sub(1)?;
     Some(ObjectLoopValues {
@@ -321,6 +339,7 @@ impl<'p> Vm<'p> {
             self.get(base, plan.index),
             self.get(base, plan.limit),
             self.get(base, plan.sum),
+            plan.steps,
         )?;
 
         // If the complete skipped history does not fit, run that history.  This
@@ -367,7 +386,9 @@ impl<'p> Vm<'p> {
         map.set_val_at(1, values.b);
         map.set_val_at(2, values.c);
 
-        self.set(base, plan.value_a, values.a);
+        if let Some(value_a) = plan.value_a {
+            self.set(base, value_a, values.a);
+        }
         self.set(base, plan.read_a, values.a);
         self.set(base, plan.one, Value::int(1));
         self.set(base, plan.value_b, values.b);
@@ -453,14 +474,18 @@ mod tests {
 
     #[test]
     fn numeric_projection_is_exact_and_rejects_unsafe_reassociation() {
-        let got = project(Value::int(0), Value::int(500_000), Value::int(0))
+        let steps = LOOP_CYCLE_STEPS as i64;
+        let got = project(Value::int(0), Value::int(500_000), Value::int(0), steps)
             .expect("comparison workload is safe");
         assert_eq!(got.a, Value::int(499_999));
         assert_eq!(got.b, Value::int(500_000));
         assert_eq!(got.c, Value::int(1_000_000));
         assert_eq!(got.sum, Value::num(250_000_500_000.0));
         assert_eq!(got.index, Value::int(500_000));
-        assert_eq!(got.charge, 7_500_000);
+        assert_eq!(got.charge, 7_000_000);
+        // The cycle with the copy of `i` charges one step more an iteration.
+        let copied = project(Value::int(0), Value::int(500_000), Value::int(0), steps + 1).expect("safe");
+        assert_eq!(copied.charge, 7_500_000);
 
         // Exercise the largest intermediate product admitted by tagged-int
         // limits. One final iteration remains, so the projected state itself
@@ -469,6 +494,7 @@ mod tests {
             Value::int(i32::MAX - 1),
             Value::int(i32::MAX),
             Value::int(0),
+            steps,
         )
         .expect("i64 covers the full tagged-int projection domain");
         assert_eq!(max.a, Value::int(i32::MAX - 1));
@@ -476,11 +502,11 @@ mod tests {
         assert_eq!(max.c, Value::num(4_294_967_294.0));
         assert_eq!(max.sum, Value::num(4_294_967_294.0));
         assert_eq!(max.index, Value::int(i32::MAX));
-        assert_eq!(max.charge, 15);
+        assert_eq!(max.charge, steps);
 
-        assert!(project(Value::int(0), Value::int(100_000_000), Value::int(0)).is_none());
-        assert!(project(Value::int(-1), Value::int(10), Value::int(0)).is_none());
-        assert!(project(Value::int(0), Value::int(10), Value::num(0.5)).is_none());
+        assert!(project(Value::int(0), Value::int(100_000_000), Value::int(0), steps).is_none());
+        assert!(project(Value::int(-1), Value::int(10), Value::int(0), steps).is_none());
+        assert!(project(Value::int(0), Value::int(10), Value::num(0.5), steps).is_none());
     }
 
     #[test]
@@ -522,7 +548,7 @@ mod tests {
             }
         "#;
         const N: i32 = 8;
-        const STEPS: i64 = 15 * N as i64 + 11;
+        const STEPS: i64 = LOOP_CYCLE_STEPS as i64 * N as i64 + 11;
 
         fn ready(remaining: i64) -> (crate::vm::Vm<'static>, u32) {
             let program = Box::leak(Box::new(compile(SRC)));
@@ -582,7 +608,7 @@ mod tests {
                 return String(s);
             }
         "#;
-        const EXPECTED_STEPS: u64 = 15 * 500_000 + 16;
+        const EXPECTED_STEPS: u64 = LOOP_CYCLE_STEPS as u64 * 500_000 + 16;
 
         let program = Box::leak(Box::new(compile(SRC)));
         let mut vm = crate::vm::Vm::new(program);

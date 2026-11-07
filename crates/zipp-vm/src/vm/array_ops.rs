@@ -7,6 +7,21 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+env_off_switch! {
+    /// `ZIPP_NO_KERNEL_UPVALS=1`: a `map`/`filter`/`reduce` callback that
+    /// captures a variable takes the per-element path again, as before the
+    /// fused kernels read captured values (`Vm::kernel_upvals`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn kernel_upvals_enabled() = "ZIPP_NO_KERNEL_UPVALS"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_SCAN_KERNEL=1`: `find`/`findIndex`/`some`/`every` call their
+    /// predicate per element, without the fused scan kernel.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn scan_kernel_enabled() = "ZIPP_NO_SCAN_KERNEL"
+}
+
 /// Arrays nested in one join in the ordinary engine. The hardened profile
 /// allows 4 by default and lets the host move it
 /// (`SandboxCaps::array_stringify_depth`).
@@ -255,7 +270,123 @@ mod array_numeric_callback_shape_tests {
     }
 }
 
+/// What `Vm::scan_kernel_run` left `find`/`findIndex`/`some`/`every`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+enum ScanRun {
+    /// The method's result: the predicate stopped, or it ran over every
+    /// element without stopping.
+    Answer(Value),
+    /// The per-element loop goes on from this index (0: no kernel ran).
+    From(usize),
+}
+
 impl<'p> Vm<'p> {
+    /// `find`/`findIndex`/`some`/`every` (`name`) on Array `idx` with
+    /// predicate `cb`: its scan kernel over the elements while each result
+    /// is a Bool short of the one that answers (`compile_scan_kernel`), when
+    /// `cb` is eligible, there is no `thisArg` and no index overlay. The
+    /// predicate runs no code that could change the array, so the elements
+    /// are read in place.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn scan_kernel_run(&mut self, name: &str, idx: u32, cb: Value, this_arg: Value, len: usize) -> ScanRun {
+        if !scan_kernel_enabled()
+            || !this_arg.is_undefined()
+            || !self.jit_fused_ok()
+            || self.jit_recurse_depth != 0
+            || !cb.is_heap()
+            || len == 0
+            || len > i32::MAX as usize
+            || self.arr_props.contains_key(&idx)
+        {
+            return ScanRun::From(0);
+        }
+        let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) else {
+            return ScanRun::From(0);
+        };
+        let Some((upv, n_up)) = self.kernel_upvals(ups) else {
+            return ScanRun::From(0);
+        };
+        let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
+        // SAFETY: program functions are immutable during execution (as the
+        // map/filter drivers).
+        let proto_ref = unsafe { &*proto };
+        // The array (3rd) parameter and `arguments` would see the receiver.
+        if proto_ref.param_count >= 3 || proto_ref.arguments_reg.is_some() {
+            return ScanRun::From(0);
+        }
+        let stop_on = name != "every";
+        let Some(entry) = self.jit.scan_kernel(fid, proto_ref, stop_on) else {
+            return ScanRun::From(0);
+        };
+        let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+        let win = self.regs.len();
+        if self.regs_would_overflow(win + upv_base + n_up) {
+            return ScanRun::From(0);
+        }
+        self.regs.resize(win + upv_base + n_up, Value::UNDEFINED);
+        for (k, &v) in upv[..n_up].iter().enumerate() {
+            self.regs[win + upv_base + k] = v;
+        }
+        let (elems, n) = match self.heap.get(idx) {
+            HeapObj::Array(items) => (items.as_ptr() as *const u64, items.len().min(len)),
+            _ => (std::ptr::null(), 0),
+        };
+        let mut status: u64 = 2;
+        let mut reached = 0usize;
+        if n != 0 {
+            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+            // SAFETY: `entry` is a scan kernel of this callback's code; the
+            // window holds its registers and captured values; `elems` points
+            // at `n` live elements that nothing moves while the call-free
+            // kernel runs.
+            let kernel: extern "win64" fn(*mut u64, *const u64, usize, *mut u64) -> usize =
+                unsafe { core::mem::transmute(entry) };
+            reached = kernel(window_ptr, elems, n, &mut status);
+        }
+        self.regs.truncate(win);
+        match status {
+            0 => ScanRun::Answer(match name {
+                "find" => match self.heap.get(idx) {
+                    HeapObj::Array(items) => items[reached],
+                    _ => Value::UNDEFINED,
+                },
+                "findIndex" => Value::int(reached as i32),
+                "some" => Value::bool(true),
+                _ => Value::bool(false),
+            }),
+            1 if n == len => ScanRun::Answer(match name {
+                "find" => Value::UNDEFINED,
+                "findIndex" => Value::int(-1),
+                "some" => Value::bool(false),
+                _ => Value::bool(true),
+            }),
+            1 => ScanRun::From(n),
+            _ => ScanRun::From(reached),
+        }
+    }
+
+    /// The values of a fused kernel callback's captured cells (`ups`), which
+    /// its driver stores past the callback's registers
+    /// (`codegen::kernel_upv_base`): the kernel body reads them and runs
+    /// nothing that could assign one. `None` (the per-element path) for more
+    /// than eight, or for one still in its temporal dead zone, whose read
+    /// throws.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn kernel_upvals(&self, ups: &[u32]) -> Option<([Value; 8], usize)> {
+        if ups.len() > 8 || !kernel_upvals_enabled() && !ups.is_empty() {
+            return None;
+        }
+        let mut out = [Value::UNDEFINED; 8];
+        for (slot, &cell) in out.iter_mut().zip(ups) {
+            let v = self.heap.cell_get(cell);
+            if v.is_uninitialized() {
+                return None;
+            }
+            *slot = v;
+        }
+        Some((out, ups.len()))
+    }
+
     /// Recognise one exact, capture-free arrow callback.  Requiring both the
     /// immutable proto metadata and the live callable's empty upvalue vector
     /// keeps this fail-closed for defaults/rest/arguments/eval, generators,
@@ -296,7 +427,7 @@ impl<'p> Vm<'p> {
         // later numeric elements may use the direct path.
         let needed = self.regs.len().checked_add(plan.registers())?;
         if self.frames.len() >= MAX_FRAMES
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
             // A real callback would push and later pop one Frame.  If that
             // push would grow the retained frame Vec, let the ordinary path do
             // it so heap accounting and a tight memory ceiling stay identical;
@@ -382,8 +513,23 @@ impl<'p> Vm<'p> {
     where
         F: FnOnce(&mut Self) -> Result<Option<Value>, Thrown>,
     {
-        if self.array_stringify_active.contains(&idx) {
+        if !self.enter_array_stringify(idx)? {
             return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+        }
+        let result = stringify(self);
+        let popped = self.array_stringify_active.pop();
+        debug_assert_eq!(popped, Some(idx));
+        result
+    }
+
+    /// [`Vm::with_array_stringify_guard`]'s entry, out of the generic body:
+    /// `false` when `idx` is already being stringified (its element reads as
+    /// empty), else `idx` pushed onto the active path after the depth and
+    /// allocation checks.
+    #[inline(never)]
+    fn enter_array_stringify(&mut self, idx: u32) -> Result<bool, Thrown> {
+        if self.array_stringify_active.contains(&idx) {
+            return Ok(false);
         }
         #[cfg(feature = "safe-sandbox")]
         let max_depth = self.sandbox_caps.array_stringify_depth;
@@ -398,10 +544,7 @@ impl<'p> Vm<'p> {
             .try_reserve(1)
             .map_err(|_| Thrown::from_static("RangeError: array stringification allocation failed"))?;
         self.array_stringify_active.push(idx);
-        let result = stringify(self);
-        let popped = self.array_stringify_active.pop();
-        debug_assert_eq!(popped, Some(idx));
-        result
+        Ok(true)
     }
 
     /// Admit `additional` more bytes onto a guest-visible join buffer: the
@@ -450,6 +593,283 @@ impl<'p> Vm<'p> {
     /// lone surrogates) as a string value.
     pub(crate) fn alloc_wtf8_str(&mut self, out: Vec<u8>) -> Value {
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
+    }
+
+    /// The interpreter's `arr.m(…)` for the methods compiled code calls
+    /// directly ([`Self::array_mutate_fast`], [`Self::array_read_fast`]), past
+    /// the builtin call chain the interpreter otherwise takes for them: the
+    /// arguments copied out of the registers (which keep them rooted), the
+    /// same declines, the same arms. `None` for any other method, or a
+    /// decline, having done nothing. Out of line, as the loop's other
+    /// receiver-kind leaves are.
+    ///
+    /// Only in a VM whose JIT is off (`ZIPP_NOJIT`, and every large program,
+    /// which runs interpreted): with it on, the sites taken here before their
+    /// function compiled left the compiled `shift`/`unshift` a third slower
+    /// (32 -> 48 ns), the route below being what the compiler plans from.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(never)]
+    pub(crate) fn interp_array_lane(
+        &mut self,
+        recv: Value,
+        key: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if self.jit_enabled {
+            return None;
+        }
+        let op = super::helpers_misc::arr_mutate_op(key, argc);
+        let memo = match op {
+            Some(_) => 0,
+            None => super::helpers_misc::arr_lane_memo(key, argc)?,
+        };
+        if argc > 8 {
+            return None;
+        }
+        let mut buf = [Value::UNDEFINED; 8];
+        for (k, slot) in buf.iter_mut().enumerate().take(argc as usize) {
+            *slot = self.get(base, arg_base + k as u16);
+        }
+        let args = &buf[..argc as usize];
+        match op {
+            Some(op) => self.array_mutate_fast(recv, op, args),
+            None => self.array_read_fast(recv, memo, args),
+        }
+    }
+
+    /// The Array methods called past the builtin call chain
+    /// (`jit_method_builtin_fallback` / `try_builtin_method` /
+    /// `dispatch_builtin_method_inner`), by compiled code (`jit_str_method`'s
+    /// Array half) and the interpreter (`interp_array_lane`): `memo` is the
+    /// method's intrinsic-memo slot ([`super::helpers_misc::arr_lane_memo`]).
+    /// `array_method` runs directly for a plain array of the main realm (no
+    /// own named property, %Array.prototype% its prototype, no indexed
+    /// property on the prototypes for a hole to read through, the default
+    /// species for `slice`/`concat`) when the method is still the boot
+    /// intrinsic and no argument can run user code: a search element of any
+    /// kind (compared, never coerced), a number or `undefined` for every
+    /// position, for `concat` primitives or plain arrays, and for `join` a
+    /// string separator over primitive elements. `None`, having done nothing,
+    /// otherwise: the caller takes the chain.
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_read_fast(&mut self, recv: Value, memo: u8, args: &[Value]) -> Option<Value> {
+        let name = super::helpers_misc::arr_lane_name(memo)?;
+        if !recv.is_heap() || !self.realm_global_objs.is_empty() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+        {
+            return None;
+        }
+        let numeric = |v: &Value| v.is_number() || *v == Value::UNDEFINED;
+        let ok = match name {
+            "indexOf" | "includes" | "lastIndexOf" => args.iter().skip(1).all(numeric),
+            "at" => args.iter().all(numeric),
+            "slice" => args.iter().all(numeric) && self.array_species_is_default(recv),
+            // A separator ToString'd without code, and elements whose
+            // ToString runs none: primitives only (a hole reads `undefined`
+            // here, as no prototype holds an index). A Symbol element
+            // throws, having done nothing, and the chain then throws it.
+            "join" => {
+                args.iter().all(|a| *a == Value::UNDEFINED || (a.is_heap() && self.heap.is_str_like(a.heap_index())))
+                    && match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.iter().all(|v| !self.is_object_value(*v)),
+                        _ => false,
+                    }
+            }
+            _ => {
+                self.array_species_is_default(recv)
+                    && args.iter().all(|a| {
+                        !a.is_heap() || self.heap.is_str_like(a.heap_index()) || self.array_spreadable_by_default(*a)
+                    })
+            }
+        };
+        if !ok || !self.array_memo_is_intrinsic(memo as usize, name) {
+            return None;
+        }
+        if name == "slice" {
+            if let Some(v) = self.array_slice_dense(idx, args) {
+                return Some(v);
+            }
+        }
+        match self.array_method(idx, name, args) {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The dense mutators called past the builtin call chain, by compiled
+    /// code (`jit_array_mutate`) and the interpreter (`interp_array_lane`):
+    /// `op` is [`super::helpers_misc::arr_mutate_op`]'s. `array_method`'s
+    /// dense arm (`splice`'s through [`Self::array_splice_dense`]), or
+    /// `None`, having done nothing, wherever the chain could do anything else
+    /// or the arm could run user code: not a plain Array, the method shadowed
+    /// or replaced, any side table (attribute overrides, frozen, sealed,
+    /// non-extensible), an arguments object, a virtual or non-writable
+    /// length, an indexed or replaced prototype, a second realm, a hole in the
+    /// first slot for `shift` (its Get reads through the prototype), for
+    /// `splice` a start or count that is not a Number or `undefined`
+    /// (ToIntegerOrInfinity would run `valueOf`) or a non-default species,
+    /// and for `fill` such a start or end. With those excluded the arm cannot
+    /// throw, so an error is a decline before any effect too.
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_mutate_fast(&mut self, arr: Value, op: u8, args: &[Value]) -> Option<Value> {
+        // The method's name and its intrinsic-memo slot (`builtins::arr_memo_id`'s
+        // numbering, asserted in `arr_mutate_memo_tests`): a match of the name
+        // against thirty memoised ones was a call per compiled `splice`.
+        let (name, memo) = match op {
+            0 => ("shift", 6),
+            1 => ("unshift", 19),
+            2 => ("splice", 18),
+            3 => ("reverse", 17),
+            4 => ("fill", 21),
+            _ => return None,
+        };
+        if !arr.is_heap() {
+            return None;
+        }
+        let idx = arr.heap_index();
+        let first_hole = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.first().is_some_and(|v| v.is_hole()),
+            _ => return None,
+        };
+        if (op == 0 && first_hole)
+            || !self.realm_global_objs.is_empty()
+            || self.arr_props.contains_key(&idx)
+            || self.array_js_len.contains_key(&idx)
+            || self.array_length_nonwritable.contains(&idx)
+            || self.array_proto_has_index
+            || self.proto_of.contains_key(&idx)
+            || self.arguments_objs.contains_key(&idx)
+            || !self.array_memo_is_intrinsic(memo, name)
+        {
+            return None;
+        }
+        if op == 2 {
+            if !args.iter().take(2).all(|a| a.is_number() || *a == Value::UNDEFINED)
+                || !self.array_species_is_default(arr)
+            {
+                return None;
+            }
+            return self.array_splice_dense(idx, args);
+        }
+        // `fill(value, start, end)`: the positions' ToIntegerOrInfinity.
+        if op == 4 && !args.iter().skip(1).all(|a| a.is_number() || *a == Value::UNDEFINED) {
+            return None;
+        }
+        match self.array_method(idx, name, args) {
+            Ok(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// `slice(start, end)` of the plain dense array `idx`, its positions
+    /// Numbers or `undefined`, when its range is hole-free: the dense arm's
+    /// copy, past `array_method`'s gates and its second species proof. The
+    /// caller (`array_read_fast`) has proved what the gates would: no side
+    /// table, the default species, no indexed or replaced prototype, the
+    /// intrinsic method. `None`, having done nothing, for a virtual length or
+    /// a hole in the range (read through the prototype by the dense arm).
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_slice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
+        if self.array_is_virtual(idx) {
+            return None;
+        }
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        let len = items.len() as f64;
+        // ToIntegerOrInfinity of a Number (or the default for `undefined`),
+        // then the relative clamp, in f64 so ±Infinity saturate.
+        let pos = |v: Option<&Value>, dflt: f64| match v {
+            Some(v) if *v != Value::UNDEFINED => {
+                let f = v.as_f64();
+                let t = if f.is_nan() { 0.0 } else { f.trunc() };
+                if t < 0.0 {
+                    (len + t).max(0.0)
+                } else {
+                    t.min(len)
+                }
+            }
+            _ => dflt,
+        };
+        let start = pos(args.first(), 0.0) as usize;
+        let end = pos(args.get(1), len) as usize;
+        let range: &[Value] = if start < end { &items[start..end] } else { &[] };
+        if Value::any_hole(range) {
+            return None;
+        }
+        let out = range.to_vec();
+        Some(self.alloc_array_current_realm(out))
+    }
+
+    /// `splice(start, deleteCount, ...items)` of the plain dense array `idx`
+    /// whose start and count are Numbers or `undefined` (at least the start
+    /// is given): the dense arm's mutation and result, past `array_method`'s
+    /// gates and its second species proof. The caller (`array_mutate_fast`)
+    /// has proved what the gates would (no side table, a writable and
+    /// non-virtual length, no indexed or replaced prototype, the default
+    /// species, the intrinsic method), so nothing here can run code or throw.
+    /// A pure removal drains, an equal-count replacement overwrites in place,
+    /// and only a resize takes `Vec::splice`.
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn array_splice_dense(&mut self, idx: u32, args: &[Value]) -> Option<Value> {
+        let len = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return None,
+        };
+        // ToIntegerOrInfinity of a Number (`undefined` is 0), in f64 so
+        // ±Infinity saturate.
+        let int = |v: Value| {
+            if v == Value::UNDEFINED {
+                0.0
+            } else {
+                let f = v.as_f64();
+                if f.is_nan() {
+                    0.0
+                } else {
+                    f.trunc()
+                }
+            }
+        };
+        let lenf = len as f64;
+        let s = int(*args.first()?);
+        let start = if s < 0.0 { (lenf + s).max(0.0) } else { s.min(lenf) } as usize;
+        let del = match args.get(1) {
+            None => len - start,
+            Some(&d) => int(d).clamp(0.0, (len - start) as f64) as usize,
+        };
+        let insert = args.get(2..).unwrap_or(&[]);
+        for &v in insert {
+            self.heap.write_barrier_val(idx, v);
+        }
+        let removed: Vec<Value> = match self.heap.get_mut(idx) {
+            HeapObj::Array(items) => {
+                let end = start + del;
+                if insert.is_empty() {
+                    items.drain(start..end).collect()
+                } else if insert.len() == del {
+                    let out = items[start..end].to_vec();
+                    items[start..end].copy_from_slice(insert);
+                    out
+                } else {
+                    let out = items[start..end].to_vec();
+                    items.splice(start..end, insert.iter().copied());
+                    out
+                }
+            }
+            _ => return None,
+        };
+        self.heap.bump_version(idx); // length/contents changed
+        Some(self.alloc_array_current_realm(removed))
     }
 
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
@@ -558,14 +978,15 @@ impl<'p> Vm<'p> {
             && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                if ups.is_empty() {
+                if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                     let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: program functions are immutable during execution;
                     // the raw ptr dodges the self.jit (&mut) vs self.program (&)
                     // borrow conflict (same pattern as native_cb_entry).
                     let proto_ref = unsafe { &*proto };
-                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
-                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    // The callback's registers, then its captured values.
+                    let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                    let reg_count = upv_base + n_up;
                     // A callback that declares the 3rd (array) param or uses
                     // `arguments` must see the receiver — not the kernel's path.
                     let kernel_entry =
@@ -578,6 +999,9 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            for (k, &v) in upv[..n_up].iter().enumerate() {
+                                self.regs[win + upv_base + k] = v;
+                            }
                             let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
@@ -616,12 +1040,13 @@ impl<'p> Vm<'p> {
             && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                if ups.is_empty() {
+                if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                     let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: as the map branch above.
                     let proto_ref = unsafe { &*proto };
-                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
-                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    // The callback's registers, then its captured values.
+                    let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                    let reg_count = upv_base + n_up;
                     // Skip the kernel when the predicate could observe the 3rd
                     // (array) param or `arguments` (see the map branch).
                     let kernel_entry =
@@ -634,6 +1059,9 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            for (k, &v) in upv[..n_up].iter().enumerate() {
+                                self.regs[win + upv_base + k] = v;
+                            }
                             let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
@@ -822,6 +1250,9 @@ impl<'p> Vm<'p> {
         original: Value,
         len: u64,
     ) -> Result<Option<Value>, Thrown> {
+        if self.array_species_is_default(original) {
+            return Ok(None);
+        }
         // ArraySpeciesCreate step 1-2: if IsArray(originalArray) is false, return
         // ArrayCreate(length) — `constructor`/`@@species` are NOT consulted for a
         // non-array receiver (e.g. `Array.prototype.map.call(typedArray | plainObj)`).
@@ -868,6 +1299,61 @@ impl<'p> Vm<'p> {
             ));
         }
         Ok(Some(self.construct(species, &[Value::num(len as f64)])?))
+    }
+
+    /// Whether ArraySpeciesCreate on `original` is ArrayCreate with nothing
+    /// observable run: a plain array of the main realm with no own named
+    /// property and no prototype of its own, %Array.prototype%'s
+    /// `constructor` a data slot holding %Array%, and %Array%'s @@species the
+    /// default getter (which answers its receiver). Every `slice`, `map`,
+    /// `filter`, `splice` and `concat` read both by name and called the
+    /// getter: a recursion through `f(...rest.slice(0, 3))` spent a fifth of
+    /// its time there.
+    pub(crate) fn array_species_is_default(&self, original: Value) -> bool {
+        if !original.is_heap() || self.arr_proto == 0 || self.array_ctor == 0 {
+            return false;
+        }
+        let idx = original.heap_index();
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+        {
+            return false;
+        }
+        let (HeapObj::Object(ap), HeapObj::Object(ctor)) =
+            (self.heap.get(self.arr_proto), self.heap.get(self.array_ctor))
+        else {
+            return false;
+        };
+        let (ap_ver, ctor_ver) = (self.heap.version_of(self.arr_proto), self.heap.version_of(self.array_ctor));
+        let (mv, ms, cv, cs, getter) = self.species_memo.get();
+        if mv == ap_ver && cv == ctor_ver {
+            // The slots are where the last full check found them; their
+            // values and kinds are read again (an in-place write bumps no
+            // version), and the getter is still the SPECIES_GET native.
+            let (ms, cs) = (ms as usize, cs as usize);
+            let g = Value::from_bits(getter);
+            return ap.val_get_ref(ms).is_some_and(|v| *v == Value::heap(self.array_ctor))
+                && !ap.is_accessor_at(ms)
+                && ctor.val_get_ref(cs).is_some_and(|v| v.bits() == getter)
+                && ctor.is_accessor_at(cs)
+                && matches!(self.heap.get(g.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET);
+        }
+        let Some(ms) = ap.pos("constructor").filter(|&slot| {
+            !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
+        }) else {
+            return false;
+        };
+        let Some(cs) = ctor.pos("@@species").filter(|&slot| {
+            let getter = ctor.val_at(slot);
+            ctor.attr_at(slot).accessor
+                && getter.is_heap()
+                && matches!(self.heap.get(getter.heap_index()), HeapObj::Native(id) if *id == native::SPECIES_GET)
+        }) else {
+            return false;
+        };
+        self.species_memo.set((ap_ver, ms as u32, ctor_ver, cs as u32, ctor.val_at(cs).bits()));
+        true
     }
 
     /// Append one concat element at the running index `n`: define it on the
@@ -966,7 +1452,14 @@ impl<'p> Vm<'p> {
         mapper: Option<(Value, Value)>,
     ) -> Result<(), Thrown> {
         let mut work = 0u64;
-        self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work)
+        // A compiled mapper runs over one reused window (`open_cb_window`).
+        let (native, win) = match mapper {
+            Some((cb, this_arg)) => self.open_cb_window(cb, this_arg),
+            None => (None, self.regs.len()),
+        };
+        let r = self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work, &native, win);
+        self.regs.truncate(win);
+        r
     }
 
     /// `flat` / `flatMap`: FlattenIntoArray into `target` (the ArraySpeciesCreate
@@ -1040,6 +1533,7 @@ impl<'p> Vm<'p> {
 
     /// `source_len` is a ToLength (up to 2^53-1), so the walk counts in u64;
     /// only a dense store is indexed by `usize`.
+    #[allow(clippy::too_many_arguments)]
     fn flatten_into_array_at(
         &mut self,
         out: &mut Vec<Value>,
@@ -1049,6 +1543,8 @@ impl<'p> Vm<'p> {
         mapper: Option<(Value, Value)>,
         active_depth: u32,
         work: &mut u64,
+        native: &Option<super::misc_methods::NativeCb>,
+        win: usize,
     ) -> Result<(), Thrown> {
         *work = work
             .checked_add(source_len)
@@ -1063,7 +1559,7 @@ impl<'p> Vm<'p> {
         // below would do is unobservable here.)
         if depth <= 0 && mapper.is_none() && dense {
             let clean = matches!(self.heap.get(sidx), HeapObj::Array(items)
-                    if items.len() as u64 == source_len && !items.iter().any(|v| v.is_hole()));
+                    if items.len() as u64 == source_len && !Value::any_hole(&items));
             if clean {
                 // (`clean` proved it the length of a Vec, so it fits.)
                 self.reserve_array_result(out, source_len as usize, false)?;
@@ -1091,7 +1587,7 @@ impl<'p> Vm<'p> {
             };
             let v = match mapper {
                 Some((cb, ta)) => {
-                    let r = self.call_value(cb, ta, &[got, Value::num(k as f64), source])?;
+                    let r = self.run_cb_elem(native, win, cb, &[got, Value::num(k as f64), source], ta)?;
                     dense = self.flatten_dense(source);
                     r
                 }
@@ -1126,7 +1622,7 @@ impl<'p> Vm<'p> {
                         "RangeError: array flattening nesting limit exceeded",
                     ));
                 }
-                self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
+                self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work, &None, win)?;
                 // The nested walk's Gets can be Proxy traps or accessors.
                 dense = self.flatten_dense(source);
             } else {
@@ -1329,14 +1825,37 @@ impl<'p> Vm<'p> {
             )));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-        let idxv = |k: u64| Value::num(k as f64);
         self.preflight_native_iteration_work(len)?;
+        // A compiled callback runs over one reused window, as the dense
+        // path's does (`open_cb_window`); `reduce` calls it with no `this`.
+        let bind_this = if name.starts_with("reduce") { Value::UNDEFINED } else { this_arg };
+        let (native, win) = self.open_cb_window(cb, bind_this);
+        let out = self.array_like_iterate_each(this, name, args, len, lenf, cb, this_arg, &native, win);
+        self.regs.truncate(win);
+        out
+    }
 
+    /// [`Vm::array_like_iterate`]'s visit, each callback through
+    /// [`Vm::run_cb_elem`] over the window the caller opened (and closes).
+    #[allow(clippy::too_many_arguments)]
+    fn array_like_iterate_each(
+        &mut self,
+        this: Value,
+        name: &str,
+        args: &[Value],
+        len: u64,
+        lenf: f64,
+        cb: Value,
+        this_arg: Value,
+        native: &Option<super::misc_methods::NativeCb>,
+        win: usize,
+    ) -> Result<Option<Value>, Thrown> {
+        let idxv = |k: u64| Value::num(k as f64);
         match name {
             "forEach" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                     }
                 }
                 Ok(Some(Value::UNDEFINED))
@@ -1382,7 +1901,7 @@ impl<'p> Vm<'p> {
                 };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         match target {
                             Some(a) => self.create_data_property_or_throw(a, k, r)?,
                             None => out[k as usize] = r,
@@ -1402,7 +1921,7 @@ impl<'p> Vm<'p> {
                 let mut n = 0u64;
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if self.truthy(r) {
                             match target {
                                 Some(a) => self.create_data_property_or_throw(a, n, val)?,
@@ -1420,7 +1939,7 @@ impl<'p> Vm<'p> {
             "some" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if self.truthy(r) {
                             return Ok(Some(Value::bool(true)));
                         }
@@ -1431,7 +1950,7 @@ impl<'p> Vm<'p> {
             "every" => {
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get_u64(this, k)? {
-                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                         if !self.truthy(r) {
                             return Ok(Some(Value::bool(false)));
                         }
@@ -1448,7 +1967,7 @@ impl<'p> Vm<'p> {
                 while i < len {
                     let k = if backward { len - 1 - i } else { i };
                     let val = self.array_iter_get_u64(this, k)?.unwrap_or(Value::UNDEFINED);
-                    let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                    let r = self.run_cb_elem(native, win, cb, &[val, idxv(k), this], this_arg)?;
                     if self.truthy(r) {
                         return Ok(Some(match name {
                             "find" | "findLast" => val,
@@ -1491,7 +2010,7 @@ impl<'p> Vm<'p> {
                             acc = val;
                             started = true;
                         } else {
-                            acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, kv, this])?;
+                            acc = self.run_cb_elem(native, win, cb, &[acc, val, kv, this], Value::UNDEFINED)?;
                         }
                     }
                     if !started {
@@ -1515,7 +2034,7 @@ impl<'p> Vm<'p> {
                         acc = val;
                         started = true;
                     } else {
-                        acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, idxv(k), this])?;
+                        acc = self.run_cb_elem(native, win, cb, &[acc, val, idxv(k), this], Value::UNDEFINED)?;
                     }
                 }
                 if !started {
@@ -2918,10 +3437,29 @@ impl<'p> Vm<'p> {
                     // lossy `String` form turned every lone surrogate into
                     // U+FFFD, which is the everyday corruption behind
                     // `split('').reverse().join('')` on emoji text.
-                    let sep = if name == "toString" || arg0 == Value::UNDEFINED {
-                        crate::heap::JsStr::new(",".to_string())
-                    } else {
-                        vm.to_js_str_owned(arg0)?
+                    // A short flat separator (and the default ",") is copied
+                    // to the stack: an owned copy per call was a malloc and a
+                    // free on every `join`.
+                    let mut sep_inline = [0u8; 32];
+                    let mut sep_inline_len = None;
+                    if name == "toString" || arg0 == Value::UNDEFINED {
+                        sep_inline[0] = b',';
+                        sep_inline_len = Some(1);
+                    } else if arg0.is_heap() {
+                        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(arg0.heap_index()) {
+                            if b.len() <= sep_inline.len() {
+                                sep_inline[..b.len()].copy_from_slice(b);
+                                sep_inline_len = Some(b.len());
+                            }
+                        }
+                    }
+                    let sep_owned = match sep_inline_len {
+                        Some(_) => None,
+                        None => Some(vm.to_js_str_owned(arg0)?),
+                    };
+                    let sep: &[u8] = match (&sep_owned, sep_inline_len) {
+                        (Some(s), _) => s.as_bytes(),
+                        (None, n) => &sep_inline[..n.unwrap_or(0)],
                     };
                     // Get(O,k) and ToString(element) interleave. The active-path
                     // guard is shared across nested ToString calls. Built as
@@ -2936,7 +3474,7 @@ impl<'p> Vm<'p> {
                         };
                         let v = v.unwrap_or(Value::UNDEFINED);
                         if k != 0 {
-                            vm.append_guest_wtf8(&mut out, sep.as_bytes())?;
+                            vm.append_guest_wtf8(&mut out, sep)?;
                         }
                         if !v.is_nullish() {
                             vm.append_guest_tostring(&mut out, v)?;
@@ -2998,12 +3536,14 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 } as usize;
+                // A hole fails HasProperty (no proto index can cover it on
+                // this gated plain-chain path) — spec skips it, and it matches
+                // nothing in the scan.
                 let pos = match self.heap.get(idx) {
-                    HeapObj::Array(items) => (from..items.len()).find(|&i| {
-                        // A hole fails HasProperty (no proto index can cover it
-                        // on this gated plain-chain path) — spec skips it.
-                        !items[i].is_hole() && self.values_strict_eq(items[i], arg0)
-                    }),
+                    HeapObj::Array(items) if from < items.len() => {
+                        super::collections::strict_eq_position(&self.heap, &items[from..], arg0, false)
+                            .map(|p| p + from)
+                    }
                     _ => None,
                 };
                 Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
@@ -3095,13 +3635,15 @@ impl<'p> Vm<'p> {
                     if let HeapObj::Array(items) = self.heap.get(idx) {
                         if !items.is_empty() {
                             let hi = (from as usize).min(items.len() - 1);
-                            for i in (0..=hi).rev() {
-                                // A hole fails HasProperty on this plain-chain
-                                // path — spec skips it (see "indexOf").
-                                if !items[i].is_hole() && self.values_strict_eq(items[i], arg0) {
-                                    result = i as i32;
-                                    break;
-                                }
+                            // A hole fails HasProperty on this plain-chain
+                            // path — spec skips it (see "indexOf").
+                            if let Some(p) = super::collections::strict_eq_position(
+                                &self.heap,
+                                &items[..=hi],
+                                arg0,
+                                true,
+                            ) {
+                                result = p as i32;
                             }
                         }
                     }
@@ -3315,7 +3857,7 @@ impl<'p> Vm<'p> {
                     && !self.arr_props.contains_key(&idx)
                     && match self.heap.get(idx) {
                         HeapObj::Array(items) => {
-                            start >= end || !items[start as usize..end as usize].iter().any(|v| v.is_hole())
+                            start >= end || !Value::any_hole(&items[start as usize..end as usize])
                         }
                         _ => false,
                     };
@@ -3386,11 +3928,22 @@ impl<'p> Vm<'p> {
                 // length: `find`/`findIndex` still visit it with `undefined` (they do
                 // not HasProperty-skip), while `some`/`every` skip it.
                 let len = self.array_snapshot(idx).len();
+                // A kernel-eligible predicate (`compile_scan_kernel`) over a
+                // dense Array with no index overlay runs the leading elements
+                // natively; the loop below goes on where it stopped short
+                // (a hole, a non-number, a non-Bool result).
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let start = match self.scan_kernel_run(name, idx, cb, this_arg, len) {
+                    ScanRun::Answer(v) => return Ok(Some(v)),
+                    ScanRun::From(i) => i,
+                };
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let start = 0usize;
                 // A compiled predicate runs over one reused window, as the
                 // all-elements driver's callback does; every exit releases it.
                 let (native, win) = self.open_cb_window(cb, this_arg);
                 let mut found: Result<Option<Value>, Thrown> = Ok(None);
-                for i in 0..len {
+                for i in start..len {
                     let v = match self.array_dense_or_proto_get(idx, i) {
                         Ok(Some(v)) => v,
                         Ok(None) => {
@@ -3488,12 +4041,14 @@ impl<'p> Vm<'p> {
                     && start < snapshot_len
                 {
                     if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
-                        if ups.is_empty() {
+                        if let Some((upv, n_up)) = self.kernel_upvals(ups) {
                             let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                             // SAFETY: immutable program functions; raw ptr dodges
                             // the jit-vs-program borrow conflict (as elsewhere).
                             let proto_ref = unsafe { &*proto };
-                            let reg_count = (proto_ref.reg_count as usize).max(3);
+                            // The callback's registers, then its captured values.
+                            let upv_base = crate::codegen::kernel_upv_base(proto_ref);
+                            let reg_count = upv_base + n_up;
                             // The reduce kernel passes only (acc, element); a
                             // callback that declares the 3rd (index) / 4th (array)
                             // param or uses `arguments` must take the per-element
@@ -3509,6 +4064,9 @@ impl<'p> Vm<'p> {
                                 let win = self.regs.len();
                                 if !self.regs_would_overflow(win + reg_count) {
                                     self.regs.resize(win + reg_count, Value::UNDEFINED);
+                                    for (k, &v) in upv[..n_up].iter().enumerate() {
+                                        self.regs[win + upv_base + k] = v;
+                                    }
                                     let count = snapshot_len - start;
                                     let window_ptr =
                                         unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
@@ -4187,7 +4745,7 @@ impl<'p> Vm<'p> {
         // allocation boundary, so decline unless one slot is already resident.
         let needed = self.regs.len().checked_add((p.reg_count as usize).max(1))?;
         if self.frames.len() >= MAX_FRAMES
-            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.reentry_exhausted()
             || self.frames.len() == self.frames.capacity()
             || self.regs_would_overflow(needed)
         {

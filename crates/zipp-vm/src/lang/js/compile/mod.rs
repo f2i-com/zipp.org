@@ -476,6 +476,7 @@ pub(crate) fn placeholder(name: &str) -> FuncProto {
         length: 0,
         rest_reg: None,
         arguments_reg: None,
+        args_count_only: false,
         is_generator: false,
         is_async: false,
         non_constructable: false,
@@ -602,6 +603,8 @@ struct FnCompiler<'a> {
     /// whether the body actually referenced `arguments` (gates building it).
     arguments_reg: Option<Reg>,
     uses_arguments: bool,
+    /// The body reads `arguments.length` (see `settle_arguments`).
+    arguments_lengths: bool,
     /// When compiling a class method/constructor, THIS class's class_id — the home
     /// for `super.x`/`super.m()`, which resolve at runtime via the home prototype's
     /// [[Prototype]] (so they work in base classes too, reaching %Object.prototype%).
@@ -708,6 +711,14 @@ struct FnCompiler<'a> {
     /// (`capture::copy_box_names`): plain registers, copied into a fresh cell
     /// for each such closure as it is made (`copy_box_for_child`).
     copy_boxed: HashSet<String>,
+    /// Locals that only ever hold a number, `undefined`, `null` or a boolean
+    /// (`capture::numeric_locals`): as a register binding, a read of one is
+    /// provably primitive, so an argument such as `i + 1` keeps a method call
+    /// fused. Empty where eval may reach the bindings.
+    num_locals: HashSet<String>,
+    /// `expr_discarded` is compiling a member assignment whose result nothing
+    /// reads; `assign` takes (and clears) it at entry.
+    assign_discarded: bool,
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,

@@ -26,22 +26,12 @@ pub(super) const KEY_ROOTED: u32 = u32::MAX;
 #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
 pub(super) const STORE_BODY_MAX: u8 = 8;
 
-/// Whether a store body's call may be made without its frame
-/// (`Vm::py_store_call`). On unless `ZIPP_NO_PY_STORE_CALLS` is set (the
-/// same-binary A/B). Read once per process.
-#[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
-fn py_store_calls_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_STORE_CALLS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a store body's call may be made without its frame
+    /// (`Vm::py_store_call`). On unless `ZIPP_NO_PY_STORE_CALLS` is set (the
+    /// same-binary A/B). Read once per process.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    fn py_store_calls_enabled() = "ZIPP_NO_PY_STORE_CALLS"
 }
 
 /// The number of stores (1 to [`STORE_BODY_MAX`]) when the code object
@@ -1251,21 +1241,11 @@ impl<'p> Vm<'p> {
 /// The positional entry names a class and its `__init__` carry (`c<n>`).
 const ENTRY_NAMES: [&str; 8] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"];
 
-/// Whether a `PyNew` site's [`ic::NEW`] entry is asked first
-/// (`Vm::py_new_hit`). On unless `ZIPP_NO_PY_NEW_HIT` is set (the
-/// same-binary A/B). Read once per process.
-fn py_new_hits_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_NEW_HIT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a `PyNew` site's [`ic::NEW`] entry is asked first
+    /// (`Vm::py_new_hit`). On unless `ZIPP_NO_PY_NEW_HIT` is set (the
+    /// same-binary A/B). Read once per process.
+    fn py_new_hits_enabled() = "ZIPP_NO_PY_NEW_HIT"
 }
 
 impl<'p> Vm<'p> {

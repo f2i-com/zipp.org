@@ -5,7 +5,46 @@
 #![allow(unused_imports)]
 use super::*;
 
+env_off_switch! {
+    /// `ZIPP_NO_JIT_CTOR_CALL=1`: a compiled call of a built-in constructor
+    /// as a function deopts, as before `jit_native_like_callee`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_ctor_call_enabled() = "ZIPP_NO_JIT_CTOR_CALL"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_STATIC_CROSS=1`: a compiled `C.m()` on a class value declines
+    /// to the generic method helper, as before `jit_class_static_callee`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn static_cross_enabled() = "ZIPP_NO_STATIC_CROSS"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_PRIVATE_CROSS=1`: compiled `this.#m` reads and `this.#m()`
+    /// calls take the generic private paths, as before
+    /// (`jit_private_method_callee`, the way-0 method read).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn private_cross_enabled() = "ZIPP_NO_PRIVATE_CROSS"
+}
+
 impl<'p> Vm<'p> {
+    /// A callee the compiled call fallback completes through `call_value`, as
+    /// the interpreter's Call op does: a native function (`parseInt`), or a
+    /// built-in constructor called as a function (`BigInt(x)`, `Number(s)`,
+    /// `Boolean(v)`), which is a constructor object on the heap. It deopted
+    /// before, so `randBig`'s `x << 32n | BigInt(u32())` left every call's
+    /// loop to the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_native_like_callee(&self, cv: Value) -> bool {
+        cv.is_heap()
+            && match self.heap.get(cv.heap_index()) {
+                HeapObj::Native(_) => true,
+                HeapObj::Object(m) => m.is_ctor && jit_ctor_call_enabled(),
+                _ => false,
+            }
+    }
+
     /// The native self-recursive-call implementation behind the `jit_self_call`
     /// FFI trampoline. Runs `self`-recursion natively on a fresh register window
     /// appended to `self.regs`. Returns result Value bits, or
@@ -330,7 +369,7 @@ impl<'p> Vm<'p> {
         // specialized instantiation instead resolves its immutable descriptor
         // first, so a later different-fid value declines without even the
         // internal `osr_deopt_exempt` mutation.
-        if !SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if !SAME_PROTO_ARROW2 && self.at_call_cap() {
             crate::vm::helpers_misc::crossstats::decline(
                 crate::vm::helpers_misc::crossstats::DECL_DEPTH,
             );
@@ -403,7 +442,7 @@ impl<'p> Vm<'p> {
             );
             return SELF_CALL_DEOPT;
         }
-        if SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if SAME_PROTO_ARROW2 && self.at_call_cap() {
             crate::vm::helpers_misc::crossstats::decline(
                 crate::vm::helpers_misc::crossstats::DECL_DEPTH,
             );
@@ -425,7 +464,7 @@ impl<'p> Vm<'p> {
                 // (a UTF-16 conversion and a system call on Windows) was a
                 // tenth of such a call's time.
                 static DECLLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *DECLLOG.get_or_init(|| std::env::var_os("ZIPP_DECLLOG").is_some()) {
+                if *DECLLOG.get_or_init(|| crate::env_var_os("ZIPP_DECLLOG").is_some()) {
                     eprintln!(
                         "[decl] no-entry fid={fid} compiled={} sp2={}",
                         self.jit.get(fid).is_some(),
@@ -733,6 +772,10 @@ impl<'p> Vm<'p> {
         };
         self.leave_tierc_activation(activation_token);
         let out = if bail == crate::codegen::NO_BAIL {
+            debug_assert!(
+                !self.has_lazy_handlers(new_base),
+                "a clean return defers no handler push"
+            );
             if needs_frame {
                 // B272: the native body completed; its frame carried no live
                 // handler (the brackets are balanced on a normal completion).
@@ -787,7 +830,7 @@ impl<'p> Vm<'p> {
                 self.osr_deopt_exempt = true;
                 CALL_THREW
             }
-        } else if self.pending_throw.is_some() {
+        } else if self.pending_throw.is_some() && !self.has_lazy_handlers(new_base) {
             // The callee's own (deeper) call threw and its native code
             // signalled unwind via a bail with the throw pending (the
             // `try_run_jit` (b) case): unwind, never resume.
@@ -795,10 +838,14 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             CALL_THREW
         } else {
-            // Guard bail mid-body: finish this activation on the interpreter
-            // over the SAME window via a transient frame (regs stay as the
-            // native code left them; ip = the recorded resume point).
+            // Guard bail mid-body, or a throw out of a lazy bracket whose
+            // handler push waits for this frame (`jit_lazy_push`): finish this
+            // activation on the interpreter over the SAME window via a
+            // transient frame (regs stay as the native code left them; ip =
+            // the recorded resume point). A throw first unwinds to the
+            // handlers the frame adopted, as the frame-backed route above.
             if self.frames.len() >= MAX_FRAMES {
+                self.drop_lazy_handlers(new_base);
                 let e =
                     self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
                 self.pending_throw = Some(e);
@@ -828,17 +875,23 @@ impl<'p> Vm<'p> {
                 callee: cv,
             });
             let stop = self.frames.len() - 1;
-            match self.run_loop(stop) {
-                Ok(v) => {
-                    self.regs.truncate(new_base);
-                    v.bits()
+            self.adopt_lazy_handlers(stop);
+            if self.finish_lazy_throw(stop) {
+                match self.run_loop(stop) {
+                    Ok(v) => {
+                        self.regs.truncate(new_base);
+                        v.bits()
+                    }
+                    Err(_) => {
+                        // pending_throw is set; the native chain unwinds and the
+                        // enclosing interpreter dispatches it to a handler.
+                        self.osr_deopt_exempt = true;
+                        CALL_THREW
+                    }
                 }
-                Err(_) => {
-                    // pending_throw is set; the native chain unwinds and the
-                    // enclosing interpreter dispatches it to a handler.
-                    self.osr_deopt_exempt = true;
-                    CALL_THREW
-                }
+            } else {
+                self.osr_deopt_exempt = true;
+                CALL_THREW
             }
         };
         self.jit_call_depth -= 1;
@@ -1081,12 +1134,128 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return SELF_CALL_DEOPT;
         }
-        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
-            return SELF_CALL_DEOPT;
+        // A class value's static data method (`Probe.make(s)`,
+        // `Entity.isEntity(o)`): the method cache keeps no way for a class
+        // receiver (`ic_recv_map` wants an object), so these declined to the
+        // generic helper, whose member walk and `call_value` ran each call
+        // in a nested interpreter loop (43 ns against 4 for a plain call).
+        // The interpreter's own lane (`class_static_data_read`) resolves it
+        // where it lies; a getter, a non-function or an excluded key keeps
+        // the old path.
+        let callee = if crate::vm::helpers_misc::is_private_key(key) {
+            // `recv.#m(...)`: the private method, brand-checked, as the
+            // interpreter resolves it (`jit_private_method_callee`); anything
+            // else the private call can be keeps the generic helper.
+            match self.jit_private_method_callee(func_id, ip, base, recv, name, key) {
+                Some(f) => f,
+                None => return SELF_CALL_DEOPT,
+            }
+        } else if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
+            match self.jit_class_static_callee(recv, key) {
+                Some(f) => f,
+                None => return SELF_CALL_DEOPT,
+            }
+        } else {
+            let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, key) else {
+                return SELF_CALL_DEOPT;
+            };
+            callee
         };
         let packed = argc as u64 | ((caller_regs as u64) << 16);
-        let _ = name; // validated above through the live instruction/key lookup
         self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
+    }
+
+    /// The plain user function `recv.#m(...)` calls (`key` the private name,
+    /// `name` its string constant) from compiled code running `func_id` over
+    /// the window at `base`: the site's way-0 private method
+    /// (`ic_private_method_way0`), else PrivateMethodCall's resolution for
+    /// the running callee (`private_member_from_owner` once the brand check
+    /// `private_receiver_ok` passes), which fills that way as the
+    /// interpreter's CallMethod does. `None`, with nothing observable done,
+    /// for a name that is a private accessor or field, a receiver that fails
+    /// the brand check (the generic path throws its TypeError) and a callee
+    /// that is not a plain function. The generic helper resolved the method
+    /// without the site on every call and ran it through `call_value`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_private_method_callee(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        base: usize,
+        recv: Value,
+        name: u32,
+        key: &str,
+    ) -> Option<Value> {
+        if !private_cross_enabled() || !recv.is_heap() {
+            return None;
+        }
+        let ctx = self.jit_running_callee(func_id, base)?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(m) = self.ic_private_method_way0(func_id, ip, ctx, recv.heap_index()) {
+            return self.ic_plain_fn(m).map(|_| m);
+        }
+        let site = super::values::private_site(func_id, name);
+        let (brand, kind, owner, _) = match self.private_memo_hit(ctx, site) {
+            Some(hit) => hit,
+            None => self.resolve_private_site(ctx, site, key)?,
+        };
+        if kind & 1 == 0 || !self.private_receiver_ok(recv, brand, kind, owner) {
+            return None;
+        }
+        let m = self.private_member_from_owner(owner, key, (kind & 8) | 1)?;
+        #[cfg(not(feature = "safe-sandbox"))]
+        if kind & 8 == 0 && m.is_heap() {
+            self.ic_private_method_fill(func_id, ip, ctx, brand, m, recv);
+        }
+        let _ = ip;
+        self.ic_plain_fn(m).map(|_| m)
+    }
+
+    /// The plain user function a class value `recv` holds as its static data
+    /// method `key`, own or through its `extends` chain, as the interpreter's
+    /// class-static lane reads it (`class_static_data_read`); `None` for an
+    /// accessor, a getter or setter of the name, a generator, async or
+    /// non-function value, and while that lane is off.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_class_static_callee(&self, recv: Value, key: &str) -> Option<Value> {
+        // A private name (`this.#m()` in a static method) is a private
+        // method call: its brand check, not a member read. A class keeps its
+        // static private methods in `statics` under the name's text, where
+        // the `extends` walk below would find a parent's for a subclass
+        // receiver that has no such brand (the interpreter reaches its
+        // class-static lane only after its private arms).
+        if !static_cross_enabled() || crate::vm::helpers_misc::is_private_key(key) {
+            return None;
+        }
+        let f = self.class_static_data_read(recv, key)?;
+        self.ic_plain_fn(f).map(|_| f)
+    }
+
+    /// The plain user function class `c` holds as its own static data
+    /// `[Symbol.hasInstance]`, read as `instance_of_op` reads it (no static
+    /// getter or setter of the name, not an accessor); `None` for anything
+    /// else, which keeps that path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn jit_own_has_instance(&self, c: Value) -> Option<Value> {
+        if !c.is_heap() || !static_cross_enabled() {
+            return None;
+        }
+        let HeapObj::Class(cc) = self.heap.get(c.heap_index()) else {
+            return None;
+        };
+        if cc.static_getters.iter().any(|(k, _)| k == "@@hasInstance")
+            || cc.static_setters.iter().any(|(k, _)| k == "@@hasInstance")
+        {
+            return None;
+        }
+        let i = cc.statics.pos("@@hasInstance")?;
+        if cc.statics.attr_at(i).accessor {
+            return None;
+        }
+        let h = cc.statics.val_at(i);
+        self.ic_plain_fn(h).map(|_| h)
     }
 
     /// A semantics-guarded `CallMethodComputed` fast path for native MEMORY
@@ -1110,7 +1279,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1205,7 +1374,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1249,7 +1418,7 @@ impl<'p> Vm<'p> {
         if op > 4 {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1333,7 +1502,7 @@ impl<'p> Vm<'p> {
         else {
             return SELF_CALL_DEOPT;
         };
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1370,7 +1539,7 @@ impl<'p> Vm<'p> {
         argc: u16,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1438,7 +1607,7 @@ impl<'p> Vm<'p> {
         if op > 1 || func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1503,7 +1672,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1523,19 +1692,167 @@ impl<'p> Vm<'p> {
         let callee = (packed_args & 0xFFFF) as u16;
         let arg_base = ((packed_args >> 16) & 0xFFFF) as u16;
         let argc = ((packed_args >> 32) & 0xFFFF) as u16;
-        // A replaced global is the interpreter's call: declined before any
-        // effect.
+        // A number's string allocates: the safe point precedes the operand
+        // reads (the window's Values are roots).
+        self.maybe_gc();
         let live = self.get(base, callee);
-        if !self.global_fn_is_intrinsic(op, live) {
-            return SELF_CALL_DEOPT;
-        }
         self.jit_call_depth += 1;
-        let r = self.global_fn_value(op, base, arg_base, argc);
+        let r = if self.global_fn_is_intrinsic(op, live) {
+            self.global_fn_value(op, base, arg_base, argc)
+        } else {
+            let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+            self.call_value(live, Value::UNDEFINED, &args)
+        };
         self.jit_call_depth -= 1;
         match r {
             Ok(v) => v.bits(),
             Err(t) => self.jit_thrown_to_sentinel(t),
         }
+    }
+
+    /// The implementation behind `jit_super_get_ic`: `super.name` as the
+    /// interpreter's arm reads it, the cache's data hit first, then the walk
+    /// (`super_base`, RequireObjectCoercible, `get_member` with `this` =
+    /// register 0), which may run an inherited getter. A repeated class (a
+    /// class expression evaluated more than once) is resolved from the top
+    /// frame, as `class_value_for` does, so unless that frame is this code's
+    /// it declines before any effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_super_get_impl(&mut self, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        let home = packed_args as u32;
+        let name = (packed_args >> 32) as u32;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        if self.class_repeated(home) && !self.frames.last().is_some_and(|f| f.func == func_id && f.base == base) {
+            return SELF_CALL_DEOPT;
+        }
+        let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
+        let Some(key) = func.string_constants.get(name as usize) else {
+            return SELF_CALL_DEOPT;
+        };
+        let key: &'p str = key.as_str();
+        let is_static = func.super_static;
+        if let crate::vm::GetAct::Value(v) = self.ic_super_get(func_id, ip, home, is_static, key) {
+            return v.bits();
+        }
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        self.jit_call_depth += 1;
+        let proto = self.super_base(home, is_static);
+        let r = match self.require_object_coercible(proto) {
+            Err(t) => Err(t),
+            Ok(()) => {
+                let this = self.get(base, 0);
+                self.get_member(proto, key, this)
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
+    /// The implementation behind `jit_private_in_ic`: the interpreter's
+    /// `#x in obj` arm for the code's running callee (`jit_running_callee`
+    /// in place of the top frame's). A non-object right side (a TypeError)
+    /// and a name the private memo cannot resolve (the textual fallback)
+    /// decline before any effect, so the interpreter re-executes them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_private_in_impl(&mut self, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let o = self.get(base, (packed_args & 0xFFFF) as u16);
+        let k = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        if !self.is_object_value(o) {
+            return SELF_CALL_DEOPT;
+        }
+        let Some(ctx) = self.jit_running_callee(func_id, base) else {
+            return SELF_CALL_DEOPT;
+        };
+        let site = super::values::private_site(func_id, 0x8000_0000 | ip as u32);
+        let resolved = match self.private_memo_hit(ctx, site) {
+            Some(hit) => Some(hit),
+            None => {
+                let key = self.key_of(k);
+                self.resolve_private_site(ctx, site, &key)
+            }
+        };
+        let Some((brand, kind, owner, pid)) = resolved else {
+            return SELF_CALL_DEOPT;
+        };
+        let present = if kind & 7 == 0 {
+            self.private_field_get_id(o, brand, pid).is_some()
+        } else {
+            self.private_receiver_ok(o, brand, kind, owner)
+        };
+        Value::bool(present).bits()
+    }
+
+    /// `jit_private_prop_ic`'s first try, for a read or a write (op 0 or 1)
+    /// of a field already there: the field the site's way 0 last served, for
+    /// the running callee, as the interpreter's own hit takes it. `None` for
+    /// everything else, which the general path answers. Nothing here can
+    /// throw, call user code or allocate.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn jit_private_way0_hit(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+    ) -> Option<u64> {
+        let op = ((packed_args >> 56) & 3) as u8;
+        if op == 2 {
+            return None;
+        }
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let o = self.get(base, (packed_args & 0xFFFF) as u16);
+        if !o.is_heap() {
+            return None;
+        }
+        let ctx = self.jit_running_callee(func_id, base)?;
+        let idx = o.heap_index();
+        let Some((brand, id, pos)) = self.ic_private_way0(func_id, ip, ctx) else {
+            // A read of a private method (`this.#m` ahead of its call): the
+            // method the site's way 0 remembers, under the same guards as the
+            // interpreter's hit.
+            if op == 0 && private_cross_enabled() {
+                return self.ic_private_method_way0(func_id, ip, ctx, idx).map(|m| m.bits());
+            }
+            return None;
+        };
+        let (at, v) = self.private_field_at(idx, brand, id, pos)?;
+        if op == 0 {
+            return Some(v.bits());
+        }
+        let nv = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
+        // No holder barrier: the collector roots private field values; a
+        // minor takes the young ones from this record (`record_young_value`),
+        // as the interpreter's way-0 write (`ic.rs`) leaves them.
+        self.private_fields_mut(idx)?.get_mut(at)?.2 = nv;
+        self.heap.record_young_value(nv);
+        Some(nv.bits())
     }
 
     /// The implementation behind `jit_private_prop_ic`: the interpreter's
@@ -1557,7 +1874,7 @@ impl<'p> Vm<'p> {
         if func_id as usize >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1571,29 +1888,7 @@ impl<'p> Vm<'p> {
         let val_reg = ((packed_args >> 16) & 0xFFFF) as u16;
         let name = ((packed_args >> 32) & 0xFF_FFFF) as u32;
         let op = ((packed_args >> 56) & 3) as u8;
-        // The field this site last served, for this callee: the
-        // interpreter's way-0 hit.
-        #[cfg(not(feature = "safe-sandbox"))]
-        if op != 2 && o.is_heap() {
-            if let Some((brand, id, pos)) = self.ic_private_way0(func_id, ip, ctx) {
-                let idx = o.heap_index();
-                if let Some((at, v)) = self.private_field_at(idx, brand, id, pos) {
-                    if op == 0 {
-                        return v.bits();
-                    }
-                    let nv = self.get(base, val_reg);
-                    // No holder barrier: the collector roots private field
-                    // values; a minor takes the young ones from this record
-                    // (`record_young_value`), as the interpreter's way-0
-                    // write (`ic.rs`) leaves them.
-                    if let Some(fields) = self.private_fields_mut(idx) {
-                        fields[at].2 = nv;
-                    }
-                    self.heap.record_young_value(nv);
-                    return nv.bits();
-                }
-            }
-        }
+        // The way-0 hit (`jit_private_way0_hit`) was tried before this.
         let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
         let Some(key) = func.string_constants.get(name as usize) else {
             return SELF_CALL_DEOPT;
@@ -1640,7 +1935,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1679,7 +1974,7 @@ impl<'p> Vm<'p> {
         if func_id >= self.main_func_count.saturating_add(self.eval_funcs.len()) {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1713,7 +2008,7 @@ impl<'p> Vm<'p> {
         if op > 4 {
             return SELF_CALL_DEOPT;
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1779,6 +2074,58 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The implementation behind [`jit_cold_op_ic`]: `ObjectRest` (`op` 0,
+    /// `packed_args` = `src | exclude_start << 16 | exclude_count << 32`) and
+    /// `MathSpread` (1, `callee | this_v << 16 | args << 32 | MathFn << 48`),
+    /// the interpreter's arms over the compiled body's window. Every decline
+    /// precedes the first effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_cold_op_impl(&mut self, op: u32, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.at_call_cap() {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(self.regs.as_ptr() as *const u64) } as usize;
+        let field = |k: u32| ((packed_args >> (16 * k)) & 0xFFFF) as u16;
+        let math = (op == 1).then(|| field(3) as u8);
+        if let Some(m) = math {
+            // The spread arguments are a compiler-made Array; anything else
+            // is malformed bytecode, which declines.
+            let args = self.get(base, field(2));
+            if (m as usize) >= crate::bytecode::MATH_FN_COUNT
+                || !args.is_heap()
+                || !matches!(self.heap.get(args.heap_index()), HeapObj::Array(_))
+            {
+                return SELF_CALL_DEOPT;
+            }
+        }
+        // The window's Values are roots: the safe point may precede the reads.
+        self.maybe_gc();
+        self.jit_call_depth += 1;
+        let r = match math {
+            None => self.object_rest_value(
+                base,
+                (packed_fip >> 32) as u32,
+                field(0),
+                u32::from(field(1)),
+                u32::from(field(2)),
+            ),
+            Some(m) => {
+                // SAFETY: `MathFn` is a fieldless `repr(u8)` enum of
+                // `MATH_FN_COUNT` variants, and `m` is below that.
+                let f: crate::bytecode::MathFn = unsafe { core::mem::transmute(m) };
+                self.math_spread_value(base, f, field(0), field(1), field(2))
+            }
+        };
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
+    }
+
     /// The implementation behind [`jit_iter_to_array_ic`] (`op` 0),
     /// [`jit_array_append_ic`] (1) and [`jit_call_spread_ic`] (2). Every
     /// decline precedes the first effect.
@@ -1790,7 +2137,7 @@ impl<'p> Vm<'p> {
         packed_args: u64,
     ) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1837,8 +2184,25 @@ impl<'p> Vm<'p> {
             _ => {
                 let callee = self.get(base, a);
                 let args = self.get(base, b);
-                let argv = self.array_snapshot(args.heap_index());
-                self.call_value(callee, Value::UNDEFINED, &argv)
+                // A short argument list is copied to the stack: the Vec's
+                // malloc/free was a sizeable part of a recursive `f(...xs)`.
+                let mut buf = [Value::UNDEFINED; 8];
+                let small = match self.heap.get(args.heap_index()) {
+                    HeapObj::Array(items) if items.len() <= buf.len() => {
+                        for (slot, &v) in buf.iter_mut().zip(items.iter()) {
+                            *slot = if v.is_hole() { Value::UNDEFINED } else { v };
+                        }
+                        Some(items.len())
+                    }
+                    _ => None,
+                };
+                match small {
+                    Some(n) => self.call_value(callee, Value::UNDEFINED, &buf[..n]),
+                    None => {
+                        let argv = self.array_snapshot(args.heap_index());
+                        self.call_value(callee, Value::UNDEFINED, &argv)
+                    }
+                }
             }
         };
         self.jit_call_depth -= 1;
@@ -1876,7 +2240,7 @@ impl<'p> Vm<'p> {
             }
             return self.int_str_value(n).bits();
         }
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1895,10 +2259,11 @@ impl<'p> Vm<'p> {
     pub(crate) fn jit_region_instanceof_impl(
         &mut self,
         caller_base_ptr: *const u64,
+        packed_fip: u64,
         packed_args: u64,
     ) -> u64 {
-        use crate::codegen::SELF_CALL_DEOPT;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if self.at_call_cap() {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -1907,6 +2272,36 @@ impl<'p> Vm<'p> {
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
         let c = self.get(base, ((packed_args >> 16) & 0xFFFF) as u16);
         let v = self.get(base, (packed_args & 0xFFFF) as u16);
+        // A class with its own static `[Symbol.hasInstance]` method: what
+        // `instance_of_op` calls (with `c` as `this` and `v` its argument,
+        // the result made a boolean), called native to native from this
+        // window, where `v` already sits in its register. Through
+        // `call_value` each test ran the method in a nested interpreter
+        // loop (105 ns a test). A decline has done nothing.
+        if let Some(h) = self.jit_own_has_instance(c) {
+            let func_id = (packed_fip >> 32) as usize;
+            let val_reg = packed_args & 0xFFFF;
+            if func_id < self.main_func_count.saturating_add(self.eval_funcs.len()) {
+                let caller_regs = self.func(func_id).reg_count.max(1) as u64;
+                if val_reg < caller_regs {
+                    // SAFETY: `val_reg` is a register of this window.
+                    let args = unsafe { caller_base_ptr.add(val_reg as usize) };
+                    let r = self.jit_cross_call_impl::<false>(
+                        caller_base_ptr,
+                        args,
+                        1 | (caller_regs << 16),
+                        h.bits(),
+                        Some(c),
+                    );
+                    if r == CALL_THREW {
+                        return r;
+                    }
+                    if r != SELF_CALL_DEOPT {
+                        return Value::bool(self.truthy(Value::from_bits(r))).bits();
+                    }
+                }
+            }
+        }
         self.jit_call_depth += 1;
         let r = self.instance_of_op(c, v);
         self.jit_call_depth -= 1;
@@ -2146,7 +2541,7 @@ impl<'p> Vm<'p> {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
         let is_method = call_kind == 1;
         let has_explicit_this = call_kind == 2;
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        if self.at_call_cap() {
             // Legal-but-deep recursion: not a region-quality signal — don't
             // count it toward eviction.
             self.osr_deopt_exempt = true;
@@ -2177,6 +2572,21 @@ impl<'p> Vm<'p> {
             let recv = self.get(base, obj);
             // `func()` borrows &'p (program lifetime) — outlives `&mut self`.
             let key: &str = &self.func(func_id as usize).string_constants[name as usize];
+            // `recv.#m()` of a private METHOD: resolved through the site's
+            // way 0 (filled on a miss) and called as a resolved method below,
+            // instead of being looked up without the site and run through
+            // `call_value` by the miss arm. A private accessor or field, or a
+            // receiver without the brand, keeps that arm.
+            let private = if crate::vm::is_private_key(key) {
+                self.jit_private_method_callee(func_id, ip, base, recv, name, key)
+                    .and_then(|m| self.ic_plain_fn(m).map(|(f, c)| (f, c, m)))
+                    .filter(|&(f, _, _)| !self.func(f as usize).lexical_this)
+            } else {
+                None
+            };
+            if let Some((fid, closure, m)) = private {
+                (fid, closure, recv, m)
+            } else {
             match self.ic_call_method(func_id, ip, recv, key) {
                 // An ARROW binds `this` LEXICALLY: reg 0 is its captured
                 // `this_val`, and the receiver is ignored entirely. This arm
@@ -2257,6 +2667,7 @@ impl<'p> Vm<'p> {
                         .jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
                 }
             }
+            }
         } else {
             let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
             let cv = self.get(base, callee_reg);
@@ -2297,9 +2708,7 @@ impl<'p> Vm<'p> {
                             // A plain NATIVE callee (parseInt, …): invoke via
                             // call_value with this=undefined, exactly like the
                             // interpreter's Call op. Everything else deopts.
-                            if cv.is_heap()
-                                && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
-                            {
+                            if self.jit_native_like_callee(cv) {
                                 // A captured boot intrinsic takes the fused
                                 // `CallMethod` builtin lanes, as it does in the
                                 // interpreter's `CallWithThis` arm (B289): the
@@ -2347,9 +2756,7 @@ impl<'p> Vm<'p> {
                         // A plain NATIVE callee (parseInt, …): invoke via
                         // call_value with this=undefined, exactly like the
                         // interpreter's Call op. Everything else deopts.
-                        if cv.is_heap()
-                            && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
-                        {
+                        if self.jit_native_like_callee(cv) {
                             let called = self.with_argv(base, arg_base, argc, |vm, argv| {
                                 vm.call_value(cv, explicit_this, argv)
                             });
@@ -2392,7 +2799,7 @@ impl<'p> Vm<'p> {
             // without `setup_call` and the interpreter's prologue. `this` is
             // already bound (above), which the cross call keeps as it is; a
             // pure decline falls through.
-            if self.jit.cross_needs_frame(fid) {
+            if self.jit.cross_needs_frame(fid) || self.jit.cross_lazy_ff(fid) {
                 let caller_regs = self.func(func_id as usize).reg_count.max(1);
                 let packed = argc as u64 | (u64::from(caller_regs) << 16);
                 // SAFETY: the argument registers lie in the caller's window.
@@ -2748,7 +3155,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) => {
                     // A HOLE element would take CreateListFromArrayLike through
                     // a proto-chain Get; ≤ 32 keeps the per-call scan bounded.
-                    if items.len() > 32 || items.iter().any(|v| v.is_hole()) {
+                    if items.len() > 32 || Value::any_hole(&items) {
                         return None;
                     }
                     let n = items.len().min(Self::MI_MAX_REGS);

@@ -249,7 +249,7 @@ pub struct Jit {
 impl Jit {
     pub fn new() -> Self {
         let mut jit = Self::default();
-        jit.threshold_override = std::env::var("ZIPP_JIT_THRESHOLD")
+        jit.threshold_override = crate::env_var("ZIPP_JIT_THRESHOLD")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|n| *n >= 1)
@@ -712,6 +712,7 @@ mod tests {
             length: 0,
             rest_reg: None,
             arguments_reg: None,
+            args_count_only: false,
             is_generator: false,
             is_async: false,
             non_constructable: false,

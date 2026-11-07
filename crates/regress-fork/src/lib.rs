@@ -250,6 +250,8 @@ pub fn rx_session_stats() -> u64 {
 
 #[macro_use]
 mod util;
+#[doc(hidden)]
+pub use crate::util::cold_sort_by;
 
 mod api;
 mod bytesearch;

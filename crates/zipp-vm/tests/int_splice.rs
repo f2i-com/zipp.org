@@ -232,16 +232,22 @@ console.log("div h=" + h);
 #[test]
 fn intsplice_parity_resolved_global_store_stays_on_the_real_call() {
     assert_matches_node(
-        r#"var N = 20000;
+        // Strict code's compound assignment to a global is what compiles to
+        // `StoreGlobalResolved` (its Get has resolved the reference); a sloppy
+        // `implicitRoute = x` is a plain `StoreGlobal`, which a slot proof
+        // covers and the leaf may inline.
+        r#""use strict";
+var N = 20000;
 var a = [];
 for (var i = 0; i < N; i++) a.push(i % 13);
 var h = 0;
-function step(x) { implicitRoute = x; return (x + 1) | 0; }
+var route = 0;
+function step(x) { route += x; return (x + 1) | 0; }
 function f(n) {
   for (var ti = 0; ti < n; ti++) h = (h + step(a[ti])) | 0;
 }
 for (var r = 0; r < 5; r++) { h = 0; f(N); }
-console.log("resolved h=" + h + " implicit=" + implicitRoute);
+console.log("resolved h=" + h + " route=" + route);
 "#,
     );
 }
@@ -661,19 +667,23 @@ fn intsplice_mechanism_one_entry_guard_per_callee() {
 /// answer, this proves they are testing the path they claim to.
 #[test]
 fn intsplice_mechanism_declines_are_named_and_fall_back() {
+    // A captured cell lives in a pool global for the run, and a callee with no
+    // slot generation is compared by value at entry: both flatten.
+    for name in [
+        "intsplice_parity_callee_with_an_upvalue",
+        "intsplice_parity_callee_slot_is_bytecode_stored",
+    ] {
+        let log = jitlog_of(name, &[]);
+        assert!(
+            log.contains("INT splice [") && log.contains("INT region fn"),
+            "{name}: expected the flattened tier:\n{log}"
+        );
+    }
     for (name, reason) in [
-        (
-            "intsplice_parity_callee_with_an_upvalue",
-            "callee reads upvalues",
-        ),
         ("intsplice_parity_callee_with_a_div", "is not flattenable"),
         (
             "intsplice_parity_argc_below_param_count",
-            "argc 1 != param_count 2",
-        ),
-        (
-            "intsplice_parity_callee_slot_is_bytecode_stored",
-            "no slot_guard",
+            "argc 1 < param_count 2",
         ),
     ] {
         let log = jitlog_of(name, &[]);
@@ -692,8 +702,11 @@ fn intsplice_mechanism_declines_are_named_and_fall_back() {
         "intsplice_parity_resolved_global_store_stays_on_the_real_call",
         &[],
     );
+    // The leaf subset admits the op; the planner's direct-global route proof
+    // refuses it (`StoreGlobalResolved` is never a raw slot store), so no leaf
+    // plan exists for the integer splice either.
     assert!(
-        resolved.contains("DECLINE (not leaf-eligible)")
+        resolved.contains("DECLINE (direct-global route is not exact)")
             && resolved.contains("no leaf plan (not monomorphic / not inline-eligible)"),
         "StoreGlobalResolved must be rejected before a raw leaf plan exists:\n{resolved}"
     );

@@ -15,12 +15,12 @@ fn enum_hoist_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ENUM_HOIST").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ENUM_HOIST").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -33,6 +33,10 @@ fn enum_hoist_enabled() -> bool {
 /// of at most 64 bytes with their heap strings are under 2 MiB.
 const KEY_STR_CACHE_MAX_BYTES: usize = 64;
 const KEY_STR_CACHE_MAX_ENTRIES: usize = 8192;
+
+/// `Vm::index_key_strs`' bound: arrays up to this length enumerate their
+/// keys from it, a quarter of `key_str_cache` at most.
+const INDEX_KEY_STRS_MAX: usize = 2048;
 
 /// `Vm::key_value_front`'s size: a direct-mapped cache in front of
 /// `key_str_cache` for keys of at most 16 bytes.
@@ -87,7 +91,70 @@ impl<'p> Vm<'p> {
                 return Ok(v);
             }
         }
+        if obj.is_heap() {
+            if let Some(v) = self.dense_array_enum(obj.heap_index(), what) {
+                return Ok(v);
+            }
+        }
         self.with_host_roots(&[obj], |vm| vm.object_enum_own_inner(obj, what))
+    }
+
+    /// `Object.keys` / `values` of an Array whose own properties are its
+    /// present dense elements alone: no side table (no named property, no
+    /// `defineProperty`'d index, no sparse overlay), no compact match-result
+    /// names, not an `arguments` object. Its keys are the indices of the
+    /// elements that are not holes, as the shared index strings, and its
+    /// values those elements; no getter can run, so nothing changes between
+    /// the reads. The general Array arm formatted each index and looked its
+    /// text up in `key_str_cache`: 14 ns a key against V8's 6. `None` for
+    /// any other receiver, entries, and an array longer than the index table.
+    fn dense_array_enum(&mut self, idx: u32, what: EnumWhat) -> Option<Value> {
+        if matches!(what, EnumWhat::Entries)
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+            || (!self.regexp_result_props.is_empty() && self.regexp_result_props.contains_key(&idx))
+            || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx))
+        {
+            return None;
+        }
+        let len = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return None,
+        };
+        if matches!(what, EnumWhat::Keys) && !self.index_key_strs_upto(len) {
+            return None;
+        }
+        let out: Vec<Value> = match self.heap.get(idx) {
+            HeapObj::Array(items) => {
+                let present = items.iter().enumerate().filter(|(_, v)| !v.is_hole());
+                match what {
+                    EnumWhat::Keys => present.map(|(i, _)| self.index_key_strs[i]).collect(),
+                    _ => present.map(|(_, v)| *v).collect(),
+                }
+            }
+            _ => return None,
+        };
+        Some(self.alloc_array_current_realm(out))
+    }
+
+    /// Make `index_key_strs` cover the indices `0..len` with `key_str_cache`'s
+    /// strings for their texts. `false` when it cannot: `len` past
+    /// `INDEX_KEY_STRS_MAX`, or the cache full before an index's text got in
+    /// (the strings it handed out stay valid either way).
+    pub(crate) fn index_key_strs_upto(&mut self, len: usize) -> bool {
+        if len > INDEX_KEY_STRS_MAX {
+            return false;
+        }
+        while self.index_key_strs.len() < len {
+            let k = self.index_key_strs.len().to_string();
+            let v = self.alloc_key_str(k.clone());
+            // Only a string `key_str_cache` holds may be kept: it is what
+            // keeps the string alive.
+            if self.cached_key_str(&k) != Some(v) {
+                return false;
+            }
+            self.index_key_strs.push(v);
+        }
+        true
     }
 
     /// `Object.keys` / `values` / `entries` of a plain object whose every

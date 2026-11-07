@@ -136,6 +136,14 @@ impl<'p> Vm<'p> {
             let i = id as usize;
             if i < self.funcs.len() {
                 self.funcs[i] = r;
+                // A frame of the stub dispatched on the stub's code.
+                if let Some(entered) = self.entered_code.get_mut(i) {
+                    *entered = None;
+                }
+                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                if let Some(desc) = self.frame_descs.get_mut(i) {
+                    *desc = 0;
+                }
                 if i >= self.main_func_count {
                     self.eval_funcs[i - self.main_func_count] = r;
                 }
@@ -239,6 +247,7 @@ impl<'p> Vm<'p> {
             }
             // The last class a compiled `new` resolved may have this body.
             self.new_class_memo = (0, 0, 0, 0, 0);
+            self.new_stored_memo = (0, 0, 0, 0, 0);
             if let Some(c) = self.ctor_framefree.get_mut(f) {
                 *c = 0;
             }

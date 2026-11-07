@@ -39,11 +39,11 @@ pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// Keep the dtype decision in this one place: admission, the xmm-home emitter
 /// and the GPR-home emitter all consume this enum. The metadata check against
 /// `TA_KINDS` makes the numeric kind ids fail closed if that authoritative
-/// table is ever reordered or extended. Uint32 is intentionally absent: its
-/// values do fit i53, but the GPR tier's deferred-sign-extension analysis has
-/// historically treated every pinned GetIndex as i32-range. Widening that
-/// proof is separate work; silently admitting kind 6 here would sign-mangle
-/// values above `i32::MAX` on some downstream paths.
+/// table is ever reordered or extended. Uint32 (`U32`) loads zero-extended:
+/// its values fit the i64/i53 home but not i32, so the GPR tier's
+/// deferred-sign-extension census marks its destination WIDE
+/// (`IntTaLoadKind::fits_i32`), as it does a DataView `getUint32`, and the
+/// interval analysis gives it `[0, 2^32 - 1]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntTaLoadKind {
     I8,
@@ -51,23 +51,37 @@ pub(crate) enum IntTaLoadKind {
     I16,
     U16,
     I32,
+    U32,
 }
 
-/// Kill switch for the narrow fixed-width integer TypedArray read widening.
-/// Int32 (the pre-existing path) remains enabled when the switch is set, so an
-/// off run is an exact semantic fallback rather than a JIT-wide disable.
-fn int_ta_narrow_reads_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_TA_NARROW_READS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
+impl IntTaLoadKind {
+    /// Whether every value this load produces fits i32 (all but `U32`).
+    pub(crate) fn fits_i32(self) -> bool {
+        self != IntTaLoadKind::U32
     }
+}
+
+env_off_switch! {
+    /// Kill switch for Uint32Array reads on the INTEGER tier (`IntTaLoadKind::U32`).
+    fn int_ta_u32_reads_enabled() = "ZIPP_NO_INT_TA_U32"
+}
+
+env_off_switch! {
+    /// Kill switch for in-place Int stores into a pinned dense all-Int Array
+    /// on the INTEGER tiers (`arr[i] = v` with an Int element and an i32 value).
+    fn int_arr_store_enabled() = "ZIPP_NO_INT_ARR_STORE"
+}
+
+/// [`int_arr_store_enabled`] for the region planner (`plan_region`).
+pub(crate) fn int_arr_store_on() -> bool {
+    int_arr_store_enabled()
+}
+
+env_off_switch! {
+    /// Kill switch for the narrow fixed-width integer TypedArray read widening.
+    /// Int32 (the pre-existing path) remains enabled when the switch is set, so an
+    /// off run is an exact semantic fallback rather than a JIT-wide disable.
+    fn int_ta_narrow_reads_enabled() = "ZIPP_NO_INT_TA_NARROW_READS"
 }
 
 pub(crate) fn int_ta_load_kind(kind: u8) -> Option<IntTaLoadKind> {
@@ -83,11 +97,12 @@ pub(crate) fn int_ta_load_kind(kind: u8) -> Option<IntTaLoadKind> {
         (3, "Int16Array", 2) => IntTaLoadKind::I16,
         (4, "Uint16Array", 2) => IntTaLoadKind::U16,
         (5, "Int32Array", 4) => IntTaLoadKind::I32,
-        // Uint32 and every future non-float numeric kind decline until their
-        // full range is proven through lazy-sx, compares, exits and boxing.
+        (6, "Uint32Array", 4) if int_ta_u32_reads_enabled() => IntTaLoadKind::U32,
+        // Every future non-float numeric kind declines until its full range is
+        // proven through lazy-sx, compares, exits and boxing.
         _ => return None,
     };
-    if load != IntTaLoadKind::I32 && !int_ta_narrow_reads_enabled() {
+    if !matches!(load, IntTaLoadKind::I32 | IntTaLoadKind::U32) && !int_ta_narrow_reads_enabled() {
         return None;
     }
     Some(load)
@@ -104,12 +119,12 @@ pub(crate) fn int_arr_length_kind(kind: u8) -> bool {
         return true; // pre-existing path remains live under the off switch
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     let on = match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_INT_DENSE_ARRAY_LENGTH").is_none();
+            let on = crate::env_var_os("ZIPP_NO_INT_DENSE_ARRAY_LENGTH").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -292,7 +307,7 @@ fn int_push3_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = int_push_enabled() && std::env::var_os("ZIPP_NO_INT_PUSH3").is_none();
+            let v = int_push_enabled() && crate::env_var_os("ZIPP_NO_INT_PUSH3").is_none();
             ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -664,9 +679,10 @@ pub(crate) fn int_unadmitted_ips(
         })
     };
     // A dense Array observed all-Int (kind 252): `arr[i]` loads the element and
-    // unboxes it into an i64 home under a per-access tag guard. READS only —
-    // a store would have to re-box and can grow/realloc the Vec, so `SetIndex`
-    // still falls to the memory path (see the catch-all below).
+    // unboxes it into an i64 home under a per-access tag guard. A store is
+    // admitted only in bounds over an Int element with an i32 value (the
+    // emitter's guards; anything else deopts AT the op), so it never grows or
+    // reallocates the Vec and re-boxes by a tag.
     let pinned_int_arr = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| {
             ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
@@ -714,9 +730,10 @@ pub(crate) fn int_unadmitted_ips(
             // Int32 write are admissible; all other index ops decline to MEM.
             Instr::GetIndex { .. } if pinned_int_read(s + off) => {}
             Instr::SetIndex { .. } if pinned_i32_write(s + off) => {}
-            // Dense all-Int Array READ (see `pinned_int_arr`); the write is not
-            // admitted and falls through to the catch-all.
+            // Dense all-Int Array read, and (behind `int_arr_store_enabled`)
+            // its guarded in-place Int store; see `pinned_int_arr`.
             Instr::GetIndex { .. } if pinned_int_arr(s + off) => {}
+            Instr::SetIndex { .. } if pinned_int_arr(s + off) && int_arr_store_enabled() => {}
             // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
@@ -2133,6 +2150,8 @@ pub(crate) fn compile_region_int_maybe_cold(
                         IntTaLoadKind::I32 => {
                             dynasm!(ops ; movsxd rax, DWORD [rdx + rcx * 4])
                         }
+                        // A 32-bit load zero-extends into rax: the exact u32.
+                        IntTaLoadKind::U32 => dynasm!(ops ; mov eax, DWORD [rdx + rcx * 4]),
                     }
                 }
                 dynasm!(ops
@@ -2172,8 +2191,37 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; cmp rcx, [rsp + off + 16]
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
-                    ; movq rax, Rx(vx)                   // value i64 home
-                    ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
+                );
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                    // Dense all-Int Array (`int_arr_store_enabled`): an in-bounds
+                    // store over an Int element is the own writable data
+                    // property's [[Set]] (the pin declined any array with an
+                    // arr_props overlay: frozen, sealed, redefined indices). A
+                    // hole, double or heap element, and a value outside i32
+                    // (which would store a double), deopt AT this ip. An Int
+                    // is no heap pointer: no write barrier.
+                    dynasm!(ops
+                        ; mov rax, [rdx + rcx * 8]       // the element it replaces
+                        ; shr rax, 48
+                        ; cmp eax, INT_TAG_HI as i32
+                        ; jne => deopt
+                        ; lea rdx, [rdx + rcx * 8]
+                        ; movq rax, Rx(vx)               // value i64 home
+                        ; movsxd rcx, eax
+                        ; cmp rcx, rax
+                        ; jne => deopt                   // outside i32
+                        ; mov ecx, eax
+                        ; mov rax, QWORD ((INT_TAG_HI as u64) << 48) as i64
+                        ; or rax, rcx
+                        ; mov [rdx], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; movq rax, Rx(vx)               // value i64 home
+                        ; mov DWORD [rdx + rcx * 4], eax // store low 32 (== ToInt32(v))
+                    );
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => deopt
                     ; mov DWORD [rsi], rip_at
@@ -2428,7 +2476,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         // Regression-only fault injection for the otherwise
                         // defensive atomic-decline path. It changes emitted
                         // code only in an explicitly marked child process.
-                        | if std::env::var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
+                        | if crate::env_var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
                             1 << 31
                         } else {
                             0

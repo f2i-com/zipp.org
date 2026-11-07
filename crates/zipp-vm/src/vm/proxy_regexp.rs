@@ -951,12 +951,12 @@ fn fastok_memo_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_FASTOK_MEMO").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -982,12 +982,12 @@ fn matchall_step_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCHALL_STEP").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCHALL_STEP").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1007,17 +1007,24 @@ fn slim_exec_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_SLIM_EXEC").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_SLIM_EXEC").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
     }
 }
+
+#[cfg(not(feature = "safe-sandbox"))]
+env_off_switch!(
+    /// `ZIPP_NO_REGEXP_MATCH_FAST=1` sends every global `@@match` back
+    /// through the per-match RegExpExec loop (`Vm::regexp_match_global_fast`).
+    fn regexp_match_fast_enabled() = "ZIPP_NO_REGEXP_MATCH_FAST"
+);
 
 /// Short-subject ASCII execs a RegExp runs on its base program before its
 /// byte-optimized twin is built (`Vm::ensure_regexp_ascii_twin_deferred`).
@@ -1070,12 +1077,12 @@ pub(crate) fn twin_at_create_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_TWIN_AT_CREATE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_TWIN_AT_CREATE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1094,12 +1101,12 @@ fn iter_subj_units_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_ITER_SUBJ_UNITS").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_ITER_SUBJ_UNITS").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1117,12 +1124,12 @@ fn matchall_batch_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCHALL_BATCH").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCHALL_BATCH").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -2548,6 +2555,10 @@ impl<'p> Vm<'p> {
         // ToString(Get(rx,"flags")); a non-global match is just RegExpExec; a global
         // match loops RegExpExec (honouring a user `exec`) collecting ToString(Get(
         // result,"0")), resets lastIndex first, and advances past an empty match.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(v) = self.regexp_match_global_fast(re, input)? {
+            return Ok(v);
+        }
         let rx = Value::heap(re);
         let flags_v = self.get_prop(rx, "flags")?;
         #[cfg(feature = "safe-sandbox")]
@@ -2631,6 +2642,283 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
     }
 
+    /// The global `@@match` loop in one engine scan, when nothing in it is
+    /// observable: a real RegExp, global and not sticky, whose `flags` reads
+    /// and `exec` are the intrinsics, with a writable `lastIndex`, matched
+    /// against a string (ToString is the identity). The generic loop then runs
+    /// RegExpBuiltinExec once per match: a result array with its side record,
+    /// the statics, a `"0"` read and a `lastIndex` round trip each time, about
+    /// 130 ns per match where this keeps only the slice. The scan is the one
+    /// `regex_replace` takes: the engine's own iterator advances past an empty
+    /// match exactly as AdvanceStringIndex does (one element, a code point
+    /// under `u`/`v`). `lastIndex` ends at 0 either way (the final failed
+    /// exec resets it), and the statics name the last match, as the loop's
+    /// last successful exec leaves them. `None` declines before any effect.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regexp_match_global_fast(&mut self, re: u32, input: Value) -> Result<Option<Value>, Thrown> {
+        if !regexp_match_fast_enabled()
+            || !input.is_heap()
+            || !matches!(
+                self.heap.get(input.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let unicode = match self.heap.get(re) {
+            HeapObj::RegExp(r) => {
+                let f = r.core.flags.as_bytes();
+                if !f.contains(&b'g') || f.contains(&b'y') {
+                    return Ok(None);
+                }
+                f.contains(&b'u') || f.contains(&b'v')
+            }
+            _ => return Ok(None),
+        };
+        if !self.regexp_exec_fast_ok(re)
+            || !self.regexp_last_index_writable(re)
+            || !self.regexp_pristine_flag_accessors_ok(re, Value::heap(re))
+        {
+            return Ok(None);
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        let s_idx = input.heap_index();
+        self.heap.flatten(s_idx);
+        let _gc = self.gc_lock_guard();
+        self.regexp_write_last_index(re, Value::int(0))?;
+        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+            _ => (false, 0),
+        };
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut last: Option<regress::Match> = None;
+        let u16s: Vec<u16> = if is_ascii {
+            self.ensure_regexp_ascii_twin_deferred(re, ascii_units);
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = match r.ascii_twin.get() {
+                    Some(Some(twin)) => &**twin,
+                    _ => &*r.regex,
+                };
+                for m in regex.find_from_ascii(subj, 0) {
+                    ranges.push(m.range());
+                    last = Some(m);
+                }
+            }
+            Vec::new()
+        } else {
+            let u16s = self.regex_subject_units_take(input);
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = &r.core.regex;
+                if unicode {
+                    for m in regex.find_from_utf16(&u16s, 0) {
+                        ranges.push(m.range());
+                        last = Some(m);
+                    }
+                } else {
+                    for m in regex.find_from_ucs2(&u16s, 0) {
+                        ranges.push(m.range());
+                        last = Some(m);
+                    }
+                }
+            }
+            u16s
+        };
+        // The generic loop runs one more exec than it finds matches.
+        self.preflight_native_iteration_work(ranges.len() as u64 + 1)?;
+        let subj_units = if is_ascii { ascii_units } else { u16s.len() };
+        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+            if is_ascii {
+                vm.ascii_slice_value(s_idx, r)
+            } else {
+                vm.units_value(&u16s[r])
+            }
+        };
+        let result = match last {
+            None => Value::NULL,
+            Some(m) => {
+                let mut elems: Vec<Value> = Vec::new();
+                elems.try_reserve_exact(ranges.len()).map_err(|_| {
+                    Thrown::from_static("RangeError: RegExp match-result allocation failed")
+                })?;
+                for r in ranges {
+                    elems.push(mk(self, r));
+                }
+                let defer = subj_units <= u32::MAX as usize;
+                self.regexp_record_statics(
+                    &m,
+                    input,
+                    s_idx,
+                    m.start(),
+                    m.end(),
+                    subj_units,
+                    defer,
+                    is_ascii,
+                    &mk,
+                );
+                Value::heap(self.heap.alloc(HeapObj::Array(elems)))
+            }
+        };
+        if !is_ascii {
+            self.regex_subject_units_put(input, u16s);
+        }
+        Ok(Some(result))
+    }
+
+    /// `@@split` in one engine scan, when nothing in it is observable: the
+    /// receiver passes `regexp_matchall_fast_ok` (so SpeciesConstructor finds
+    /// %RegExp%, the `flags` reads are the intrinsics, IsRegExp inside the
+    /// splitter's construction reads the intrinsic `@@match`, and `exec` is
+    /// the intrinsic), the subject is a string and `limit` is undefined or a
+    /// number (no ToUint32 user code). The generic loop builds a sticky
+    /// splitter and then one result array per piece; the scan keeps none of
+    /// it. Its matches are the splitter's: the search from `q` finds the first
+    /// position whose sticky attempt succeeds (the `ITFB_SPLIT_SCAN`
+    /// argument), the engine's step past an empty match is AdvanceStringIndex,
+    /// a match starting at the end is never tried (`q < size`), and an empty
+    /// match where the piece starts (`e == p`) is skipped as the spec skips
+    /// it. The statics name the last successful attempt. `None` declines
+    /// before any effect.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn regexp_split_scan(
+        &mut self,
+        re: u32,
+        input: Value,
+        limit: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        if !regexp_match_fast_enabled()
+            || !(limit.is_undefined() || limit.is_number())
+            || !input.is_heap()
+            || !matches!(
+                self.heap.get(input.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+            || !matches!(self.heap.get(re), HeapObj::RegExp(_))
+            || !self.regexp_matchall_fast_ok(re)
+        {
+            return Ok(None);
+        }
+        let unicode = match self.heap.get(re) {
+            HeapObj::RegExp(r) => {
+                let f = r.core.flags.as_bytes();
+                f.contains(&b'u') || f.contains(&b'v')
+            }
+            _ => return Ok(None),
+        };
+        let lim: u64 = if limit.is_undefined() {
+            u32::MAX as u64
+        } else {
+            to_uint32(limit.as_f64()) as u64
+        };
+        if lim == 0 {
+            return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())))));
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        let s_idx = input.heap_index();
+        self.heap.flatten(s_idx);
+        let _gc = self.gc_lock_guard();
+        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+            _ => (false, 0),
+        };
+        let mut found: Vec<regress::Match> = Vec::new();
+        let u16s: Vec<u16> = if is_ascii {
+            self.ensure_regexp_ascii_twin_deferred(re, ascii_units);
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = match r.ascii_twin.get() {
+                    Some(Some(twin)) => &**twin,
+                    _ => &*r.regex,
+                };
+                if ascii_units == 0 {
+                    found.extend(regex.match_at_ascii(subj, 0));
+                } else {
+                    found.extend(regex.find_from_ascii(subj, 0).take_while(|m| m.start() < ascii_units));
+                }
+            }
+            Vec::new()
+        } else {
+            let u16s = self.regex_subject_units_take(input);
+            let size = u16s.len();
+            if let HeapObj::RegExp(r) = self.heap.get(re) {
+                let regex = &r.core.regex;
+                if unicode {
+                    found.extend(regex.find_from_utf16(&u16s, 0).take_while(|m| m.start() < size));
+                } else {
+                    found.extend(regex.find_from_ucs2(&u16s, 0).take_while(|m| m.start() < size));
+                }
+            }
+            u16s
+        };
+        let size = if is_ascii { ascii_units } else { u16s.len() };
+        // One exec per match plus the failed one that ends the generic loop.
+        self.preflight_native_iteration_work(found.len() as u64 + 1)?;
+        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+            if is_ascii {
+                vm.ascii_slice_value(s_idx, r)
+            } else {
+                vm.units_value(&u16s[r])
+            }
+        };
+        let mut a: Vec<Value> = Vec::new();
+        // The last successful exec: the match the loop stopped at when `limit`
+        // ends it, else the last one (every match from `q < size` is tried).
+        let mut last = found.len().checked_sub(1);
+        if size == 0 {
+            // One sticky attempt at 0: a match leaves the result empty.
+            if found.is_empty() {
+                a.push(input);
+            }
+        } else {
+            let mut p = 0usize;
+            let mut done = false;
+            'scan: for (i, m) in found.iter().enumerate() {
+                let (q, e) = (m.start(), m.end().min(size));
+                if e == p {
+                    continue;
+                }
+                let piece = mk(self, p..q);
+                a.push(piece);
+                if a.len() as u64 == lim {
+                    done = true;
+                    last = Some(i);
+                    break;
+                }
+                p = e;
+                for cap in &m.captures {
+                    let v = match cap {
+                        Some(r) => mk(self, r.clone()),
+                        None => Value::UNDEFINED,
+                    };
+                    a.push(v);
+                    if a.len() as u64 == lim {
+                        done = true;
+                        last = Some(i);
+                        break 'scan;
+                    }
+                }
+            }
+            if !done {
+                let tail = mk(self, p..size);
+                a.push(tail);
+            }
+        }
+        if let Some(m) = last.map(|i| &found[i]) {
+            let defer = size <= u32::MAX as usize;
+            self.regexp_record_statics(m, input, s_idx, m.start(), m.end(), size, defer, is_ascii, &mk);
+        }
+        if !is_ascii {
+            self.regex_subject_units_put(input, u16s);
+        }
+        Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(a)))))
+    }
+
     /// RegExp.prototype[Symbol.split] core (simplified — no capture groups in the
     /// output yet). Shared by String.prototype.split for a regex separator.
     pub(crate) fn regexp_split_impl(
@@ -2644,6 +2932,10 @@ impl<'p> Vm<'p> {
         // loop calls RegExpExec (honouring a user `exec`) reading lastIndex/length/
         // captures via Get. Positions p/q/e are UTF-16 unit indices; the no-match
         // advance is spec AdvanceStringIndex (+2 over an astral pair in `u`/`v`).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let Some(v) = self.regexp_split_scan(re, input, limit)? {
+            return Ok(v);
+        }
         let rx = Value::heap(re);
         // ToString(string) — IDENTITY for a string value (exact WTF-8).
         let s_val = self.to_str_value(input)?;
@@ -3522,6 +3814,9 @@ impl<'p> Vm<'p> {
         elems.push(whole);
         for cap in &m.captures {
             let v = match cap {
+                // A group spanning the whole match (a tokenizer's `(\d+)|(\w+)`)
+                // is the same string: strings are values, so one serves both.
+                Some(r) if r.start == mstart && r.end == mend => whole,
                 Some(r) => mk(self, r.clone()),
                 None => Value::UNDEFINED,
             };
@@ -4002,12 +4297,12 @@ impl<'p> Vm<'p> {
                 return true;
             }
             use std::sync::atomic::{AtomicU8, Ordering};
-            static STATE: AtomicU8 = AtomicU8::new(0);
+            static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
             match STATE.load(Ordering::Relaxed) {
                 1 => true,
                 2 => false,
                 _ => {
-                    let on = std::env::var_os("ZIPP_NO_ASCII_SLICE_FAST").is_none();
+                    let on = crate::env_var_os("ZIPP_NO_ASCII_SLICE_FAST").is_none();
                     STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                     on
                 }
@@ -4560,6 +4855,24 @@ impl<'p> Vm<'p> {
     /// lone surrogates round-trip exactly and a covered (high, low) pair
     /// recombines into its astral scalar (canonical form).
     pub(crate) fn units_value(&mut self, units: &[u16]) -> Value {
+        // One ASCII unit is an interned string (as `alloc_js` would pick):
+        // `/./gu` over mostly-ASCII text slices one per match.
+        // One code point (a unit, or a surrogate pair) is the heap's cached
+        // one-character string: `/./gu` over text slices one per match.
+        match *units {
+            [u] => return self.str_from_cp(u32::from(u)),
+            [hi, lo] if (0xD800..0xDC00).contains(&hi) && (0xDC00..0xE000).contains(&lo) => {
+                let cp = 0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+                return self.str_from_cp(cp);
+            }
+            _ => {}
+        }
+        // An ASCII slice of a non-ASCII subject (most tokens of mixed text):
+        // its bytes are its units, with no WTF-8 encoding or rescan.
+        if units.iter().all(|&u| u < 0x80) {
+            let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+            return Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_ascii(bytes)));
+        }
         let mut out: Vec<u8> = Vec::with_capacity(units.len() * 3);
         push_units(&mut out, units);
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
@@ -6993,12 +7306,12 @@ pub(crate) fn match_variant_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCH_VARIANT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCH_VARIANT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7015,21 +7328,21 @@ pub(crate) fn rx_scalar_matchall_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_MATCHALL").is_none()
-                && std::env::var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none()
-                && std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none()
+            let v = (crate::env_var_os("ZIPP_NO_RX_SCALAR_MATCHALL").is_none()
+                && crate::env_var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none()
+                && crate::env_var_os("ZIPP_NO_FASTOK_MEMO").is_none()
                 && matchall_step_enabled()
                 && slim_exec_enabled()
                 && matchall_batch_enabled()
                 && match_variant_enabled()
                 && string_regexp_call_direct_enabled()
-                && std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
-                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+                && crate::env_var_os("ZIPP_NO_ITER_REGION").is_none()
+                && crate::env_var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7049,12 +7362,12 @@ pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7072,16 +7385,16 @@ pub(crate) fn rx_scalar_exec_enabled() -> bool {
         return false;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_EXEC").is_none()
+            let v = (crate::env_var_os("ZIPP_NO_RX_SCALAR_EXEC").is_none()
                 && regexp_call_direct_enabled()
                 && slim_exec_enabled()
                 && match_variant_enabled()
-                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+                && crate::env_var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7098,12 +7411,12 @@ pub(crate) fn regexp_call_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_CALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_CALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7120,12 +7433,12 @@ pub(crate) fn string_regexp_call_direct_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_RX_STRING_CALL_DIRECT").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_RX_STRING_CALL_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -7177,7 +7490,7 @@ pub(crate) mod rxstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_RXSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_RXSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

@@ -1083,12 +1083,30 @@ impl Regex {
         )
     }
 
+    /// PATCH (see startpredicate.rs `UnitFilter`): whether a match can begin
+    /// at code unit `start`. A sticky lexer tries several patterns at each
+    /// position and most fail on their first element; this answers those
+    /// before an executor (and its loop, group and backtrack vectors) exists.
+    /// A pattern with a filter consumes at least one element, so the end of
+    /// the text answers no as well.
+    #[cfg(feature = "utf16")]
+    #[inline(always)]
+    fn unit_may_start(&self, text: &[u16], start: usize) -> bool {
+        match &self.cr.unit_start {
+            Some(f) => text.get(start).is_some_and(|&u| f.contains(u)),
+            None => true,
+        }
+    }
+
     /// PATCH (FORK.md B9): one match attempt anchored at code-unit index
     /// `start`, code-point elements — the sticky counterpart of
     /// [`Self::find_from_utf16`]. `start` should be a code-point boundary: the
     /// caller maps a `lastIndex` inside a surrogate pair to the pair's start.
     #[cfg(feature = "utf16")]
     pub fn match_at_utf16(&self, text: &[u16], start: usize) -> Option<Match> {
+        if !self.unit_may_start(text, start) {
+            return None;
+        }
         let input = Utf16Input::new(text, self.cr.flags.unicode_mode());
         classicalbacktrack::BacktrackExecutor::new(
             input,
@@ -1115,6 +1133,9 @@ impl Regex {
     /// [`Self::find_from_ucs2`].
     #[cfg(feature = "utf16")]
     pub fn match_at_ucs2(&self, text: &[u16], start: usize) -> Option<Match> {
+        if !self.unit_may_start(text, start) {
+            return None;
+        }
         let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         classicalbacktrack::BacktrackExecutor::new(
             input,

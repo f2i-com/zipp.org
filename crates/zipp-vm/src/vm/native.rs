@@ -303,8 +303,7 @@ pub const AGENT_SLEEP: u16 = 904;
 /// error chain first.
 pub const DISPOSE_ASYNC_STEP: u16 = 905;
 pub const DISPOSE_ASYNC_STEP_REJECT: u16 = 906;
-/// Host `print(...)` as a first-class global value (the bare CALL form is
-/// compiled to the Print instruction; this covers `var p = print` etc.).
+/// Host `print(...)`.
 pub const GLOBAL_PRINT: u16 = 907;
 /// The `$262.agent` worker-thread slice (vm/agents.rs): `start(src)` spawns a
 /// concurrent agent (blocks until running); `broadcast(sab[, id])` blocks
@@ -470,9 +469,7 @@ pub const DEC_ACCESS_GET: u16 = 941;
 pub const DEC_ACCESS_SET: u16 = 942;
 /// `context.access.has(target)` — same state as DEC_ACCESS_GET.
 pub const DEC_ACCESS_HAS: u16 = 943;
-/// Host console namespace methods. Unlike the compile-time `Print` shortcut,
-/// these are first-class callable values so dynamic/`with` resolution can fall
-/// back to the actual global object without changing observable semantics.
+/// Host console namespace methods.
 pub const CONSOLE_LOG: u16 = 944;
 pub const CONSOLE_INFO: u16 = 945;
 pub const CONSOLE_WARN: u16 = 946;

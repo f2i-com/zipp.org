@@ -160,6 +160,22 @@ const _: () = {
     assert!(JIT_IC_TABLE_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 };
 
+/// The heap's ready objects (`Heap::ready`): each class's `next` and `end`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_READY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, ready);
+
+/// `proto_of`'s values (`ProtoTable::raw`), for an instance's entry.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, raw_len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_PROTO_COUNT_OFFSET: usize = core::mem::offset_of!(Vm<'static>, proto_of)
+    + core::mem::offset_of!(crate::slot_table::ProtoTable, count);
+
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
 /// on EVERY access — the mirror vectors grow when helpers allocate, and
@@ -223,10 +239,14 @@ const _: () = {
     use crate::vm::TiercActivationState as A;
     assert!(core::mem::offset_of!(A, active) == 0);
     assert!(core::mem::offset_of!(A, frame_free) == 1);
+    assert!(core::mem::offset_of!(A, _pad0) == 2);
     assert!(core::mem::offset_of!(A, closure) == 4);
     assert!(core::mem::offset_of!(A, callee) == 8);
+    assert!(core::mem::offset_of!(A, _pad1) == 12);
     assert!(core::mem::offset_of!(A, upvals_raw) == 16);
     assert!(core::mem::size_of::<A>() == 24);
+    // The whole-word moves (`Vm::tierc_activation_words`) read it as `[u64; 3]`.
+    assert!(core::mem::align_of::<A>() == 8);
 };
 /// B189b mirrors for the emitted call lane: a Closure occupant's captured
 /// `this` bits and (B243, emitted again) its upvalue base, which the inline
@@ -307,7 +327,7 @@ const _: () = {
     assert!(core::mem::offset_of!(R, depth) == 0);
     assert!(core::mem::offset_of!(R, slots) == 8);
     assert!(core::mem::size_of::<R>() == 8 + 24 * crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX);
-    assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 62);
+    assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 2046);
 };
 /// B189b native GC-due guard: the emitted lane calls only when NO collection
 /// is pending (`maybe_gc` would be a no-op); a pending request routes to the
@@ -1421,13 +1441,23 @@ impl<'p> Vm<'p> {
         roots: &[Value],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let base = self.host_result_roots.len();
-        self.host_result_roots
-            .extend(roots.iter().copied().filter(|value| value.is_heap()));
+        let base = self.enter_host_roots(roots);
         let result = f(self);
         debug_assert!(self.host_result_roots.len() >= base);
         self.host_result_roots.truncate(base);
         result
+    }
+
+    /// [`Vm::with_host_roots`]' entry, out of the generic body: the root
+    /// stack's length before `roots`' heap values are pushed. One copy of
+    /// the filtering push instead of one per caller's closure type (19 in
+    /// the WebAssembly module).
+    #[inline(never)]
+    fn enter_host_roots(&mut self, roots: &[Value]) -> usize {
+        let base = self.host_result_roots.len();
+        self.host_result_roots
+            .extend(roots.iter().copied().filter(|value| value.is_heap()));
+        base
     }
 
     /// Root one more temporary in the innermost [`Vm::with_host_roots`]

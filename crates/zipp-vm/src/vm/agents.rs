@@ -317,6 +317,7 @@ pub(crate) type WaiterKey = (usize, usize);
 /// One registered waiter, FIFO-ordered per key. A blocked `Atomics.wait`
 /// parks on its own [`WaitCell`]; an `Atomics.waitAsync` records its Vm's
 /// [`Mailbox`] plus the unique id its `async_waiters` tuple carries.
+#[cfg_attr(feature = "wasm-single-agent", allow(dead_code))]
 pub(crate) enum WaiterEntry {
     Sync(Arc<WaitCell>),
     Async { mailbox: Arc<Mailbox>, id: u64 },
@@ -326,6 +327,7 @@ pub(crate) enum WaiterEntry {
 /// `notify` flips the state under the registry lock; the waiter re-checks it
 /// around every condvar wake, so a spurious wakeup (or a plain data op on the
 /// address — see the no-spurious-wakeup-* tests) never ends the wait early.
+#[cfg_attr(feature = "wasm-single-agent", allow(dead_code))]
 pub(crate) struct WaitCell {
     state: Mutex<u8>,
     cv: Condvar,
@@ -350,6 +352,7 @@ fn waiters() -> &'static Mutex<HashMap<WaiterKey, VecDeque<WaiterEntry>>> {
 
 /// Unique ids tying a registry `Async` entry to one Vm `async_waiters` tuple
 /// (0 is reserved for "never registered").
+#[cfg(not(feature = "wasm-single-agent"))]
 fn next_waiter_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -358,6 +361,7 @@ fn next_waiter_id() -> u64 {
 /// `timeout_ms` (clamped >= 0, possibly +inf) as an `Instant` deadline; None
 /// = wait forever. Finite values are capped (~1 year) so
 /// `Duration::from_secs_f64` cannot overflow on absurd-but-finite timeouts.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) fn finite_deadline(timeout_ms: f64) -> Option<crate::vm::clock::Instant> {
     if timeout_ms.is_finite() {
         let secs = (timeout_ms / 1000.0).min(86_400.0 * 365.0);
@@ -368,6 +372,7 @@ pub(crate) fn finite_deadline(timeout_ms: f64) -> Option<crate::vm::clock::Insta
 }
 
 /// How a blocking `Atomics.wait` ended.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) enum WaitOutcome {
     NotEqual,
     TimedOut,
@@ -381,6 +386,7 @@ pub(crate) enum WaitOutcome {
 /// lapses. A lapsed waiter deregisters itself under the registry lock —
 /// finding its entry already gone means a `notify` popped (and counted) it
 /// concurrently, and that wake wins: "ok".
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) fn sync_wait(
     key: WaiterKey,
     timeout_ms: f64,
@@ -443,6 +449,7 @@ pub(crate) fn sync_wait(
 }
 
 /// What `Atomics.waitAsync` decided under the registry lock.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) enum AsyncWaitDecision {
     NotEqual,
     TimedOut,
@@ -453,6 +460,7 @@ pub(crate) enum AsyncWaitDecision {
 /// as [`sync_wait`], but the enqueued entry carries the caller's mailbox and
 /// a fresh id instead of a parked cell. The caller files the id (with the
 /// promise + deadline) in its `async_waiters`.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) fn register_async_waiter(
     key: WaiterKey,
     timeout_ms: f64,
@@ -481,6 +489,7 @@ pub(crate) fn register_async_waiter(
 /// wake already sitting in its mailbox); an Async waiter belonging to the
 /// CALLING Vm (`own_mailbox`) is instead returned for direct in-place
 /// resolution. Returns (total woken, own ids).
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) fn notify_waiters(
     key: WaiterKey,
     count: f64,

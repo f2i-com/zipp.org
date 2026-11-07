@@ -19,7 +19,7 @@ pub(crate) mod interp_stats {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Mutex;
 
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static TABLE: Mutex<Option<HashMap<u32, (String, u64, u64)>>> = Mutex::new(None);
     /// `(func, region entry ip, resume ip) -> runs`: how often each compiled
     /// loop region was entered and where it handed control back. A resume ip
@@ -33,7 +33,7 @@ pub(crate) mod interp_stats {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_INTERPSTATS").is_some();
+                let on = crate::env_var_os("ZIPP_INTERPSTATS").is_some();
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -105,24 +105,25 @@ pub(crate) const LEAN_DESC_KNOWN: u32 = 1 << 26;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 pub(crate) const LEAN_DESC_ARROW: u32 = 1 << 27;
 
+/// What [`Vm::tail_call_lean`] made of a tail call.
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+enum TailLean {
+    /// Nothing: the full path decides.
+    No,
+    /// The dispatch continues with the frame now on top.
+    Next,
+    /// The callee's value finished the run.
+    Done(Value),
+}
+
 /// How many arguments `Vm::arg_window` copies out on the stack.
 const ARGS_ON_STACK: usize = 8;
 
-/// `ZIPP_NO_JIT_SHARED_CONSTS=1`: compiled code embeds a fresh string per
-/// literal, as before `Vm::jit_const_str_bits` took the shared one.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn jit_shared_const_strs_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_JIT_SHARED_CONSTS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_JIT_SHARED_CONSTS=1`: compiled code embeds a fresh string per
+    /// literal, as before `Vm::jit_const_str_bits` took the shared one.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_shared_const_strs_enabled() = "ZIPP_NO_JIT_SHARED_CONSTS"
 }
 
 #[inline(always)]
@@ -131,12 +132,12 @@ fn lean_calls_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_LEAN_CALL").is_none();
+            let on = crate::env_var_os("ZIPP_NO_LEAN_CALL").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -162,9 +163,10 @@ impl<'p> Vm<'p> {
         // Native re-entry guard: a NESTED run_loop (builtin callback, generator
         // resume, direct eval, JIT bail) is a real Rust frame, and runaway
         // recursion through such re-entries would exhaust the OS stack before
-        // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
-        // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
-        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+        // MAX_FRAMES ever fires. Cap the nesting, by depth and by the floor of
+        // the stack the host declared, so it throws a catchable RangeError
+        // (staging/sm/extensions/recursion.js) instead of crashing.
+        if self.reentry_exhausted() {
             return Err(self.run_loop_depth_exceeded(stop_depth));
         }
         self.run_loop_depth += 1;
@@ -449,12 +451,6 @@ impl<'p> Vm<'p> {
             // loop; we never mutate program functions during execution.
             #[cfg(not(feature = "safe-sandbox"))]
             let code: &Vec<Instr> = unsafe { &*code };
-            // The running function's string constants, kept for the same
-            // reason: a property read, a property write and a method call
-            // each name their key through them, and each used to find the
-            // function again first (a bounds-checked double index, and in a
-            // size-first build a call).
-            let strs: &'p [String] = running.string_constants.as_slice();
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -570,7 +566,7 @@ impl<'p> Vm<'p> {
             // tiers: a frame they run whole needs none, and code placed
             // before their entry slowed a JIT row by 7% (warm-router).
             let icode: &'p [Instr] = if self.interp_fuse_ok() {
-                running.fused.entered(&running.code).unwrap_or(running.code.as_slice())
+                self.entered_code(func_id, running)
             } else {
                 running.code.as_slice()
             };
@@ -1252,13 +1248,11 @@ impl<'p> Vm<'p> {
                             // `i32::MIN % -1` (JS: -0) — and a zero remainder from
                             // a NEGATIVE dividend is -0 in JS, a double. All three
                             // fall through to the f64 path, which produces them.
-                            let ia = va.as_int();
-                            match ia.checked_rem(vb.as_int()) {
-                                Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
-                                _ => Value::num(va.as_f64() % vb.as_f64()),
-                            }
+                            super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                         } else if va.is_number() && vb.is_number() {
-                            Value::num(va.as_f64() % vb.as_f64())
+                            // Two doubles: integral ones (`(x >>> 0) % n`)
+                            // still skip the software fmod (`js_rem`).
+                            Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?
                         };
@@ -1640,6 +1634,7 @@ impl<'p> Vm<'p> {
                     // ── superinstructions (`FusedCode`) ── each is its two
                     // instructions' arms run back to back: the same number
                     // paths inline, the same helpers otherwise.
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddIntMove { dst, a, imm, upd, mdst, msrc } => {
                         let va = self.get(base, a);
                         let r = self.add_int_value(va, imm, upd)?;
@@ -1648,6 +1643,7 @@ impl<'p> Vm<'p> {
                         self.set(base, mdst, v);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddIntJump { dst, a, imm, upd, target } => {
                         let va = self.get(base, a);
                         let r = self.add_int_value(va, imm, upd)?;
@@ -1664,6 +1660,7 @@ impl<'p> Vm<'p> {
                         self.maybe_gc();
                         ip = target as usize;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntCmpJump { ldst, val, a, le, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1687,6 +1684,7 @@ impl<'p> Vm<'p> {
                         };
                         ip = if r { ip + 2 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseGlobalCmpJump { gdst, idx, a, le, target } => {
                         let g = self.globals[idx as usize];
                         let g = if g.is_uninitialized()
@@ -1711,6 +1709,7 @@ impl<'p> Vm<'p> {
                         };
                         ip = if r { ip + 2 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddLoadInt { ldst, val, dst, a } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1727,6 +1726,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadGlobalAddInt { gdst, idx, dst, a, imm, upd } => {
                         let g = self.globals[idx as usize];
                         let g = if g.is_uninitialized()
@@ -1742,6 +1742,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseAddReturn { dst, a, b, src } => {
                         let r = self.add(base, a, b)?;
                         self.set(base, dst, r);
@@ -1757,6 +1758,77 @@ impl<'p> Vm<'p> {
                         }
                         break;
                     }
+                    // The global runs (`overlay_global_runs`): an Int global with
+                    // no route here, everything else out of line (`global_run`).
+                    // Whole arms inline grew every other arm's register shuffles.
+                    #[cfg(not(feature = "meter-only"))]
+                    Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target } => {
+                        let g = self.globals[idx as usize];
+                        if g.is_int() && self.global_route_epoch == 0 {
+                            self.set(base, gdst, g);
+                            self.set(base, ldst, Value::int(val));
+                            ip = if g.as_int() < val { ip + 3 } else { target as usize };
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, false)?;
+                        }
+                    }
+                    #[cfg(not(feature = "meter-only"))]
+                    Instr::FuseGlobalIncJump { reg, idx, imm, target, .. } => {
+                        let g = self.globals[idx as usize];
+                        let r = if g.is_int() && self.global_store_plain(idx) {
+                            g.as_int().checked_add(imm as i32)
+                        } else {
+                            None
+                        };
+                        if let Some(r) = r {
+                            let r = Value::int(r);
+                            self.set(base, reg, r);
+                            self.globals[idx as usize] = r;
+                            // The backward `Jump` at `ip + 3`, as `FuseAddIntJump`'s.
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            if !LITE && self.jit_enabled {
+                                ip += 3;
+                                continue;
+                            }
+                            self.maybe_gc();
+                            ip = target as usize;
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, true)?;
+                        }
+                    }
+                    #[cfg(not(feature = "meter-only"))]
+                    Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx } => {
+                        let val = Value::int(val as i32);
+                        self.set(base, ldst, val);
+                        let va = self.get(base, a);
+                        let r = self.fused_bitwise(va, val, op)?;
+                        self.set(base, dst, r);
+                        if self.global_store_plain(idx) {
+                            self.globals[idx as usize] = r;
+                            ip += 3;
+                        } else {
+                            ip += 2;
+                        }
+                    }
+                    #[cfg(not(feature = "meter-only"))]
+                    Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op } => {
+                        let g = self.globals[idx as usize];
+                        if g.is_int() && self.global_route_epoch == 0 {
+                            let val = Value::int(val as i32);
+                            self.set(base, gdst, g);
+                            self.set(base, ldst, val);
+                            let r = self.fused_bitwise(g, val, op)?;
+                            self.set(base, dst, r);
+                            ip += 3;
+                        } else {
+                            ip = self.global_run(*instr, base, func_id, ip, true)?;
+                        }
+                    }
+                    #[cfg(not(feature = "meter-only"))]
+                    Instr::FuseGlobalInc { .. } => {
+                        ip = self.global_run(*instr, base, func_id, ip, true)?;
+                    }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadGlobal2 { dst, idx, dst2, idx2 } => {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized()
@@ -1778,6 +1850,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst2, v);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseLoadIntBitwise { ldst, val, dst, a, b, op } => {
                         self.set(base, ldst, Value::int(val));
                         let (va, vb) = (self.get(base, a), self.get(base, b));
@@ -1785,6 +1858,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseEqJump { dst, a, b, ne, when, target } => {
                         let (va, vb) = (self.get(base, a), self.get(base, b));
                         let eq = self.strict_eq_fast(va, vb);
@@ -1793,6 +1867,7 @@ impl<'p> Vm<'p> {
                         // Forward only (see the variant): no back-edge here.
                         ip = if r == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntEqJump { ldst, val, a, dst, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1806,6 +1881,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r { target as usize } else { ip + 3 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseIntNeJump { ldst, val, a, dst, target } => {
                         self.set(base, ldst, Value::int(val));
                         let va = self.get(base, a);
@@ -1817,6 +1893,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r { ip + 3 } else { target as usize };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseConstEqJump { ldst, idx, a, dst, when, target } => {
                         let c = self.resolve_const_slot(func_id, idx.into());
                         self.set(base, ldst, c);
@@ -1824,21 +1901,20 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip = if r == when { target as usize } else { ip + 3 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseTypeOfJump { dst, a, code, neg, when, target } => {
                         let va = self.get(base, a);
-                        let t = self.type_of(va);
-                        let m = crate::bytecode::TYPEOF_NAMES
-                            .get(code as usize)
-                            .is_some_and(|&n| n == t)
-                            != neg;
+                        let m = (self.type_code(va) == code) != neg;
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseNotJump { dst, a, when, target } => {
                         let m = !self.truthy(self.get(base, a));
                         self.set(base, dst, Value::bool(m));
                         ip = if m == when { target as usize } else { ip + 2 };
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseNullJump { ldst, a, dst, ne, when, target } => {
                         // `a == null`, as `loose_eq_nullish` decides it.
                         self.set(base, ldst, Value::NULL);
@@ -1935,17 +2011,14 @@ impl<'p> Vm<'p> {
                         // unfused pair computes (code 255 indexes nothing and
                         // so never matches).
                         let va = self.get(base, a);
-                        let t = self.type_of(va);
-                        let m = crate::bytecode::TYPEOF_NAMES
-                            .get(code as usize)
-                            .is_some_and(|&n| n == t);
+                        let m = self.type_code(va) == code;
                         self.set(base, dst, Value::bool(m != neg));
                         ip += 1;
                     }
                     Instr::TypeOfSame { dst, a, b, neg } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let same = self.type_of(va) == self.type_of(vb);
+                        let same = self.type_code(va) == self.type_code(vb);
                         self.set(base, dst, Value::bool(same != neg));
                         ip += 1;
                     }
@@ -1992,29 +2065,42 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let cv = self.get(base, callee);
-                        // A plain constructor function: its frame is pushed
-                        // here, in this loop, as a call's is, and its pop
-                        // hands back the instance (`construct_this`).
-                        let flat = match self.flat_new_instance(cv) {
-                            Some((fid, closure, obj)) => Some((fid, closure, obj, cv)),
-                            None => self.flat_new_class_instance(cv)?,
-                        };
-                        if let Some((fid, closure, obj, callee_v)) = flat {
-                            let rooted = self.host_result_roots.len();
-                            self.host_result_roots.push(obj);
-                            self.pending_new_target = cv;
-                            let pushed = self.setup_call(
-                                fid, closure, obj, base, arg_base, argc, dst, ip + 1, callee_v,
-                            );
-                            self.pending_new_target = Value::UNDEFINED;
-                            self.host_result_roots.truncate(rooted);
-                            pushed?;
-                            if let Some(f) = self.frames.last_mut() {
-                                f.construct_this = true;
-                            }
-                            break;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if self.jit_enabled {
+                            self.note_new_site(ip, cv);
                         }
-                        self.new_construct(base, ip, dst, cv, arg_base, argc)?;
+                        // A body that only stores: the finished instance.
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        let stored = self.new_stored(cv, base, arg_base, argc);
+                        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                        let stored: Option<Value> = None;
+                        if let Some(v) = stored {
+                            self.set(base, dst, v);
+                        } else {
+                            // A plain constructor function: its frame is pushed
+                            // here, in this loop, as a call's is, and its pop
+                            // hands back the instance (`construct_this`).
+                            let flat = match self.flat_new_instance(cv) {
+                                Some((fid, closure, obj)) => Some((fid, closure, obj, cv)),
+                                None => self.flat_new_class_instance(cv)?,
+                            };
+                            if let Some((fid, closure, obj, callee_v)) = flat {
+                                let rooted = self.host_result_roots.len();
+                                self.host_result_roots.push(obj);
+                                self.pending_new_target = cv;
+                                let pushed = self.setup_call(
+                                    fid, closure, obj, base, arg_base, argc, dst, ip + 1, callee_v,
+                                );
+                                self.pending_new_target = Value::UNDEFINED;
+                                self.host_result_roots.truncate(rooted);
+                                pushed?;
+                                if let Some(f) = self.frames.last_mut() {
+                                    f.construct_this = true;
+                                }
+                                break;
+                            }
+                            self.new_construct(base, ip, dst, cv, arg_base, argc)?;
+                        }
                         ip += 1;
                     }
                     Instr::FieldInit {
@@ -2848,7 +2934,7 @@ impl<'p> Vm<'p> {
                                 // Q4 leaf-call inline plan: monomorphic plain-leaf
                                 // callees at this region's Call sites (read-only —
                                 // built before the &proto borrow below).
-                                let leaf_plan = self.build_leaf_inline_plan(
+                                let mut leaf_plan = self.build_leaf_inline_plan(
                                     func_id,
                                     t as u32,
                                     region_end as u32,
@@ -2904,7 +2990,8 @@ impl<'p> Vm<'p> {
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
                                 let proto_ref = unsafe { &*proto };
-                                let heap_helper_addrs = self.jit_heap_helper_addrs();
+                                let mut heap_helper_addrs = self.jit_heap_helper_addrs();
+                                heap_helper_addrs.acc_lanes = self.build_acc_lane_plan(func_id);
                                 // ── globals that are NOT slot bindings ──
                                 // An UNINITIALIZED slot is not an empty binding:
                                 // a script GlobalDeclarationInstantiation
@@ -2938,8 +3025,9 @@ impl<'p> Vm<'p> {
                                 // copy of a cross-tier fact is the whole point of B66.
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
-                                let (cross_plan, cross_pending, cross_baked) =
+                                let (mut cross_plan, cross_pending, cross_baked) =
                                     self.build_cross_call_plan(func_id, Some(base), false);
+                                self.plan_new_lanes(func_id, &mut cross_plan, &mut leaf_plan);
                                 self.jit.note_cross_baked(func_id, &cross_baked);
                                 // B199: a "no entry yet" decline at a REGION is
                                 // deferred (capped) instead of baked — the callee
@@ -3015,12 +3103,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
-                        // A comparison's boolean, nearly always: no call.
-                        let t = if v.is_bool() {
-                            v.bits() == Value::TRUE.bits()
-                        } else {
-                            self.truthy(v)
-                        };
+                        let t = self.jump_condition(v);
                         if !t {
                             // A taken BACKWARD conditional closes a loop
                             // (`do … while`): the same GC safe point as the
@@ -3036,11 +3119,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
-                        let t = if v.is_bool() {
-                            v.bits() == Value::TRUE.bits()
-                        } else {
-                            self.truthy(v)
-                        };
+                        let t = self.jump_condition(v);
                         if t {
                             // See `JumpIfFalse`: a backward taken branch is a
                             // loop back-edge.
@@ -3073,9 +3152,10 @@ impl<'p> Vm<'p> {
                             ip = target as usize;
                         } else {
                             #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            // The cycle is 14 instructions, 15 when `o.a = i;`
+                            // stores from a copy of `i` (`object_loop`).
                             if ip >= 6
-                                && target as usize >= 15
-                                && target as usize - 15 == ip
+                                && matches!((target as usize).checked_sub(ip), Some(14 | 15))
                                 && self.get(base, a) == Value::int(1)
                             {
                                 // Run the first iteration normally so its
@@ -3240,6 +3320,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseUpvalGetMove { dst, idx, mdst, msrc } => {
                         #[cfg(not(feature = "safe-sandbox"))]
                         let cell = self.closure_upvalue_cached(&mut upv, cur_closure, idx);
@@ -3257,6 +3338,7 @@ impl<'p> Vm<'p> {
                         self.set(base, mdst, m);
                         ip += 2;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FuseMove2 { dst, src, dst2, src2 } => {
                         let v = self.get(base, src);
                         self.set(base, dst, v);
@@ -3587,7 +3669,7 @@ impl<'p> Vm<'p> {
                         // `ic_get_prop` call further down. A getter way 0
                         // names is called from here as that call's would be.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        match self.ic_get_prop_way0(func_id, ip, o) {
+                        match self.ic_get_prop_way0(func_id, ip, o, name) {
                             GetAct::Value(v) => {
                                 self.set(base, dst, v);
                                 ip += 1;
@@ -3598,6 +3680,16 @@ impl<'p> Vm<'p> {
                                 closure,
                                 getter,
                             } => {
+                                // A leaf getter (`get v() { return this._v; }`)
+                                // runs without a frame (`lite::leaf_scan`).
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, o, true, base, 0, 0) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 // A shaped receiver is an object: no boxing.
                                 self.setup_call_this_outlined(
                                     fid,
@@ -3621,7 +3713,22 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
+                        // `.length` of a string, an Array or a TypedArray is
+                        // an internal slot, not a property the shape-keyed IC
+                        // can hold, so every such read used to fall through
+                        // the IC miss and the generic member walk: ~26ns on a
+                        // string or Array and ~45ns on a TypedArray, against
+                        // ~6ns for a cached field. It is the bound of nearly
+                        // every loop, and a fifth of a bundle's reads, so
+                        // answer it before any probe.
+                        if key.len() == 6 && key == "length" && o.is_heap() {
+                            if let Some(v) = self.length_fast(o) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // A private name the own hit did not answer (`private_get_slow`).
                         if is_private_key(key) {
                             if let Some(v) = self.private_get_slow(func_id, ip, name, o, key)? {
@@ -3641,20 +3748,6 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
-                        }
-                        // `.length` of a string, an Array or a TypedArray is
-                        // an internal slot, not a property the shape-keyed IC
-                        // can hold, so every such read used to fall through
-                        // the IC miss and the generic member walk: ~26ns on a
-                        // string or Array and ~45ns on a TypedArray, against
-                        // ~6ns for a cached field. It is the bound of nearly
-                        // every loop, so answer it before the IC.
-                        if key.len() == 6 && key == "length" && o.is_heap() {
-                            if let Some(v) = self.length_fast(o) {
-                                self.set(base, dst, v);
-                                ip += 1;
-                                continue;
-                            }
                         }
                         // A receiver with no shape (an Array, a string, a
                         // DataView, a Map or Set, a promise) can never hit the
@@ -3742,6 +3835,14 @@ impl<'p> Vm<'p> {
                                 // The lean push: an object receiver needs no
                                 // boxing even for a sloppy getter.
                                 let this_is_object = self.is_object_value(o);
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, o, this_is_object, base, 0, 0) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 self.setup_call_this_outlined(
                                     fid,
                                     closure,
@@ -3835,7 +3936,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
                         // Private stores (field-init emission, compound and update
                         // writes) go to the side table or the accessors. One
                         // byte-compare on the hot path.
@@ -3951,7 +4052,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let key = strs[name as usize].as_str();
+                        let key = running.string_constants[name as usize].as_str();
                         self.private_set_strict(func_id, ip, name, o, key, v)?;
                         ip += 1;
                     }
@@ -4093,6 +4194,12 @@ impl<'p> Vm<'p> {
                         // callee (native/bound/class/generator/async/primitive)
                         // falls through to the Call+Return emitted after.
                         let callee_v = self.get(base, callee);
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        match self.tail_call_lean::<LITE>(base, callee_v, arg_base, argc, stop_depth) {
+                            TailLean::Next => break,
+                            TailLean::Done(v) => return Ok(v),
+                            TailLean::No => {}
+                        }
                         // Args live above `base` — copy them out BEFORE the
                         // window is rebuilt in place: into a stack buffer for
                         // the usual few (a `Vec` here was an allocator round
@@ -4176,7 +4283,7 @@ impl<'p> Vm<'p> {
                         // `this.#m()` ran it.
                         let copy_method = if plain.is_none()
                             && (name == crate::bytecode::NO_NAME
-                                || matches!(strs[name as usize].as_str(), "slice" | "concat"))
+                                || matches!(running.string_constants[name as usize].as_str(), "slice" | "concat"))
                         {
                             self.captured_array_copy_method(func_id, ip)
                         } else {
@@ -4206,6 +4313,21 @@ impl<'p> Vm<'p> {
                                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                                 if self.jit_enabled && crate::codegen::cwt_leaf_enabled() {
                                     let _ = self.ic_call(func_id, ip, callee_v);
+                                }
+                                // A leaf callee runs without a frame
+                                // (`lite::leaf_scan`): a `super.area()` whose
+                                // target reads a field and adds. A sloppy
+                                // callee's `this` is boxed by its frame, so
+                                // only a strict one's is passed as it is.
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) =
+                                        self.leaf_call(fid, closure, this_val, p.is_strict, base, arg_base, argc)
+                                    {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
                                 }
                                 // The lean push for a strict callee (every
                                 // class method: `super.m()`, `this.#m()`);
@@ -4381,6 +4503,17 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
+                            // A leaf callee runs without a frame (`lite::leaf_scan`).
+                            #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                            if LITE {
+                                if let Some(v) =
+                                    self.leaf_call(call.fid, call.closure, Value::UNDEFINED, false, base, arg_base, argc)
+                                {
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             // The entry carries the callee's frame facts: the
                             // push reads nothing of its `FuncProto`.
                             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
@@ -4511,7 +4644,7 @@ impl<'p> Vm<'p> {
                                 // Minified code names everything `t`/`e`, so the
                                 // enclosing function's string literals are what
                                 // actually identify it. Opt-in: they are long.
-                                let strings = if std::env::var_os("ZIPP_TRACE_CALLS").is_some() {
+                                let strings = if crate::env_var_os("ZIPP_TRACE_CALLS").is_some() {
                                     let sample: Vec<&str> = f
                                         .string_constants
                                         .iter()
@@ -4582,24 +4715,50 @@ impl<'p> Vm<'p> {
                         argc,
                     } => {
                         let recv = self.get(base, obj);
+                        // The method cache's ways by the receiver's mirror
+                        // alone (`ic_call_method_mirror`): a hit needs neither
+                        // the name nor the receiver's slot and map.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let early = self.ic_call_method_mirror(func_id, ip, recv);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let early: Option<(u32, u32, Value)> = None;
                         // `program` outlives the VM, so borrow the method name
                         // with the program's lifetime (NOT self's) â€” avoids
                         // cloning the name string on every method call (a heap
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
-                        let key: &'p str = &strs[name as usize];
+                        // An early hit leaves this arm below without it.
+                        let key: &'p str = if early.is_none() {
+                            &running.string_constants[name as usize]
+                        } else {
+                            ""
+                        };
                         // A method of an ordinary object or class instance: the
                         // method cache first. None of the receiver-kind leaves
                         // below can serve such a receiver (they want a string,
                         // a DataView, a generator, an array, a Map or a
                         // function), and each paid a key compare or a heap read
                         // before the cache on every `o.m()`.
-                        let object_recv = recv.is_heap()
-                            && !is_private_key(key)
-                            && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_));
+                        let object_recv = early.is_some()
+                            || (recv.is_heap()
+                                && !is_private_key(key)
+                                && matches!(self.heap.get(recv.heap_index()), HeapObj::Object(_)));
                         if object_recv {
-                            if let Some((fid, closure, callee)) = self.ic_call_method(func_id, ip, recv, key) {
+                            let hit = match early {
+                                Some(hit) => Some(hit),
+                                None => self.ic_call_method(func_id, ip, recv, key),
+                            };
+                            if let Some((fid, closure, callee)) = hit {
+                                // A leaf callee runs without a frame (`lite::leaf_scan`).
+                                #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                if LITE {
+                                    if let Some(v) = self.leaf_call(fid, closure, recv, true, base, arg_base, argc) {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 self.setup_call_lean_this(
                                     fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee,
                                 )?;
@@ -4791,6 +4950,20 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // The array methods compiled code calls directly
+                        // (`array_mutate_fast`, `array_read_fast`): the same
+                        // declines, the same arms. After the reduction above,
+                        // which a loop that only wants the copy's length takes
+                        // first: placed ahead of it, the lane built every copy
+                        // the reduction skips (sparse-array-v2 +13%).
+                        #[cfg(not(feature = "meter-only"))]
+                        if recv.is_heap() && matches!(self.heap.get(recv.heap_index()), HeapObj::Array(_)) {
+                            if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // PrivateMethodCall brand check (`obj.#m()`): the receiver must
                         // carry the declaring class's brand, else a TypeError. Gated on
                         // is_private_key so ordinary calls (push/map/…) only pay a
@@ -4804,7 +4977,7 @@ impl<'p> Vm<'p> {
                             // and owner's method search below were two thirds
                             // of a `this.#m()` call.
                             #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv) {
+                            if let GetAct::Value(f) = self.ic_get_prop_way0(func_id, ip, recv, name) {
                                 if let Some((fid, closure)) = self.plain_fn_entry(f) {
                                     self.setup_call_lean_this(
                                         fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, f,
@@ -5115,6 +5288,7 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
+                    #[cfg(not(feature = "meter-only"))]
                     Instr::FusePopHandlerJump { target } => {
                         let top = self.frames.len() - 1;
                         self.frames[top].handlers.pop();
@@ -5480,243 +5654,20 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
-                        // A generator is driven by `.next()`; the cursor is unused.
-                        // The step is taken without its `{value, done}` result
-                        // object, which nothing could see: built, read back and
-                        // dropped, it was a third of a generator-driven loop.
-                        // A `yield*` step still hands over the inner result
-                        // object itself, which is read below as before.
-                        // A primed loop decided at `IterPrime` (its record's
-                        // [[NextMethod]] is read once: undefined there means the
-                        // intrinsic); an unprimed step asks now.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator(_))
-                            && if next != u16::MAX {
-                                self.get(base, next).is_undefined()
-                            } else {
-                                self.gen_method_pristine(it.heap_index(), "next")
-                            }
+                        // A generator's step runs as a frame of this loop; its
+                        // yield or return completes this instruction.
+                        if self.iter_generator_direct(base, it, next)
+                            && self.gen_enter_inline(it.heap_index(), ip, value_dst, done_dst, Value::UNDEFINED, false)
                         {
-                            // Run the step as a frame of this loop; its yield or
-                            // return completes this instruction.
-                            if self.gen_enter_inline(it.heap_index(), ip, value_dst, done_dst, Value::UNDEFINED, false) {
-                                break;
-                            }
-                            let res = match self.generator_next_step(it.heap_index())? {
-                                Some(super::async_runtime::GenStep::Yield(v)) => {
-                                    self.set(base, value_dst, v);
-                                    self.set(base, done_dst, Value::FALSE);
-                                    ip += 1;
-                                    continue;
-                                }
-                                Some(super::async_runtime::GenStep::Done(v)) => {
-                                    self.set(base, value_dst, v);
-                                    self.set(base, done_dst, Value::TRUE);
-                                    ip += 1;
-                                    continue;
-                                }
-                                Some(super::async_runtime::GenStep::Raw(r)) => r,
-                                None => Value::UNDEFINED,
-                            };
-                            // `iter_result` builds `{value, done}` in that order
-                            // and nothing else, so when the result is exactly
-                            // that shape its slots can be read directly instead
-                            // of through two full `get_prop`s. Verified against
-                            // the map rather than assumed, because `yield*`
-                            // returns the INNER result verbatim and that may be
-                            // any user object.
-                            if let Some((val, done)) = self.iter_result_unwrap(res) {
-                                self.set(base, value_dst, val);
-                                self.set(base, done_dst, done);
-                                ip += 1;
-                                continue;
-                            }
-                            let done = self.get_prop(res, "done")?;
-                            let val = self.get_prop(res, "value")?;
-                            self.set(base, value_dst, val);
-                            self.set(base, done_dst, done);
-                            ip += 1;
-                            continue;
+                            break;
                         }
-                        // A user iterator object (`@@iterator` already resolved by
-                        // GetIterator): pull the next result via `.next()`. Lazy â€”
-                        // a `break` simply stops calling it. The cached prologue
-                        // [[NextMethod]] (IterPrime) is used when present; the
-                        // uncached (destructuring) sites re-fetch per step.
-                        // `HeapObj::Intl` is in the list for %SegmentIterator%:
-                        // it is an ordinary object with a `next` method, and
-                        // without it `for (v of segmenter.segment(s))` fell
-                        // through to the positional walk below and reported the
-                        // iterator itself as "not iterable".
-                        // A generator lands here when its `next` was replaced
-                        // (the arm above runs it directly only while it is the
-                        // intrinsic).
-                        if matches!(
-                            self.heap.get(it.heap_index()),
-                            HeapObj::Object(_)
-                                | HeapObj::Proxy { .. }
-                                | HeapObj::Iterator { .. }
-                                | HeapObj::IterHelper(_)
-                                | HeapObj::Intl { .. }
-                                | HeapObj::Generator(_)
-                        ) {
-                            let next = if next != u16::MAX {
-                                self.get(base, next)
-                            } else {
-                                self.get_prop(it, "next")?
-                            };
-                            if self.is_callable(next) {
-                                // A %RegExpStringIterator% stepped by the PRISTINE
-                                // intrinsic `next`: run the step inline. The
-                                // {value, done} result object the intrinsic would
-                                // build is engine-internal and its `done`/`value`
-                                // Gets are unobservable — skip both.
-                                if next.is_heap()
-                                    && matches!(self.heap.get(next.heap_index()),
-                                                HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
-                                {
-                                    if let Some(step) =
-                                        self.regexp_string_iter_step(it.heap_index())
-                                    {
-                                        let (val, done) = step?;
-                                        self.set(base, value_dst, val);
-                                        self.set(base, done_dst, Value::bool(done));
-                                        ip += 1;
-                                        continue;
-                                    }
-                                    // Same argument, same intrinsic `next`: a
-                                    // live %ArrayIteratorPrototype% iterator
-                                    // (`a.values()`, `a.keys()`, `a.entries()`,
-                                    // and every iterator-helper chain over an
-                                    // array) is stepped inline, and the
-                                    // {value, done} object it would have built
-                                    // — 90ns of a 143ns step — is never made.
-                                    if let Some(step) = self.array_iter_step(it.heap_index()) {
-                                        let (val, done) = step?;
-                                        self.set(base, value_dst, val);
-                                        self.set(base, done_dst, Value::bool(done));
-                                        ip += 1;
-                                        continue;
-                                    }
-                                    // Map/Set (`map.keys()`, `set.values()`,
-                                    // `map.entries()`) and snapshot iterators.
-                                    // `None` leaves the TypedArray-backed case,
-                                    // whose per-step bounds check can throw, on
-                                    // the general path below.
-                                    if let Some((val, done)) =
-                                        self.collection_iter_step(it.heap_index())?
-                                    {
-                                        self.set(base, value_dst, val);
-                                        self.set(base, done_dst, Value::bool(done));
-                                        ip += 1;
-                                        continue;
-                                    }
-                                }
-                                let res = self.call_value(next, it, &[])?;
-                                // IteratorNext step 3: a non-Object result is a TypeError.
-                                if !self.is_object_value(res) {
-                                    return Err(Thrown(
-                                        "TypeError: iterator result is not an object".into(),
-                                    ));
-                                }
-                                // IteratorStep reads only `done`; IteratorValue (the
-                                // `value` Get — observable via a getter) happens ONLY
-                                // when the iterator is not done.
-                                let done = self.get_prop(res, "done")?;
-                                let val = if self.truthy(done) {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.get_prop(res, "value")?
-                                };
-                                self.set(base, value_dst, val);
-                                self.set(base, done_dst, done);
-                                ip += 1;
-                                continue;
-                            }
-                        }
-                        // Array/Set element, string char, or Map [k,v] at the cursor.
-                        let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
-                        // A Set's / Map's tombstoned (deleted) slots are skipped.
-                        while match self.heap.get(it.heap_index()) {
-                            HeapObj::Set(items) => cursor < items.len() && items[cursor].is_hole(),
-                            HeapObj::Map { keys, .. } => {
-                                cursor < keys.len() && keys[cursor].is_hole()
-                            }
-                            _ => false,
-                        } {
-                            cursor += 1;
-                        }
-                        // A STRING iterates by CODE POINT (one step per scalar; an
-                        // astral char is ONE step) while the cursor advances in
-                        // UTF-16 units (matching `.length`). Flatten a rope first
-                        // (no-op tag check for everything else).
-                        self.heap.flatten(it.heap_index());
-                        let str_step = match self.heap.get(it.heap_index()) {
-                            HeapObj::Str(s) => Some(s.cp_step(cursor)),
-                            _ => None,
-                        };
-                        if let Some(step) = str_step {
-                            match step {
-                                Some((cp, next)) => {
-                                    // `cp` may be a lone surrogate — a real 1-unit
-                                    // surrogate string, not U+FFFD.
-                                    let val = self.str_from_cp(cp);
-                                    self.set(base, value_dst, val);
-                                    self.set(base, done_dst, Value::bool(false));
-                                    self.set(base, idx, Value::int(next as i32));
-                                }
-                                None => self.set(base, done_dst, Value::bool(true)),
-                            }
-                            ip += 1;
-                            continue;
-                        }
-                        // `coll`: a Map/Set step reads its entry positionally
-                        // (`collection_entry_at`); everything else is an ordinary index.
-                        let (len, coll) = match self.heap.get(it.heap_index()) {
-                            // The JS length: past the dense store for a
-                            // virtual array (the fast path above declined it).
-                            HeapObj::Array(_) => (self.js_array_len(it.heap_index()), false),
-                            HeapObj::Set(items) => (items.len(), true),
-                            HeapObj::Str(s) => (s.units(), false),
-                            HeapObj::Cons { len, .. } => (*len, false),
-                            HeapObj::Map { keys, .. } => (keys.len(), true),
-                            // The LIVE length each step: a tracking view follows its
-                            // resizable buffer (shrink ends early, grow yields more);
-                            // a detached/out-of-bounds view mid-iteration throws.
-                            HeapObj::TypedArray { .. } => {
-                                match self.ta_effective_len(it.heap_index()) {
-                                    Some(n) => (n, false),
-                                    None => {
-                                        return Err(Thrown(
-                                            "TypeError: TypedArray iterator: the viewed buffer is detached or out of bounds".into(),
-                                        ))
-                                    }
-                                }
-                            }
-                            _ => {
-                                return Err(Thrown(format!(
-                                    "TypeError: {} is not iterable",
-                                    self.display(it)
-                                )));
-                            }
-                        };
-                        if cursor < len {
-                            let val = if coll {
-                                self.collection_entry_at(it, cursor)
-                            } else {
-                                self.get_index(it, Value::int(cursor as i32))?
-                            };
-                            self.set(base, value_dst, val);
-                            self.set(base, done_dst, Value::bool(false));
-                            self.set(base, idx, len_value(cursor + 1));
-                        } else {
-                            self.set(base, done_dst, Value::bool(true));
-                        }
+                        self.iter_next_step(base, it, value_dst, done_dst, idx, next)?;
                         ip += 1;
                     }
                     // Instructions no measured workload executes run in `dispatch_cold`,
                     // out of line, so this loop stays small (see `vm/dispatch_cold.rs`).
                     _ => match self.dispatch_cold(
-                        instr, ip, frame_idx, func_id, base, cur_closure, running, code, strs, stop_depth,
+                        instr, ip, frame_idx, func_id, base, cur_closure, running, code, stop_depth,
                     )? {
                         super::dispatch_cold::ColdFlow::Next(next) => ip = next,
                         super::dispatch_cold::ColdFlow::Frame => break,
@@ -5734,6 +5685,7 @@ impl<'p> Vm<'p> {
     /// other value matches none. Answers the next ip.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn str_switch(
         &mut self,
         running: &'p crate::bytecode::FuncProto,
@@ -5792,6 +5744,7 @@ impl<'p> Vm<'p> {
     /// next ip.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn int_switch(
         &mut self,
         running: &'p crate::bytecode::FuncProto,
@@ -5825,6 +5778,114 @@ impl<'p> Vm<'p> {
         } else {
             sw.after as usize
         }
+    }
+
+    /// A tail call of a plain function, from its entry in `frame_descs`. A
+    /// leaf runs without a frame and its value is this frame's return;
+    /// anything else with a lean frame takes this frame over.
+    /// `try_tail_reuse` reads the callee's `FuncProto` for every flag and
+    /// copies the arguments out first, and it gives a leaf a frame. A site's
+    /// call cache would answer no better: tail sites are often polymorphic
+    /// or call a fresh closure each time, and it refilled, costing more
+    /// instructions than this saved. The answer depends only on the function.
+    /// Out of line, so the dispatch loop stays the size it was.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn tail_call_lean<const LITE: bool>(
+        &mut self,
+        base: usize,
+        callee_v: Value,
+        arg_base: u16,
+        argc: u16,
+        stop_depth: usize,
+    ) -> TailLean {
+        if !callee_v.is_heap() {
+            return TailLean::No;
+        }
+        let idx = callee_v.heap_index();
+        let (fid, closure) = match self.heap.get(idx) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, idx),
+            _ => return TailLean::No,
+        };
+        let desc = match self.frame_descs.get(fid as usize) {
+            Some(&d) if d != 0 => d,
+            _ => self.frame_desc_fill(fid),
+        };
+        if desc & (LEAN_DESC_OK | LEAN_DESC_ARROW) == 0 {
+            return TailLean::No;
+        }
+        let top = self.frames.len() - 1;
+        // A constructing frame's `this` is the instance its pop returns, and
+        // a frame with handlers has a `finally` to route through.
+        if self.frames[top].construct_this || self.frames[top].handlers.capacity() != 0 {
+            return TailLean::No;
+        }
+        if LITE {
+            if let Some(v) = self.leaf_call(fid, closure, Value::UNDEFINED, false, base, arg_base, argc) {
+                return if self.pop_frame_fast(v, stop_depth) {
+                    TailLean::Done(v)
+                } else {
+                    TailLean::Next
+                };
+            }
+        }
+        let this_val = if desc & LEAN_DESC_OK != 0 {
+            if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+                Value::heap(self.callee_this_global(callee_v))
+            } else {
+                Value::UNDEFINED
+            }
+        } else if desc & LEAN_DESC_ARROW != 0 && closure != NO_CLOSURE {
+            self.arrow_closure_this(closure, Value::UNDEFINED)
+        } else {
+            return TailLean::No;
+        };
+        let callee_regs = (desc & 0xFFFF) as usize;
+        let n = (argc as usize).min(((desc >> 16) & 0xFF) as usize);
+        // The streak's end throws on the full path.
+        if self.tail_reuse_streak >= MAX_TAIL_REUSE_STREAK
+            || !self.regs_fit_now(base + callee_regs)
+            || !lean_calls_enabled()
+            || !self.regs.reopen_window(base, callee_regs, this_val, base + arg_base as usize, n)
+        {
+            return TailLean::No;
+        }
+        self.tail_reuse_streak += 1;
+        let fr = &mut self.frames[top];
+        fr.func = fid;
+        fr.closure = closure;
+        fr.ip = 0;
+        fr.callee = callee_v;
+        fr.new_target = Value::UNDEFINED;
+        fr.eval_scope = u32::MAX;
+        fr.super_done = false;
+        fr.args_obj = u32::MAX;
+        fr.arg_win = u32::MAX;
+        fr.argc = 0;
+        fr.is_eval = false;
+        TailLean::Next
+    }
+
+    /// Function `fid`'s entry in `frame_descs`, first asked: its
+    /// [`Self::lean_call_desc`], with neither lean flag for a generator or an
+    /// async function, whose call does not run its body in a frame.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[cold]
+    #[inline(never)]
+    fn frame_desc_fill(&mut self, fid: u32) -> u32 {
+        let p = self.func(fid as usize);
+        let desc = if p.is_generator || p.is_async {
+            LEAN_DESC_KNOWN
+        } else {
+            self.lean_call_desc(fid) | LEAN_DESC_KNOWN
+        };
+        let i = fid as usize;
+        if self.frame_descs.len() <= i {
+            self.frame_descs.resize(self.funcs.len().max(i + 1), 0);
+        }
+        self.frame_descs[i] = desc;
+        desc
     }
 
     /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,
@@ -5918,12 +5979,16 @@ impl<'p> Vm<'p> {
         }
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let mapinfo =
-                (!p_strict && simple).then(|| (self.frames.len() - 1, base, callee_params));
-            let arr = self.build_arguments_object(argv.to_vec(), callee_v, p_strict, mapinfo);
-            self.regs[base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(fid as usize).args_count_only {
+                self.regs[base + areg as usize] = Value::int(argv.len() as i32);
+            } else {
+                let mapinfo =
+                    (!p_strict && simple).then(|| (self.frames.len() - 1, base, callee_params));
+                let arr = self.build_arguments_object(argv.to_vec(), callee_v, p_strict, mapinfo);
+                self.regs[base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
         let fr = self.frames.last_mut().unwrap();
@@ -5949,6 +6014,35 @@ impl<'p> Vm<'p> {
     /// and Tier C whole-function path). All entries are fixed `extern "win64" fn`
     /// addresses — independent of `self` — so this is a pure constructor.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_math_imul_data_slot(&self, receiver_idx: u32) -> Option<(Value, u64, u32)> {
+        let HeapObj::Object(map) = self.heap.get(receiver_idx) else {
+            return None;
+        };
+        let slot = map.pos("imul")?;
+        if map.attr_at(slot).accessor {
+            return None;
+        }
+        let callee = map.val_at(slot);
+        let native_id = native::MATH_METHOD_BASE + crate::bytecode::MathFn::Imul as u16;
+        self.static_builtin_is_intrinsic("Math", native_id, callee, Value::heap(receiver_idx))
+            .then_some((callee, map.vals_ptr() as u64, slot as u32))
+    }
+
+    /// The live `Math` and its `imul`, while it is the intrinsic data property:
+    /// what `jit_math_imul_guard` bakes, for a guard that runs on every region
+    /// entry. Rebuilding the whole guard there looked up every `Math` method, a
+    /// fifth of `numbers-format-parse`, whose `fnv` enters its loop per string.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_math_imul_live(&self) -> Option<(u64, u64)> {
+        let receiver_idx = self.builtin_ns_slots[0];
+        if receiver_idx == u32::MAX {
+            return None;
+        }
+        let (callee, ..) = self.jit_math_imul_data_slot(receiver_idx)?;
+        Some((Value::heap(receiver_idx).bits(), callee.bits()))
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_math_imul_guard(&self) -> Option<crate::codegen::MathIntrinsicGuard> {
         // The generated Math.imul path can replace its per-call Rust identity
         // helper with local comparisons. In addition to the captured reference
@@ -5957,7 +6051,7 @@ impl<'p> Vm<'p> {
         // data slot and generation, and re-read the live slot before doing any
         // arithmetic.  An accessor, deletion, relocation or in-place overwrite
         // all fail closed to the unchanged bytecode/call path.
-        if std::env::var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
+        if crate::env_var_os("ZIPP_NO_DIRECT_MATH_GUARD").is_some() {
             return None;
         }
         self.builtin_globals
@@ -5965,20 +6059,8 @@ impl<'p> Vm<'p> {
             .copied()
             .and_then(|receiver_idx| {
                 let receiver = Value::heap(receiver_idx);
-                let (callee, receiver_vals, receiver_slot) = match self.heap.get(receiver_idx) {
-                    HeapObj::Object(map) => {
-                        let slot = map.pos("imul")?;
-                        if map.attr_at(slot).accessor {
-                            return None;
-                        }
-                        (map.val_at(slot), map.vals_ptr() as u64, slot as u32)
-                    }
-                    _ => return None,
-                };
-                let native_id = native::MATH_METHOD_BASE + crate::bytecode::MathFn::Imul as u16;
-                if !self.static_builtin_is_intrinsic("Math", native_id, callee, receiver) {
-                    return None;
-                }
+                let (callee, receiver_vals, receiver_slot) =
+                    self.jit_math_imul_data_slot(receiver_idx)?;
                 // Bake every other Math.* intrinsic the same way, so the
                 // emitted per-op guard is three compares rather than a helper
                 // call (`emit_math_identity_guard`). An op whose property is
@@ -6115,6 +6197,8 @@ impl<'p> Vm<'p> {
             is_array: jit_is_array as *const () as usize,
             len_of: jit_len_of as *const () as usize,
             forin_keys: jit_forin_keys as *const () as usize,
+            acc_lanes: None,
+            priv_lanes: None,
         }
     }
 
@@ -6430,7 +6514,7 @@ impl<'p> Vm<'p> {
         // which may compile NEW regions (rehashing `jit.regions` — any &Region
         // would dangle) or even evict THIS region (parked in `Jit::retired`,
         // so the mmap'd code stays alive for the in-flight run).
-        let (entry, field_plan, local_sroa, bounds, is_mem) = {
+        let (entry, field_plan, local_sroa, bounds, is_mem, cells) = {
             let region = self.jit.get_region(func_id, entry_ip)?;
             (
                 region.entry(),
@@ -6438,8 +6522,19 @@ impl<'p> Vm<'p> {
                 region.local_sroa_plan().cloned(),
                 region.bounds(),
                 region.is_mem(),
+                region.cells().to_vec(),
             )
         };
+        // A flattened region reads a captured variable from a pool global. A
+        // cell in its temporal dead zone throws on the read: not this run's.
+        for c in &cells {
+            let v = self.heap.cell_get(c.cell);
+            if v.is_uninitialized() {
+                self.jit.note_region_entry_refused(func_id, entry_ip);
+                return None;
+            }
+            self.globals[c.slot as usize] = v;
+        }
 
         // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
         // pool globals the native code reads as ordinary globals.
@@ -6673,6 +6768,9 @@ impl<'p> Vm<'p> {
                 let v = self.globals[slot as usize];
                 let _ = self.set_prop(obj, &key, v, false);
             }
+        }
+        for c in cells.iter().filter(|c| c.written) {
+            self.heap.cell_set(c.cell, self.globals[c.slot as usize]);
         }
         // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.
         // A call helper may have flagged this exit as exempt (depth-cap deopt /
@@ -6995,6 +7093,33 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "safe-sandbox"))]
         return unsafe { *self.regs.get_unchecked(index) };
     }
+    /// The instructions a frame of `func_id` (`running`) dispatches on: its
+    /// superinstruction copy (`FusedCode`, built on its first entry) when
+    /// anything in it fused, else its code. Every call and every return asks,
+    /// and a program of thousands of functions kept that answer in a record of
+    /// its own, a cold line per frame transition; `Vm::entered_code` keeps
+    /// only the answers, four to a line.
+    #[inline(always)]
+    fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+        match self.entered_code.get(func_id as usize) {
+            Some(&Some(code)) => code,
+            _ => self.entered_code_fill(func_id, running),
+        }
+    }
+
+    /// [`Self::entered_code`]'s first ask for a function.
+    #[cold]
+    #[inline(never)]
+    fn entered_code_fill(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+        let code = running.fused.entered(&running.code).unwrap_or(running.code.as_slice());
+        let i = func_id as usize;
+        if self.entered_code.len() <= i {
+            self.entered_code.resize(self.funcs.len().max(i + 1), None);
+        }
+        self.entered_code[i] = Some(code);
+        code
+    }
+
     /// Whether the dispatch may run a function's superinstruction copy
     /// (`FusedCode`): not under `ZIPP_NO_INTERP_FUSE`, and not while a
     /// recorder meters or traces each instruction, which a superinstruction
@@ -7018,6 +7143,7 @@ impl<'p> Vm<'p> {
     /// everything else (coercion, BigInt, the TypeErrors) through
     /// `numeric_binop`.
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn fused_bitwise(&mut self, va: Value, vb: Value, op: crate::bytecode::BitwiseOp) -> Result<Value, Thrown> {
         use crate::bytecode::BitwiseOp as B;
         let ints = if va.is_int() && vb.is_int() {
@@ -7057,6 +7183,7 @@ impl<'p> Vm<'p> {
     /// Number paths inline, a Python `for` counter's small BigInt inline as
     /// in the arm (it is every iteration's), the rest out of line.
     #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn add_int_value(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
         if va.is_int() {
             return Ok(match va.as_int().checked_add(imm) {
@@ -7080,6 +7207,7 @@ impl<'p> Vm<'p> {
     /// superinstruction (`Instr::FuseAddIntMove`): the arm's own code.
     #[cold]
     #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
     fn add_int_generic(&mut self, va: Value, imm: i32, upd: bool) -> Result<Value, Thrown> {
         let p = self.numeric_prim(va)?;
         if let Some(b) = self.bigint_val(p) {
@@ -7109,6 +7237,119 @@ impl<'p> Vm<'p> {
         unsafe {
             *self.regs.get_unchecked_mut(index) = v;
         }
+    }
+
+    /// Whether a store to global slot `idx` is a plain write of the slot
+    /// now: what `StoreGlobal`, `StoreGlobalStrict` and `StoreGlobalResolved`
+    /// each do for an initialized slot that no own property of the global
+    /// object routes, with no evalScript `const` and no pending unresolvable
+    /// reference (the global runs' stores, `overlay_global_runs`).
+    #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn global_store_plain(&self, idx: u32) -> bool {
+        !self.globals[idx as usize].is_uninitialized()
+            && self.eval_const_globals.is_empty()
+            && self.strict_unresolvable_globals.is_empty()
+            && (self.global_route_epoch == 0 || !self.global_real_own_route(idx))
+    }
+
+    /// Global `idx` as `LoadGlobal` reads it.
+    #[inline(always)]
+    #[cfg(not(feature = "meter-only"))]
+    fn global_run_load(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
+        let g = self.globals[idx as usize];
+        if g.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
+            self.load_global_slow(idx, func_id)
+        } else {
+            Ok(g)
+        }
+    }
+
+    /// One global run (`overlay_global_runs`) at `ip`, in either loop: its
+    /// instructions' arms back to back, and the next position. A store that
+    /// is no plain slot write (`global_store_plain`) is left to its own arm,
+    /// which the run continues at; so is the back-edge of a counter step when
+    /// `osr_back_edge` (the main loop with the JIT on, where the `Jump` arm
+    /// feeds the OSR tier). Out of line: inline, these arms cost every other
+    /// arm of the loops a few percent of their instructions.
+    #[inline(never)]
+    #[cfg(not(feature = "meter-only"))]
+    pub(crate) fn global_run(
+        &mut self,
+        instr: Instr,
+        base: usize,
+        func_id: u32,
+        ip: usize,
+        osr_back_edge: bool,
+    ) -> Result<usize, Thrown> {
+        Ok(match instr {
+            Instr::FuseGlobalIntCmpJump { gdst, idx, ldst, val, target } => {
+                let g = self.global_run_load(idx as u32, func_id)?;
+                self.set(base, gdst, g);
+                self.set(base, ldst, Value::int(val));
+                let r = if g.is_int() {
+                    g.as_int() < val
+                } else if g.is_double() {
+                    g.as_f64() < val as f64
+                } else {
+                    self.cmp_lt(base, gdst, ldst, true)?
+                };
+                if r {
+                    ip + 3
+                } else {
+                    target as usize
+                }
+            }
+            Instr::FuseGlobalIncJump { reg, idx, imm, upd, .. } | Instr::FuseGlobalInc { reg, idx, imm, upd } => {
+                let g = self.globals[idx as usize];
+                if g.is_int() && self.global_store_plain(idx) {
+                    let r = match g.as_int().checked_add(imm as i32) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(g.as_int() as f64 + imm as f64),
+                    };
+                    self.set(base, reg, r);
+                    self.globals[idx as usize] = r;
+                    match instr {
+                        // The backward `Jump` at `ip + 3`, as `FuseAddIntJump`'s.
+                        Instr::FuseGlobalIncJump { target, .. } if !osr_back_edge => {
+                            self.maybe_gc();
+                            target as usize
+                        }
+                        _ => ip + 3,
+                    }
+                } else {
+                    // The load and the step; the store in its own arm.
+                    let g = self.global_run_load(idx, func_id)?;
+                    self.set(base, reg, g);
+                    let r = self.add_int_value(g, imm.into(), upd)?;
+                    self.set(base, reg, r);
+                    ip + 2
+                }
+            }
+            Instr::FuseIntBitwiseStoreGlobal { ldst, val, dst, a, op, idx } => {
+                let val = Value::int(val as i32);
+                self.set(base, ldst, val);
+                let va = self.get(base, a);
+                let r = self.fused_bitwise(va, val, op)?;
+                self.set(base, dst, r);
+                if self.global_store_plain(idx) {
+                    self.globals[idx as usize] = r;
+                    ip + 3
+                } else {
+                    ip + 2
+                }
+            }
+            Instr::FuseGlobalIntBitwise { gdst, idx, ldst, val, dst, op } => {
+                let g = self.global_run_load(idx, func_id)?;
+                self.set(base, gdst, g);
+                let val = Value::int(val as i32);
+                self.set(base, ldst, val);
+                let r = self.fused_bitwise(g, val, op)?;
+                self.set(base, dst, r);
+                ip + 3
+            }
+            _ => unreachable!("global_run is given a global run"),
+        })
     }
 
     // â”€â”€ call setup â”€â”€
@@ -7688,7 +7929,34 @@ impl<'p> Vm<'p> {
     /// `SuperCtor` at `ip` (`super(...)`), out of `dispatch_body` as
     /// [`Self::new_construct`] is.
     #[inline(never)]
-    fn super_ctor_call(
+    /// `super(...args)` (`SuperCtorSpread`) on the top frame at `base`: as
+    /// [`Self::super_ctor_call`], the arguments the elements of the array in
+    /// register `args`. The interpreter's arm and Tier C's
+    /// (`jit_class_ctor_op_impl`).
+    pub(crate) fn super_ctor_spread_call(
+        &mut self,
+        base: usize,
+        ip: usize,
+        ctor: u16,
+        home_class_id: u32,
+        args: u16,
+    ) -> Result<(), Thrown> {
+        let parent = self.get(base, ctor);
+        self.sync_top_ip(ip);
+        if !self.is_constructor(parent) {
+            return Err(Thrown("TypeError: superclass is not a constructor".into()));
+        }
+        let this = self.get(base, 0);
+        let args_v = self.get(base, args);
+        let arg_vec = self.array_snapshot(args_v.heap_index());
+        // As `super_ctor_call`: an arrow's `super(...)` passes the captured
+        // `new.target`.
+        let nt = self.frame_new_target();
+        let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
+        self.super_ctor_complete(base, this, produced, home_class_id)
+    }
+
+    pub(crate) fn super_ctor_call(
         &mut self,
         base: usize,
         ip: usize,
@@ -7708,12 +7976,12 @@ impl<'p> Vm<'p> {
         let mut small = [Value::UNDEFINED; ARGS_ON_STACK];
         let mut big = Vec::new();
         let args = self.arg_window(base, arg_base, argc, &mut small, &mut big);
-        // `super(...)` keeps the derived activation's new.target.
-        let nt = self
-            .frames
-            .last()
-            .map(|f| f.new_target)
-            .unwrap_or(Value::UNDEFINED);
+        // `super(...)` keeps the derived activation's new.target: an ARROW
+        // calling it (`() => super(x)`) has no own, and reads the one it
+        // captured inside the construction, as `new.target` does
+        // (`frame_new_target`); its frame's own is undefined, which the
+        // parent constructor saw as its `new.target`.
+        let nt = self.frame_new_target();
         // super() PRODUCES `this`; completion enforces the once-only rule,
         // rebinds reg 0 (return-override), lifts the this-TDZ and runs this
         // class's deferred field initializers.
@@ -7819,17 +8087,21 @@ impl<'p> Vm<'p> {
         // `arguments`: an array of ALL actual args (a function that references it).
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let argsv: Vec<Value> = (0..argc as usize)
-                .map(|i| self.regs[caller_base + arg_base as usize + i])
-                .collect();
-            // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
-            // the frame about to be pushed (frames.len() is its index).
-            let mapinfo =
-                (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
-            let arr = self.build_arguments_object(argsv, callee_val, is_strict, mapinfo);
-            self.regs[new_base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(func_id as usize).args_count_only {
+                self.regs[new_base + areg as usize] = Value::int(argc as i32);
+            } else {
+                let argsv: Vec<Value> = (0..argc as usize)
+                    .map(|i| self.regs[caller_base + arg_base as usize + i])
+                    .collect();
+                // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
+                // the frame about to be pushed (frames.len() is its index).
+                let mapinfo =
+                    (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+                let arr = self.build_arguments_object(argsv, callee_val, is_strict, mapinfo);
+                self.regs[new_base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
 
@@ -7928,11 +8200,15 @@ impl<'p> Vm<'p> {
         }
         let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let mapinfo = (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
-            let arr = self.build_arguments_object(args.to_vec(), callee_val, is_strict, mapinfo);
-            self.regs[new_base + areg as usize] = arr;
-            if mapinfo.is_some() {
-                args_obj = arr.heap_index();
+            if self.func(func_id as usize).args_count_only {
+                self.regs[new_base + areg as usize] = Value::int(args.len() as i32);
+            } else {
+                let mapinfo = (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+                let arr = self.build_arguments_object(args.to_vec(), callee_val, is_strict, mapinfo);
+                self.regs[new_base + areg as usize] = arr;
+                if mapinfo.is_some() {
+                    args_obj = arr.heap_index();
+                }
             }
         }
         let last = self.frames.len() - 1;
@@ -8045,13 +8321,8 @@ impl<'p> Vm<'p> {
         } else {
             this_val
         };
-        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-        self.regs[new_base] = this_val;
         let n = (argc as usize).min(proto.param_count as usize);
-        for i in 0..n {
-            let v = self.regs[caller_base + arg_base as usize + i];
-            self.regs[new_base + 1 + i] = v;
-        }
+        self.regs.open_window(callee_regs, this_val, caller_base + arg_base as usize, n);
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
@@ -8173,6 +8444,51 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// [`Self::setup_call_lean_this`] for a method of an ordinary object or
+    /// class instance `recv` whose callee's frame facts the caller holds
+    /// (`desc`, [`Self::lean_call_desc`]): the lite method cache's push,
+    /// which reads nothing of the callee's `FuncProto`.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn setup_call_method_desc(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        recv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> Result<(), Thrown> {
+        let new_base = self.regs.len();
+        let lean = desc & LEAN_DESC_OK != 0
+            && self.frames.len() < MAX_FRAMES
+            && self.regs_fit_now(new_base + (desc & 0xFFFF) as usize)
+            && lean_calls_enabled();
+        #[cfg(feature = "python")]
+        let lean = lean && !super::prof_py::on();
+        if !lean {
+            return self.setup_call_lean_this(
+                func_id,
+                closure,
+                recv,
+                true,
+                caller_base,
+                arg_base,
+                argc,
+                dst,
+                caller_ip_next,
+                callee_val,
+            );
+        }
+        self.lean_desc_push(func_id, closure, desc, recv, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        Ok(())
+    }
+
     /// [`Self::setup_call_lean_desc`] for an arrow ([`LEAN_DESC_ARROW`]): the
     /// same push, with the `this` its closure captured. An arrow took the
     /// whole of `setup_call`, which reads the callee's prototype for every
@@ -8242,13 +8558,9 @@ impl<'p> Vm<'p> {
     ) {
         let callee_regs = (desc & 0xFFFF) as usize;
         let params = ((desc >> 16) & 0xFF) as usize;
-        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-        self.regs[new_base] = this_val;
+        debug_assert_eq!(new_base, self.regs.len());
         let n = (argc as usize).min(params);
-        for i in 0..n {
-            let v = self.regs[caller_base + arg_base as usize + i];
-            self.regs[new_base + 1 + i] = v;
-        }
+        self.regs.open_window(callee_regs, this_val, caller_base + arg_base as usize, n);
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
@@ -8718,7 +9030,7 @@ impl<'p> Vm<'p> {
 /// NaN, the infinities, larger magnitudes and every non-number: those take
 /// the full ToNumeric path.
 #[inline(always)]
-fn number_int32(v: Value) -> Option<i32> {
+pub(crate) fn number_int32(v: Value) -> Option<i32> {
     if v.is_int() {
         return Some(v.as_int());
     }

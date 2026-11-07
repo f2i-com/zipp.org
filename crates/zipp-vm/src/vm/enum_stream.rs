@@ -86,12 +86,12 @@ fn enum_loop_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ENUM_LOOP_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ENUM_LOOP_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -104,12 +104,12 @@ fn enum_count_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ENUM_COUNT_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ENUM_COUNT_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -122,12 +122,12 @@ fn sparse_forin_fold_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPARSE_FORIN_FOLD").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_SPARSE_FORIN_FOLD").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -140,12 +140,12 @@ fn in_probe_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_IN_PROBE_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_IN_PROBE_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -158,12 +158,12 @@ fn array_copy_len_reduce_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_ARRAY_COPY_LEN_REDUCE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_ARRAY_COPY_LEN_REDUCE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -1348,7 +1348,19 @@ impl<'p> Vm<'p> {
             }
             sparse_entries.push((index as u32, value));
         }
-        sparse_entries.sort_unstable_by_key(|(index, _)| *index);
+        // Ascending index order. The indices are distinct, so each entry's
+        // index above its position is a `u64` that sorts the same way, through
+        // the engine's one `[u64]` sort rather than a copy for this tuple.
+        let mut order: Vec<u64> = sparse_entries
+            .iter()
+            .enumerate()
+            .map(|(pos, &(index, _))| u64::from(index) << 32 | pos as u64)
+            .collect();
+        order.sort_unstable();
+        let sparse_entries: Vec<(u32, Value)> = order
+            .into_iter()
+            .map(|key| sparse_entries[(key & u64::from(u32::MAX)) as usize])
+            .collect();
         let key_count = dense_entries.len().checked_add(sparse_entries.len())?;
         let final_count = (count.as_int() as i64).checked_add(key_count as i64)?;
         let final_count = i32::try_from(final_count).ok()?;

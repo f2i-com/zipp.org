@@ -293,6 +293,11 @@ pub struct CompiledRegex {
     // Unicode/UTF-16 programs always carry None.
     pub(crate) suffix_start: Option<crate::suffix_start::Plan>,
 
+    // PATCH (see startpredicate.rs `UnitFilter`): the first-unit filter the
+    // search uses over UTF-16 / UCS-2 input, where `start_pred` cannot run.
+    #[cfg(feature = "utf16")]
+    pub(crate) unit_start: Option<Box<crate::startpredicate::UnitFilter>>,
+
     // Number of loops, used to populate loop data.
     pub loops: u32,
 
@@ -372,6 +377,10 @@ impl CompiledRegex {
         }
         if let Some(plan) = &self.suffix_start {
             bytes = bytes.saturating_add(plan.resident_bytes());
+        }
+        #[cfg(feature = "utf16")]
+        if self.unit_start.is_some() {
+            bytes = bytes.saturating_add(core::mem::size_of::<crate::startpredicate::UnitFilter>());
         }
         #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
         {

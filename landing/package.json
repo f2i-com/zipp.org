@@ -1,7 +1,7 @@
 {
   "name": "zipp-landing",
   "private": true,
-  "version": "0.0.32",
+  "version": "0.0.33",
   "zippEngineRelease": "0.0.32",
   "type": "module",
   "engines": {

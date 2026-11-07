@@ -26,8 +26,15 @@ pub(crate) struct NativeCb {
     uninit_mask: u64,
     /// The global slot and value a self-calling body assumed (`try_run_jit`).
     self_binding: Option<(u32, u64)>,
-    /// A closure with captures: its cells are installed around each call.
-    capturing: bool,
+    /// A closure with captures: the base of its upvalue list, installed as
+    /// the activation's around each call, or 0. Read once: the list is fixed
+    /// at the closure's creation and the closure, the builtin's callback, is
+    /// rooted for the whole builtin, so the base cannot move under it. It was
+    /// a heap lookup per element.
+    upvals_raw: u64,
+    /// The JIT's evictions when `entry` was taken (`Jit::retired_count`):
+    /// after one, `entry` may be a parked body its function has replaced.
+    retired: usize,
 }
 
 impl<'p> Vm<'p> {
@@ -302,6 +309,7 @@ impl<'p> Vm<'p> {
         // calls compiled, and the conditions of a frame-free native call (the
         // ones an emitted cross-call site tests before it enters one).
         let capturing = !ups.is_empty();
+        let upvals_raw = if capturing { ups.as_ptr() as u64 } else { 0 };
         if capturing
             && (self.jit.cross_entry(fid).is_none()
                 || !self.closure_eval_scope.is_empty()
@@ -386,7 +394,7 @@ impl<'p> Vm<'p> {
                 .bits();
             let heap_helper_addrs = self.jit_heap_helper_addrs();
             let const_strs = self.jit_build_const_strs(fid);
-            let leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+            let mut leaf_plan = if crate::env_var_os("ZIPP_NO_TIERC_LEAF").is_none() {
                 self.build_leaf_inline_plan(fid, 0, (proto_ref.code.len() - 1) as u32)
             } else {
                 rustc_hash::FxHashMap::default()
@@ -394,7 +402,8 @@ impl<'p> Vm<'p> {
             // Callback compilation happens outside a live caller bytecode
             // frame/site, so there is no receiver exemplar to bake.
             let method_plan = rustc_hash::FxHashMap::default();
-            let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None, true);
+            let (mut cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None, true);
+            self.plan_new_lanes(fid, &mut cross_plan, &mut leaf_plan);
             self.jit.note_cross_pending(fid, &cross_pending);
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
@@ -415,6 +424,7 @@ impl<'p> Vm<'p> {
                 &plain_makefunc,
                 &prop_shape,
                 &class_read,
+                &crate::codegen::OptCallees::default(),
             );
         }
         // The direct global routes the body was compiled with, as
@@ -444,7 +454,8 @@ impl<'p> Vm<'p> {
             fid,
             uninit_mask,
             self_binding,
-            capturing,
+            upvals_raw,
+            retired: self.jit.retired_count(),
         })
     }
 
@@ -499,8 +510,11 @@ impl<'p> Vm<'p> {
         }
         // Still compiled (an evicted body is parked, never freed, so `entry`
         // stays callable; a function sent back to the interpreter must not be
-        // entered again), under the binding its self-calls assumed.
+        // entered again), by the body `entry` belongs to (one compiled again
+        // after an eviction is another body: the parked one's deopts would
+        // count against it), under the binding its self-calls assumed.
         let live = self.jit.fn_state(fid) == crate::codegen::FN_COMPILED
+            && (self.jit.retired_count() == native.retired || self.jit.entry_is_current(fid, entry))
             && native.self_binding.is_none_or(|(slot, expect)| {
                 self.globals.get(slot as usize).map(|v| v.bits()) == Some(expect)
             });
@@ -529,18 +543,8 @@ impl<'p> Vm<'p> {
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
         }
-        // A capturing closure's cells, read from the closure each call (its
-        // list never changes, but this is the pointer native code follows).
-        let upvals_raw = if native.capturing {
-            match self.heap.get(cb.heap_index()) {
-                HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
-                    upvalues.as_ptr() as u64
-                }
-                _ => return self.call_value(cb, this_val, args),
-            }
-        } else {
-            0u64
-        };
+        // A capturing closure's cells (see `NativeCb::upvals_raw`).
+        let upvals_raw = native.upvals_raw;
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is a valid compiled win64 fn (regs, bail_out, vm)->bits
@@ -555,7 +559,7 @@ impl<'p> Vm<'p> {
         // `visit` over a cyclic graph) nested native frames with no budget until
         // the OS stack overflowed and the process aborted. Charge it against the
         // same re-entry cap so it throws the interpreter's catchable RangeError.
-        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+        if self.reentry_exhausted() {
             return Err(Thrown::from_static(
                 "RangeError: Maximum call stack size exceeded",
             ));
@@ -646,6 +650,12 @@ impl<'p> Vm<'p> {
             return result;
         }
         let _ = (native, win);
+        // In a VM that runs only the interpreter, a leaf callback runs
+        // without a frame (`Vm::leaf_callback`).
+        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+        if let Some(v) = self.leaf_callback(cb, this_val, args) {
+            return Ok(v);
+        }
         self.call_value(cb, this_val, args)
     }
 }
@@ -679,7 +689,7 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
             let mant = if digits.len() > 1 {
                 format!("{}.{}", &digits[..1], &digits[1..])
             } else {
-                digits
+                digits.to_string()
             };
             (mant, exp)
         }

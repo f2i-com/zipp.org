@@ -67,56 +67,26 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// Kill switch: `ZIPP_NO_GPR_HOMES=1` disables the GPR-home sub-mode (the
-/// region then compiles on the xmm-home INT emitter exactly as before).
-pub(crate) fn gpr_homes_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_HOMES").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_HOMES=1` disables the GPR-home sub-mode (the
+    /// region then compiles on the xmm-home INT emitter exactly as before).
+    fn gpr_homes_enabled() = "ZIPP_NO_GPR_HOMES"
 }
 
-/// Kill switch: `ZIPP_NO_DV_GPR=1` disables the W9 DataView-on-GPR-homes
-/// hosting (the `region_int` DV retry and this emitter's DV arms). The region
-/// then falls to the DOUBLE tier's B115 DV arm exactly as before the wave.
-pub(crate) fn dv_gpr_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_DV_GPR").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_DV_GPR=1` disables the W9 DataView-on-GPR-homes
+    /// hosting (the `region_int` DV retry and this emitter's DV arms). The region
+    /// then falls to the DOUBLE tier's B115 DV arm exactly as before the wave.
+    fn dv_gpr_enabled() = "ZIPP_NO_DV_GPR"
 }
 
-/// Collapse repeated executions of a statically pure nested integer reduction
-/// after executing one real inner pass. The first pass supplies the exact
-/// modulo-2^32 accumulator delta; the generated tail applies that affine delta
-/// to the remaining outer iterations. `ZIPP_NO_DV_NESTED_REDUCE=1` restores
-/// the ordinary outer backedge for a same-binary comparison.
-fn dv_nested_reduce_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_DV_NESTED_REDUCE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Collapse repeated executions of a statically pure nested integer reduction
+    /// after executing one real inner pass. The first pass supplies the exact
+    /// modulo-2^32 accumulator delta; the generated tail applies that affine delta
+    /// to the remaining outer iterations. `ZIPP_NO_DV_NESTED_REDUCE=1` restores
+    /// the ordinary outer backedge for a same-binary comparison.
+    fn dv_nested_reduce_enabled() = "ZIPP_NO_DV_NESTED_REDUCE"
 }
 
 /// Fail-closed description of the canonical nested-loop shape emitted for a
@@ -842,68 +812,38 @@ fn dv_nested_reduce_plan(
     })
 }
 
-/// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
-/// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
-/// a region that fits the pool one-home-per-value still engages, restoring
-/// wave-6 behavior byte-for-byte. `ZIPP_NO_GPR_HOMES=1` kills the whole
-/// sub-mode, retry included.
-pub(crate) fn gpr_nest_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_NEST").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
+    /// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
+    /// a region that fits the pool one-home-per-value still engages, restoring
+    /// wave-6 behavior byte-for-byte. `ZIPP_NO_GPR_HOMES=1` kills the whole
+    /// sub-mode, retry included.
+    fn gpr_nest_enabled() = "ZIPP_NO_GPR_NEST"
 }
 
-/// Kill switch: `ZIPP_NO_GPR_SPLIT=1` refuses B94 split-receiver plans in this
-/// emitter again (W8). With it set, a split plan reaches native code only via
-/// the xmm INT emitter under `ZIPP_INT_SPLIT=1` — exactly the pre-W8 world.
-///
-/// Why splits are IN scope here: `int_split_enabled`'s refutation priced the
-/// split on the XMM emitter, where every Bitwise op round-trips xmm↔gpr on the
-/// serial chain (the i32 fill measured ~96ms vs ~60ms MEM), and its own
-/// follow-up note named "gpr (not xmm) homes for bitwise-chain regions" as the
-/// real fix. This emitter IS those homes; the write-through contract is
-/// mirrored instruction-for-instruction from the xmm emitter's proven B94 arm
-/// (def → boxed store to the reg-file slot BEFORE any i53 guard; flush skips
-/// the register; the receiver LoadGlobal stores the object to the same slot).
-pub(crate) fn gpr_split_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_SPLIT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_SPLIT=1` refuses B94 split-receiver plans in this
+    /// emitter again (W8). With it set, a split plan reaches native code only via
+    /// the xmm INT emitter under `ZIPP_INT_SPLIT=1` — exactly the pre-W8 world.
+    ///
+    /// Why splits are IN scope here: `int_split_enabled`'s refutation priced the
+    /// split on the XMM emitter, where every Bitwise op round-trips xmm↔gpr on the
+    /// serial chain (the i32 fill measured ~96ms vs ~60ms MEM), and its own
+    /// follow-up note named "gpr (not xmm) homes for bitwise-chain regions" as the
+    /// real fix. This emitter IS those homes; the write-through contract is
+    /// mirrored instruction-for-instruction from the xmm emitter's proven B94 arm
+    /// (def → boxed store to the reg-file slot BEFORE any i53 guard; flush skips
+    /// the register; the receiver LoadGlobal stores the object to the same slot).
+    fn gpr_split_enabled() = "ZIPP_NO_GPR_SPLIT"
 }
 
-/// Kill switch: `ZIPP_NO_GPR_LAZYSX=1` disables ONLY the W8 deferred
-/// sign-extension ([`lazy_sx_sets`] returns empty sets): every Bitwise/imul
-/// def canonicalizes immediately and entry admission stays wave-7 loose. The
-/// in-place instruction selection is unconditional — it is representation-
-/// neutral and locally verifiable arm by arm.
-pub(crate) fn gpr_lazysx_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_LAZYSX").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_LAZYSX=1` disables ONLY the W8 deferred
+    /// sign-extension ([`lazy_sx_sets`] returns empty sets): every Bitwise/imul
+    /// def canonicalizes immediately and entry admission stays wave-7 loose. The
+    /// in-place instruction selection is unconditional — it is representation-
+    /// neutral and locally verifiable arm by arm.
+    fn gpr_lazysx_enabled() = "ZIPP_NO_GPR_LAZYSX"
 }
 
 /// Kill switch: `ZIPP_NO_GPR_SPILL_SLOTS=1` disables the W10.3 frame spill
@@ -913,7 +853,7 @@ pub(crate) fn gpr_lazysx_enabled() -> bool {
 /// `ZIPP_NO_GPR_SPLIT` (above) is a DIFFERENT switch one edit-distance away.
 pub(crate) fn gpr_spill_slots_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
@@ -930,29 +870,19 @@ pub(crate) fn gpr_spill_slots_enabled() -> bool {
             // representation makes the op cheaper"). Kept dark for shapes a
             // future planner cost model may admit; `ZIPP_GPR_SPILL_SLOTS=1`
             // engages it, `ZIPP_NO_GPR_SPILL_SLOTS=1` forces it off even then.
-            let on = std::env::var_os("ZIPP_GPR_SPILL_SLOTS").is_some()
-                && std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+            let on = crate::env_var_os("ZIPP_GPR_SPILL_SLOTS").is_some()
+                && crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
     }
 }
 
-/// Kill switch: `ZIPP_NO_GPR_DEOPT_SHADOW=1` restores the per-definition
-/// boxed write-through used by B94/B97 and narrowed globals. The shadow mode
-/// is selected per plan below; an empty/refused plan emits the old bytes too.
-fn gpr_deopt_shadow_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_GPR_DEOPT_SHADOW").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Kill switch: `ZIPP_NO_GPR_DEOPT_SHADOW=1` restores the per-definition
+    /// boxed write-through used by B94/B97 and narrowed globals. The shadow mode
+    /// is selected per plan below; an empty/refused plan emits the old bytes too.
+    fn gpr_deopt_shadow_enabled() = "ZIPP_NO_GPR_DEOPT_SHADOW"
 }
 
 /// `compile_region_int_gpr`'s result. `PoolOverflow` is the one decline worth
@@ -1911,8 +1841,9 @@ fn spill_census(
 /// home to write an i32-range value:
 ///   - Bitwise (non-`>>>`) and `Math.imul` results are ToInt32 by definition;
 ///   - `LoadInt` / Int `LoadConst` / hoisted-const fills are i32 payloads;
-///   - pinned `GetIndex` (Int payload / i32 element, both movsxd'd) and pinned
-///     `charCodeAt` (movzx byte, 0..255) land in i32 range;
+///   - pinned `GetIndex` (Int payload / i32-or-narrower element) and pinned
+///     `charCodeAt` (movzx byte, 0..255) land in i32 range — a Uint32Array
+///     `GetIndex` (zero-extended, up to 2^32-1) is WIDE;
 ///   - `Move` / `LoadGlobal` / `StoreGlobal` / `AddInt +0` copies require the
 ///     SOURCE home i32-invariant (or an i32 immediate);
 ///   - everything else — Add/Sub/Mul/Mod/Neg, `AddInt` with a real immediate,
@@ -1953,6 +1884,7 @@ fn spill_census(
 fn lazy_sx_sets(
     proto: &FuncProto,
     plan: &RegionPlan,
+    ta_plan: &TaPinPlan,
     s: usize,
     e: usize,
     map: &FxHashMap<u8, Loc>,
@@ -2087,8 +2019,22 @@ fn lazy_sx_sets(
                 }
             }
             // Pinned element reads sign-extend an i32 (Int payload / i32
-            // element); pinned charCodeAt zero-extends a byte. Both i32.
-            Instr::GetIndex { .. } => {}
+            // element); pinned charCodeAt zero-extends a byte. Both i32 —
+            // except a Uint32Array read, which zero-extends up to 2^32-1 and
+            // is WIDE for the same reason as a DV getUint32 below.
+            Instr::GetIndex { dst, .. } => {
+                let u32_read = ta_plan
+                    .access
+                    .get(&ip)
+                    .and_then(|&j| ta_plan.pins.get(j as usize))
+                    .and_then(|p| int_ta_load_kind(p.kind))
+                    .is_some_and(|k| !k.fits_i32());
+                if u32_read {
+                    if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
+                        wide.insert(dh);
+                    }
+                }
+            }
             // W9: DV get* kinds 0-5 land in i32 range (census-neutral, like
             // charCodeAt); a getUint32 (kind 6) ranges to 2^32-1 and is NOT
             // i32-provable — its home is WIDE, or a consumer's lazy movsxd
@@ -2640,7 +2586,7 @@ pub(crate) fn compile_region_int_gpr(
     // from symbolic home colours to the existing GPR allocator.  The global
     // spill kill switch still disables both uses, and the computed lane's own
     // switch prevents this branch from existing at all.
-    let spills_not_forced_off = std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+    let spills_not_forced_off = crate::env_var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
     let computed_spill = !entry.computed_guards.is_empty() && spills_not_forced_off;
     // Spec-order member calls add a captured callee prefix and can turn an
     // otherwise seven-home DV loop into a graph-colouring shape that needs one
@@ -2689,7 +2635,7 @@ pub(crate) fn compile_region_int_gpr(
     // i32-strict to license it (empty sets under ZIPP_NO_GPR_LAZYSX=1; split,
     // write-through and W10.3 spilled homes are never members — see
     // `lazy_sx_sets`).
-    let (lazy, strict) = lazy_sx_sets(proto, plan, s, e, &map, &hoist_c);
+    let (lazy, strict) = lazy_sx_sets(proto, plan, ta_plan, s, e, &map, &hoist_c);
     // V1 deopt shadows are local to call-free, unspliced, all-DV plans. Any
     // failed proof produces the empty plan and therefore the exact old boxed
     // write-through/frame bytes.
@@ -3014,9 +2960,14 @@ pub(crate) fn compile_region_int_gpr(
 
     // ── body ── same fusion/DCE/metering structure as the xmm emitter.
     let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
+    let loop_align = crate::codegen::emit_misc::jit_loop_align();
+    let loop_heads = crate::codegen::emit_misc::loop_heads(&proto.code, s, e);
     for ip in s..=e {
         let rip_at = rip(ip);
         let rip_after = rip(ip + 1);
+        if loop_align != 0 && loop_heads[ip - s] {
+            crate::codegen::emit_misc::align_loop_head(&mut ops, loop_align);
+        }
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
@@ -3733,6 +3684,10 @@ pub(crate) fn compile_region_int_gpr(
                         Some(IntTaLoadKind::I32) => {
                             dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx * 4])
                         }
+                        // Zero-extends to the exact u32 (home WIDE, see lazy_sx_sets).
+                        Some(IntTaLoadKind::U32) => {
+                            dynasm!(ops ; mov Rd(d), DWORD [rdx + rcx * 4])
+                        }
                         None => {
                             crate::codegen::region_int_gpr::gpr_decline_note(
                                 "pinned element kind not an int TA load",
@@ -3774,13 +3729,39 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
                 );
-                emit_src64(&mut ops, src(val), 0); // rax = value (low 32 used;
-                                                   // a lazy home's low 32 is right)
-                dynasm!(ops
-                    ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
-                    ; jmp => done
-                    ; => deopt
-                );
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                    // Dense all-Int Array: as the xmm arm. The element it replaces
+                    // must be an Int (a hole, double or heap value deopts), and the
+                    // value an i32 (the canonical i64 form is compared with its
+                    // sign-extended low half), then the boxed Int is stored.
+                    dynasm!(ops
+                        ; mov rax, [rdx + rcx * 8]
+                        ; shr rax, 48
+                        ; cmp eax, INT_TAG_HI as i32
+                        ; jne => deopt
+                        ; lea rdx, [rdx + rcx * 8]
+                    );
+                    emit_src64_canon(&mut ops, src(val), 0, &lazy); // rax = canonical value
+                    dynasm!(ops
+                        ; movsxd rcx, eax
+                        ; cmp rcx, rax
+                        ; jne => deopt                   // outside i32
+                        ; mov ecx, eax
+                        ; mov rax, QWORD ((INT_TAG_HI as u64) << 48) as i64
+                        ; or rax, rcx
+                        ; mov [rdx], rax
+                        ; jmp => done
+                        ; => deopt
+                    );
+                } else {
+                    emit_src64(&mut ops, src(val), 0); // rax = value (low 32 used;
+                                                       // a lazy home's low 32 is right)
+                    dynasm!(ops
+                        ; mov DWORD [rdx + rcx * 4], eax // store low 32 (== ToInt32(v))
+                        ; jmp => done
+                        ; => deopt
+                    );
+                }
                 emit_store_ip(&mut ops, ip_slot, rip_at);
                 dynasm!(ops
                     ; jmp => flush_exit

@@ -341,7 +341,7 @@ mod mm_avx2 {
         if l != u8::MAX {
             return l;
         }
-        let l = if std::env::var_os("ZIPP_NO_TORCH_AVX2").is_some() || !is_x86_feature_detected!("avx2") {
+        let l = if crate::env_var_os("ZIPP_NO_TORCH_AVX2").is_some() || !is_x86_feature_detected!("avx2") {
             0
         } else if is_x86_feature_detected!("fma") {
             2

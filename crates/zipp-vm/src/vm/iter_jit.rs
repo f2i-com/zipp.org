@@ -20,21 +20,11 @@
 
 use super::*;
 
-/// Same-binary ablation for the whole iterator/finally Tier-C lane.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_iter_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_ITER").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary ablation for the whole iterator/finally Tier-C lane.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_iter_enabled() = "ZIPP_NO_TIERC_ITER"
 }
 
 /// `GetIterator { dst, src }` — the pristine dense-array identity subset. All
@@ -143,6 +133,39 @@ pub(crate) extern "win64" fn jit_end_finally(vm: *mut core::ffi::c_void, kind_bi
 /// the next op.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const END_FINALLY_NEXT: u64 = u64::MAX;
+
+/// What the return routing below answers when no `finally` is left to run:
+/// the function returns. Not an ip, and not [`END_FINALLY_NEXT`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const FINALLY_RETURN: u64 = u64::MAX - 1;
+
+/// A `return` in a `try` of a Tier C body, or one resumed at `EndFinally`: the
+/// interpreter arm's `route_through_finally` on the activation's own frame
+/// (handler-op bodies take only frame-backed entries). Returns the `finally` to
+/// run, entered with the return completion, or [`FINALLY_RETURN`]. Such a return
+/// used to bail on every call, and the rest of the function ran interpreted.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_return_finally(vm: *mut core::ffi::c_void, val_bits: u64) -> u64 {
+    // SAFETY: the running VM; the calling body holds no borrow of it.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.route_through_finally(1, Value::from_bits(val_bits))
+        .map_or(FINALLY_RETURN, u64::from)
+}
+
+/// [`jit_end_finally_route`] in a body whose returns route natively: a return
+/// completion goes on through [`jit_return_finally`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_end_finally_returns(
+    vm: *mut core::ffi::c_void,
+    kind_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let kind = Value::from_bits(kind_bits);
+    if kind.is_int() && kind.as_int() & 3 == 1 {
+        return jit_return_finally(vm, val_bits);
+    }
+    jit_end_finally_route(vm, kind_bits, val_bits)
+}
 
 /// `JumpFinally { target, floor }` in a Tier C body — a `break` or
 /// `continue` leaving `try` blocks (a `for-of`'s body is one): the

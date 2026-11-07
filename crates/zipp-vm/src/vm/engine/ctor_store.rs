@@ -32,6 +32,180 @@ pub(crate) enum StoreSrc {
     /// A constant that is not a heap value (a number, a boolean, `null`,
     /// `undefined`).
     Bits(u64),
+    /// A register of a body [`eval_store_body`] runs.
+    Reg(u16),
+}
+
+/// The registers a body may name there, its own and one per stored name.
+const EVAL_REGS: usize = 24;
+
+/// One step of a constructor body evaluated with no frame: arithmetic on
+/// numbers, which runs no user code, and moves. Its stores into `this` are
+/// moves to registers past the body's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StoreOp {
+    Move { dst: u16, src: u16 },
+    Bits { dst: u16, bits: u64 },
+    Add { dst: u16, a: u16, b: u16 },
+    Sub { dst: u16, a: u16, b: u16 },
+    Mul { dst: u16, a: u16, b: u16 },
+    Div { dst: u16, a: u16, b: u16 },
+    AddInt { dst: u16, a: u16, imm: i32 },
+    Bit { dst: u16, a: u16, b: u16, op: crate::bytecode::BitwiseOp },
+}
+
+/// A body [`eval_store_body`] runs, and how many of the call's arguments it
+/// binds.
+#[derive(Debug)]
+pub(crate) struct StoreBody {
+    params: u16,
+    ops: Box<[StoreOp]>,
+}
+
+/// A constructor body that computes what it stores, for [`eval_store_body`]:
+/// its steps and its stores. Any op that could run user code, any other read
+/// of `this` and any branch or capture finds nothing.
+fn scan_eval_body(p: &crate::bytecode::FuncProto) -> Option<(StoreBody, Vec<(String, StoreSrc)>)> {
+    if p.is_generator
+        || p.is_async
+        || p.lexical_this
+        || p.rest_reg.is_some()
+        || p.arguments_reg.is_some()
+        || !p.upvalues.is_empty()
+        || !p.simple_params
+    {
+        return None;
+    }
+    let term = p.code.iter().position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    if !matches!(p.code[term], Instr::ReturnUndefined) {
+        return None;
+    }
+    let read = |r: u16| (r != 0).then_some(r);
+    let mut keys: Vec<(String, StoreSrc)> = Vec::new();
+    let mut ops = Vec::with_capacity(term);
+    for ins in &p.code[..term] {
+        ops.push(match *ins {
+            Instr::Move { dst, src } => StoreOp::Move { dst, src: read(src)? },
+            Instr::LoadInt { dst, val } => StoreOp::Bits { dst, bits: Value::int(val).bits() },
+            Instr::LoadNull { dst } => StoreOp::Bits { dst, bits: Value::NULL.bits() },
+            Instr::LoadUndefined { dst } => StoreOp::Bits { dst, bits: Value::UNDEFINED.bits() },
+            Instr::LoadBool { dst, val } => StoreOp::Bits { dst, bits: Value::bool(val).bits() },
+            Instr::LoadConst { dst, idx } => {
+                let c = *p.constants.get(idx as usize)?;
+                if c.is_heap() {
+                    return None; // a string (an interning sentinel) or a heap constant
+                }
+                StoreOp::Bits { dst, bits: c.bits() }
+            }
+            Instr::Add { dst, a, b } => StoreOp::Add { dst, a: read(a)?, b: read(b)? },
+            Instr::Sub { dst, a, b } => StoreOp::Sub { dst, a: read(a)?, b: read(b)? },
+            Instr::Mul { dst, a, b } => StoreOp::Mul { dst, a: read(a)?, b: read(b)? },
+            Instr::Div { dst, a, b } => StoreOp::Div { dst, a: read(a)?, b: read(b)? },
+            Instr::AddInt { dst, a, imm, .. } => StoreOp::AddInt { dst, a: read(a)?, imm },
+            Instr::Bitwise { dst, a, b, op } => StoreOp::Bit { dst, a: read(a)?, b: read(b)?, op },
+            Instr::SetProp { obj: 0, name, val, .. } | Instr::DefineField { obj: 0, name, val } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = match keys.iter().position(|(k, _)| k == key) {
+                    Some(at) => at,
+                    None => {
+                        if !store_key_ok(key) || keys.len() == STORE_MAX {
+                            return None;
+                        }
+                        keys.push((key.clone(), StoreSrc::Reg(p.reg_count + keys.len() as u16)));
+                        keys.len() - 1
+                    }
+                };
+                StoreOp::Move { dst: p.reg_count + at as u16, src: read(val)? }
+            }
+            Instr::GetProp { dst, obj: 0, name } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = keys.iter().position(|(k, _)| k == key)?;
+                StoreOp::Move { dst, src: p.reg_count + at as u16 }
+            }
+            _ => return None,
+        });
+    }
+    if keys.is_empty() || p.reg_count as usize + keys.len() > EVAL_REGS {
+        return None;
+    }
+    Some((StoreBody { params: p.param_count, ops: ops.into_boxed_slice() }, keys))
+}
+
+/// Run `ops` over `regs`. `false`: an operand was not a number, nothing outside
+/// `regs` has changed, and the body must run for real to say what it does. The
+/// arithmetic is the interpreter's, to the bit.
+#[inline]
+fn eval_store_body(ops: &[StoreOp], regs: &mut [Value; EVAL_REGS]) -> bool {
+    use crate::bytecode::BitwiseOp as B;
+    for op in ops {
+        match *op {
+            StoreOp::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+            StoreOp::Bits { dst, bits } => regs[dst as usize] = Value::from_bits(bits),
+            StoreOp::Add { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_int() && y.is_int() {
+                    match x.as_int().checked_add(y.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(x.as_int() as f64 + y.as_int() as f64),
+                    }
+                } else if x.is_number() && y.is_number() {
+                    Value::num(x.as_f64() + y.as_f64())
+                } else {
+                    return false;
+                };
+            }
+            StoreOp::Sub { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                regs[dst as usize] = if x.is_int() && y.is_int() {
+                    match x.as_int().checked_sub(y.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(x.as_int() as f64 - y.as_int() as f64),
+                    }
+                } else if x.is_number() && y.is_number() {
+                    Value::num(x.as_f64() - y.as_f64())
+                } else {
+                    return false;
+                };
+            }
+            StoreOp::Mul { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_number() || !y.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() * y.as_f64());
+            }
+            StoreOp::Div { dst, a, b } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_number() || !y.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() / y.as_f64());
+            }
+            StoreOp::AddInt { dst, a, imm } => {
+                let x = regs[a as usize];
+                if !x.is_number() {
+                    return false;
+                }
+                regs[dst as usize] = Value::num(x.as_f64() + imm as f64);
+            }
+            StoreOp::Bit { dst, a, b, op } => {
+                let (x, y) = (regs[a as usize], regs[b as usize]);
+                if !x.is_int() || !y.is_int() {
+                    return false;
+                }
+                let (i, j) = (x.as_int(), y.as_int());
+                regs[dst as usize] = match op {
+                    B::And => Value::int(i & j),
+                    B::Or => Value::int(i | j),
+                    B::Xor => Value::int(i ^ j),
+                    B::Shl => Value::int(i.wrapping_shl(j as u32 & 31)),
+                    B::Shr => Value::int(i >> (j as u32 & 31)),
+                    B::Ushr => Value::num(((i as u32) >> (j as u32 & 31)) as f64),
+                };
+            }
+        }
+    }
+    true
 }
 
 /// What the scan found for one constructor body, and the proof of the chain
@@ -40,6 +214,8 @@ pub(crate) enum StoreSrc {
 pub(crate) struct CtorStore {
     /// `None`: the body is not store-only.
     keys: Option<std::rc::Rc<[(String, StoreSrc)]>>,
+    /// The body, when its stores are of values it computes.
+    body: Option<std::rc::Rc<StoreBody>>,
     proof: Option<std::rc::Rc<StoreProof>>,
     /// The last receiver kind the proof failed for — its class (or
     /// [[Prototype]]), the class's version and `class_proto_epoch` — so a
@@ -72,25 +248,21 @@ pub(crate) type CtorStoreLast = (
     u32,
     Option<std::rc::Rc<[(String, StoreSrc)]>>,
     Option<std::rc::Rc<StoreProof>>,
+    Option<std::rc::Rc<StoreBody>>,
 );
+
+/// `Vm::new_stored_memo`: the callee last seen at a `new`, its slot's version,
+/// its constructor's fid (`u32::MAX`: not one this path answers), the class
+/// (`u32::MAX` for a plain function) and the instance's [[Prototype]] bits.
+pub(crate) type NewStoredMemo = (u64, u32, u32, u32, u64);
 
 /// The most stores a body may make here: the shared key lists stop at 16.
 const STORE_MAX: usize = 16;
 
-/// `ZIPP_NO_CTOR_STORE=1` runs every constructor's body again (the
-/// same-binary A/B).
-fn ctor_store_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_CTOR_STORE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CTOR_STORE=1` runs every constructor's body again (the
+    /// same-binary A/B).
+    fn ctor_store_enabled() = "ZIPP_NO_CTOR_STORE"
 }
 
 /// A name a computed or exotic write could intercept: the store miss
@@ -191,11 +363,382 @@ fn scan_store_body(p: &crate::bytecode::FuncProto) -> Option<Vec<(String, StoreS
     None
 }
 
+/// A straight constructor body that computes what it stores, rewritten for an
+/// inline at the `new`: its stores into `this` become moves to registers past
+/// its own, one per name, and `this` is otherwise not touched. Nothing it does
+/// is then visible until the instance is made at the end, so a bail anywhere
+/// can run the whole `new` again. The names, and where each value is. A read
+/// of a name already stored is that store's register; any other read of
+/// `this`, a branch (the instance's shape would depend on it) or a capture
+/// (the plan bakes no cells) keeps the body's path.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn scan_compute_body(
+    p: &crate::bytecode::FuncProto,
+) -> Option<(Vec<Instr>, Vec<String>, Vec<crate::codegen::NewLaneVal>)> {
+    use crate::codegen::NewLaneVal;
+    if p.is_generator
+        || p.is_async
+        || p.lexical_this
+        || p.rest_reg.is_some()
+        || p.arguments_reg.is_some()
+        || !p.upvalues.is_empty()
+        || !p.simple_params
+    {
+        return None;
+    }
+    let term = p.code.iter().position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    if !matches!(p.code[term], Instr::ReturnUndefined) {
+        return None;
+    }
+    let mut code = Vec::with_capacity(term + 1);
+    let mut keys: Vec<String> = Vec::new();
+    let mut vals: Vec<NewLaneVal> = Vec::new();
+    // Registers holding a constant the leaf subset has no op for.
+    let mut known: rustc_hash::FxHashMap<u16, u64> = rustc_hash::FxHashMap::default();
+    for ins in &p.code[..term] {
+        match *ins {
+            Instr::LoadNull { dst } => {
+                known.insert(dst, Value::NULL.bits());
+            }
+            Instr::LoadUndefined { dst } => {
+                known.insert(dst, Value::UNDEFINED.bits());
+            }
+            Instr::Move { dst, src } if known.contains_key(&src) => {
+                known.insert(dst, known[&src]);
+            }
+            Instr::SetProp { obj: 0, name, val, .. } | Instr::DefineField { obj: 0, name, val } => {
+                let key = p.string_constants.get(name as usize)?;
+                let at = match keys.iter().position(|k| k == key) {
+                    Some(at) => at,
+                    None => {
+                        if !store_key_ok(key) || keys.len() == STORE_MAX {
+                            return None;
+                        }
+                        keys.push(key.clone());
+                        vals.push(NewLaneVal::Bits(Value::UNDEFINED.bits()));
+                        keys.len() - 1
+                    }
+                };
+                vals[at] = match known.get(&val) {
+                    Some(&bits) => NewLaneVal::Bits(bits),
+                    None => {
+                        let stage = p.reg_count + at as u16;
+                        code.push(Instr::Move { dst: stage, src: val });
+                        NewLaneVal::Reg(stage)
+                    }
+                };
+            }
+            Instr::GetProp { dst, obj: 0, name } => {
+                let key = p.string_constants.get(name as usize)?;
+                match vals[keys.iter().position(|k| k == key)?] {
+                    NewLaneVal::Reg(src) => {
+                        code.push(Instr::Move { dst, src });
+                        known.remove(&dst);
+                    }
+                    NewLaneVal::Bits(bits) => {
+                        known.insert(dst, bits);
+                    }
+                    NewLaneVal::Arg(_) => return None,
+                }
+            }
+            Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. } => return None,
+            other => {
+                if crate::codegen::instr_uses(&other).iter().any(|r| *r == 0 || known.contains_key(r)) {
+                    return None;
+                }
+                let defs = crate::codegen::splice_body_defs(std::slice::from_ref(&other))?;
+                known.retain(|r, _| *r >= 64 || defs & (1u64 << r) == 0);
+                code.push(other);
+            }
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    code.push(Instr::ReturnUndefined);
+    Some((code, keys, vals))
+}
+
 /// No heap index is ever `u32::MAX`, so a lookup of it in `proto_of` misses,
 /// as one for an instance not yet made does.
 const NO_INSTANCE: u32 = u32::MAX;
 
+/// Sites [`Vm::note_new_site`] remembers. Direct-mapped: the sites a program
+/// compiles with are the ones running now.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const NEW_SITES: usize = 64;
+
+/// One remembered `new` site: `(func << 32) | ip`, the callee's bits and its
+/// slot's version.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) type NewSite = (u64, u64, u32);
+
 impl<'p> Vm<'p> {
+    /// The interpreter ran `new` at this ip of the running function with the
+    /// callee `cv`: what a compile of the site plans against.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(never)]
+    pub(crate) fn note_new_site(&mut self, ip: usize, cv: Value) {
+        if !cv.is_heap() {
+            return;
+        }
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        let key = ((frame.func as u64) << 32) | ip as u64;
+        if self.new_sites.is_empty() {
+            self.new_sites = vec![(u64::MAX, 0, 0); NEW_SITES];
+        }
+        let at = (key ^ (key >> 32)) as usize % NEW_SITES;
+        self.new_sites[at] = (key, cv.bits(), self.heap.version_of(cv.heap_index()));
+    }
+
+    /// Plan a lane for each `New` site of `func_id` whose constructor, as last
+    /// seen there, only stores its arguments (see [`crate::codegen::NewLanePlan`]).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn plan_new_lanes(
+        &mut self,
+        func_id: u32,
+        plan: &mut crate::codegen::CrossCallPlan,
+        leaf: &mut rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan>,
+    ) {
+        if !ctor_store_enabled() || !crate::heap::ready_objects_enabled() || self.new_sites.is_empty() {
+            return;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return;
+        }
+        let code = &self.func(func_id as usize).code;
+        let sites: Vec<(usize, u16)> = code
+            .iter()
+            .enumerate()
+            .filter_map(|(ip, i)| match *i {
+                Instr::New { argc, .. } => Some((ip, argc)),
+                _ => None,
+            })
+            .collect();
+        for (ip, argc) in sites {
+            let key = ((func_id as u64) << 32) | ip as u64;
+            let (site, bits, ver) = self.new_sites[(key ^ (key >> 32)) as usize % NEW_SITES];
+            if site != key || self.heap.version_of(Value::from_bits(bits).heap_index()) != ver {
+                continue;
+            }
+            if let Some(lane) = self.plan_new_lane(bits, ver, argc) {
+                if crate::jitlog_enabled() {
+                    eprintln!("[new] fn{func_id}@{ip} NEW-LANE {} stores, class {:?}", lane.vals.len(), lane.class);
+                }
+                plan.entry(ip).or_default().new_lane = Some(Box::leak(Box::new(lane)));
+            } else if let Some(body) = self.plan_new_leaf(func_id, bits, ver, argc) {
+                if crate::jitlog_enabled() {
+                    eprintln!("[new] fn{func_id}@{ip} NEW-LEAF {} ops", body.body.len());
+                }
+                leaf.insert(ip, body);
+            }
+        }
+    }
+
+    /// What `new` of the callee `bits` makes: the constructor's fid, the
+    /// instance's class (`u32::MAX` for a plain function's) and its
+    /// [[Prototype]] if it is a plain function's.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn new_target(&mut self, bits: u64) -> Option<(u32, u32, Option<u32>)> {
+        let cv = Value::from_bits(bits);
+        let ci = cv.heap_index();
+        if matches!(self.heap.get(ci), HeapObj::Class(_)) {
+            return Some((self.flat_new_class_target(cv)?.0, ci, None));
+        }
+        let (fid, _closure) = self.ic_plain_fn(cv)?;
+        let p = self.func(fid as usize);
+        if p.non_constructable
+            || p.lexical_this
+            || !self.obj_realm.is_empty()
+            || !self.realm_global_objs.is_empty()
+            || self.get_function_realm(cv) != 0
+        {
+            return None;
+        }
+        let proto = self.prototype_of(cv).filter(|&p| self.is_object_value(p))?;
+        Some((fid, u32::MAX, Some(proto.heap_index())))
+    }
+
+    /// The lane for `new` of `bits`, given the `vals` its instance holds under
+    /// `keys`: the proof `ctor_store_new` would make for those names now.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn new_lane_proved(
+        &mut self,
+        bits: u64,
+        callee_ver: u32,
+        class: u32,
+        proto: Option<u32>,
+        keys: &[(String, StoreSrc)],
+        vals: Vec<crate::codegen::NewLaneVal>,
+    ) -> Option<crate::codegen::NewLanePlan> {
+        let proof = self.prove_stores(class, proto.unwrap_or(u32::MAX), keys)?;
+        crate::heap::val_slab_class(keys.len())?;
+        let mut hops = proof.hops.clone();
+        if class != u32::MAX {
+            hops.push((class, proof.class_ver));
+        }
+        Some(crate::codegen::NewLanePlan {
+            callee_bits: bits,
+            callee_ver,
+            epoch: proof.epoch,
+            hops,
+            class: (class != u32::MAX).then_some(class),
+            proto,
+            shape: proof.shape,
+            keys: crate::bytecode::PlanHandle::borrowed_bits(&proof.plan),
+            names: keys.iter().map(|(k, _)| k.clone()).collect(),
+            vals,
+        })
+    }
+
+    /// [`Self::plan_new_lanes`] for a callee whose body only stores.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plan_new_lane(&mut self, bits: u64, callee_ver: u32, argc: u16) -> Option<crate::codegen::NewLanePlan> {
+        use crate::codegen::NewLaneVal;
+        let (fid, class, proto) = self.new_target(bits)?;
+        let keys = scan_store_body(self.func(fid as usize))?;
+        let vals = keys
+            .iter()
+            .map(|(_, src)| match *src {
+                StoreSrc::Arg(a) if a < argc => NewLaneVal::Arg(a),
+                StoreSrc::Arg(_) => NewLaneVal::Bits(Value::UNDEFINED.bits()),
+                StoreSrc::Bits(b) => NewLaneVal::Bits(b),
+                StoreSrc::Reg(r) => NewLaneVal::Reg(r),
+            })
+            .collect();
+        self.new_lane_proved(bits, callee_ver, class, proto, &keys, vals)
+    }
+
+    /// [`Self::plan_new_lanes`] for a callee whose body computes what it
+    /// stores: a leaf inline of the body with the stores staged in registers
+    /// past its own, around the lane that makes the instance from them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn plan_new_leaf(
+        &mut self,
+        func_id: u32,
+        bits: u64,
+        callee_ver: u32,
+        argc: u16,
+    ) -> Option<crate::codegen::LeafInlinePlan> {
+        let (fid, class, proto) = self.new_target(bits)?;
+        let (code, keys, vals) = scan_compute_body(self.func(fid as usize))?;
+        let mut spliced = self.func(fid as usize).clone();
+        spliced.code = code;
+        spliced.reg_count += keys.len() as u16;
+        let (body, mask) = crate::codegen::callee_leaf_ok_for_call(&spliced, argc)?;
+        if mask != 0
+            || body.iter().any(|i| {
+                matches!(
+                    i,
+                    Instr::LoadGlobal { .. }
+                        | Instr::LoadGlobalOrUndefined { .. }
+                        | Instr::StoreGlobal { .. }
+                        | Instr::StoreGlobalStrict { .. }
+                        | Instr::StoreGlobalResolved { .. }
+                )
+            })
+        {
+            return None;
+        }
+        let stores: Vec<(String, StoreSrc)> = keys.into_iter().map(|k| (k, StoreSrc::Arg(0))).collect();
+        let lane = self.new_lane_proved(bits, callee_ver, class, proto, &stores, vals)?;
+        let reg_window = self.func(func_id as usize).reg_count;
+        let mut consts = rustc_hash::FxHashMap::default();
+        for ins in &body {
+            if let Instr::LoadConst { idx, .. } = *ins {
+                if let Some(c) = spliced.constants.get(idx as usize) {
+                    consts.insert(idx, c.bits());
+                }
+            }
+        }
+        let uninit_mask = if crate::codegen::splice_fill_enabled() {
+            crate::codegen::splice_uninit_mask(&body, spliced.reg_count as usize, spliced.param_count as usize)
+        } else {
+            u64::MAX
+        };
+        let alias_params = match crate::codegen::splice_body_defs(&body) {
+            Some(defs) if crate::codegen::splice_alias_enabled() => (0..(argc.min(spliced.param_count) as u64).min(63))
+                .filter(|i| defs & (1u64 << (1 + i)) == 0)
+                .fold(0u64, |m, i| m | (1u64 << i)),
+            _ => 0,
+        };
+        Some(crate::codegen::LeafInlinePlan {
+            callee_bits: bits,
+            callee_ver,
+            same_proto_fid: None,
+            same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
+            this_bits: Value::UNDEFINED.bits(),
+            this_reg: None,
+            new_lane: Some(Box::leak(Box::new(lane))),
+            class_guard: None,
+            prop_shapes: rustc_hash::FxHashMap::default(),
+            reg_window,
+            callee_reg_count: spliced.reg_count,
+            param_count: spliced.param_count,
+            default_arg_mask: 0,
+            body,
+            consts,
+            string_constants: spliced.string_constants.clone(),
+            nested: rustc_hash::FxHashMap::default(),
+            upvals: rustc_hash::FxHashMap::default(),
+            cell_get: crate::vm::helpers_misc::jit_cell_get as *const () as usize,
+            cell_set: crate::vm::helpers_misc::jit_cell_set as *const () as usize,
+            prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as *const () as usize,
+            callee_fid: fid,
+            uninit_mask,
+            alias_params,
+            slot_guard: None,
+            direct_global_route_epoch: None,
+            typed_lane: None,
+            span_code_unit_pred: None,
+        })
+    }
+
+    /// The interpreter's `new cv(...)` when its constructor's body is one
+    /// [`Self::ctor_store_new`] answers, with no frame and no add per field.
+    /// `None`, with nothing done, for anything else.
+    #[inline]
+    pub(crate) fn new_stored(&mut self, cv: Value, base: usize, arg_base: u16, argc: u16) -> Option<Value> {
+        if !cv.is_heap() {
+            return None;
+        }
+        let memo = self.new_stored_memo;
+        let (fid, class, proto) = if memo.0 == cv.bits()
+            && memo.1 == self.heap.version_of(cv.heap_index())
+            && self.obj_realm.is_empty()
+            && self.realm_global_objs.is_empty()
+        {
+            (memo.2, memo.3, Value::from_bits(memo.4))
+        } else {
+            self.new_stored_target(cv)?
+        };
+        if fid == u32::MAX {
+            return None;
+        }
+        let made = self.ctor_store_new(fid, class, proto, base, arg_base, argc);
+        if made.is_none() && self.ctor_stores.get(&fid).is_some_and(|e| e.keys.is_none()) {
+            self.new_stored_memo.2 = u32::MAX;
+        }
+        made
+    }
+
+    /// What [`Self::new_stored`] needs of `cv`, remembered for the next `new`:
+    /// a write of `F.prototype` moves `F`'s version.
+    #[inline(never)]
+    fn new_stored_target(&mut self, cv: Value) -> Option<(u32, u32, Value)> {
+        let (fid, class, proto) = self.new_target(cv.bits())?;
+        let proto = proto.map_or(Value::UNDEFINED, Value::heap);
+        self.new_stored_memo = (cv.bits(), self.heap.version_of(cv.heap_index()), fid, class, proto.bits());
+        Some((fid, class, proto))
+    }
+
     /// `new` of the store-only constructor body `fid` from compiled code,
     /// for an instance of the class `class` (a base class with no instance
     /// fields) or, for a plain function (`class` = `u32::MAX`), with the
@@ -226,7 +769,7 @@ impl<'p> Vm<'p> {
         // a construction loop.
         if self.ctor_store_last.0 == fid {
             if let (Some(keys), Some(proof)) = (&self.ctor_store_last.1, &self.ctor_store_last.2) {
-                let (keys, proof) = (keys.clone(), proof.clone());
+                let (keys, proof, body) = (keys.clone(), proof.clone(), self.ctor_store_last.3.clone());
                 let proto_idx = if class != u32::MAX {
                     u32::MAX
                 } else if proto.is_heap() {
@@ -235,17 +778,27 @@ impl<'p> Vm<'p> {
                     u32::MAX - 1 // no proof is for this
                 };
                 if proto_idx != u32::MAX - 1 && self.store_proof_holds(&proof, class, proto_idx) {
-                    return Some(self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc));
+                    return self.ctor_store_make(&keys, body.as_deref(), &proof, class, proto, base, arg_base, argc);
                 }
             }
         }
-        let (keys, proof) = match self.ctor_stores.get(&fid) {
-            Some(e) => (e.keys.clone(), e.proof.clone()),
+        let (keys, body, proof) = match self.ctor_stores.get(&fid) {
+            Some(e) => (e.keys.clone(), e.body.clone(), e.proof.clone()),
             None => {
-                let keys: Option<std::rc::Rc<[(String, StoreSrc)]>> =
-                    scan_store_body(self.func(fid as usize)).map(std::rc::Rc::from);
-                self.ctor_stores.insert(fid, CtorStore { keys: keys.clone(), ..CtorStore::default() });
-                (keys, None)
+                let p = self.func(fid as usize);
+                let (keys, body) = match scan_store_body(p) {
+                    Some(keys) => (Some(keys), None),
+                    None => match scan_eval_body(p) {
+                        Some((body, keys)) => (Some(keys), Some(std::rc::Rc::new(body))),
+                        None => (None, None),
+                    },
+                };
+                let keys: Option<std::rc::Rc<[(String, StoreSrc)]>> = keys.map(std::rc::Rc::from);
+                self.ctor_stores.insert(
+                    fid,
+                    CtorStore { keys: keys.clone(), body: body.clone(), ..CtorStore::default() },
+                );
+                (keys, body, None)
             }
         };
         let keys = keys?;
@@ -279,37 +832,55 @@ impl<'p> Vm<'p> {
                 p
             }
         };
-        let made = self.ctor_store_make(&keys, &proof, class, proto, base, arg_base, argc);
-        self.ctor_store_last = (fid, Some(keys), Some(proof));
-        Some(made)
+        let made = self.ctor_store_make(&keys, body.as_deref(), &proof, class, proto, base, arg_base, argc);
+        self.ctor_store_last = (fid, Some(keys), Some(proof), body);
+        made
     }
 
     /// The instance `ctor_store_new` makes once `proof` holds: the stores'
     /// values from the caller's window, born finished, then given its class
-    /// or its [[Prototype]].
+    /// or its [[Prototype]]. `None`, with nothing made, when a computing
+    /// body meets an operand it cannot evaluate.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn ctor_store_make(
         &mut self,
         keys: &[(String, StoreSrc)],
+        body: Option<&StoreBody>,
         proof: &StoreProof,
         class: u32,
         proto: Value,
         base: usize,
         arg_base: u16,
         argc: u16,
-    ) -> Value {
+    ) -> Option<Value> {
         // The construction the body's call was: a safe point, before the
         // allocation (the arguments are in the caller's window, a root).
         self.maybe_gc();
         let mut vals = [Value::UNDEFINED; STORE_MAX];
+        let mut regs = [Value::UNDEFINED; EVAL_REGS];
+        if let Some(body) = body {
+            for a in 0..body.params.min(argc) {
+                regs[a as usize + 1] = self.get(base, arg_base + a);
+            }
+            if !eval_store_body(&body.ops, &mut regs) {
+                return None;
+            }
+        }
         for (i, (_, src)) in keys.iter().enumerate() {
             vals[i] = match *src {
                 StoreSrc::Arg(a) if a < argc => self.get(base, arg_base + a),
                 StoreSrc::Arg(_) => Value::UNDEFINED,
                 StoreSrc::Bits(b) => Value::from_bits(b),
+                StoreSrc::Reg(r) => regs[r as usize],
             };
         }
+        // SAFETY: the proof's plan is the VM's own for that shape
+        // (`shape_key_plans`), never removed or replaced, and its heap's maps
+        // die with it.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let idx = unsafe { self.heap.alloc_finalized_borrowed(&proof.plan, &vals[..keys.len()], proof.shape) };
+        #[cfg(feature = "safe-sandbox")]
         let idx = self.heap.alloc_finalized(&proof.plan, &vals[..keys.len()], proof.shape);
         if class != u32::MAX {
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
@@ -320,7 +891,7 @@ impl<'p> Vm<'p> {
         } else if proto.is_heap() {
             self.proto_of.insert(idx, proto);
         }
-        Value::heap(idx)
+        Some(Value::heap(idx))
     }
 
     /// Whether `p` still proves the stores for a fresh instance of `class`
@@ -356,6 +927,13 @@ impl<'p> Vm<'p> {
             // class keeps the body's path. A class's fields are fixed when
             // it is made, so this holds for as long as the proof does.
             if self.class_body_fn(Value::heap(class), true).is_some() {
+                return None;
+            }
+            // A class that declares private methods or accessors brands each
+            // instance as it is made (`brand_instance`), and an instance born
+            // finished would have no brand: `this.#m()` on it threw. A
+            // class's brand is fixed when it is made, as its fields are.
+            if self.class_brands_instances(class) {
                 return None;
             }
             let mut buf = [(0u32, 0u32); 16];
@@ -395,7 +973,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        hops.sort_unstable();
+        crate::cold_sort::sort(&mut hops);
         hops.dedup();
         let mut shape = crate::shape::EMPTY;
         for (k, _) in keys {

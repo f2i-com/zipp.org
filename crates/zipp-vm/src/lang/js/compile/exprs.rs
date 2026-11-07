@@ -42,12 +42,12 @@ fn prefix_end_finalize_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_PREFIX_FINALIZE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_PREFIX_FINALIZE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -85,7 +85,7 @@ pub(crate) fn interp_only_bytecode() -> bool {
         return true;
     }
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    !*KEEP.get_or_init(|| std::env::var_os("ZIPP_KEEP_COPIES").is_some())
+    !*KEEP.get_or_init(|| crate::env_var_os("ZIPP_KEEP_COPIES").is_some())
 }
 
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
@@ -162,12 +162,12 @@ fn spread_inline_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_SPREAD_INLINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_SPREAD_INLINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -207,12 +207,12 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_FUSED_CMPJUMP").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_FUSED_CMPJUMP").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -229,12 +229,12 @@ pub(crate) fn typeof_same_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_TYPEOF_SAME").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -270,12 +270,12 @@ pub(crate) fn concat_fuse_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_CONCAT_FUSE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_CONCAT_FUSE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -291,12 +291,12 @@ pub(crate) fn pad2_cache_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_PAD2_CACHE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_PAD2_CACHE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -420,6 +420,21 @@ impl<'a> FnCompiler<'a> {
             // value there (`update`'s `dst_fresh`).
             let dst = self.temp();
             return self.update(*op, true, target, dst, true);
+        }
+        // `this.x = x;`: the store takes the value's own register, with no
+        // copy into a result register nothing reads (`assign_discarded`).
+        if let ast::Expr::Assign {
+            op: ast::AssignOp::Assign,
+            target: target @ ast::Target::Member(m),
+            value,
+            ..
+        } = e
+        {
+            if !matches!(&m.object, ast::Expr::Super) && discarded_store_enabled() {
+                let dst = self.temp();
+                self.assign_discarded = true;
+                return self.assign(ast::AssignOp::Assign, target, value, dst);
+            }
         }
         // `[a, b] = [b, a];`: no array is built when nothing reads it.
         if let ast::Expr::Assign {
@@ -1000,6 +1015,50 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// The register of this function's own `arguments`, when `m` reads its
+    /// `.length`: the name is not shadowed, and `resolve`, which would ask for
+    /// the object, has not been called for this read.
+    fn own_arguments_length(&self, m: &ast::Member, prop: &str) -> Option<Reg> {
+        let ast::Expr::Ident(name, ..) = &m.object else {
+            return None;
+        };
+        let name: &str = name;
+        if prop != "length" || name != "arguments" || m.optional || self.in_generator || self.in_async {
+            return None;
+        }
+        let r = self.arguments_reg?;
+        if self.cell_regs.contains(&r) || !self.with_objs_for(name).is_empty() {
+            return None;
+        }
+        let slot = self.scopes.iter().rev().find_map(|scope| scope.slot_of(name))?;
+        (slot.reg() == Some(r)).then_some(r)
+    }
+
+    /// Decide `arguments` as the function ends: the register its proto
+    /// records, and whether the call stores only the argument count there.
+    /// A read of `arguments.length` was emitted as a `GetProp` of the register
+    /// without asking for the object. If nothing else asked (no other mention,
+    /// no capture, no direct eval), those are the register's only reads, and
+    /// become `Move`s of the count: no object per call. If something did, they
+    /// stay what they are, reads of the real object's `length`, which a
+    /// program may have changed.
+    pub(crate) fn settle_arguments(&mut self) -> (Option<Reg>, bool) {
+        if self.uses_arguments {
+            return (self.arguments_reg, false);
+        }
+        let Some(r) = self.arguments_reg.filter(|_| self.arguments_lengths) else {
+            return (None, false);
+        };
+        for ins in &mut self.code {
+            if let Instr::GetProp { dst, obj, .. } = *ins {
+                if obj == r {
+                    *ins = Instr::Move { dst, src: r };
+                }
+            }
+        }
+        (Some(r), true)
+    }
+
     pub(crate) fn static_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
         // Namespace constants (notably Math.PI/E/…) are ordinary property reads.
         // Folding them by identifier spelling ignored lexical shadowing, a
@@ -1022,6 +1081,12 @@ impl<'a> FnCompiler<'a> {
             } else {
                 return Err("`super.x` is only valid in a method".into());
             }
+            return Ok(dst);
+        }
+        if let Some(r) = self.own_arguments_length(m, prop) {
+            self.arguments_lengths = true;
+            let name = self.string_name(prop);
+            self.emit(Instr::GetProp { dst, obj: r, name });
             return Ok(dst);
         }
         // `(x = v).p` with `x` a plain local: assign in place and read the
@@ -2176,6 +2241,19 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// [`Self::load_number`] for a folded constant, which unlike a literal
+    /// can be `-0` (`-0`, `0 * -1`): that one is a double constant, since an
+    /// int load would drop its sign.
+    fn load_folded_number(&mut self, dst: Reg, n: f64) -> Reg {
+        if n == 0.0 && n.is_sign_negative() {
+            let idx = self.add_const(Value::num(n));
+            self.emit(Instr::LoadConst { dst, idx });
+        } else {
+            self.load_number(dst, n);
+        }
+        dst
+    }
+
     /// Compile the OPERAND of a `typeof`, without the `TypeOf` itself.
     ///
     /// `typeof <unbound identifier>` must yield "undefined", NOT throw a
@@ -2351,6 +2429,12 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
     ) -> R<Reg> {
         use ast::BinaryOp as Op;
+        // `4096 * 4`, `1 << 20`: a numeric constant expression loads its value.
+        if const_fold_enabled() {
+            if let Some(v) = const_binary(op, left, right, CONST_FOLD_DEPTH) {
+                return Ok(self.load_folded_number(dst, v));
+            }
+        }
         // `typeof a === typeof b` (and every equality polarity) compares two
         // members of the same fixed eight-name domain. Evaluate both operands
         // in source order, then classify them in one total opcode. This is
@@ -2696,6 +2780,17 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn unary(&mut self, op: ast::UnaryOp, arg: &ast::Expr, dst: Reg) -> R<Reg> {
         use ast::UnaryOp as Op;
+        // `-1`, `~0`: a numeric constant loads its value.
+        if matches!(op, Op::Minus | Op::Plus | Op::BitNot) && const_fold_enabled() {
+            if let Some(v) = const_number(arg, CONST_FOLD_DEPTH) {
+                let v = match op {
+                    Op::Minus => -v,
+                    Op::Plus => v,
+                    _ => f64::from(!crate::vm::helpers_num2::to_int32(v)),
+                };
+                return Ok(self.load_folded_number(dst, v));
+            }
+        }
         match op {
             Op::Minus => {
                 let a = self.expr(arg)?;
@@ -3670,7 +3765,7 @@ mod static_key_plan_tests {
 
     #[test]
     fn compiler_off_child() {
-        if std::env::var_os("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD").is_none() {
+        if crate::env_var_os("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD").is_none() {
             return;
         }
         let program = compile("function build(v){return {a:v,b:2}} build(1);");

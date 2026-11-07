@@ -11,6 +11,7 @@
 //! imports them (a CommonJS package's `module.exports` as its default and
 //! its properties as names, the dual package's `import` build, `node:fs`
 //! and `path`). The expected lines are Node 24's for the same files.
+#![cfg(feature = "node")]
 
 const FILES: &[(&str, &str)] = &[
     (

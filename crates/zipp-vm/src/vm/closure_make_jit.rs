@@ -12,29 +12,19 @@
 
 use super::*;
 
-/// Same-binary ablation for the whole closure-creation lane.
-///
-/// DEFAULT-ON again since B184: B181 parked it because a widened body could
-/// reach a mid-body `SELF_CALL_DEOPT` after an effect (the general
-/// `CallMethod` miss and the arrow lexical-`this` resolution), which a
-/// cross-called frame can only survive by replaying the whole call. Both
-/// deopt edges now COMPLETE through the interpreter-equivalent slow path
-/// (`jit_method_builtin_fallback`'s general tail; `call_value` for the
-/// arrow rebinding), so the replay hazard those edges carried is gone.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[inline]
-pub(crate) fn tierc_closure_make_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_CLOSURE_MAKE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Same-binary ablation for the whole closure-creation lane.
+    ///
+    /// DEFAULT-ON again since B184: B181 parked it because a widened body could
+    /// reach a mid-body `SELF_CALL_DEOPT` after an effect (the general
+    /// `CallMethod` miss and the arrow lexical-`this` resolution), which a
+    /// cross-called frame can only survive by replaying the whole call. Both
+    /// deopt edges now COMPLETE through the interpreter-equivalent slow path
+    /// (`jit_method_builtin_fallback`'s general tail; `call_value` for the
+    /// arrow rebinding), so the replay hazard those edges carried is gone.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn tierc_closure_make_enabled() = "ZIPP_NO_TIERC_CLOSURE_MAKE"
 }
 
 /// The verified execution context for one creation site.
@@ -616,13 +606,7 @@ mod tests {
         let cell = vm.heap.alloc_cell(Value::int(41));
         vm.regs[cell_reg as usize] = Value::heap(cell);
         let callee = vm.heap.alloc(HeapObj::Func(fid));
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, callee, 0);
 
         let packed = ((fid as u64) << 32) | ip as u64;
         let regs = vm.regs.as_mut_ptr() as *mut u64;
@@ -659,13 +643,7 @@ mod tests {
         vm.regs = vec![Value::UNDEFINED; cell_regs].into();
         vm.regs[reg as usize] = Value::int(9);
         let cell_callee = vm.heap.alloc(HeapObj::Func(cell_fid));
-        vm.jit_tierc_activation = TiercActivationState {
-            active: true,
-            frame_free: true,
-            closure: NO_CLOSURE,
-            callee: cell_callee,
-            upvals_raw: 0,
-        };
+        vm.jit_tierc_activation = TiercActivationState::new(true, true, NO_CLOSURE, cell_callee, 0);
         let packed_cell = ((cell_fid as u64) << 32) | cell_ip as u64;
         let regs = vm.regs.as_mut_ptr() as *mut u64;
         let n = vm.regs.len() as u64;

@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.32"
+version = "0.0.33"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
@@ -35,6 +35,15 @@ panic = "abort"
 # stays.
 lto = "fat"
 codegen-units = 1
+
+# BigInt arithmetic is cold next to the engine's own code (the interpreter
+# never runs through it for Numbers), so the full variants build it for size,
+# as Lite builds everything. MEASURED 2026-11-04 on the javascript module:
+# num-bigint 85.7 -> 50.5 KB of code, the module 15.3 KB smaller raw and
+# 2.1 KB after Brotli; a BigInt-heavy section (64-256-bit add/mul/div/shift,
+# toString) runs 5-10% slower in it. Nothing outside BigInt changes.
+[profile.release.package.num-bigint]
+opt-level = "z"
 
 # Lite explicitly prioritizes download size. Full variants retain the measured
 # throughput-oriented release profile; the feature flag alone does not change it.

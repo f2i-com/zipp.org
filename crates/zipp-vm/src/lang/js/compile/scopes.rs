@@ -179,6 +179,7 @@ impl<'a> FnCompiler<'a> {
             rest_reg: None,
             arguments_reg: None,
             uses_arguments: false,
+            arguments_lengths: false,
             super_class: None,
             super_home_obj: false,
             super_static: false,
@@ -217,6 +218,8 @@ impl<'a> FnCompiler<'a> {
             captured,
             late_boxed: HashSet::default(),
             copy_boxed: HashSet::default(),
+            num_locals: HashSet::default(),
+            assign_discarded: false,
             cell_regs: HashSet::default(),
             lexical_regs: HashSet::default(),
             const_regs: HashSet::default(),
@@ -470,7 +473,7 @@ impl<'a> FnCompiler<'a> {
             })
             .collect();
         // Recorded as each one ENDS, so a nested site comes first.
-        sites.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+        crate::cold_sort::sort_by_key(&mut sites, |s| (s.start, std::cmp::Reverse(s.end)));
         sites.into_boxed_slice()
     }
 
@@ -1167,12 +1170,12 @@ pub(crate) fn reg_classes_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_REG_CLASSES").is_none();
+            let on = crate::env_var_os("ZIPP_NO_REG_CLASSES").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

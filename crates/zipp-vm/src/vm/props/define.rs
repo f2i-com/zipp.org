@@ -804,6 +804,7 @@ impl<'p> Vm<'p> {
                     if v.is_heap() {
                         self.prototypes.insert(idx, v.heap_index());
                     }
+                    self.heap.bump_version(idx);
                 }
             }
             if !is_class && wr == Some(false) {
@@ -936,6 +937,7 @@ impl<'p> Vm<'p> {
                     .define(key, stored, attr);
             }
             _ => {
+                self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
                 self.fn_props
                     .entry(idx)
                     .or_insert_with(ObjMap::new_side_table)

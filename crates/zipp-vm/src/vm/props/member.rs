@@ -621,6 +621,7 @@ impl<'p> Vm<'p> {
             return;
         }
         let nv = self.alloc_str(name);
+        self.fn_props_gen = self.fn_props_gen.wrapping_add(1);
         self.fn_props
             .entry(fi)
             .or_insert_with(ObjMap::new_side_table)
@@ -811,9 +812,13 @@ impl<'p> Vm<'p> {
                     p => p,
                 }
             }
+            // `re.lastIndex` is a non-configurable own data property whose
+            // value lives in the struct (defineProperty writes it through and
+            // keeps only attributes aside): a sticky lexer reads it per token.
+            HeapObj::RegExp(re) if key == "lastIndex" => return Some(re.last_index),
             HeapObj::RegExp(_) => {
                 if self.arr_props.contains_key(&idx)
-                    || matches!(key, "lastIndex" | "length" | "name")
+                    || matches!(key, "length" | "name")
                     || regexp_intrinsic_accessor(key).is_some()
                     || regexp_flag_char(key).is_some()
                     || self.regexp_proto == 0

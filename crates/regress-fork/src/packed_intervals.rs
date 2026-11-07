@@ -50,7 +50,7 @@ impl PackedIntervals {
         for part in self.union_of {
             part.decode_into(&mut all);
         }
-        all.sort_unstable_by_key(|iv| iv.first);
+        crate::util::cold_sort_by(&mut all, |a, b| a.first.cmp(&b.first));
         let mut out: Vec<Interval> = Vec::with_capacity(all.len());
         for iv in all {
             match out.last_mut() {

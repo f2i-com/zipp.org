@@ -300,7 +300,7 @@ impl Walk {
 #[derive(Debug)]
 struct Walker<'a, F>
 where
-    F: FnMut(&Node, &mut Walk),
+    F: FnMut(&Node, &mut Walk) + ?Sized,
 {
     func: &'a mut F,
     postorder: bool,
@@ -309,7 +309,7 @@ where
 
 impl<F> Walker<'_, F>
 where
-    F: FnMut(&Node, &mut Walk),
+    F: FnMut(&Node, &mut Walk) + ?Sized,
 {
     fn process_children(&mut self, n: &Node) {
         match n {
@@ -371,7 +371,7 @@ where
 #[derive(Debug)]
 struct MutWalker<'a, F>
 where
-    F: FnMut(&mut Node, &mut Walk),
+    F: FnMut(&mut Node, &mut Walk) + ?Sized,
 {
     func: &'a mut F,
     postorder: bool,
@@ -380,7 +380,7 @@ where
 
 impl<F> MutWalker<'_, F>
 where
-    F: FnMut(&mut Node, &mut Walk),
+    F: FnMut(&mut Node, &mut Walk) + ?Sized,
 {
     fn process_children(&mut self, n: &mut Node) {
         match n {
@@ -446,6 +446,10 @@ pub fn walk<F>(postorder: bool, unicode: bool, n: &Node, func: &mut F)
 where
     F: FnMut(&Node, &mut Walk),
 {
+    // WebAssembly: one Walker for every closure type (module size), the
+    // closure called through `dyn`; native code keeps it monomorphized.
+    #[cfg(target_arch = "wasm32")]
+    let func: &mut dyn FnMut(&Node, &mut Walk) = func;
     let mut walker = Walker {
         func,
         postorder,
@@ -464,6 +468,8 @@ pub fn walk_mut<F>(postorder: bool, unicode: bool, n: &mut Node, func: &mut F)
 where
     F: FnMut(&mut Node, &mut Walk),
 {
+    #[cfg(target_arch = "wasm32")]
+    let func: &mut dyn FnMut(&mut Node, &mut Walk) = func;
     let mut walker = MutWalker {
         func,
         postorder,

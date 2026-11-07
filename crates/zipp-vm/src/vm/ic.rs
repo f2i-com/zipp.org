@@ -91,19 +91,9 @@ const IC_PROBATION: u8 = 64;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
 
-/// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
-fn class_miss_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CLASS_MISS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_CLASS_MISS=1`: a class instance's absent key fills no way.
+    fn class_miss_enabled() = "ZIPP_NO_CLASS_MISS"
 }
 
 /// `Vm::own_slot_cache`'s size, a power of two.
@@ -184,12 +174,12 @@ fn ic_mega_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_IC_MEGA").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_IC_MEGA").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -206,7 +196,7 @@ fn module_ic_enabled() -> bool {
         return true;
     }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_IC").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_MODULE_IC").is_none())
 }
 
 /// Sentinel `ret_dst` for a frame whose return value is DISCARDED (an
@@ -680,7 +670,7 @@ fn dynamic_ic_enabled() -> bool {
         return true;
     }
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_DYNAMIC_IC").is_none())
+    *FLAG.get_or_init(|| crate::env_var_os("ZIPP_NO_DYNAMIC_IC").is_none())
 }
 
 /// Cache storage every runtime-installed function of one VM may draw on
@@ -801,6 +791,108 @@ impl<'p> Vm<'p> {
         self.site_ics.get(func_id as usize)?.as_ref()?.get(ip)
     }
 
+    /// The accessor lane (`codegen::AccLane`) of the `GetProp` (`set` false)
+    /// or `SetProp` at `(func_id, ip)`: its cache's first way when that is an
+    /// own or a chain accessor keyed by a real shape, with the chain still as
+    /// filled and, on the chain, a plain function as the getter or setter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_acc_lane(&self, func_id: u32, ip: usize, name: u32, set: bool) -> Option<crate::codegen::AccLane> {
+        use crate::codegen::{AccLane, ACC_FIRST_DEFAULT, ACC_FIRST_HEAP, ACC_OWN};
+        let site = self.ic_site(func_id, ip)?;
+        if site.n == 0 {
+            return None;
+        }
+        let mut lane = AccLane {
+            name,
+            recv_shape: 0,
+            kind: ACC_OWN,
+            first: 0,
+            nhops: 0,
+            hops: [(0, 0); 6],
+            holder: 0,
+            slot: 0,
+            fn_bits: 0,
+            fid: 0,
+            closure: 0,
+            field: u32::MAX,
+            to_int32: false,
+        };
+        match site.entries[0] {
+            IcEntry::OwnAcc { shape, slot } if shape != crate::shape::DICT => {
+                lane.recv_shape = shape;
+                lane.slot = slot;
+                Some(lane)
+            }
+            IcEntry::ProtoAcc {
+                recv_shape,
+                first,
+                hops,
+                slot,
+            } if recv_shape != crate::shape::DICT && hops.1 > 0 => {
+                lane.kind = match first {
+                    FIRST_HEAP => ACC_FIRST_HEAP,
+                    FIRST_DEFAULT => ACC_FIRST_DEFAULT,
+                    _ => return None,
+                };
+                let n = hops.1 as usize;
+                if n > lane.hops.len() || hops.0[..n].iter().any(|&(h, v)| self.heap.version_of(h) != v) {
+                    return None;
+                }
+                let holder = hops.0[n - 1].0;
+                let HeapObj::Object(hm) = self.heap.get(holder) else {
+                    return None;
+                };
+                let s = slot as usize;
+                if hm.is_ctor || hm.key_get(s).is_none() || !hm.attr_at(s).accessor {
+                    return None;
+                }
+                let f = if set { hm.attr_at(s).setter } else { hm.val_at(s) };
+                let (fid, closure) = self.ic_plain_fn(f)?;
+                // An arrow's `this` is its captured one, which only the
+                // interpreter's call binds (`jit_prop_slow_impl` deopts it).
+                if self.func(fid as usize).lexical_this {
+                    return None;
+                }
+                lane.recv_shape = recv_shape;
+                lane.first = hops.0[0].0;
+                lane.nhops = n as u8;
+                lane.hops[..n].copy_from_slice(&hops.0[..n]);
+                lane.holder = holder;
+                lane.slot = slot;
+                lane.fn_bits = f.bits();
+                lane.fid = fid;
+                lane.closure = closure;
+                // A trivial accessor of a field every receiver of the shape
+                // holds as writable data: the lane reads or writes it in place.
+                // (A metered body keeps the call, whose frame is charged.)
+                #[cfg(feature = "instrument")]
+                let metered = self.jit.metered();
+                #[cfg(not(feature = "instrument"))]
+                let metered = false;
+                if crate::codegen::acc_inline_enabled() && !metered {
+                    let trivial = if set {
+                        self.simple_setter_field(fid)
+                    } else {
+                        self.simple_getter_field(fid).map(|f| (f, false))
+                    };
+                    if let Some((field, to_int32)) = trivial {
+                        let writable_data = crate::shape::attr_bits(true, false, false, false);
+                        let accessor = crate::shape::attr_bits(false, false, false, true);
+                        if let Some(at) = crate::shape::describe(recv_shape)
+                            .iter()
+                            .position(|(k, bits)| &**k == field && bits & writable_data != 0 && bits & accessor == 0)
+                        {
+                            lane.field = at as u32;
+                            lane.to_int32 = to_int32;
+                        }
+                    }
+                }
+                Some(lane)
+            }
+            _ => None,
+        }
+    }
+
     /// The receiver shape and own data slot the property instruction at
     /// `(func_id, ip)` last found its key at (`SiteCell`), and whether a write
     /// proved the slot writable: Tier C's known-shape lane (`PropShapePlan`)
@@ -837,6 +929,7 @@ impl<'p> Vm<'p> {
                 epoch,
                 callee,
                 recv_shape,
+                fid,
                 ..
             } if recv_shape != crate::shape::DICT
                 && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
@@ -847,6 +940,58 @@ impl<'p> Vm<'p> {
                     ver,
                     epoch,
                     value: callee.bits(),
+                    fid,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The own data properties the `GetProp` at `(func_id, ip)`'s cache
+    /// holds, as (receiver shape, slot) pairs: its ways for receivers of a
+    /// shape (a dictionary receiver's way names no shape). Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_own_data_ways(&self, func_id: u32, ip: usize) -> Vec<(u32, u32)> {
+        let Some(site) = self.ic_site(func_id, ip) else {
+            return Vec::new();
+        };
+        site.entries[..site.n as usize]
+            .iter()
+            .filter_map(|e| match *e {
+                IcEntry::OwnData { shape, slot } if shape != crate::shape::DICT => Some((shape, slot)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
+    /// (way 0 an `IcEntry::ClassGetter` of a plain user function), with the
+    /// guards of `ic_class_method_read`'s lane: Tier O inlines its body.
+    /// `value` is the getter. Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_class_getter_read(&self, func_id: u32, ip: usize) -> Option<crate::codegen::ClassReadLane> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::ClassGetter {
+                class,
+                ver,
+                epoch,
+                getter,
+                recv_shape,
+            } if recv_shape != crate::shape::DICT
+                && crate::heap::class_mirror_fid(class) != crate::heap::FID_MIRROR_NONE =>
+            {
+                let (fid, _) = self.ic_plain_fn(getter)?;
+                Some(crate::codegen::ClassReadLane {
+                    recv_shape,
+                    class,
+                    ver,
+                    epoch,
+                    value: getter.bits(),
+                    fid,
                 })
             }
             _ => None,
@@ -922,7 +1067,7 @@ impl<'p> Vm<'p> {
         // `ZIPP_NO_IC_PROBATION=1` leaves a disabled site disabled, as before:
         // the two sides of a one-binary A/B.
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_IC_PROBATION").is_some()) {
+        if *OFF.get_or_init(|| crate::env_var_os("ZIPP_NO_IC_PROBATION").is_some()) {
             return true;
         }
         site.rot = site.rot.wrapping_add(1);
@@ -1218,7 +1363,7 @@ impl<'p> Vm<'p> {
     /// compiler's AST) took that whole call on most reads. `None` for
     /// anything else, which goes on to the call.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-    #[inline]
+    #[inline(never)]
     pub(crate) fn ic_get_prop_mega(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
         // A private name is its brand's, never a string key's that spells it.
         if !recv.is_heap()
@@ -1323,7 +1468,7 @@ impl<'p> Vm<'p> {
     /// Forced inline: it is a handful of compares, and as a call it held
     /// 10% of a property-read loop's samples on the WebAssembly build.
     #[inline(always)]
-    fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
+    pub(crate) fn ic_recv_map(&self, recv: Value) -> Option<(u32, &ObjMap)> {
         if !recv.is_heap() {
             return None;
         }
@@ -1522,9 +1667,16 @@ impl<'p> Vm<'p> {
     /// (`ic_get_acc_tail`). Each went to the full `ic_get_prop` call once
     /// this hit and the prototype probe had missed: an object literal's
     /// getter took 31 ns a read against QuickJS's 22.
+    ///
+    /// A shaped receiver at a site that has found its key as an own data
+    /// property, in a layout none of this answers, asks the (shape, key) memo
+    /// here (`ic_get_memo_tail`): such a read (`node.flags` over a compiler's
+    /// AST, up to a third of a bundle's) came to it only after the dispatch
+    /// arm's other probes and the `ic_get_prop` call, where no other read
+    /// pays for the question.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    pub(crate) fn ic_get_prop_way0(&self, func_id: u32, ip: usize, recv: Value) -> GetAct {
+    pub(crate) fn ic_get_prop_way0(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
         if !recv.is_heap() {
             return GetAct::None;
         }
@@ -1543,27 +1695,45 @@ impl<'p> Vm<'p> {
             // SAFETY: as in `ic_get_prop_own_hit`.
             return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
         }
-        let Some(site) = cell.site.as_deref() else {
-            return GetAct::None;
-        };
-        if site.n == 0 {
-            return GetAct::None;
-        }
-        match site.entries[0] {
-            IcEntry::OwnData { shape, slot } if shape == mir.shape => {
-                // SAFETY: as in `ic_get_prop_own_hit`.
-                GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) })
-            }
-            IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
-                match self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape) {
-                    Some(v) => GetAct::Value(v),
-                    None => GetAct::None,
+        let knows_own = cell.knows_own();
+        let act = match cell.site.as_deref() {
+            Some(site) if site.n != 0 => match site.entries[0] {
+                IcEntry::OwnData { shape, slot } if shape == mir.shape => {
+                    // SAFETY: as in `ic_get_prop_own_hit`.
+                    return GetAct::Value(unsafe { *(mir.vals as *const Value).add(slot as usize) });
                 }
-            }
-            IcEntry::OwnAcc { .. } | IcEntry::ProtoAcc { .. } | IcEntry::ClassGetter { .. } | IcEntry::ClassMethod { .. } => {
-                self.ic_get_acc_tail(recv.heap_index(), &site.entries[0], mir.shape, mir.vals)
-            }
+                IcEntry::ProtoData { .. } | IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
+                    match self.ic_get_way0_tail(recv.heap_index(), &site.entries[0], mir.shape) {
+                        Some(v) => GetAct::Value(v),
+                        None => GetAct::None,
+                    }
+                }
+                IcEntry::OwnAcc { .. }
+                | IcEntry::ProtoAcc { .. }
+                | IcEntry::ClassGetter { .. }
+                | IcEntry::ClassMethod { .. } => {
+                    self.ic_get_acc_tail(recv.heap_index(), &site.entries[0], mir.shape, mir.vals)
+                }
+                _ => GetAct::None,
+            },
             _ => GetAct::None,
+        };
+        if knows_own && matches!(act, GetAct::None) {
+            return self.ic_get_memo_tail(func_id, ip, recv, name);
+        }
+        act
+    }
+
+    /// [`Self::ic_get_prop_way0`]'s question to the (shape, key) memo. Out of
+    /// line: the loop keeps its one call, and `name`'s text, the first load
+    /// of a read that gets here, is read only if one does.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_get_memo_tail(&mut self, func_id: u32, ip: usize, recv: Value, name: u32) -> GetAct {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        match self.ic_get_prop_mega(func_id, ip, recv, key) {
+            Some(v) => GetAct::Value(v),
+            None => GetAct::None,
         }
     }
 
@@ -1727,6 +1897,50 @@ impl<'p> Vm<'p> {
             return None;
         };
         (self.private_memo_key(ctx) == Some(head)).then_some((brand, id, pos))
+    }
+
+    /// The private FIELD `(brand, id, pos)` a site's first way holds
+    /// (`IcEntry::Private`, not an add), whatever callee filled it: what the
+    /// private-field lane planner bakes (`Vm::build_priv_lane_plan`, which
+    /// makes the brand sound by its declaration's evaluation count).
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    pub(crate) fn ic_private_field_way0_plan(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32)> {
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::Private { brand, id, pos, .. } if pos != PRIVATE_ADD => Some((brand, id, pos)),
+            _ => None,
+        }
+    }
+
+    /// The site's way-0 private METHOD (`IcEntry::PrivateMethod`) for code
+    /// running as `ctx` and the receiver at heap `idx`: what
+    /// [`Self::ic_private_method_tail`] answers for the top frame's callee,
+    /// for compiled code, whose running callee is not the top frame's. A
+    /// compiled `this.#m` read only ever tried the field way, so every one
+    /// resolved the method again and refilled this way.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    #[inline]
+    pub(crate) fn ic_private_method_way0(&self, func_id: u32, ip: usize, ctx: Value, idx: u32) -> Option<Value> {
+        let Some(IcEntry::PrivateMethod {
+            head,
+            brand,
+            method,
+            epoch,
+            pos,
+        }) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()).map(|s| s.entries[0])
+        else {
+            return None;
+        };
+        if epoch != self.private_epoch
+            || self.private_memo_key(ctx) != Some(head)
+            || matches!(self.heap.get(idx), HeapObj::Class(_))
+        {
+            return None;
+        }
+        self.brand_entry_at(idx, brand, pos).is_some().then_some(method)
     }
 
     /// [`Self::ic_private_get_tail`] for a write of the field, which must
@@ -2081,6 +2295,18 @@ impl<'p> Vm<'p> {
         (!v.is_uninitialized()).then_some((v, slot))
     }
 
+    /// [`Self::ic_get_prop`] after the (shape, key) memo, for the lite loop,
+    /// whose arm stays one call (`ic_get_prop_mega`).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[inline(never)]
+    pub(crate) fn ic_get_prop_memo_first(&mut self, func_id: u32, ip: usize, recv: Value, key: &str) -> GetAct {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if let Some(v) = self.ic_get_prop_mega(func_id, ip, recv, key) {
+            return GetAct::Value(v);
+        }
+        self.ic_get_prop(func_id, ip, recv, key)
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     ///
     /// The safe profile's dispatch loop takes it inline. Left to the
@@ -2096,15 +2322,6 @@ impl<'p> Vm<'p> {
         recv: Value,
         key: &str,
     ) -> GetAct {
-        // A field read through more layouts than the inline hits keep: the
-        // mirror and the (shape, key) memo before this call's site probe and
-        // the receiver's map (`ic_get_prop_mega`), here rather than as its own
-        // step in the dispatch loops, where every read the hits missed paid
-        // its call whether or not it could answer.
-        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-        if let Some(v) = self.ic_get_prop_mega(func_id, ip, recv, key) {
-            return GetAct::Value(v);
-        }
         // Receiver guards + own-`pos` are entry-independent: derive ONCE per
         // probe (a 4-way site otherwise pays the heap fetch + key scan per
         // entry). The site is fetched once for both probe and disable check.
@@ -3804,6 +4021,133 @@ impl<'p> Vm<'p> {
     }
 
     // ── CallMethod sites ──
+
+    /// The way of the `CallMethod` cache at `(func_id, ip)` that holds
+    /// `recv`'s answer `callee` by `recv`'s hidden class, after
+    /// `ic_call_method` gave it: `(shape, slot, 0, 0, 0)` for an own data
+    /// slot, `(shape, u32::MAX, class, version, epoch)` for a class method.
+    /// The lite loop's method cache keeps it, so its hit checks the same
+    /// guards without the site lookup and the ways' loop.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn ic_method_way(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        callee: Value,
+    ) -> Option<(u32, u32, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        let (_, m) = self.ic_recv_map(recv)?;
+        let sh = m.shape();
+        if sh == crate::shape::DICT {
+            return None;
+        }
+        site.entries[..site.n as usize].iter().find_map(|e| match *e {
+            IcEntry::OwnData { shape, slot } if shape == sh && m.val_at(slot as usize).bits() == callee.bits() => {
+                Some((sh, slot, 0, 0, 0))
+            }
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                epoch,
+                callee: c,
+                recv_shape,
+                ..
+            } if recv_shape == sh && c.bits() == callee.bits() && m.class == Some(class) => {
+                Some((sh, u32::MAX, class, ver, epoch))
+            }
+            _ => None,
+        })
+    }
+
+    /// [`Self::ic_call_method`]'s shape-keyed ways, guarded by the receiver's
+    /// hot mirror alone: its shape is the map's, and its fid word tells a
+    /// class instance's class (`FID_MIRROR_CLASS`) from a plain object's
+    /// (`FID_MIRROR_NONE`), which is all the ways ask of the map. Every
+    /// method call read the name and its text (the private-name test), the
+    /// receiver's slot for its kind and its map for the shape before these
+    /// ways: a third of a Babel run's method calls hit way 0 of an inherited
+    /// method and another third a later way. `None` for anything else,
+    /// which takes `ic_call_method` (and fills there).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_call_method_mirror(&self, func_id: u32, ip: usize, recv: Value) -> Option<(u32, u32, Value)> {
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        let mir = self.heap.hot_mirror_of(idx);
+        if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+            return None;
+        }
+        let bits = self.ic_call_method_mirror_ways(func_id, ip, idx, mir);
+        if bits == Value::UNDEFINED.bits() {
+            return None;
+        }
+        let callee = Value::from_bits(bits);
+        self.ic_plain_fn(callee).map(|(fid, closure)| (fid, closure, callee))
+    }
+
+    /// [`Self::ic_call_method_mirror`]'s site and ways, out of line: the
+    /// dispatch loop keeps one call. It answers with the plain user function's
+    /// bits alone (`undefined`'s for none), which come back in a register:
+    /// as `Option<(u32, u32, Value)>` the answer came back through memory,
+    /// stored in pieces and read back as one 16-byte load, a failed
+    /// store-forward that held a fifth of a polymorphic `o.area()` loop's
+    /// cycles. The caller re-derives `(fid, closure)` with `ic_plain_fn`,
+    /// which is what a class-method way stored them from at its fill.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_call_method_mirror_ways(&self, func_id: u32, ip: usize, idx: u32, mir: crate::heap::HotMirror) -> u64 {
+        const NONE: u64 = Value::UNDEFINED.bits();
+        if !self.deferred_ns_state.is_empty() || !self.ic_func_eligible(func_id) {
+            return NONE;
+        }
+        let Some(site) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()) else {
+            return NONE;
+        };
+        let sh = mir.shape;
+        for e in &site.entries[..site.n as usize] {
+            match *e {
+                IcEntry::OwnData { shape, slot } if shape == sh => {
+                    // SAFETY: the matching shape proves `vals` is the map's
+                    // live value column and that it holds `slot`.
+                    let v = unsafe { *(mir.vals as *const Value).add(slot as usize) };
+                    return if self.ic_plain_fn(v).is_some() { v.bits() } else { NONE };
+                }
+                IcEntry::ClassMethod {
+                    class,
+                    ver,
+                    epoch,
+                    callee,
+                    recv_shape,
+                    ..
+                } if recv_shape == sh => {
+                    if mir.fid == crate::heap::FID_MIRROR_CLASS | class
+                        && self.heap.version_of(class) == ver
+                        && self.class_proto_epoch == epoch
+                    {
+                        return callee.bits();
+                    }
+                }
+                IcEntry::ProtoData {
+                    recv_shape,
+                    first,
+                    hops,
+                    slot,
+                } if recv_shape == sh && slot != u32::MAX && mir.fid == crate::heap::FID_MIRROR_NONE => {
+                    if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                        let v = hm.val_at(slot as usize);
+                        if self.ic_plain_fn(v).is_some() {
+                            return v.bits();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        NONE
+    }
 
     /// IC lookup + fill for a `CallMethod` site: resolves `recv.key` to a
     /// PLAIN user function to frame-call with `this = recv`. `None` ⇒ slow

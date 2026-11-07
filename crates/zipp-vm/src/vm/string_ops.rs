@@ -23,12 +23,12 @@ fn matchall_pristine_enabled() -> bool {
         return true;
     }
     use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none() as u8;
+            let v = crate::env_var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -57,6 +57,30 @@ impl<'p> Vm<'p> {
         // Keep the optional diagnostics identical to dispatch_builtin_method:
         // stats are counted outside the StringOps phase, then the actual string
         // operation is attributed to that phase when the sampler is enabled.
+        super::builtins::builtin_stats_count(self, recv, "charCodeAt");
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
+        let i = arg.as_int();
+        let unit = if i >= 0 {
+            self.heap_unit_at(recv.heap_index(), i as usize)
+        } else {
+            None
+        };
+        Some(match unit {
+            Some(unit) => Value::int(unit as i32),
+            None => Value::num(f64::NAN),
+        })
+    }
+
+    /// [`Vm::interp_char_code_at_fast`] for a call whose callee is KNOWN to be
+    /// `String.prototype.charCodeAt` (a captured native of that id): no proof
+    /// of what the prototype holds. Out of line, as the rest of the captured
+    /// own-method path: inlined into the interpreter's call arms it moved the
+    /// profile-guided layout of their hot code (parse-large-js 10% slower).
+    #[inline(never)]
+    pub(crate) fn captured_char_code_at(&mut self, recv: Value, arg: Value) -> Option<Value> {
+        if !recv.is_heap() || !arg.is_int() || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_)) {
+            return None;
+        }
         super::builtins::builtin_stats_count(self, recv, "charCodeAt");
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
         let i = arg.as_int();
@@ -402,26 +426,17 @@ impl<'p> Vm<'p> {
     /// index): an interned slot for ASCII, else a fresh 1-unit string — a REAL
     /// lone-surrogate string when `u` is a surrogate half.
     pub(crate) fn str_from_unit(&mut self, u: u16) -> Value {
-        if u < 128 {
-            return Value::heap(u as u32);
-        }
-        Value::heap(
-            self.heap
-                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(u as u32))),
-        )
+        self.str_from_cp(u32::from(u))
     }
 
     /// The string Value for code point `cp` (for-of / iterator steps): an
-    /// interned slot for ASCII, else a fresh 1-code-point string (`cp` may be
-    /// a lone surrogate).
+    /// interned slot for ASCII, else the heap's cached 1-code-point string
+    /// (`cp` may be a lone surrogate).
     pub(crate) fn str_from_cp(&mut self, cp: u32) -> Value {
         if cp < 128 {
             return Value::heap(cp);
         }
-        Value::heap(
-            self.heap
-                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(cp))),
-        )
+        Value::heap(self.heap.cp_str(cp))
     }
 
     /// Allocate the receiver substring corresponding to subslice `t` of the
@@ -458,6 +473,13 @@ impl<'p> Vm<'p> {
         if self.is_object_value(v) {
             let sv = self.to_str_value(v)?;
             return self.append_guest_heap_str(out, sv.heap_index());
+        }
+        // An Int's digits from a stack buffer: `to_js_string` built a
+        // `String` for each, a malloc and a free per number a `join` printed.
+        if v.is_int() {
+            let mut buf = [0u8; 11];
+            let n = fmt_i32_into(v.as_int(), &mut buf);
+            return self.append_guest_wtf8(out, &buf[buf.len() - n..]);
         }
         let s = self.to_js_string(v)?;
         self.append_guest_wtf8(out, s.as_bytes())
@@ -978,6 +1000,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.call_value(searcher, rxv, &[Value::heap(idx)])?))
             }
             "match" => {
+                // A RegExp whose `@@match` is the intrinsic data property (no own
+                // shadow, the prototype slot untouched): the Get is unobservable
+                // and the call is `regexp_match_impl`, without the generic call.
+                if let Some(re) = self.as_regexp(arg0) {
+                    if self.regexp_method_is_intrinsic(re, "@@match", native::REGEXP_SYM_MATCH) {
+                        return Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?));
+                    }
+                }
                 // An OBJECT regexp's `@@match` overrides the default (a real RegExp's
                 // RegExp.prototype[@@match] routes through the same regexp_match_impl);
                 // a primitive argument builds a RegExp. Mirrors `matchAll`.
@@ -1413,6 +1443,30 @@ impl<'p> Vm<'p> {
                     return Ok(Some(Value::heap(self.heap.alloc_js(js))));
                 }
                 use crate::unorm::{nfc, nfd, nfkc, nfkd};
+                // ASCII is in every normalization form: no ASCII character has
+                // a decomposition or composes, and strings are values, so the
+                // receiver is the result.
+                if js_recv.is_ascii() {
+                    return Ok(Some(Value::heap(idx)));
+                }
+                // A short receiver is normalized once and admitted after: the
+                // longest expansion (a compatibility decomposition, U+FDFA's 18
+                // characters from one) keeps the result a small allocation to
+                // make before the size check. Longer ones are measured first.
+                if s.len() <= CASE_MAP_ONE_PASS_BYTES {
+                    let mut out = String::with_capacity(s.len() + (s.len() >> 2));
+                    match form.as_str() {
+                        "NFC" => extend_chars(&mut out, nfc(s)),
+                        "NFD" => extend_chars(&mut out, nfd(s)),
+                        "NFKC" => extend_chars(&mut out, nfkc(s)),
+                        _ => extend_chars(&mut out, nfkd(s)),
+                    }
+                    if out == s {
+                        return Ok(Some(Value::heap(idx)));
+                    }
+                    self.preflight_guest_string_size(out.len())?;
+                    return Ok(Some(self.alloc_str(out)));
+                }
                 let out_len = match form.as_str() {
                     "NFC" => checked_char_output_len(nfc(s))?,
                     "NFD" => checked_char_output_len(nfd(s))?,
@@ -1739,6 +1793,7 @@ impl<'p> Vm<'p> {
                         // `hi` is unit `pos`, or `pos + 1` when `pos` split a pair.
                         let from = pos + usize::from(lo != hi);
                         let at = from + crate::heap::wtf8_units(&hay.as_bytes()[hi..hi + b]);
+                        hay.note_boundary(at, hi + b);
                         Value::int(at as i32)
                     }
                     None => Value::int(-1),
@@ -1774,6 +1829,7 @@ impl<'p> Vm<'p> {
                             // `lo` is unit `pos`, or `pos - 1` inside a pair.
                             let lo_unit = pos - usize::from(lo != hi);
                             let at = lo_unit - crate::heap::wtf8_units(&hay.as_bytes()[b..lo]);
+                            hay.note_boundary(at, b);
                             Value::int(at as i32)
                         }
                     }
@@ -2430,6 +2486,27 @@ impl<'p> Vm<'p> {
 
 fn invalid_string_length() -> Thrown {
     Thrown::from_static("RangeError: Invalid string length")
+}
+
+/// `i`'s decimal text (ToString of an Int), right-aligned in `buf`, and its
+/// length: `i32::MIN` takes all 11 bytes.
+#[inline]
+pub(crate) fn fmt_i32_into(i: i32, buf: &mut [u8; 11]) -> usize {
+    let mut u = (i as i64).unsigned_abs();
+    let mut p = buf.len();
+    loop {
+        p -= 1;
+        buf[p] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        p -= 1;
+        buf[p] = b'-';
+    }
+    buf.len() - p
 }
 
 /// A `split` receiver at most this long never takes the counting pass: its

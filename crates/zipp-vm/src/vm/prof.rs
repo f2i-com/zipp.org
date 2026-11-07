@@ -127,7 +127,7 @@ static COUNTS: [AtomicU64; N_PHASES] = [
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static ON: AtomicU8 = AtomicU8::new(2);
+static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
 /// Sampling interval. 200µs over a ~500ms benchmark row is ~2,500 samples —
 /// enough that a 2% subsystem is ~50 samples and visible above noise, while the
@@ -150,7 +150,7 @@ pub(crate) fn enabled() -> bool {
 /// most of it recovered by keeping the hot side to one load + compare.
 #[cold]
 fn init() -> bool {
-    let v = (std::env::var_os("ZIPP_PROF").is_some() || std::env::var_os("ZIPP_PROF_PC").is_some())
+    let v = (crate::env_var_os("ZIPP_PROF").is_some() || crate::env_var_os("ZIPP_PROF_PC").is_some())
         as u8;
     ON.store(v, Ordering::Relaxed);
     if v == 1 {
@@ -225,7 +225,7 @@ pub fn dump() -> (Vec<(&'static str, u64, f64)>, u64) {
         })
         .filter(|(_, c, _)| *c > 0)
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    crate::cold_sort::sort_by(&mut v, |a, b| b.1.cmp(&a.1));
     (v, total)
 }
 
@@ -287,6 +287,7 @@ pub(crate) mod pc {
     type SymInitializeFn = unsafe extern "system" fn(Handle, *const u8, i32) -> i32;
     type SymSetOptionsFn = unsafe extern "system" fn(u32) -> u32;
     type SymFromAddrFn = unsafe extern "system" fn(Handle, u64, *mut u64, *mut u8) -> i32;
+    type SymGetLineFromAddr64Fn = unsafe extern "system" fn(Handle, u64, *mut u32, *mut u8) -> i32;
 
     /// dbghelp, resolved at REPORT time rather than linked.
     ///
@@ -297,6 +298,8 @@ pub(crate) mod pc {
     /// after sampling stops, so a runtime lookup is free here.
     struct DbgHelp {
         from_addr: SymFromAddrFn,
+        /// `SymGetLineFromAddr64`, asked only under `ZIPP_PROF_PC_LINES`.
+        line_from_addr: Option<SymGetLineFromAddr64Fn>,
     }
 
     fn load_dbghelp() -> Option<DbgHelp> {
@@ -320,9 +323,13 @@ pub(crate) mod pc {
             let init: SymInitializeFn = std::mem::transmute(init);
             let set_options: SymSetOptionsFn = std::mem::transmute(opts);
             let from_addr: SymFromAddrFn = std::mem::transmute(from);
-            set_options(SYMOPT);
+            let lines = lines_wanted();
+            let line = GetProcAddress(m, b"SymGetLineFromAddr64\0".as_ptr());
+            let line_from_addr = (lines && line != 0)
+                .then(|| std::mem::transmute::<usize, SymGetLineFromAddr64Fn>(line));
+            set_options(if lines { SYMOPT | SYMOPT_LOAD_LINES } else { SYMOPT });
             init(GetCurrentProcess(), std::ptr::null(), 1);
-            Some(DbgHelp { from_addr })
+            Some(DbgHelp { from_addr, line_from_addr })
         }
     }
 
@@ -384,7 +391,7 @@ pub(crate) mod pc {
     static STACK_HI: AtomicU64 = AtomicU64::new(0);
 
     fn stack_wanted() -> bool {
-        std::env::var_os("ZIPP_PROF_STACK").is_some()
+        crate::env_var_os("ZIPP_PROF_STACK").is_some()
     }
 
     /// The executable's exception directory: `DataDirectory[3]` of the PE32+
@@ -477,7 +484,7 @@ pub(crate) mod pc {
     /// Is PC mode requested? Separate from the phase profiler so `ZIPP_PROF=1`
     /// alone keeps its old, allocation-free, suspend-free behaviour.
     fn wanted() -> bool {
-        std::env::var_os("ZIPP_PROF_PC").is_some()
+        crate::env_var_os("ZIPP_PROF_PC").is_some()
     }
 
     /// Duplicate the CALLING thread's handle into one usable from the sampler,
@@ -615,7 +622,26 @@ pub(crate) mod pc {
         let end = start + len as u64;
         if let Ok(mut r) = RANGES.lock() {
             r.retain(|e| e.1 <= start || e.0 >= end);
-            r.push((start, end, label()));
+            let label = label();
+            // `ZIPP_PROF_PC_CODE=<dir>`: each body's bytes as `<start>.bin` and
+            // a `ranges.txt` line, so the dump's absolute samples can be laid
+            // over a disassembly instruction by instruction.
+            if let Some(dir) = crate::env_var_os("ZIPP_PROF_PC_CODE") {
+                let dir = std::path::PathBuf::from(dir);
+                // SAFETY: the JIT registers a mapped, readable body of `len`
+                // bytes, which stays mapped (parked) while sampling runs.
+                let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+                let _ = std::fs::write(dir.join(format!("{start:x}.bin")), bytes);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("ranges.txt"))
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(f, "{start:x} {end:x} {label}");
+                }
+            }
+            r.push((start, end, label));
         }
     }
 
@@ -627,6 +653,49 @@ pub(crate) mod pc {
     const SYMBOL_NAME_CAP: usize = 512;
     /// `SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS`.
     const SYMOPT: u32 = 0x0000_0002 | 0x0000_0004;
+    const SYMOPT_LOAD_LINES: u32 = 0x0000_0010;
+    /// `IMAGEHLP_LINE64` (x86-64): `SizeOfStruct` at 0x00, `LineNumber` at
+    /// 0x10, the `FileName` pointer at 0x18; 40 bytes.
+    const LINE_SIZE: usize = 40;
+    const LINE_NUMBER_OFF: usize = 0x10;
+    const LINE_FILE_OFF: usize = 0x18;
+
+    /// `ZIPP_PROF_PC_LINES=1`: name each sample by its source line, not only
+    /// its function, so the time inside one large function (the interpreter
+    /// loop) can be read. Needs a build with line tables (the `profiling`
+    /// profile).
+    fn lines_wanted() -> bool {
+        crate::env_var_os("ZIPP_PROF_PC_LINES").is_some()
+    }
+
+    /// `addr`'s `file:line` (the file's last path component), or `None`.
+    fn line_of(dbg: &DbgHelp, addr: u64) -> Option<String> {
+        let f = dbg.line_from_addr?;
+        #[repr(C, align(8))]
+        struct LineBuf([u8; LINE_SIZE]);
+        let mut buf = LineBuf([0u8; LINE_SIZE]);
+        let mut disp: u32 = 0;
+        // SAFETY: `buf` is an `IMAGEHLP_LINE64` with its size set; dbghelp
+        // fills it and points `FileName` at a string it owns, read at once.
+        unsafe {
+            std::ptr::write(buf.0.as_mut_ptr() as *mut u32, LINE_SIZE as u32);
+            if f(GetCurrentProcess(), addr, &mut disp, buf.0.as_mut_ptr()) == 0 {
+                return None;
+            }
+            let line = std::ptr::read(buf.0.as_ptr().add(LINE_NUMBER_OFF) as *const u32);
+            let file = std::ptr::read(buf.0.as_ptr().add(LINE_FILE_OFF) as *const *const u8);
+            if file.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while n < 1024 && *file.add(n) != 0 {
+                n += 1;
+            }
+            let path = String::from_utf8_lossy(std::slice::from_raw_parts(file, n)).into_owned();
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+            Some(format!("{name}:{line}"))
+        }
+    }
 
     /// dbghelp fills `SYMBOL_INFO` through `ULONG`/`ULONG64` fields, so the
     /// buffer must be 8-aligned; a bare `[u8; N]` is align-1 and the `u32`
@@ -689,7 +758,7 @@ pub(crate) mod pc {
             Ok(r) => r.clone(),
             Err(_) => return (Vec::new(), 0),
         };
-        ranges.sort_by_key(|r| r.0);
+        crate::cold_sort::sort_by_key(&mut ranges, |r| r.0);
         let mut tally: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut sym_cache: std::collections::HashMap<u64, Option<String>> =
             std::collections::HashMap::new();
@@ -711,7 +780,11 @@ pub(crate) mod pc {
             let name = match sym_cache.entry(rip) {
                 std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let n = dbg.as_ref().and_then(|d| symbolicate(d, rip));
+                    let mut n = dbg.as_ref().and_then(|d| symbolicate(d, rip));
+                    if let (Some(name), Some(line)) = (&mut n, dbg.as_ref().and_then(|d| line_of(d, rip))) {
+                        name.push(' ');
+                        name.push_str(&line);
+                    }
                     e.insert(n.clone());
                     n
                 }
@@ -748,12 +821,12 @@ pub(crate) mod pc {
                 dropped as f64 * 100.0 / (total as u64 + dropped) as f64,
             ));
         }
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        crate::cold_sort::sort_by(&mut rows, |a, b| b.1.cmp(&a.1));
         // `ZIPP_PROF_PC_DUMP=<path>` writes every sample as a module-relative
         // offset (or an absolute address when it is outside the image), one
         // per line, so a whole profile can be bucketed offline rather than
         // through this 25-row console view.
-        if let Some(path) = std::env::var_os("ZIPP_PROF_PC_DUMP") {
+        if let Some(path) = crate::env_var_os("ZIPP_PROF_PC_DUMP") {
             let mut out = String::with_capacity(total * 12);
             for i in 0..total {
                 // SAFETY: as above, `i < total <= MAX_SAMPLES`.
@@ -768,7 +841,7 @@ pub(crate) mod pc {
             let _ = std::fs::write(path, out);
         }
         let stacks = STACK_BUF.load(Ordering::Acquire);
-        if let (true, Some(path)) = (stacks != 0, std::env::var_os("ZIPP_PROF_STACK_DUMP")) {
+        if let (true, Some(path)) = (stacks != 0, crate::env_var_os("ZIPP_PROF_STACK_DUMP")) {
             let n = STACK_COUNT.load(Ordering::Relaxed).min(STACK_MAX_SAMPLES);
             let mut out = String::with_capacity(n * 64);
             for s in 0..n {
@@ -815,10 +888,10 @@ pub(crate) mod pc {
         {
             use std::io::Write;
             use std::sync::atomic::{AtomicU8, Ordering};
-            static ON: AtomicU8 = AtomicU8::new(2);
+            static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
             let on = match ON.load(Ordering::Relaxed) {
                 2 => {
-                    let v = std::env::var_os("ZIPP_PERF_MAP").is_some() as u8;
+                    let v = crate::env_var_os("ZIPP_PERF_MAP").is_some() as u8;
                     ON.store(v, Ordering::Relaxed);
                     v
                 }
@@ -833,7 +906,7 @@ pub(crate) mod pc {
                 // `ZIPP_PERF_MAP=dump`: the body's bytes too, for a disassembly
                 // to lay the samples over. (A sandbox build has no JIT.)
                 #[cfg(not(feature = "safe-sandbox"))]
-                if std::env::var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
+                if crate::env_var_os("ZIPP_PERF_MAP").is_some_and(|v| v == "dump") {
                     // SAFETY: the JIT registers a mapped, readable code range it
                     // just emitted, `len` bytes from `start`.
                     let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };

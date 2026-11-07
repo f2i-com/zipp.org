@@ -43,6 +43,16 @@ enum LiteStep {
     Full,
 }
 
+/// What an object method's call made of its site (`Vm::lite_call_method`).
+enum LiteCallOut {
+    /// A leaf's result, its frameless run done.
+    Value(Value),
+    /// The callee's frame, pushed.
+    Pushed(u32),
+    /// Not the method cache's: the main loop's.
+    HandOver,
+}
+
 /// A function's class in the lite loop (`LiteState::ok`).
 const LITE_UNDECIDED: u8 = 0;
 /// Runs in the small copy: only `lite_small_instr` instructions.
@@ -52,54 +62,24 @@ const LITE_NO: u8 = 2;
 /// Runs in the full copy.
 const LITE_FULL: u8 = 3;
 
-/// `ZIPP_NO_LITE=1`: every frame runs in the main loop (for A/B).
-#[inline]
-fn lite_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_LITE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_LITE=1`: every frame runs in the main loop (for A/B).
+    #[inline]
+    fn lite_enabled() = "ZIPP_NO_LITE"
 }
 
-/// `ZIPP_NO_LITE_ASYNC=1`: no async function (and no module's top level)
-/// runs in the lite loop, for A/B.
-#[inline]
-fn lite_async_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_LITE_ASYNC").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_LITE_ASYNC=1`: no async function (and no module's top level)
+    /// runs in the lite loop, for A/B.
+    #[inline]
+    fn lite_async_enabled() = "ZIPP_NO_LITE_ASYNC"
 }
 
-/// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
-/// runs in the lite loop (`loops_are_lite`), for A/B.
-#[inline]
-fn partial_lite_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PARTIAL_LITE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PARTIAL_LITE=1`: only a function that is all lite instructions
+    /// runs in the lite loop (`loops_are_lite`), for A/B.
+    #[inline]
+    fn partial_lite_enabled() = "ZIPP_NO_PARTIAL_LITE"
 }
 
 /// The instructions of the lite loop's small copy, the superinstructions over
@@ -146,6 +126,12 @@ fn lite_instr(i: &Instr) -> bool {
             | Instr::Mul { .. }
             | Instr::Bitwise { .. }
             | Instr::FuseLoadIntBitwise { .. }
+            // A script's global runs (`overlay_global_runs`).
+            | Instr::FuseGlobalIntCmpJump { .. }
+            | Instr::FuseGlobalIncJump { .. }
+            | Instr::FuseGlobalInc { .. }
+            | Instr::FuseIntBitwiseStoreGlobal { .. }
+            | Instr::FuseGlobalIntBitwise { .. }
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::FuseEqJump { .. }
@@ -222,7 +208,9 @@ fn jump_target(i: &Instr) -> Option<u32> {
         | Instr::JumpIfTrue { target, .. }
         | Instr::JumpIfNotLt { target, .. }
         | Instr::JumpIfNotLe { target, .. }
-        | Instr::FuseAddIntJump { target, .. } => Some(target),
+        | Instr::FuseAddIntJump { target, .. }
+        | Instr::FuseGlobalIncJump { target, .. }
+        | Instr::FuseGlobalIntCmpJump { target, .. } => Some(target),
         _ => None,
     }
 }
@@ -286,6 +274,197 @@ impl LiteCall {
     };
 }
 
+/// Slots of the lite loop's method cache, indexed by the call site.
+const LITE_METHOD_SLOTS: usize = 256;
+
+/// One slot of the lite loop's method cache: a `CallMethod` site's last
+/// answer by the receiver's hidden class, as the site's own cache way held
+/// it (`Vm::ic_method_way`), with the callee's resolution and frame facts.
+/// A hit checks that way's guards and nothing else: `ic_call_method`'s
+/// site lookup, its ways' loop, the callee's kind and flags and the key's
+/// text were three times the cost of the push on an object method's call.
+#[derive(Clone, Copy)]
+struct LiteMethod {
+    /// The site: its function (`u32::MAX` for none) and position.
+    site_fid: u32,
+    site_ip: u32,
+    callee: u64,
+    /// The receiver's hidden class (never `DICT`).
+    shape: u32,
+    /// The receiver's own data slot holding the method, or `u32::MAX` for
+    /// a method of the receiver's class.
+    slot: u32,
+    /// An own method: the callee's version. A class method: the class.
+    ver: u32,
+    /// A class method: the class's version and `class_proto_epoch`.
+    class_ver: u32,
+    epoch: u32,
+    fid: u32,
+    closure: u32,
+    desc: u32,
+}
+
+impl LiteMethod {
+    const EMPTY: LiteMethod = LiteMethod {
+        site_fid: u32::MAX,
+        site_ip: 0,
+        callee: 0,
+        shape: 0,
+        slot: 0,
+        ver: 0,
+        class_ver: 0,
+        epoch: 0,
+        fid: 0,
+        closure: 0,
+        desc: 0,
+    };
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LITE_LEAF=1`: every call the lite loop makes takes a frame
+    /// (`leaf_scan`), for A/B.
+    #[inline]
+    fn leaf_enabled() = "ZIPP_NO_LITE_LEAF"
+}
+
+/// A function's class as a frameless leaf (`LiteState::leaf`).
+const LEAF_UNDECIDED: u8 = 0;
+/// A leaf whatever its `this`.
+const LEAF_ANY: u8 = 1;
+/// A leaf when its caller passes its `this` (it reads it).
+const LEAF_THIS: u8 = 2;
+const LEAF_NO: u8 = 3;
+/// Registers a leaf may have: its window is on the stack.
+const LEAF_MAX_REGS: usize = 16;
+/// Declines (`Vm::lite_leaf_run`) after which a leaf takes a frame for good.
+const LEAF_BAIL_LIMIT: u8 = 32;
+
+/// Whether `p` is a leaf the lite loop runs without a frame: number
+/// arithmetic, comparisons, strict equality, moves, captured-variable,
+/// global and own-property reads, and forward branches on them, none of
+/// which can call anything, throw, allocate or write outside its
+/// registers. Such a body's frame was most of its call: a method's push,
+/// return and their bookkeeping ran four times its body. With no backward
+/// jump it runs each instruction at most once. Not a generator, async
+/// function or one that needs its `arguments`; an arrow only if it never
+/// reads its `this`.
+///
+/// `arguments` only for its length (`args_count_only`): its register holds
+/// the count, as a frame's setup writes it. A captured variable's write
+/// (`UpvalSet`) is the one effect a leaf may have, and so it must be its
+/// last chance to decline: every instruction after it is one that cannot
+/// decline (constants, moves, a read of a cell it wrote, an unconditional
+/// forward jump, the return). Branches before it may jump over it (`if (v
+/// === k) n++`): every jump is forward, so a path that skips the write has
+/// committed nothing, and what it reaches past the write cannot decline
+/// either. A conditional branch after it can (a heap condition), so none
+/// may follow it.
+fn leaf_scan(p: &crate::bytecode::FuncProto) -> u8 {
+    if p.is_generator
+        || p.is_async
+        || p.rest_reg.is_some()
+        || (p.arguments_reg.is_some() && !p.args_count_only)
+        || p.reg_count as usize > LEAF_MAX_REGS
+        || (p.param_count as usize) >= LEAF_MAX_REGS
+    {
+        return LEAF_NO;
+    }
+    // The cells written so far, once a write has committed.
+    let mut written: Option<Vec<u16>> = None;
+    let mut reads_this = false;
+    for (ip, i) in p.code.iter().enumerate() {
+        if let Some(w) = &written {
+            // Past the commit: only what cannot decline.
+            let ok = match *i {
+                Instr::LoadInt { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::Move { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined => true,
+                Instr::LoadConst { idx, .. } => p.constants.get(idx as usize).is_some_and(|c| c.is_number()),
+                Instr::UpvalGet { idx, .. } => w.contains(&idx),
+                Instr::Jump { target } => target as usize > ip && (target as usize) < p.code.len(),
+                _ => false,
+            };
+            if !ok {
+                return LEAF_NO;
+            }
+            if let Instr::Move { src: 0, .. } | Instr::Return { src: 0 } = *i {
+                reads_this = true;
+            }
+            continue;
+        }
+        if let Instr::UpvalSet { idx, src } = *i {
+            reads_this |= src == 0;
+            written = Some(vec![idx]);
+            continue;
+        }
+        let forward = |t: u32| t as usize > ip && (t as usize) < p.code.len();
+        let srcs: &[u16] = match *i {
+            Instr::LoadInt { .. }
+            | Instr::LoadBool { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::UpvalGet { .. }
+            | Instr::ReturnUndefined => &[],
+            Instr::LoadConst { idx, .. } if p.constants.get(idx as usize).is_some_and(|c| c.is_number()) => &[],
+            Instr::Move { src, .. } | Instr::Return { src } => &[src],
+            Instr::AddInt { a, .. } | Instr::Neg { a, .. } | Instr::Not { a, .. } => &[a],
+            Instr::Add { a, b, .. }
+            | Instr::Sub { a, b, .. }
+            | Instr::Mul { a, b, .. }
+            | Instr::Div { a, b, .. }
+            | Instr::Mod { a, b, .. }
+            | Instr::Lt { a, b, .. }
+            | Instr::Le { a, b, .. }
+            | Instr::Gt { a, b, .. }
+            | Instr::Ge { a, b, .. }
+            | Instr::Eq { a, b, .. }
+            | Instr::Ne { a, b, .. }
+            | Instr::Bitwise { a, b, .. } => &[a, b],
+            Instr::GetProp { obj, name, .. } if !is_private_key(&p.string_constants[name as usize]) => &[obj],
+            // A `Math` method (every `MathFn` is a pure function of its
+            // arguments), with its arguments in the window.
+            Instr::MathOp {
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } if arg_base as usize + argc as usize <= LEAF_MAX_REGS => {
+                let reads = (arg_base..arg_base + argc).any(|x| x == 0)
+                    || (callee != crate::bytecode::NO_REG && (callee == 0 || this_v == 0));
+                reads_this |= reads;
+                &[]
+            }
+            Instr::Jump { target } if forward(target) => &[],
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } if forward(target) => &[cond],
+            _ => return LEAF_NO,
+        };
+        reads_this |= srcs.contains(&0);
+    }
+    // Every path ends at a return (the compiler closes every body with one).
+    if !matches!(p.code.last(), Some(Instr::Return { .. } | Instr::ReturnUndefined)) {
+        return LEAF_NO;
+    }
+    match (reads_this, p.lexical_this) {
+        (false, _) => LEAF_ANY,
+        (true, false) => LEAF_THIS,
+        (true, true) => LEAF_NO,
+    }
+}
+
+/// The method cache slot of the site whose instruction is `at`: its address,
+/// which the dispatch has in hand. A hash of the function and position was
+/// computed for every instruction the loop ran, hoisted to its dispatch.
+#[inline(always)]
+fn lite_method_slot(at: &Instr) -> usize {
+    (at as *const Instr as usize / std::mem::size_of::<Instr>()) & (LITE_METHOD_SLOTS - 1)
+}
+
 /// The lite loop's per-VM tables.
 pub(crate) struct LiteState<'p> {
     /// Per function id: 0 not yet decided, 1 the lite loop runs it, 2 not.
@@ -297,6 +476,32 @@ pub(crate) struct LiteState<'p> {
     /// (`LITE_HANDOVER_BUDGET`).
     budget: Vec<u16>,
     calls: Box<[LiteCall]>,
+    methods: Box<[LiteMethod]>,
+    /// Per function id: its class as a frameless leaf (`LEAF_*`).
+    leaf: Vec<u8>,
+    /// Per function id: the declines its leaf runs have had.
+    leaf_bails: Vec<u8>,
+}
+
+/// Where a leaf run (`lite_leaf_run`) reads its arguments: a caller's
+/// register window, or a builtin's argument list.
+#[derive(Clone, Copy)]
+enum LeafArgs<'a> {
+    Window { base: usize, arg_base: u16, argc: u16 },
+    Slice(&'a [Value]),
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_CALLBACK=1`: a builtin calls a leaf callback in a frame
+    /// (the same-binary A/B).
+    fn leaf_callback_enabled() = "ZIPP_NO_LEAF_CALLBACK"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_JIT_LEAF_GETTER=1`: compiled code frame-calls every getter its
+    /// fast paths decline (the same-binary A/B for `leaf_getter`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_leaf_getter_enabled() = "ZIPP_NO_JIT_LEAF_GETTER"
 }
 
 impl Default for LiteState<'_> {
@@ -305,7 +510,10 @@ impl Default for LiteState<'_> {
             ok: Vec::new(),
             code: Vec::new(),
             budget: Vec::new(),
+            leaf: Vec::new(),
+            leaf_bails: Vec::new(),
             calls: vec![LiteCall::EMPTY; LITE_CALL_SLOTS].into_boxed_slice(),
+            methods: vec![LiteMethod::EMPTY; LITE_METHOD_SLOTS].into_boxed_slice(),
         }
     }
 }
@@ -347,6 +555,437 @@ impl<'p> Vm<'p> {
     pub(crate) fn lite_forget(&mut self, fid: u32) {
         if let Some(ok) = self.lite.ok.get_mut(fid as usize) {
             *ok = LITE_UNDECIDED;
+        }
+        if let Some(l) = self.lite.leaf.get_mut(fid as usize) {
+            *l = LEAF_UNDECIDED;
+        }
+    }
+
+    /// Run `fid`'s body without a frame when it is a leaf (`leaf_scan`):
+    /// its result, or `None` when it is not one or this run declined
+    /// (`leaf_run`), and the call takes its frame. `this_ok`: the caller
+    /// passes the callee's `this` (a method call's receiver), which a leaf
+    /// that reads its `this` needs.
+    ///
+    /// Inline, only the test of the callee's class: a call into the loop's
+    /// function inline grew its every arm's register shuffles.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn lite_leaf(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this: Value,
+        this_ok: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        if self.lite.leaf.get(fid as usize) == Some(&LEAF_NO) {
+            return None;
+        }
+        self.lite_leaf_try(fid, closure, this, this_ok, base, arg_base, argc)
+    }
+
+    /// [`Self::lite_leaf`] for the main loop's calls an interpreter-only VM
+    /// makes (its frames' calls the lite loop does not run: a script's top
+    /// level past its first hand-over, a `super.m()`).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(crate) fn leaf_call(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this: Value,
+        this_ok: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        self.lite_leaf(fid, closure, this, this_ok, base, arg_base, argc)
+    }
+
+    /// [`Self::lite_leaf`] for a callee that may be a leaf.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn lite_leaf_try(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this: Value,
+        this_ok: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        let state = match self.lite.leaf.get(fid as usize) {
+            Some(&s) if s != LEAF_UNDECIDED => s,
+            _ => self.lite_leaf_decide(fid),
+        };
+        if state == LEAF_NO || (state == LEAF_THIS && !this_ok) || self.frames.len() >= MAX_FRAMES {
+            return None;
+        }
+        self.lite_leaf_run(fid, closure, this, LeafArgs::Window { base, arg_base, argc })
+    }
+
+    /// A builtin's callback `cb` (an array method's, a sort's comparator)
+    /// run as a leaf (`leaf_scan`) with `args`, in a VM that runs only the
+    /// interpreter: its result, or `None` when it is not one or this run
+    /// declined, and the builtin calls it in a frame. `this_arg` is passed as
+    /// it is to a strict callee or as an object; a sloppy one reading any
+    /// other `this` needs its frame's binding.
+    #[inline]
+    pub(crate) fn leaf_callback(&mut self, cb: Value, this_arg: Value, args: &[Value]) -> Option<Value> {
+        if !self.lite_entry_ok() || !cb.is_heap() || !leaf_callback_enabled() {
+            return None;
+        }
+        let (fid, closure) = match self.heap.get(cb.heap_index()) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, cb.heap_index()),
+            _ => return None,
+        };
+        if self.lite.leaf.get(fid as usize) == Some(&LEAF_NO) {
+            return None;
+        }
+        self.leaf_callback_try(fid, closure, this_arg, args)
+    }
+
+    /// A getter compiled code reached (`jit_prop_slow_impl`) run as a leaf
+    /// (`leaf_scan`) with `recv` as its `this`: its result, or `None` when it
+    /// is not one or this run declined, and the getter takes its frame as
+    /// before. In a VM that also compiles: a leaf getter (`get area() {
+    /// return this.w * this.h }`) cost a frame push, an entry and a pop from
+    /// compiled code where the interpreter's own accessor reads ran it
+    /// frameless, and accessor-heavy rows ran slower with the JIT than
+    /// without it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn leaf_getter(&mut self, fid: u32, closure: u32, recv: Value) -> Option<Value> {
+        if !jit_leaf_getter_enabled() || self.lite.leaf.get(fid as usize) == Some(&LEAF_NO) {
+            return None;
+        }
+        self.leaf_callback_try(fid, closure, recv, &[])
+    }
+
+    #[inline(never)]
+    fn leaf_callback_try(&mut self, fid: u32, closure: u32, this_arg: Value, args: &[Value]) -> Option<Value> {
+        // Another realm's function reads its own globals, and a closure made
+        // under direct `eval` its scope: both take their frame.
+        if !self.realm_global_objs.is_empty()
+            || !self.obj_realm.is_empty()
+            || (!self.closure_eval_scope.is_empty() && self.closure_eval_scope.contains_key(&closure))
+        {
+            return None;
+        }
+        let state = match self.lite.leaf.get(fid as usize) {
+            Some(&s) if s != LEAF_UNDECIDED => s,
+            _ => self.lite_leaf_decide(fid),
+        };
+        if state == LEAF_NO || self.frames.len() >= MAX_FRAMES {
+            return None;
+        }
+        if state == LEAF_THIS && !(self.func(fid as usize).is_strict || self.is_object_value(this_arg)) {
+            return None;
+        }
+        self.lite_leaf_run(fid, closure, this_arg, LeafArgs::Slice(args))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn lite_leaf_decide(&mut self, fid: u32) -> u8 {
+        let i = fid as usize;
+        if self.lite.leaf.len() <= i {
+            self.lite.leaf.resize(i + 1, LEAF_UNDECIDED);
+            self.lite.leaf_bails.resize(i + 1, 0);
+        }
+        let s = if leaf_enabled() {
+            leaf_scan(self.func(i))
+        } else {
+            LEAF_NO
+        };
+        self.lite.leaf[i] = s;
+        s
+    }
+
+    /// One run of leaf `fid` over a register window on the stack: `this`,
+    /// the arguments from the caller's `base + arg_base`, the rest
+    /// `undefined`. Its ops are the interpreter's fast paths exactly, and
+    /// any operand they do not take (a non-number, a property the site's
+    /// own-data way does not answer) declines before the body has done
+    /// anything a caller could see, so the call then runs it again in a
+    /// frame. A leaf that declines `LEAF_BAIL_LIMIT` times stays a frame
+    /// call.
+    #[inline(always)]
+    fn lite_leaf_run(&mut self, fid: u32, closure: u32, this: Value, args: LeafArgs<'_>) -> Option<Value> {
+        use crate::bytecode::BitwiseOp as B;
+        let p = self.func(fid as usize);
+        let code: &'p [Instr] = &p.code;
+        let mut r = [Value::UNDEFINED; LEAF_MAX_REGS];
+        r[0] = this;
+        let argc = match args {
+            LeafArgs::Window { argc, .. } => argc as usize,
+            LeafArgs::Slice(s) => s.len(),
+        };
+        let n = argc.min(p.param_count as usize).min(LEAF_MAX_REGS - 1);
+        match args {
+            LeafArgs::Window { base, arg_base, .. } => {
+                for (k, slot) in r[1..=n].iter_mut().enumerate() {
+                    *slot = self.get(base, arg_base + k as u16);
+                }
+            }
+            LeafArgs::Slice(s) => r[1..=n].copy_from_slice(&s[..n]),
+        }
+        // `arguments` for its length alone (`leaf_scan`): the count.
+        if let Some(areg) = p.arguments_reg {
+            r[areg as usize] = Value::int(argc as i32);
+        }
+        let mut ip = 0;
+        macro_rules! decline {
+            () => {{
+                let b = &mut self.lite.leaf_bails[fid as usize];
+                *b += 1;
+                if *b >= LEAF_BAIL_LIMIT {
+                    self.lite.leaf[fid as usize] = LEAF_NO;
+                }
+                return None;
+            }};
+        }
+        macro_rules! num2 {
+            ($a:expr, $b:expr, $int:expr, $f:expr) => {{
+                let (x, y) = (r[$a as usize], r[$b as usize]);
+                if x.is_int() && y.is_int() {
+                    $int(x.as_int(), y.as_int())
+                } else if x.is_number() && y.is_number() {
+                    $f(x.as_f64(), y.as_f64())
+                } else {
+                    decline!();
+                }
+            }};
+        }
+        loop {
+            match code[ip] {
+                Instr::LoadInt { dst, val } => r[dst as usize] = Value::int(val),
+                Instr::LoadConst { dst, idx } => r[dst as usize] = p.constants[idx as usize],
+                Instr::LoadBool { dst, val } => r[dst as usize] = Value::bool(val),
+                Instr::LoadNull { dst } => r[dst as usize] = Value::NULL,
+                Instr::LoadUndefined { dst } => r[dst as usize] = Value::UNDEFINED,
+                Instr::Move { dst, src } => r[dst as usize] = r[src as usize],
+                // The lite loop's reads: a binding in its TDZ, and a global
+                // the slow route answers, throw or run code there.
+                Instr::LoadGlobal { dst, idx } => {
+                    let v = self.globals[idx as usize];
+                    if v.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
+                        decline!();
+                    }
+                    r[dst as usize] = v;
+                }
+                Instr::UpvalGet { dst, idx } => {
+                    if closure == NO_CLOSURE {
+                        decline!();
+                    }
+                    let v = self.heap.cell_get(self.closure_upvalue(closure, idx));
+                    if v.is_uninitialized() {
+                        decline!();
+                    }
+                    r[dst as usize] = v;
+                }
+                // The body's one effect, past which nothing declines
+                // (`leaf_scan`); the lite loop's checks first: a `const`, a
+                // function expression's own name and a binding in its TDZ
+                // are the frame's (it throws, or ignores the write).
+                Instr::UpvalSet { idx, src } => {
+                    if closure == NO_CLOSURE {
+                        decline!();
+                    }
+                    let cell = self.closure_upvalue(closure, idx);
+                    if (!self.const_cells.is_empty() && self.const_cells.contains(&cell))
+                        || (!self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell))
+                        || self.heap.cell_get(cell).is_uninitialized()
+                    {
+                        decline!();
+                    }
+                    self.heap.upval_cell_set(cell, r[src as usize]);
+                }
+                Instr::Eq { dst, a, b } | Instr::Ne { dst, a, b } => {
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    // Two different heap values may be equal strings, which
+                    // a comparison may flatten: the frame's.
+                    if x.is_heap() && y.is_heap() && x.bits() != y.bits() {
+                        decline!();
+                    }
+                    let eq = self.strict_eq_fast(x, y);
+                    r[dst as usize] = Value::bool(eq == matches!(code[ip], Instr::Eq { .. }));
+                }
+                Instr::Not { dst, a } => match r[a as usize].truthy_primitive() {
+                    Some(t) => r[dst as usize] = Value::bool(!t),
+                    None => decline!(),
+                },
+                Instr::Neg { dst, a } => {
+                    let x = r[a as usize];
+                    r[dst as usize] = if x.is_int() {
+                        match x.as_int() {
+                            0 => Value::num(-0.0),
+                            i => match i.checked_neg() {
+                                Some(v) => Value::int(v),
+                                None => Value::num(-(i as f64)),
+                            },
+                        }
+                    } else if x.is_double() {
+                        Value::num(-x.as_f64())
+                    } else {
+                        decline!();
+                    };
+                }
+                Instr::Jump { target } => {
+                    ip = target as usize;
+                    continue;
+                }
+                Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                    let Some(t) = r[cond as usize].truthy_primitive() else {
+                        decline!();
+                    };
+                    if t == matches!(code[ip], Instr::JumpIfTrue { .. }) {
+                        ip = target as usize;
+                        continue;
+                    }
+                }
+                Instr::Add { dst, a, b } => {
+                    r[dst as usize] = num2!(
+                        a,
+                        b,
+                        |x: i32, y: i32| match x.checked_add(y) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(x as f64 + y as f64),
+                        },
+                        |x: f64, y: f64| Value::num(x + y)
+                    )
+                }
+                Instr::Sub { dst, a, b } => {
+                    r[dst as usize] = num2!(
+                        a,
+                        b,
+                        |x: i32, y: i32| match x.checked_sub(y) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(x as f64 - y as f64),
+                        },
+                        |x: f64, y: f64| Value::num(x - y)
+                    )
+                }
+                Instr::Mul { dst, a, b } => {
+                    r[dst as usize] = num2!(
+                        a,
+                        b,
+                        // A zero product with a negative operand is -0.
+                        |x: i32, y: i32| match x.checked_mul(y) {
+                            Some(v) if v != 0 || (x | y) >= 0 => Value::int(v),
+                            _ => Value::num(x as f64 * y as f64),
+                        },
+                        |x: f64, y: f64| Value::num(x * y)
+                    )
+                }
+                Instr::Lt { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x < y), |x, y| Value::bool(x < y)),
+                Instr::Le { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x <= y), |x, y| Value::bool(x <= y)),
+                Instr::Gt { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x > y), |x, y| Value::bool(x > y)),
+                Instr::Ge { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x >= y), |x, y| Value::bool(x >= y)),
+                Instr::AddInt { dst, a, imm, .. } => {
+                    let x = r[a as usize];
+                    r[dst as usize] = if x.is_int() {
+                        match x.as_int().checked_add(imm) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(x.as_int() as f64 + imm as f64),
+                        }
+                    } else if x.is_number() {
+                        Value::num(x.as_f64() + imm as f64)
+                    } else {
+                        decline!();
+                    };
+                }
+                Instr::Bitwise { dst, a, b, op } => {
+                    // `fused_bitwise`'s Number path: ToInt32 of each.
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    let (x, y) = if x.is_int() && y.is_int() {
+                        (x.as_int(), y.as_int())
+                    } else {
+                        match super::dispatch::number_int32(x).zip(super::dispatch::number_int32(y)) {
+                            Some(p) => p,
+                            None => decline!(),
+                        }
+                    };
+                    r[dst as usize] = match op {
+                        B::And => Value::int(x & y),
+                        B::Or => Value::int(x | y),
+                        B::Xor => Value::int(x ^ y),
+                        B::Shl => Value::int(x.wrapping_shl(y as u32 & 31)),
+                        B::Shr => Value::int(x >> (y as u32 & 31)),
+                        B::Ushr => Value::num(((x as u32) >> (y as u32 & 31)) as f64),
+                    };
+                }
+                Instr::GetProp { dst, obj, name } => {
+                    let o = r[obj as usize];
+                    if let Some(v) = self.ic_get_prop_own_hit(fid, ip, o) {
+                        r[dst as usize] = v;
+                    } else {
+                        // The site's inherited or dictionary-hint way (a
+                        // `Math` method's read), as the lite loop's arm
+                        // takes it; its settle refreshes a mirror only.
+                        let key: &'p str = p.string_constants[name as usize].as_str();
+                        match self.ic_get_prop_proto_hit(fid, ip, o, key) {
+                            Some(v) => {
+                                self.ic_proto_hit_settle(o);
+                                r[dst as usize] = v;
+                            }
+                            None => decline!(),
+                        }
+                    }
+                }
+                Instr::Div { dst, a, b } => {
+                    r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 / y as f64), |x: f64, y: f64| {
+                        Value::num(x / y)
+                    })
+                }
+                // JS `%` on Numbers is C's fmod: the dividend's sign, -0 kept.
+                Instr::Mod { dst, a, b } => {
+                    r[dst as usize] = num2!(a, b, super::helpers_num2::js_rem_int, |x: f64, y: f64| {
+                        Value::num(super::helpers_num2::js_rem(x, y))
+                    })
+                }
+                Instr::MathOp {
+                    dst,
+                    op,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                } => {
+                    let intrinsic = if callee == crate::bytecode::NO_REG {
+                        self.math_bare_is_intrinsic(op, this_v as u32)
+                    } else {
+                        self.math_method_is_intrinsic(
+                            native::MATH_METHOD_BASE + op as u16,
+                            r[callee as usize],
+                            r[this_v as usize],
+                        )
+                    };
+                    let args = &r[arg_base as usize..(arg_base + argc) as usize];
+                    // Numbers only: anything else's ToNumber can run code.
+                    if !intrinsic || !args.iter().all(|v| v.is_number()) {
+                        decline!();
+                    }
+                    let v = match (op, args) {
+                        (crate::bytecode::MathFn::Imul, [a, b, ..]) if a.is_int() && b.is_int() => {
+                            Value::int(a.as_int().wrapping_mul(b.as_int()))
+                        }
+                        _ => match self.eval_math_args(op, args) {
+                            Ok(x) => Value::num(x),
+                            Err(_) => decline!(),
+                        },
+                    };
+                    r[dst as usize] = v;
+                }
+                Instr::Return { src } => return Some(r[src as usize]),
+                Instr::ReturnUndefined => return Some(Value::UNDEFINED),
+                _ => decline!(),
+            }
+            ip += 1;
         }
     }
 
@@ -463,6 +1102,103 @@ impl<'p> Vm<'p> {
             };
         }
         Some((call.fid, call.closure, desc))
+    }
+
+    /// The method `recv.<name>` resolves to for the `CallMethod` at `ip` in
+    /// `func_id`, an ordinary object or class instance its receiver: the
+    /// lite method cache's answer, else `ic_call_method`'s (remembered by
+    /// the way that holds it), with the callee's frame descriptor. `None`
+    /// for anything the method cache does not answer (a private name, a
+    /// native, an accessor).
+    #[inline(always)]
+    fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+        let slot = lite_method_slot(at);
+        let e = &self.lite.methods[slot];
+        if e.site_fid == func_id && e.site_ip == ip as u32 {
+            if let Some((_, m)) = self.ic_recv_map(recv) {
+                if m.shape() == e.shape
+                    && if e.slot != u32::MAX {
+                        m.val_at(e.slot as usize).bits() == e.callee
+                            && self.heap.version_of(Value::from_bits(e.callee).heap_index()) == e.ver
+                    } else {
+                        m.class == Some(e.ver)
+                            && self.heap.version_of(e.ver) == e.class_ver
+                            && self.class_proto_epoch == e.epoch
+                    }
+                {
+                    return Some((e.fid, e.closure, Value::from_bits(e.callee), e.desc));
+                }
+            }
+        }
+        self.lite_method_miss(slot, func_id, ip, recv, name)
+    }
+
+    /// The `CallMethod` at `at` (`ip` in `func_id`) on an ordinary object
+    /// or class instance `recv`: the method cache's callee run as a leaf
+    /// or its frame pushed. Out of line: inline, the cache, the leaf test
+    /// and the push grew the loop's register shuffles in every arm, and a
+    /// loop with no call ran 11% more cycles.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn lite_call_method(
+        &mut self,
+        at: &Instr,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        name: u32,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+    ) -> Result<LiteCallOut, Thrown> {
+        let Some((fid, closure, callee, desc)) = self.lite_method(at, func_id, ip, recv, name) else {
+            return Ok(LiteCallOut::HandOver);
+        };
+        if let Some(v) = self.lite_leaf(fid, closure, recv, true, base, arg_base, argc) {
+            return Ok(LiteCallOut::Value(v));
+        }
+        self.setup_call_method_desc(fid, closure, desc, recv, base, arg_base, argc, dst, ip + 1, callee)?;
+        Ok(LiteCallOut::Pushed(fid))
+    }
+
+    /// [`Self::lite_method`] past its cache, which it fills at `slot`.
+    #[inline(never)]
+    fn lite_method_miss(
+        &mut self,
+        slot: usize,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        name: u32,
+    ) -> Option<(u32, u32, Value, u32)> {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        if is_private_key(key) {
+            return None;
+        }
+        let (fid, closure, callee) = self.ic_call_method(func_id, ip, recv, key)?;
+        let desc = self.lean_call_desc(fid);
+        if let Some((shape, own, class, class_ver, epoch)) = self.ic_method_way(func_id, ip, recv, callee) {
+            let ver = if own == u32::MAX {
+                class
+            } else {
+                self.heap.version_of(callee.heap_index())
+            };
+            self.lite.methods[slot] = LiteMethod {
+                site_fid: func_id,
+                site_ip: ip as u32,
+                callee: callee.bits(),
+                shape,
+                slot: own,
+                ver,
+                class_ver,
+                epoch,
+                fid,
+                closure,
+                desc,
+            };
+        }
+        Some((fid, closure, callee, desc))
     }
 
     /// Run the top frame, and the eligible frames it calls or returns to, in
@@ -744,11 +1480,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::JumpIfFalse { cond, target } if FULL => {
                     let v = self.get(base, cond);
-                    let t = if v.is_bool() {
-                        v.bits() == Value::TRUE.bits()
-                    } else {
-                        self.truthy(v)
-                    };
+                    let t = self.jump_condition(v);
                     if !t {
                         // A taken backward branch closes a loop (`do … while`).
                         if (target as usize) < ip {
@@ -761,11 +1493,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::JumpIfTrue { cond, target } if FULL => {
                     let v = self.get(base, cond);
-                    let t = if v.is_bool() {
-                        v.bits() == Value::TRUE.bits()
-                    } else {
-                        self.truthy(v)
-                    };
+                    let t = self.jump_condition(v);
                     if t {
                         if (target as usize) < ip {
                             self.maybe_gc();
@@ -820,6 +1548,21 @@ impl<'p> Vm<'p> {
                     let r = self.fused_bitwise(va, vb, op)?;
                     self.set(base, dst, r);
                     ip += 2;
+                }
+                // The global runs, through the main loop's out-of-line arm
+                // (`Vm::global_run`); a counter's back-edge counts as one.
+                Instr::FuseGlobalIntCmpJump { .. }
+                | Instr::FuseGlobalIncJump { .. }
+                | Instr::FuseGlobalInc { .. }
+                | Instr::FuseIntBitwiseStoreGlobal { .. }
+                | Instr::FuseGlobalIntBitwise { .. }
+                    if FULL =>
+                {
+                    let next = self.global_run(code[ip], base, func_id, ip, false)?;
+                    if next <= ip {
+                        steps += LITE_LOOP_STEPS;
+                    }
+                    ip = next;
                 }
                 Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
@@ -978,7 +1721,7 @@ impl<'p> Vm<'p> {
                         }
                         hand_over!();
                     }
-                    match self.ic_get_prop(func_id, ip, o, key) {
+                    match self.ic_get_prop_memo_first(func_id, ip, o, key) {
                         GetAct::Value(v) => {
                             self.set(base, dst, v);
                             ip += 1;
@@ -1111,13 +1854,9 @@ impl<'p> Vm<'p> {
                     // ToNumeric path.
                     let (va, vb) = (self.get(base, a), self.get(base, b));
                     let r = if va.is_int() && vb.is_int() {
-                        let ia = va.as_int();
-                        match ia.checked_rem(vb.as_int()) {
-                            Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
-                            _ => Value::num(va.as_f64() % vb.as_f64()),
-                        }
+                        super::helpers_num2::js_rem_int(va.as_int(), vb.as_int())
                     } else if va.is_number() && vb.is_number() {
-                        Value::num(va.as_f64() % vb.as_f64())
+                        Value::num(super::helpers_num2::js_rem(va.as_f64(), vb.as_f64()))
                     } else {
                         hand_over!();
                     };
@@ -1267,21 +2006,29 @@ impl<'p> Vm<'p> {
                     // array's `push` and a string's `charCodeAt`, its leaves.
                     // Anything else is the main arm's.
                     let recv = self.get(base, obj);
-                    let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
-                    if !recv.is_heap() || is_private_key(key) {
+                    if !recv.is_heap() {
                         hand_over!();
+                    }
+                    // The key's text, for what the method cache does not
+                    // answer (it reads no key on a hit).
+                    macro_rules! key {
+                        () => {
+                            self.func(func_id as usize).string_constants[name as usize].as_str()
+                        };
                     }
                     match self.heap.get(recv.heap_index()) {
                         HeapObj::Object(_) => {
-                            let Some((fid, closure, callee_fn)) = self.ic_call_method(func_id, ip, recv, key) else {
-                                hand_over!();
-                            };
-                            self.setup_call_lean_this(
-                                fid, closure, recv, true, base, arg_base, argc, dst, ip + 1, callee_fn,
-                            )?;
-                            lite_enter!(fid);
+                            match self.lite_call_method(&code[ip], func_id, ip, recv, name, base, arg_base, argc, dst)? {
+                                LiteCallOut::Value(v) => {
+                                    steps += LITE_CALL_STEPS;
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                }
+                                LiteCallOut::Pushed(fid) => lite_enter!(fid),
+                                LiteCallOut::HandOver => hand_over!(),
+                            }
                         }
-                        HeapObj::Array(_) if argc == 1 && super::builtins::is_push_name(key) => {
+                        HeapObj::Array(_) if argc == 1 && super::builtins::is_push_name(key!()) => {
                             let v = self.get(base, arg_base);
                             let Some(len) = self.interp_array_push_fast(recv, v) else {
                                 hand_over!();
@@ -1289,14 +2036,14 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, len);
                             ip += 1;
                         }
-                        HeapObj::Array(_) if argc == 0 && super::builtins::is_pop_name(key) => {
+                        HeapObj::Array(_) if argc == 0 && super::builtins::is_pop_name(key!()) => {
                             let Some(v) = self.interp_array_pop_fast(recv) else {
                                 hand_over!();
                             };
                             self.set(base, dst, v);
                             ip += 1;
                         }
-                        HeapObj::Str(_) | HeapObj::Cons { .. } if argc == 1 && key == "charCodeAt" => {
+                        HeapObj::Str(_) | HeapObj::Cons { .. } if argc == 1 && key!() == "charCodeAt" => {
                             let arg = self.get(base, arg_base);
                             let Some(r) = self.interp_char_code_at_fast(recv, arg) else {
                                 hand_over!();
@@ -1317,6 +2064,16 @@ impl<'p> Vm<'p> {
                     let Some((fid, closure, desc)) = self.lite_resolve(func_id, ip, callee_v) else {
                         hand_over!();
                     };
+                    // The small copy's calls are a recursive function's, never
+                    // a leaf's, and its registers are tight.
+                    if FULL {
+                        if let Some(v) = self.lite_leaf(fid, closure, Value::UNDEFINED, false, base, arg_base, argc) {
+                            steps += LITE_CALL_STEPS;
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                    }
                     // Every push puts the callee's window at the file's end:
                     // its base, known before the push stores it.
                     let callee_base = self.regs.len();
@@ -1406,8 +2163,13 @@ mod tests {
             assert_eq!(vm.lite.ok[fb as usize], LITE_SMALL, "fib runs in the small copy");
             assert_eq!(vm.lite.ok[fid("readP") as usize], LITE_FULL, "a property read needs the full copy");
             // Its caller's loop holds a `typeof`, so the main program runs in
-            // the main loop and every call of `tiny` is a short entry.
-            assert!(!vm.lite_eligible(fid("tiny")), "tiny's short entries from the main program spent its budget");
+            // the main loop, which runs `tiny` as a frameless leaf
+            // (`leaf_call`): no call of it enters the lite loop, so none
+            // spends its hand-over budget.
+            let tiny = fid("tiny");
+            assert_eq!(vm.lite.leaf.get(tiny as usize), Some(&LEAF_ANY), "tiny runs as a frameless leaf");
+            assert!(vm.lite_eligible(tiny), "tiny's leaf runs spent none of its hand-overs");
+            assert_eq!(vm.lite.budget[tiny as usize], LITE_HANDOVER_BUDGET);
             assert!(!vm.lite_eligible(fid("other")), "typeof is not in the lite set");
             // Eligible by its instructions, so only the budget sent it back.
             let p = &program.functions[out as usize];

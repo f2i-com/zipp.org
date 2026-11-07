@@ -13,6 +13,100 @@ fn cross3_finish_fid_fits(fid: u32) -> bool {
     fid <= 0x00FF_FFFF
 }
 
+/// Byte offsets of a `Vec<T>`'s data pointer and length inside the vector,
+/// found by laying a probe vector's words beside what it reports (`as_ptr`,
+/// `len` and `capacity`, three different numbers). `None` unless `Vec<T>` is
+/// exactly three words and each answer is in exactly one of them: Rust does
+/// not fix the field order, so compiled code that reads a vector in place
+/// asks this binary instead of assuming it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn vec_raw_offsets<T>() -> Option<(i32, i32)> {
+    const W: usize = std::mem::size_of::<usize>();
+    if std::mem::size_of::<Vec<T>>() != 3 * W || std::mem::size_of::<T>() == 0 {
+        return None;
+    }
+    let v: Vec<T> = Vec::with_capacity(5);
+    // SAFETY: `Vec<T>` is three words (checked above), all initialized.
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let (ptr, len, cap) = (v.as_ptr() as usize, v.len(), v.capacity());
+    let find = |x: usize| {
+        let mut at = (0..3).filter(|&i| words[i] == x);
+        let i = at.next()?;
+        at.next().is_none().then_some(i)
+    };
+    let (p, l, c) = (find(ptr)?, find(len)?, find(cap)?);
+    if p == l || p == c || l == c {
+        return None;
+    }
+    Some(((p * W) as i32, (l * W) as i32))
+}
+
+/// Where compiled code finds a heap slot's private list (`codegen::PrivLayout`):
+/// `Vm::private_fields`' field offsets, its vectors' probed layouts
+/// (`vec_raw_offsets`) and the entry tuple's. Worked out once; `None` when a
+/// probe fails, and then no private-field lane is planned.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn priv_layout() -> Option<&'static crate::codegen::PrivLayout> {
+    type Entry = (u64, u32, Value);
+    type List = Vec<Entry>;
+    static LAYOUT: std::sync::OnceLock<Option<crate::codegen::PrivLayout>> = std::sync::OnceLock::new();
+    LAYOUT
+        .get_or_init(|| {
+            if std::mem::size_of::<Value>() != 8 || crate::slot_table::EMPTY != u32::MAX {
+                return None;
+            }
+            let (flat_p, flat_l) = vec_raw_offsets::<u32>()?;
+            let (vals_p, _) = vec_raw_offsets::<List>()?;
+            let (list_p, list_l) = vec_raw_offsets::<Entry>()?;
+            let table = core::mem::offset_of!(Vm<'static>, private_fields);
+            let flat = table + core::mem::offset_of!(crate::slot_table::SlotTable<List, true>, flat);
+            let vals = table + core::mem::offset_of!(crate::slot_table::SlotTable<List, true>, vals);
+            let field = |x: usize| i32::try_from(x).ok();
+            Some(crate::codegen::PrivLayout {
+                flat_ptr: field(flat)? + flat_p,
+                flat_len: field(flat)? + flat_l,
+                vals_ptr: field(vals)? + vals_p,
+                list_size: field(std::mem::size_of::<List>())?,
+                list_ptr: list_p,
+                list_len: list_l,
+                entry_size: field(std::mem::size_of::<Entry>())?,
+                brand_off: field(core::mem::offset_of!(Entry, 0))?,
+                id_off: field(core::mem::offset_of!(Entry, 1))?,
+                val_off: field(core::mem::offset_of!(Entry, 2))?,
+            })
+        })
+        .as_ref()
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod priv_layout_tests {
+    /// The probe finds this binary's vector layout, and reading a live list
+    /// through it gives back what `Vec`'s own accessors say.
+    #[test]
+    fn the_probed_layout_reads_a_list_in_place() {
+        let l = super::priv_layout().expect("vectors are three words here");
+        let list: Vec<(u64, u32, crate::value::Value)> =
+            vec![(7, 9, crate::value::Value::int(5)), (11, 13, crate::value::Value::int(6))];
+        let base = &list as *const _ as *const u8;
+        // SAFETY: offsets inside the three-word vector header.
+        let (ptr, len) = unsafe {
+            (
+                *(base.add(l.list_ptr as usize) as *const usize),
+                *(base.add(l.list_len as usize) as *const usize),
+            )
+        };
+        assert_eq!(ptr, list.as_ptr() as usize);
+        assert_eq!(len, 2);
+        let e1 = ptr + l.entry_size as usize;
+        // SAFETY: entry 1 of a two-entry list.
+        unsafe {
+            assert_eq!(*((e1 + l.brand_off as usize) as *const u64), 11);
+            assert_eq!(*((e1 + l.id_off as usize) as *const u32), 13);
+            assert_eq!(*((e1 + l.val_off as usize) as *const u64), crate::value::Value::int(6).bits());
+        }
+    }
+}
+
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
 mod cross3_finish_abi_tests {
     use super::cross3_finish_fid_fits;
@@ -24,25 +118,15 @@ mod cross3_finish_abi_tests {
     }
 }
 
-/// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
-/// ways contain multiple plain-function FuncProto ids. This is a plan-time
-/// profitability decision only: the existing helper still resolves and checks
-/// the live callee Value/fid/entry on every invocation. Metered VMs deliberately
-/// keep the pre-change plan until this broader route has its own explicit
-/// charging gate. `ZIPP_NO_POLY_FID_CROSSCALL=1` is the same-binary off switch.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn poly_fid_crosscall_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_POLY_FID_CROSSCALL").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
+    /// ways contain multiple plain-function FuncProto ids. This is a plan-time
+    /// profitability decision only: the existing helper still resolves and checks
+    /// the live callee Value/fid/entry on every invocation. Metered VMs deliberately
+    /// keep the pre-change plan until this broader route has its own explicit
+    /// charging gate. `ZIPP_NO_POLY_FID_CROSSCALL=1` is the same-binary off switch.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn poly_fid_crosscall_enabled() = "ZIPP_NO_POLY_FID_CROSSCALL"
 }
 
 /// B270: for each `Call` in `code`, the nearest preceding instruction (in
@@ -141,67 +225,37 @@ fn nested_reject(why: &str) {
     }
 }
 
-/// `ZIPP_NO_NESTED_CAPTURED_IMUL=1` makes `splice_nested_leaf` decline an inner
-/// body that holds a reference-captured `Math.imul` again, as it did before
-/// the capture was flattened to the bare form there. For a one-binary A/B.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn nested_captured_imul_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_NESTED_CAPTURED_IMUL").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NESTED_CAPTURED_IMUL=1` makes `splice_nested_leaf` decline an inner
+    /// body that holds a reference-captured `Math.imul` again, as it did before
+    /// the capture was flattened to the bare form there. For a one-binary A/B.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn nested_captured_imul_enabled() = "ZIPP_NO_NESTED_CAPTURED_IMUL"
 }
 
-/// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
-/// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
-/// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
-/// which removes the fat-LTO code-layout confound §2 warns about and that B77 was
-/// reverted for. Cached, because this is read once per candidate receiver per
-/// region compile. (`ZIPP_NO_METHOD_INLINE=1` remains the whole-mechanism switch;
-/// it is no use for attribution, since it also kills the class and own-slot arms.)
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn proto_method_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_PROTO_METHOD_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
+    /// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
+    /// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+    /// which removes the fat-LTO code-layout confound §2 warns about and that B77 was
+    /// reverted for. Cached, because this is read once per candidate receiver per
+    /// region compile. (`ZIPP_NO_METHOD_INLINE=1` remains the whole-mechanism switch;
+    /// it is no use for attribution, since it also kills the class and own-slot arms.)
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn proto_method_inline_enabled() = "ZIPP_NO_PROTO_METHOD_INLINE"
 }
 
-/// W20 (M2): `ZIPP_NO_OWN_ACCESSOR_INLINE=1` drops the OWN-accessor arm back out
-/// of `build_accessor_shape`, leaving the class arm exactly as it was -- i.e. OFF
-/// reproduces pre-wave behaviour byte-identically, since the own-slot receivers
-/// this admits are precisely the ones that used to `return None`. Exists so the
-/// mechanism can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
-/// which removes the fat-LTO code-layout confound a two-binary A/B carries.
-/// Memoized and read at PLAN time only (once per candidate receiver per region
-/// compile), never on a hot path.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn own_accessor_inline_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_OWN_ACCESSOR_INLINE").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// W20 (M2): `ZIPP_NO_OWN_ACCESSOR_INLINE=1` drops the OWN-accessor arm back out
+    /// of `build_accessor_shape`, leaving the class arm exactly as it was -- i.e. OFF
+    /// reproduces pre-wave behaviour byte-identically, since the own-slot receivers
+    /// this admits are precisely the ones that used to `return None`. Exists so the
+    /// mechanism can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+    /// which removes the fat-LTO code-layout confound a two-binary A/B carries.
+    /// Memoized and read at PLAN time only (once per candidate receiver per region
+    /// compile), never on a hot path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn own_accessor_inline_enabled() = "ZIPP_NO_OWN_ACCESSOR_INLINE"
 }
 
 /// Recognise one exact, effect-free scanner leaf. The match is intentionally
@@ -761,7 +815,7 @@ impl<'p> Vm<'p> {
             // reject the arbitrary Call itself, while the MEM tier owns the
             // post-call refresh contract used here.
             let call_result_candidate = matches!(recv, Recv::Str | Recv::Len)
-                && std::env::var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
+                && crate::env_var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
                 && writer.is_some_and(|wip| matches!(proto.code[wip], Instr::Call { .. }));
             let call_written = call_result_candidate
                 && call_result_reaches_lookup_on_all_paths(&proto.code, s, e, lookup_ip, obj);
@@ -1296,7 +1350,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) if !items.is_empty() && items.len() <= MAX_ARMS => items,
                 _ => continue,
             };
-            if items.iter().any(|v| v.is_hole()) {
+            if Value::any_hole(&items) {
                 continue;
             }
 
@@ -1451,6 +1505,7 @@ impl<'p> Vm<'p> {
                     callee_reg_count: callee.reg_count,
                     this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
                     this_reg: None,
+                    new_lane: None,
                     class_guard: None,
                     prop_shapes: FxHashMap::default(),
                     param_count: callee.param_count,
@@ -1520,6 +1575,98 @@ impl<'p> Vm<'p> {
             }
         }
         plan
+    }
+
+    /// The accessor lanes (`codegen::AccLanePlan`) of `func_id`'s property
+    /// sites whose cache's first way is an accessor (`Vm::ic_acc_lane`),
+    /// leaked: the emitted code hands each lane's address to its helper.
+    /// `None` for none, and under `ZIPP_NO_ACC_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_acc_lane_plan(&self, func_id: u32) -> Option<&'static crate::codegen::AccLanePlan> {
+        if !crate::codegen::acc_lane_enabled() || self.py_plans_skipped(func_id) {
+            return None;
+        }
+        let mut plan = crate::codegen::AccLanePlan::default();
+        for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+            let (name, set) = match *instr {
+                Instr::GetProp { name, .. } => (name, false),
+                Instr::SetProp { name, .. } => (name, true),
+                _ => continue,
+            };
+            if let Some(lane) = self.ic_acc_lane(func_id, ip, name, set) {
+                plan.insert(ip, lane);
+            }
+        }
+        if plan.is_empty() {
+            return None;
+        }
+        Some(Box::leak(Box::new(plan)))
+    }
+
+    /// The private-field lanes (`codegen::PrivLanePlan`) of `func_id`'s
+    /// private reads and writes whose cache's first way is a field
+    /// (`IcEntry::Private`) of a class declaration evaluated once so far,
+    /// leaked like the accessor lanes. `None` for none, without a probed
+    /// layout (`priv_layout`), under a metering recorder, and under
+    /// `ZIPP_NO_PRIV_LANE=1`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_priv_lane_plan(&mut self, func_id: u32) -> Option<&'static crate::codegen::PrivLanePlan> {
+        if !crate::codegen::priv_lane_enabled() || self.py_plans_skipped(func_id) {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            return None;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let layout = *priv_layout()?;
+            let func: &'p crate::bytecode::FuncProto = self.func(func_id as usize);
+            let mut plan = crate::codegen::PrivLanePlan { layout, lanes: rustc_hash::FxHashMap::default() };
+            for (ip, instr) in func.code.iter().enumerate() {
+                let private = match *instr {
+                    Instr::GetProp { name, .. } => func
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k.as_bytes().first() == Some(&b'#')),
+                    Instr::SetPrivate { .. } => true,
+                    _ => false,
+                };
+                if !private {
+                    continue;
+                }
+                let Some((brand, id, pos)) = self.ic_private_field_way0_plan(func_id, ip) else {
+                    continue;
+                };
+                if pos >= 4096 {
+                    continue;
+                }
+                let Some(&owner) = self.brand_owner.get(&brand) else {
+                    continue;
+                };
+                let class_id = match self.heap.get(owner) {
+                    HeapObj::Class(c) => c.class_id,
+                    _ => continue,
+                };
+                if self.class_repeated(class_id) {
+                    continue;
+                }
+                let flag = self.jit_private_class_flags.entry(class_id).or_insert_with(|| Box::new(1));
+                if **flag == 0 {
+                    continue;
+                }
+                let flag = &**flag as *const u8 as usize;
+                plan.lanes.insert(ip, crate::codegen::PrivLane { brand, id, pos, flag });
+            }
+            if plan.lanes.is_empty() {
+                return None;
+            }
+            Some(Box::leak(Box::new(plan)))
+        }
     }
 
     /// Tier C's class-method lane (`codegen::ClassReadPlan`): for each
@@ -2001,7 +2148,8 @@ impl<'p> Vm<'p> {
             || callee.rest_reg.is_some()
             || callee.arguments_reg.is_some()
             || (crate::codegen::handler_callee_skip_enabled()
-                && crate::codegen::proto_has_handler_ops(callee))
+                && crate::codegen::proto_has_handler_ops(callee)
+                && !self.jit.cross_lazy_ff(fid))
             || usize::from(callee.param_count) != usize::from(argc)
             || argc > 6
         {
@@ -2041,10 +2189,24 @@ impl<'p> Vm<'p> {
         // recursive functions all call themselves that way, and every such
         // call took the generic cross-call helper (`ZIPP_NO_CROSS3_SELF_GLOBAL=1`
         // leaves them out again).
+        // A wide body (> 64 registers) qualifies when its wide fill mask is
+        // empty, as the non-self `wide_empty` admission below: the lane zeroes
+        // nothing. The masks are this proto's own analysis, the same calls the
+        // compile makes before `set_cross_entry`; raytracer's 87-register
+        // `trace` reached its own recursion through the helper only.
+        let self_wide_empty = fid == caller_fid
+            && reg_count > 64
+            && crate::codegen::crosscall2_enabled()
+            && crate::codegen::crosscall_wide_mask_enabled()
+            && crate::codegen::cross3_wide_enabled()
+            && crate::codegen::cross_uninit_mask(callee) == u64::MAX
+            && crate::codegen::cross_uninit_wide_mask(callee).is_some_and(|m| {
+                m.len() == (reg_count as usize).div_ceil(64) && m.iter().all(|&w| w == 0)
+            });
         let self_arm = fid == caller_fid
             && whole_body
             && crate::codegen::cross3_self_enabled()
-            && reg_count <= 64
+            && (reg_count <= 64 || self_wide_empty)
             && crate::codegen::markdown_inline_plan(callee).is_none()
             && (crate::codegen::cross3_self_global_enabled() || callee.name_global.is_none_or(|own| {
                 !callee
@@ -2052,10 +2214,24 @@ impl<'p> Vm<'p> {
                     .iter()
                     .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
             }));
-        let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry(fid)
+        let parked = self.jit.cross_parked_mask(fid);
+        let mut self_wide = false;
+        let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry_lane(fid)
         {
             Some((_entry, mask, json, markdown)) => {
                 (mask, json, markdown, self.jit.cross_mask_gen(fid))
+            }
+            None if self_arm && self_wide_empty => {
+                // The install records the inline mask as MAX (a wide body's
+                // always is) and, with no live entry before it, does not bump
+                // for the wide words: the generation it leaves is this one.
+                self_wide = true;
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[cross] fn{caller_fid}@{call_ip} CROSS3 wide self arm (regs={reg_count}, empty wide mask)"
+                    );
+                }
+                (0, None, None, self.jit.cross_mask_gen_after_set(fid, u64::MAX))
             }
             None if self_arm => {
                 let mask = if crate::codegen::crosscall2_enabled() {
@@ -2069,6 +2245,11 @@ impl<'p> Vm<'p> {
                     );
                 }
                 (mask, None, None, self.jit.cross_mask_gen_after_set(fid, mask))
+            }
+            // Evicted for its own retry: its entry returns at its recompile,
+            // and the null entry routes to the helper until then.
+            None if parked.is_some() => {
+                (parked.unwrap_or(u64::MAX), None, None, self.jit.cross_mask_gen(fid))
             }
             None => {
                 if crate::jitlog_enabled() {
@@ -2093,7 +2274,7 @@ impl<'p> Vm<'p> {
         if json_walk.is_some()
             || markdown_inline.is_some()
             || uninit_mask == u64::MAX
-            || (reg_count > 64 && !wide_empty)
+            || (reg_count > 64 && !wide_empty && !self_wide)
         {
             if crate::jitlog_enabled() {
                 eprintln!(
@@ -2114,6 +2295,7 @@ impl<'p> Vm<'p> {
             sloppy_this,
             mask_gen,
             uninit_mask,
+            act_free: crate::codegen::cross3_act_free_enabled() && crate::codegen::activation_free(callee),
         })
     }
 
@@ -2198,7 +2380,7 @@ impl<'p> Vm<'p> {
         let mut pending: Vec<u32> = Vec::new();
         // B229: callees this plan BAKES a lane against (see `note_cross_baked`).
         let mut baked: Vec<u32> = Vec::new();
-        if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
+        if crate::env_var_os("ZIPP_NO_CROSSCALL").is_some() {
             return (plan, pending, baked);
         }
         let caller = self.func(func_id as usize);
@@ -2390,6 +2572,7 @@ impl<'p> Vm<'p> {
                     cross3m: None,
                     class_method: false,
                     class_getter: false,
+                    new_lane: None,
                 },
             );
         }
@@ -2527,12 +2710,13 @@ impl<'p> Vm<'p> {
                         || usize::from(callee.param_count) != usize::from(argc)
                         // B213: see the call arm — no entry can ever exist.
                         || (crate::codegen::handler_callee_skip_enabled()
-                            && crate::codegen::proto_has_handler_ops(callee))
+                            && crate::codegen::proto_has_handler_ops(callee)
+                            && !self.jit.cross_lazy_ff(fid))
                     {
                         continue;
                     }
                     let Some((_entry, uninit_mask, json_walk, markdown_inline)) =
-                        self.jit.cross_entry(fid)
+                        self.jit.cross_entry_lane(fid)
                     else {
                         pending.push(fid);
                         continue;
@@ -2944,7 +3128,7 @@ impl<'p> Vm<'p> {
             // polymorphic site only when every filled way names the same
             // FuncProto; later gates require that proto to be capture-free and
             // non-arrow, and emitted code re-checks the LIVE callee's proto.
-            let poly_on = std::env::var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
+            let poly_on = crate::env_var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
             let upval_rep = (poly_on && !with_this)
                 .then(|| {
                     self.leaf_upval_callee_representative(func_id, start as usize, ip, callee_reg)
@@ -3174,6 +3358,17 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            // A body that can bail after a global write is a leaf only because
+            // the emitter buffers its writes; it decides that on this very body,
+            // so the two must agree (the span helper's path buffers nothing).
+            if crate::codegen::leaf_store_then_bail(&body)
+                && (span_code_unit_pred.is_some() || !crate::codegen::leaf_global_stores_buffered(&body))
+            {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (unbuffered global write before a bail)");
+                }
+                continue;
+            }
             // A flattened wrapper owns no captures (enforced by
             // `splice_nested_leaf`), so the nested callee's biased body indices
             // exclusively address this returned map. Merge it before the write
@@ -3284,6 +3479,7 @@ impl<'p> Vm<'p> {
                 && default_arg_mask == 0
                 && span_code_unit_pred.is_none()
                 && nested.is_empty()
+                && !callee.args_count_only
             {
                 for (i, ins) in body.iter().enumerate() {
                     let Instr::GetProp { dst, obj, name } = *ins else {
@@ -3537,6 +3733,7 @@ impl<'p> Vm<'p> {
                     same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as *const () as usize,
                     this_bits,
                     this_reg,
+                    new_lane: None,
                     class_guard,
                     prop_shapes,
                     reg_window,
@@ -3684,8 +3881,10 @@ impl<'p> Vm<'p> {
         use crate::codegen::MethodInlinePlan;
         use crate::heap::HeapObj;
         const MAX_ARMS: usize = crate::codegen::JIT_IC_WAYS; // = 8
+        // Elements of an `arr[i]` receiver's array looked at for candidates.
+        const MI_ARRAY_CAND_SCAN: usize = 256;
         let mut plan = rustc_hash::FxHashMap::default();
-        if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
+        if crate::env_var_os("ZIPP_NO_METHOD_INLINE").is_some() {
             return plan; // kill-switch (live through all stages)
         }
         #[cfg(feature = "instrument")]
@@ -3852,8 +4051,14 @@ impl<'p> Vm<'p> {
                 if let Some(&av) = self.regs.get(base + arr_reg as usize) {
                     if av.is_heap() {
                         if let HeapObj::Array(items) = self.heap.get(av.heap_index()) {
-                            let snapshot: Vec<Value> = items.iter().copied().collect();
-                            for el in snapshot {
+                            // Its first few distinct objects are the guesses: the
+                            // whole array was copied and walked, for at most eight
+                            // arms, at every such site of every compile (4% of a
+                            // row holding 100K-element arrays).
+                            for &el in items.iter().take(MI_ARRAY_CAND_SCAN) {
+                                if cands.len() >= MAX_ARMS {
+                                    break;
+                                }
                                 push_cand(el, &mut cands, &mut cand_bits);
                             }
                         }
@@ -4027,6 +4232,13 @@ impl<'p> Vm<'p> {
             nested_reject("inner-not-leaf");
             return None;
         };
+        // A body that bails after a global write is a leaf only because the
+        // emitter buffers its writes, which it does not do in a wrapper's
+        // flat body (it holds the wrapper's `Call`).
+        if crate::codegen::leaf_store_then_bail(&inner_body) {
+            nested_reject("inner-buffered-global-write");
+            return None;
+        }
         // `splice_uninit_mask`, parameter aliasing and the typed-lane planner
         // encode register sets in u64. The historical 32+32 leaf caps made
         // this bound implicit; the guarded wider leaf cap needs it explicit.

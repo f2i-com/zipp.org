@@ -20,7 +20,7 @@ use std::cell::UnsafeCell;
 #[cfg(feature = "safe-sandbox")]
 use std::collections::BTreeMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Whether two property keys are the same text, compared here.
 ///
@@ -169,13 +169,13 @@ pub(crate) fn hash_once_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_HASH_ONCE").is_none();
+            let on = crate::env_var_os("ZIPP_NO_HASH_ONCE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -336,20 +336,10 @@ fn renumber_above(slots: &mut [u32], slot: u32) {
 #[cfg(not(target_arch = "wasm32"))]
 const SLOT_TABLE_FIRST_GROWTH: usize = 1 << 17;
 
-/// `ZIPP_NO_SLOT_JUMP=1` grows the slot tables by `Vec`'s doubling.
-#[cfg(not(target_arch = "wasm32"))]
-fn slot_jump_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SLOT_JUMP").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_SLOT_JUMP=1` grows the slot tables by `Vec`'s doubling.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn slot_jump_enabled() = "ZIPP_NO_SLOT_JUMP"
 }
 
 /// A hint that the cache line at `p` is about to be read. A prefetch reads
@@ -542,13 +532,13 @@ fn split_propindex_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPLIT_PROPINDEX").is_none();
+            let on = crate::env_var_os("ZIPP_NO_SPLIT_PROPINDEX").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1222,96 +1212,56 @@ fn sparse_num_index_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_SPARSE_NUM_INDEX").is_none();
+            let on = crate::env_var_os("ZIPP_NO_SPARSE_NUM_INDEX").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
     }
 }
 
-/// `ZIPP_NO_VAL_SLAB=1` makes every finalize-born literal carry an owned
-/// `Vec<Value>` (the pre-B187 representation) — the single-binary A/B for
-/// the literal value slab. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn val_slab_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_VAL_SLAB").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_VAL_SLAB=1` makes every finalize-born literal carry an owned
+    /// `Vec<Value>` (the pre-B187 representation) — the single-binary A/B for
+    /// the literal value slab. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn val_slab_enabled() = "ZIPP_NO_VAL_SLAB"
 }
 
-/// `ZIPP_NO_OBJ_POOL=1` disables the B187 stage-3 `Box<ObjMap>` recycle pool
-/// (every finalize-born literal takes a fresh allocation and every dead shell
-/// ships to the courier, the stage-2 behavior) — the single-binary A/B for
-/// the pool. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL=1` disables the B187 stage-3 `Box<ObjMap>` recycle pool
+    /// (every finalize-born literal takes a fresh allocation and every dead shell
+    /// ships to the courier, the stage-2 behavior) — the single-binary A/B for
+    /// the pool. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_enabled() = "ZIPP_NO_OBJ_POOL"
 }
 
-/// `ZIPP_NO_OBJ_POOL_SORT=1` skips the address sort at trim (LIFO serve in
-/// push order, the pre-B196a behavior) — the single-binary A/B separating
-/// the sort's own cost from the locality it buys. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_sort_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_SORT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_SORT=1` skips the address sort at trim (LIFO serve in
+    /// push order, the pre-B196a behavior) — the single-binary A/B separating
+    /// the sort's own cost from the locality it buys. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_sort_enabled() = "ZIPP_NO_OBJ_POOL_SORT"
 }
 
-/// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
-/// post-major pool flush. By default the sorter first proves the common
-/// recycle shape -- an already-sorted retained prefix followed by one
-/// monotone sweep run -- and joins those runs in linear time. Any uncertainty
-/// falls back to the exact pre-existing full sort. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn obj_pool_run_sort_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_RUN_SORT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
+    /// post-major pool flush. By default the sorter first proves the common
+    /// recycle shape -- an already-sorted retained prefix followed by one
+    /// monotone sweep run -- and joins those runs in linear time. Any uncertainty
+    /// falls back to the exact pre-existing full sort. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn obj_pool_run_sort_enabled() = "ZIPP_NO_OBJ_POOL_RUN_SORT"
 }
 
 /// Address-order one recycle pool while preserving the FULL sort's result.
@@ -1440,20 +1390,10 @@ const fn attrs_elide_enabled() -> bool {
     true
 }
 
-#[cfg(not(feature = "meter-only"))]
-#[inline]
-fn attrs_elide_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_ATTRS_ELIDE").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
+    fn attrs_elide_enabled() = "ZIPP_NO_ATTRS_ELIDE"
 }
 
 pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
@@ -1474,7 +1414,7 @@ pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
 mod static_key_stats {
     use super::*;
 
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     static OBJECTS: AtomicU64 = AtomicU64::new(0);
     static APPENDS: AtomicU64 = AtomicU64::new(0);
     static MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
@@ -1486,7 +1426,7 @@ mod static_key_stats {
             1 => true,
             2 => false,
             _ => {
-                let on = std::env::var_os("ZIPP_STATIC_KEY_STATS").is_some();
+                let on = crate::env_var_os("ZIPP_STATIC_KEY_STATS").is_some();
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
@@ -1734,7 +1674,7 @@ fn prop_holes_mode() -> u8 {
     if s != u8::MAX {
         return s;
     }
-    let mode = match std::env::var("ZIPP_PROP_HOLES").as_deref() {
+    let mode = match crate::env_var("ZIPP_PROP_HOLES").as_deref() {
         Ok("0") => 0,
         Ok("all") => 2,
         _ => 1,
@@ -2234,7 +2174,7 @@ const VAL_SLAB_CLASS_COUNT: usize = 5;
 /// that boundary penalty without changing the allocation/copy path.
 #[cfg(not(feature = "safe-sandbox"))]
 #[inline]
-fn val_slab_class(count: usize) -> Option<u8> {
+pub(crate) fn val_slab_class(count: usize) -> Option<u8> {
     match count {
         1..=4 => Some(0),
         5 => Some(1),
@@ -2339,6 +2279,146 @@ impl ValSlabClass {
             + vec_capacity_bytes(&self.chunks)
             + vec_capacity_bytes(&self.free)
     }
+}
+
+/// An empty plain object, made and installed ahead of its use, for a literal
+/// or a constructor to take without a call: its slot is a young
+/// `HeapObj::Object`, its map holds an empty planned key list and an empty
+/// slab cell, and nothing refers to it. Taking one is filling these fields.
+///
+/// Compiled code reads `map` at +0, `vals` at +8 and `idx` at +16.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ReadyObj {
+    /// The `ObjMap`, its box owned by the object's slot.
+    map: usize,
+    /// The first slot of its value cell.
+    vals: usize,
+    idx: u32,
+}
+
+/// The ready objects of one slab class, `next..end` of `buf`. Compiled code
+/// takes from the front through `next`, and falls to a helper at `end`.
+///
+/// A ready object is an ordinary garbage object until it is taken, so the
+/// collector needs nothing for them: a collection just empties the window
+/// (`Heap::ready_abandon`), and the sweep frees those left like any others.
+///
+/// They come from two places. A minor sweep turns the plain objects it finds
+/// dead straight into ready ones, up to what the class took in the last
+/// epoch (`Heap::ready_recycle`): a short-lived object's slot, map and cell
+/// stay together, and tearing them apart to build them again was most of what
+/// it cost. Past that, `Heap::ready_refill` makes a batch by the allocating
+/// path. An object the sweep made was not counted live until the window that
+/// holds it runs out (`uncounted`), which is when the collection trigger looks.
+///
+/// Compiled code reads `next` at +0 and `end` at +8.
+#[cfg(not(feature = "safe-sandbox"))]
+#[repr(C)]
+pub(crate) struct ReadyClass {
+    next: usize,
+    end: usize,
+    /// The first of this window.
+    start: usize,
+    buf: Vec<ReadyObj>,
+    /// How many the next refill makes.
+    batch: usize,
+    /// Taken this epoch, before this window.
+    taken: usize,
+    /// How many the next sweep keeps ready.
+    demand: usize,
+    /// The window's objects are not in `Heap::live` yet.
+    uncounted: bool,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ReadyClass {
+    /// Take from the whole of `buf`.
+    fn open(&mut self) {
+        self.start = self.buf.as_ptr().expose_provenance();
+        self.next = self.start;
+        self.end = self.start + self.buf.len() * std::mem::size_of::<ReadyObj>();
+    }
+}
+
+/// A program that allocates a little pays for few; one that keeps allocating
+/// reaches this many a refill.
+#[cfg(not(feature = "safe-sandbox"))]
+const READY_BATCH_MIN: usize = 8;
+#[cfg(not(feature = "safe-sandbox"))]
+const READY_BATCH_MAX: usize = 256;
+
+/// The key plan of no keys, a ready object's until it is filled.
+#[cfg(not(feature = "safe-sandbox"))]
+fn empty_key_plan() -> &'static StaticKeyPlan {
+    static EMPTY: std::sync::OnceLock<StaticKeyPlan> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| StaticKeyPlan::new(Vec::new()))
+}
+
+/// [`ReadyLayout`], from a map in the form a ready object has.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn ready_layout() -> ReadyLayout {
+    let mut m = ObjMap::new();
+    m.ready_keys();
+    m.vals = ValStore::Slab {
+        base: 0,
+        owner_and_len: 0,
+    };
+    m.attrs = PropAttrs::AllData { len: 0 };
+    let at = |p: *const u8, m: &ObjMap| {
+        (p.expose_provenance() - std::ptr::from_ref(m).cast::<u8>().expose_provenance()) as i32
+    };
+    let (mut keys_all, mut keys_len, mut attrs_len, mut vals_owner_len) = (0, 0, 0, 0);
+    if let PropKeys::Planned { all, visible_len } = &m.keys {
+        keys_all = at(std::ptr::from_ref(all).cast(), &m);
+        keys_len = at(std::ptr::from_ref(visible_len).cast(), &m);
+    }
+    if let PropAttrs::AllData { len } = &m.attrs {
+        attrs_len = at(std::ptr::from_ref(len).cast(), &m);
+    }
+    if let ValStore::Slab { owner_and_len, .. } = &m.vals {
+        vals_owner_len = at(std::ptr::from_ref(owner_and_len).cast(), &m);
+    }
+    let shape = at(std::ptr::from_ref(&m.shape).cast(), &m);
+    let class = at(std::ptr::from_ref(&m.class).cast(), &m);
+    // The form was written just above: nothing here is left at zero but the
+    // shape, the map's first field.
+    assert!(shape == 0 && keys_all != 0 && keys_len != 0 && attrs_len != 0 && vals_owner_len != 0);
+    assert!(std::mem::size_of::<Option<u32>>() == 8);
+    ReadyLayout { shape, keys_all, keys_len, attrs_len, vals_owner_len, class }
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_READY_OBJECTS=1`: every object takes the allocating path (the
+    /// same-binary A/B).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_objects_enabled() = "ZIPP_NO_READY_OBJECTS"
+}
+
+/// Where compiled code writes in a ready object's map. Enum payloads have no
+/// `offset_of!`, so these are read off a real map once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+pub(crate) struct ReadyLayout {
+    pub(crate) shape: i32,
+    pub(crate) keys_all: i32,
+    pub(crate) keys_len: i32,
+    pub(crate) attrs_len: i32,
+    pub(crate) vals_owner_len: i32,
+    pub(crate) class: i32,
+}
+
+/// The `ObjMap::class` word and the hot record's fid word of an instance of
+/// `class`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn class_words(class: u32) -> (u64, u32) {
+    let mut m = ObjMap::new();
+    m.class = Some(class);
+    // `Option<u32>` is two initialized `u32`s when `Some`.
+    // SAFETY: it is 8 bytes, 4-aligned; read unaligned, with no bit invalid.
+    let word = unsafe { std::ptr::read_unaligned(std::ptr::from_ref(&m.class).cast::<u64>()) };
+    (word, object_mirror_fid(&m))
 }
 
 /// The attribute column of an [`ObjMap`], with the all-default case elided.
@@ -2575,6 +2655,74 @@ impl ObjMap {
         let (keys, cloned) = self.keys.make_owned();
         keys.reserve_exact(additional);
         key_bytes_add(&mut self.key_bytes, cloned);
+    }
+
+    /// Make a new empty map's key list the empty plan, the form a ready
+    /// object is filled from (see [`ReadyClass`]).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_keys(&mut self) {
+        self.keys = PropKeys::Planned {
+            all: PlanHandle::of_static(empty_key_plan()),
+            visible_len: 0,
+        };
+    }
+
+    /// Empty a dead map into the form a ready object has, and say so: `false`,
+    /// with nothing changed, for one that holds more than a plain object's
+    /// planned keys and slab cell.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_reset(&mut self, empty: &'static StaticKeyPlan) -> bool {
+        if self.shape == crate::shape::DICT
+            || !self.extensible
+            || self.is_ctor
+            || self.class_proto
+            || self.frozen
+            || self.sealed
+            || self.is_raw_json
+            || self.has_element_key
+            || self.planned_append_failed
+            || self.index.is_some()
+            || self.numeric_index.is_some()
+        {
+            return false;
+        }
+        let (PropKeys::Planned { all, visible_len }, ValStore::Slab { owner_and_len, .. }, PropAttrs::AllData { len }) =
+            (&mut self.keys, &mut self.vals, &mut self.attrs)
+        else {
+            return false;
+        };
+        *all = PlanHandle::of_static(empty);
+        *visible_len = 0;
+        *owner_and_len &= !VAL_SLAB_OWNER_LEN_MASK;
+        *len = 0;
+        self.shape = crate::shape::EMPTY;
+        self.class = None;
+        self.key_bytes = 0;
+        true
+    }
+
+    /// Fill a ready object's map with `n` values, already in its cell, as
+    /// `plan`'s literal.
+    ///
+    /// # Safety
+    ///
+    /// As [`PlanHandle::borrowed`], for `plan`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    unsafe fn ready_fill(&mut self, plan: &StaticKeyPlan, n: usize, shape: u32) {
+        if let PropKeys::Planned { all, visible_len } = &mut self.keys {
+            // The handle replaced is the empty plan's, borrowed: no count to
+            // give back.
+            // SAFETY: this function's contract.
+            unsafe { std::ptr::write(all, PlanHandle::borrowed(plan)) };
+            *visible_len = n;
+        }
+        if let ValStore::Slab { owner_and_len, .. } = &mut self.vals {
+            *owner_and_len |= n;
+        }
+        self.attrs = PropAttrs::AllData { len: n as u32 };
+        self.shape = shape;
     }
 
     /// Replace the whole key list, counting what the new one owns.
@@ -5232,16 +5380,48 @@ impl JsStr {
         } else {
             (units, self.bytes.len())
         };
-        if pos.abs_diff(i) > SEEK_MARKS_DISTANCE {
-            let marks = self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes)));
-            if let Some(&m) = marks.get(i / SEEK_MARK_STRIDE) {
+        let dist = pos.abs_diff(i);
+        if dist > SEEK_MARK_STRIDE {
+            // Made once a walk would be long; once made, the nearer of the
+            // mark and the memo (a search that found a match leaves the memo
+            // there, up to SEEK_MARKS_DISTANCE from the next start).
+            let marks = if dist > SEEK_MARKS_DISTANCE {
+                Some(&**self.marks.get_or_init(|| Box::new(seek_marks(&self.bytes))))
+            } else {
+                self.marks.get().map(|m| &**m)
+            };
+            if let Some(&m) = marks.and_then(|marks| marks.get(i / SEEK_MARK_STRIDE)) {
                 // At or before `i`, by at most a stride and a pair.
-                (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+                if i - ((m >> 32) as usize) < dist {
+                    (pos, bi) = ((m >> 32) as usize, m as u32 as usize);
+                }
             }
         }
+        // A lead byte gives both the sequence's length and its unit count (two
+        // for a 4-byte astral scalar), so the walk decodes nothing, and an
+        // ASCII stretch is crossed eight bytes at a time.
+        let bytes: &[u8] = &self.bytes;
         while pos < i {
-            let (cp, blen) = wtf8_decode(&self.bytes, bi);
-            let n = cp_units(cp);
+            if i - pos >= 8 {
+                if let Some(word) = bytes.get(bi..bi + 8) {
+                    let word = u64::from_le_bytes(word.try_into().unwrap_or([0x80; 8]));
+                    if word & 0x8080_8080_8080_8080 == 0 {
+                        pos += 8;
+                        bi += 8;
+                        continue;
+                    }
+                }
+            }
+            let b0 = bytes[bi];
+            let (blen, n) = if b0 < 0x80 {
+                (1, 1)
+            } else if b0 < 0xE0 {
+                (2, 1)
+            } else if b0 < 0xF0 {
+                (3, 1)
+            } else {
+                (4, 2)
+            };
             if pos + n > i {
                 // `i` addresses the trail half of this astral scalar.
                 break;
@@ -5251,14 +5431,25 @@ impl JsStr {
         }
         while pos > i {
             bi -= 1;
-            while self.bytes[bi] & 0xC0 == 0x80 {
+            while bytes[bi] & 0xC0 == 0x80 {
                 bi -= 1;
             }
-            let (cp, _) = wtf8_decode(&self.bytes, bi);
-            pos -= cp_units(cp);
+            pos -= 1 + usize::from(bytes[bi] >= 0xF0);
         }
         self.cursor.set(((pos as u64) << 32) | bi as u64);
         (pos, bi)
+    }
+
+    /// Leave the position memo at a code-point boundary the caller has just
+    /// found: unit `pos` starts at byte `byte`. A find-all loop's next
+    /// `indexOf(needle, at + 1)` then seeks one step instead of walking from
+    /// where the previous search started. No-op on ASCII (no memo needed).
+    #[inline]
+    pub fn note_boundary(&self, pos: usize, byte: usize) {
+        if !self.ascii && pos <= self.units as usize && byte <= self.bytes.len() {
+            debug_assert!(byte == self.bytes.len() || self.bytes[byte] & 0xC0 != 0x80);
+            self.cursor.set(((pos as u64) << 32) | byte as u64);
+        }
     }
 
     /// Locate unit position `i`: the code point containing it and `i`'s offset
@@ -5496,7 +5687,12 @@ pub enum Reactions {
 }
 
 impl Reactions {
-    #[inline]
+    /// Always inlined natively, so the caller's pair is built where it is
+    /// stored: out of line, it was built on the stack and copied in with
+    /// 16-byte loads over 8-byte stores, which cannot forward (3% of
+    /// await-sustained). WebAssembly keeps the one copy (1 KB of Lite).
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    #[cfg_attr(target_arch = "wasm32", inline)]
     pub fn push(&mut self, r: ReactionPair) {
         match self {
             Reactions::None => *self = Reactions::One(r),
@@ -6049,6 +6245,7 @@ impl AbData {
     /// growth); Shared stores the new visible length (the allocation is
     /// preallocated to `maxByteLength` — callers validate `n <= max`).
     pub fn resize_bytes(&mut self, n: usize) {
+        note_buffer_moved();
         match self {
             AbData::Local(v) => v.resize(n, 0u8),
             AbData::Shared(m) => m.set_byte_len(n),
@@ -6061,6 +6258,7 @@ impl AbData {
     /// `SharedArrayBuffer.prototype.grow`. Returns false when `n` is below the
     /// live length (including a concurrent growth observed by SharedMem's CAS).
     pub fn grow_bytes(&mut self, n: usize) -> bool {
+        note_buffer_moved();
         match self {
             AbData::Local(v) => {
                 if n < v.len() {
@@ -6075,6 +6273,22 @@ impl AbData {
             AbData::External(_) => false,
         }
     }
+}
+
+/// Advanced whenever an ArrayBuffer's bytes may move or stop being its own:
+/// every resize, growth and detach goes through [`AbData::resize_bytes`] or
+/// [`AbData::grow_bytes`], and a WebAssembly memory's detach calls this
+/// itself. Compiled code keeps a typed array's element base across calls
+/// (Tier C's receiver cache, `jit_get_index_ta_fill`) only while this is the
+/// value it read with it. Process-wide, so a VM on another thread can only
+/// make the caches miss more often. Starts at 1: a zeroed cache slot never
+/// matches it.
+pub(crate) static TA_DATA_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// See [`TA_DATA_EPOCH`].
+#[inline]
+pub(crate) fn note_buffer_moved() {
+    TA_DATA_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl From<Vec<u8>> for AbData {
@@ -6366,19 +6580,9 @@ mod gc_courier {
         false
     }
 
-    #[cfg(not(feature = "meter-only"))]
-    fn enabled() -> bool {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static STATE: AtomicU8 = AtomicU8::new(0);
-        match STATE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => {
-                let on = std::env::var_os("ZIPP_NO_GC_COURIER").is_none();
-                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-                on
-            }
-        }
+    env_off_switch! {
+        #[cfg(not(feature = "meter-only"))]
+        fn enabled() = "ZIPP_NO_GC_COURIER"
     }
 
     /// B210: buffer capacity a payload must clear to be worth an off-thread
@@ -6393,7 +6597,7 @@ mod gc_courier {
         static STATE: AtomicUsize = AtomicUsize::new(usize::MAX);
         match STATE.load(Ordering::Relaxed) {
             usize::MAX => {
-                let v = if std::env::var_os("ZIPP_NO_COURIER_GATE").is_some() {
+                let v = if crate::env_var_os("ZIPP_NO_COURIER_GATE").is_some() {
                     0
                 } else {
                     COURIER_MIN_BYTES
@@ -6542,54 +6746,24 @@ const KEY_POOL_MAX: usize = 4096;
 #[cfg(not(feature = "safe-sandbox"))]
 const KEY_POOL_MAX_CAP: usize = 64;
 
-/// B220 latch: `ZIPP_NO_KEY_POOL=1` mallocs a fresh key String per append and
-/// drops dying keys (the pricing comparator).
-#[cfg(not(feature = "safe-sandbox"))]
-pub(crate) fn key_pool_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_KEY_POOL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B220 latch: `ZIPP_NO_KEY_POOL=1` mallocs a fresh key String per append and
+    /// drops dying keys (the pricing comparator).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn key_pool_enabled() = "ZIPP_NO_KEY_POOL"
 }
 
-/// B239 latch: `ZIPP_NO_SHELL_REFIT=1` builds a fresh `ObjMap` and assigns it
-/// over the pooled shell, as before.
-#[cfg(not(feature = "safe-sandbox"))]
-fn shell_refit_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SHELL_REFIT").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B239 latch: `ZIPP_NO_SHELL_REFIT=1` builds a fresh `ObjMap` and assigns it
+    /// over the pooled shell, as before.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn shell_refit_enabled() = "ZIPP_NO_SHELL_REFIT"
 }
 
-/// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
-/// mirror through `refresh_mirror` again, as before.
-fn settled_alloc_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SETTLED_ALLOC").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
+    /// mirror through `refresh_mirror` again, as before.
+    fn settled_alloc_enabled() = "ZIPP_NO_SETTLED_ALLOC"
 }
 
 /// B257 latch: `ZIPP_NO_THIN_ALLOC=1` disables the thin literal-allocation
@@ -6602,12 +6776,12 @@ fn settled_alloc_enabled() -> bool {
 /// into [`Heap::thin_alloc`] at construction.
 #[allow(dead_code)] // the sandbox build folds it away
 pub(crate) fn thin_alloc_enabled() -> bool {
-    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STATE: crate::EnvSwitchCell = crate::EnvSwitchCell::new(0);
     match STATE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_THIN_ALLOC").is_none();
+            let on = crate::env_var_os("ZIPP_NO_THIN_ALLOC").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -6634,23 +6808,13 @@ fn thin_alloc_default() -> bool {
     false
 }
 
-/// B258 latch: `ZIPP_NO_SHELL_CELL=1` makes a pool-bound shell return its
-/// slab cell at death (the B187 form) instead of carrying the cell into the
-/// recycle pool for the next same-class literal to fill in place. Latched on
-/// first use; the heap folds it into [`Heap::shell_cell`] at construction.
-#[cfg(not(feature = "safe-sandbox"))]
-fn shell_cell_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_SHELL_CELL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B258 latch: `ZIPP_NO_SHELL_CELL=1` makes a pool-bound shell return its
+    /// slab cell at death (the B187 form) instead of carrying the cell into the
+    /// recycle pool for the next same-class literal to fill in place. Latched on
+    /// first use; the heap folds it into [`Heap::shell_cell`] at construction.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn shell_cell_enabled() = "ZIPP_NO_SHELL_CELL"
 }
 
 /// B258: the construction-time fold behind [`Heap::shell_cell`]. The thin
@@ -6670,40 +6834,20 @@ const CONCAT_MEMO_SLOTS: usize = 2048;
 #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
 const CONCAT_SUFFIX_MEMO_SLOTS: usize = 256;
 
-/// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
-/// misses, every insert is skipped, no string is ever frozen).
-#[cfg(not(feature = "safe-sandbox"))]
-fn concat_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CONCAT_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
+    /// misses, every insert is skipped, no string is ever frozen).
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn concat_memo_enabled() = "ZIPP_NO_CONCAT_MEMO"
 }
 
-/// B253 pricing switch. This leaves B212's const+int memo enabled so the
-/// same binary isolates only the stable-suffix bridge between two int memos.
-/// The JIT emitters consult it too, so disabling the bridge also removes its
-/// next-leaf tag proof from generated code.
-#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
-pub(crate) fn concat_suffix_memo_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_CONCAT_SUFFIX_MEMO").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// B253 pricing switch. This leaves B212's const+int memo enabled so the
+    /// same binary isolates only the stable-suffix bridge between two int memos.
+    /// The JIT emitters consult it too, so disabling the bridge also removes its
+    /// next-leaf tag proof from generated code.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    fn concat_suffix_memo_enabled() = "ZIPP_NO_CONCAT_SUFFIX_MEMO"
 }
 
 #[cfg(all(feature = "safe-sandbox", feature = "jit", target_arch = "x86_64"))]
@@ -6827,6 +6971,16 @@ pub struct TextCodec {
     pub pending_len: u8,
     pub pending: [u8; 4],
 }
+
+/// A BigInt beyond i128 as [`HeapObj::BigIntBig`] holds it: in the slot
+/// natively (one allocation fewer per value), behind a `Box` in the
+/// meter-only (browser) builds, where the inline form grew the module.
+/// `NumBig::clone(b)` and `.into()` serve both.
+#[cfg(not(feature = "meter-only"))]
+pub type BigIntCell = num_bigint::BigInt;
+/// See the native definition.
+#[cfg(feature = "meter-only")]
+pub type BigIntCell = Box<num_bigint::BigInt>;
 
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
@@ -7056,7 +7210,7 @@ pub enum HeapObj {
     /// (vm/bigint.rs) demote on construction, so equality/ordering between the
     /// two variants never has to cross-compare (a `BigInt` and a `BigIntBig`
     /// are always unequal). Holds no heap references (GC trace is a no-op).
-    BigIntBig(Box<num_bigint::BigInt>),
+    BigIntBig(BigIntCell),
     /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
     /// property key dedupe correctly). `desc` is the description (a string Value or
     /// UNDEFINED). `prop_key` is the internal string under which the symbol is
@@ -7289,6 +7443,11 @@ pub struct Heap {
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
     versions: Vec<u32>,
+    /// One-code-point strings handed out by [`Heap::cp_str`], direct-mapped by
+    /// code point: (code point, slot, the slot's version when cached). A slot
+    /// freed or reused since has another version, so a stale entry is seen
+    /// and replaced; the cache roots nothing. Empty until first used.
+    cp_strs: Vec<(u32, u32, u32)>,
     /// B244: one coarse invalidation epoch for emitted dense-Array snapshots.
     ///
     /// A native region may hold an Array's raw `Vec<Value>` base and length in
@@ -7423,6 +7582,15 @@ pub struct Heap {
     pub(crate) arr_mirror_len: u32,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
+    /// Objects a literal can take without a call, by slab class.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) ready: [ReadyClass; VAL_SLAB_CLASS_COUNT],
+    #[cfg(not(feature = "safe-sandbox"))]
+    ready_on: bool,
+    /// Ready objects the last abandon found untaken: in the young log, but
+    /// nothing the program allocated.
+    #[cfg(not(feature = "safe-sandbox"))]
+    ready_untaken: usize,
     /// Raw base of `gen` (B264): the inline dense-array store lane tests the
     /// holder's generation byte through it -- a YOUNG holder (state bits 0)
     /// needs no barrier in either barrier mode. Refreshed wherever `gen` can
@@ -7831,7 +7999,7 @@ const GEN_OLD: u8 = 1;
 /// `GEN_DIRTY`: old AND in the remembered set (the dedup bit of the barrier).
 const GEN_DIRTY: u8 = 2;
 /// Mask selecting the state bits out of a `Heap::gen` byte.
-const GEN_STATE: u8 = 0b11;
+pub(crate) const GEN_STATE: u8 = 0b11;
 /// `GEN_STATE` for the emitted store lane's `test byte` (a holder whose
 /// state bits are zero is YOUNG and needs no barrier).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8151,20 +8319,10 @@ const NURSERY_BUDGET_MAX: usize = 1 << 16;
 /// `Heap::adapt_young_budget`): a phase change gets another try.
 const NURSERY_GROW_HOLD: u32 = 64;
 
-/// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
-/// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
-fn nursery_marginal_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_NURSERY_MARGINAL").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_NURSERY_MARGINAL=1`: the young budget doubles on high survival
+    /// whether or not the doubling pays (`Heap::adapt_young_budget`), for A/B.
+    fn nursery_marginal_enabled() = "ZIPP_NO_NURSERY_MARGINAL"
 }
 
 /// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
@@ -8208,7 +8366,7 @@ impl Heap {
         let resident_payload_high_water = resident_payload_charged
             .iter()
             .fold(0usize, |n, bytes| n.saturating_add(bytes.get()));
-        let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
+        let oracle = crate::env_var_os("ZIPP_GCSTATS").is_some();
         let born = if oracle {
             vec![0; objs.len()]
         } else {
@@ -8216,18 +8374,18 @@ impl Heap {
         };
         // Default-on since W9 (B122) — see the `nursery` field doc. The
         // ZIPP_NURSERY opt-in from waves 7-8 is subsumed (harmless if set).
-        let nursery = std::env::var_os("ZIPP_NO_NURSERY").is_none();
+        let nursery = crate::env_var_os("ZIPP_NO_NURSERY").is_none();
         // The pre-interned prefix is pinned and immutable — OLD from birth.
         let gen = if nursery {
             vec![GEN_OLD; objs.len()]
         } else {
             Vec::new()
         };
-        let budget_env = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
+        let budget_env = crate::env_var("ZIPP_NURSERY_YOUNG_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v >= 1024);
-        let nursery_max_minors = std::env::var("ZIPP_NURSERY_MAX_MINORS")
+        let nursery_max_minors = crate::env_var("ZIPP_NURSERY_MAX_MINORS")
             .ok()
             .as_deref()
             .and_then(parse_nursery_max_minors)
@@ -8235,12 +8393,12 @@ impl Heap {
         // W10: an explicit budget (or the adapt kill switch) PINS it — the
         // survival controller below then never moves it.
         let budget_pinned =
-            budget_env.is_some() || std::env::var_os("ZIPP_NO_NURSERY_ADAPT").is_some();
+            budget_env.is_some() || crate::env_var_os("ZIPP_NO_NURSERY_ADAPT").is_some();
         let young_budget = budget_env.unwrap_or(NURSERY_YOUNG_BUDGET);
-        let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
-        let nonyoung_cache_on = std::env::var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
-        let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
-        let valgrain_small_max = std::env::var_os("ZIPP_VALGRAIN_SMALL_MAX")
+        let pretenure_on = crate::env_var_os("ZIPP_NO_PRETENURE").is_none();
+        let nonyoung_cache_on = crate::env_var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
+        let valgrain = crate::env_var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
+        let valgrain_small_max = crate::env_var_os("ZIPP_VALGRAIN_SMALL_MAX")
             .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
             .unwrap_or(VALGRAIN_SMALL_MAX_DEFAULT);
         let mut h = Heap {
@@ -8336,9 +8494,28 @@ impl Heap {
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready: std::array::from_fn(|_| ReadyClass {
+                next: 0,
+                end: 0,
+                start: 0,
+                buf: Vec::new(),
+                batch: READY_BATCH_MIN,
+                taken: 0,
+                demand: 0,
+                uncounted: false,
+            }),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_untaken: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            ready_on: ready_objects_enabled()
+                && thin_alloc_default()
+                && attrs_elide_enabled()
+                && crate::bytecode::plan_borrow_enabled(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             gen_raw: 0,
             versions,
+            cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
             free: Vec::new(),
@@ -8772,6 +8949,27 @@ impl Heap {
     ) -> u32 {
         debug_assert!(self.thin_alloc);
         let class = val_slab_class(vals.len());
+        if borrow && !plan.has_element_key() && vals.len() < PLANNED_INDEX_THRESHOLD {
+            if let Some(ready) = class.and_then(|c| self.ready_take(c as usize)) {
+                // SAFETY: the cell has room for this class, and is unaliased
+                // (its object is unreachable); `vals` may be the register
+                // window, which is not the cell. The plan: this function's
+                // contract.
+                unsafe {
+                    copy_vals_by_word(
+                        vals.as_ptr(),
+                        std::ptr::with_exposed_provenance_mut::<Value>(ready.vals),
+                        vals.len(),
+                    );
+                    (*std::ptr::with_exposed_provenance_mut::<ObjMap>(ready.map)).ready_fill(plan, vals.len(), shape);
+                }
+                #[cfg(feature = "jit")]
+                {
+                    self.hot_mirror[ready.idx as usize].shape = shape;
+                }
+                return ready.idx;
+            }
+        }
         // B258: the pooled shell is popped FIRST so the slab cell it may
         // still carry (see `free_slot`'s pool arm) can hold THIS literal's
         // values: same class means `cap >= vals.len()`, and the copy below
@@ -8906,6 +9104,160 @@ impl Heap {
         self.alloc_object_settled_thin(boxed, shape)
     }
 
+    /// The next ready object of slab class `class`, refilling the buffer when
+    /// it is out. `None`: this heap is not using them.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_take(&mut self, class: usize) -> Option<ReadyObj> {
+        let r = &mut self.ready[class];
+        if r.next == r.end && !self.ready_refill(class) {
+            return None;
+        }
+        let r = &mut self.ready[class];
+        // SAFETY: `next` is inside `buf`, below `end` (the refill above left
+        // at least one).
+        let e = unsafe { *std::ptr::with_exposed_provenance::<ReadyObj>(r.next) };
+        r.next += std::mem::size_of::<ReadyObj>();
+        Some(e)
+    }
+
+    /// Make the next batch of ready objects of `class`. The allocating path
+    /// makes each, so its accounting, its collection trigger and its growth
+    /// are the ordinary ones; `false` when a heap is in a mode that must see
+    /// every value stored (an audit, an oracle) or a young object would not
+    /// be young (a pretenure scope), whose inline stores have no barrier.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[cold]
+    #[inline(never)]
+    fn ready_refill(&mut self, class: usize) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        let cap = val_slab_class_cap(class as u8);
+        let r = &mut self.ready[class];
+        let used = r.buf.len();
+        r.taken += used;
+        if std::mem::take(&mut r.uncounted) {
+            self.live += used;
+            if self.live >= self.gc_threshold {
+                self.gc_requested = true;
+            }
+        }
+        let r = &mut self.ready[class];
+        let want = r.batch;
+        r.batch = (want * 2).min(READY_BATCH_MAX);
+        let mut buf = std::mem::take(&mut r.buf);
+        buf.clear();
+        buf.reserve(want);
+        for _ in 0..want {
+            let idx = self.alloc_ctor_object_new(cap, None);
+            let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
+                unreachable!("alloc_ctor_object_new made an object")
+            };
+            m.ready_keys();
+            buf.push(ReadyObj {
+                map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
+                vals: m.vals.as_ptr().expose_provenance(),
+                idx,
+            });
+        }
+        self.ready[class].buf = buf;
+        self.ready[class].open();
+        true
+    }
+
+    /// Before a minor's sweep: whether it may make ready objects, the
+    /// classes' buffers emptied for it if so.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_recycle_begin(&mut self) -> bool {
+        if !self.ready_on || self.oracle || self.pretenure != 0 || self.payload_accounting.get() {
+            return false;
+        }
+        // A window longer than the young budget would put the next collection
+        // past it, where the budget's own controller cannot see survival.
+        let budget = self.young_budget;
+        for r in &mut self.ready {
+            r.demand = r.demand.min(budget);
+            r.buf.clear();
+            r.buf.reserve(r.demand);
+        }
+        true
+    }
+
+    /// Slot `idx`'s occupant is dead: make it a ready object again if it is a
+    /// plain object its class wants. It stays where it is, an empty young
+    /// object: its slot gets a new version as a freed one does, so no cache
+    /// that knew it can hit, and it stays in the young log, whose reader is
+    /// the sweep that just found it.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(always)]
+    fn ready_recycle(&mut self, idx: u32, empty: &'static StaticKeyPlan) -> bool {
+        let slab = self.val_slab.as_ptr().expose_provenance();
+        let HeapObj::Object(m) = &mut self.objs[idx as usize] else {
+            return false;
+        };
+        let (base, owner) = match &m.vals {
+            ValStore::Slab { base, owner_and_len } => (*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK),
+            ValStore::Vec(_) => return false,
+        };
+        let class = (owner - slab) / std::mem::size_of::<ValSlabClass>();
+        let r = &mut self.ready[class];
+        if r.buf.len() >= r.demand || !m.ready_reset(empty) {
+            return false;
+        }
+        r.buf.push(ReadyObj {
+            map: std::ptr::from_mut::<ObjMap>(&mut **m).expose_provenance(),
+            vals: base,
+            idx,
+        });
+        #[cfg(feature = "jit")]
+        {
+            self.hot_mirror[idx as usize] = HotMirror {
+                shape: crate::shape::EMPTY,
+                fid: FID_MIRROR_NONE,
+                vals: base as u64,
+            };
+        }
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.gen[idx as usize] = GEN_YOUNG;
+        true
+    }
+
+    /// After a minor's sweep: open the windows it filled.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn ready_recycle_end(&mut self) {
+        for r in &mut self.ready {
+            r.open();
+            r.uncounted = !r.buf.is_empty();
+        }
+    }
+
+    /// Forget the ready objects not taken: a collection is about to run, and
+    /// they are garbage like any other (see [`ReadyClass`]).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn ready_abandon(&mut self) {
+        self.ready_untaken = 0;
+        for r in &mut self.ready {
+            self.ready_untaken += (r.end - r.next) / std::mem::size_of::<ReadyObj>();
+            let used = (r.next - r.start) / std::mem::size_of::<ReadyObj>();
+            r.demand = (r.taken + used) * 5 / 4;
+            r.taken = 0;
+            r.start = r.end;
+            r.next = r.end;
+            r.buf.clear();
+            r.uncounted = false;
+        }
+    }
+
+    /// No more ready objects: a second realm exists, whose objects need more
+    /// than a shape at birth (`Vm::realm_born`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn ready_disable(&mut self) {
+        self.ready_on = false;
+        self.ready_abandon();
+    }
+
     /// A constructor's new instance: an empty object of class `class` (none
     /// for a function's) whose values go in a slab cell of the class for
     /// `hint` properties, what the constructor's last instance ended up
@@ -8918,6 +9270,25 @@ impl Heap {
     /// slab off, takes the vector.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(crate) fn alloc_ctor_object(&mut self, hint: usize, class: Option<u32>) -> u32 {
+        if let Some(ready) = val_slab_class(hint.max(1)).and_then(|c| self.ready_take(c as usize)) {
+            // SAFETY: the map is the box in the ready object's slot, which
+            // nothing else refers to.
+            let m = unsafe { &mut *std::ptr::with_exposed_provenance_mut::<ObjMap>(ready.map) };
+            // An instance's keys are appended one by one, as a new map's are.
+            m.keys = PropKeys::default();
+            m.class = class;
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[ready.idx as usize].fid = object_mirror_fid(m);
+            }
+            return ready.idx;
+        }
+        self.alloc_ctor_object_new(hint, class)
+    }
+
+    /// [`Heap::alloc_ctor_object`] with no ready object to take.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn alloc_ctor_object_new(&mut self, hint: usize, class: Option<u32>) -> u32 {
         let Some(sc) = val_slab_class(hint).filter(|_| self.thin_alloc) else {
             let mut m = ObjMap::with_value_capacity(hint);
             m.class = class;
@@ -10177,6 +10548,34 @@ impl Heap {
         &self.young
     }
 
+    /// How many of the young log's slots the program really allocated.
+    #[inline]
+    pub(crate) fn young_allocated(&self) -> usize {
+        #[cfg(not(feature = "safe-sandbox"))]
+        return self.young.len() - self.ready_untaken;
+        #[cfg(feature = "safe-sandbox")]
+        self.young.len()
+    }
+
+    /// The free list, out of the heap while a sweep's side tables are pruned
+    /// against it; [`Self::restore_free`] puts it back.
+    pub(crate) fn take_free(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.free)
+    }
+
+    pub(crate) fn restore_free(&mut self, free: Vec<u32>) {
+        self.free = free;
+    }
+
+    /// [`Self::take_free`] for the young log.
+    pub(crate) fn take_young(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.young)
+    }
+
+    pub(crate) fn restore_young(&mut self, young: Vec<u32>) {
+        self.young = young;
+    }
+
     /// Promote everything logged so far and drop the log (called from
     /// `set_gc_floor`: the boot allocations are pinned forever, so they are
     /// OLD from the floor on and the first minor never walks them).
@@ -10228,6 +10627,11 @@ impl Heap {
         {
             self.obj_pool_refill_scope(true);
         }
+        // What became a ready object stays in the log, moved to its front.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let recycle = self.ready_recycle_begin().then(empty_key_plan);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut kept = 0;
         // The log is in allocation order, which recycled slots scatter, so
         // each dead entry's slot is a cold line, and an ordinary object's map
         // behind its Box a second one (the two hottest lines of `free_slot`).
@@ -10235,7 +10639,8 @@ impl Heap {
         // arrive, a dead object's map four ahead.
         const SLOT_AHEAD: usize = 8;
         const MAP_AHEAD: usize = 4;
-        for (j, &idx) in log.iter().enumerate() {
+        for j in 0..log.len() {
+            let idx = log[j];
             if let Some(&ahead) = log.get(j + SLOT_AHEAD) {
                 prefetch_line(self.objs.as_ptr().wrapping_add(ahead as usize));
             }
@@ -10247,6 +10652,15 @@ impl Heap {
                 }
             }
             if !marks[idx as usize] {
+                #[cfg(not(feature = "safe-sandbox"))]
+                if let Some(empty) = recycle {
+                    if self.ready_recycle(idx, empty) {
+                        log[kept] = idx;
+                        kept += 1;
+                        swept += 1;
+                        continue;
+                    }
+                }
                 self.free_slot(idx);
                 swept += 1;
             } else {
@@ -10259,7 +10673,12 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         {
             self.obj_pool_refill_scope(false);
+            if recycle.is_some() {
+                self.ready_recycle_end();
+            }
+            log.truncate(kept);
         }
+        #[cfg(feature = "safe-sandbox")]
         log.clear();
         self.young = log;
         swept
@@ -11367,7 +11786,6 @@ impl Heap {
         self.gc_threshold = live.saturating_add(self.young_budget);
         self.gc_requested = false;
         self.minors_since_major += 1;
-        self.young.clear();
     }
 
     /// Invalidate every emitted dense-Array raw snapshot. Saturation is an
@@ -11484,6 +11902,38 @@ impl Heap {
     #[inline]
     pub fn version_of(&self, idx: u32) -> u32 {
         self.versions[idx as usize]
+    }
+
+    /// The string of the one code point `cp` (at or above 128; a lone
+    /// surrogate's own value is a code point here): the cached slot while it
+    /// still holds that string, else a fresh one, frozen because every holder
+    /// of the handle shares it. Iterating non-ASCII text or slicing it a
+    /// character at a time allocated one string per step.
+    ///
+    /// Out of line: inlined through `str_from_cp`/`str_from_unit` into the
+    /// interpreter loops' string arms, its body moved their register
+    /// allocation under PGO and halved the lite loop's leaf calls
+    /// (call_method 434 -> 811 ms interpreted) while plain builds were equal.
+    #[inline(never)]
+    pub fn cp_str(&mut self, cp: u32) -> u32 {
+        const CACHE: usize = 1024;
+        let k = cp as usize & (CACHE - 1);
+        if let Some(&(c, idx, version)) = self.cp_strs.get(k) {
+            if c == cp
+                && self.versions.get(idx as usize) == Some(&version)
+                && matches!(self.objs.get(idx as usize), Some(HeapObj::Str(_)))
+            {
+                return idx;
+            }
+        }
+        let mut js = JsStr::from_code_point(cp);
+        js.freeze_shared();
+        let idx = self.alloc(HeapObj::Str(js));
+        if self.cp_strs.is_empty() {
+            self.cp_strs = vec![(u32::MAX, 0, 0); CACHE];
+        }
+        self.cp_strs[k] = (cp, idx, self.versions[idx as usize]);
+        idx
     }
 
     #[inline]
@@ -14806,7 +15256,7 @@ impl Heap {
                 }
             }
         }
-        kinds.sort_by(|a, b| b.2.cmp(&a.2));
+        crate::cold_sort::sort_by(&mut kinds, |a, b| b.2.cmp(&a.2));
         (
             self.objs.capacity(),
             self.resident_payload_current.get(),

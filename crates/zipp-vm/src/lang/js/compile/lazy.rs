@@ -60,7 +60,7 @@ fn lazy_setting() -> u8 {
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
     let mut m = MODE.load(Ordering::Relaxed);
     if m == u8::MAX {
-        m = match std::env::var("ZIPP_LAZY").as_deref() {
+        m = match crate::env_var("ZIPP_LAZY").as_deref() {
             Ok("seeded") => 1,
             Ok("end") => 2,
             Ok("verify") => 3,
@@ -207,14 +207,14 @@ fn restricted_name(n: &str) -> bool {
 fn duplicate_params(p: &ast::Params) -> bool {
     let mut seen = rustc_hash::FxHashSet::default();
     let mut dup = false;
-    visit::params(p, &mut |n| {
+    visit::params(p, visit::arg(&mut |n| {
         if let Node::Pattern(ast::Pattern::Ident(name)) = n {
             if !seen.insert(&**name) {
                 dup = true;
             }
         }
         (!dup).into()
-    });
+    }));
     dup
 }
 
@@ -403,6 +403,7 @@ impl FnCompiler<'_> {
             length: if run { expected_arg_count(params) } else { 0 },
             rest_reg,
             arguments_reg: None,
+            args_count_only: false,
             is_generator: false,
             is_async: false,
             non_constructable: is_arrow,
@@ -512,8 +513,8 @@ impl Compiler {
             }
         };
         match node {
-            FnNode::Function(f) => visit::function(f, &mut offer),
-            FnNode::Arrow(a) => visit::arrow(a, &mut offer),
+            FnNode::Function(f) => visit::function(f, visit::arg(&mut offer)),
+            FnNode::Arrow(a) => visit::arrow(a, visit::arg(&mut offer)),
         };
         for c in children {
             if !facts.ok {
@@ -563,7 +564,7 @@ fn note_eager(why: Option<&'static str>, bytes: u32) {
 pub(super) fn take_eager_census() -> Vec<(&'static str, u64, u64)> {
     let mut v: Vec<(&'static str, u64, u64)> =
         EAGER_WHY.with(|m| m.borrow_mut().drain().map(|(k, (n, b))| (k, n, b)).collect());
-    v.sort_by(|a, b| b.2.cmp(&a.2));
+    crate::cold_sort::sort_by(&mut v, |a, b| b.2.cmp(&a.2));
     v
 }
 
@@ -597,7 +598,7 @@ pub(super) struct ProgramIndex<'a> {
 impl<'a> ProgramIndex<'a> {
     pub(super) fn of(prog: &'a ast::Program) -> ProgramIndex<'a> {
         let mut index = ProgramIndex { nodes: rustc_hash::FxHashMap::default(), regexes: Vec::new() };
-        visit::stmts(&prog.body, &mut |n| {
+        visit::stmts(&prog.body, visit::arg(&mut |n| {
             match n {
                 Node::Function(f) => {
                     index.nodes.insert((f.span.start, f.span.end), FnNode::Function(f));
@@ -609,7 +610,7 @@ impl<'a> ProgramIndex<'a> {
                 _ => {}
             }
             visit::Flow::Go
-        });
+        }));
         index
     }
 

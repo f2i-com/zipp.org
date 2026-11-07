@@ -1338,6 +1338,7 @@ impl Jit {
                         is_mem: true,
                         field_plan: None,
                         local_sroa: None,
+                        cells: Vec::new(),
                         is_boxref: false,
                     },
                 );

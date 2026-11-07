@@ -5,6 +5,33 @@
 #![allow(unused_imports)]
 use super::*;
 
+env_off_switch! {
+    /// `ZIPP_NO_INSTANCEOF_MEMO=1`: every `instanceof` against an ordinary
+    /// function re-checks its right-hand side (`Vm::instanceof_memo`).
+    fn instanceof_memo_enabled() = "ZIPP_NO_INSTANCEOF_MEMO"
+}
+
+/// Whether a function's own-property side table holds `@@hasInstance`, and
+/// whether it holds `prototype`: the two keys `instanceof` asks of a plain
+/// function. Side tables have no shape for the (shape, key) memo, so each
+/// `pos` scanned every key: two scans per test of an `instanceof` against a
+/// constructor with a few statics (a minifier's AST node classes, 2.95M tests
+/// in a run). One pass answers both; an indexed table keeps its lookups.
+fn own_has_instance_and_prototype(m: &crate::heap::ObjMap) -> (bool, bool) {
+    if m.is_indexed() {
+        return (m.pos("@@hasInstance").is_some(), m.pos("prototype").is_some());
+    }
+    let (mut has_instance, mut prototype) = (false, false);
+    for k in m.keys_iter() {
+        match k.len() {
+            13 => has_instance |= k == "@@hasInstance",
+            9 => prototype |= k == "prototype",
+            _ => {}
+        }
+    }
+    (has_instance, prototype)
+}
+
 /// Whether class `cc` has no own `@@hasInstance` (a static method, field or
 /// accessor), remembered by the shape of its `statics`
 /// (`ClassData::no_has_instance_shape`): every `instanceof` against a class
@@ -192,18 +219,69 @@ impl<'p> Vm<'p> {
             return None;
         }
         let ci = c.heap_index();
+        // An ordinary function whose checks below passed since its version
+        // and `fn_props` last changed (`instanceof_memo`): its prototype.
+        let memo = self.instanceof_memo[ci as usize & (crate::vm::INSTANCEOF_MEMO_SLOTS - 1)];
+        let p = if memo.idx == ci
+            && instanceof_memo_enabled()
+            && memo.ver == self.heap.version_of(ci)
+            && memo.gen == self.fn_props_gen
+            && !self.proto_of.has(ci)
+        {
+            memo.proto
+        } else {
+            match self.instanceof_rhs_checked(c, v)? {
+                Ok(p) => p,
+                Err(answer) => return Some(answer),
+            }
+        };
+        if !self.is_object_value(v) {
+            return Some(false);
+        }
+        let mut cur = v;
+        for _ in 0..10_000 {
+            cur = match self.instanceof_proto_step(cur) {
+                Some(next) => next,
+                None => {
+                    if self.proxy_parts(cur.heap_index()).is_some() {
+                        return None;
+                    }
+                    self.object_get_prototype_of(cur)
+                }
+            };
+            if !cur.is_heap() {
+                return Some(false);
+            }
+            if cur == p {
+                return Some(true);
+            }
+        }
+        None
+    }
+
+    /// The right-hand side half of [`Self::instanceof_fast`]: `None` when
+    /// `c` needs the full operator, `Some(Err(answer))` when a class walk
+    /// answered, else `Some(Ok(p))` with `c.prototype`, an object, which an
+    /// ordinary function also leaves in `instanceof_memo`.
+    fn instanceof_rhs_checked(&mut self, c: Value, v: Value) -> Option<Result<Value, bool>> {
+        let ci = c.heap_index();
         let mut cur = ci;
         let mut chain_ok = false;
+        // Whether `c` itself, a function, has an own `prototype`, when the
+        // walk below already looked at its side table.
+        let mut ci_own_prototype = None;
         for _ in 0..64 {
             match self.heap.get(cur) {
                 HeapObj::Func(_) | HeapObj::Closure { .. } => {
-                    if self
-                        .fn_props
-                        .get(&cur)
-                        .is_some_and(|m| m.pos("@@hasInstance").is_some())
-                        || self.proto_of.has(cur)
-                    {
+                    let (has_instance, prototype) = match self.fn_props.get(&cur) {
+                        Some(m) => own_has_instance_and_prototype(m),
+                        None => (false, false),
+                    };
+                    if has_instance || self.proto_of.has(cur) {
                         return None;
+                    }
+                    if cur == ci {
+                        ci_own_prototype = Some(prototype);
                     }
                     chain_ok = true;
                     break;
@@ -240,43 +318,29 @@ impl<'p> Vm<'p> {
             let f = self.func(fid as usize);
             if f.non_constructable
                 || f.lexical_this
-                || self
-                    .fn_props
-                    .get(&ci)
-                    .is_some_and(|m| m.pos("prototype").is_some())
+                || ci_own_prototype.unwrap_or_else(|| {
+                    self.fn_props.get(&ci).is_some_and(|m| m.pos("prototype").is_some())
+                })
             {
                 return None;
             }
         }
         if let Some(b) = self.instanceof_class_walk(ci, v) {
-            return Some(b);
+            return Some(Err(b));
         }
         let p = self.prototype_of(c)?;
         if !self.is_object_value(p) {
             return None;
         }
-        if !self.is_object_value(v) {
-            return Some(false);
-        }
-        let mut cur = v;
-        for _ in 0..10_000 {
-            cur = match self.instanceof_proto_step(cur) {
-                Some(next) => next,
-                None => {
-                    if self.proxy_parts(cur.heap_index()).is_some() {
-                        return None;
-                    }
-                    self.object_get_prototype_of(cur)
-                }
+        if instanceof_memo_enabled() && matches!(self.heap.get(ci), HeapObj::Func(_) | HeapObj::Closure { .. }) {
+            self.instanceof_memo[ci as usize & (crate::vm::INSTANCEOF_MEMO_SLOTS - 1)] = crate::vm::InstanceofMemo {
+                idx: ci,
+                ver: self.heap.version_of(ci),
+                gen: self.fn_props_gen,
+                proto: p,
             };
-            if !cur.is_heap() {
-                return Some(false);
-            }
-            if cur == p {
-                return Some(true);
-            }
         }
-        None
+        Some(Ok(p))
     }
 
     /// `v instanceof C` for a class `C` (heap `ci`) and a class instance `v`
@@ -488,6 +552,21 @@ impl<'p> Vm<'p> {
         }
         self.class_value_in_chain(self.private_brands_of(callee), class_id)
             .or(slot.latest)
+    }
+
+    /// The value `LoadClassValue` of `class_id` has for all running code
+    /// while no class is evaluated again (`mi_class_epoch` unmoved): a class
+    /// evaluated exactly once, undecorated or with no replacement. Tier O
+    /// bakes it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn class_value_fixed(&self, class_id: u32) -> Option<Value> {
+        let slot = self.class_values.get(class_id as usize)?;
+        let v = slot.latest.filter(|_| !slot.repeated)?;
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Class(c) if c.dec.as_ref().is_some_and(|d| d.replacement.is_heap()) => None,
+            HeapObj::Class(_) => Some(v),
+            _ => None,
+        }
     }
 
     /// Whether compile-time class `class_id` has been evaluated more than once.

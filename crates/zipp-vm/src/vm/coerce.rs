@@ -80,7 +80,7 @@ fn ascii_char_append_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -103,7 +103,7 @@ fn str_append_index_first_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -130,7 +130,7 @@ fn str_append_index_reserve_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
+            let on = crate::env_var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
             ON.store(on, Ordering::Relaxed);
             on == 1
         }
@@ -941,7 +941,7 @@ impl<'p> Vm<'p> {
     /// path. O(n), but only consulted by methods that are already O(n) (and whose
     /// per-element JS callback dominates).
     pub(crate) fn array_has_holes(&self, idx: u32) -> bool {
-        matches!(self.heap.get(idx), HeapObj::Array(items) if items.iter().any(|v| v.is_hole()))
+        matches!(self.heap.get(idx), HeapObj::Array(items) if Value::any_hole(&items))
     }
 
     /// IsArray(v) (ES 7.2.2): true for an Array exotic, recursing through Proxy
@@ -1033,7 +1033,7 @@ impl<'p> Vm<'p> {
             let idx = obj.heap_index();
             if !self.arguments_objs.contains_key(&idx)
                 && self.js_array_len(idx) == items.len()
-                && !items.iter().any(|v| v.is_hole())
+                && !Value::any_hole(&items)
                 && !self.arr_props.get(&idx).is_some_and(|m| m.has_element_key())
             {
                 self.preflight_native_iteration_work(items.len() as u64)?;
@@ -1088,6 +1088,9 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(v) {
             return Ok(false);
         }
+        if self.array_spreadable_by_default(v) {
+            return Ok(true);
+        }
         let flag = self.get_prop(v, "@@isConcatSpreadable")?;
         if flag != Value::UNDEFINED {
             return Ok(self.truthy(flag));
@@ -1095,6 +1098,40 @@ impl<'p> Vm<'p> {
         // Step 4 is the REAL IsArray: it pierces Proxy targets (a proxy over an
         // array IS spreadable) and throws on a revoked proxy.
         self.value_is_array_throwing(v)
+    }
+
+    /// IsConcatSpreadable of a plain array of the main realm with no own
+    /// named property, on the default chain (%Array.prototype%, then
+    /// %Object.prototype%) where neither prototype holds the flag: the Get
+    /// finds `undefined` and IsArray is true, so it is spreadable with
+    /// nothing read. Each concat argument walked that chain by name.
+    pub(crate) fn array_spreadable_by_default(&self, v: Value) -> bool {
+        let idx = v.heap_index();
+        if self.arr_proto == 0
+            || self.obj_proto == 0
+            || !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.proto_of.contains_key(&idx)
+            || self.arr_props.contains_key(&idx)
+            || self.proto_of.contains_key(&self.arr_proto)
+        {
+            return false;
+        }
+        // Whether a prototype holds the flag changes only with a key added or
+        // deleted, which bumps its version: proved once per pair of versions
+        // (`spreadable_memo`), not hashed into both maps per argument.
+        let vers = (self.heap.version_of(self.arr_proto), self.heap.version_of(self.obj_proto));
+        if self.spreadable_memo.get() == vers {
+            return true;
+        }
+        let holds_flag = |o: u32| match self.heap.get(o) {
+            HeapObj::Object(m) => m.pos("@@isConcatSpreadable").is_some(),
+            _ => true,
+        };
+        let clear = !holds_flag(self.arr_proto) && !holds_flag(self.obj_proto);
+        if clear {
+            self.spreadable_memo.set(vers);
+        }
+        clear
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors
@@ -1184,6 +1221,17 @@ impl<'p> Vm<'p> {
         }
         if v.is_int() {
             return Ok(self.int_str_value(v.as_int()));
+        }
+        if v.is_double() {
+            // The text is ASCII and is the string's buffer: the general path
+            // copied it through the display buffer into a second `String`,
+            // then scanned it for non-ASCII bytes.
+            let text = fmt_f64(v.as_f64());
+            if let [b] = *text.as_bytes() {
+                return Ok(Value::heap(u32::from(b)));
+            }
+            let text = crate::heap::JsStr::from_ascii(text.into_bytes());
+            return Ok(Value::heap(self.heap.alloc_js(text)));
         }
         // An object's ToPrimitive result is kept as the string VALUE it is:
         // `String(['\uD800'])` is the array's join result, surrogate intact.
@@ -1703,6 +1751,10 @@ impl<'p> Vm<'p> {
         // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →
         // the spec's mixing TypeError; otherwise Number addition (ToNumber of
         // a Symbol throws there).
+        #[cfg(not(feature = "meter-only"))]
+        if let Some(v) = self.bigint_big_op(crate::vm::helpers_misc::BigOp::Add, pa, pb) {
+            return Ok(v);
+        }
         let (ab, bb) = (self.bigint_val(pa), self.bigint_val(pb));
         match (ab, bb) {
             (Some(x), Some(y)) => self.bigint_op(crate::vm::helpers_misc::BigOp::Add, x, y),
@@ -2467,6 +2519,11 @@ impl<'p> Vm<'p> {
         va: Value,
         vb: Value,
     ) -> Result<Option<Option<std::cmp::Ordering>>, Thrown> {
+        // Two BigInts, ordered where they live (no copy of a Big).
+        #[cfg(not(feature = "meter-only"))]
+        if let Some(o) = self.bigint_ref_cmp(va, vb) {
+            return Ok(Some(Some(o)));
+        }
         let ab = self.bigint_val(va);
         let bb = self.bigint_val(vb);
         if ab.is_none() && bb.is_none() {
@@ -2518,11 +2575,19 @@ impl<'p> Vm<'p> {
             && self.heap.is_str_like(va.heap_index())
             && self.heap.is_str_like(vb.heap_index())
         {
+            // Two flat strings of known ASCII, the common case: their flags say
+            // so, and byte order is UTF-16 code-unit order.
+            if let (HeapObj::Str(a), HeapObj::Str(b)) =
+                (self.heap.get(va.heap_index()), self.heap.get(vb.heap_index()))
+            {
+                if a.is_ascii() && b.is_ascii() {
+                    return Some(a.as_bytes().cmp(b.as_bytes()));
+                }
+            }
             let sa = self.heap.str_wtf8_cow(va.heap_index())?;
             let sb = self.heap.str_wtf8_cow(vb.heap_index())?;
             let (a, b) = (sa.as_ref(), sb.as_ref());
-            // Fast path: ASCII byte order == UTF-16 code-unit order (and
-            // `is_ascii` is vectorised), so the hot common case stays a byte cmp.
+            // A rope, or a flat string its flag does not vouch for.
             if a.is_ascii() && b.is_ascii() {
                 return Some(a.cmp(b));
             }
@@ -2537,6 +2602,7 @@ impl<'p> Vm<'p> {
         None
     }
 
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn strict_eq(&self, base: usize, a: u16, b: u16) -> bool {
         self.strict_eq_vals(self.get(base, a), self.get(base, b))
     }
@@ -2596,6 +2662,25 @@ impl<'p> Vm<'p> {
             }
         }
         false
+    }
+
+    /// A conditional jump's test, in the interpreter loop: a comparison's
+    /// boolean, nearly always, with no call, and in the native builds a
+    /// primitive too (`if (node.x)` on an absent `x`), so only a heap value
+    /// calls `truthy`, which the loop does not inline. The WASM modules keep
+    /// the call: the inline primitive test, in each copy of the loop, was
+    /// 723 Brotli bytes of the Lite module (both modules smaller raw without
+    /// it) for about a percent of interpreted time.
+    #[inline(always)]
+    pub(crate) fn jump_condition(&self, v: Value) -> bool {
+        if v.is_bool() {
+            return v.bits() == Value::TRUE.bits();
+        }
+        #[cfg(not(feature = "meter-only"))]
+        if !v.is_heap() {
+            return v.truthy_primitive().unwrap_or(true);
+        }
+        self.truthy(v)
     }
 
     #[inline]
@@ -2693,6 +2778,11 @@ impl<'p> Vm<'p> {
     /// position args (`charAt`/`charCodeAt`/`at`/…), which use ToInteger, not a
     /// plain number cast (so `"42".charAt(true)` is index 1, `"1"` is 1, etc).
     pub(crate) fn to_integer_or_zero(&mut self, v: Value) -> Result<i64, Thrown> {
+        // An Int is its own integer: no ToNumber, and no `trunc` (a libm call
+        // on the baseline x86-64 target, which has no `roundsd`).
+        if v.is_int() {
+            return Ok(i64::from(v.as_int()));
+        }
         let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Ok(0);
@@ -2711,6 +2801,10 @@ impl<'p> Vm<'p> {
     /// ToNumber (a BigInt or Symbol argument is a TypeError, per spec) - for
     /// String.prototype position/count arguments.
     pub(crate) fn to_integer_strict(&mut self, v: Value) -> Result<i64, Thrown> {
+        // An Int is already integral (`ta.set(src, at)`, `a.at(i)`).
+        if v.is_int() {
+            return Ok(v.as_int() as i64);
+        }
         let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Ok(0);
@@ -3326,7 +3420,7 @@ impl<'p> Vm<'p> {
     /// INSPECT (`console.log` rendering). Strings are quoted only when nested;
     /// arrays/objects use node's spaced bracket style (`[ 1, 2, 3 ]`,
     /// `{ a: 1 }`). Unlike a serializer this is deliberately bounded: hostile
-    /// graphs must not turn one Print instruction into unbounded native work.
+    /// graphs must not turn one console call into unbounded native work.
     /// Render a complete console line into one bounded buffer. A per-argument
     /// cap is insufficient: thousands of individually small arguments followed
     /// by `Vec<String>::join` can otherwise allocate far beyond the output

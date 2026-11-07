@@ -30,6 +30,14 @@ pub const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
+env_off_switch! {
+    /// `ZIPP_NO_TA_DIRECT_STORE=1`: the interpreter's numeric typed-array
+    /// store builds its element bytes through `ta_encode` again (the
+    /// same-binary A/B for `ta_interp_numeric_set_fixed`).
+    #[inline]
+    fn ta_direct_store_enabled() = "ZIPP_NO_TA_DIRECT_STORE"
+}
+
 /// The `N` bytes of `data` at `off`, or `None` past its end: one bounds check
 /// and a fixed-width load, for the typed-array element reads.
 #[inline(always)]
@@ -76,13 +84,59 @@ impl TaInterpNumericView {
 /// `DV_PROTO_METHODS`: the kinds `dataview_get_kind` pairs with them.
 const DV_GET_KINDS: [u8; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
 
+/// The position of the `%TypedArray%.prototype` method `name` in
+/// `TA_PROTO_METHODS`, picked by the name's length and a byte or two and then
+/// confirmed by one compare (as `dataview_proto_slot` does). A scan of the
+/// table compared the name with up to 32 literals.
+#[inline]
+pub(crate) fn ta_proto_method_slot(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    let at = |i: usize| b.get(i).copied().unwrap_or(0);
+    let slot = match (b.len(), at(0)) {
+        (2, b'a') => 0,
+        (3, b'm') => 7,
+        (3, b's') => 23,
+        (4, b'j') => 1,
+        (4, b'f') if at(2) == b'n' => 9,
+        (4, b'f') => 17,
+        (4, b's') if at(2) == b'm' => 14,
+        (4, b's') => 21,
+        (4, b'k') => 24,
+        (4, b'w') => 30,
+        (5, b'e') => 13,
+        (5, b's') => 19,
+        (6, b'f') => 8,
+        (6, b'r') => 15,
+        (6, b'v') => 25,
+        (7, b'i') => 3,
+        (7, b'f') => 6,
+        (7, b'r') => 18,
+        (7, b'e') => 26,
+        (8, b't') if at(3) == b't' => 2,
+        (8, b't') => 29,
+        (8, b'i') => 5,
+        (8, b'f') => 11,
+        (8, b's') => 20,
+        (9, b'f') => 10,
+        (10, b'c') => 22,
+        (10, b'@') => 27,
+        (10, b't') => 28,
+        (11, b'l') => 4,
+        (11, b'r') => 16,
+        (13, b'f') => 12,
+        (14, b't') => 31,
+        _ => return None,
+    };
+    crate::heap::key_eq(name, native::TA_PROTO_METHODS.get(slot)?).then_some(slot)
+}
+
 /// The %DataView.prototype% entry of the accessor `name` (the slot
 /// `dataview_get_kind`, `dataview_set_kind` and `dataview_big_kind` give),
 /// picked by the name's length and two of its bytes and then confirmed by
 /// one inline compare. The three `match`es compared the name with up to
 /// twenty literals by `memcmp`, on every `dv.getUint32` read: 11 ns of it.
 #[inline]
-fn dataview_proto_slot(name: &str) -> Option<usize> {
+pub(crate) fn dataview_proto_slot(name: &str) -> Option<usize> {
     let b = name.as_bytes();
     let (cand, slot) = match (b.len(), *b.first()?, *b.get(3)?) {
         (7, b'g', b'I') => ("getInt8", 0),
@@ -170,6 +224,19 @@ fn dataview_big_bits_index(slot: usize) -> usize {
 }
 
 impl<'p> Vm<'p> {
+    /// The boot accessor's bits for the `DV_PROTO_METHODS` entry `slot` (as
+    /// `dataview_proto_slot` numbers them), once the boot recorded them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn dataview_intrinsic_bits(&self, slot: usize) -> Option<u64> {
+        let bits = match slot {
+            0..=7 => self.dataview_numeric_getter_bits[slot],
+            10..=17 => self.dataview_numeric_setter_bits[slot - 10],
+            8 | 9 | 18 | 19 => self.dataview_bigint_bits[dataview_big_bits_index(slot)],
+            _ => return None,
+        };
+        (bits != Value::UNDEFINED.bits()).then_some(bits)
+    }
+
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
             .then(|| v.heap_index())
@@ -420,6 +487,79 @@ impl<'p> Vm<'p> {
         Some(self.ta_effective_len(ta_idx).unwrap_or(0))
     }
 
+    /// `ta.<name>` for a `%TypedArray%.prototype` method `name`: what a Get
+    /// finds when the view has no own `name` and its [[Prototype]] is its
+    /// kind's intrinsic prototype, which shadows no such method and inherits
+    /// from %TypedArray%.prototype%: that prototype's slot, read in place.
+    /// `None` (an accessor there, an own shadow, a subclass instance, another
+    /// realm's view, a name that is not such a method) sends the caller to
+    /// the ordinary lookup. The view has no shape for the property cache, so
+    /// `ta.subarray` walked the chain and searched both prototypes by name on
+    /// every read, after trying the name as a numeric index.
+    ///
+    /// The prototype half is memoized under versions as `ta_length_fast`'s
+    /// is (`ta_meth_kind_ver` per kind, `ta_meth_slots` per method); the
+    /// slot's value is re-read on every use, since an in-place overwrite
+    /// advances no version.
+    pub(crate) fn ta_proto_method_read(&mut self, ta_idx: u32, name: &str) -> Option<u64> {
+        let method = ta_proto_method_slot(name)?;
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind as usize,
+            _ => return None,
+        };
+        let want_proto = match self.ta_protos.get(kind) {
+            Some(&p) if p != 0 => p,
+            _ => return None,
+        };
+        let base = self.ta_base_proto;
+        if base == 0
+            || kind >= self.ta_meth_kind_ver.len()
+            || (!self.arr_props.is_empty()
+                && self.arr_props.get(&ta_idx).is_some_and(|m| m.pos(name).is_some()))
+            || !matches!(
+                self.proto_of.get(&ta_idx),
+                Some(v) if v.is_heap() && v.heap_index() == want_proto
+            )
+        {
+            return None;
+        }
+        // The kind's prototype: proved once per version to carry none of the
+        // method names and to inherit from %TypedArray%.prototype%.
+        if self.ta_meth_kinds & (1 << kind) == 0 || self.ta_meth_kind_ver[kind] != self.heap.version_of(want_proto) {
+            let clean = match self.heap.get(want_proto) {
+                HeapObj::Object(m) => native::TA_PROTO_METHODS.iter().all(|n| m.pos(n).is_none()),
+                _ => false,
+            } && matches!(
+                self.proto_of.get_copied(want_proto),
+                Some(v) if v.is_heap() && v.heap_index() == base
+            );
+            if !clean {
+                return None;
+            }
+            self.ta_meth_kind_ver[kind] = self.heap.version_of(want_proto);
+            self.ta_meth_kinds |= 1 << kind;
+        }
+        let base_ver = self.heap.version_of(base);
+        let (ver, slot) = self.ta_meth_slots.get(method).copied()?;
+        let HeapObj::Object(m) = self.heap.get(base) else {
+            return None;
+        };
+        let slot = if ver == base_ver && (slot as usize) < m.slot_len() {
+            slot as usize
+        } else {
+            let s = m.pos(name)?;
+            self.ta_meth_slots[method] = (base_ver, s as u32);
+            s
+        };
+        let HeapObj::Object(m) = self.heap.get(base) else {
+            return None;
+        };
+        if m.is_accessor_at(slot) {
+            return None;
+        }
+        m.val_get_ref(slot).map(|v| v.bits())
+    }
+
     /// `o.length` for the receivers whose length is an internal slot rather
     /// than an ordinary property: a primitive string (its UTF-16 units), a
     /// dense or sparse Array (never an arguments object, whose `length` is an
@@ -577,6 +717,19 @@ impl<'p> Vm<'p> {
         let Some((method, _)) = dataview_get_kind(name) else {
             return Ok(None);
         };
+        self.dataview_interp_get_slot(view_idx, method, position, little_endian)
+    }
+
+    /// [`Self::dataview_interp_get_fast`] for the getter at `DV_PROTO_METHODS`
+    /// entry `method` (0 to 7), named by its entry rather than its name.
+    #[inline(always)]
+    pub(crate) fn dataview_interp_get_slot(
+        &self,
+        view_idx: u32,
+        method: usize,
+        position: Value,
+        little_endian: Value,
+    ) -> Result<Option<Value>, Thrown> {
         let pristine_version = match self.heap.get(view_idx) {
             HeapObj::DataView {
                 pristine_version, ..
@@ -680,9 +833,27 @@ impl<'p> Vm<'p> {
         value: Value,
         little_endian: Value,
     ) -> Result<Option<()>, Thrown> {
-        let Some((slot, kind)) = dataview_set_kind(name) else {
-            return Ok(None);
-        };
+        match dataview_proto_slot(name) {
+            Some(slot @ 10..=17) => self.dataview_interp_set_slot(view_idx, slot, position, value, little_endian),
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::dataview_interp_set_fast`] for the setter at `DV_PROTO_METHODS`
+    /// entry `slot` (10 to 17), named by its entry rather than its name.
+    #[inline(always)]
+    pub(crate) fn dataview_interp_set_slot(
+        &mut self,
+        view_idx: u32,
+        slot: usize,
+        position: Value,
+        value: Value,
+        little_endian: Value,
+    ) -> Result<Option<()>, Thrown> {
+        // The setters' kinds are the getters' (`setInt8` is entry 10 to
+        // `getInt8`'s 0).
+        let kind = DV_GET_KINDS[slot - 10];
+        let name = native::DV_PROTO_METHODS[slot];
         let pristine_version = match self.heap.get(view_idx) {
             HeapObj::DataView {
                 pristine_version, ..
@@ -886,9 +1057,10 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let name = native::DV_PROTO_METHODS[slot];
-        let Some((_, kind)) = dataview_set_kind(name) else {
-            return Ok(None);
-        };
+        // The setters' kinds are the getters' (`setInt8` is entry 10 to
+        // `getInt8`'s 0): a table read, where the name was matched by memcmp.
+        let kind = DV_GET_KINDS[slot - 10];
+        debug_assert_eq!(dataview_set_kind(name), Some((slot, kind)));
         self.dataview_set_leaf(view_idx, kind, name, position, value, little_endian)
     }
 
@@ -942,17 +1114,54 @@ impl<'p> Vm<'p> {
                 "RangeError: Offset is outside the bounds of the DataView",
             ));
         }
-        let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
-        if !self.truthy(little_endian) {
-            bytes[..size].reverse();
+        // An Int's low bits are its ToUintN; a double takes the modular path.
+        // The browser (meter-only) builds keep the smaller original write.
+        #[cfg(feature = "meter-only")]
+        {
+            let mut bytes = crate::vm::helpers_numeric::ta_encode(kind, value.as_f64());
+            if !self.truthy(little_endian) {
+                bytes[..size].reverse();
+            }
+            let abs = byte_offset + pos;
+            if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+                if abs + size <= data.len() {
+                    data[abs..abs + size].copy_from_slice(&bytes[..size]);
+                }
+            }
+            Ok(Some(()))
+        }
+        #[cfg(not(feature = "meter-only"))]
+        {
+        let bytes = if value.is_int() {
+            crate::vm::helpers_numeric::ta_encode_int(kind, value.as_int())
+        } else {
+            crate::vm::helpers_numeric::ta_encode(kind, value.as_f64())
+        };
+        // `le === 1` and an absent flag are primitives: no out-of-line call.
+        let little = match little_endian.truthy_primitive() {
+            Some(t) => t,
+            None => self.truthy(little_endian),
+        };
+        // The element's bytes as one little-endian word, swapped within its
+        // width for a big-endian write, then stored at that fixed width: the
+        // variable-length copy was a `memcpy` call per write.
+        let mut word = u64::from_le_bytes(bytes);
+        if !little {
+            word = word.swap_bytes() >> (64 - 8 * size as u32);
         }
         let abs = byte_offset + pos;
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
-            if abs + size <= data.len() {
-                data[abs..abs + size].copy_from_slice(&bytes[..size]);
+            if let Some(dst) = data.get_mut(abs..abs + size) {
+                match size {
+                    1 => dst[0] = word as u8,
+                    2 => dst.copy_from_slice(&(word as u16).to_le_bytes()),
+                    4 => dst.copy_from_slice(&(word as u32).to_le_bytes()),
+                    _ => dst.copy_from_slice(&word.to_le_bytes()),
+                }
             }
         }
         Ok(Some(()))
+        }
     }
 
     /// What `Get(view, name)` finds when `name` is one of the numeric getters
@@ -1519,7 +1728,27 @@ impl<'p> Vm<'p> {
         else {
             return false;
         };
-        let bytes: Vec<u8> = match self.heap.get(sbuf) {
+        // One buffer: a memmove in place (overlap-safe), with no snapshot.
+        if sbuf == dbuf {
+            return match self.heap.get_mut(dbuf) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                    let (Some(ae), Some(be)) = (a.checked_add(n), b.checked_add(n)) else {
+                        return false;
+                    };
+                    if ae > data.len() || be > data.len() {
+                        return false;
+                    }
+                    data.copy_within(a..ae, b);
+                    true
+                }
+                _ => false,
+            };
+        }
+        // Two buffers: snapshot the source bytes (on the stack when short —
+        // `out.set(frame, at)` paid an allocation per call), then copy.
+        let mut small = [0u8; 256];
+        let big: Vec<u8>;
+        let bytes: &[u8] = match self.heap.get(sbuf) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => {
                 let Some(end) = a.checked_add(n) else {
                     return false;
@@ -1527,7 +1756,13 @@ impl<'p> Vm<'p> {
                 if end > data.len() {
                     return false;
                 }
-                data[a..end].to_vec()
+                if n <= small.len() {
+                    small[..n].copy_from_slice(&data[a..end]);
+                    &small[..n]
+                } else {
+                    big = data[a..end].to_vec();
+                    &big
+                }
             }
             _ => return false,
         };
@@ -1539,7 +1774,7 @@ impl<'p> Vm<'p> {
                 if end > data.len() {
                     return false;
                 }
-                data[b..end].copy_from_slice(&bytes);
+                data[b..end].copy_from_slice(bytes);
                 true
             }
             _ => false,
@@ -1645,7 +1880,13 @@ impl<'p> Vm<'p> {
             3 => Value::int(i16::from_le_bytes(ta_bytes(data, off)?) as i32),
             4 => Value::int(u16::from_le_bytes(ta_bytes(data, off)?) as i32),
             5 => Value::int(i32::from_le_bytes(ta_bytes(data, off)?)),
-            6 => Value::num(u32::from_le_bytes(ta_bytes(data, off)?) as f64),
+            6 => {
+                let u = u32::from_le_bytes(ta_bytes(data, off)?);
+                match i32::try_from(u) {
+                    Ok(n) => Value::int(n),
+                    Err(_) => Value::num(u as f64),
+                }
+            }
             7 => Value::num(f32::from_le_bytes(ta_bytes(data, off)?) as f64),
             8 => Value::num(f64::from_le_bytes(ta_bytes(data, off)?)),
             11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(ta_bytes(
@@ -1686,6 +1927,27 @@ impl<'p> Vm<'p> {
         i: usize,
         number: Value,
     ) -> bool {
+        // A fixed-length view (any not in `ta_tracking`) in this small
+        // frame; the general form, out of line, cost every store its
+        // register saves.
+        if (self.ta_tracking.is_empty() || !self.ta_tracking.contains(&view.ta_idx)) && ta_direct_store_enabled() {
+            return self.ta_interp_numeric_set_fixed(
+                view.buffer,
+                view.kind,
+                view.byte_offset,
+                view.stored_len,
+                i,
+                number,
+            );
+        }
+        self.ta_interp_numeric_set_general(view, i, number)
+    }
+
+    /// [`Vm::ta_interp_numeric_set_view`] for any view: a length-tracking
+    /// one's length follows its buffer.
+    #[cold]
+    #[inline(never)]
+    fn ta_interp_numeric_set_general(&mut self, view: TaInterpNumericView, i: usize, number: Value) -> bool {
         let TaInterpNumericView {
             ta_idx,
             buffer,
@@ -1693,13 +1955,13 @@ impl<'p> Vm<'p> {
             byte_offset,
             stored_len,
         } = view;
+        let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let size = native::TA_KINDS[kind as usize].1;
         let bytes = if number.is_int() {
             ta_encode_int(kind, number.as_int())
         } else {
             ta_encode(kind, number.as_f64())
         };
-        let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
         let data = match self.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => data,
             // A detached view's numeric element write is the specified no-op
@@ -1733,6 +1995,83 @@ impl<'p> Vm<'p> {
             2 => data[off..off + 2].copy_from_slice(&bytes[..2]),
             4 => data[off..off + 4].copy_from_slice(&bytes[..4]),
             _ => data[off..off + 8].copy_from_slice(&bytes),
+        }
+        true
+    }
+
+    /// [`Vm::ta_interp_numeric_set_view`] for a fixed-length view (not in
+    /// `ta_tracking`): the element converted and written at its kind's width
+    /// in one step. Through the general form, every store built the element
+    /// as an 8-byte array behind a jump on the kind (a call for a fraction),
+    /// multiplied the view's length with an overflow check and chose the
+    /// width again, a third of a typed-array store loop's instructions.
+    /// Same answers: a detached buffer, an index past the view or a view no
+    /// longer inside its buffer is the specified no-op (`true`); anything
+    /// but an ArrayBuffer declines (`false`).
+    #[inline(always)]
+    fn ta_interp_numeric_set_fixed(
+        &mut self,
+        buffer: u32,
+        kind: u8,
+        byte_offset: usize,
+        stored_len: usize,
+        i: usize,
+        number: Value,
+    ) -> bool {
+        let data = match self.heap.get_mut(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            HeapObj::ArrayBuffer { .. } => return true,
+            _ => return false,
+        };
+        // A product past `usize` saturates and fails the bound, as the
+        // general form's overflow did.
+        let size = native::TA_KINDS[kind as usize].1;
+        if i >= stored_len || byte_offset.saturating_add(stored_len.saturating_mul(size)) > data.len() {
+            return true;
+        }
+        let off = byte_offset + i * size;
+        // ToUint32/16/8 of a fraction: the low bits of its truncation below
+        // 2^63, `to_uint_modular` above (and for NaN, which fails the test).
+        #[inline(always)]
+        fn low_bits(number: Value) -> u64 {
+            if number.is_int() {
+                number.as_int() as i64 as u64
+            } else {
+                let f = number.as_f64();
+                if f.abs() < 9_223_372_036_854_775_808.0 {
+                    (f as i64) as u64
+                } else {
+                    super::helpers_numeric::to_uint_modular(f, 64)
+                }
+            }
+        }
+        #[inline(always)]
+        fn put<const N: usize>(data: &mut [u8], off: usize, b: [u8; N]) {
+            if let Some(d) = data.get_mut(off..off + N) {
+                d.copy_from_slice(&b);
+            }
+        }
+        let num = |v: Value| if v.is_int() { v.as_int() as f64 } else { v.as_f64() };
+        match kind {
+            8 => put(data, off, num(number).to_le_bytes()),
+            5 | 6 => put(data, off, (low_bits(number) as u32).to_le_bytes()),
+            0 | 1 => put(data, off, [low_bits(number) as u8]),
+            3 | 4 => put(data, off, (low_bits(number) as u16).to_le_bytes()),
+            7 => {
+                // An i32 rounds to f32 as its exact f64 would.
+                let f = if number.is_int() { number.as_int() as f32 } else { number.as_f64() as f32 };
+                put(data, off, f.to_le_bytes())
+            }
+            2 => {
+                let b = if number.is_int() {
+                    number.as_int().clamp(0, 255) as u8
+                } else {
+                    super::helpers_numeric::clamp_u8(number.as_f64())
+                };
+                put(data, off, [b])
+            }
+            11 => put(data, off, crate::vm::helpers_num2::f64_to_f16_bits(num(number)).to_le_bytes()),
+            _ => return false,
         }
         true
     }
@@ -2005,6 +2344,7 @@ impl<'p> Vm<'p> {
     /// array type throws the spec TypeError, not the index error). `waitable` ⇒ the
     /// view must be Int32Array/BigInt64Array (wait/waitAsync/notify); `needs_shared`
     /// ⇒ its buffer must be a SharedArrayBuffer (wait).
+    #[cfg(not(feature = "wasm-single-agent"))]
     pub(crate) fn atomic_validate(
         &mut self,
         ta: Value,
@@ -2102,6 +2442,7 @@ impl<'p> Vm<'p> {
     /// is a RangeError. (The spec compares the byte index with the buffer's
     /// length; comparing whole elements also refuses an element the buffer
     /// now cuts in two.)
+    #[cfg(not(feature = "wasm-single-agent"))]
     fn atomic_revalidate(&self, ti: u32, i: usize) -> Result<(), Thrown> {
         match self.ta_effective_len(ti) {
             None => Err(Thrown::from_static(
@@ -2114,6 +2455,7 @@ impl<'p> Vm<'p> {
 
     /// The (buffer heap idx, byte address) a wait/notify on `(ta, index)`
     /// keys its waiter-list entry by.
+    #[cfg(not(feature = "wasm-single-agent"))]
     fn ta_wait_addr(&self, ti: u32, i: usize) -> (u32, usize) {
         match self.heap.get(ti) {
             HeapObj::TypedArray {
@@ -2132,6 +2474,7 @@ impl<'p> Vm<'p> {
     /// Execute an `Atomics.<op>` call. Single-threaded, so read-modify-write ops
     /// are plain (non-contended); `wait` never blocks (no notifier → "timed-out")
     /// and `notify` reports 0 woken.
+    #[cfg(not(feature = "wasm-single-agent"))]
     pub(crate) fn atomics_op(&mut self, op: &str, args: &[Value]) -> Result<Value, Thrown> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -2822,6 +3165,7 @@ impl<'p> Vm<'p> {
 /// value (current value for `load`), sign/zero-extended to `i64` per the
 /// element kind; the `store` return is unused (callers return the input).
 #[cfg(not(feature = "safe-sandbox"))]
+#[cfg(not(feature = "wasm-single-agent"))]
 fn sab_atomic_op(
     mem: &crate::heap::SharedMem,
     kind: u8,
@@ -2874,6 +3218,7 @@ fn sab_atomic_op(
 }
 
 #[cfg(feature = "safe-sandbox")]
+#[cfg(not(feature = "wasm-single-agent"))]
 fn sab_atomic_op(
     _mem: &crate::heap::SharedMem,
     _kind: u8,
@@ -2912,6 +3257,20 @@ mod tests {
             "setBigUint6x", "gotUint32", "buffer", "byteLength", "getUint3", "GetUint32", "setInt7",
         ] {
             assert_eq!(dataview_proto_slot(n), None, "{n:?}");
+        }
+    }
+
+    #[test]
+    fn ta_proto_method_slot_matches_the_name_table() {
+        for (i, n) in native::TA_PROTO_METHODS.iter().enumerate() {
+            assert_eq!(ta_proto_method_slot(n), Some(i), "{n}");
+        }
+        for n in [
+            "", "a", "ad", "mop", "sex", "jo1n", "fine", "filt", "sore", "slicE", "length", "buffer", "byteLength",
+            "constructor", "toStrong", "toSortex", "subarrax", "@@iterato", "@@toStringTag", "BYTES_PER_ELEMENT",
+            "findLastIndey", "toLocaleStrinG", "getUint32",
+        ] {
+            assert_eq!(ta_proto_method_slot(n), None, "{n:?}");
         }
     }
 }

@@ -68,21 +68,11 @@ use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
 use crate::value::Value;
 
-/// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
-/// `Vm::mark_roots`). The two sides of a one-binary A/B.
-#[inline]
-fn old_jobs_skip_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static ON: AtomicU8 = AtomicU8::new(2);
-    match ON.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_NO_OLD_JOBS_SKIP").is_none() as u8;
-            ON.store(v, Ordering::Relaxed);
-            v == 1
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OLD_JOBS_SKIP=1`: a minor walks every queued job again (see
+    /// `Vm::mark_roots`). The two sides of a one-binary A/B.
+    #[inline]
+    fn old_jobs_skip_enabled() = "ZIPP_NO_OLD_JOBS_SKIP"
 }
 
 /// RAII guard that suspends collection for its scope (decrements on drop, even
@@ -211,7 +201,7 @@ impl<V, const FLAT: bool> SlotKeyed for crate::slot_table::SlotTable<V, FLAT> {
     }
 }
 
-/// `proto_of`: the table's own walks, with its link copy kept in step.
+/// `proto_of`: one store a slot, so the freed list is always the walk.
 impl SlotKeyed for crate::slot_table::ProtoTable {
     #[inline(never)]
     fn retain_marked(&mut self, marks: &[bool]) {
@@ -219,16 +209,12 @@ impl SlotKeyed for crate::slot_table::ProtoTable {
     }
 
     #[inline(never)]
-    fn prune_freed(&mut self, freed: &[u32], live: &[bool]) {
+    fn prune_freed(&mut self, freed: &[u32], _live: &[bool]) {
         if self.is_empty() {
             return;
         }
-        if self.len() <= freed.len() {
-            self.retain(|&k| live[k as usize]);
-        } else {
-            for &i in freed {
-                self.forget(i);
-            }
+        for &i in freed {
+            self.forget(i);
         }
     }
 }
@@ -459,6 +445,8 @@ impl Vm<'_> {
 
     fn gc(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.ready_abandon();
         let n = self.heap.len();
         let floor = self.gc_floor as usize;
         if floor == 0 || n <= floor {
@@ -559,10 +547,13 @@ impl Vm<'_> {
         if self.regexp_vehicle != 0 {
             root_idx!(self.regexp_vehicle);
         }
-        root_val!(self.node_exit_hook);
-        root_val!(self.node_tick_hook);
-        root_val!(self.node_host);
-        root_val!(self.node_cjs);
+        #[cfg(feature = "node")]
+        {
+            root_val!(self.node_exit_hook);
+            root_val!(self.node_tick_hook);
+            root_val!(self.node_host);
+            root_val!(self.node_cjs);
+        }
         // WebAssembly: the namespace, its members, the JavaScript functions
         // instances import, and the buffers handed out over memories.
         #[cfg(feature = "webassembly")]
@@ -1296,27 +1287,41 @@ impl Vm<'_> {
         }
         self.process_weak_references(&marks, n);
         let log_len = self.heap.young_log().len();
+        let allocated = self.heap.young_allocated();
         // `free_slot` appends every reclaimed young slot to `Heap::free`.
         // No heap slot can be allocated or reused during this collector-only
         // window, so the appended suffix is the exact freed set in sweep order.
         // Reuse it rather than allocating and filling a duplicate `Vec<u32>`.
         let free_before = self.heap.free_indices().len();
         let swept = self.heap.sweep_young(&marks);
-        debug_assert_eq!(self.heap.free_indices().len() - free_before, swept);
+        // The young log now lists what the sweep made ready, dead like the
+        // freed slots and in the same tables.
+        let recycled = self.heap.young_log().len();
+        debug_assert_eq!(self.heap.free_indices().len() - free_before + recycled, swept);
         let t_sweep = gcstats::now(stats);
         // W10 survival-adaptive budget (B123) — before note_minor_done reads
         // it for the next threshold. Skipped under stress: epochs of ~1 alloc
         // make the ratio noise, and stress ignores gc_threshold anyway.
         if !self.gc_stress {
-            self.heap.adapt_young_budget(log_len - swept, log_len);
+            self.heap.adapt_young_budget(log_len - swept, allocated);
         }
         // A minor prunes only what it FREED (see `prune_freed`); the
         // whole-table retains are the major's.
-        self.prune_freed(free_before, &marks);
+        let freed = self.heap.take_free();
+        self.prune_freed(&freed[free_before..], &marks);
+        self.heap.restore_free(freed);
+        let ready = self.heap.take_young();
+        self.prune_freed(&ready, &marks);
+        self.heap.restore_young(ready);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
         // all-true again: exactly the next minor's base. Stash it for reuse.
+        // A ready object's slot goes back to true too: the next minor finds
+        // it in the young log, as it finds every young slot.
         for &i in &self.heap.free_indices()[free_before..] {
+            marks[i as usize] = true;
+        }
+        for &i in self.heap.young_log() {
             marks[i as usize] = true;
         }
         self.heap.stash_nonyoung_marks(marks);
@@ -1338,7 +1343,7 @@ impl Vm<'_> {
         );
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
-        self.heap.note_minor_done(n - free_after);
+        self.heap.note_minor_done(n - free_after - recycled);
         // Every queued job's Values were roots of this collection and are
         // old now (survivors are promoted).
         self.microtasks_old = self.microtasks.len();
@@ -1395,11 +1400,7 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
-    fn prune_freed(&mut self, free_before: usize, live_bits: &[bool]) {
-        // `sweep_young` is the only operation between `free_before`'s capture
-        // and this call. It only appends to the free list, so this suffix is
-        // stable and contains each slot reclaimed by this minor exactly once.
-        let freed = &self.heap.free_indices()[free_before..];
+    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
         if freed.is_empty() {
             return;
         }
@@ -2531,7 +2532,7 @@ mod gcstats {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_GCSTATS").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_GCSTATS").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -2693,7 +2694,7 @@ mod gcstats {
 mod shape_verify {
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -2701,7 +2702,7 @@ mod shape_verify {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -2717,7 +2718,7 @@ mod shape_verify {
 mod nursery_verify {
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    static ON: AtomicU8 = AtomicU8::new(2);
+    static ON: crate::EnvSwitchCell = crate::EnvSwitchCell::new(2);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -2725,7 +2726,7 @@ mod nursery_verify {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var_os("ZIPP_NURSERY_VERIFY").is_some() as u8;
+                let v = crate::env_var_os("ZIPP_NURSERY_VERIFY").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }
@@ -2738,21 +2739,11 @@ pub use gcstats::dump_budget as gc_young_budget_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;
 
-/// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
-/// (minor-only refill, the B194-landed behavior) — the single-binary A/B
-/// for the B196a major-refill widening. Latched on first use.
-#[cfg(not(feature = "safe-sandbox"))]
-#[inline]
-fn major_refill_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_MAJOR").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
+    /// (minor-only refill, the B194-landed behavior) — the single-binary A/B
+    /// for the B196a major-refill widening. Latched on first use.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn major_refill_enabled() = "ZIPP_NO_OBJ_POOL_MAJOR"
 }

@@ -683,6 +683,44 @@ pub(crate) fn strict_eq(heap: &Heap, a: Value, b: Value) -> bool {
     false
 }
 
+/// The first position in `items` (the last, when `rev`) whose element is
+/// `=== target`, a hole matching nothing: `indexOf` / `lastIndexOf` over a
+/// dense store. Split by the kind of `target` so each element costs what its
+/// comparison needs: a number compares by value against numbers only (an
+/// Int target equals an Int element only by its bits), a string or BigInt
+/// keeps `strict_eq`, and anything else (object, symbol, boolean, null,
+/// undefined) is equal only to its own bits. `strict_eq` per element, a call
+/// with its tag tests, scanned at a third of V8's rate.
+pub(crate) fn strict_eq_position(heap: &Heap, items: &[Value], target: Value, rev: bool) -> Option<usize> {
+    #[inline(always)]
+    fn find(items: &[Value], rev: bool, f: impl Fn(Value) -> bool) -> Option<usize> {
+        if rev {
+            items.iter().rposition(|&v| f(v))
+        } else {
+            items.iter().position(|&v| f(v))
+        }
+    }
+    let t = target.bits();
+    if target.is_int() {
+        let tf = target.as_f64();
+        return find(items, rev, |v| v.bits() == t || (v.is_double() && v.as_f64() == tf));
+    }
+    if target.is_double() {
+        let tf = target.as_f64();
+        if tf.is_nan() {
+            return None;
+        }
+        return find(items, rev, |v| v.is_number() && v.as_f64() == tf);
+    }
+    let by_value = target.is_heap()
+        && (heap.is_str_like(target.heap_index())
+            || matches!(heap.get(target.heap_index()), HeapObj::BigInt(_) | HeapObj::BigIntBig(_)));
+    if !by_value {
+        return find(items, rev, |v| v.bits() == t);
+    }
+    find(items, rev, |v| !v.is_hole() && strict_eq(heap, v, target))
+}
+
 /// JS `SameValueZero` (the Map/Set key equality) — `Vm::same_value_zero`
 /// delegates here.
 pub(crate) fn svz_eq(heap: &Heap, a: Value, b: Value) -> bool {

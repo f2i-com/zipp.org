@@ -196,18 +196,18 @@ pub(crate) fn analyze_int_guards_strict(
         }
         match analyze_run(proto, s, e, seeded, dv) {
             None => {
-                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
                     eprintln!("[absint] [{s},{e}] analyze_run=None (unsupported op or no convergence)");
                 }
                 strict_globs.clear();
                 return FxHashSet::default();
             }
             Some((states, elide)) => {
-                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                if crate::env_var_os("ZIPP_ABSINT_LOG").is_some() {
                     let mut c: Vec<u32> = cands.iter().copied().collect();
                     c.sort_unstable();
                     eprintln!("[absint] [{s},{e}] cands={c:?} elided={}", elide.len());
-                    if let Some(g) = std::env::var("ZIPP_ABSINT_GLOB").ok().and_then(|v| v.parse::<u32>().ok()) {
+                    if let Some(g) = crate::env_var("ZIPP_ABSINT_GLOB").ok().and_then(|v| v.parse::<u32>().ok()) {
                         for (off, i) in proto.code[s..=e].iter().enumerate() {
                             let ip = s + off;
                             match states[off].as_ref() {
@@ -450,17 +450,27 @@ fn analyze_run(
                 out.regs.insert(dst, iv);
                 out.alias.remove(&dst);
             }
-            // A pinned int element read defines an i32; a pinned store defines
-            // nothing. Unpinned index ops stay outside the subset.
+            // A pinned int element read defines its element type's range (a
+            // dense int array's an i32); a pinned store defines nothing.
+            // Unpinned index ops stay outside the subset.
             Instr::GetIndex { dst, .. } if dv.is_some() => {
+                use crate::codegen::region_int::{int_ta_load_kind, IntTaLoadKind as K};
                 let ta = dv.unwrap();
-                match ta.access.get(&ip).map(|&j| ta.pins[j as usize].kind) {
-                    Some(k) if k == 5 || k == ARR_INT_PIN_KIND => {
-                        out.regs.insert(dst, IV_I32);
-                        out.alias.remove(&dst);
-                    }
-                    _ => return None,
-                }
+                let iv = match ta.access.get(&ip).map(|&j| ta.pins[j as usize].kind) {
+                    Some(k) if k == ARR_INT_PIN_KIND => IV_I32,
+                    Some(k) => match int_ta_load_kind(k) {
+                        Some(K::I8) => (-128, 127),
+                        Some(K::U8) => (0, 255),
+                        Some(K::I16) => (-32768, 32767),
+                        Some(K::U16) => (0, 65535),
+                        Some(K::I32) => IV_I32,
+                        Some(K::U32) => (0, (1i64 << 32) - 1),
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                out.regs.insert(dst, iv);
+                out.alias.remove(&dst);
             }
             Instr::SetIndex { .. } if dv.is_some() => {
                 if dv.unwrap().access.get(&ip).is_none() {

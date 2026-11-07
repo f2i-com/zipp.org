@@ -64,21 +64,11 @@ const ORD_COLUMNS_MAX: usize = 6;
 /// How deep a tuple key `Vm::py_ord_sort_columns` sorts by columns nests.
 const ORD_COLUMNS_DEPTH: usize = 4;
 
-/// Whether a native sort may compare its keys by columns
-/// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
-/// (the same-binary A/B). Read once per process.
-fn py_sort_columns_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("ZIPP_NO_PY_SORT_COLUMNS").is_none();
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
+env_off_switch! {
+    /// Whether a native sort may compare its keys by columns
+    /// (`Vm::py_ord_sort_columns`). On unless `ZIPP_NO_PY_SORT_COLUMNS` is set
+    /// (the same-binary A/B). Read once per process.
+    fn py_sort_columns_enabled() = "ZIPP_NO_PY_SORT_COLUMNS"
 }
 
 /// One operand, classified.
@@ -1223,7 +1213,7 @@ impl<'p> Vm<'p> {
             || self.array_js_len.contains_key(&idx)
             || self.proto_of.contains_key(&idx)
             || self.array_proto_has_index
-            || !self.array_method_is_intrinsic("pop")
+            || !self.array_pop_is_intrinsic()
         {
             return None;
         }
@@ -2028,7 +2018,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(idx) {
             HeapObj::BigInt(n) => Some(OrdKey::Int(BigVal::Small(*n))),
-            HeapObj::BigIntBig(b) => Some(OrdKey::Int(BigVal::Big((**b).clone()))),
+            HeapObj::BigIntBig(b) => Some(OrdKey::Int(BigVal::Big(num_bigint::BigInt::clone(b)))),
             HeapObj::Array(items) if depth < 16 => {
                 let items = items.clone();
                 let mut out = Vec::with_capacity(items.len());
