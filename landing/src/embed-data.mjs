@@ -8,7 +8,7 @@
 // The release named here is the one the embed section links to; package.json's
 // zippEngineRelease must match it (tests/embed.test.mjs).
 
-export const EMBED_RELEASE = '0.0.32'
+export const EMBED_RELEASE = '0.0.33'
 export const REPOSITORY_URL = 'https://github.com/f2i-com/zipp.org'
 export const RELEASE_TAG_URL = `${REPOSITORY_URL}/releases/tag/v${EMBED_RELEASE}`
 export const releaseAssetUrl = (name) => `${REPOSITORY_URL}/releases/download/v${EMBED_RELEASE}/${name}`
@@ -27,12 +27,12 @@ export const STARTER = {
   path: `/embed/zipp-starter-${EMBED_RELEASE}.zip`,
 }
 
-// Release asset sizes in bytes, from the v0.0.32 release: each plain module and
+// Release asset sizes in bytes, from the v0.0.33 release: each plain module and
 // its Brotli-compressed `.wasm.br` copy.
 const asset = (variant, bytes, brBytes) => ({ file: `zipp-${EMBED_RELEASE}-${variant}.wasm`, bytes, brBytes })
 
-export const PYTHON_BASE = asset('javascript-python-base', 7_343_820, 1_793_772)
-export const TORCH_PACKAGE = asset('torch-package', 2_163_109, 403_239)
+export const PYTHON_BASE = asset('javascript-python-base', 6_579_140, 1_644_825)
+export const TORCH_PACKAGE = asset('torch-package', 2_163_109, 403_378)
 
 export const ENGINES = [
   {
@@ -40,21 +40,21 @@ export const ENGINES = [
     label: 'JavaScript',
     summary: 'The full JavaScript engine, with Intl and Temporal.',
     language: 'javascript',
-    ...asset('javascript', 5_612_037, 1_405_104),
+    ...asset('javascript', 4_854_369, 1_253_579),
   },
   {
     id: 'lite',
     label: 'JavaScript Lite',
     summary: 'JavaScript without Intl and Temporal, built for size.',
     language: 'javascript',
-    ...asset('javascript-lite', 3_446_021, 899_764),
+    ...asset('javascript-lite', 2_832_203, 778_621),
   },
   {
     id: 'javascript-python',
     label: 'JavaScript + Python',
     summary: 'Both languages, with torch built in.',
     language: 'python',
-    ...asset('javascript-python', 9_380_719, 2_170_760),
+    ...asset('javascript-python', 8_616_452, 2_020_183),
   },
 ]
 

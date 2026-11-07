@@ -132,6 +132,39 @@ release product with the canonical benchmark product; it is not the effect of
 profile guidance alone, which would take a feature- and flag-matched pair to
 measure.
 
+### Release 0.0.33, as published
+
+The 0.0.33 release notes measure the 0.0.33 Windows binary from the release
+build's dry run (the release's engine source, the same profile-guided recipe)
+against the published 0.0.32, Bellard's QuickJS 2026-06-04, QuickJS-NG 0.18.0
+and Node 24.19.0 on 7 November 2026: an otherwise idle Ryzen 9 9950X3D,
+address-space randomization off, each run pinned to one core, the code cache
+off, medians of 7 runs with every engine interleaved. This is a release
+comparison taken with scratch scripts, not a stamped capture like the ones
+above. Ratios are 0.0.33 / the other engine; every engine that finishes a
+bundle prints the same output as ZIPP.
+
+| Bundled application, cache off (7 runs) | / 0.0.32 | / Bellard's QuickJS | / QuickJS-NG | / Node 24 | interpreted / `node --jitless` |
+|---|---:|---:|---:|---:|---:|
+| Babel | 0.96× | 0.78× | 0.57× | 3.80× | 1.75× |
+| TypeScript | 0.97× | 0.81× | 0.63× | Node fails | Node fails |
+| Prettier | 0.98× | 0.89× | 0.67× | 1.11× | 1.52× |
+| marked, lodash, acorn, terser, three.js, immer, RxJS, date-fns | 0.88× | 0.30× | 0.29× | 1.66× | 1.61× |
+| Vue server rendering | 0.98× | 0.86× | 0.70× | 1.00× | 1.04× |
+| Preact server rendering | 1.02× | 0.84× | 0.60× | 0.98× | 0.92× |
+| React server rendering | 1.00× | QuickJS fails | QuickJS-NG fails | 0.94× | 0.93× |
+
+QuickJS fails React server rendering for want of `TextEncoder`. A program of
+256 or more functions runs interpreted even with the JIT on (every bundle here
+but Preact's), so the bundles' JIT and interpreter figures are close. Over 90
+benchmark programs (5 runs each, outputs identical to 0.0.32's in both lanes)
+0.0.33 takes 0.664× 0.0.32's time with the JIT and 0.609× Node 24's, ahead of
+Node on 72 of the 89 programs Node runs (0.0.32: 53). Interpreted, with no
+native code at all (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`), it takes 0.872× 0.0.32's
+time, 0.948× `node --jitless`'s (ahead on 54 of 89), 0.649× Bellard's
+QuickJS's (faster on 79 of 89) and 0.464× QuickJS-NG's (faster on 87 of 88).
+The full tables are in [docs/releases/0.0.33.md](releases/0.0.33.md#performance).
+
 ### Release 0.0.31, as published
 
 The 0.0.31 release notes measure the published 0.0.31 and 0.0.30 Windows
