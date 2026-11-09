@@ -10,7 +10,7 @@ rustc-hash = { workspace = true }
 # XID_Start / XID_Continue, the same tables the RustPython-compatible lexer used.
 unicode-ident = "=1.0.27"
 # Emoji_Presentation: a lone emoji is an identifier (RustPython's extension, kept).
-unicode-properties = { version = "=0.1.4", default-features = false, features = ["emoji"] }
+unicode-properties = { version = "=0.1.5", default-features = false, features = ["emoji"] }
 # The arena the emitter's tree (`tree`) is laid out in.
 bumpalo = "3.20"
 # Float literal values: the engine's decimal parser, so that a module with the
