@@ -52,7 +52,8 @@
 //! any call (`LOOP_FRAMES`).
 //!
 //! Only the interpreter-only dispatch loop enters it (`LITE`), at a
-//! back-edge of a loop that has run a while.
+//! back-edge of a loop that has run a while, and only on x86-64, where
+//! every hand-off is checked to be a jump (`Vm::loop_warm`).
 
 use super::dispatch::number_int32;
 use super::*;
@@ -274,8 +275,88 @@ unsafe fn back(mut cx: Cx, n: *const Op) -> Step {
 #[inline(always)]
 fn out(cx: Cx) -> Step {
     Step {
-        next: cx.op as usize | 1,
+        next: cx.op as usize | LEAVE,
         fuel: cx.fuel,
+    }
+}
+
+/// Bits of the position a handler answers (positions are eight-aligned):
+/// leave at it, for the dispatch loop; and with that, the handler's work
+/// raised an error (`LoopTier::thrown`), which the dispatch loop returns.
+const LEAVE: usize = 1;
+const THREW: usize = 2;
+/// With `LEAVE`: the handlers stopped for the dispatch loop's sake (a
+/// collection is due at its next safe point, or program code changed what
+/// the entry was told), not at an instruction they do not run: no strike.
+const PAUSE: usize = 4;
+
+/// A `heavy!` body's answer when its work raised `e`.
+#[cold]
+#[inline(never)]
+unsafe fn raise(cx: Cx, e: Thrown) -> Done {
+    cx.vm().lite.loops.thrown = Some(e);
+    Done {
+        next: cx.op as usize | LEAVE | THREW,
+        vm: cx.vm,
+    }
+}
+
+/// After a `heavy!` body's call of an operation that may run program code
+/// (a native with a callback, a getter, a conversion): the frame's
+/// registers where they are now (a nested run may have moved the register
+/// file; the runner's other state a nested entry puts back itself), and
+/// whether the handlers may go on, which they may not once that code has
+/// changed how a global is reached (`Vm::loop_globals_plain`, asked at the
+/// entry).
+#[inline(always)]
+unsafe fn settle(cx: Cx) -> (Cx, bool) {
+    let vm = cx.vm();
+    let base = vm.frames[vm.frames.len() - 1].base;
+    let regs = vm.regs.as_mut_ptr().add(base) as *mut u64;
+    vm.lite.loops.regs = regs as usize;
+    (Cx { regs, ..cx }, vm.loop_globals_plain() && !vm.heap.gc_requested())
+}
+
+/// The answer of a `heavy!` body whose work is done: on at `n`, or (`on`
+/// false) leave there with no strike.
+#[inline(always)]
+fn then(cx: Cx, n: *const Op, on: bool) -> Done {
+    Done {
+        next: n as usize | if on { 0 } else { LEAVE | PAUSE },
+        vm: cx.vm,
+    }
+}
+
+/// A `heavy!` body's answer after work that allocated and ran no code: on
+/// at `n`, or leave there for the collection that is now due, which the
+/// dispatch loop runs at its next safe point (the handlers' own is every
+/// few thousand back-edges, `FUEL`).
+#[inline(always)]
+unsafe fn after_alloc(cx: Cx, n: *const Op) -> Done {
+    then(cx, n, !cx.vm().heap.gc_requested())
+}
+
+/// A `heavy!` body's answer after such an operation: on at the next
+/// position, or leave there (`settle`); its error, when it raised one.
+#[inline(always)]
+unsafe fn finish_unit(cx: Cx, r: Result<(), Thrown>) -> Done {
+    let (cx, on) = settle(cx);
+    match r {
+        Ok(()) => then(cx, cx.after(1), on),
+        Err(e) => raise(cx, e),
+    }
+}
+
+/// [`finish_unit`] for an operation with a result, which goes to `c`.
+#[inline(always)]
+unsafe fn finish(cx: Cx, r: Result<Value, Thrown>) -> Done {
+    let (cx, on) = settle(cx);
+    match r {
+        Ok(v) => {
+            cx.put(cx.c(), v.bits());
+            then(cx, cx.after(1), on)
+        }
+        Err(e) => raise(cx, e),
     }
 }
 
@@ -333,7 +414,7 @@ macro_rules! heavy {
             #[allow(unused_variables)]
             let $go = |c: Cx, n: *const Op| Done { next: n as usize, vm: c.vm };
             #[allow(unused_variables)]
-            let $out = |c: Cx| Done { next: c.op as usize | 1, vm: c.vm };
+            let $out = |c: Cx| Done { next: c.op as usize | LEAVE, vm: c.vm };
             $code
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -343,7 +424,7 @@ macro_rules! heavy {
             #[allow(unused_variables)]
             let $go = |c: Cx, n: *const Op| Done { next: n as usize, vm: c.vm };
             #[allow(unused_variables)]
-            let $out = |c: Cx| Done { next: c.op as usize | 1, vm: c.vm };
+            let $out = |c: Cx| Done { next: c.op as usize | LEAVE, vm: c.vm };
             $code
         }
         h!(
@@ -354,7 +435,7 @@ macro_rules! heavy {
                 let done = $body(cx.vm, cx.regs, cx.op);
                 let loops = &(*(done.vm as *mut Vm)).lite.loops;
                 let fuel = loops.fuel;
-                if done.next & 1 != 0 {
+                if done.next & LEAVE != 0 {
                     return Step { next: done.next, fuel };
                 }
                 let cx = Cx { vm: done.vm, regs: loops.regs as *mut u64, op: done.next as *const Op, fuel };
@@ -400,11 +481,11 @@ h!(
 /// Int32s whose result fits and two doubles are the handler's; a result
 /// that does not fit and a mixed pair are `$slow`'s.
 macro_rules! arith {
-    ($name:ident, $slow:ident, $checked:ident, $fop:tt, $int_ok:expr) => {
+    ($name:ident, $slow:ident, $other:ident, $checked:ident, $fop:tt, $int_ok:expr) => {
         slow!($slow, |cx| {
             let (vx, vy) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
             if !(vx.is_number() && vy.is_number()) {
-                return out(cx);
+                return again!(cx, $other);
             }
             cx.put(cx.c(), Value::num(vx.as_f64() $fop vy.as_f64()).bits());
             go(cx, cx.after(1))
@@ -428,10 +509,59 @@ macro_rules! arith {
         });
     };
 }
-arith!(h_add, s_add, checked_add, +, |_, _, _| true);
-arith!(h_sub, s_sub, checked_sub, -, |_, _, _| true);
+arith!(h_add, s_add, h_add_any, checked_add, +, |_, _, _| true);
+arith!(h_sub, s_sub, h_out, checked_sub, -, |_, _, _| true);
 // A zero product with a negative operand is -0, a double: the arm's.
-arith!(h_mul, s_mul, checked_mul, *, |x, y, v| v != 0 || (x | y) >= 0);
+arith!(h_mul, s_mul, h_out, checked_mul, *, |x, y, v| v != 0 || (x | y) >= 0);
+
+heavy!(
+    /// `Add` on operands that are not two Numbers: the general `+` (a
+    /// string's concatenation, an object's conversion, BigInts).
+    h_add_any,
+    b_add_any,
+    |cx, go, out| {
+        let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        finish(cx, cx.vm().add_values(x, y))
+    }
+);
+
+heavy!(
+    /// `StrConcatChain`: `c = a + b`, a link of a concatenation chain whose
+    /// accumulator may grow in place, as the dispatch arm makes it.
+    h_str_chain,
+    b_str_chain,
+    |cx, go, out| {
+        let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        finish(cx, cx.vm().add_values_chain(x, y))
+    }
+);
+
+heavy!(
+    /// `StrAppendInPlace`: `c = a + b` where `a` is the statement's own
+    /// accumulator (`s += x`), as the dispatch arm makes it: the append in
+    /// place, or the general `+` when `b` needs a conversion.
+    h_str_append,
+    b_str_append,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        let r = match vm.str_append_inplace(x, y) {
+            Some(r) => Ok(r),
+            None => vm.add_values(x, y),
+        };
+        finish(cx, r)
+    }
+);
+
+heavy!(
+    /// `ToStr`: `c = ToString(a)`, a template literal's substitution.
+    h_to_str,
+    b_to_str,
+    |cx, go, out| {
+        let x = Value::from_bits(cx.get(cx.a()));
+        finish(cx, cx.vm().to_str_value(x))
+    }
+);
 
 slow!(s_div, |cx| {
     let (vx, vy) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
@@ -1216,55 +1346,56 @@ h!(
 // ── elements, properties, calls that are leaves ──
 
 heavy!(
-    /// `GetIndex`: `c = a[b]`, the dispatch arm's two leaves: a numeric
-    /// typed array's element and a dense array's present one.
+    /// `GetIndex`: `c = a[b]`, as the dispatch arm reads it: a numeric
+    /// typed array's element and a dense array's present one, its two
+    /// leaves, else the general read.
     h_get_index,
     b_get_index,
     |cx, go, out| {
         let vm = cx.vm();
         let (o, k) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
-        if !o.is_heap() {
-            return out(cx);
-        }
-        let idx = o.heap_index();
-        let r = match vm.heap.get(idx) {
-            HeapObj::TypedArray {
-                buffer,
-                kind,
-                byte_offset,
-                length,
-            } => {
-                if native::TA_KINDS[*kind as usize].2 {
-                    return out(cx);
-                }
-                let Some(i) = array_index(k) else { return out(cx) };
-                let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                    idx,
-                    *buffer,
-                    *kind,
-                    *byte_offset,
-                    *length,
-                );
-                match vm.ta_interp_numeric_get_view(view, i) {
-                    Some(r) => r,
-                    None => return out(cx),
-                }
+        let leaf = if !o.is_heap() {
+            None
+        } else {
+            let idx = o.heap_index();
+            match vm.heap.get(idx) {
+                HeapObj::TypedArray {
+                    buffer,
+                    kind,
+                    byte_offset,
+                    length,
+                } if !native::TA_KINDS[*kind as usize].2 => match array_index(k) {
+                    Some(i) => {
+                        let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                            idx,
+                            *buffer,
+                            *kind,
+                            *byte_offset,
+                            *length,
+                        );
+                        vm.ta_interp_numeric_get_view(view, i)
+                    }
+                    None => None,
+                },
+                HeapObj::Array(_) => vm.interp_dense_int_get(o, k),
+                _ => None,
             }
-            HeapObj::Array(_) => match vm.interp_dense_int_get(o, k) {
-                Some(r) => r,
-                None => return out(cx),
-            },
-            _ => return out(cx),
         };
-        cx.put(cx.c(), r.bits());
-        go(cx, cx.after(1))
+        match leaf {
+            Some(r) => {
+                cx.put(cx.c(), r.bits());
+                go(cx, cx.after(1))
+            }
+            None => finish(cx, vm.get_index(o, k)),
+        }
     }
 );
 
 heavy!(
-    /// `SetIndex`: `a[b] = c`, the dispatch arm's numeric typed-array store,
-    /// and the general store's first step for an array: a present element
-    /// of one with nothing in a side table, overwritten in place.
+    /// `SetIndex`: `a[b] = c`, as the dispatch arm stores it: a numeric
+    /// typed array's element, its leaf, and the general store, whose first
+    /// step for an array is here too (a present element of one with nothing
+    /// in a side table, overwritten in place).
     h_set_index,
     b_set_index,
     |cx, go, out| {
@@ -1274,78 +1405,108 @@ heavy!(
             Value::from_bits(cx.get(cx.b())),
             Value::from_bits(cx.get(cx.c())),
         );
-        if !o.is_heap() {
-            return out(cx);
-        }
-        let idx = o.heap_index();
-        match vm.heap.get(idx) {
-            HeapObj::TypedArray {
-                buffer,
-                kind,
-                byte_offset,
-                length,
-            } => {
-                if !v.is_number()
-                    || native::TA_KINDS[*kind as usize].2
-                    || (!vm.immutable_buffers.is_empty() && vm.immutable_buffers.contains(buffer))
-                {
-                    return out(cx);
+        let mut stored = false;
+        if o.is_heap() {
+            let idx = o.heap_index();
+            match vm.heap.get(idx) {
+                HeapObj::TypedArray {
+                    buffer,
+                    kind,
+                    byte_offset,
+                    length,
+                } => {
+                    if v.is_number()
+                        && !native::TA_KINDS[*kind as usize].2
+                        && (vm.immutable_buffers.is_empty() || !vm.immutable_buffers.contains(buffer))
+                    {
+                        if let Some(i) = array_index(k) {
+                            let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                                idx,
+                                *buffer,
+                                *kind,
+                                *byte_offset,
+                                *length,
+                            );
+                            stored = vm.ta_interp_numeric_set_view(view, i, v);
+                        }
+                    }
                 }
-                let Some(i) = array_index(k) else { return out(cx) };
-                let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
-                    idx,
-                    *buffer,
-                    *kind,
-                    *byte_offset,
-                    *length,
-                );
-                if !vm.ta_interp_numeric_set_view(view, i, v) {
-                    return out(cx);
+                HeapObj::Array(_) => {
+                    if let Some(i) = array_index(k) {
+                        if (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&idx))
+                            && (vm.arguments_objs.is_empty() || !vm.arguments_objs.contains_key(&idx))
+                        {
+                            // The store's barrier, as `set_index` raises it first.
+                            vm.store_barrier_v(crate::heap::gcoracle::SET_INDEX, o, v);
+                            stored = vm.heap.array_overwrite_present(idx, i, v);
+                        }
+                    }
                 }
+                _ => {}
             }
-            HeapObj::Array(_) => {
-                let Some(i) = array_index(k) else { return out(cx) };
-                if (!vm.arr_props.is_empty() && vm.arr_props.contains_key(&idx))
-                    || (!vm.arguments_objs.is_empty() && vm.arguments_objs.contains_key(&idx))
-                {
-                    return out(cx);
-                }
-                // The store's barrier, as `set_index` raises it first.
-                vm.store_barrier_v(crate::heap::gcoracle::SET_INDEX, o, v);
-                if !vm.heap.array_overwrite_present(idx, i, v) {
-                    return out(cx);
-                }
-            }
-            _ => return out(cx),
         }
-        go(cx, cx.after(1))
+        if stored {
+            return go(cx, cx.after(1));
+        }
+        let strict = vm.func(vm.lite.loops.func as usize).is_strict;
+        finish_unit(cx, vm.set_index(o, k, v, strict))
     }
 );
 
 heavy!(
-    /// `GetProp`: `c = a.<name>` by the site cache's own-data hit, then its
-    /// inherited-data hit (`d` the function, `k` the name's constant).
+    /// `GetProp`: `c = a.<name>` by the site's ways as the dispatch arm asks
+    /// them (`ic_get_prop_way0`: every layout the site has seen, own or
+    /// inherited data, an accessor), then the arm's other steps that run no
+    /// code (`Vm::loop_get_prop`). A getter is called as the arm calls it: a
+    /// leaf run
+    /// without a frame, any other in a frame the runner pushes (`d` the
+    /// function, `k` the name's constant).
     h_get_prop,
     b_get_prop,
     |cx, go, out| {
         let vm = cx.vm();
         let o = Value::from_bits(cx.get(cx.a()));
-        let ip = cx.ip();
-        let v = match vm.ic_get_prop_own_hit(cx.d(), ip, o) {
-            Some(v) => v,
-            None => {
+        let (ip, name) = (cx.ip(), cx.k() as u32);
+        // The site's ways first, as the dispatch arm asks them: every
+        // layout the site has seen, an accessor's way among them.
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        let first = vm.ic_get_prop_way0(cx.d(), ip, o, name);
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+        let first = match vm.ic_get_prop_own_hit(cx.d(), ip, o) {
+            Some(v) => GetAct::Value(v),
+            None => GetAct::None,
+        };
+        let act = match first {
+            GetAct::None => {
                 if !o.is_heap() {
                     return out(cx);
                 }
-                let key: &str = vm.func(cx.d() as usize).string_constants[cx.k() as usize].as_str();
-                match vm.ic_get_prop_proto_hit(cx.d(), ip, o, key) {
-                    Some(v) => {
-                        vm.ic_proto_hit_settle(o);
-                        v
+                vm.loop_get_prop(cx.d(), ip, o, name)
+            }
+            act => act,
+        };
+        let v = match act {
+            GetAct::Value(v) => v,
+            GetAct::Accessor { fid, closure, getter } => {
+                // An object receiver needs no boxing, even for a sloppy
+                // getter.
+                let this_is_object = vm.is_object_value(o);
+                let base = cx.frame_base();
+                match vm.leaf_call(fid, closure, o, this_is_object, base, 0, 0) {
+                    Some(v) => v,
+                    None => {
+                        if !this_is_object {
+                            return out(cx);
+                        }
+                        let desc = vm.lean_call_desc(fid);
+                        return match vm.loop_enter(fid, closure, desc, Some(o), base, 0, 0, cx.c() as u16, ip + 1, getter) {
+                            Some(first) => go(cx, first),
+                            None => out(cx),
+                        };
                     }
-                    None => return out(cx),
                 }
             }
+            GetAct::None => return out(cx),
         };
         cx.put(cx.c(), v.bits());
         go(cx, cx.after(1))
@@ -1353,10 +1514,14 @@ heavy!(
 );
 
 heavy!(
-    /// `SetProp`: `a.<name> = b` by the site cache's own-data hit, then an
-    /// ordinary object's other cached writes (an append), which leave
-    /// nothing written when they do not finish (`d` the function, `k` the
-    /// name's constant).
+    /// `SetProp`: `a.<name> = b` by the dispatch arm's steps (a private
+    /// name is never asked here: `decode`). The site's ways
+    /// (`ic_set_prop_way0`: an own slot in any layout the site has seen, an
+    /// append, a setter); a Proxy's trap; a class's or a function's own
+    /// data property; the
+    /// cache's other writes (an append), or the setter it names, called in
+    /// a frame the runner pushes; then the general store. `c` the site's
+    /// strictness, `d` the function, `k` the name's constant.
     h_set_prop,
     b_set_prop,
     |cx, go, out| {
@@ -1368,17 +1533,59 @@ heavy!(
         if o.is_heap() && o.heap_index() == vm.global_this {
             return out(cx);
         }
+        // The site's ways first, as the dispatch arm asks them: an own
+        // slot of any layout the site has seen, an append, a setter.
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        match vm.ic_set_prop_way0(cx.d(), ip, o, v, cx.k() as u32) {
+            SetAct::Done => return go(cx, cx.after(1)),
+            SetAct::Setter { fid, closure, setter } => {
+                // A shaped receiver is an object: no boxing.
+                let desc = vm.lean_call_desc(fid);
+                let (base, val) = (cx.frame_base(), cx.b() as u16);
+                return match vm.loop_enter(fid, closure, desc, Some(o), base, val, 1, super::ic::RET_DISCARD, ip + 1, setter) {
+                    Some(first) => go(cx, first),
+                    None => out(cx),
+                };
+            }
+            SetAct::None => {}
+        }
+        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
         if vm.ic_set_prop_own_hit(cx.d(), ip, o, v) {
             return go(cx, cx.after(1));
         }
-        if !o.is_heap() || !matches!(vm.heap.get(o.heap_index()), HeapObj::Object(_)) {
-            return out(cx);
-        }
         let key: &str = vm.func(cx.d() as usize).string_constants[cx.k() as usize].as_str();
-        if matches!(vm.ic_set_prop(cx.d(), ip, o, key, v), SetAct::Done) {
-            return go(cx, cx.after(1));
+        let strict = vm.func(cx.d() as usize).is_strict || cx.c() != 0;
+        if o.is_heap() {
+            // 0 an ordinary object, 1 a Proxy, 2 anything else.
+            let kind = match vm.heap.get(o.heap_index()) {
+                HeapObj::Object(_) => 0,
+                HeapObj::Proxy { .. } => 1,
+                _ => 2,
+            };
+            if kind == 1 {
+                return finish_unit(cx, vm.set_prop_proxy(o, key, v, strict).map(|_| ()));
+            }
+            if kind == 2 && (vm.class_static_data_write(o, key, v) || vm.fn_own_data_write(o, key, v)) {
+                return go(cx, cx.after(1));
+            }
         }
-        out(cx)
+        match vm.ic_set_prop(cx.d(), ip, o, key, v) {
+            SetAct::Done => go(cx, cx.after(1)),
+            SetAct::Setter { fid, closure, setter } => {
+                // The lean push, as for a getter: an object receiver needs
+                // no boxing. The value is the setter's one argument.
+                if !vm.is_object_value(o) {
+                    return out(cx);
+                }
+                let desc = vm.lean_call_desc(fid);
+                let (base, val) = (cx.frame_base(), cx.b() as u16);
+                match vm.loop_enter(fid, closure, desc, Some(o), base, val, 1, super::ic::RET_DISCARD, ip + 1, setter) {
+                    Some(first) => go(cx, first),
+                    None => out(cx),
+                }
+            }
+            SetAct::None => finish_unit(cx, vm.set_prop(o, key, v, strict).map(|_| ())),
+        }
     }
 );
 
@@ -1551,56 +1758,83 @@ const METHOD_CHAR_CODE_AT: u64 = 2;
 const METHOD_POP: u64 = 3;
 
 heavy!(
-    /// `CallMethod`: `c = a.<name>(args)` by the lite loop's steps. An
-    /// ordinary object's or class instance's method the method cache names:
+    /// `CallMethod`: `c = a.<name>(args)` by the dispatch arm's steps. An
+    /// ordinary object's or class instance's method, by the lite loop's
+    /// entry for the site, then the method cache's ways and the cache
+    /// (`Vm::loop_method_other`):
     /// a leaf run without a frame (`Vm::leaf_call`), any other in a frame
-    /// the runner pushes and goes on in (`Vm::loop_enter`). `push` with one
-    /// argument and `pop` with none on an array; `charCodeAt` with one on a
-    /// flat string (`b` the first argument's register, `d` the function,
-    /// `k` which name).
+    /// the runner pushes and goes on in (`Vm::loop_enter`); an own native
+    /// method. `push` with one argument and `pop` with none on an array;
+    /// `charCodeAt` with one on a flat string; any other builtin's method on
+    /// a string, an array, a Map or Set or a number
+    /// (`Vm::loop_method_builtin`). `b` the first argument's register, `d`
+    /// the function, `k` which name.
     h_call_method,
     b_call_method,
     |cx, go, out| {
         let vm = cx.vm();
         let recv = Value::from_bits(cx.get(cx.a()));
-        if !recv.is_heap() {
-            return out(cx);
-        }
-        let v = match vm.heap.get(recv.heap_index()) {
-            HeapObj::Object(_) => {
-                let ip = cx.ip();
-                let at = &*(vm.lite.loops.code as *const Instr).add(ip);
-                let Instr::CallMethod { name, argc, .. } = *at else { return out(cx) };
-                let Some((fid, closure, callee, desc)) = vm.lite_method(at, cx.d(), ip, recv, name) else {
-                    return out(cx);
-                };
-                let (base, arg_base) = (cx.frame_base(), cx.b() as u16);
-                match vm.leaf_call(fid, closure, recv, true, base, arg_base, argc) {
-                    Some(v) => Some(v),
-                    None => {
-                        let dst = cx.c() as u16;
-                        return match vm.loop_enter(fid, closure, desc, Some(recv), base, arg_base, argc, dst, ip + 1, callee) {
-                            Some(first) => go(cx, first),
+        let ip = cx.ip();
+        let at = &*(vm.lite.loops.code as *const Instr).add(ip);
+        let Instr::CallMethod { name, argc, .. } = *at else { return out(cx) };
+        let (base, arg_base) = (cx.frame_base(), cx.b() as u16);
+        let v = if !recv.is_heap() {
+            None
+        } else {
+            match vm.heap.get(recv.heap_index()) {
+                HeapObj::Object(_) => {
+                    // The lite loop's entry (the one layout a site
+                    // usually has), then every other layout the site has
+                    // seen (`Vm::loop_method_other`).
+                    let hit = match vm.lite_method_entry(at, cx.d(), ip, recv) {
+                        Some(hit) => Some(hit),
+                        None => vm.loop_method_other(at, cx.d(), ip, recv, name),
+                    };
+                    let Some((fid, closure, callee, desc)) = hit else {
+                        // An own native method (`Reflect.get(t, k)`).
+                        let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                        return match vm.ic_call_native(cx.d(), ip, recv, key) {
+                            Some(id) => {
+                                let r = vm.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, recv, argv));
+                                finish(cx, r)
+                            }
                             None => out(cx),
                         };
+                    };
+                    match vm.leaf_call(fid, closure, recv, true, base, arg_base, argc) {
+                        Some(v) => Some(v),
+                        None => {
+                            let dst = cx.c() as u16;
+                            return match vm.loop_enter(fid, closure, desc, Some(recv), base, arg_base, argc, dst, ip + 1, callee) {
+                                Some(first) => go(cx, first),
+                                None => out(cx),
+                            };
+                        }
                     }
                 }
+                HeapObj::Array(_) if cx.k() == METHOD_PUSH => {
+                    vm.interp_array_push_fast(recv, Value::from_bits(cx.get(cx.b())))
+                }
+                HeapObj::Array(_) if cx.k() == METHOD_POP => vm.interp_array_pop_fast(recv),
+                HeapObj::Str(_) if cx.k() == METHOD_CHAR_CODE_AT => {
+                    vm.interp_char_code_at_fast(recv, Value::from_bits(cx.get(cx.b())))
+                }
+                _ => None,
             }
-            HeapObj::Array(_) if cx.k() == METHOD_PUSH => {
-                vm.interp_array_push_fast(recv, Value::from_bits(cx.get(cx.b())))
-            }
-            HeapObj::Array(_) if cx.k() == METHOD_POP => vm.interp_array_pop_fast(recv),
-            HeapObj::Str(_) if cx.k() == METHOD_CHAR_CODE_AT => {
-                vm.interp_char_code_at_fast(recv, Value::from_bits(cx.get(cx.b())))
-            }
-            _ => None,
         };
         match v {
             Some(v) => {
                 cx.put(cx.c(), v.bits());
                 go(cx, cx.after(1))
             }
-            None => out(cx),
+            None => match vm.loop_method_builtin(cx.d(), ip, recv, name, base, arg_base, argc) {
+                Ok(None) => {
+                    let (cx, _) = settle(cx);
+                    out(cx)
+                }
+                Ok(Some(v)) => finish(cx, Ok(v)),
+                Err(e) => finish(cx, Err(e)),
+            },
         }
     }
 );
@@ -1671,22 +1905,40 @@ heavy!(
 
 heavy!(
     /// `CallWithThis`: `c = a.call(b, args)` in a member call's spec order,
-    /// when the callee is a plain function and `this` an ordinary object or
-    /// class instance: a leaf run without a frame, any other in a frame the
-    /// runner pushes (`d` the first argument's register, `k` the count).
+    /// by the dispatch arm's steps. A plain function whose `this` needs no
+    /// boxing (a strict callee, or an object): a leaf run without a frame,
+    /// any other in a frame the runner pushes. A native callee
+    /// (`s.charCodeAt(g)`, `map.get(g)`): `Vm::loop_call_this_native`. `d`
+    /// the first argument's register, `k` the count under the site's name.
     h_call_this,
     b_call_this,
     |cx, go, out| {
         let vm = cx.vm();
         let (callee, this_val) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
-        let Some((fid, closure)) = vm.ic_plain_fn(callee) else { return out(cx) };
-        if !this_val.is_heap() || !matches!(vm.heap.get(this_val.heap_index()), HeapObj::Object(_)) {
-            return out(cx);
-        }
         let (base, arg_base, argc) = (cx.frame_base(), cx.d() as u16, cx.k() as u16);
-        if let Some(v) = vm.leaf_call(fid, closure, this_val, true, base, arg_base, argc) {
+        let Some((fid, closure)) = vm.ic_plain_fn(callee) else {
+            let name = (cx.k() >> 32) as u32;
+            // The two leaves first: nothing of theirs runs code.
+            if let Some(v) = vm.captured_leaf_call(this_val, callee, base, arg_base, argc) {
+                cx.put(cx.c(), v.bits());
+                return go(cx, cx.after(1));
+            }
+            return match vm.loop_call_this_native(vm.lite.loops.func, name, callee, this_val, base, arg_base, argc) {
+                Ok(None) => {
+                    let (cx, _) = settle(cx);
+                    out(cx)
+                }
+                Ok(Some(v)) => finish(cx, Ok(v)),
+                Err(e) => finish(cx, Err(e)),
+            };
+        };
+        let this_ok = vm.func(fid as usize).is_strict || vm.is_object_value(this_val);
+        if let Some(v) = vm.leaf_call(fid, closure, this_val, this_ok, base, arg_base, argc) {
             cx.put(cx.c(), v.bits());
             return go(cx, cx.after(1));
+        }
+        if !this_ok {
+            return out(cx);
         }
         let desc = vm.lean_call_desc(fid);
         match vm.loop_enter(fid, closure, desc, Some(this_val), base, arg_base, argc, cx.c() as u16, cx.ip() + 1, callee) {
@@ -1784,11 +2036,11 @@ heavy!(
 );
 
 heavy!(
-    /// `IterNext` over an array the iteration reads directly (the dispatch
-    /// arm's first case): the element at the cursor `b` of the array `a`
-    /// into `c` with `d` false, or `d` true past the last. A hole, an array
-    /// with a virtual length or side-table elements, and every other
-    /// iterator are the dispatch arm's.
+    /// `IterNext`, as the dispatch arm steps it. Over an array the
+    /// iteration reads directly (its first case): the element at the cursor
+    /// `b` of the array `a` into `c` with `d` false, or `d` true past the
+    /// last. A generator the arm runs as a frame of its own loop is the
+    /// arm's; every other iterator takes the arm's general step.
     h_iter_next,
     b_iter_next,
     |cx, go, out| {
@@ -1798,22 +2050,325 @@ heavy!(
             return out(cx);
         }
         let idx = it.heap_index();
-        if (!vm.array_js_len.is_empty() && vm.array_js_len.contains_key(&idx)) || vm.array_elements_overlaid(idx) {
+        if (vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&idx)) && !vm.array_elements_overlaid(idx) {
+            let cur = array_index(Value::from_bits(cx.get(cx.b()))).unwrap_or(0);
+            if let HeapObj::Array(items) = vm.heap.get(idx) {
+                match items.get(cur) {
+                    Some(v) if !v.is_hole() => {
+                        let v = *v;
+                        cx.put(cx.c(), v.bits());
+                        cx.put(cx.d(), Value::bool(false).bits());
+                        cx.put(cx.b(), Value::int((cur + 1) as i32).bits());
+                        return go(cx, cx.after(1));
+                    }
+                    Some(_) => {}
+                    None => {
+                        cx.put(cx.d(), Value::bool(true).bits());
+                        return go(cx, cx.after(1));
+                    }
+                }
+            }
+        }
+        let Instr::IterNext { next, .. } = *(vm.lite.loops.code as *const Instr).add(cx.ip()) else {
+            return out(cx);
+        };
+        let base = cx.frame_base();
+        if vm.iter_generator_direct(base, it, next) {
             return out(cx);
         }
-        let cur = array_index(Value::from_bits(cx.get(cx.b()))).unwrap_or(0);
-        let HeapObj::Array(items) = vm.heap.get(idx) else { return out(cx) };
-        match items.get(cur) {
-            Some(v) if !v.is_hole() => {
-                let v = *v;
-                cx.put(cx.c(), v.bits());
-                cx.put(cx.d(), Value::bool(false).bits());
-                cx.put(cx.b(), Value::int((cur + 1) as i32).bits());
-            }
-            Some(_) => return out(cx),
-            None => cx.put(cx.d(), Value::bool(true).bits()),
+        let r = vm.iter_next_step(base, it, cx.c() as u16, cx.d() as u16, cx.b() as u16, next);
+        finish_unit(cx, r)
+    }
+);
+
+heavy!(
+    /// `NewArray`: `c` = an array of the `d` registers from `a`.
+    h_new_array,
+    b_new_array,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (first, n) = (cx.a(), cx.d());
+        let mut items = vm.heap.take_arr_buf(n as usize);
+        for i in 0..n {
+            items.push(Value::from_bits(cx.get(first + i)));
+        }
+        let v = Value::heap(vm.heap.alloc(HeapObj::Array(items)));
+        // ArrayCreate uses the current realm's %Array.prototype%.
+        vm.realm_born(v.heap_index(), vm.arr_proto);
+        cx.put(cx.c(), v.bits());
+        after_alloc(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `NewObject`: `c` = an empty object with room for `k` properties.
+    h_new_object,
+    b_new_object,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let v = Value::heap(vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(cx.k() as usize)))));
+        vm.realm_born(v.heap_index(), vm.obj_proto);
+        cx.put(cx.c(), v.bits());
+        after_alloc(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `FinalizeObject`: `c` = the object literal of the site's key plan
+    /// (`k`) over the `b` values from `a`, as the dispatch arm builds it; a
+    /// plan it would refuse is its to refuse (`d` the function).
+    h_finalize_object,
+    b_finalize_object,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (val_base, count, plan_idx) = (cx.a(), cx.b() as usize, cx.k() as u16);
+        let Some(plan) = vm.func(cx.d() as usize).static_key_plans.get(plan_idx as usize) else {
+            return out(cx);
+        };
+        if !plan.runtime_valid()
+            || plan.len() > crate::bytecode::FINALIZE_STAGE_SLOTS
+            || plan.is_empty()
+            || plan.len() != count
+            || val_base as usize + count > u16::MAX as usize
+        {
+            return out(cx);
+        }
+        let shape = vm.finalize_shape(cx.d(), plan_idx, plan);
+        let mut buf = [Value::UNDEFINED; crate::bytecode::FINALIZE_STAGE_SLOTS];
+        for (i, slot) in buf[..count].iter_mut().enumerate() {
+            *slot = Value::from_bits(cx.get(val_base + i as u32));
+        }
+        let v = Value::heap(vm.alloc_finalized_site(plan, &buf[..count], shape));
+        vm.realm_born(v.heap_index(), vm.obj_proto);
+        cx.put(cx.c(), v.bits());
+        after_alloc(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `MakeClosure` and `MakeArrow`: `c` = a closure of function `d` over
+    /// the frame's cells (`k` set: an arrow, its `this` in `a`).
+    h_make_closure,
+    b_make_closure,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let this_reg = (cx.k() != 0).then_some(cx.a() as u16);
+        let v = vm.make_closure_in_frame(vm.frames.len() - 1, cx.frame_base(), cx.d(), this_reg);
+        cx.put(cx.c(), v.bits());
+        after_alloc(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `MakeCell`: register `c` = a cell holding what it held; `MakeCellTdz`
+    /// (`k` set): a cell in its dead zone.
+    h_make_cell,
+    b_make_cell,
+    |cx, go, out| {
+        let init = if cx.k() != 0 {
+            Value::UNINITIALIZED
+        } else {
+            Value::from_bits(cx.get(cx.c()))
+        };
+        let cell = cx.vm().heap.alloc_cell(init);
+        cx.put(cx.c(), Value::heap(cell).bits());
+        after_alloc(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `PushHandler` and `PushFinally`: the frame's handler stack takes the
+    /// instruction's `catch` or `finally`.
+    h_push_handler,
+    b_push_handler,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let handler = match *(vm.lite.loops.code as *const Instr).add(cx.ip()) {
+            Instr::PushHandler { catch_target, catch_reg } => crate::heap::Handler::Catch {
+                target: catch_target,
+                reg: catch_reg,
+            },
+            Instr::PushFinally { target, kind_reg, val_reg } => crate::heap::Handler::Finally {
+                target,
+                kind_reg,
+                val_reg,
+            },
+            _ => return out(cx),
+        };
+        let top = vm.frames.len() - 1;
+        // A recycled buffer for the frame's first push.
+        if vm.frames[top].handlers.capacity() == 0 {
+            vm.frames[top].handlers = super::handler_pool::take(&mut vm.handler_pool);
+        }
+        vm.frames[top].handlers.push(handler);
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `PopHandler`, `PopFinally` and `FusePopHandlerJump`: the frame's
+    /// handler stack gives its last back, and on at `d`.
+    h_pop_handler,
+    b_pop_handler,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let top = vm.frames.len() - 1;
+        vm.frames[top].handlers.pop();
+        go(cx, cx.target())
+    }
+);
+
+h!(
+    /// `EndFinally` after a `finally` entered in the ordinary course (its
+    /// kind register `a` holds 0): on. Any other completion is the dispatch
+    /// arm's to resume.
+    h_end_finally,
+    |cx| {
+        let kind = cx.get(cx.a());
+        if !is_int(kind) || kind as u32 & 3 != 0 {
+            return out(cx);
         }
         go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `FuseTypeOfJump`: `c = (typeof a is the type k names)`, negated as
+    /// `k` says, then a branch on it to `d`, or on two positions.
+    h_typeof_jump,
+    b_typeof_jump,
+    |cx, go, out| {
+        let k = cx.k();
+        let m = (cx.vm().type_code(Value::from_bits(cx.get(cx.a()))) == k as u8) != (k >> 8 & 1 != 0);
+        cx.put(cx.c(), Value::bool(m).bits());
+        if m == (k >> 9 & 1 != 0) {
+            go(cx, cx.target())
+        } else {
+            go(cx, cx.after(2))
+        }
+    }
+);
+
+slow!(s_null_jump, |cx| {
+    // A heap value loosely equals `null` only as `document.all` does.
+    let v = Value::from_bits(cx.get(cx.a()));
+    let k = cx.k();
+    let r = cx.vm().is_htmldda_index(v.heap_index()) != (k & 1 != 0);
+    cx.put(cx.c(), Value::bool(r).bits());
+    if r == (k & 2 != 0) {
+        go(cx, cx.target())
+    } else {
+        go(cx, cx.after(3))
+    }
+});
+
+h!(
+    /// `FuseNullJump`: `b = null; c = (a == null)`, negated as `k` says,
+    /// then a branch on it to `d`, or on three positions.
+    h_null_jump,
+    |cx| {
+        cx.put(cx.b(), Value::NULL.bits());
+        let v = Value::from_bits(cx.get(cx.a()));
+        if v.is_heap() {
+            return again!(cx, s_null_jump);
+        }
+        let k = cx.k();
+        let r = v.is_nullish() != (k & 1 != 0);
+        cx.put(cx.c(), Value::bool(r).bits());
+        if r == (k & 2 != 0) {
+            go(cx, cx.target())
+        } else {
+            go(cx, cx.after(3))
+        }
+    }
+);
+
+heavy!(
+    /// `LooseEq` and `LooseNe` on operands that are not two Int32s: `null`
+    /// and `undefined` by `loose_eq_nullish`, else the general comparison.
+    h_loose_eq_any,
+    b_loose_eq_any,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
+        let ne = cx.k() != 0;
+        match vm.loose_eq_nullish(x, y) {
+            Some(r) => {
+                cx.put(cx.c(), Value::bool(r != ne).bits());
+                go(cx, cx.after(1))
+            }
+            None => finish(cx, vm.loose_eq(x, y).map(|r| Value::bool(r != ne))),
+        }
+    }
+);
+
+h!(
+    /// `LooseEq` (`k` 0) and `LooseNe` (`k` 1): `c = (a == b)` on two
+    /// Int32s, as `Eq` decides them.
+    h_loose_eq,
+    |cx| {
+        let (x, y) = (cx.get(cx.a()), cx.get(cx.b()));
+        if !ints(x, y) {
+            return again!(cx, h_loose_eq_any);
+        }
+        cx.put(cx.c(), Value::bool((x == y) != (cx.k() != 0)).bits());
+        go(cx, cx.after(1))
+    }
+);
+
+heavy!(
+    /// `StrAppendIndex`: `dst = a + obj[key]`, as the dispatch arm makes it
+    /// (its registers are the instruction's).
+    h_str_append_index,
+    b_str_append_index,
+    |cx, go, out| {
+        let vm = cx.vm();
+        let Instr::StrAppendIndex {
+            dst,
+            a,
+            obj,
+            key,
+            scratch,
+        } = *(vm.lite.loops.code as *const Instr).add(cx.ip())
+        else {
+            return out(cx);
+        };
+        let base = cx.frame_base();
+        let (av, ov, kv) = (vm.get(base, a), vm.get(base, obj), vm.get(base, key));
+        let r = match vm.str_append_index_ascii_fast(av, ov, kv) {
+            Some(r) => Ok(r),
+            // The element's read may run code and move the register file:
+            // the registers by their indices from here.
+            None => match vm.get_index(ov, kv) {
+                Ok(bv) => {
+                    vm.set(base, scratch, bv);
+                    let (av, bv) = (vm.get(base, a), vm.get(base, scratch));
+                    match vm.str_append_inplace(av, bv) {
+                        Some(r) => Ok(r),
+                        None => vm.add_values(av, bv),
+                    }
+                }
+                Err(e) => Err(e),
+            },
+        };
+        let (cx, on) = settle(cx);
+        match r {
+            Ok(v) => {
+                cx.put(dst as u32, v.bits());
+                then(cx, cx.after(1), on)
+            }
+            Err(e) => raise(cx, e),
+        }
+    }
+);
+
+heavy!(
+    /// `GetIterator`: `c` = the iterator of `a`.
+    h_get_iterator,
+    b_get_iterator,
+    |cx, go, out| {
+        let v = Value::from_bits(cx.get(cx.a()));
+        finish(cx, cx.vm().get_iterator(v))
     }
 );
 
@@ -1955,7 +2510,9 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         // A private name's read or write is the dispatch arm's (brand
         // checks): it fills no way of the cache these two ask.
         Instr::GetProp { dst, obj, name } if !private(name) => op(h_get_prop, obj, 0, dst, func_id, name as u64),
-        Instr::SetProp { obj, val, name, .. } if !private(name) => op(h_set_prop, obj, val, 0, func_id, name as u64),
+        Instr::SetProp { obj, val, name, strict } if !private(name) => {
+            op(h_set_prop, obj, val, strict as u16, func_id, name as u64)
+        }
         Instr::GetPropDv { dst, obj, slot, .. } => op(h_get_prop_dv, obj, 0, dst, func_id, slot as u64),
         Instr::CallMethodDv {
             dst,
@@ -2003,8 +2560,8 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
             this_v,
             arg_base,
             argc,
-            ..
-        } => op(h_call_this, callee, this_v, dst, arg_base as u32, argc as u64),
+            name,
+        } => op(h_call_this, callee, this_v, dst, arg_base as u32, argc as u64 | (name as u64) << 32),
         Instr::FuseAddReturn { dst, a, b, src } => op(h_add_return, a, b, dst, src as u32, 0),
         Instr::Return { src } => op(h_return, src, 0, 0, 0, 0),
         Instr::ReturnUndefined => op(h_return_undefined, 0, 0, 0, 0, 0),
@@ -2020,6 +2577,42 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
             idx,
             ..
         } => op(h_iter_next, iter, idx, value_dst, done_dst as u32, 0),
+        Instr::NewArray { dst, arg_base, argc } => op(h_new_array, arg_base, 0, dst, argc as u32, 0),
+        Instr::NewObject { dst, hint } => op(h_new_object, 0, 0, dst, 0, hint as u64),
+        Instr::FinalizeObject {
+            dst,
+            plan,
+            val_base,
+            count,
+        } => op(h_finalize_object, val_base, count, dst, func_id, plan as u64),
+        Instr::MakeClosure { dst, func_id: f } => op(h_make_closure, 0, 0, dst, f, 0),
+        Instr::MakeArrow {
+            dst,
+            func_id: f,
+            this_reg,
+        } => op(h_make_closure, this_reg, 0, dst, f, 1),
+        Instr::MakeCell { reg } => op(h_make_cell, 0, 0, reg, 0, 0),
+        Instr::MakeCellTdz { reg } => op(h_make_cell, 0, 0, reg, 0, 1),
+        Instr::PushHandler { .. } | Instr::PushFinally { .. } => op(h_push_handler, 0, 0, 0, 0, 0),
+        Instr::PopHandler | Instr::PopFinally => op(h_pop_handler, 0, 0, 0, at(ip as u32 + 1), 0),
+        Instr::FusePopHandlerJump { target } if fits(target) && target as usize > ip => {
+            op(h_pop_handler, 0, 0, 0, at(target), 0)
+        }
+        Instr::EndFinally { kind_reg, .. } => op(h_end_finally, kind_reg, 0, 0, 0, 0),
+        Instr::FuseTypeOfJump { dst, a, code: c, neg, when, target } if fits(target) && target as usize > ip => {
+            op(h_typeof_jump, a, 0, dst, at(target), c as u64 | (neg as u64) << 8 | (when as u64) << 9)
+        }
+        Instr::FuseNullJump { ldst, a, dst, ne, when, target } if fits(target) && target as usize > ip => {
+            op(h_null_jump, a, ldst, dst, at(target), ne as u64 | (when as u64) << 1)
+        }
+        Instr::LooseEq { dst, a, b } => op(h_loose_eq, a, b, dst, 0, 0),
+        Instr::LooseNe { dst, a, b } => op(h_loose_eq, a, b, dst, 0, 1),
+        Instr::StrConcat { dst, a, b } => op(h_add_any, a, b, dst, 0, 0),
+        Instr::StrConcatChain { dst, a, b } => op(h_str_chain, a, b, dst, 0, 0),
+        Instr::StrAppendInPlace { dst, a, b } => op(h_str_append, a, b, dst, 0, 0),
+        Instr::ToStr { dst, a } => op(h_to_str, a, 0, dst, 0, 0),
+        Instr::StrAppendIndex { .. } => op(h_str_append_index, 0, 0, 0, 0, 0),
+        Instr::GetIterator { dst, src } => op(h_get_iterator, src, 0, dst, 0, 0),
         _ => leave,
     }
 }
@@ -2030,27 +2623,51 @@ struct LoopFn {
     /// replaced: `engine::lazy_install`).
     code: usize,
     ops: Box<[Op]>,
-    /// Per position: the entries at it (a loop's head) that left before a
-    /// back-edge, `MAX_STRIKES` of which leave that loop to the dispatch
-    /// loop.
+    /// Per position: the strikes of the entries at it (a loop's head),
+    /// `MAX_STRIKES` of which leave that loop to the dispatch loop.
     strikes: Box<[u8]>,
+    /// The function's loop heads (the distinct targets of its backward
+    /// jumps, sorted), and how many of them the runner has given back:
+    /// when that is all of them the function's back-edges stop asking
+    /// (`ST_DEAD`). `open`: a loop was given back at a head not among
+    /// them, so the count proves nothing.
+    heads: Box<[u32]>,
+    gone: u32,
+    open: bool,
 }
 
 /// Back-edges a function's loops take in the dispatch loop before the
-/// runner is asked.
-const WARM_BACK_EDGES: u16 = 32;
-/// Entries at one loop's head that leave before a back-edge after which
-/// that loop stays in the dispatch loop: an instruction with no handler on
-/// every iteration's path (a call) makes each entry a round trip that costs
-/// more than the handlers before it saved.
-const MAX_STRIKES: u8 = 32;
+/// runner is asked. Building a function's positions costs about what a few
+/// hundred handled instructions save, and most loops of a large program
+/// never run that long: at 32 the two shorter bundles paid one to two
+/// percent for positions they barely used.
+const WARM_BACK_EDGES: u16 = 256;
+/// The strikes at one loop's head after which that loop stays in the
+/// dispatch loop. An entry is a round trip of a few hundred instructions,
+/// which the handlers of an iteration or two do not save: an entry that
+/// left before a back-edge (an instruction with no handler on every
+/// iteration's path) is two strikes, one that took a single back-edge (a
+/// loop that runs twice and returns) is one, and one that took eight or
+/// more takes a strike off. An entry that left in a frame the handlers
+/// pushed is dearer (the dispatch loop takes over a callee, and returns
+/// through frames it did not enter) and its iterations, being calls, saved
+/// less: under eight back-edges it is a strike, and only sixteen or more
+/// take one off. A request loop whose every fourth request built a string
+/// in a handler function, at an instruction the handlers did not run, ran
+/// 17% slower entered than not and was never given back.
+const MAX_STRIKES: u8 = 64;
+
+/// A given-back loop's strikes, once it is counted in `LoopFn::gone`.
+const GONE: u8 = u8::MAX;
 
 const ST_COLD: u8 = 0;
 const ST_READY: u8 = 1;
 const ST_DEAD: u8 = 2;
 
-/// Entries of the table of loops the runner gave back (`LoopTier::dead`).
-const DEAD_SLOTS: usize = 64;
+/// Entries of the table of loops the runner gave back (`LoopTier::dead`). A
+/// large program has hundreds of them, and one a collision pushes out pays
+/// a call at its every back-edge until it is put back.
+const DEAD_SLOTS: usize = 4096;
 
 /// The runner's per-VM tables.
 pub(crate) struct LoopTier {
@@ -2062,7 +2679,9 @@ pub(crate) struct LoopTier {
     /// Loops the runner gave back, as `dead_key`s, each in the slot its key
     /// names: a back-edge of one costs the dispatch arm a load and a
     /// compare. A loop a collision pushed out is found again by its strikes.
-    dead: [u64; DEAD_SLOTS],
+    /// Empty until the first loop is given back (`DEAD_SLOTS` words then):
+    /// a VM that never runs a loop that long carries no table.
+    dead: Vec<u64>,
     /// The dispatched code of the function the runner is in (`h_math` and
     /// `h_switch` read their instruction's fields from it).
     code: usize,
@@ -2089,6 +2708,9 @@ pub(crate) struct LoopTier {
     floor: usize,
     /// Frames the runner pushed, over all entries.
     pushes: u64,
+    /// The error a handler's work raised (`THREW`), until the dispatch loop
+    /// takes it (`Vm::loop_thrown`).
+    thrown: Option<Thrown>,
 }
 
 impl Default for LoopTier {
@@ -2097,7 +2719,7 @@ impl Default for LoopTier {
             state: Vec::new(),
             warm: Vec::new(),
             fns: Vec::new(),
-            dead: [u64::MAX; DEAD_SLOTS],
+            dead: Vec::new(),
             code: 0,
             ops: 0,
             regs: 0,
@@ -2109,6 +2731,7 @@ impl Default for LoopTier {
             entries: 0,
             floor: 0,
             pushes: 0,
+            thrown: None,
         }
     }
 }
@@ -2122,7 +2745,9 @@ fn dead_key(func_id: u32, head: usize) -> u64 {
 /// The slot of [`LoopTier::dead`] a key names.
 #[inline(always)]
 fn dead_slot(key: u64) -> usize {
-    (key ^ key >> 29) as usize & (DEAD_SLOTS - 1)
+    // The function's id spread over the table, the head beside it.
+    let (func, head) = ((key >> 32) as u32, key as u32);
+    ((func.wrapping_mul(0x9E37_79B1) >> 20) ^ head) as usize & (DEAD_SLOTS - 1)
 }
 
 env_off_switch! {
@@ -2141,6 +2766,11 @@ env_off_switch! {
 /// position it stored in that frame: the dispatch loop goes on from the top
 /// frame, as after any call.
 pub(crate) const LOOP_FRAMES: usize = usize::MAX;
+
+/// What `Vm::loop_back_edge` answers when a handler's work raised an error:
+/// the dispatch loop returns it (`Vm::loop_thrown`), as it returns one an
+/// arm of its own raised. Every answer from here up is one of these two.
+pub(crate) const LOOP_THROWN: usize = usize::MAX - 1;
 
 /// Whether the environment variable `name` is set, asked once (`cell`).
 fn env_latch(cell: &std::sync::atomic::AtomicU8, name: &str) -> bool {
@@ -2180,7 +2810,7 @@ impl<'p> Vm<'p> {
         match self.lite.loops.state.get(func_id as usize) {
             Some(&ST_READY) => {
                 let key = dead_key(func_id, head);
-                if self.lite.loops.dead[dead_slot(key)] == key {
+                if self.lite.loops.dead.get(dead_slot(key)) == Some(&key) {
                     head
                 } else {
                     self.loop_run(func_id, base, head, code)
@@ -2201,7 +2831,12 @@ impl<'p> Vm<'p> {
             t.state.resize(i + 1, ST_COLD);
             t.warm.resize(i + 1, 0);
         }
-        if !loop_runner_enabled() {
+        // On x86-64 every handler's hand-off is checked to be a jump (the
+        // unit test below, and the handlers' machine code). Elsewhere a
+        // hand-off that is a call would nest the native stack through a
+        // recursion that takes no back-edge, so the runner stays off there
+        // until the same is checked.
+        if !loop_runner_enabled() || !cfg!(target_arch = "x86_64") {
             t.state[i] = ST_DEAD;
             return head;
         }
@@ -2240,21 +2875,205 @@ impl<'p> Vm<'p> {
             self.lite.loops.fns.resize_with(i + 1, || None);
         }
         // The function's code changed: none of its loops is given back.
-        for k in self.lite.loops.dead.iter_mut() {
-            if (*k >> 32) as u32 == func_id {
-                *k = u64::MAX;
+        if self.lite.loops.fns[i].is_some() {
+            for k in self.lite.loops.dead.iter_mut() {
+                if (*k >> 32) as u32 == func_id {
+                    *k = u64::MAX;
+                }
             }
         }
         let f = self.func(i);
         let nglobals = self.globals.len();
         let ops: Box<[Op]> = (0..code.len()).map(|ip| decode(f, code, ip, func_id, nglobals)).collect();
         let at = ops.as_ptr();
+        // Its loop heads: the distinct targets of its backward jumps.
+        let mut heads: Vec<u32> = code
+            .iter()
+            .enumerate()
+            .filter_map(|(ip, ins)| super::lite::jump_target(ins).filter(|&t| t as usize <= ip))
+            .collect();
+        heads.sort_unstable();
+        heads.dedup();
         self.lite.loops.fns[i] = Some(Box::new(LoopFn {
             code: code.as_ptr() as usize,
             ops,
             strikes: vec![0; code.len()].into_boxed_slice(),
+            heads: heads.into_boxed_slice(),
+            gone: 0,
+            open: false,
         }));
         at
+    }
+
+    /// `CallMethod` on an ordinary object or class instance past the lite
+    /// loop's entry: the method cache's ways by the receiver's mirror, as
+    /// the dispatch arm asks them (every layout the site has seen), then
+    /// the cache, which fills both. Out of line: a site one layout reaches
+    /// never gets here, and inline these steps grew the handler's body
+    /// under it.
+    #[inline(never)]
+    fn loop_method_other(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+        if let Some((fid, closure, callee)) = self.ic_call_method_mirror(func_id, ip, recv) {
+            return Some((fid, closure, callee, self.lean_call_desc(fid)));
+        }
+        self.lite_method(at, func_id, ip, recv, name)
+    }
+
+    /// `GetProp` of a heap receiver past the site's ways: the dispatch
+    /// arm's steps that run no code and raise nothing, in its
+    /// order (a private name is never asked here: `decode`). The cache's
+    /// inherited-data hit; a receiver with no shape by its kind (a class's
+    /// static, a function's own property, a prototype intrinsic), a
+    /// constructor's own data property, a method of `Array.prototype` or
+    /// `String.prototype` itself; then the cache. `GetAct::None`: the arm's
+    /// (a Proxy's trap, the member walk).
+    #[inline(never)]
+    fn loop_get_prop(&mut self, func_id: u32, ip: usize, o: Value, name: u32) -> GetAct {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+            self.ic_proto_hit_settle(o);
+            return GetAct::Value(v);
+        }
+        let idx = o.heap_index();
+        let (object, ctor, proxy) = match self.heap.get(idx) {
+            HeapObj::Object(m) => (true, m.is_ctor, false),
+            HeapObj::Proxy { .. } => (false, false, true),
+            _ => (false, false, false),
+        };
+        if proxy {
+            return GetAct::None;
+        }
+        if !object {
+            if let Some(v) = self.shapeless_read(o, key) {
+                return GetAct::Value(v);
+            }
+        } else if ctor {
+            if let Some(v) = self.ctor_own_data_read(o, key) {
+                return GetAct::Value(v);
+            }
+        } else if self.arr_proto != 0
+            && (idx == self.arr_proto || idx == self.str_proto)
+            && self.realm_global_objs.is_empty()
+            && self.active_realm.is_none()
+        {
+            if let Some(bits) = self.proto_intrinsic_bits(key, idx == self.arr_proto) {
+                return GetAct::Value(Value::from_bits(bits));
+            }
+        }
+        self.ic_get_prop(func_id, ip, o, key)
+    }
+
+    /// `CallWithThis` of a native callee, as the dispatch arm runs one with
+    /// no other realm in existence, in its order: a Map's or Set's method on
+    /// a receiver of its kind; the captured-intrinsic lanes; the native
+    /// itself. `None`, with nothing done, for anything else (`f.call`,
+    /// `f.apply`, a callee that is not a native, another realm): the arm's.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn loop_call_this_native(
+        &mut self,
+        func_id: u32,
+        name: u32,
+        callee: Value,
+        this_val: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if !callee.is_heap() || !self.realm_global_objs.is_empty() || !self.realm_fns.is_empty() {
+            return Ok(None);
+        }
+        let HeapObj::Native(id) = *self.heap.get(callee.heap_index()) else {
+            return Ok(None);
+        };
+        if id == native::FN_CALL || id == native::FN_APPLY {
+            return Ok(None);
+        }
+        if this_val.is_heap() {
+            let kind_ok = match native::proto_method(id) {
+                Some((_, 3, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Set(_)),
+                Some((_, 4, _)) => matches!(self.heap.get(this_val.heap_index()), HeapObj::Map { .. }),
+                _ => false,
+            };
+            if kind_ok {
+                return self
+                    .with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, this_val, argv))
+                    .map(Some);
+            }
+        }
+        if name != crate::bytecode::NO_NAME {
+            if let Some(v) = self.captured_intrinsic_lane(func_id, base, this_val, callee, name, arg_base, argc)? {
+                return Ok(Some(v));
+            }
+        }
+        self.with_argv(base, arg_base, argc, |vm, argv| vm.call_native(id, this_val, argv))
+            .map(Some)
+    }
+
+    /// `CallMethod` on a receiver that is not an ordinary object, past the
+    /// handler's own leaves: the dispatch arm's steps for a primitive
+    /// string, an array, a Map, a Set and a number, in its order. The
+    /// string, array and Map lanes; then, as for every receiver, a user's
+    /// method the method cache finds (the arm's frame: `None`) before the
+    /// builtin dispatcher. `None`, with nothing done, for every other
+    /// receiver and for a name none of these serves: the arm's.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn loop_method_builtin(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        name: u32,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        if recv.is_heap() {
+            let idx = recv.heap_index();
+            // 0 a string, 1 an array, 2 a Map or WeakMap, 3 a Set.
+            let kind = match self.heap.get(idx) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => 0,
+                HeapObj::Array(_) => 1,
+                HeapObj::Map { .. } | HeapObj::WeakMap { .. } => 2,
+                HeapObj::Set(_) => 3,
+                _ => return Ok(None),
+            };
+            match kind {
+                0 => {
+                    if argc == 1 && key == "charCodeAt" {
+                        let arg = self.get(base, arg_base);
+                        if let Some(v) = self.interp_char_code_at_fast(recv, arg) {
+                            return Ok(Some(v));
+                        }
+                    }
+                    if let Some(v) = self.interp_string_method_fast(idx, key, base, arg_base, argc)? {
+                        return Ok(Some(v));
+                    }
+                }
+                1 => {
+                    if let Some(v) = self.interp_array_lane(recv, key, base, arg_base, argc) {
+                        return Ok(Some(v));
+                    }
+                }
+                2 if argc == 1 || argc == 2 => {
+                    if let Some(v) = self.interp_map_method_fast(recv, key, base, arg_base, argc)? {
+                        return Ok(Some(v));
+                    }
+                }
+                _ => {}
+            }
+        } else if !recv.is_number() {
+            return Ok(None);
+        }
+        // `f.call`, `f.bind` and `f.apply` are a function receiver's, which
+        // is none of these; a user's method takes the arm's frame.
+        if self.ic_call_method(func_id, ip, recv, key).is_some() {
+            return Ok(None);
+        }
+        self.try_builtin_method(recv, key, base, arg_base, argc)
     }
 
     /// The runner is in the top frame from here on: `func_id`'s, whose
@@ -2293,6 +3112,13 @@ impl<'p> Vm<'p> {
         callee: Value,
     ) -> Option<*const Op> {
         if !loop_frames_enabled() {
+            return None;
+        }
+        // The native stack, as at a back-edge (`back`): a recursion takes
+        // none, and its calls are where a chain whose hand-offs were not
+        // jumps is cut.
+        if stack_ptr() < self.lite.loops.stack_floor {
+            self.lite.loops.stack_trips += 1;
             return None;
         }
         let p: &'p FuncProto = self.func(fid as usize);
@@ -2410,10 +3236,28 @@ impl<'p> Vm<'p> {
         let i = func_id as usize;
         // A loop the runner gave back stays the dispatch loop's: its every
         // back-edge comes here until the table holds it, so this is first.
-        if let Some(Some(f)) = self.lite.loops.fns.get(i) {
+        if let Some(Some(f)) = self.lite.loops.fns.get_mut(i) {
             if f.code == code.as_ptr() as usize && f.strikes[head] >= MAX_STRIKES {
+                // Counted once (the strikes then read `GONE`); with every
+                // loop of the function gone, its back-edges stop asking.
+                let all = if f.strikes[head] != GONE {
+                    f.strikes[head] = GONE;
+                    match f.heads.binary_search(&(head as u32)) {
+                        Ok(_) => f.gone += 1,
+                        Err(_) => f.open = true,
+                    }
+                    !f.open && f.gone as usize >= f.heads.len()
+                } else {
+                    false
+                };
                 let key = dead_key(func_id, head);
+                if self.lite.loops.dead.is_empty() {
+                    self.lite.loops.dead = vec![u64::MAX; DEAD_SLOTS];
+                }
                 self.lite.loops.dead[dead_slot(key)] = key;
+                if all {
+                    self.lite.loops.state[i] = ST_DEAD;
+                }
                 return head;
             }
         }
@@ -2425,7 +3269,14 @@ impl<'p> Vm<'p> {
         let ops = self.loop_fn(func_id, code);
         let floor = self.frames.len();
         let closure = self.frames[floor - 1].closure;
+        // An entry under a handler's call (program code a native ran) puts
+        // back what the handlers of the entry above it go on with.
+        let outer = {
+            let t = &self.lite.loops;
+            (t.code, t.ops, t.regs, t.closure, t.func, t.floor, t.fuel, t.stack_floor)
+        };
         self.loop_frame_is(func_id, closure, code.as_ptr() as usize, ops, base);
+        let trips = self.lite.loops.stack_trips;
         let vm = self as *mut Self as *mut c_void;
         // SAFETY: the frame's window is in the register file, which no
         // handler grows (a call's push is one that fits it); a function's
@@ -2444,8 +3295,8 @@ impl<'p> Vm<'p> {
                 let regs = self.lite.loops.regs as *mut u64;
                 let s = ((*op).h)(vm, regs, op, fuel);
                 iters += fuel - s.fuel;
-                if s.next & 1 != 0 {
-                    break (s.next & !1, iters);
+                if s.next & LEAVE != 0 {
+                    break (s.next, iters);
                 }
                 op = s.next as *const Op;
                 fuel = s.fuel;
@@ -2460,16 +3311,31 @@ impl<'p> Vm<'p> {
             }
         };
         // Where the chain left: a position of the function it is in now.
+        let (threw, paused) = (left & THREW != 0, left & PAUSE != 0);
+        let left = left & !(LEAVE | THREW | PAUSE);
         let ip = (left - self.lite.loops.ops) / std::mem::size_of::<Op>();
         let top = self.frames.len() - 1;
         let moved = top + 1 != floor;
-        if moved {
+        if moved || threw {
             self.frames[top].ip = ip;
         }
-        if iters == 0 {
+        if !threw && !paused {
             if let Some(f) = &mut self.lite.loops.fns[i] {
-                f.strikes[head] += 1;
+                let n = &mut f.strikes[head];
+                // `moved`: the entry left in a frame the handlers pushed.
+                *n = match (iters, moved) {
+                    (0, _) => n.saturating_add(2),
+                    (1, _) | (2..=7, true) => n.saturating_add(1),
+                    (2..=7, false) | (8..=15, true) => *n,
+                    _ => n.saturating_sub(1),
+                };
             }
+        }
+        if loop_runner_trace() && self.lite.loops.stack_trips != trips {
+            eprintln!(
+                "[loop] fn{i}: the handlers grew the native stack {} times: a hand-off was a call, not a jump",
+                self.lite.loops.stack_trips - trips
+            );
         }
         if loop_runner_trace() {
             let (fid, strikes) = (self.lite.loops.func, self.lite.loops.fns[i].as_ref().map_or(0, |f| f.strikes[head]));
@@ -2482,11 +3348,24 @@ impl<'p> Vm<'p> {
                 eprintln!("[loop] fn{i} head {head}: {iters} back-edges, left at {ip} (Some({at:?})), in fn{fid}{what}");
             }
         }
-        if moved {
+        {
+            let t = &mut self.lite.loops;
+            (t.code, t.ops, t.regs, t.closure, t.func, t.floor, t.fuel, t.stack_floor) = outer;
+        }
+        if threw {
+            LOOP_THROWN
+        } else if moved {
             LOOP_FRAMES
         } else {
             ip
         }
+    }
+
+    /// The error behind [`LOOP_THROWN`].
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn loop_thrown(&mut self) -> Thrown {
+        self.lite.loops.thrown.take().unwrap_or_else(|| Thrown(String::new()))
     }
 }
 
@@ -2532,7 +3411,7 @@ console.log([arith(10000), g, typed(10000), arrays(10000), props(10000), strs(10
             vm.output,
             ["134775612,35000,-1537291438,16741666,55000,1014588,271319705,77912,49995000,24265399,5238420"]
         );
-        if loop_runner_enabled() && vm.lite_entry_ok() {
+        if loop_runner_enabled() && vm.lite_entry_ok() && cfg!(target_arch = "x86_64") {
             assert!(vm.lite.loops.entries >= 10, "the runner took the loops: {}", vm.lite.loops.entries);
             if loop_frames_enabled() {
                 assert!(vm.lite.loops.pushes >= 10000, "the runner pushed the calls' frames: {}", vm.lite.loops.pushes);

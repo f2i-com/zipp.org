@@ -206,7 +206,7 @@ const LITE_CALL_STEPS: u64 = 8;
 
 /// The target of `i` when it is a jump the lite loop or the compiler's loops
 /// can take backward.
-fn jump_target(i: &Instr) -> Option<u32> {
+pub(super) fn jump_target(i: &Instr) -> Option<u32> {
     match *i {
         Instr::Jump { target }
         | Instr::JumpIfFalse { target, .. }
@@ -1120,6 +1120,17 @@ impl<'p> Vm<'p> {
     /// native, an accessor).
     #[inline(always)]
     pub(super) fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+        if let Some(hit) = self.lite_method_entry(at, func_id, ip, recv) {
+            return Some(hit);
+        }
+        self.lite_method_miss(lite_method_slot(at), func_id, ip, recv, name)
+    }
+
+    /// [`Self::lite_method`]'s cache alone: the method when the layout the
+    /// site's entry remembers is the receiver's, with nothing filled on a
+    /// miss.
+    #[inline(always)]
+    pub(super) fn lite_method_entry(&self, at: &Instr, func_id: u32, ip: usize, recv: Value) -> Option<(u32, u32, Value, u32)> {
         let slot = lite_method_slot(at);
         let e = &self.lite.methods[slot];
         if e.site_fid == func_id && e.site_ip == ip as u32 {
@@ -1138,7 +1149,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.lite_method_miss(slot, func_id, ip, recv, name)
+        None
     }
 
     /// The `CallMethod` at `at` (`ip` in `func_id`) on an ordinary object
@@ -1498,7 +1509,10 @@ impl<'p> Vm<'p> {
                         steps += LITE_LOOP_STEPS;
                         self.maybe_gc();
                         ip = self.loop_back_edge(func_id, base, t, code);
-                        if ip == super::loop_tier::LOOP_FRAMES {
+                        if ip >= super::loop_tier::LOOP_THROWN {
+                            if ip != super::loop_tier::LOOP_FRAMES {
+                                return Err(self.loop_thrown());
+                            }
                             reframe!();
                         }
                         continue;
@@ -1514,7 +1528,10 @@ impl<'p> Vm<'p> {
                     steps += LITE_LOOP_STEPS;
                     self.maybe_gc();
                     ip = self.loop_back_edge(func_id, base, target as usize, code);
-                    if ip == super::loop_tier::LOOP_FRAMES {
+                    if ip >= super::loop_tier::LOOP_THROWN {
+                        if ip != super::loop_tier::LOOP_FRAMES {
+                            return Err(self.loop_thrown());
+                        }
                         reframe!();
                     }
                 }
@@ -1603,7 +1620,10 @@ impl<'p> Vm<'p> {
                         // A back-edge: the loop runner's entry.
                         steps += LITE_LOOP_STEPS;
                         ip = self.loop_back_edge(func_id, base, next, code);
-                        if ip == super::loop_tier::LOOP_FRAMES {
+                        if ip >= super::loop_tier::LOOP_THROWN {
+                            if ip != super::loop_tier::LOOP_FRAMES {
+                                return Err(self.loop_thrown());
+                            }
                             reframe!();
                         }
                     } else {

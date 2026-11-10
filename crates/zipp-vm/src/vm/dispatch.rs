@@ -1662,8 +1662,11 @@ impl<'p> Vm<'p> {
                         #[cfg(not(feature = "safe-sandbox"))]
                         if LITE {
                             ip = self.loop_back_edge(func_id, base, target as usize, icode);
-                            if ip == super::loop_tier::LOOP_FRAMES {
-                                break;
+                            if ip >= super::loop_tier::LOOP_THROWN {
+                                if ip == super::loop_tier::LOOP_FRAMES {
+                                    break;
+                                }
+                                return Err(self.loop_thrown());
                             }
                             continue;
                         }
@@ -1804,8 +1807,11 @@ impl<'p> Vm<'p> {
                             #[cfg(not(feature = "safe-sandbox"))]
                             if LITE {
                                 ip = self.loop_back_edge(func_id, base, target as usize, icode);
-                                if ip == super::loop_tier::LOOP_FRAMES {
-                                    break;
+                                if ip >= super::loop_tier::LOOP_THROWN {
+                                    if ip == super::loop_tier::LOOP_FRAMES {
+                                        break;
+                                    }
+                                    return Err(self.loop_thrown());
                                 }
                                 continue;
                             }
@@ -3162,8 +3168,11 @@ impl<'p> Vm<'p> {
                         #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                         if LITE && t < ip {
                             ip = self.loop_back_edge(func_id, base, t, icode);
-                            if ip == super::loop_tier::LOOP_FRAMES {
-                                break;
+                            if ip >= super::loop_tier::LOOP_THROWN {
+                                if ip == super::loop_tier::LOOP_FRAMES {
+                                    break;
+                                }
+                                return Err(self.loop_thrown());
                             }
                             continue;
                         }
