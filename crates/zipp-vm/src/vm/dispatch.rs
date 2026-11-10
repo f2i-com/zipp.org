@@ -1658,6 +1658,15 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         self.maybe_gc();
+                        // The loop runner's back-edge (`vm/loop_tier.rs`).
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if LITE {
+                            ip = self.loop_back_edge(func_id, base, target as usize, icode);
+                            if ip == super::loop_tier::LOOP_FRAMES {
+                                break;
+                            }
+                            continue;
+                        }
                         ip = target as usize;
                     }
                     #[cfg(not(feature = "meter-only"))]
@@ -1791,6 +1800,15 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             self.maybe_gc();
+                            // The loop runner's back-edge (`vm/loop_tier.rs`).
+                            #[cfg(not(feature = "safe-sandbox"))]
+                            if LITE {
+                                ip = self.loop_back_edge(func_id, base, target as usize, icode);
+                                if ip == super::loop_tier::LOOP_FRAMES {
+                                    break;
+                                }
+                                continue;
+                            }
                             ip = target as usize;
                         } else {
                             ip = self.global_run(*instr, base, func_id, ip, true)?;
@@ -3139,6 +3157,15 @@ impl<'p> Vm<'p> {
                                 ip = bail as usize;
                                 continue;
                             }
+                        }
+                        // The loop runner's back-edge (`vm/loop_tier.rs`).
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        if LITE && t < ip {
+                            ip = self.loop_back_edge(func_id, base, t, icode);
+                            if ip == super::loop_tier::LOOP_FRAMES {
+                                break;
+                            }
+                            continue;
                         }
                         ip = t;
                     }
@@ -7200,7 +7227,7 @@ impl<'p> Vm<'p> {
     /// its own, a cold line per frame transition; `Vm::entered_code` keeps
     /// only the answers, four to a line.
     #[inline(always)]
-    fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+    pub(super) fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
         match self.entered_code.get(func_id as usize) {
             Some(&Some(code)) => code,
             _ => self.entered_code_fill(func_id, running),
@@ -8685,6 +8712,59 @@ impl<'p> Vm<'p> {
             new_target,
             callee: callee_val,
         });
+    }
+
+    /// The lean push for a caller that cannot raise (the loop runner,
+    /// `vm/loop_tier.rs`): `false`, with nothing changed, for every call
+    /// [`Self::setup_call_lean_desc`], [`Self::setup_call_method_desc`] and
+    /// [`Self::setup_call_arrow`] send to the full setup. `recv`: a method
+    /// call's receiver; `None` for a plain call, whose `this` is the
+    /// callee's own (undefined, its realm's global object, an arrow's
+    /// captured one).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(super) fn lean_push_or_decline(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        recv: Option<Value>,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> bool {
+        let new_base = self.regs.len();
+        if self.frames.len() >= MAX_FRAMES
+            || !self.regs_fit_now(new_base + (desc & 0xFFFF) as usize)
+            || !lean_calls_enabled()
+        {
+            return false;
+        }
+        #[cfg(feature = "python")]
+        if super::prof_py::on() {
+            return false;
+        }
+        let this_val = match recv {
+            Some(recv) if desc & LEAN_DESC_OK != 0 => recv,
+            Some(_) => return false,
+            None if desc & LEAN_DESC_OK != 0 => {
+                if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+                    Value::heap(self.callee_this_global(callee_val))
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            None if desc & LEAN_DESC_ARROW != 0 && closure != NO_CLOSURE => {
+                self.arrow_closure_this(closure, Value::UNDEFINED)
+            }
+            None => return false,
+        };
+        self.lean_desc_push(func_id, closure, desc, this_val, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        true
     }
 
     /// The frame facts [`Self::setup_call_lean_desc`] needs of `func_id`,

@@ -4008,6 +4008,8 @@ mod enum_stream;
 mod error_stack;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+mod loop_tier;
 mod text_codec;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;

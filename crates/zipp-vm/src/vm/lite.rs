@@ -486,6 +486,8 @@ pub(crate) struct LiteState<'p> {
     leaf: Vec<u8>,
     /// Per function id: the declines its leaf runs have had.
     leaf_bails: Vec<u8>,
+    /// The loop runner's tables (`vm/loop_tier.rs`).
+    pub(super) loops: super::loop_tier::LoopTier,
 }
 
 /// Where a leaf run (`lite_leaf_run`) reads its arguments: a caller's
@@ -519,6 +521,7 @@ impl Default for LiteState<'_> {
             leaf_bails: Vec::new(),
             calls: vec![LiteCall::EMPTY; LITE_CALL_SLOTS].into_boxed_slice(),
             methods: vec![LiteMethod::EMPTY; LITE_METHOD_SLOTS].into_boxed_slice(),
+            loops: Default::default(),
         }
     }
 }
@@ -1086,7 +1089,7 @@ impl<'p> Vm<'p> {
     /// cache's answer, else `ic_call`'s (remembered when the lite loop runs
     /// the callee).
     #[inline(always)]
-    fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
+    pub(super) fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
         if callee.is_heap() {
             let idx = callee.heap_index();
             let e = self.lite.calls[idx as usize & (LITE_CALL_SLOTS - 1)];
@@ -1116,7 +1119,7 @@ impl<'p> Vm<'p> {
     /// for anything the method cache does not answer (a private name, a
     /// native, an accessor).
     #[inline(always)]
-    fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+    pub(super) fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
         let slot = lite_method_slot(at);
         let e = &self.lite.methods[slot];
         if e.site_fid == func_id && e.site_ip == ip as u32 {
@@ -1308,6 +1311,28 @@ impl<'p> Vm<'p> {
                 }
             }};
         }
+        // The loop runner left in another frame than the one it entered in
+        // (a call it made, `vm/loop_tier.rs`), whose position it stored: on
+        // in that frame here, or in the main loop.
+        macro_rules! reframe {
+            () => {{
+                top = self.frames.len() - 1;
+                func_id = self.frames[top].func;
+                if !self.lite_eligible(func_id) {
+                    exit!(LiteStep::Exit(LiteExit::Resume));
+                }
+                if !FULL && self.lite_is_full(func_id) {
+                    exit!(LiteStep::Full);
+                }
+                base = self.frames[top].base;
+                ip = self.frames[top].ip;
+                code = self.lite_fn_code(func_id);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    upv = (std::ptr::null(), 0);
+                }
+            }};
+        }
         // Run the frame a call just pushed for `fid` here, or hand it (and
         // the caller after it, to its next frame transition) to the main
         // loop: the `Call` arm's steps after its push.
@@ -1467,10 +1492,16 @@ impl<'p> Vm<'p> {
                 }
                 Instr::Jump { target } => {
                     let t = target as usize;
-                    // A back-edge: the main arm's GC safe point.
+                    // A back-edge: the main arm's GC safe point, and the loop
+                    // runner's entry (`vm/loop_tier.rs`).
                     if t < ip {
                         steps += LITE_LOOP_STEPS;
                         self.maybe_gc();
+                        ip = self.loop_back_edge(func_id, base, t, code);
+                        if ip == super::loop_tier::LOOP_FRAMES {
+                            reframe!();
+                        }
+                        continue;
                     }
                     ip = t;
                 }
@@ -1478,10 +1509,14 @@ impl<'p> Vm<'p> {
                     let va = self.get(base, a);
                     let r = self.add_int_value(va, imm, upd)?;
                     self.set(base, dst, r);
-                    // The back-edge `Jump` at `ip + 1`: its GC safe point.
+                    // The back-edge `Jump` at `ip + 1`: its GC safe point,
+                    // and the loop runner's entry.
                     steps += LITE_LOOP_STEPS;
                     self.maybe_gc();
-                    ip = target as usize;
+                    ip = self.loop_back_edge(func_id, base, target as usize, code);
+                    if ip == super::loop_tier::LOOP_FRAMES {
+                        reframe!();
+                    }
                 }
                 Instr::JumpIfFalse { cond, target } if FULL => {
                     let v = self.get(base, cond);
@@ -1565,9 +1600,15 @@ impl<'p> Vm<'p> {
                 {
                     let next = self.global_run(code[ip], base, func_id, ip, false)?;
                     if next <= ip {
+                        // A back-edge: the loop runner's entry.
                         steps += LITE_LOOP_STEPS;
+                        ip = self.loop_back_edge(func_id, base, next, code);
+                        if ip == super::loop_tier::LOOP_FRAMES {
+                            reframe!();
+                        }
+                    } else {
+                        ip = next;
                     }
-                    ip = next;
                 }
                 Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
