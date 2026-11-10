@@ -9,7 +9,10 @@
 //!
 //! The thread here has 64 MiB and declares 4: the floor must stop both
 //! recursions well before the 4096-level cap, in every mode, with the error
-//! still catchable and the program still running after it.
+//! still catchable and the program still running after it. A debug build
+//! declares 16: its interpreter's frame is several times a release build's,
+//! and under 4 MiB the callback recursion stopped at or before the sixteenth
+//! level the program asks it to pass.
 //!
 //! Native builds only: the sandbox profile's own caps (32 nested run loops,
 //! 4,096 frames) stop both recursions long before any floor, and refuse the
@@ -36,7 +39,7 @@ console.log("after", down(5000));
 const EXPECTED: &str = "generator RangeError true true 0\ncallback RangeError true true\nafter 5000";
 
 const THREAD_STACK: usize = 64 << 20;
-const DECLARED: usize = 4 << 20;
+const DECLARED: usize = if cfg!(debug_assertions) { 16 << 20 } else { 4 << 20 };
 
 #[test]
 fn declared_stack_floor_child() {
