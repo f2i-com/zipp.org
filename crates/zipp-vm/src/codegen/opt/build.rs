@@ -1780,54 +1780,84 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         class_values: Some((inputs.class_values, inputs.class_epoch)),
         poly: Some(inputs.poly),
     };
-    let mut blocks: Vec<Block> = Vec::with_capacity(order.len());
-    let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len()];
+    // A loop may jump back to bytecode ip 0. In that case the bytecode
+    // entry is a loop header, not a unique predecessor-free entry block.
+    // Split out a synthetic SSA preheader so its first invocation and its
+    // back-edges enter through distinct phi inputs.
+    let entry_preheader = !bpreds[0].is_empty();
+    let ir_offset = usize::from(entry_preheader);
+    let mut blocks: Vec<Block> = Vec::with_capacity(order.len() + ir_offset);
+    let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len() + ir_offset];
     // Phis to fill once every block is built: (block, phi, register).
     let mut phis: Vec<(usize, V, u16)> = Vec::new();
     let undefined_bits = Value::UNDEFINED.bits();
-    for (k, &bb) in order.iter().enumerate() {
+    let make_entry = |b: &mut Builder| -> (Vec<V>, Vec<V>) {
+        let mut defs: Vec<V> = vec![V::MAX; nregs];
+        let mut insts = Vec::new();
+        let undef = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
+        for (r, d) in defs.iter_mut().enumerate() {
+            *d = if r <= p.param_count as usize {
+                let v = b.push(Op::Param(r as u16), Rep::Tagged, None);
+                insts.push(v);
+                v
+            } else {
+                undef
+            };
+        }
+        // The speculated parameters are unboxed once at the true function
+        // entry, not again when a loop returns to bytecode ip 0.
+        let entry_live = live_before[0].as_ref().expect("the entry has liveness");
+        let unbox: Vec<usize> = (0..nregs).filter(|&r| spec[r]).collect();
+        if !unbox.is_empty() {
+            let s = b.states.len() as u32;
+            b.states.push(FrameState {
+                ip: 0,
+                why: ENTRY_SITE,
+                regs: (0..nregs)
+                    .filter(|&r| entry_live.get(r))
+                    .map(|r| (r as u16, defs[r]))
+                    .collect(),
+            });
+            for r in unbox {
+                let c = b.push(Op::TaggedToF64(defs[r]), Rep::F64, Some(s));
+                insts.push(c);
+                defs[r] = c;
+            }
+        }
+        (defs, insts)
+    };
+    if entry_preheader {
+        let (defs, insts) = make_entry(&mut b);
+        exit_defs[0] = defs;
+        blocks.push(Block {
+            insts,
+            term: Term::Jump(1),
+            preds: Vec::new(),
+        });
+    }
+    for (original_k, &bb) in order.iter().enumerate() {
+        let k = original_k + ir_offset;
         b.cur_block = k as B;
         b.memo.clear();
         b.shape_memo.clear();
-        let preds: Vec<B> = bpreds[bb].iter().map(|&p| rpo_index[p] as B).collect();
+        let mut preds: Vec<B> = bpreds[bb]
+            .iter()
+            .map(|&p| (rpo_index[p] + ir_offset) as B)
+            .collect();
+        if entry_preheader && original_k == 0 {
+            preds.insert(0, 0);
+        }
         let mut defs: Vec<V> = vec![V::MAX; nregs];
         let mut insts_of_block: Vec<V> = Vec::new();
         if k == 0 {
             debug_assert!(preds.is_empty(), "the entry has no predecessor");
-            let undef = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
-            for (r, d) in defs.iter_mut().enumerate() {
-                *d = if r <= p.param_count as usize {
-                    let v = b.push(Op::Param(r as u16), Rep::Tagged, None);
-                    insts_of_block.push(v);
-                    v
-                } else {
-                    undef
-                };
-            }
-            // The speculated parameters (`spec`), unboxed behind one frame
-            // state: the call's first op, its parameters as passed.
-            let entry_live = live_before[starts[bb]].as_ref().expect("the entry has liveness");
-            let unbox: Vec<usize> = (0..nregs).filter(|&r| spec[r]).collect();
-            if !unbox.is_empty() {
-                let s = b.states.len() as u32;
-                b.states.push(FrameState {
-                    ip: starts[bb] as u32,
-                    why: ENTRY_SITE,
-                    regs: (0..nregs)
-                        .filter(|&r| entry_live.get(r))
-                        .map(|r| (r as u16, defs[r]))
-                        .collect(),
-                });
-                for r in unbox {
-                    let c = b.push(Op::TaggedToF64(defs[r]), Rep::F64, Some(s));
-                    insts_of_block.push(c);
-                    defs[r] = c;
-                }
-            }
+            (defs, insts_of_block) = make_entry(&mut b);
         } else if preds.len() == 1 && (preds[0] as usize) < k {
             defs = exit_defs[preds[0] as usize].clone();
         } else {
-            let reps = in_rep[bb].as_ref().expect("a reachable block has entry representations");
+            let reps = in_rep[bb]
+                .as_ref()
+                .expect("a reachable block has entry representations");
             for r in 0..nregs {
                 if live_in[bb].get(r) {
                     let phi = b.push(Op::Phi(Vec::new()), reps[r], None);
@@ -1850,12 +1880,12 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             let inline = inline_at.get(&ip).copied();
             match translate(&mut b, &top, ip, &code[ip], &mut defs, &mut fs, inline)? {
                 Flow::Next => {}
-                Flow::Jump(t) => term = Some(Term::Jump(rpo_index[block_of_ip(t)] as B)),
+                Flow::Jump(t) => term = Some(Term::Jump((rpo_index[block_of_ip(t)] + ir_offset) as B)),
                 Flow::Branch { cond, t, f } => {
                     term = Some(Term::Branch {
                         cond,
-                        t: rpo_index[block_of_ip(t)] as B,
-                        f: rpo_index[block_of_ip(f)] as B,
+                        t: (rpo_index[block_of_ip(t)] + ir_offset) as B,
+                        f: (rpo_index[block_of_ip(f)] + ir_offset) as B,
                     })
                 }
                 Flow::Ret(v) => {
@@ -1867,7 +1897,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
         }
         let term = term.unwrap_or_else(|| {
             // Falls through into the next block.
-            Term::Jump(rpo_index[block_of_ip(end_of(bb))] as B)
+            Term::Jump((rpo_index[block_of_ip(end_of(bb))] + ir_offset) as B)
         });
         exit_defs[k] = defs;
         blocks.push(Block {
