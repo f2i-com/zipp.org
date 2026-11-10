@@ -2438,6 +2438,12 @@ env_off_switch! {
     fn lane_mod_enabled() = "ZIPP_NO_LANE_MOD"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_LANE_IMUL=1`: a typed lane multiplies every product as
+    /// doubles again, for an A/B.
+    fn lane_imul_enabled() = "ZIPP_NO_LANE_IMUL"
+}
+
 /// One scheduled lane instruction. Emission is a dumb match — every decision
 /// (types, homes, folds, in-place forms) was made by `build_typed_lane`.
 pub(crate) enum LaneStep {
@@ -2525,6 +2531,13 @@ pub(crate) enum LaneStep {
         d: u8,
         imm: i64,
         b: u8,
+    },
+    /// Exact i64 product with a positive constant (bounds proven ≤ 2^53 at
+    /// plan time, `imul_const`).
+    IMulImm {
+        d: u8,
+        a: u8,
+        imm: i32,
     },
     /// 32-bit ALU op on ToInt32'd operands; result re-extended per op
     /// (movsxd for signed results, the 32-bit write's zero-extension for
@@ -3119,6 +3132,43 @@ impl LaneBuilder<'_> {
         });
         self.binds.insert(dst, sid);
         Ok(())
+    }
+
+    /// `x * k` for an exact integer `x` and a positive integer constant `k`
+    /// (either order), as one `imul` on the integer home, when the product's
+    /// interval stays within 2^53: there the f64 product is that integer, and
+    /// it is never -0 (an Int home holds no -0, and `0 * k` is +0 for a
+    /// positive `k`). `Ok(false)` leaves every other product to `fbin`.
+    ///
+    /// Through `fbin` the integer was converted, multiplied and left a double
+    /// for the rest of the body and for the caller: `super.area() * 3 + 1`
+    /// came back as a double the loop around the call then added to an
+    /// integer and truncated, a conversion each way per call.
+    fn imul_const(&mut self, i: usize, dst: u16, sa: usize, sb: usize) -> Result<bool, &'static str> {
+        let (sint, k) = match (self.slots[sa], self.slots[sb]) {
+            (Av::Int { .. }, Av::ImmI(k)) => (sa, k),
+            (Av::ImmI(k), Av::Int { .. }) => (sb, k),
+            _ => return Ok(false),
+        };
+        if k <= 0 || k > i32::MAX as i64 || !lane_imul_enabled() {
+            return Ok(false);
+        }
+        let Av::Int { h, lo, hi } = self.slots[sint] else {
+            return Ok(false);
+        };
+        let (Some(plo), Some(phi)) = (lo.checked_mul(k), hi.checked_mul(k)) else {
+            return Ok(false);
+        };
+        if plo < -I53 || phi > I53 {
+            return Ok(false);
+        }
+        self.binds.remove(&dst);
+        let prefer = self.dying_homes(i, &[sint], true);
+        let d = self.alloc_gpr(i + 1, &prefer, None)?;
+        self.steps.push(LaneStep::IMulImm { d, a: h, imm: k as i32 });
+        let sid = self.push_slot(Av::Int { h: d, lo: plo, hi: phi });
+        self.binds.insert(dst, sid);
+        Ok(true)
     }
 
     /// Scalar f64 op, IEEE bytecode-op-for-op. Int operands convert via
@@ -3936,7 +3986,11 @@ fn build_lane_inner(
             Instr::Mul { dst, a, b: rb } => {
                 let sa = b.resolve(i, a)?;
                 let sb = b.resolve(i, rb)?;
-                b.fbin(i, dst, sa, sb, DOp::Mul)?;
+                // An exact integer times a positive constant is the same
+                // number as the f64 product (`imul_const`).
+                if !b.imul_const(i, dst, sa, sb)? {
+                    b.fbin(i, dst, sa, sb, DOp::Mul)?;
+                }
             }
             Instr::Div { dst, a, b: rb } => {
                 let sa = b.resolve(i, a)?;
@@ -4454,6 +4508,9 @@ fn emit_typed_lane(
                     ; sub rax, Rq(b)
                     ; mov Rq(d), rax
                 );
+            }
+            LaneStep::IMulImm { d, a, imm } => {
+                dynasm!(ops ; imul Rq(d), Rq(a), imm);
             }
             LaneStep::Bit32 { d, a, b, op } => match op {
                 B::And | B::Or | B::Xor => {
