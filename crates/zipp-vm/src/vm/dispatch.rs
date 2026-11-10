@@ -2191,6 +2191,15 @@ impl<'p> Vm<'p> {
                         // object's [[Prototype]]) with `this` = the current receiver
                         // (so a getter sees it). For a base class the base is
                         // %Object.prototype%.
+                        //
+                        // The site's stamped data way first: neither the
+                        // name nor the home class is read for it.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        if let Some(v) = self.ic_super_stamped(func_id, ip) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].as_str();
                         // ── interpreter super-property IC ── data reads hit

@@ -113,6 +113,17 @@ const SHAPE_REBUILD_MAX: usize = 64;
 #[cfg(feature = "safe-sandbox")]
 const HASH_TREE_ENTRY_BYTES: usize = 48;
 
+/// The bit of an object's version word that marks it as a guarded
+/// prototype-chain member (`Heap::guard_version`). Setting it changes the
+/// word, so whatever recorded the unmarked version misses once, as after any
+/// step; the steps keep it until the slot's occupant goes.
+pub(crate) const VERSION_GUARD: u32 = 1 << 31;
+
+/// Whether this build has the stamped chain entries that read
+/// `Heap::chain_epoch` (`vm::ic::SiteIc`). Without them no object is ever
+/// marked and the version steps carry no epoch test.
+const CHAIN_STAMPS: bool = cfg!(all(feature = "jit", not(feature = "safe-sandbox")));
+
 /// [`Heap`]'s fid-mirror sentinel for "not a plain callable": no real
 /// FuncProto id reaches `u32::MAX` (function tables are bounds-checked far
 /// below it), so the emitted guard can compare against a baked id blindly.
@@ -7442,7 +7453,18 @@ pub struct Heap {
     /// JIT inline cache reads this (by heap index) to validate a cached
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
-    versions: Vec<u32>,
+    ///
+    /// The top bit ([`VERSION_GUARD`]) marks an object some cache entry
+    /// guards as a prototype-chain member (`Heap::guard_version`): every
+    /// step of such an object's version also moves [`Heap::chain_epoch`].
+    versions: Vec<Cell<u32>>,
+    /// Moves whenever the version of a [`VERSION_GUARD`]-marked object does
+    /// (a key added, removed or redefined, its [[Prototype]] replaced, its
+    /// slot freed or reused). A cache entry whose chain objects were all
+    /// marked and whose versions matched when it recorded this value needs
+    /// no per-object check while the value stands: one compare for a chain
+    /// of any depth. Never 0, which entries hold for "not stamped".
+    pub(crate) chain_epoch: u32,
     /// One-code-point strings handed out by [`Heap::cp_str`], direct-mapped by
     /// code point: (code point, slot, the slot's version when cached). A slot
     /// freed or reused since has another version, so a stale entry is seen
@@ -8348,14 +8370,14 @@ impl Heap {
         let mut versions = Vec::with_capacity(256);
         for b in 0u8..128 {
             objs.push(HeapObj::Str(JsStr::new((b as char).to_string())));
-            versions.push(0);
+            versions.push(Cell::new(0));
         }
         objs.push(HeapObj::Str(JsStr::new(String::new())));
-        versions.push(0);
+        versions.push(Cell::new(0));
         for n in 0u8..100 {
             let bytes = vec![b'0' + n / 10, b'0' + n % 10];
             objs.push(HeapObj::Str(JsStr::from_ascii(bytes)));
-            versions.push(0);
+            versions.push(Cell::new(0));
         }
         debug_assert_eq!(objs.len(), INTERN_PINNED_END as usize + 1);
         let live = objs.len();
@@ -8515,6 +8537,7 @@ impl Heap {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             gen_raw: 0,
             versions,
+            chain_epoch: 1,
             cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
@@ -9218,7 +9241,7 @@ impl Heap {
                 vals: base as u64,
             };
         }
-        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.version_retire(idx);
         self.gen[idx as usize] = GEN_YOUNG;
         true
     }
@@ -9450,7 +9473,7 @@ impl Heap {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn reuse_slot_stamp(&mut self, idx: u32) {
-        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.version_reuse(idx);
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);
@@ -10120,7 +10143,7 @@ impl Heap {
             if self.payload_accounting.get() {
                 self.resident_payload_charged[idx as usize].set(payload);
             }
-            self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            self.version_reuse(idx);
             #[cfg(feature = "jit")]
             match hot {
                 Some(h) => self.hot_mirror[idx as usize] = h,
@@ -10158,7 +10181,7 @@ impl Heap {
         }
         self.objs.push(obj);
         self.resident_payload_charged.push(Cell::new(payload));
-        self.versions.push(0);
+        self.versions.push(Cell::new(0));
         self.cell_vals_mirror.push(Value::UNDEFINED.bits());
         #[cfg(feature = "jit")]
         {
@@ -11239,7 +11262,7 @@ impl Heap {
                 &mut self.objs[idx as usize],
                 HeapObj::Date(f64::NAN),
             ));
-            self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            self.version_retire(idx);
             if self.nursery {
                 self.gen[idx as usize] = GEN_OLD;
             }
@@ -11561,7 +11584,7 @@ impl Heap {
     /// to the free list.
     #[inline(always)]
     fn free_slot_tail(&mut self, idx: u32) {
-        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.version_retire(idx);
         if self.nursery {
             // Tombstones read OLD: `gen == GEN_YOUNG ⇔ in the young log`
             // stays exact, so a minor's boundary marks cover free slots too.
@@ -11856,7 +11879,7 @@ impl Heap {
         if let HeapObj::Object(mut m) = old {
             m.vals.strip_slab();
         }
-        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.version_retire(idx);
         self.refresh_mirror(idx);
     }
 
@@ -11875,7 +11898,7 @@ impl Heap {
             self.dirty_array_snapshots();
             self.arr_mirror[idx as usize] = [0, 0];
         }
-        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.version_step(idx);
         // Invalidate, don't refresh: callers bump on either side of the
         // mutation, and a refresh here would capture the wrong side at a
         // bump-first site — a shape-way hit has no second guard to catch it.
@@ -11889,19 +11912,82 @@ impl Heap {
         }
     }
 
+    /// One step of slot `idx`'s version for a change to the object in it; a
+    /// guarded chain member's also moves `chain_epoch`.
+    #[inline(always)]
+    fn version_step(&mut self, idx: u32) {
+        let v = self.versions[idx as usize].get();
+        self.versions[idx as usize].set(v.wrapping_add(1));
+        if CHAIN_STAMPS && v & VERSION_GUARD != 0 {
+            self.chain_epoch_step();
+        }
+    }
+
+    /// One step of slot `idx`'s version when its occupant goes (freed or
+    /// replaced): the next occupant starts unguarded.
+    #[inline(always)]
+    fn version_retire(&mut self, idx: u32) {
+        let v = self.versions[idx as usize].get();
+        if CHAIN_STAMPS && v & VERSION_GUARD != 0 {
+            self.version_retire_guarded(idx, v);
+        } else {
+            self.versions[idx as usize].set(v.wrapping_add(1));
+        }
+    }
+
+    /// [`Self::version_retire`] of a guarded chain member, out of line: one
+    /// in thousands of the objects a sweep frees is one.
+    #[cold]
+    #[inline(never)]
+    fn version_retire_guarded(&mut self, idx: u32, v: u32) {
+        self.versions[idx as usize].set(v.wrapping_add(1) & !VERSION_GUARD);
+        self.chain_epoch_step();
+    }
+
+    /// One step of the version of a free slot an allocation is taking. The
+    /// step that freed it cleared any mark (`version_retire`), and nothing
+    /// marks a free slot, so this is the bare increment every allocation
+    /// into a reused slot always made.
+    #[inline(always)]
+    fn version_reuse(&mut self, idx: u32) {
+        let v = self.versions[idx as usize].get();
+        debug_assert!(!CHAIN_STAMPS || v & VERSION_GUARD == 0, "a free slot carries a chain mark");
+        self.versions[idx as usize].set(v.wrapping_add(1));
+    }
+
+    #[inline]
+    fn chain_epoch_step(&mut self) {
+        self.chain_epoch = self.chain_epoch.wrapping_add(1).max(1);
+    }
+
+    /// Mark object `idx` as a guarded prototype-chain member and answer its
+    /// version as marked: from here every step of that version moves
+    /// `chain_epoch`. The mark itself changes the word without moving the
+    /// epoch: no entry stamped with the epoch can have recorded the unmarked
+    /// word, since stamping requires every chain object marked.
+    #[inline]
+    pub(crate) fn guard_version(&self, idx: u32) -> u32 {
+        if !CHAIN_STAMPS {
+            return self.versions[idx as usize].get();
+        }
+        let v = self.versions[idx as usize].get() | VERSION_GUARD;
+        self.versions[idx as usize].set(v);
+        v
+    }
+
     /// Base pointer of the parallel version array (for the JIT inline cache). The
     /// array does not reallocate during a native region run (a region never
     /// allocates a heap object), so this stays valid for the run.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn versions_ptr(&self) -> *const u32 {
-        self.versions.as_ptr()
+        self.versions.as_ptr().cast::<u32>()
     }
 
     /// Current version of object `idx` (for filling an inline-cache entry).
     #[inline]
     pub fn version_of(&self, idx: u32) -> u32 {
-        self.versions[idx as usize]
+        self.versions[idx as usize].get()
     }
 
     /// The string of the one code point `cp` (at or above 128; a lone
@@ -11920,7 +12006,7 @@ impl Heap {
         let k = cp as usize & (CACHE - 1);
         if let Some(&(c, idx, version)) = self.cp_strs.get(k) {
             if c == cp
-                && self.versions.get(idx as usize) == Some(&version)
+                && self.versions.get(idx as usize).map(Cell::get) == Some(version)
                 && matches!(self.objs.get(idx as usize), Some(HeapObj::Str(_)))
             {
                 return idx;
@@ -11932,7 +12018,7 @@ impl Heap {
         if self.cp_strs.is_empty() {
             self.cp_strs = vec![(u32::MAX, 0, 0); CACHE];
         }
-        self.cp_strs[k] = (cp, idx, self.versions[idx as usize]);
+        self.cp_strs[k] = (cp, idx, self.versions[idx as usize].get());
         idx
     }
 
@@ -12174,8 +12260,8 @@ impl Heap {
         let e = self.concat_memo[concat_memo_slot(li, n)];
         if e.left_idx == li
             && e.int == n
-            && e.left_ver == self.versions[li as usize]
-            && e.res_ver == self.versions[e.res_idx as usize]
+            && e.left_ver == self.versions[li as usize].get()
+            && e.res_ver == self.versions[e.res_idx as usize].get()
         {
             if self.oracle {
                 self.concat_memo_stats[0] += 1;
@@ -12209,10 +12295,10 @@ impl Heap {
         }
         self.concat_memo[concat_memo_slot(li, n)] = ConcatMemoEntry {
             left_idx: li,
-            left_ver: self.versions[li as usize],
+            left_ver: self.versions[li as usize].get(),
             int: n,
             res_idx: res,
-            res_ver: self.versions[res as usize],
+            res_ver: self.versions[res as usize].get(),
         };
     }
 
@@ -12241,8 +12327,8 @@ impl Heap {
         };
         if e.left_idx == li
             && e.right_idx == ri
-            && e.left_ver == self.versions[li as usize]
-            && e.res_ver == self.versions[e.res_idx as usize]
+            && e.left_ver == self.versions[li as usize].get()
+            && e.res_ver == self.versions[e.res_idx as usize].get()
         {
             if self.oracle {
                 self.concat_suffix_memo_stats[0] += 1;
@@ -12285,10 +12371,10 @@ impl Heap {
         }
         let entry = ConcatSuffixMemoEntry {
             left_idx: li,
-            left_ver: self.versions[li as usize],
+            left_ver: self.versions[li as usize].get(),
             right_idx: ri,
             res_idx: res,
-            res_ver: self.versions[res as usize],
+            res_ver: self.versions[res as usize].get(),
         };
         let memo = self.concat_suffix_memo.get_or_insert_with(|| {
             Box::new([ConcatSuffixMemoEntry::EMPTY; CONCAT_SUFFIX_MEMO_SLOTS])
@@ -13120,7 +13206,7 @@ mod tests {
         );
         assert_eq!(m.vals.as_slice(), &vals);
         // Born by growth at version 0, +1 at the sweep, +1 at the reuse.
-        assert_eq!(heap.versions[obj2 as usize], 2);
+        assert_eq!(heap.versions[obj2 as usize].get(), 2);
         // Every settled mirror equals what a re-read of the occupant yields.
         for idx in [obj2, arr2, func2, clo2] {
             let before = (

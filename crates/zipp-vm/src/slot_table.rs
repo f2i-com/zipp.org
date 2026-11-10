@@ -479,6 +479,18 @@ impl ProtoTable {
         }
     }
 
+    /// Slot `k`'s entry as stored: its [[Prototype]] value's bits, or 0 for
+    /// none. One load and no branch on the kind, for a caller that compares
+    /// it with the value it expects (`Vm::ic_proto_stamped`).
+    #[inline(always)]
+    #[cfg_attr(not(all(feature = "jit", not(feature = "safe-sandbox"))), allow(dead_code))]
+    pub(crate) fn raw_bits(&self, k: u32) -> u64 {
+        match self.vals.get(k as usize) {
+            Some(v) => v.bits(),
+            None => Self::NO_ENTRY_BITS,
+        }
+    }
+
     pub(crate) fn resident_bytes(&self) -> usize {
         (self.vals.capacity().saturating_mul(std::mem::size_of::<crate::value::Value>()))
             .saturating_add(self.fresh.capacity().saturating_mul(std::mem::size_of::<u32>()))
