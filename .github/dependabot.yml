@@ -42,6 +42,12 @@ updates:
           - "react-dom"
           - "@types/react"
           - "@types/react-dom"
+    # wrangler comes with @cloudflare/vite-plugin, which depends on one exact
+    # version of it. Raised by itself it is installed a second time, with its
+    # own miniflare and workerd, beside the copy the plugin runs. It moves
+    # when the plugin does.
+    ignore:
+      - dependency-name: "wrangler"
 
   - package-ecosystem: github-actions
     directory: "/"
