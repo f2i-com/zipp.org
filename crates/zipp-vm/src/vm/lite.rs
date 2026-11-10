@@ -161,6 +161,11 @@ fn lite_instr(i: &Instr) -> bool {
             // comparisons, a function's own captured cells.
             | Instr::CallMethod { .. }
             | Instr::CallWithThis { .. }
+            // The same three at a site named for a DataView accessor
+            // (`overlay_view_calls`).
+            | Instr::GetPropDv { .. }
+            | Instr::CallMethodDv { .. }
+            | Instr::CallWithThisDv { .. }
             | Instr::LoadConst { .. }
             | Instr::LoadNull { .. }
             | Instr::LoadBool { .. }
@@ -1070,7 +1075,7 @@ impl<'p> Vm<'p> {
     #[inline(always)]
     fn lite_code(p: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
         if crate::bytecode::interp_fuse_enabled() {
-            p.fused.entered(&p.code).unwrap_or(p.code.as_slice())
+            p.fused.entered(&p.code, &p.string_constants).unwrap_or(p.code.as_slice())
         } else {
             p.code.as_slice()
         }
@@ -1679,7 +1684,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::GetProp { dst, obj, name } if FULL => {
+                Instr::GetProp { dst, obj, name } | Instr::GetPropDv { dst, obj, name, .. } if FULL => {
                     let o = self.get(base, obj);
                     if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
                         self.set(base, dst, v);
@@ -1697,6 +1702,15 @@ impl<'p> Vm<'p> {
                     // loop's.
                     if !o.is_heap() {
                         hand_over!();
+                    }
+                    // A site named for a DataView accessor: a pristine
+                    // DataView's read by the accessor's entry (the main arm's).
+                    if let Instr::GetPropDv { slot, .. } = code[ip] {
+                        if let Some(bits) = self.dataview_proto_read_slot(o.heap_index(), slot as usize) {
+                            self.set(base, dst, Value::from_bits(bits));
+                            ip += 1;
+                            continue;
+                        }
                     }
                     let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
                     #[cfg(not(feature = "safe-sandbox"))]
@@ -1969,13 +1983,31 @@ impl<'p> Vm<'p> {
                     arg_base,
                     argc,
                     ..
+                }
+                | Instr::CallWithThisDv {
+                    dst,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                    ..
                 } if FULL => {
                     // A member call in spec order whose callee is a plain user
                     // function: the main arm's frame push, lean when `this`
                     // needs no boxing. Everything else is the main arm's
-                    // (natives, `f.call`, the captured intrinsic lanes).
+                    // (natives, `f.call`, the captured intrinsic lanes), but
+                    // a DataView accessor's at a site named for one, which is
+                    // the main arm's lane for it.
                     let (callee_v, this_val) = (self.get(base, callee), self.get(base, this_v));
                     let Some((fid, closure)) = self.ic_plain_fn(callee_v) else {
+                        if matches!(code[ip], Instr::CallWithThisDv { .. }) {
+                            let bits = self.dataview_site_captured(this_val, callee_v, base, arg_base, argc);
+                            if bits != super::typedarray::DV_SITE_DECLINE {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         hand_over!();
                     };
                     let this_is_object =
@@ -2000,6 +2032,14 @@ impl<'p> Vm<'p> {
                     name,
                     arg_base,
                     argc,
+                }
+                | Instr::CallMethodDv {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                    ..
                 } if FULL => {
                     // An ordinary object's or class instance's method through
                     // the method cache, the main arm's first step for one; an
@@ -2049,6 +2089,19 @@ impl<'p> Vm<'p> {
                                 hand_over!();
                             };
                             self.set(base, dst, r);
+                            ip += 1;
+                        }
+                        // A DataView's numeric accessor at a site named for
+                        // one: the main arm's lane for it.
+                        HeapObj::DataView { .. } => {
+                            let Instr::CallMethodDv { slot, .. } = code[ip] else {
+                                hand_over!();
+                            };
+                            let bits = self.dataview_site_call(recv, slot as usize, base, arg_base, argc);
+                            if bits == super::typedarray::DV_SITE_DECLINE {
+                                hand_over!();
+                            }
+                            self.set(base, dst, Value::from_bits(bits));
                             ip += 1;
                         }
                         _ => hand_over!(),

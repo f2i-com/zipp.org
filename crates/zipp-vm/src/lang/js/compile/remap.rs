@@ -462,10 +462,23 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         }
         #[cfg(all())]
         Instr::FuseIntBitwiseStoreGlobal { ldst: r0, dst: r1, a: r2, .. }
-        | Instr::FuseGlobalIntBitwise { gdst: r0, ldst: r1, dst: r2, .. } => {
+        | Instr::FuseGlobalIntBitwise { gdst: r0, ldst: r1, dst: r2, .. }
+        | Instr::CallMethodDv { dst: r0, obj: r1, arg_base: r2, .. } => {
             *r0 = m(*r0);
             *r1 = m(*r1);
             *r2 = m(*r2);
+        }
+        #[cfg(all())]
+        Instr::GetPropDv { dst: r0, obj: r1, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+        }
+        #[cfg(all())]
+        Instr::CallWithThisDv { dst: r0, callee: r1, this_v: r2, arg_base: r3, .. } => {
+            *r0 = m(*r0);
+            *r1 = m(*r1);
+            *r2 = m(*r2);
+            *r3 = m(*r3);
         }
     );
 }

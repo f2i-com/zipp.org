@@ -3700,7 +3700,7 @@ impl<'p> Vm<'p> {
                         self.set_fn_name_from_key(f, k, prefix);
                         ip += 1;
                     }
-                    Instr::GetProp { dst, obj, name } => {
+                    Instr::GetProp { dst, obj, name } | Instr::GetPropDv { dst, obj, name, .. } => {
                         let o = self.get(base, obj);
                         // The cache's way-0 own-data hit, inline and first: the
                         // steps below answer only names and receivers that hit
@@ -3753,6 +3753,20 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
+                        }
+                        // A site named for a numeric DataView accessor
+                        // (`GetPropDv`): a pristine DataView's read is its
+                        // prototype's entry for it, by the entry, where the
+                        // probes below came to the same answer by the name.
+                        #[cfg(not(feature = "meter-only"))]
+                        if let Instr::GetPropDv { slot, .. } = *instr {
+                            if o.is_heap() {
+                                if let Some(bits) = self.dataview_proto_read_slot(o.heap_index(), slot as usize) {
+                                    self.set(base, dst, Value::from_bits(bits));
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                         }
                         let key = running.string_constants[name as usize].as_str();
                         // `.length` of a string, an Array or a TypedArray is
@@ -4287,6 +4301,14 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                         name,
+                    }
+                    | Instr::CallWithThisDv {
+                        dst,
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc,
+                        name,
                     } => {
                         // A `with`-resolved identifier call: `this` = the
                         // with-object. A plain user function pushes a frame in
@@ -4296,6 +4318,19 @@ impl<'p> Vm<'p> {
                         // routes through call_value.
                         let callee_v = self.get(base, callee);
                         let this_val = self.get(base, this_v);
+                        // A site named for a numeric DataView accessor
+                        // (`CallWithThisDv`): the captured callee says which,
+                        // and on a DataView the call is that accessor's, ahead
+                        // of every other kind of callee's probe below.
+                        #[cfg(not(feature = "meter-only"))]
+                        if matches!(*instr, Instr::CallWithThisDv { .. }) {
+                            let bits = self.dataview_site_captured(this_val, callee_v, base, arg_base, argc);
+                            if bits != super::typedarray::DV_SITE_DECLINE {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // The spec-order member-call lowering captures the
                         // callable before evaluating its literal arguments.
                         // Recover the exact array copy-length loop reduction at
@@ -4754,6 +4789,14 @@ impl<'p> Vm<'p> {
                         name,
                         arg_base,
                         argc,
+                    }
+                    | Instr::CallMethodDv {
+                        dst,
+                        obj,
+                        name,
+                        arg_base,
+                        argc,
+                        ..
                     } => {
                         let recv = self.get(base, obj);
                         // The method cache's ways by the receiver's mirror
@@ -4763,6 +4806,22 @@ impl<'p> Vm<'p> {
                         let early = self.ic_call_method_mirror(func_id, ip, recv);
                         #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
                         let early: Option<(u32, u32, Value)> = None;
+                        // A site named for a numeric DataView accessor
+                        // (`CallMethodDv`), which the cache never answers: a
+                        // pristine DataView's lane by the accessor's prototype
+                        // entry, ahead of the name and the receiver-kind probes
+                        // below. Anything else is those, as for `CallMethod`.
+                        #[cfg(not(feature = "meter-only"))]
+                        if early.is_none() {
+                            if let Instr::CallMethodDv { slot, .. } = *instr {
+                                let bits = self.dataview_site_call(recv, slot as usize, base, arg_base, argc);
+                                if bits != super::typedarray::DV_SITE_DECLINE {
+                                    self.set(base, dst, Value::from_bits(bits));
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         // `program` outlives the VM, so borrow the method name
                         // with the program's lifetime (NOT self's) â€” avoids
                         // cloning the name string on every method call (a heap
@@ -7152,7 +7211,10 @@ impl<'p> Vm<'p> {
     #[cold]
     #[inline(never)]
     fn entered_code_fill(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
-        let code = running.fused.entered(&running.code).unwrap_or(running.code.as_slice());
+        let code = running
+            .fused
+            .entered(&running.code, &running.string_constants)
+            .unwrap_or(running.code.as_slice());
         let i = func_id as usize;
         if self.entered_code.len() <= i {
             self.entered_code.resize(self.funcs.len().max(i + 1), None);

@@ -5383,6 +5383,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
 
         // ── heap property / element ops ──
         Instr::GetProp { obj, .. }
+        | Instr::GetPropDv { obj, .. }
         | Instr::DeleteProp { obj, .. }
         | Instr::WithHas { obj, .. }
         | Instr::WithGet { obj, .. }
@@ -5509,11 +5510,14 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::TailCall { callee, arg_base, argc }
         | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
         Instr::CallWithThis { callee, this_v, arg_base, argc, .. }
+        | Instr::CallWithThisDv { callee, this_v, arg_base, argc, .. }
         | Instr::RegExpMethod { callee, this_v, arg_base, argc, .. }
         | Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
             win(&[callee, this_v], arg_base, argc)
         }
-        Instr::CallMethod { obj, arg_base, argc, .. } => win(&[obj], arg_base, argc),
+        Instr::CallMethod { obj, arg_base, argc, .. } | Instr::CallMethodDv { obj, arg_base, argc, .. } => {
+            win(&[obj], arg_base, argc)
+        }
         Instr::CallMethodComputed { obj, key, arg_base, argc, .. } => {
             win(&[obj, key], arg_base, argc)
         }
