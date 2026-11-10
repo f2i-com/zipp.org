@@ -2880,13 +2880,17 @@ pub enum Instr {
         slot: u8,
     },
     /// `CallMethod { dst, obj, name, arg_base, argc }`, as [`Instr::GetPropDv`].
+    /// `slot` sits ahead of `name`: the wasm-lite build lays a variant's
+    /// fields out as declared behind a two-byte tag, and there it fills the
+    /// gap `name`'s alignment leaves (after `argc` it made the instruction
+    /// twenty bytes, which that build refuses).
     CallMethodDv {
         dst: Reg,
         obj: Reg,
+        slot: u8,
         name: u32,
         arg_base: Reg,
         argc: u16,
-        slot: u8,
     },
     /// `CallWithThis { .. }` whose `name` is a numeric DataView accessor's:
     /// the callee it captured says which.
