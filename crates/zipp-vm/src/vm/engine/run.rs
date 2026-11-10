@@ -1499,7 +1499,10 @@ impl<'p> Vm<'p> {
         self.run_loop_depth += 1;
         let bits = {
             let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
-            f(regs_ptr, &mut bail as *mut u32, vm_ptr)
+            let route = self.route_run_begin();
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            self.route_run_end(route);
+            r
         };
         self.run_loop_depth -= 1;
         if let Some(token) = token {
@@ -2178,6 +2181,27 @@ impl<'p> Vm<'p> {
     pub(crate) fn note_global_route_change(&mut self) {
         self.global_route_epoch = self.global_route_epoch.saturating_add(1);
         self.jit_global_route_ok.clear();
+        // Native code already running validated its routes before this.
+        self.jit_route_dirty = 1;
+    }
+
+    /// A native run is about to start, its function's direct global routes
+    /// validated for the current epoch (`jit_globals_still_routable`): it
+    /// runs with `jit_route_dirty` clear. Answers what the flag held, for
+    /// [`Self::route_run_end`].
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    pub(crate) fn route_run_begin(&mut self) -> u8 {
+        std::mem::replace(&mut self.jit_route_dirty, 0)
+    }
+
+    /// The native run [`Self::route_run_begin`] opened has ended: the code
+    /// that called it is stale if it was before (`prev`), or if a route
+    /// changed during the run.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    pub(crate) fn route_run_end(&mut self, prev: u8) {
+        self.jit_route_dirty |= prev;
     }
 
     /// A REAL own property has appeared on (or been redefined on) the global object.

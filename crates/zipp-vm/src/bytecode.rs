@@ -2865,6 +2865,43 @@ pub enum Instr {
         dst: Reg,
         op: BitwiseOp,
     },
+    // ── sites named for a DataView accessor (`overlay_view_calls`) ──
+    // One instruction each, the original's fields and meaning: the arms that
+    // run the original run these too, and try a DataView's lane first. The
+    // name is matched once, when the copy is built, where the lanes matched
+    // its text on every call; a receiver that is not a pristine DataView (a
+    // class of the user's with a `getUint8` method) pays one test.
+    /// `GetProp { dst, obj, name }` whose `name` is the numeric DataView
+    /// accessor at `DV_PROTO_METHODS` entry `slot`.
+    GetPropDv {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        slot: u8,
+    },
+    /// `CallMethod { dst, obj, name, arg_base, argc }`, as [`Instr::GetPropDv`].
+    /// `slot` sits ahead of `name`: the wasm-lite build lays a variant's
+    /// fields out as declared behind a two-byte tag, and there it fills the
+    /// gap `name`'s alignment leaves (after `argc` it made the instruction
+    /// twenty bytes, which that build refuses).
+    CallMethodDv {
+        dst: Reg,
+        obj: Reg,
+        slot: u8,
+        name: u32,
+        arg_base: Reg,
+        argc: u16,
+    },
+    /// `CallWithThis { .. }` whose `name` is a numeric DataView accessor's:
+    /// the callee it captured says which.
+    CallWithThisDv {
+        dst: Reg,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+        name: u32,
+    },
     /// The whole body of a function whose body has not been compiled yet
     /// (`compile::lazy`): compile it, put it in this function's place, and
     /// run it from its first instruction in the frame this call pushed. The
@@ -3428,20 +3465,21 @@ impl FusedCode {
         )
     }
 
-    /// An entry of the function whose bytecode is `code`: the copy, built
-    /// now if this is the first, when anything in it fused.
+    /// An entry of the function whose bytecode is `code` and whose string
+    /// constants are `strings` (the names its member sites carry): the
+    /// copy, built now if this is the first, when anything in it fused.
     #[inline]
-    pub fn entered(&self, code: &[Instr]) -> Option<&[Instr]> {
+    pub fn entered(&self, code: &[Instr], strings: &[String]) -> Option<&[Instr]> {
         match self.code.get() {
             Some(c) => (!c.is_empty()).then_some(&**c),
-            None => self.build(code),
+            None => self.build(code, strings),
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn build(&self, code: &[Instr]) -> Option<&[Instr]> {
-        self.code.get_or_init(|| fuse_for_interpreter(code).unwrap_or_default());
+    fn build(&self, code: &[Instr], strings: &[String]) -> Option<&[Instr]> {
+        self.code.get_or_init(|| fuse_with_names(code, strings).unwrap_or_default());
         self.get()
     }
 
@@ -3713,7 +3751,15 @@ fn str_switch_run(code: &[Instr], i: usize, ldst: Reg, a: Reg, dst: Reg) -> usiz
 /// The interpreter's superinstruction copy of `code` (see [`FusedCode`]),
 /// or `None` when no pair in it fuses. Pairs never overlap: after a fused
 /// pair the scan resumes at the instruction after its second.
+#[cfg(test)]
 pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
+    fuse_with_names(code, &[])
+}
+
+/// [`fuse_for_interpreter`] for a function whose string constants are
+/// `strings`: its member sites named for a DataView accessor are marked too
+/// (`overlay_view_calls`).
+pub(crate) fn fuse_with_names(code: &[Instr], strings: &[String]) -> Option<Box<[Instr]>> {
     let mut out: Option<Vec<Instr>> = None;
     let mut i = 0;
     while i + 1 < code.len() {
@@ -3873,7 +3919,70 @@ pub(crate) fn fuse_for_interpreter(code: &[Instr]) -> Option<Box<[Instr]>> {
     if global_runs_enabled() {
         overlay_global_runs(code, &mut out);
     }
+    if !strings.is_empty() && view_calls_enabled() {
+        overlay_view_calls(code, strings, &mut out);
+    }
     out.map(Vec::into_boxed_slice)
+}
+
+/// The third pass of [`fuse_with_names`]: a member read or call whose name
+/// is a numeric DataView accessor's (`getUint32`, `setFloat64`; the BigInt
+/// four keep their lanes by name) becomes its `…Dv` form, at its own
+/// position and only where the passes before left the original. Nothing
+/// about the receiver is known here: the arms test it on every run.
+fn overlay_view_calls(code: &[Instr], strings: &[String], out: &mut Option<Vec<Instr>>) {
+    let slot_of = |name: u32| -> Option<u8> {
+        let text = strings.get(name as usize)?;
+        match crate::vm::typedarray::dataview_proto_slot(text)? {
+            slot @ (0..=7 | 10..=17) => Some(slot as u8),
+            _ => None,
+        }
+    };
+    for (i, instr) in code.iter().enumerate() {
+        let marked = match *instr {
+            Instr::GetProp { dst, obj, name } => slot_of(name).map(|slot| Instr::GetPropDv { dst, obj, name, slot }),
+            Instr::CallMethod {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+            } => slot_of(name).map(|slot| Instr::CallMethodDv {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+                slot,
+            }),
+            Instr::CallWithThis {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                name,
+            } if name != NO_NAME => slot_of(name).map(|_| Instr::CallWithThisDv {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                name,
+            }),
+            _ => None,
+        };
+        let Some(marked) = marked else {
+            continue;
+        };
+        let untouched = match out.as_ref() {
+            None => true,
+            Some(o) => std::mem::discriminant(&o[i]) == std::mem::discriminant(instr),
+        };
+        if untouched {
+            out.get_or_insert_with(|| code.to_vec())[i] = marked;
+        }
+    }
 }
 
 /// The global slot and source register of a store to a global that, with
@@ -4038,11 +4147,50 @@ mod fused_code_tests {
         // A holder builds on its first entry; nothing to fuse leaves it built
         // and empty.
         let holder = FusedCode::default();
-        assert!(holder.entered(&code).is_some());
+        assert!(holder.entered(&code, &[]).is_some());
         assert!(holder.get().is_some());
         let none = FusedCode::default();
-        assert!(none.entered(&[Instr::Return { src: 0 }]).is_none());
+        assert!(none.entered(&[Instr::Return { src: 0 }], &[]).is_none());
         assert!(none.code.get().is_some() && none.get().is_none());
+    }
+
+    /// A member site named for a numeric DataView accessor takes its `…Dv`
+    /// form in place (the same fields, the accessor's prototype entry), a
+    /// BigInt accessor's and any other name's stay as they are, and a
+    /// function with no such site gets no copy for it.
+    #[test]
+    fn view_call_sites_are_marked_in_place() {
+        let strings: Vec<String> = ["getUint32", "setFloat64", "getBigInt64", "length", "getInt8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let code = [
+            Instr::CallMethod { dst: 1, obj: 2, name: 0, arg_base: 3, argc: 2 },
+            Instr::GetProp { dst: 4, obj: 2, name: 1 },
+            Instr::CallWithThis { dst: 5, callee: 4, this_v: 2, arg_base: 6, argc: 3, name: 1 },
+            Instr::CallMethod { dst: 1, obj: 2, name: 2, arg_base: 3, argc: 1 },
+            Instr::GetProp { dst: 4, obj: 2, name: 3 },
+            Instr::CallWithThis { dst: 5, callee: 4, this_v: 2, arg_base: 6, argc: 0, name: NO_NAME },
+            Instr::GetProp { dst: 4, obj: 2, name: 4 },
+            Instr::Return { src: 1 },
+        ];
+        let fused = fuse_with_names(&code, &strings).expect("the sites are marked");
+        assert_eq!(fused.len(), code.len());
+        assert!(matches!(fused[0], Instr::CallMethodDv { dst: 1, obj: 2, name: 0, arg_base: 3, argc: 2, slot: 5 }));
+        assert!(matches!(fused[1], Instr::GetPropDv { dst: 4, obj: 2, name: 1, slot: 17 }));
+        assert!(matches!(
+            fused[2],
+            Instr::CallWithThisDv { dst: 5, callee: 4, this_v: 2, arg_base: 6, argc: 3, name: 1 }
+        ));
+        assert!(matches!(fused[3], Instr::CallMethod { name: 2, .. }));
+        assert!(matches!(fused[4], Instr::GetProp { name: 3, .. }));
+        assert!(matches!(fused[5], Instr::CallWithThis { name: NO_NAME, .. }));
+        assert!(matches!(fused[6], Instr::GetPropDv { name: 4, slot: 0, .. }));
+        // No such name, nothing else to fuse: no copy.
+        let plain = [Instr::GetProp { dst: 4, obj: 2, name: 3 }, Instr::Return { src: 4 }];
+        assert!(fuse_with_names(&plain, &strings).is_none());
+        // Without the names nothing is marked.
+        assert!(fuse_for_interpreter(&code).is_none());
     }
 
     /// A script's global loop: its header, a masked global, an accumulator's
@@ -4329,6 +4477,12 @@ env_off_switch! {
     /// `ZIPP_NO_GLOBAL_RUNS=1` leaves a script's global runs to the pair
     /// forms (`overlay_global_runs`).
     fn global_runs_enabled() = "ZIPP_NO_GLOBAL_RUNS"
+}
+
+env_off_switch! {
+    /// `ZIPP_NO_VIEW_CALLS=1` leaves the sites named for a DataView accessor
+    /// as they are (`overlay_view_calls`): the lanes by name.
+    fn view_calls_enabled() = "ZIPP_NO_VIEW_CALLS"
 }
 
 pub(crate) fn interp_fuse_enabled() -> bool {

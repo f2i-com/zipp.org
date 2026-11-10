@@ -1432,6 +1432,19 @@ pub struct LeafInlinePlan {
     /// wrap it. Nothing is committed until the instance is made, so a bail
     /// runs the whole `new` again, as a call's does.
     pub new_lane: Option<&'static NewLanePlan>,
+    /// A body `New` (by body index) of a constructor that only stores its
+    /// arguments (`Vec.prototype.sub`'s `return new Vec(…)`): the lane that
+    /// makes the instance inline (`emit_new_lane_into`), its callee identity,
+    /// guards and ready object checked there, any miss the call's fallback.
+    /// An instance a later bail abandons is unreachable garbage, so the
+    /// re-run call is still the only observable one. Empty for a body with no
+    /// `New` (`Vm::plan_alloc_leaf`).
+    pub inner_new: FxHashMap<usize, &'static NewLanePlan>,
+    /// The value a body `LoadClassValue` reads, by class id: the class as
+    /// evaluated once (`Vm::class_value_fixed`), valid while `mi_class_epoch`
+    /// is `class_epoch`, as Tier C's own `LoadClassValue` constant.
+    pub class_values: FxHashMap<u32, u64>,
+    pub class_epoch: u32,
     /// A `CallMethod` site's class-method lane (`ClassReadLane`): the receiver
     /// in `this_reg` at the lane's shape and class proves the method is
     /// `callee_bits`, so this guard replaces the callee identity check, and a

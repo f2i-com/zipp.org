@@ -1506,6 +1506,9 @@ impl<'p> Vm<'p> {
                     this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
                     this_reg: None,
                     new_lane: None,
+                    inner_new: rustc_hash::FxHashMap::default(),
+                    class_values: rustc_hash::FxHashMap::default(),
+                    class_epoch: 0,
                     class_guard: None,
                     prop_shapes: FxHashMap::default(),
                     param_count: callee.param_count,
@@ -3063,7 +3066,7 @@ impl<'p> Vm<'p> {
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_leaf_inline_plan(
-        &self,
+        &mut self,
         func_id: u32,
         start: u32,
         end: u32,
@@ -3302,6 +3305,14 @@ impl<'p> Vm<'p> {
                 )
             };
             let mut span_code_unit_pred = None;
+            // An allocating leaf's lanes and class constants (`plan_alloc_leaf`).
+            let mut inner_new = rustc_hash::FxHashMap::default();
+            let mut class_values = rustc_hash::FxHashMap::default();
+            let alloc_leaf = if captured_span.is_none() && callee_leaf_ok_for_call(callee, argc).is_none() {
+                self.plan_alloc_leaf(fid, argc)
+            } else {
+                None
+            };
             let body = if let Some((pred, body, mask)) = captured_span {
                 default_arg_mask = mask;
                 span_code_unit_pred = Some(pred);
@@ -3310,6 +3321,24 @@ impl<'p> Vm<'p> {
                 match callee_leaf_ok_for_call(callee, argc) {
                     Some((b, mask)) => {
                         default_arg_mask = mask;
+                        b
+                    }
+                    None if alloc_leaf.is_some() => {
+                        // A body whose `new`s all have store-only lanes
+                        // (`sub(o) { return new Vec(…) }`): inlined with each
+                        // instance made in place.
+                        let Some((b, mask, inner, classes)) = alloc_leaf else {
+                            continue;
+                        };
+                        default_arg_mask = mask;
+                        inner_new = inner;
+                        class_values = classes;
+                        if log {
+                            eprintln!(
+                                "[leaf] fn{func_id}@{ip} callee fn{fid} ALLOC-LEAF ({} new)",
+                                inner_new.len()
+                            );
+                        }
                         b
                     }
                     None => {
@@ -3652,7 +3681,7 @@ impl<'p> Vm<'p> {
             // look current and the real call remains authoritative.
             // The typed lane models reg 0 as the baked `this_bits`, so a body
             // with a bound receiver keeps the boxed per-op expansion.
-            let typed_lane = if !crate::codegen::typed_splice_enabled() || this_reg.is_some() {
+            let typed_lane = if !crate::codegen::typed_splice_enabled() || this_reg.is_some() || !inner_new.is_empty() {
                 // (A class-method site's `this_reg` is always set, so it never
                 // takes the lane, whose miss is a plain call's helper.)
                 None
@@ -3734,6 +3763,9 @@ impl<'p> Vm<'p> {
                     this_bits,
                     this_reg,
                     new_lane: None,
+                    inner_new,
+                    class_values,
+                    class_epoch: self.mi_class_epoch,
                     class_guard,
                     prop_shapes,
                     reg_window,

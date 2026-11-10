@@ -117,6 +117,9 @@ pub(crate) const JIT_CALL_DEPTH_OFFSET: usize = core::mem::offset_of!(Vm<'static
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, global_route_epoch);
+/// `Vm::jit_route_dirty`: a global's route changed under running native code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ROUTE_DIRTY_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit_route_dirty);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);

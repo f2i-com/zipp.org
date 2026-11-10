@@ -1136,7 +1136,11 @@ impl Em<'_> {
                 dynasm!(self.ops
                     // The slot, as Tier C reads it: a body is entered only
                     // while its globals' routes hold (`jit_globals_still_
-                    // routable`). One in its TDZ is the interpreter's.
+                    // routable`), and one that changed since then is the
+                    // interpreter's (`Vm::jit_route_dirty`). One in its TDZ
+                    // is the interpreter's too.
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32], 0
+                    ; jne => stub
                     ; mov rax, [rdi + base]
                     ; mov Rq(d), [rax + off]
                     ; mov rax, QWORD Value::UNINITIALIZED.bits() as i64
@@ -1566,8 +1570,11 @@ impl Em<'_> {
                 let off = 8 * idx as i32;
                 dynasm!(self.ops
                     // The slot, as Tier C writes it (routes are checked at
-                    // entry); one in its TDZ or never made is the
-                    // interpreter's to write.
+                    // entry, and a change since is the interpreter's:
+                    // `Vm::jit_route_dirty`); one in its TDZ or never made
+                    // is the interpreter's to write.
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32], 0
+                    ; jne => stub
                     ; mov rax, [rdi + base]
                     ; mov rcx, QWORD Value::UNINITIALIZED.bits() as i64
                     ; cmp [rax + off], rcx
@@ -1591,6 +1598,9 @@ impl Em<'_> {
                     None => {
                         let base = crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32;
                         dynasm!(self.ops
+                            // `Math` by its slot, while that is its route.
+                            ; cmp BYTE [rdi + crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32], 0
+                            ; jne => stub
                             ; mov rax, [rdi + base]
                             ; mov rax, [rax + 8 * gidx as i32]
                         );

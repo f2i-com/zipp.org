@@ -766,7 +766,9 @@ impl<'p> Vm<'p> {
                 let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
                     core::mem::transmute(entry);
                 let mut b: u32 = crate::codegen::NO_BAIL;
+                let route = self.route_run_begin();
                 let r = f(regs_ptr, &mut b as *mut u32, vm_ptr);
+                self.route_run_end(route);
                 (r, b)
             }
         };

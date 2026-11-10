@@ -9,7 +9,14 @@
 //!
 //! The thread here has 64 MiB and declares 4: the floor must stop both
 //! recursions well before the 4096-level cap, in every mode, with the error
-//! still catchable and the program still running after it.
+//! still catchable and the program still running after it. An unoptimized
+//! build is given 16 where 4 does not do: its interpreter's frame is several
+//! times an optimized one's, and under 4 MiB its callback recursion stops at
+//! or before the sixteenth level the program asks it to pass. Which of the
+//! two a build needs is not something `cfg` says (the CI shards build with
+//! debug assertions at opt-level 1, where 16 MiB lets the callback recursion
+//! reach the cap first), so the program must give its output under one of
+//! them.
 //!
 //! Native builds only: the sandbox profile's own caps (32 nested run loops,
 //! 4,096 frames) stop both recursions long before any floor, and refuse the
@@ -36,24 +43,33 @@ console.log("after", down(5000));
 const EXPECTED: &str = "generator RangeError true true 0\ncallback RangeError true true\nafter 5000";
 
 const THREAD_STACK: usize = 64 << 20;
-const DECLARED: usize = 4 << 20;
+/// The stacks declared, tried in turn: an optimized build's, then an
+/// unoptimized one's.
+const DECLARED: [usize; 2] = [4 << 20, 16 << 20];
 
 #[test]
 fn declared_stack_floor_child() {
     if std::env::var("ZIPP_STACK_FLOOR_CHILD").is_err() {
         return;
     }
-    let out = std::thread::Builder::new()
-        .stack_size(THREAD_STACK)
-        .spawn(|| {
-            zipp_vm::set_native_stack_bytes(DECLARED);
-            zipp_vm::run(PROGRAM).expect("compiles")
-        })
-        .expect("thread")
-        .join()
-        .expect("no panic");
-    assert_eq!(out.error, None, "{:?}", out.errput);
-    assert_eq!(out.output.join("\n"), EXPECTED);
+    let mut got = String::new();
+    for declared in DECLARED {
+        let out = std::thread::Builder::new()
+            .stack_size(THREAD_STACK)
+            .spawn(move || {
+                zipp_vm::set_native_stack_bytes(declared);
+                zipp_vm::run(PROGRAM).expect("compiles")
+            })
+            .expect("thread")
+            .join()
+            .expect("no panic");
+        assert_eq!(out.error, None, "{:?}", out.errput);
+        got = out.output.join("\n");
+        if got == EXPECTED {
+            return;
+        }
+    }
+    assert_eq!(got, EXPECTED, "under neither declared stack");
 }
 
 /// Each mode in a fresh process: an overflow aborts the process, which the

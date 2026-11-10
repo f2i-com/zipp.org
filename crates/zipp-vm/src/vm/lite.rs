@@ -161,6 +161,11 @@ fn lite_instr(i: &Instr) -> bool {
             // comparisons, a function's own captured cells.
             | Instr::CallMethod { .. }
             | Instr::CallWithThis { .. }
+            // The same three at a site named for a DataView accessor
+            // (`overlay_view_calls`).
+            | Instr::GetPropDv { .. }
+            | Instr::CallMethodDv { .. }
+            | Instr::CallWithThisDv { .. }
             | Instr::LoadConst { .. }
             | Instr::LoadNull { .. }
             | Instr::LoadBool { .. }
@@ -201,7 +206,7 @@ const LITE_CALL_STEPS: u64 = 8;
 
 /// The target of `i` when it is a jump the lite loop or the compiler's loops
 /// can take backward.
-fn jump_target(i: &Instr) -> Option<u32> {
+pub(super) fn jump_target(i: &Instr) -> Option<u32> {
     match *i {
         Instr::Jump { target }
         | Instr::JumpIfFalse { target, .. }
@@ -481,6 +486,8 @@ pub(crate) struct LiteState<'p> {
     leaf: Vec<u8>,
     /// Per function id: the declines its leaf runs have had.
     leaf_bails: Vec<u8>,
+    /// The loop runner's tables (`vm/loop_tier.rs`).
+    pub(super) loops: super::loop_tier::LoopTier,
 }
 
 /// Where a leaf run (`lite_leaf_run`) reads its arguments: a caller's
@@ -514,6 +521,7 @@ impl Default for LiteState<'_> {
             leaf_bails: Vec::new(),
             calls: vec![LiteCall::EMPTY; LITE_CALL_SLOTS].into_boxed_slice(),
             methods: vec![LiteMethod::EMPTY; LITE_METHOD_SLOTS].into_boxed_slice(),
+            loops: Default::default(),
         }
     }
 }
@@ -1070,7 +1078,7 @@ impl<'p> Vm<'p> {
     #[inline(always)]
     fn lite_code(p: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
         if crate::bytecode::interp_fuse_enabled() {
-            p.fused.entered(&p.code).unwrap_or(p.code.as_slice())
+            p.fused.entered(&p.code, &p.string_constants).unwrap_or(p.code.as_slice())
         } else {
             p.code.as_slice()
         }
@@ -1081,7 +1089,7 @@ impl<'p> Vm<'p> {
     /// cache's answer, else `ic_call`'s (remembered when the lite loop runs
     /// the callee).
     #[inline(always)]
-    fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
+    pub(super) fn lite_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
         if callee.is_heap() {
             let idx = callee.heap_index();
             let e = self.lite.calls[idx as usize & (LITE_CALL_SLOTS - 1)];
@@ -1111,7 +1119,18 @@ impl<'p> Vm<'p> {
     /// for anything the method cache does not answer (a private name, a
     /// native, an accessor).
     #[inline(always)]
-    fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+    pub(super) fn lite_method(&mut self, at: &Instr, func_id: u32, ip: usize, recv: Value, name: u32) -> Option<(u32, u32, Value, u32)> {
+        if let Some(hit) = self.lite_method_entry(at, func_id, ip, recv) {
+            return Some(hit);
+        }
+        self.lite_method_miss(lite_method_slot(at), func_id, ip, recv, name)
+    }
+
+    /// [`Self::lite_method`]'s cache alone: the method when the layout the
+    /// site's entry remembers is the receiver's, with nothing filled on a
+    /// miss.
+    #[inline(always)]
+    pub(super) fn lite_method_entry(&self, at: &Instr, func_id: u32, ip: usize, recv: Value) -> Option<(u32, u32, Value, u32)> {
         let slot = lite_method_slot(at);
         let e = &self.lite.methods[slot];
         if e.site_fid == func_id && e.site_ip == ip as u32 {
@@ -1130,7 +1149,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        self.lite_method_miss(slot, func_id, ip, recv, name)
+        None
     }
 
     /// The `CallMethod` at `at` (`ip` in `func_id`) on an ordinary object
@@ -1289,6 +1308,28 @@ impl<'p> Vm<'p> {
                 func_id = self.frames[top].func;
                 if !self.lite_eligible(func_id) {
                     short_entry!();
+                    exit!(LiteStep::Exit(LiteExit::Resume));
+                }
+                if !FULL && self.lite_is_full(func_id) {
+                    exit!(LiteStep::Full);
+                }
+                base = self.frames[top].base;
+                ip = self.frames[top].ip;
+                code = self.lite_fn_code(func_id);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    upv = (std::ptr::null(), 0);
+                }
+            }};
+        }
+        // The loop runner left in another frame than the one it entered in
+        // (a call it made, `vm/loop_tier.rs`), whose position it stored: on
+        // in that frame here, or in the main loop.
+        macro_rules! reframe {
+            () => {{
+                top = self.frames.len() - 1;
+                func_id = self.frames[top].func;
+                if !self.lite_eligible(func_id) {
                     exit!(LiteStep::Exit(LiteExit::Resume));
                 }
                 if !FULL && self.lite_is_full(func_id) {
@@ -1462,10 +1503,19 @@ impl<'p> Vm<'p> {
                 }
                 Instr::Jump { target } => {
                     let t = target as usize;
-                    // A back-edge: the main arm's GC safe point.
+                    // A back-edge: the main arm's GC safe point, and the loop
+                    // runner's entry (`vm/loop_tier.rs`).
                     if t < ip {
                         steps += LITE_LOOP_STEPS;
                         self.maybe_gc();
+                        ip = self.loop_back_edge(func_id, base, t, code);
+                        if ip >= super::loop_tier::LOOP_THROWN {
+                            if ip != super::loop_tier::LOOP_FRAMES {
+                                return Err(self.loop_thrown());
+                            }
+                            reframe!();
+                        }
+                        continue;
                     }
                     ip = t;
                 }
@@ -1473,10 +1523,17 @@ impl<'p> Vm<'p> {
                     let va = self.get(base, a);
                     let r = self.add_int_value(va, imm, upd)?;
                     self.set(base, dst, r);
-                    // The back-edge `Jump` at `ip + 1`: its GC safe point.
+                    // The back-edge `Jump` at `ip + 1`: its GC safe point,
+                    // and the loop runner's entry.
                     steps += LITE_LOOP_STEPS;
                     self.maybe_gc();
-                    ip = target as usize;
+                    ip = self.loop_back_edge(func_id, base, target as usize, code);
+                    if ip >= super::loop_tier::LOOP_THROWN {
+                        if ip != super::loop_tier::LOOP_FRAMES {
+                            return Err(self.loop_thrown());
+                        }
+                        reframe!();
+                    }
                 }
                 Instr::JumpIfFalse { cond, target } if FULL => {
                     let v = self.get(base, cond);
@@ -1560,9 +1617,18 @@ impl<'p> Vm<'p> {
                 {
                     let next = self.global_run(code[ip], base, func_id, ip, false)?;
                     if next <= ip {
+                        // A back-edge: the loop runner's entry.
                         steps += LITE_LOOP_STEPS;
+                        ip = self.loop_back_edge(func_id, base, next, code);
+                        if ip >= super::loop_tier::LOOP_THROWN {
+                            if ip != super::loop_tier::LOOP_FRAMES {
+                                return Err(self.loop_thrown());
+                            }
+                            reframe!();
+                        }
+                    } else {
+                        ip = next;
                     }
-                    ip = next;
                 }
                 Instr::Eq { dst, a, b } if FULL => {
                     let (va, vb) = (self.get(base, a), self.get(base, b));
@@ -1679,7 +1745,7 @@ impl<'p> Vm<'p> {
                     self.set(base, dst, r);
                     ip += 1;
                 }
-                Instr::GetProp { dst, obj, name } if FULL => {
+                Instr::GetProp { dst, obj, name } | Instr::GetPropDv { dst, obj, name, .. } if FULL => {
                     let o = self.get(base, obj);
                     if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
                         self.set(base, dst, v);
@@ -1697,6 +1763,15 @@ impl<'p> Vm<'p> {
                     // loop's.
                     if !o.is_heap() {
                         hand_over!();
+                    }
+                    // A site named for a DataView accessor: a pristine
+                    // DataView's read by the accessor's entry (the main arm's).
+                    if let Instr::GetPropDv { slot, .. } = code[ip] {
+                        if let Some(bits) = self.dataview_proto_read_slot(o.heap_index(), slot as usize) {
+                            self.set(base, dst, Value::from_bits(bits));
+                            ip += 1;
+                            continue;
+                        }
                     }
                     let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
                     #[cfg(not(feature = "safe-sandbox"))]
@@ -1969,13 +2044,31 @@ impl<'p> Vm<'p> {
                     arg_base,
                     argc,
                     ..
+                }
+                | Instr::CallWithThisDv {
+                    dst,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                    ..
                 } if FULL => {
                     // A member call in spec order whose callee is a plain user
                     // function: the main arm's frame push, lean when `this`
                     // needs no boxing. Everything else is the main arm's
-                    // (natives, `f.call`, the captured intrinsic lanes).
+                    // (natives, `f.call`, the captured intrinsic lanes), but
+                    // a DataView accessor's at a site named for one, which is
+                    // the main arm's lane for it.
                     let (callee_v, this_val) = (self.get(base, callee), self.get(base, this_v));
                     let Some((fid, closure)) = self.ic_plain_fn(callee_v) else {
+                        if matches!(code[ip], Instr::CallWithThisDv { .. }) {
+                            let bits = self.dataview_site_captured(this_val, callee_v, base, arg_base, argc);
+                            if bits != super::typedarray::DV_SITE_DECLINE {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         hand_over!();
                     };
                     let this_is_object =
@@ -2000,6 +2093,14 @@ impl<'p> Vm<'p> {
                     name,
                     arg_base,
                     argc,
+                }
+                | Instr::CallMethodDv {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                    ..
                 } if FULL => {
                     // An ordinary object's or class instance's method through
                     // the method cache, the main arm's first step for one; an
@@ -2049,6 +2150,19 @@ impl<'p> Vm<'p> {
                                 hand_over!();
                             };
                             self.set(base, dst, r);
+                            ip += 1;
+                        }
+                        // A DataView's numeric accessor at a site named for
+                        // one: the main arm's lane for it.
+                        HeapObj::DataView { .. } => {
+                            let Instr::CallMethodDv { slot, .. } = code[ip] else {
+                                hand_over!();
+                            };
+                            let bits = self.dataview_site_call(recv, slot as usize, base, arg_base, argc);
+                            if bits == super::typedarray::DV_SITE_DECLINE {
+                                hand_over!();
+                            }
+                            self.set(base, dst, Value::from_bits(bits));
                             ip += 1;
                         }
                         _ => hand_over!(),

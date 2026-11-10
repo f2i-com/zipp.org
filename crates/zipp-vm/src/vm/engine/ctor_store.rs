@@ -265,6 +265,13 @@ env_off_switch! {
     fn ctor_store_enabled() = "ZIPP_NO_CTOR_STORE"
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_ALLOC_LEAF=1`: a leaf body with a `new` (`Vm::plan_alloc_leaf`)
+    /// is not inlined, as before, for an A/B on one binary.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn alloc_leaf_enabled() = "ZIPP_NO_ALLOC_LEAF"
+}
+
 /// A name a computed or exotic write could intercept: the store miss
 /// helper's exclusions (`jit_set_prop_miss`), plus the empty name and an
 /// escaped well-known symbol.
@@ -542,6 +549,75 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// An ALLOCATING leaf body for a call of `fid` with `argc` arguments: the
+    /// body (`callee_leaf_ok_for_call_alloc`), a lane for each of its `New`s
+    /// and the class constant each `LoadClassValue` reads. Every `New` must
+    /// have been seen by the interpreter with the class it still holds and
+    /// get a store-only lane (`plan_new_lane`); every class must have been
+    /// evaluated once. `None` keeps the call. Off under `ZIPP_NO_ALLOC_LEAF`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn plan_alloc_leaf(
+        &mut self,
+        fid: u32,
+        argc: u16,
+    ) -> Option<(
+        Vec<Instr>,
+        u64,
+        rustc_hash::FxHashMap<usize, &'static crate::codegen::NewLanePlan>,
+        rustc_hash::FxHashMap<u32, u64>,
+    )> {
+        if !alloc_leaf_enabled()
+            || !ctor_store_enabled()
+            || !crate::heap::ready_objects_enabled()
+            || self.new_sites.is_empty()
+        {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
+        let callee = self.func(fid as usize);
+        let (body, mask) = crate::codegen::callee_leaf_ok_for_call_alloc(callee, argc)?;
+        let param_count = callee.param_count;
+        let mut inner = rustc_hash::FxHashMap::default();
+        let mut classes = rustc_hash::FxHashMap::default();
+        for (bi, ins) in body.iter().enumerate() {
+            match *ins {
+                Instr::LoadClassValue { class_id, .. } => {
+                    let v = self.class_value_fixed(class_id)?;
+                    classes.insert(class_id, v.bits());
+                }
+                Instr::New { arg_base, argc: n, .. } => {
+                    // The arguments sit in the body's own temporaries, past
+                    // `this` and the parameters, so they never alias a
+                    // caller argument slot.
+                    if n > 0 && arg_base <= param_count {
+                        return None;
+                    }
+                    // The body is the callee's code prefix: a body index is
+                    // the callee's ip, which keys the site table.
+                    let key = ((fid as u64) << 32) | bi as u64;
+                    let (site, bits, ver) = self.new_sites[(key ^ (key >> 32)) as usize % NEW_SITES];
+                    if site != key || self.heap.version_of(Value::from_bits(bits).heap_index()) != ver {
+                        return None;
+                    }
+                    let lane = self.plan_new_lane(bits, ver, n)?;
+                    if lane.vals.iter().any(|v| matches!(v, crate::codegen::NewLaneVal::Reg(_))) {
+                        return None;
+                    }
+                    inner.insert(bi, &*Box::leak(Box::new(lane)));
+                }
+                _ => {}
+            }
+        }
+        if inner.is_empty() {
+            return None;
+        }
+        Some((body, mask, inner, classes))
+    }
+
     /// What `new` of the callee `bits` makes: the constructor's fid, the
     /// instance's class (`u32::MAX` for a plain function's) and its
     /// [[Prototype]] if it is a plain function's.
@@ -677,6 +753,9 @@ impl<'p> Vm<'p> {
             this_bits: Value::UNDEFINED.bits(),
             this_reg: None,
             new_lane: Some(Box::leak(Box::new(lane))),
+            inner_new: rustc_hash::FxHashMap::default(),
+            class_values: rustc_hash::FxHashMap::default(),
+            class_epoch: 0,
             class_guard: None,
             prop_shapes: rustc_hash::FxHashMap::default(),
             reg_window,

@@ -84,6 +84,25 @@ impl TaInterpNumericView {
 /// `DV_PROTO_METHODS`: the kinds `dataview_get_kind` pairs with them.
 const DV_GET_KINDS: [u8; 8] = [0, 1, 3, 4, 5, 6, 7, 8];
 
+/// What a DataView site lane (`Vm::dataview_site_call`) answers when it did
+/// nothing: no numeric accessor's result, which is a Number or `undefined`.
+#[cfg(not(feature = "meter-only"))]
+pub(crate) const DV_SITE_DECLINE: u64 = Value::HOLE.bits();
+
+/// Whether the builtin-call histogram is on, which counts each accessor
+/// call by its name: the site lanes leave those calls to the lanes that do.
+#[cfg(all(not(feature = "meter-only"), not(target_arch = "wasm32")))]
+#[inline(always)]
+fn site_stats_on(vm: &Vm<'_>) -> bool {
+    vm.builtin_stats_enabled
+}
+
+#[cfg(all(not(feature = "meter-only"), target_arch = "wasm32"))]
+#[inline(always)]
+fn site_stats_on(_vm: &Vm<'_>) -> bool {
+    false
+}
+
 /// The position of the `%TypedArray%.prototype` method `name` in
 /// `TA_PROTO_METHODS`, picked by the name's length and a byte or two and then
 /// confirmed by one compare (as `dataview_proto_slot` does). A scan of the
@@ -1173,7 +1192,13 @@ impl<'p> Vm<'p> {
     pub(crate) fn dataview_proto_read(&self, view_idx: u32, name: &str) -> Option<u64> {
         // The setters and the BigInt accessors sit at their own boot entries;
         // the proof is the same.
-        let method = dataview_proto_slot(name)?;
+        self.dataview_proto_read_slot(view_idx, dataview_proto_slot(name)?)
+    }
+
+    /// [`Self::dataview_proto_read`] for the accessor at `DV_PROTO_METHODS`
+    /// entry `method`, named by its entry rather than its name.
+    #[inline]
+    pub(crate) fn dataview_proto_read_slot(&self, view_idx: u32, method: usize) -> Option<u64> {
         let HeapObj::DataView {
             pristine_version, ..
         } = self.heap.get(view_idx)
@@ -1218,6 +1243,237 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         self.dataview_get_leaf(view_idx, method, position, little_endian)
+    }
+
+    /// `recv.<accessor>(args…)` at a site named for the numeric DataView
+    /// accessor at `DV_PROTO_METHODS` entry `slot` (`Instr::CallMethodDv`),
+    /// its `argc` arguments at `arg_base` of the window at `base`: the call's
+    /// result, or [`DV_SITE_DECLINE`] with nothing done. The proof is
+    /// `dataview_interp_get_slot`'s (the receiver's own properties and
+    /// prototype untouched since construction, the prototype's boot shape,
+    /// the entry's exact bits); the name, which that lane's callers matched
+    /// on every call, was matched when the site was marked.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(never)]
+    pub(crate) fn dataview_site_call(&mut self, recv: Value, slot: usize, base: usize, arg_base: u16, argc: u16) -> u64 {
+        if !recv.is_heap() {
+            return DV_SITE_DECLINE;
+        }
+        let view_idx = recv.heap_index();
+        let HeapObj::DataView {
+            buffer,
+            pristine_version,
+            byte_offset,
+            byte_length,
+        } = *self.heap.get(view_idx)
+        else {
+            return DV_SITE_DECLINE;
+        };
+        if self.heap.version_of(view_idx) != pristine_version || !self.dataview_entry_is_boot(slot) {
+            return DV_SITE_DECLINE;
+        }
+        self.dataview_site_run(buffer, byte_offset, byte_length, slot, base, arg_base, argc)
+    }
+
+    /// [`Self::dataview_site_call`] for the split member call
+    /// (`Instr::CallWithThisDv`): `callee` is what the call's `[[Get]]`
+    /// returned before its arguments ran, so when it is a numeric DataView
+    /// accessor and `recv` a DataView the call is that accessor's, whatever
+    /// the receiver or its prototype holds by now (`dataview_captured_get`'s
+    /// proof, and its one realm).
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(never)]
+    pub(crate) fn dataview_site_captured(
+        &mut self,
+        recv: Value,
+        callee: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> u64 {
+        if !recv.is_heap() || !callee.is_heap() || !self.realm_global_objs.is_empty() {
+            return DV_SITE_DECLINE;
+        }
+        let HeapObj::Native(id) = *self.heap.get(callee.heap_index()) else {
+            return DV_SITE_DECLINE;
+        };
+        let slot = id.wrapping_sub(native::DV_METHOD_BASE) as usize;
+        if !matches!(slot, 0..=7 | 10..=17) {
+            return DV_SITE_DECLINE;
+        }
+        let HeapObj::DataView {
+            buffer,
+            byte_offset,
+            byte_length,
+            ..
+        } = *self.heap.get(recv.heap_index())
+        else {
+            return DV_SITE_DECLINE;
+        };
+        self.dataview_site_run(buffer, byte_offset, byte_length, slot, base, arg_base, argc)
+    }
+
+    /// Whether %DataView.prototype%'s entry `slot` (a numeric getter's or
+    /// setter's) still holds the boot accessor, in the one realm there is.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(always)]
+    fn dataview_entry_is_boot(&self, slot: usize) -> bool {
+        if !self.realm_global_objs.is_empty()
+            || self.dataview_proto == 0
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            return false;
+        }
+        let boot = if slot < 8 {
+            self.dataview_numeric_getter_bits[slot]
+        } else {
+            self.dataview_numeric_setter_bits[slot - 10]
+        };
+        matches!(
+            self.heap.get(self.dataview_proto),
+            HeapObj::Object(map)
+                if map.shape() == self.dataview_proto_shape
+                    && slot < map.slot_len()
+                    && map.val_at(slot).bits() == boot
+        )
+    }
+
+    /// The numeric accessor at entry `slot` on a DataView's window, for a
+    /// caller that has proved it is the function being called: the read's
+    /// value or `undefined` after the write, for an Int position inside the
+    /// window, a primitive endianness flag, a Number to store, and a live,
+    /// fixed-length, writable buffer the window fits. Anything else (a
+    /// position or value to convert, an error to raise, a detached,
+    /// immutable or length-tracking buffer, the builtin-call histogram) is
+    /// [`DV_SITE_DECLINE`] with nothing done: the general lanes redo it.
+    #[cfg(not(feature = "meter-only"))]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn dataview_site_run(
+        &mut self,
+        buffer: u32,
+        byte_offset: usize,
+        byte_length: usize,
+        slot: usize,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> u64 {
+        const DECLINE: u64 = DV_SITE_DECLINE;
+        let at = base + arg_base as usize;
+        let argc = argc as usize;
+        let position = if argc > 0 { self.regs[at] } else { Value::UNDEFINED };
+        if !position.is_int() || position.as_int() < 0 || site_stats_on(self) || !self.dv_tracking.is_empty() {
+            return DECLINE;
+        }
+        let pos = position.as_int() as usize;
+        let setter = slot >= 10;
+        let kind = DV_GET_KINDS[if setter { slot - 10 } else { slot }];
+        let size = native::TA_KINDS[kind as usize].1;
+        let flag_at = if setter { 2 } else { 1 };
+        let flag = if argc > flag_at { self.regs[at + flag_at] } else { Value::UNDEFINED };
+        let Some(little) = flag.truthy_primitive() else {
+            return DECLINE;
+        };
+        // The window inside the buffer and the access inside the window.
+        let inside = |buffer_len: usize| {
+            byte_offset.checked_add(byte_length).is_some_and(|end| end <= buffer_len)
+                && size <= byte_length
+                && pos <= byte_length - size
+        };
+        let abs = byte_offset.wrapping_add(pos);
+        if setter {
+            let value = if argc > 1 { self.regs[at + 1] } else { Value::UNDEFINED };
+            if !value.is_number() || (!self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&buffer)) {
+                return DECLINE;
+            }
+            let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) else {
+                return DECLINE;
+            };
+            if *detached || !inside(data.len()) {
+                return DECLINE;
+            }
+            // As `dataview_set_leaf` stores it: the element's bytes as one
+            // little-endian word, swapped within its width for a big-endian
+            // write.
+            let bytes = if value.is_int() {
+                crate::vm::helpers_numeric::ta_encode_int(kind, value.as_int())
+            } else {
+                crate::vm::helpers_numeric::ta_encode(kind, value.as_f64())
+            };
+            let mut word = u64::from_le_bytes(bytes);
+            if !little {
+                word = word.swap_bytes() >> (64 - 8 * size as u32);
+            }
+            let Some(dst) = data.get_mut(abs..abs + size) else {
+                return DECLINE;
+            };
+            match size {
+                1 => dst[0] = word as u8,
+                2 => dst.copy_from_slice(&(word as u16).to_le_bytes()),
+                4 => dst.copy_from_slice(&(word as u32).to_le_bytes()),
+                _ => dst.copy_from_slice(&word.to_le_bytes()),
+            }
+            return Value::UNDEFINED.bits();
+        }
+        let data = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            _ => return DECLINE,
+        };
+        if !inside(data.len()) {
+            return DECLINE;
+        }
+        macro_rules! rd {
+            ($n:expr) => {
+                match ta_bytes::<$n>(data, abs) {
+                    Some(b) => b,
+                    None => return DECLINE,
+                }
+            };
+        }
+        // As `dataview_get_leaf` makes them: integer kinds as Int values.
+        let result = match kind {
+            0 => Value::int(rd!(1)[0] as i8 as i32),
+            1 => Value::int(rd!(1)[0] as i32),
+            3 => Value::int(if little {
+                i16::from_le_bytes(rd!(2))
+            } else {
+                i16::from_be_bytes(rd!(2))
+            } as i32),
+            4 => Value::int(if little {
+                u16::from_le_bytes(rd!(2))
+            } else {
+                u16::from_be_bytes(rd!(2))
+            } as i32),
+            5 => Value::int(if little {
+                i32::from_le_bytes(rd!(4))
+            } else {
+                i32::from_be_bytes(rd!(4))
+            }),
+            6 => {
+                let u = if little {
+                    u32::from_le_bytes(rd!(4))
+                } else {
+                    u32::from_be_bytes(rd!(4))
+                };
+                if u <= i32::MAX as u32 {
+                    Value::int(u as i32)
+                } else {
+                    Value::num(u as f64)
+                }
+            }
+            7 => Value::num(if little {
+                f32::from_le_bytes(rd!(4))
+            } else {
+                f32::from_be_bytes(rd!(4))
+            } as f64),
+            _ => Value::num(if little {
+                f64::from_le_bytes(rd!(8))
+            } else {
+                f64::from_be_bytes(rd!(8))
+            }),
+        };
+        result.bits()
     }
 
     /// The numeric DataView getter `method` (its index in `DV_PROTO_METHODS`)

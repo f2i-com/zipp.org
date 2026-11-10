@@ -5745,6 +5745,7 @@ pub(crate) fn compile_proto_mem(
                     // is a live, direct slot. One Int guard at the first read
                     // replaces the twelve generic ToInt32 checks in a three-
                     // step chain. A miss is a pure exact-ip interpreter replay.
+                    emit_route_guard(&mut ops, bail);
                     dynasm!(ops
                         ; mov rax, [r12 + (plan.idx as i32) * 8]
                         ; mov r10, rax
@@ -5760,10 +5761,12 @@ pub(crate) fn compile_proto_mem(
                     let resume = ip + usize::from(plan.count) * 6;
                     dynasm!(ops ; jmp => labels[resume]);
                 } else {
+                    emit_route_guard(&mut ops, bail);
                     dynasm!(ops
                         ; mov rax, [r12 + (idx as i32) * 8]
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
             Instr::UpvalGet { dst, idx } => {
@@ -5966,10 +5969,12 @@ pub(crate) fn compile_proto_mem(
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src } => {
+                emit_route_guard(&mut ops, bail);
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax
                 );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::AddInt { dst, a, imm, .. } => {
                 // Int fast path (the interpreter's `checked_add`), f64 fallback

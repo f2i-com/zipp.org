@@ -2654,6 +2654,16 @@ pub struct Vm<'p> {
     /// single compare against zero, so the common path pays one `cmp`. See
     /// `Vm::jit_globals_still_routable`.
     global_route_epoch: u32,
+    /// Set when `global_route_epoch` moves: a route changed while the native
+    /// code now running was already past its entry check. A callback under a
+    /// compiled loop that deletes a global, or puts a getter, a setter or
+    /// read-only attributes behind one, left that loop reading and writing
+    /// the raw slot for the rest of its run: the entry check had passed. A
+    /// compiled global access tests this byte first and, when it is set,
+    /// hands the instruction to the interpreter (`codegen::emit_route_guard`).
+    /// A native run starts with it clear, its routes just validated, and
+    /// gives its caller's back when it ends (`Vm::route_run_begin`).
+    jit_route_dirty: u8,
     /// Memo for the (rare) non-zero-epoch entry check: `func_id` → the epoch at
     /// which its direct global accesses were last VALIDATED, and the verdict. Keeps a
     /// hot function that survived a global delete from re-scanning its whole body on
@@ -4008,6 +4018,8 @@ mod enum_stream;
 mod error_stack;
 #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
 mod lite;
+#[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+mod loop_tier;
 mod text_codec;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;

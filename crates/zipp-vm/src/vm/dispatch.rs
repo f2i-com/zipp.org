@@ -1658,6 +1658,18 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         self.maybe_gc();
+                        // The loop runner's back-edge (`vm/loop_tier.rs`).
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        if LITE {
+                            ip = self.loop_back_edge(func_id, base, target as usize, icode);
+                            if ip >= super::loop_tier::LOOP_THROWN {
+                                if ip == super::loop_tier::LOOP_FRAMES {
+                                    break;
+                                }
+                                return Err(self.loop_thrown());
+                            }
+                            continue;
+                        }
                         ip = target as usize;
                     }
                     #[cfg(not(feature = "meter-only"))]
@@ -1791,6 +1803,18 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             self.maybe_gc();
+                            // The loop runner's back-edge (`vm/loop_tier.rs`).
+                            #[cfg(not(feature = "safe-sandbox"))]
+                            if LITE {
+                                ip = self.loop_back_edge(func_id, base, target as usize, icode);
+                                if ip >= super::loop_tier::LOOP_THROWN {
+                                    if ip == super::loop_tier::LOOP_FRAMES {
+                                        break;
+                                    }
+                                    return Err(self.loop_thrown());
+                                }
+                                continue;
+                            }
                             ip = target as usize;
                         } else {
                             ip = self.global_run(*instr, base, func_id, ip, true)?;
@@ -2191,14 +2215,26 @@ impl<'p> Vm<'p> {
                         // object's [[Prototype]]) with `this` = the current receiver
                         // (so a getter sees it). For a base class the base is
                         // %Object.prototype%.
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        //
+                        // The site's stamped way first, a value or a getter:
+                        // neither the name nor the home class is read for it.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let stamped = self.ic_super_stamped(func_id, ip);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let stamped = GetAct::None;
                         // ── interpreter super-property IC ── data reads hit
                         // directly; a cached plain GETTER frame-calls with
                         // `this` = the current receiver and ret_dst = dst.
                         {
-                            let is_static = self.func(func_id as usize).super_static;
-                            match self.ic_super_get(func_id, ip, home_class_id, is_static, key) {
+                            let act = match stamped {
+                                GetAct::None => {
+                                    let key = self.func(func_id as usize).string_constants[name as usize].as_str();
+                                    let is_static = self.func(func_id as usize).super_static;
+                                    self.ic_super_get(func_id, ip, home_class_id, is_static, key)
+                                }
+                                act => act,
+                            };
+                            match act {
                                 GetAct::Value(v) => {
                                     self.set(base, dst, v);
                                     ip += 1;
@@ -2210,6 +2246,19 @@ impl<'p> Vm<'p> {
                                     getter,
                                 } => {
                                     let this = self.get(base, 0);
+                                    // A leaf getter (`get v() { return
+                                    // this._v; }`) runs without a frame, as a
+                                    // `GetProp`'s does (`lite::leaf_scan`): a
+                                    // strict one's `this` is passed as it is.
+                                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                    if LITE {
+                                        let strict = self.func(fid as usize).is_strict;
+                                        if let Some(v) = self.leaf_call(fid, closure, this, strict, base, 0, 0) {
+                                            self.set(base, dst, v);
+                                            ip += 1;
+                                            continue;
+                                        }
+                                    }
                                     self.setup_call(
                                         fid,
                                         closure,
@@ -2226,6 +2275,8 @@ impl<'p> Vm<'p> {
                                 GetAct::None => {}
                             }
                         }
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self
                             .super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
@@ -2241,22 +2292,33 @@ impl<'p> Vm<'p> {
                         name,
                         val,
                     } => {
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
-                        let this = self.get(base, 0);
-                        let v = self.get(base, val);
-                        let is_static = self.func(func_id as usize).super_static;
                         // ── interpreter super-property IC ── a cached plain
                         // SETTER on the super chain frame-calls with `this` =
                         // the receiver and ret_dst = RET_DISCARD; data writes
                         // (which go to the RECEIVER) stay on the slow path. The
                         // entry is version-guarded on the same chain the
                         // SuperBase op captured, so a retargeted base misses it.
+                        // The site's stamped setter way first
+                        // (`ic_super_set_stamped`): neither the name nor the
+                        // home class is read for it.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let stamped = self.ic_super_set_stamped(func_id, ip);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let stamped = SetAct::None;
+                        let act = match stamped {
+                            SetAct::None => {
+                                let key = self.func(func_id as usize).string_constants[name as usize].as_str();
+                                let is_static = self.func(func_id as usize).super_static;
+                                self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                            }
+                            act => act,
+                        };
+                        let this = self.get(base, 0);
                         if let SetAct::Setter {
                             fid,
                             closure,
                             setter,
-                        } = self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                        } = act
                         {
                             self.setup_call(
                                 fid,
@@ -2273,6 +2335,9 @@ impl<'p> Vm<'p> {
                         }
                         // PutValue strictness comes from the reference site (the
                         // enclosing function) — class methods are always strict.
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let v = self.get(base, val);
                         let strict = self.func(func_id as usize).is_strict;
                         let proto = self.get(base, base_reg);
                         self.super_set_obj(proto, &key, this, v, strict)?;
@@ -3099,6 +3164,18 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // The loop runner's back-edge (`vm/loop_tier.rs`).
+                        #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                        if LITE && t < ip {
+                            ip = self.loop_back_edge(func_id, base, t, icode);
+                            if ip >= super::loop_tier::LOOP_THROWN {
+                                if ip == super::loop_tier::LOOP_FRAMES {
+                                    break;
+                                }
+                                return Err(self.loop_thrown());
+                            }
+                            continue;
+                        }
                         ip = t;
                     }
                     Instr::JumpIfFalse { cond, target } => {
@@ -3659,7 +3736,7 @@ impl<'p> Vm<'p> {
                         self.set_fn_name_from_key(f, k, prefix);
                         ip += 1;
                     }
-                    Instr::GetProp { dst, obj, name } => {
+                    Instr::GetProp { dst, obj, name } | Instr::GetPropDv { dst, obj, name, .. } => {
                         let o = self.get(base, obj);
                         // The cache's way-0 own-data hit, inline and first: the
                         // steps below answer only names and receivers that hit
@@ -3712,6 +3789,20 @@ impl<'p> Vm<'p> {
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
+                        }
+                        // A site named for a numeric DataView accessor
+                        // (`GetPropDv`): a pristine DataView's read is its
+                        // prototype's entry for it, by the entry, where the
+                        // probes below came to the same answer by the name.
+                        #[cfg(not(feature = "meter-only"))]
+                        if let Instr::GetPropDv { slot, .. } = *instr {
+                            if o.is_heap() {
+                                if let Some(bits) = self.dataview_proto_read_slot(o.heap_index(), slot as usize) {
+                                    self.set(base, dst, Value::from_bits(bits));
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                         }
                         let key = running.string_constants[name as usize].as_str();
                         // `.length` of a string, an Array or a TypedArray is
@@ -4246,6 +4337,14 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                         name,
+                    }
+                    | Instr::CallWithThisDv {
+                        dst,
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc,
+                        name,
                     } => {
                         // A `with`-resolved identifier call: `this` = the
                         // with-object. A plain user function pushes a frame in
@@ -4255,6 +4354,19 @@ impl<'p> Vm<'p> {
                         // routes through call_value.
                         let callee_v = self.get(base, callee);
                         let this_val = self.get(base, this_v);
+                        // A site named for a numeric DataView accessor
+                        // (`CallWithThisDv`): the captured callee says which,
+                        // and on a DataView the call is that accessor's, ahead
+                        // of every other kind of callee's probe below.
+                        #[cfg(not(feature = "meter-only"))]
+                        if matches!(*instr, Instr::CallWithThisDv { .. }) {
+                            let bits = self.dataview_site_captured(this_val, callee_v, base, arg_base, argc);
+                            if bits != super::typedarray::DV_SITE_DECLINE {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // The spec-order member-call lowering captures the
                         // callable before evaluating its literal arguments.
                         // Recover the exact array copy-length loop reduction at
@@ -4713,6 +4825,14 @@ impl<'p> Vm<'p> {
                         name,
                         arg_base,
                         argc,
+                    }
+                    | Instr::CallMethodDv {
+                        dst,
+                        obj,
+                        name,
+                        arg_base,
+                        argc,
+                        ..
                     } => {
                         let recv = self.get(base, obj);
                         // The method cache's ways by the receiver's mirror
@@ -4722,6 +4842,22 @@ impl<'p> Vm<'p> {
                         let early = self.ic_call_method_mirror(func_id, ip, recv);
                         #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
                         let early: Option<(u32, u32, Value)> = None;
+                        // A site named for a numeric DataView accessor
+                        // (`CallMethodDv`), which the cache never answers: a
+                        // pristine DataView's lane by the accessor's prototype
+                        // entry, ahead of the name and the receiver-kind probes
+                        // below. Anything else is those, as for `CallMethod`.
+                        #[cfg(not(feature = "meter-only"))]
+                        if early.is_none() {
+                            if let Instr::CallMethodDv { slot, .. } = *instr {
+                                let bits = self.dataview_site_call(recv, slot as usize, base, arg_base, argc);
+                                if bits != super::typedarray::DV_SITE_DECLINE {
+                                    self.set(base, dst, Value::from_bits(bits));
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         // `program` outlives the VM, so borrow the method name
                         // with the program's lifetime (NOT self's) â€” avoids
                         // cloning the name string on every method call (a heap
@@ -6319,7 +6455,9 @@ impl<'p> Vm<'p> {
         let outer_steps = self.meter_park();
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
+        let route = self.route_run_begin();
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        self.route_run_end(route);
         self.leave_tierc_activation(activation_token);
         #[cfg(feature = "instrument")]
         {
@@ -6413,7 +6551,9 @@ impl<'p> Vm<'p> {
         // SAFETY: `_rdtsc` has no preconditions on x86-64; the run is as
         // `try_run_jit`'s, and `head` is one of the body's heads.
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let route = self.route_run_begin();
         let (bits, bail) = unsafe { (*jitfn).run_at(regs_ptr, vm_ptr, head) };
+        self.route_run_end(route);
         let ticks = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         self.leave_tierc_activation(activation_token);
         if bail != crate::codegen::NO_BAIL
@@ -6590,7 +6730,9 @@ impl<'p> Vm<'p> {
                 let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
                     std::mem::transmute(entry);
                 let mut resume: u32 = crate::codegen::NO_BAIL;
+                let route = self.route_run_begin();
                 let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
+                self.route_run_end(route);
                 resume
             }
         };
@@ -7100,7 +7242,7 @@ impl<'p> Vm<'p> {
     /// its own, a cold line per frame transition; `Vm::entered_code` keeps
     /// only the answers, four to a line.
     #[inline(always)]
-    fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
+    pub(super) fn entered_code(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
         match self.entered_code.get(func_id as usize) {
             Some(&Some(code)) => code,
             _ => self.entered_code_fill(func_id, running),
@@ -7111,7 +7253,10 @@ impl<'p> Vm<'p> {
     #[cold]
     #[inline(never)]
     fn entered_code_fill(&mut self, func_id: u32, running: &'p crate::bytecode::FuncProto) -> &'p [Instr] {
-        let code = running.fused.entered(&running.code).unwrap_or(running.code.as_slice());
+        let code = running
+            .fused
+            .entered(&running.code, &running.string_constants)
+            .unwrap_or(running.code.as_slice());
         let i = func_id as usize;
         if self.entered_code.len() <= i {
             self.entered_code.resize(self.funcs.len().max(i + 1), None);
@@ -8582,6 +8727,59 @@ impl<'p> Vm<'p> {
             new_target,
             callee: callee_val,
         });
+    }
+
+    /// The lean push for a caller that cannot raise (the loop runner,
+    /// `vm/loop_tier.rs`): `false`, with nothing changed, for every call
+    /// [`Self::setup_call_lean_desc`], [`Self::setup_call_method_desc`] and
+    /// [`Self::setup_call_arrow`] send to the full setup. `recv`: a method
+    /// call's receiver; `None` for a plain call, whose `this` is the
+    /// callee's own (undefined, its realm's global object, an arrow's
+    /// captured one).
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(super) fn lean_push_or_decline(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        desc: u32,
+        recv: Option<Value>,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+        callee_val: Value,
+    ) -> bool {
+        let new_base = self.regs.len();
+        if self.frames.len() >= MAX_FRAMES
+            || !self.regs_fit_now(new_base + (desc & 0xFFFF) as usize)
+            || !lean_calls_enabled()
+        {
+            return false;
+        }
+        #[cfg(feature = "python")]
+        if super::prof_py::on() {
+            return false;
+        }
+        let this_val = match recv {
+            Some(recv) if desc & LEAN_DESC_OK != 0 => recv,
+            Some(_) => return false,
+            None if desc & LEAN_DESC_OK != 0 => {
+                if desc & LEAN_DESC_SLOPPY != 0 && self.global_this != 0 {
+                    Value::heap(self.callee_this_global(callee_val))
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            None if desc & LEAN_DESC_ARROW != 0 && closure != NO_CLOSURE => {
+                self.arrow_closure_this(closure, Value::UNDEFINED)
+            }
+            None => return false,
+        };
+        self.lean_desc_push(func_id, closure, desc, this_val, new_base, caller_base, arg_base, argc, dst, caller_ip_next, callee_val);
+        true
     }
 
     /// The frame facts [`Self::setup_call_lean_desc`] needs of `func_id`,

@@ -144,8 +144,29 @@ pub(crate) fn emit_new_lane(
     arg_base: u16,
     dst: u16,
 ) -> dynasmrt::DynamicLabel {
-    use crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET;
     let (miss, done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+    emit_new_lane_into(ops, lane, callee, arg_base, dst, miss);
+    dynasm!(ops
+        ; jmp =>done
+        ; =>miss
+    );
+    done
+}
+
+/// `lane`'s instance in `dst`, falling through, or a jump to `miss` with
+/// nothing observable done: the live callee in `callee` must be the lane's
+/// (bits and slot version), its proof must hold, and a ready object must be
+/// there. `callee`, `arg_base` (the arguments, consecutive) and `dst` are
+/// registers of the emitting window, already mapped by the caller.
+pub(crate) fn emit_new_lane_into(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &NewLanePlan,
+    callee: u16,
+    arg_base: u16,
+    dst: u16,
+    miss: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET;
     dynasm!(ops
         ; mov rax, [rbx + dreg(callee)]
         ; mov r10, QWORD lane.callee_bits as i64
@@ -158,11 +179,6 @@ pub(crate) fn emit_new_lane(
     );
     emit_new_guards(ops, lane, miss);
     emit_new_instance(ops, lane, arg_base, |r| r, dst, miss);
-    dynasm!(ops
-        ; jmp =>done
-        ; =>miss
-    );
-    done
 }
 
 /// `lane`'s proof, or a jump to `miss`: nothing on the chain the proof read
@@ -741,6 +757,8 @@ pub(crate) fn emit_math_identity_guard(
                 guard.op_slot[op as usize],
             );
             if bits != 0 && slot != u32::MAX && this_v < crate::bytecode::BARE_MATH_BY_NAME {
+                // `Math` by its slot, while that is its route.
+                emit_route_guard(ops, bail);
                 dynasm!(ops
                     ; mov rax, [r12 + gidx * 8]
                     ; mov r10, QWORD guard.receiver_bits as i64
@@ -2283,6 +2301,19 @@ pub(crate) fn emit_arr_mirror_iter_step(
         ; mov [rbx + dreg(done_dst)], r10     // true; the value is left
         ; jmp => done
         ; => miss
+    );
+}
+
+/// The guard a compiled global access makes first: a route changed while
+/// this code was running (`Vm::jit_route_dirty`), so the slot may no longer be
+/// the binding (deleted, or a getter, a setter or read-only attributes put
+/// behind it), and the instruction is the interpreter's. One byte compare
+/// against zero on the path every program but those takes.
+pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmrt::DynamicLabel) {
+    let off = crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32;
+    dynasm!(ops
+        ; cmp BYTE [rdi + off], 0
+        ; jne => bail
     );
 }
 

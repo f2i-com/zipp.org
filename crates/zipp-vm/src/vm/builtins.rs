@@ -1886,6 +1886,43 @@ impl<'p> Vm<'p> {
         self.try_builtin_method(recv, key, base, arg_base, argc)
     }
 
+    /// [`Vm::captured_intrinsic_lane`]'s two leaves, which run no code and
+    /// raise nothing, for the loop runner (`vm/loop_tier.rs`): a captured
+    /// `String.prototype.charCodeAt` on a flat string with an Int32 and a
+    /// captured `Array.prototype.push` on an array, each with one argument,
+    /// the callee known by its own identity (`captured_own_method`). `None`,
+    /// with nothing done, for anything else.
+    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+    pub(crate) fn captured_leaf_call(
+        &mut self,
+        recv: Value,
+        callee: Value,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<Value> {
+        if argc != 1 || !recv.is_heap() || !callee.is_heap() {
+            return None;
+        }
+        let HeapObj::Native(native_id) = *self.heap.get(callee.heap_index()) else {
+            return None;
+        };
+        let is_arr = match self.heap.get(recv.heap_index()) {
+            HeapObj::Array(_) => true,
+            HeapObj::Str(_) => false,
+            _ => return None,
+        };
+        let own = self.captured_own_method(native_id, is_arr)?;
+        let arg = self.regs[base + arg_base as usize];
+        if !is_arr && own == "charCodeAt" {
+            self.captured_char_code_at(recv, arg)
+        } else if is_arr && is_push_name(own) {
+            self.interp_array_push_fast(recv, arg)
+        } else {
+            None
+        }
+    }
+
     /// [`Vm::captured_intrinsic_lane`]'s call of a captured method by its own
     /// name `own` (see [`Vm::captured_own_method`]). Out of line: inlined into
     /// the interpreter's `CallWithThis` arm, it moved the profile-guided layout
