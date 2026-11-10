@@ -6455,7 +6455,9 @@ impl<'p> Vm<'p> {
         let outer_steps = self.meter_park();
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
+        let route = self.route_run_begin();
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        self.route_run_end(route);
         self.leave_tierc_activation(activation_token);
         #[cfg(feature = "instrument")]
         {
@@ -6549,7 +6551,9 @@ impl<'p> Vm<'p> {
         // SAFETY: `_rdtsc` has no preconditions on x86-64; the run is as
         // `try_run_jit`'s, and `head` is one of the body's heads.
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let route = self.route_run_begin();
         let (bits, bail) = unsafe { (*jitfn).run_at(regs_ptr, vm_ptr, head) };
+        self.route_run_end(route);
         let ticks = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         self.leave_tierc_activation(activation_token);
         if bail != crate::codegen::NO_BAIL
@@ -6726,7 +6730,9 @@ impl<'p> Vm<'p> {
                 let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
                     std::mem::transmute(entry);
                 let mut resume: u32 = crate::codegen::NO_BAIL;
+                let route = self.route_run_begin();
                 let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
+                self.route_run_end(route);
                 resume
             }
         };

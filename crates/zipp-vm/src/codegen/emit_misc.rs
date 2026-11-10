@@ -757,6 +757,8 @@ pub(crate) fn emit_math_identity_guard(
                 guard.op_slot[op as usize],
             );
             if bits != 0 && slot != u32::MAX && this_v < crate::bytecode::BARE_MATH_BY_NAME {
+                // `Math` by its slot, while that is its route.
+                emit_route_guard(ops, bail);
                 dynasm!(ops
                     ; mov rax, [r12 + gidx * 8]
                     ; mov r10, QWORD guard.receiver_bits as i64
@@ -2299,6 +2301,19 @@ pub(crate) fn emit_arr_mirror_iter_step(
         ; mov [rbx + dreg(done_dst)], r10     // true; the value is left
         ; jmp => done
         ; => miss
+    );
+}
+
+/// The guard a compiled global access makes first: a route changed while
+/// this code was running (`Vm::jit_route_dirty`), so the slot may no longer be
+/// the binding (deleted, or a getter, a setter or read-only attributes put
+/// behind it), and the instruction is the interpreter's. One byte compare
+/// against zero on the path every program but those takes.
+pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmrt::DynamicLabel) {
+    let off = crate::vm::host_api::JIT_ROUTE_DIRTY_OFFSET as i32;
+    dynasm!(ops
+        ; cmp BYTE [rdi + off], 0
+        ; jne => bail
     );
 }
 

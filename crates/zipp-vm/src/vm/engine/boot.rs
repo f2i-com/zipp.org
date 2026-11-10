@@ -515,6 +515,7 @@ impl<'p> Vm<'p> {
             deleted_callable_intrinsics: rustc_hash::FxHashSet::default(),
             deleted_globals: std::collections::HashSet::new(),
             global_route_epoch: 0,
+            jit_route_dirty: 0,
             jit_global_route_ok: rustc_hash::FxHashMap::default(),
             strict_unresolvable_globals: Vec::new(),
             array_length_nonwritable: crate::slot_table::SlotSet::default(),

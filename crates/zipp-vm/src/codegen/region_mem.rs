@@ -814,10 +814,12 @@ pub(crate) fn compile_region_mem(
                 );
             }
             Instr::LoadGlobal { dst, idx } => {
+                emit_route_guard(&mut ops, bail);
                 dynasm!(ops
                     ; mov rax, [r12 + (idx as i32) * 8]
                     ; mov [rbx + dreg(dst)], rax
                 );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
@@ -843,10 +845,12 @@ pub(crate) fn compile_region_mem(
                     // below reads the range directly.
                     continue;
                 }
+                emit_route_guard(&mut ops, bail);
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax
                 );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Add { dst, a, b } => {
                 // Int+Int fast path (32-bit add + overflow check, Int result —
