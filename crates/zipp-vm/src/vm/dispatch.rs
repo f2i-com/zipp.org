@@ -2192,22 +2192,25 @@ impl<'p> Vm<'p> {
                         // (so a getter sees it). For a base class the base is
                         // %Object.prototype%.
                         //
-                        // The site's stamped data way first: neither the
-                        // name nor the home class is read for it.
+                        // The site's stamped way first, a value or a getter:
+                        // neither the name nor the home class is read for it.
                         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                        if let Some(v) = self.ic_super_stamped(func_id, ip) {
-                            self.set(base, dst, v);
-                            ip += 1;
-                            continue;
-                        }
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let stamped = self.ic_super_stamped(func_id, ip);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let stamped = GetAct::None;
                         // ── interpreter super-property IC ── data reads hit
                         // directly; a cached plain GETTER frame-calls with
                         // `this` = the current receiver and ret_dst = dst.
                         {
-                            let is_static = self.func(func_id as usize).super_static;
-                            match self.ic_super_get(func_id, ip, home_class_id, is_static, key) {
+                            let act = match stamped {
+                                GetAct::None => {
+                                    let key = self.func(func_id as usize).string_constants[name as usize].as_str();
+                                    let is_static = self.func(func_id as usize).super_static;
+                                    self.ic_super_get(func_id, ip, home_class_id, is_static, key)
+                                }
+                                act => act,
+                            };
+                            match act {
                                 GetAct::Value(v) => {
                                     self.set(base, dst, v);
                                     ip += 1;
@@ -2219,6 +2222,19 @@ impl<'p> Vm<'p> {
                                     getter,
                                 } => {
                                     let this = self.get(base, 0);
+                                    // A leaf getter (`get v() { return
+                                    // this._v; }`) runs without a frame, as a
+                                    // `GetProp`'s does (`lite::leaf_scan`): a
+                                    // strict one's `this` is passed as it is.
+                                    #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
+                                    if LITE {
+                                        let strict = self.func(fid as usize).is_strict;
+                                        if let Some(v) = self.leaf_call(fid, closure, this, strict, base, 0, 0) {
+                                            self.set(base, dst, v);
+                                            ip += 1;
+                                            continue;
+                                        }
+                                    }
                                     self.setup_call(
                                         fid,
                                         closure,
@@ -2235,6 +2251,8 @@ impl<'p> Vm<'p> {
                                 GetAct::None => {}
                             }
                         }
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self
                             .super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
@@ -2250,22 +2268,33 @@ impl<'p> Vm<'p> {
                         name,
                         val,
                     } => {
-                        let key =
-                            self.func(func_id as usize).string_constants[name as usize].as_str();
-                        let this = self.get(base, 0);
-                        let v = self.get(base, val);
-                        let is_static = self.func(func_id as usize).super_static;
                         // ── interpreter super-property IC ── a cached plain
                         // SETTER on the super chain frame-calls with `this` =
                         // the receiver and ret_dst = RET_DISCARD; data writes
                         // (which go to the RECEIVER) stay on the slow path. The
                         // entry is version-guarded on the same chain the
                         // SuperBase op captured, so a retargeted base misses it.
+                        // The site's stamped setter way first
+                        // (`ic_super_set_stamped`): neither the name nor the
+                        // home class is read for it.
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        let stamped = self.ic_super_set_stamped(func_id, ip);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let stamped = SetAct::None;
+                        let act = match stamped {
+                            SetAct::None => {
+                                let key = self.func(func_id as usize).string_constants[name as usize].as_str();
+                                let is_static = self.func(func_id as usize).super_static;
+                                self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                            }
+                            act => act,
+                        };
+                        let this = self.get(base, 0);
                         if let SetAct::Setter {
                             fid,
                             closure,
                             setter,
-                        } = self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                        } = act
                         {
                             self.setup_call(
                                 fid,
@@ -2282,6 +2311,9 @@ impl<'p> Vm<'p> {
                         }
                         // PutValue strictness comes from the reference site (the
                         // enclosing function) — class methods are always strict.
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
+                        let v = self.get(base, val);
                         let strict = self.func(func_id as usize).is_strict;
                         let proto = self.get(base, base_reg);
                         self.super_set_obj(proto, &key, this, v, strict)?;

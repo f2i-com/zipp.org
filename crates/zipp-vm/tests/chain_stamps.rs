@@ -10,9 +10,11 @@
 //! default and a null prototype, `super` after the parent's method is replaced
 //! and the chain re-linked, a class evaluated more than once, prototypes that
 //! die and whose slots are reused, a six-link chain changed at each depth, a
-//! chain changed while the reading loop runs, and appends after the chain
-//! gains a setter or a read-only property of the name. In the interpreter, by
-//! default and with every function compiled at once.
+//! chain changed while the reading loop runs, appends after the chain gains a
+//! setter or a read-only property of the name, `super` getters and setters
+//! whose parent accessor is redefined, made data, removed or re-linked, and
+//! `super` in an object literal's methods. In the interpreter, by default and
+//! with every function compiled at once.
 
 const SOURCE: &str = r##""use strict";
 const out = [];
@@ -218,10 +220,43 @@ function hot(f, n) { let s = 0; for (let i = 0; i < (n || 400); i++) s = (s + f(
   r.push(String(mkn(p)), seen, mkn(null));
   out.push("N " + r.join(" "));
 }
+// 13. super getters and setters: the parent's accessor redefined, made data, removed, the chain re-linked
+{
+  class A { constructor() { this._v = 1; this.log = 0; } get v() { return this._v; } set v(x) { this._v = x | 0; } }
+  class B extends A { get v() { return super.v * 2; } set v(x) { super.v = x + 1; } }
+  class C extends B { get v() { return super.v + 1; } set v(x) { super.v = x * 2; } }
+  const objs = [new B(), new C(), new B(), new C()];
+  const run = () => { let s = 0; for (let i = 0; i < 1200; i++) { const o = objs[i & 3]; o.v = i & 255; s += o.v; } return s; };
+  const r = [run()];
+  Object.defineProperty(A.prototype, "v", { get() { return this._v + 100; }, set(x) { this._v = -x; this.log++; }, configurable: true });
+  r.push(run(), objs[0].log);
+  class Z { get v() { return 1000 + (this.z | 0); } set v(x) { this.z = x; } }
+  Object.setPrototypeOf(B.prototype, Z.prototype); r.push(run(), objs[1].z);
+  Object.setPrototypeOf(B.prototype, A.prototype); r.push(run());
+  Object.defineProperty(A.prototype, "v", { get() { return 5; }, configurable: true });
+  let threw = 0; try { run(); } catch (e) { threw = e instanceof TypeError ? 1 : 2; } r.push(threw);
+  Object.defineProperty(A.prototype, "v", { value: 7, writable: true, configurable: true });
+  r.push(run(), Object.keys(objs[0]).join("."));
+  delete A.prototype.v; r.push(String(run()));
+  out.push("S " + r.join(" "));
+}
+
+// 14. super in an object literal's methods, the home's prototype changed and replaced
+{
+  const base = { get x() { return this.k + 1; }, m() { return 10; } };
+  const obj = { k: 5, get x() { return super.x * 3; }, m() { return super.m() + 1; } };
+  Object.setPrototypeOf(obj, base);
+  const r = [hot(() => obj.x + obj.m())];
+  base.m = function () { return 20; }; r.push(hot(() => obj.x + obj.m()));
+  Object.defineProperty(base, "x", { get() { return 2; }, configurable: true }); r.push(hot(() => obj.x + obj.m()));
+  const other = { get x() { return 100; }, m() { return 30; } };
+  Object.setPrototypeOf(obj, other); r.push(hot(() => obj.x + obj.m()));
+  out.push("T " + r.join(" "));
+}
 console.log(out.join("\n"));
 "##;
 
-const EXPECTED: &str = "A 2800 3600 40000 3600 4400 5200 8400 5200 8400 5200 400 undefined 800\nB 29500\nC 1140000\nD 4200 6000 3300 -600 4800 6600 8400\nE 0 0 1600 0 0 0 0 2400 3200\nF 25600 248800 248800 11200800 248800 16800\nG 345000\nH 62800\nI 400 4000 4400 4800 5200 5600 6000 5600 5200 4800 4400 4000\nJ 12998\nK 46050 75150 300 46050 0 300 46050 46050 NaN 300300\nN 45150 45150 NaN 300 45150";
+const EXPECTED: &str = "A 2800 3600 40000 3600 4400 5200 8400 5200 8400 5200 400 undefined 800\nB 29500\nC 1140000\nD 4200 6000 3300 -600 4800 6600 8400\nE 0 0 1600 0 0 0 0 2400 3200\nF 25600 248800 248800 11200800 248800 16800\nG 345000\nH 62800\nI 400 4000 4400 4800 5200 5600 6000 5600 5200 4800 4400 4000\nJ 12998\nK 46050 75150 300 46050 0 300 46050 46050 NaN 300300\nN 45150 45150 NaN 300 45150\nS 441480 -200280 300 2841480 347 -200280 0 145968 _v.log.z.v 145960\nT 11600 15600 10800 132400";
 
 #[test]
 fn chain_stamps_worker() {

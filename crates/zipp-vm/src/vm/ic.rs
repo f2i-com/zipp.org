@@ -266,7 +266,7 @@ pub(crate) enum IcEntry {
         recv_shape: u32,
     },
     /// `set key(v)` resolved on the receiver's class chain (SetProp sites).
-    /// `recv_shape` as for `ClassGetter` (`ic_set_way0_tail`).
+    /// `recv_shape` as for `ClassGetter` (`ic_set_ways_plan`).
     ClassSetter {
         class: u32,
         ver: u32,
@@ -1925,8 +1925,8 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
     fn ic_get_acc_tail(&self, idx: u32, site: &SiteIc, shape: u32, vals: u64) -> GetAct {
-        for e in &site.entries[..site.n as usize] {
-            let act = self.ic_get_acc_way(idx, e, shape, vals);
+        for way in 0..site.n as usize {
+            let act = self.ic_get_acc_way(idx, site, way, shape, vals);
             if !matches!(act, GetAct::None) {
                 return act;
             }
@@ -1937,8 +1937,8 @@ impl<'p> Vm<'p> {
     /// One way of [`Self::ic_get_acc_tail`].
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    fn ic_get_acc_way(&self, idx: u32, e: &IcEntry, shape: u32, vals: u64) -> GetAct {
-        match *e {
+    fn ic_get_acc_way(&self, idx: u32, site: &SiteIc, way: usize, shape: u32, vals: u64) -> GetAct {
+        match site.entries[way] {
             IcEntry::OwnAcc { shape: s, slot } if s == shape => {
                 // SAFETY: as the own-data read: the matching shape proves
                 // `vals` is the map's live value column and holds `slot`.
@@ -1964,11 +1964,16 @@ impl<'p> Vm<'p> {
                 let HeapObj::Object(m) = self.heap.get(idx) else {
                     return GetAct::None;
                 };
-                if m.class.is_some()
-                    || !self.interp_own_resolve_vm_is_interpreter()
-                    || self.ic_chain_ok(idx, first, &hops).is_none()
-                {
+                if m.class.is_some() || !self.interp_own_resolve_vm_is_interpreter() {
                     return GetAct::None;
+                }
+                // The chain by the way's stamp when it has one (`SiteIc`),
+                // as an inherited data way's.
+                if site.stamp(way) != self.heap.chain_epoch || !self.ic_first_link_is(idx, first, &hops) {
+                    if self.ic_chain_ok(idx, first, &hops).is_none() {
+                        return GetAct::None;
+                    }
+                    self.ic_stamp_way(site, way, &hops);
                 }
                 self.ic_chain_acc_get(hops, slot)
             }
@@ -3193,7 +3198,7 @@ impl<'p> Vm<'p> {
     }
 
     /// [`Self::ic_set_prop_own_hit`] for the main dispatch loop, which also
-    /// takes from way 0, out of line (`ic_set_way0_tail`), an append (a
+    /// takes from way 0, out of line (`ic_set_ways_plan`), an append (a
     /// constructor's `this.x = v`) and a setter to call. Each went through
     /// the site key's text, the private and static-member tests and the full
     /// `ic_set_prop` call, whose megamorphic probe, site fetch and receiver
@@ -3240,7 +3245,12 @@ impl<'p> Vm<'p> {
                     | IcEntry::OwnAcc { .. }
                     | IcEntry::ProtoAcc { .. }
                     | IcEntry::ClassSetter { .. } => {
-                        return self.ic_set_way0_tail(func_id, ip, idx, mir.shape, val, name);
+                        // The plan under the site's borrow, then its effect.
+                        let plan = self.ic_set_ways_plan(site, idx, mir.shape);
+                        return match plan {
+                            Some(p) => self.ic_set_plan_apply(func_id, p, val, name),
+                            None => SetAct::None,
+                        };
                     }
                     _ => return SetAct::None,
                 }
@@ -3266,32 +3276,37 @@ impl<'p> Vm<'p> {
     /// reached with each subclass's starting layout, holds a way per layout,
     /// and every store that missed the first took the full `ic_set_prop`
     /// call, a ninth of a setter loop cycling four classes.
+    ///
+    /// In two calls: the plan, read under the borrow of the site the dispatch
+    /// arm already holds (`ic_set_ways_plan`), then its effect
+    /// (`ic_set_plan_apply`). As one call that changes the heap, the tail
+    /// could not take the site and fetched it again from the function's
+    /// table on every setter call and every append.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(never)]
-    fn ic_set_way0_tail(&mut self, func_id: u32, ip: usize, idx: u32, shape: u32, val: Value, name: u32) -> SetAct {
+    fn ic_set_ways_plan(&self, site: &SiteIc, idx: u32, shape: u32) -> Option<SetPlan> {
         let HeapObj::Object(m) = self.heap.get(idx) else {
-            return SetAct::None;
+            return None;
         };
-        let Some(site) = self.ic_cell(func_id, ip).and_then(|c| c.site.as_deref()) else {
-            return SetAct::None;
-        };
-        let mut plan = None;
         for way in 0..site.n as usize {
-            plan = self.ic_set_way_plan(site, way, idx, m, shape);
+            let plan = self.ic_set_way_plan(site, way, idx, m, shape);
             if plan.is_some() {
-                break;
+                return plan;
             }
         }
-        match plan {
-            Some(p) => {
-                let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
-                self.ic_apply_set(p, key, val)
-            }
-            None => SetAct::None,
-        }
+        None
     }
 
-    /// One way of [`Self::ic_set_way0_tail`].
+    /// The effect of a plan [`Self::ic_set_ways_plan`] made for the site
+    /// whose key is `name`.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(never)]
+    fn ic_set_plan_apply(&mut self, func_id: u32, plan: SetPlan, val: Value, name: u32) -> SetAct {
+        let key: &'p str = self.func(func_id as usize).string_constants[name as usize].as_str();
+        self.ic_apply_set(plan, key, val)
+    }
+
+    /// One way of [`Self::ic_set_ways_plan`].
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
     fn ic_set_way_plan(&self, site: &SiteIc, way: usize, idx: u32, m: &ObjMap, shape: u32) -> Option<SetPlan> {
@@ -3333,7 +3348,11 @@ impl<'p> Vm<'p> {
                 first,
                 hops,
                 slot,
-            } if recv_shape == shape && m.class.is_none() && self.ic_chain_ok(idx, first, &hops).is_some() => {
+            } if recv_shape == shape && m.class.is_none() => {
+                if site.stamp(way) != self.heap.chain_epoch || !self.ic_first_link_is(idx, first, &hops) {
+                    self.ic_chain_ok(idx, first, &hops)?;
+                    self.ic_stamp_way(site, way, &hops);
+                }
                 match self.ic_chain_acc_set(hops, slot) {
                     SetAct::Setter { fid, closure, setter } => Some(SetPlan::Setter { fid, closure, setter }),
                     _ => None,
@@ -5686,21 +5705,65 @@ impl<'p> Vm<'p> {
     /// running callee, the class's slot, the site, each hop's version and
     /// the holder's map for every `super.m()`: 32 cycles of a method that
     /// calls its parent's.
+    ///
+    /// An accessor entry (`super.v` through a parent's getter) answers the
+    /// same way, with the getter its holder's slot now names.
     #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
     #[inline(always)]
-    pub(crate) fn ic_super_stamped(&self, func_id: u32, ip: usize) -> Option<Value> {
-        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
-        if site.n == 0
-            || site.stamp0.get() != self.heap.chain_epoch
-            || site.class_stamp.get() != self.mi_class_epoch.wrapping_add(1)
-            || !self.deferred_ns_state.is_empty()
-        {
-            return None;
-        }
-        let IcEntry::SuperData { ref hops, slot, .. } = site.entries[0] else {
-            return None;
+    pub(crate) fn ic_super_stamped(&self, func_id: u32, ip: usize) -> GetAct {
+        let Some(site) = self.ic_super_stamped_site(func_id, ip) else {
+            return GetAct::None;
         };
-        self.ic_holder_val(hops.0[hops.1 as usize - 1].0, slot)
+        match site.entries[0] {
+            IcEntry::SuperData { ref hops, slot, .. } => {
+                match self.ic_holder_val(hops.0[hops.1 as usize - 1].0, slot) {
+                    Some(v) => GetAct::Value(v),
+                    None => GetAct::None,
+                }
+            }
+            IcEntry::SuperAcc { hops, slot, .. } => self.ic_chain_acc_get(hops, slot),
+            _ => GetAct::None,
+        }
+    }
+
+    /// [`Self::ic_super_stamped`] for a `SuperSet` site: the plain setter its
+    /// stamped accessor entry's holder names.
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    pub(crate) fn ic_super_set_stamped(&self, func_id: u32, ip: usize) -> SetAct {
+        match self.ic_super_stamped_site(func_id, ip) {
+            Some(site) => match site.entries[0] {
+                IcEntry::SuperAcc { hops, slot, .. } => self.ic_chain_acc_set(hops, slot),
+                _ => SetAct::None,
+            },
+            None => SetAct::None,
+        }
+    }
+
+    /// The site of `(func_id, ip)` when both of its way-0 stamps stand
+    /// (`ic_super_stamped`).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline(always)]
+    fn ic_super_stamped_site(&self, func_id: u32, ip: usize) -> Option<&SiteIc> {
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        (site.n != 0
+            && site.stamp0.get() == self.heap.chain_epoch
+            && site.class_stamp.get() == self.mi_class_epoch.wrapping_add(1)
+            && self.deferred_ns_state.is_empty())
+        .then_some(site)
+    }
+
+    /// Give way 0 of a super site its two stamps after its entry's hops,
+    /// `hops`, validated one by one: only for a class evaluated once, whose
+    /// value is the site's home for all running code until a class is
+    /// evaluated again (`ic_super_stamped`).
+    #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+    #[inline]
+    fn ic_super_stamp(&self, site: &SiteIc, way: usize, hops: &IcHops, home_class_id: u32) {
+        if way == 0 && hops_guarded(hops) && !self.class_repeated(home_class_id) {
+            site.set_stamp(0, self.heap.chain_epoch);
+            site.class_stamp.set(self.mi_class_epoch.wrapping_add(1));
+        }
     }
 
     /// IC for `SuperGet`: a data hit yields the value; an accessor hit yields
@@ -5725,15 +5788,8 @@ impl<'p> Vm<'p> {
                         slot,
                     } if h == home => {
                         if self.ic_super_chain_ok(&hops) {
-                            // Way 0 of a class evaluated once gets its two
-                            // stamps (`ic_super_stamped`): the home is then
-                            // the same for all running code until a class is
-                            // evaluated again.
                             #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
-                            if way == 0 && hops_guarded(&hops) && !self.class_repeated(home_class_id) {
-                                site.set_stamp(0, self.heap.chain_epoch);
-                                site.class_stamp.set(self.mi_class_epoch.wrapping_add(1));
-                            }
+                            self.ic_super_stamp(site, way, &hops, home_class_id);
                             #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
                             let _ = way;
                             if let HeapObj::Object(hm) =
@@ -5758,6 +5814,8 @@ impl<'p> Vm<'p> {
                         slot,
                     } if h == home => {
                         if self.ic_super_chain_ok(&hops) {
+                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                            self.ic_super_stamp(site, way, &hops, home_class_id);
                             match self.ic_chain_acc_get(hops, slot) {
                                 GetAct::None => {}
                                 act => return act,
@@ -5807,7 +5865,7 @@ impl<'p> Vm<'p> {
             return SetAct::None;
         };
         if let Some(site) = self.ic_site(func_id, ip) {
-            for e in &site.entries[..site.n as usize] {
+            for (way, e) in site.entries[..site.n as usize].iter().enumerate() {
                 if let IcEntry::SuperAcc {
                     home: h,
                     hops,
@@ -5815,6 +5873,10 @@ impl<'p> Vm<'p> {
                 } = *e
                 {
                     if h == home && self.ic_super_chain_ok(&hops) {
+                        #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
+                        self.ic_super_stamp(site, way, &hops, home_class_id);
+                        #[cfg(not(all(feature = "jit", not(feature = "safe-sandbox"))))]
+                        let _ = way;
                         match self.ic_chain_acc_set(hops, slot) {
                             SetAct::None => {}
                             act => return act,
