@@ -353,6 +353,22 @@ env_off_switch! {
     fn slot_jump_enabled() = "ZIPP_NO_SLOT_JUMP"
 }
 
+/// Whether this build keeps spare slots at the tables' tail (`Heap::spare`).
+/// The checked profile's tables grow by the slot each allocation takes.
+const SLOT_SPARES: bool = cfg!(not(feature = "safe-sandbox"));
+
+/// Slots the tables gain at a time once an allocation has to grow them
+/// (`Heap::grow_free_slots`).
+#[cfg(not(feature = "safe-sandbox"))]
+const SLOT_BATCH: usize = 64;
+
+env_off_switch! {
+    /// `ZIPP_NO_SLOT_BATCH=1`: the slot tables grow by the one slot each
+    /// allocation takes, for an A/B.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn slot_batch_enabled() = "ZIPP_NO_SLOT_BATCH"
+}
+
 /// A hint that the cache line at `p` is about to be read. A prefetch reads
 /// nothing architecturally and cannot fault, so any address will do. Written
 /// with SSE on x86_64 (baseline; not in the safe-sandbox profile, which has
@@ -7458,6 +7474,9 @@ pub struct Heap {
     /// guards as a prototype-chain member (`Heap::guard_version`): every
     /// step of such an object's version also moves [`Heap::chain_epoch`].
     versions: Vec<Cell<u32>>,
+    /// Slots at the tables' tail that no allocation has taken yet
+    /// (`grow_free_slots`): tombstones in every table, outside `len()`.
+    spare: u32,
     /// Moves whenever the version of a [`VERSION_GUARD`]-marked object does
     /// (a key added, removed or redefined, its [[Prototype]] replaced, its
     /// slot freed or reused). A cache entry whose chain objects were all
@@ -8537,6 +8556,7 @@ impl Heap {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             gen_raw: 0,
             versions,
+            spare: 0,
             chain_epoch: 1,
             cp_strs: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -8718,7 +8738,7 @@ impl Heap {
         // call of the function capturing it).
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 #[cfg(feature = "jit")]
                 debug_assert_eq!(
                     self.hot_mirror[idx as usize],
@@ -9389,7 +9409,7 @@ impl Heap {
         if self.payload_accounting.get() {
             return self.alloc_settled(HeapObj::Object(boxed), hot);
         }
-        let Some(idx) = self.free.pop() else {
+        let Some(idx) = self.pop_free() else {
             return self.alloc_settled(HeapObj::Object(boxed), hot);
         };
         self.reuse_slot_begin();
@@ -9503,7 +9523,7 @@ impl Heap {
     pub(crate) fn alloc_array_settled(&mut self, items: Vec<Value>) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 #[cfg(feature = "jit")]
                 debug_assert_eq!(
                     self.hot_mirror[idx as usize],
@@ -9529,7 +9549,7 @@ impl Heap {
     pub(crate) fn alloc_func_settled(&mut self, fid: u32) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::Func(fid));
                 #[cfg(feature = "jit")]
@@ -9562,7 +9582,7 @@ impl Heap {
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 // A Vec's buffer address survives the move into the slot.
                 #[cfg(feature = "jit")]
                 let upvals_raw = if upvalues.is_empty() {
@@ -9649,7 +9669,7 @@ impl Heap {
         let hot = no_hot_mirror();
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::PyAttrs { layout, vals });
                 #[cfg(feature = "jit")]
@@ -10127,7 +10147,7 @@ impl Heap {
         }
         // Reuse a reclaimed slot when one is available (its version is bumped so a
         // stale inline-cache entry for the old occupant misses).
-        if let Some(idx) = self.free.pop() {
+        if let Some(idx) = self.pop_free() {
             // Over the tombstone, as the thin paths install theirs: the
             // assignment's drop glue was a call and a read of the dead
             // occupant's tag on every general allocation into a reused slot.
@@ -10175,6 +10195,7 @@ impl Heap {
             }
             return idx;
         }
+        debug_assert_eq!(self.spare, 0, "growth with spare slots left");
         let idx = self.objs.len() as u32;
         if self.objs.len() == self.objs.capacity() {
             self.reserve_slot_growth();
@@ -10214,7 +10235,85 @@ impl Heap {
             });
             self.allocs_epoch += 1;
         }
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() && slot_batch_enabled() {
+            self.grow_free_slots();
+        }
         idx
+    }
+
+    /// After the tables grew by the slot an allocation took: add the next
+    /// [`SLOT_BATCH`]` - 1` slots behind it as free ones, so the allocations
+    /// that follow reuse them (the thin lanes: a tombstone overwritten, a
+    /// version step, a log entry) where each would have grown the tables
+    /// itself, a push onto every per-slot table and the re-caching of their
+    /// bases, per object, for as long as the heap grows.
+    ///
+    /// A slot added here is in every table what a slot a sweep freed is (the
+    /// tombstone, a cleared mirror, no charge, `GEN_OLD`), but it is not on
+    /// the free list and not in the heap's length: `spare` counts them at
+    /// the tables' tail, and `pop_free` hands them out lowest first once the
+    /// free list is empty. So objects get the slots, in the order, they would
+    /// have got by growing one at a time, and `len()` is still the number of
+    /// slots ever handed out: what the collector sizes its marks by, what
+    /// setup pins as built-ins (`Vm::set_gc_floor`; a spare slot under that
+    /// line would hold a program's object for good), and what a test counts
+    /// allocations with. Only within the capacity already reserved: the
+    /// growth policy (`reserve_slot_growth`) is not touched.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline(never)]
+    fn grow_free_slots(&mut self) {
+        let n = (SLOT_BATCH - 1).min(self.objs.capacity() - self.objs.len());
+        if n == 0 {
+            return;
+        }
+        let start = self.objs.len();
+        let len = start + n;
+        self.objs.resize_with(len, || HeapObj::Date(f64::NAN));
+        self.resident_payload_charged.resize_with(len, || Cell::new(0));
+        self.versions.resize_with(len, || Cell::new(0));
+        self.cell_vals_mirror.resize(len, Value::UNDEFINED.bits());
+        #[cfg(feature = "jit")]
+        {
+            self.hot_mirror.resize(len, HotMirror::CLEAR);
+            self.this_mirror.resize(len, Value::UNDEFINED.bits());
+            self.upvals_mirror.resize(len, 0);
+        }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.arr_mirror.resize(len, [0, 0]);
+        self.recache_mirror_raws();
+        if self.nursery {
+            self.gen.resize(len, GEN_OLD);
+            self.recache_gen_raw();
+        }
+        if self.oracle {
+            self.born.resize(len, self.epoch.saturating_sub(1));
+        }
+        self.spare = n as u32;
+    }
+
+    /// A slot an allocation can take without growing the tables: the last
+    /// one a sweep freed, else the lowest spare one (`grow_free_slots`).
+    #[inline(always)]
+    fn pop_free(&mut self) -> Option<u32> {
+        match self.free.pop() {
+            Some(idx) => Some(idx),
+            None => self.pop_spare(),
+        }
+    }
+
+    /// Out of line: the allocation lanes are inlined where objects are made,
+    /// and with this body in each of them a loop of short-lived literals ran
+    /// a tenth slower (the lanes' callers stopped inlining them).
+    #[cold]
+    #[inline(never)]
+    fn pop_spare(&mut self) -> Option<u32> {
+        if !SLOT_SPARES || self.spare == 0 {
+            return None;
+        }
+        let idx = (self.objs.len() - self.spare as usize) as u32;
+        self.spare -= 1;
+        Some(idx)
     }
 
     /// Record the embedder's resident-byte ceiling (`usize::MAX` = none).
@@ -10773,6 +10872,19 @@ impl Heap {
         if max == 0 {
             return false;
         }
+        // A shaped object's slot count is its shape's property count, and its
+        // mirror names that shape on the line the store has just read. The
+        // slot and the map behind it are two more, and cold for a holder the
+        // program has not touched since it was promoted: a store of a fresh
+        // object into a field of a long-lived record waited on both. (A
+        // Python attribute table's layout id is above every shape.)
+        #[cfg(feature = "jit")]
+        {
+            let sh = self.hot_mirror[holder as usize].shape;
+            if sh != crate::shape::DICT && (sh as usize) < crate::shape::SHAPE_MAX {
+                return crate::shape::len(sh) as usize <= max;
+            }
+        }
         match &self.objs[holder as usize] {
             HeapObj::Array(items) => items.len() <= max,
             HeapObj::Object(map) => map.vals.len() <= max,
@@ -11032,7 +11144,11 @@ impl Heap {
     /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
     #[inline]
     pub fn len(&self) -> usize {
-        self.objs.len()
+        if SLOT_SPARES {
+            self.objs.len() - self.spare as usize
+        } else {
+            self.objs.len()
+        }
     }
 
     /// O(1) resident-byte estimate: the slot tables and pools at their capacity
@@ -11747,7 +11863,7 @@ impl Heap {
         // here, from a count with zero floated garbage in it.
         self.major_at = (live.saturating_mul(GC_GROWTH))
             .max(GC_MIN_THRESHOLD)
-            .max(self.objs.len() / 2);
+            .max(self.len() / 2);
         self.gc_threshold = if self.nursery {
             // Next collection: a minor, one young budget from now (whether it
             // stays a minor is `note_minor_done`'s post-sweep decision).
@@ -11802,7 +11918,7 @@ impl Heap {
         }
         // Refresh the sweep-amortisation floor: the slot vector may have
         // grown since the last major, and a major sweep walks all of it.
-        self.major_at = self.major_at.max(self.objs.len() / 2);
+        self.major_at = self.major_at.max(self.len() / 2);
         if live >= self.major_at {
             self.major_due = true;
         }
@@ -12166,7 +12282,7 @@ impl Heap {
             && js.byte_capacity() < BIG_PAYLOAD_BYTES
             && ALLOCATOR_REPORTS.load(Ordering::Relaxed)
         {
-            if let Some(idx) = self.free.pop() {
+            if let Some(idx) = self.pop_free() {
                 #[cfg(feature = "jit")]
                 debug_assert_eq!(
                     self.hot_mirror[idx as usize],
