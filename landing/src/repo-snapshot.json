@@ -1,53 +1,53 @@
 {
-  "generated_at": "2026-11-07T06:00:49.948Z",
+  "generated_at": "2026-11-11T09:29:50.471Z",
   "stale": false,
   "source": {
     "repo": "f2i-com/zipp.org",
     "branch": "main",
-    "commit": "5e6586bb32c8ed8954ba75bcc681c6a297d1e73f"
+    "commit": "332ce013c544e489c30937f32b2431189f0df8da"
   },
   "repo": {
-    "stars": 8,
+    "stars": 9,
     "forks": 0,
-    "open_issues": 0,
-    "pushed_at": "2026-11-07T05:44:35Z",
+    "open_issues": 1,
+    "pushed_at": "2026-11-11T08:40:59Z",
     "license": "Apache-2.0"
   },
   "release": {
-    "tag": "v0.0.33",
-    "name": "ZIPP v0.0.33",
-    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.33",
-    "published_at": "2026-11-07T05:09:46Z"
+    "tag": "v0.0.35",
+    "name": "ZIPP v0.0.35",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.35",
+    "published_at": "2026-11-11T09:16:33Z"
   },
   "releases": [
+    {
+      "tag": "v0.0.35",
+      "name": "ZIPP v0.0.35",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.35",
+      "published_at": "2026-11-11T09:16:33Z"
+    },
+    {
+      "tag": "v0.0.34",
+      "name": "ZIPP v0.0.34",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.34",
+      "published_at": "2026-11-11T03:43:40Z"
+    },
     {
       "tag": "v0.0.33",
       "name": "ZIPP v0.0.33",
       "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.33",
       "published_at": "2026-11-07T05:09:46Z"
-    },
-    {
-      "tag": "v0.0.32",
-      "name": "ZIPP v0.0.32",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.32",
-      "published_at": "2026-10-29T14:58:55Z"
-    },
-    {
-      "tag": "v0.0.31",
-      "name": "ZIPP v0.0.31",
-      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.31",
-      "published_at": "2026-10-29T09:03:03Z"
     }
   ],
   "commits": {
     "latest": {
-      "sha": "5e6586bb32c8ed8954ba75bcc681c6a297d1e73f",
-      "message": "Merge dev into main: the 0.0.33 notes' QuickJS program comparison [skip ci]",
-      "date": "2026-11-07T05:44:33Z",
-      "url": "https://github.com/f2i-com/zipp.org/commit/5e6586bb32c8ed8954ba75bcc681c6a297d1e73f"
+      "sha": "332ce013c544e489c30937f32b2431189f0df8da",
+      "message": "Merge dev into main: prepare 0.0.35 [skip ci]",
+      "date": "2026-11-11T08:40:31Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/332ce013c544e489c30937f32b2431189f0df8da"
     }
   },
-  "version": "0.0.33",
+  "version": "0.0.35",
   "readme": {
     "test262_pct": 99.999,
     "test262_pass": 96227,
