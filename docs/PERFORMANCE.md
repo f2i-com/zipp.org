@@ -132,6 +132,40 @@ release product with the canonical benchmark product; it is not the effect of
 profile guidance alone, which would take a feature- and flag-matched pair to
 measure.
 
+### Release 0.0.35, as published
+
+The 0.0.35 release notes measure the 0.0.35 Windows binary from the release
+build's dry run (the release's engine source, the same profile-guided recipe)
+against the published 0.0.34 and Node 24.19.0 on 11 November 2026: an
+otherwise idle Ryzen 9 9950X3D, address-space randomization off, each run
+pinned to one core, the code cache off, medians of 9 runs with every engine
+interleaved (7 for the TypeScript bundle). This is a release comparison taken
+with scratch scripts, not a stamped capture like the ones above. Ratios are
+0.0.35 / the other engine; every engine that finishes a bundle prints the
+same output as ZIPP.
+
+| Bundled application, cache off | / 0.0.34 | / Node 24 | interpreted / 0.0.34 | interpreted / `node --jitless` |
+|---|---:|---:|---:|---:|
+| Babel | 1.00× | 3.83× | 0.99× | 1.79× |
+| TypeScript | 1.01× | Node fails | 1.00× | Node fails |
+| Prettier | 1.02× | 1.12× | 1.02× | 1.49× |
+| marked, lodash, acorn, terser, three.js, immer, RxJS, date-fns | 1.01× | 1.68× | 1.00× | 1.60× |
+| Vue server rendering | 1.00× | 1.00× | 0.99× | 0.96× |
+| Preact server rendering | 1.00× | 0.97× | 0.91× | 0.84× |
+| React server rendering | 0.98× | 0.90× | 1.00× | 0.88× |
+
+Over 90 benchmark programs (outputs identical to 0.0.34's in both lanes)
+0.0.35 takes 0.984× 0.0.34's time with the JIT and 0.595× Node 24's, ahead of
+Node on 72 of the 89 programs Node runs (0.0.34 in the same runs: 71); the
+compiled code's bail-out blocks, now placed after a function's code, take
+`class-prototype-hot` to 0.81× and `sparse-array` to 0.85×. Interpreted, with
+no native code at all (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`), it takes 0.997×
+0.0.34's time and 0.781× `node --jitless`'s, ahead on 71 of 89 (70). The
+published binary, built afterwards from the same source by the same recipe, is
+within 2% of the measured one on 35 of 40 program-and-lane comparisons; the
+notes list the other five. The full tables are in
+[docs/releases/0.0.35.md](releases/0.0.35.md#performance).
+
 ### Release 0.0.33, as published
 
 The 0.0.33 release notes measure the 0.0.33 Windows binary from the release
