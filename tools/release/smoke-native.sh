@@ -72,6 +72,39 @@ for jit in on off; do
     exit 1
   fi
 done
+# The interpreter's loop runner (x86_64 only): every handler hands off to the
+# next with a jump, so a chain of them takes no native stack. A build in which
+# a hand-off stayed a call (a profile-guided build's indirect-call promotion
+# stitched handlers together and called the rest) still runs correctly, the
+# runner noticing at each back-edge, but slowly; the trace names such an entry.
+if [[ "$arch" == x86_64 ]]; then
+  cat > "$work/runner.js" <<'SMOKE'
+var g = 0;
+function inner(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + i * 3) | 0; return s; }
+class Box { constructor() { this.v = 1; } step(x) { var t = this.v; for (var i = 0; i < x; i++) t = (t + i) | 0; this.v = t & 1023; return t; } }
+function mk(k) { var c = 0; return function (a) { c = (c + a + k) | 0; return c; }; }
+var m = new Map(), b = new Box(), f = mk(3), o = { x: 1, y: 2 }, a = [1, 2, 3, 4], str = "", s = 0;
+for (var i = 0; i < 200000; i++) {
+  g = (g + (i & 7)) | 0;
+  o.x = o.y + (i & 1);
+  a[i & 3] = a[(i + 1) & 3] + 1;
+  m.set(i & 255, (m.get(i & 255) | 0) + 1);
+  if ((i & 1023) === 0) str = "k" + i + ":" + o.x;
+  s = (s + inner(i & 7) + b.step(i & 3) + f(i & 15) + str.length + a.length) | 0;
+}
+console.log("zipp-runner-smoke", g, s, m.size, o.x, b.v);
+SMOKE
+  runner="$(ZIPP_NOJIT=1 ZIPP_LOOP_RUNNER_TRACE=1 "$@" js runner.js 2>&1 | tr -d '\r')"
+  if ! grep -qx 'zipp-runner-smoke 700000 -347573808 256 3 321' <<<"$runner"; then
+    echo "runner smoke output: $(grep -v '^\[loop\]' <<<"$runner")" >&2
+    exit 1
+  fi
+  if grep -q 'grew the native stack' <<<"$runner"; then
+    echo "a loop-runner handler hands off with a call, not a jump:" >&2
+    grep -m 5 'grew the native stack' <<<"$runner" >&2
+    exit 1
+  fi
+fi
 python="$("$@" py smoke.py | tr -d '\r')"
 if [[ "$python" != "zipp-release-smoke 14 ['b', 'a']" ]]; then
   echo "python smoke output: $python" >&2
