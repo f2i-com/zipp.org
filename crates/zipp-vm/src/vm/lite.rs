@@ -341,6 +341,10 @@ const LEAF_THIS: u8 = 2;
 const LEAF_NO: u8 = 3;
 /// Registers a leaf may have: its window is on the stack.
 const LEAF_MAX_REGS: usize = 16;
+/// `LEAF_MAX_REGS - 1`: a leaf's register operand, masked, indexes its window
+/// without a bounds check (`leaf_scan` keeps every operand below 16).
+const LEAF_REG_MASK: usize = LEAF_MAX_REGS - 1;
+const _: () = assert!(LEAF_MAX_REGS.is_power_of_two());
 /// Declines (`Vm::lite_leaf_run`) after which a leaf takes a frame for good.
 const LEAF_BAIL_LIMIT: u8 = 32;
 
@@ -744,9 +748,13 @@ impl<'p> Vm<'p> {
         }
         // `arguments` for its length alone (`leaf_scan`): the count.
         if let Some(areg) = p.arguments_reg {
-            r[areg as usize] = Value::int(argc as i32);
+            r[areg as usize & LEAF_REG_MASK] = Value::int(argc as i32);
         }
         let mut ip = 0;
+        // The closure's upvalue list, read at the run's first captured
+        // variable (`closure_upvalue_cached`): each access fetched the
+        // closure from the heap and the list's header first.
+        let mut upc: (*const u32, usize) = (std::ptr::null(), 0);
         macro_rules! decline {
             () => {{
                 let b = &mut self.lite.leaf_bails[fid as usize];
@@ -759,7 +767,7 @@ impl<'p> Vm<'p> {
         }
         macro_rules! num2 {
             ($a:expr, $b:expr, $int:expr, $f:expr) => {{
-                let (x, y) = (r[$a as usize], r[$b as usize]);
+                let (x, y) = (r[$a as usize & LEAF_REG_MASK], r[$b as usize & LEAF_REG_MASK]);
                 if x.is_int() && y.is_int() {
                     $int(x.as_int(), y.as_int())
                 } else if x.is_number() && y.is_number() {
@@ -771,12 +779,12 @@ impl<'p> Vm<'p> {
         }
         loop {
             match code[ip] {
-                Instr::LoadInt { dst, val } => r[dst as usize] = Value::int(val),
-                Instr::LoadConst { dst, idx } => r[dst as usize] = p.constants[idx as usize],
-                Instr::LoadBool { dst, val } => r[dst as usize] = Value::bool(val),
-                Instr::LoadNull { dst } => r[dst as usize] = Value::NULL,
-                Instr::LoadUndefined { dst } => r[dst as usize] = Value::UNDEFINED,
-                Instr::Move { dst, src } => r[dst as usize] = r[src as usize],
+                Instr::LoadInt { dst, val } => r[dst as usize & LEAF_REG_MASK] = Value::int(val),
+                Instr::LoadConst { dst, idx } => r[dst as usize & LEAF_REG_MASK] = p.constants[idx as usize],
+                Instr::LoadBool { dst, val } => r[dst as usize & LEAF_REG_MASK] = Value::bool(val),
+                Instr::LoadNull { dst } => r[dst as usize & LEAF_REG_MASK] = Value::NULL,
+                Instr::LoadUndefined { dst } => r[dst as usize & LEAF_REG_MASK] = Value::UNDEFINED,
+                Instr::Move { dst, src } => r[dst as usize & LEAF_REG_MASK] = r[src as usize & LEAF_REG_MASK],
                 // The lite loop's reads: a binding in its TDZ, and a global
                 // the slow route answers, throw or run code there.
                 Instr::LoadGlobal { dst, idx } => {
@@ -784,17 +792,17 @@ impl<'p> Vm<'p> {
                     if v.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
                         decline!();
                     }
-                    r[dst as usize] = v;
+                    r[dst as usize & LEAF_REG_MASK] = v;
                 }
                 Instr::UpvalGet { dst, idx } => {
                     if closure == NO_CLOSURE {
                         decline!();
                     }
-                    let v = self.heap.cell_get(self.closure_upvalue(closure, idx));
+                    let v = self.heap.cell_get(self.closure_upvalue_cached(&mut upc, closure, idx));
                     if v.is_uninitialized() {
                         decline!();
                     }
-                    r[dst as usize] = v;
+                    r[dst as usize & LEAF_REG_MASK] = v;
                 }
                 // The body's one effect, past which nothing declines
                 // (`leaf_scan`); the lite loop's checks first: a `const`, a
@@ -804,32 +812,32 @@ impl<'p> Vm<'p> {
                     if closure == NO_CLOSURE {
                         decline!();
                     }
-                    let cell = self.closure_upvalue(closure, idx);
+                    let cell = self.closure_upvalue_cached(&mut upc, closure, idx);
                     if (!self.const_cells.is_empty() && self.const_cells.contains(&cell))
                         || (!self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell))
                         || self.heap.cell_get(cell).is_uninitialized()
                     {
                         decline!();
                     }
-                    self.heap.upval_cell_set(cell, r[src as usize]);
+                    self.heap.upval_cell_set(cell, r[src as usize & LEAF_REG_MASK]);
                 }
                 Instr::Eq { dst, a, b } | Instr::Ne { dst, a, b } => {
-                    let (x, y) = (r[a as usize], r[b as usize]);
+                    let (x, y) = (r[a as usize & LEAF_REG_MASK], r[b as usize & LEAF_REG_MASK]);
                     // Two different heap values may be equal strings, which
                     // a comparison may flatten: the frame's.
                     if x.is_heap() && y.is_heap() && x.bits() != y.bits() {
                         decline!();
                     }
                     let eq = self.strict_eq_fast(x, y);
-                    r[dst as usize] = Value::bool(eq == matches!(code[ip], Instr::Eq { .. }));
+                    r[dst as usize & LEAF_REG_MASK] = Value::bool(eq == matches!(code[ip], Instr::Eq { .. }));
                 }
-                Instr::Not { dst, a } => match r[a as usize].truthy_primitive() {
-                    Some(t) => r[dst as usize] = Value::bool(!t),
+                Instr::Not { dst, a } => match r[a as usize & LEAF_REG_MASK].truthy_primitive() {
+                    Some(t) => r[dst as usize & LEAF_REG_MASK] = Value::bool(!t),
                     None => decline!(),
                 },
                 Instr::Neg { dst, a } => {
-                    let x = r[a as usize];
-                    r[dst as usize] = if x.is_int() {
+                    let x = r[a as usize & LEAF_REG_MASK];
+                    r[dst as usize & LEAF_REG_MASK] = if x.is_int() {
                         match x.as_int() {
                             0 => Value::num(-0.0),
                             i => match i.checked_neg() {
@@ -848,7 +856,7 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
-                    let Some(t) = r[cond as usize].truthy_primitive() else {
+                    let Some(t) = r[cond as usize & LEAF_REG_MASK].truthy_primitive() else {
                         decline!();
                     };
                     if t == matches!(code[ip], Instr::JumpIfTrue { .. }) {
@@ -857,7 +865,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 Instr::Add { dst, a, b } => {
-                    r[dst as usize] = num2!(
+                    r[dst as usize & LEAF_REG_MASK] = num2!(
                         a,
                         b,
                         |x: i32, y: i32| match x.checked_add(y) {
@@ -868,7 +876,7 @@ impl<'p> Vm<'p> {
                     )
                 }
                 Instr::Sub { dst, a, b } => {
-                    r[dst as usize] = num2!(
+                    r[dst as usize & LEAF_REG_MASK] = num2!(
                         a,
                         b,
                         |x: i32, y: i32| match x.checked_sub(y) {
@@ -879,7 +887,7 @@ impl<'p> Vm<'p> {
                     )
                 }
                 Instr::Mul { dst, a, b } => {
-                    r[dst as usize] = num2!(
+                    r[dst as usize & LEAF_REG_MASK] = num2!(
                         a,
                         b,
                         // A zero product with a negative operand is -0.
@@ -890,13 +898,13 @@ impl<'p> Vm<'p> {
                         |x: f64, y: f64| Value::num(x * y)
                     )
                 }
-                Instr::Lt { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x < y), |x, y| Value::bool(x < y)),
-                Instr::Le { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x <= y), |x, y| Value::bool(x <= y)),
-                Instr::Gt { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x > y), |x, y| Value::bool(x > y)),
-                Instr::Ge { dst, a, b } => r[dst as usize] = num2!(a, b, |x, y| Value::bool(x >= y), |x, y| Value::bool(x >= y)),
+                Instr::Lt { dst, a, b } => r[dst as usize & LEAF_REG_MASK] = num2!(a, b, |x, y| Value::bool(x < y), |x, y| Value::bool(x < y)),
+                Instr::Le { dst, a, b } => r[dst as usize & LEAF_REG_MASK] = num2!(a, b, |x, y| Value::bool(x <= y), |x, y| Value::bool(x <= y)),
+                Instr::Gt { dst, a, b } => r[dst as usize & LEAF_REG_MASK] = num2!(a, b, |x, y| Value::bool(x > y), |x, y| Value::bool(x > y)),
+                Instr::Ge { dst, a, b } => r[dst as usize & LEAF_REG_MASK] = num2!(a, b, |x, y| Value::bool(x >= y), |x, y| Value::bool(x >= y)),
                 Instr::AddInt { dst, a, imm, .. } => {
-                    let x = r[a as usize];
-                    r[dst as usize] = if x.is_int() {
+                    let x = r[a as usize & LEAF_REG_MASK];
+                    r[dst as usize & LEAF_REG_MASK] = if x.is_int() {
                         match x.as_int().checked_add(imm) {
                             Some(v) => Value::int(v),
                             None => Value::num(x.as_int() as f64 + imm as f64),
@@ -909,7 +917,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::Bitwise { dst, a, b, op } => {
                     // `fused_bitwise`'s Number path: ToInt32 of each.
-                    let (x, y) = (r[a as usize], r[b as usize]);
+                    let (x, y) = (r[a as usize & LEAF_REG_MASK], r[b as usize & LEAF_REG_MASK]);
                     let (x, y) = if x.is_int() && y.is_int() {
                         (x.as_int(), y.as_int())
                     } else {
@@ -918,7 +926,7 @@ impl<'p> Vm<'p> {
                             None => decline!(),
                         }
                     };
-                    r[dst as usize] = match op {
+                    r[dst as usize & LEAF_REG_MASK] = match op {
                         B::And => Value::int(x & y),
                         B::Or => Value::int(x | y),
                         B::Xor => Value::int(x ^ y),
@@ -928,9 +936,9 @@ impl<'p> Vm<'p> {
                     };
                 }
                 Instr::GetProp { dst, obj, name } => {
-                    let o = r[obj as usize];
+                    let o = r[obj as usize & LEAF_REG_MASK];
                     if let Some(v) = self.ic_get_prop_own_hit(fid, ip, o) {
-                        r[dst as usize] = v;
+                        r[dst as usize & LEAF_REG_MASK] = v;
                     } else {
                         // The site's inherited or dictionary-hint way (a
                         // `Math` method's read), as the lite loop's arm
@@ -939,20 +947,20 @@ impl<'p> Vm<'p> {
                         match self.ic_get_prop_proto_hit(fid, ip, o, key) {
                             Some(v) => {
                                 self.ic_proto_hit_settle(o);
-                                r[dst as usize] = v;
+                                r[dst as usize & LEAF_REG_MASK] = v;
                             }
                             None => decline!(),
                         }
                     }
                 }
                 Instr::Div { dst, a, b } => {
-                    r[dst as usize] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 / y as f64), |x: f64, y: f64| {
+                    r[dst as usize & LEAF_REG_MASK] = num2!(a, b, |x: i32, y: i32| Value::num(x as f64 / y as f64), |x: f64, y: f64| {
                         Value::num(x / y)
                     })
                 }
                 // JS `%` on Numbers is C's fmod: the dividend's sign, -0 kept.
                 Instr::Mod { dst, a, b } => {
-                    r[dst as usize] = num2!(a, b, super::helpers_num2::js_rem_int, |x: f64, y: f64| {
+                    r[dst as usize & LEAF_REG_MASK] = num2!(a, b, super::helpers_num2::js_rem_int, |x: f64, y: f64| {
                         Value::num(super::helpers_num2::js_rem(x, y))
                     })
                 }
@@ -969,8 +977,8 @@ impl<'p> Vm<'p> {
                     } else {
                         self.math_method_is_intrinsic(
                             native::MATH_METHOD_BASE + op as u16,
-                            r[callee as usize],
-                            r[this_v as usize],
+                            r[callee as usize & LEAF_REG_MASK],
+                            r[this_v as usize & LEAF_REG_MASK],
                         )
                     };
                     let args = &r[arg_base as usize..(arg_base + argc) as usize];
@@ -987,9 +995,9 @@ impl<'p> Vm<'p> {
                             Err(_) => decline!(),
                         },
                     };
-                    r[dst as usize] = v;
+                    r[dst as usize & LEAF_REG_MASK] = v;
                 }
-                Instr::Return { src } => return Some(r[src as usize]),
+                Instr::Return { src } => return Some(r[src as usize & LEAF_REG_MASK]),
                 Instr::ReturnUndefined => return Some(Value::UNDEFINED),
                 _ => decline!(),
             }

@@ -12764,13 +12764,13 @@ impl Heap {
     #[inline]
     pub(crate) fn upval_cell_set(&mut self, idx: u32, v: Value) {
         debug_assert!(matches!(self.get(idx), HeapObj::Cell));
-        self.write_barrier_val(idx, v);
-        if self.oracle
-            && v.is_heap()
-            && !self.oracle_young(idx)
-            && self.oracle_young(v.heap_index())
-        {
-            gcoracle::hit(gcoracle::CELL_SET);
+        // Only a heap value can make an old-to-young edge: a number's store
+        // is the mirror's alone (the barrier stayed a call where inlined).
+        if v.is_heap() {
+            self.write_barrier_val(idx, v);
+            if self.oracle && !self.oracle_young(idx) && self.oracle_young(v.heap_index()) {
+                gcoracle::hit(gcoracle::CELL_SET);
+            }
         }
         self.cell_vals_mirror[idx as usize] = v.bits();
     }
