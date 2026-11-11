@@ -2317,16 +2317,69 @@ pub(crate) fn emit_route_guard(ops: &mut dynasmrt::x64::Assembler, bail: dynasmr
     );
 }
 
+thread_local! {
+    /// The bail blocks of the compiles in progress on this thread, innermost
+    /// last (`DeferredBails`): each block's label, resume ip and epilogue.
+    static DEFERRED_BAILS: std::cell::RefCell<Vec<Vec<(dynasmrt::DynamicLabel, i32, dynasmrt::DynamicLabel)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A compile's bail blocks, emitted after its code: while one is alive,
+/// [`emit_region_bail`] records each block here, and [`Self::flush`] emits
+/// them all, after the epilogue's `ret` and before `finalize`. Inline, every
+/// bailing op's success path jumped over its block, a taken jump per op on
+/// every iteration, and the blocks spread a loop's code over more lines.
+/// Dropped without a flush (a compile that gave up), it forgets them.
+pub(crate) struct DeferredBails(());
+
+impl DeferredBails {
+    pub(crate) fn begin() -> Self {
+        DEFERRED_BAILS.with(|d| d.borrow_mut().push(Vec::new()));
+        DeferredBails(())
+    }
+
+    /// Emit every block recorded since [`Self::begin`].
+    pub(crate) fn flush(&self, ops: &mut dynasmrt::x64::Assembler) {
+        let list = DEFERRED_BAILS.with(|d| d.borrow_mut().last_mut().map(std::mem::take).unwrap_or_default());
+        for (bail, ip, epilogue) in list {
+            dynasm!(ops
+                ; => bail
+                ; mov DWORD [rsi], ip
+                ; jmp => epilogue
+            );
+        }
+    }
+}
+
+impl Drop for DeferredBails {
+    fn drop(&mut self) {
+        DEFERRED_BAILS.with(|d| {
+            d.borrow_mut().pop();
+        });
+    }
+}
+
 /// Emit a region op's bail block: the success path skips it; the block records
 /// the resume ip into `[rsi]` and jumps to the shared epilogue (which restores
 /// the 4-push/40-byte frame). Unlike the function JIT no result is set — a
-/// region's `run` ignores rax and reads only the resume ip.
+/// region's `run` ignores rax and reads only the resume ip. Inside a compile
+/// that defers its bails (`DeferredBails`) the block goes after the code.
 pub(crate) fn emit_region_bail(
     ops: &mut dynasmrt::x64::Assembler,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
     epilogue: dynasmrt::DynamicLabel,
 ) {
+    let deferred = DEFERRED_BAILS.with(|d| match d.borrow_mut().last_mut() {
+        Some(list) => {
+            list.push((bail, ip as i32, epilogue));
+            true
+        }
+        None => false,
+    });
+    if deferred {
+        return;
+    }
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; jmp => done
