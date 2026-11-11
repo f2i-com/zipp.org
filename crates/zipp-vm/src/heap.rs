@@ -2273,14 +2273,26 @@ impl ValSlabClass {
             return base;
         }
         if self.cursor + cap > VAL_SLAB_CHUNK {
-            self.chunks
-                .push(Box::new([Value::UNDEFINED; VAL_SLAB_CHUNK]));
-            self.cursor = 0;
+            self.grow_chunk();
         }
         let chunk = self.chunks.last_mut().expect("chunk just ensured");
         let base = unsafe { chunk.as_mut_ptr().add(self.cursor) }.expose_provenance();
         self.cursor += cap;
         base
+    }
+
+    /// A new chunk, built on the heap where it lives: `Box::new([v; N])`
+    /// built its 32 KiB on the stack and copied it over, and inlined, that
+    /// frame was every allocating caller's, probed page by page at each call
+    /// (`__chkstk`: an object literal's handler reserved 33 KB to make a
+    /// two-key object).
+    #[cold]
+    #[inline(never)]
+    fn grow_chunk(&mut self) {
+        let chunk: Box<[Value]> = vec![Value::UNDEFINED; VAL_SLAB_CHUNK].into_boxed_slice();
+        let chunk: Box<[Value; VAL_SLAB_CHUNK]> = chunk.try_into().expect("VAL_SLAB_CHUNK values");
+        self.chunks.push(chunk);
+        self.cursor = 0;
     }
 
     #[inline]
