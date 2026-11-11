@@ -3696,6 +3696,8 @@ pub(crate) fn compile_proto_mem(
     let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
     // Shared epilogue: every Return / bail records [rsi] then jumps here.
     let epilogue = ops.new_dynamic_label();
+    // Every bail block after the code (`DeferredBails`).
+    let deferred_bails = super::emit_misc::DeferredBails::begin();
     // ── Q4 leaf-call inlining (Tier C) ── inline a monomorphic plain-leaf callee
     // at a Call site over a scratch window carved above the whole-function frame.
     let do_leaf = !leaf_plan.is_empty();
@@ -9123,6 +9125,7 @@ pub(crate) fn compile_proto_mem(
     } else {
         Vec::new()
     };
+    deferred_bails.flush(&mut ops);
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     if !op_offsets.is_empty() {

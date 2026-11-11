@@ -467,6 +467,8 @@ pub(crate) fn compile_region_mem(
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
     let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
     let epilogue = ops.new_dynamic_label();
+    // Every bail block after the code (`DeferredBails`).
+    let deferred_bails = super::emit_misc::DeferredBails::begin();
     // Resume in the interpreter at the loop header if the hoisted `.length`
     // compute deopts at entry (`g` isn't a string/array).
     let entry_len_bail = ops.new_dynamic_label();
@@ -5578,6 +5580,7 @@ pub(crate) fn compile_region_mem(
     } else {
         Vec::new()
     };
+    deferred_bails.flush(&mut ops);
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     if !op_offsets.is_empty() {
