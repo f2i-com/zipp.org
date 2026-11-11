@@ -514,14 +514,41 @@ arith!(h_sub, s_sub, h_out, checked_sub, -, |_, _, _| true);
 // A zero product with a negative operand is -0, a double: the arm's.
 arith!(h_mul, s_mul, h_out, checked_mul, *, |x, y, v| v != 0 || (x | y) >= 0);
 
+/// Whether `+` on `x` and `y` runs no program code: neither is an object,
+/// whose conversion calls its `valueOf` or `toString`, nor a Symbol (a
+/// TypeError, raised before anything runs, but kept with the general case).
+/// Then nothing can move the register file or change how a global is
+/// reached, and the handler goes on by `after_alloc`, not `finish`.
+#[inline(always)]
+fn add_runs_no_code(vm: &Vm, x: Value, y: Value) -> bool {
+    (!x.is_heap() || vm.heap.is_str_like(x.heap_index())) && (!y.is_heap() || vm.heap.is_str_like(y.heap_index()))
+}
+
+/// A `heavy!` body's answer after `+` that ran no program code
+/// (`add_runs_no_code`): the result to `c`, on by `after_alloc`.
+#[inline(always)]
+unsafe fn added(cx: Cx, r: Result<Value, Thrown>) -> Done {
+    match r {
+        Ok(v) => {
+            cx.put(cx.c(), v.bits());
+            after_alloc(cx, cx.after(1))
+        }
+        Err(e) => raise(cx, e),
+    }
+}
+
 heavy!(
     /// `Add` on operands that are not two Numbers: the general `+` (a
     /// string's concatenation, an object's conversion, BigInts).
     h_add_any,
     b_add_any,
     |cx, go, out| {
+        let vm = cx.vm();
         let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
-        finish(cx, cx.vm().add_values(x, y))
+        if add_runs_no_code(vm, x, y) {
+            return added(cx, vm.add_values(x, y));
+        }
+        finish(cx, vm.add_values(x, y))
     }
 );
 
@@ -531,8 +558,12 @@ heavy!(
     h_str_chain,
     b_str_chain,
     |cx, go, out| {
+        let vm = cx.vm();
         let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
-        finish(cx, cx.vm().add_values_chain(x, y))
+        if add_runs_no_code(vm, x, y) {
+            return added(cx, vm.add_values_chain(x, y));
+        }
+        finish(cx, vm.add_values_chain(x, y))
     }
 );
 
@@ -545,11 +576,14 @@ heavy!(
     |cx, go, out| {
         let vm = cx.vm();
         let (x, y) = (Value::from_bits(cx.get(cx.a())), Value::from_bits(cx.get(cx.b())));
-        let r = match vm.str_append_inplace(x, y) {
-            Some(r) => Ok(r),
-            None => vm.add_values(x, y),
-        };
-        finish(cx, r)
+        // `str_append_inplace` answers only when `y` needs no conversion.
+        if let Some(r) = vm.str_append_inplace(x, y) {
+            return added(cx, Ok(r));
+        }
+        if add_runs_no_code(vm, x, y) {
+            return added(cx, vm.add_values(x, y));
+        }
+        finish(cx, vm.add_values(x, y))
     }
 );
 
@@ -558,8 +592,13 @@ heavy!(
     h_to_str,
     b_to_str,
     |cx, go, out| {
+        let vm = cx.vm();
         let x = Value::from_bits(cx.get(cx.a()));
-        finish(cx, cx.vm().to_str_value(x))
+        // A primitive's or a string's ToString runs no program code.
+        if add_runs_no_code(vm, x, x) {
+            return added(cx, vm.to_str_value(x));
+        }
+        finish(cx, vm.to_str_value(x))
     }
 );
 
@@ -1125,14 +1164,37 @@ h!(
 
 heavy!(
     /// `LoadConst` of a string: `c` = the constant `k` of the function, as
-    /// the dispatch arm resolves it.
-    h_load_const,
+    /// the dispatch arm resolves it (its first read interns it).
+    h_load_const_heavy,
     b_load_const,
     |cx, go, out| {
         let vm = cx.vm();
         let v = vm.resolve_const_slot(vm.lite.loops.func, cx.k() as u32);
         cx.put(cx.c(), v.bits());
         go(cx, cx.after(1))
+    }
+);
+
+h!(
+    /// `LoadConst` of a string: its resolved value from the constant cache
+    /// (`resolve_const_string`'s first step), read inline; a constant not
+    /// resolved yet, or the cache off, is `h_load_const_heavy`'s.
+    h_load_const,
+    |cx| {
+        let vm = cx.vm();
+        if vm.const_string_cache_enabled {
+            if let Some(&v) = vm
+                .const_string_dense
+                .get(vm.lite.loops.func as usize)
+                .and_then(|f| f.get(cx.k() as usize))
+            {
+                if !v.is_undefined() {
+                    cx.put(cx.c(), v.bits());
+                    return go(cx, cx.after(1));
+                }
+            }
+        }
+        again!(cx, h_load_const_heavy)
     }
 );
 
@@ -1460,13 +1522,17 @@ heavy!(
     /// code (`Vm::loop_get_prop`). A getter is called as the arm calls it: a
     /// leaf run
     /// without a frame, any other in a frame the runner pushes (`d` the
-    /// function, `k` the name's constant).
-    h_get_prop,
+    /// function, `k` the name's constant). Out of line, as
+    /// `h_get_prop_memo`: inlined into the light handler that jumps here,
+    /// its call of the body cost that handler saved registers at entry.
+    #[inline(never)]
+    h_get_prop_heavy,
     b_get_prop,
     |cx, go, out| {
         let vm = cx.vm();
         let o = Value::from_bits(cx.get(cx.a()));
-        let (ip, name) = (cx.ip(), cx.k() as u32);
+        let ip = cx.ip();
+        let Instr::GetProp { name, .. } = *(vm.lite.loops.code as *const Instr).add(ip) else { return out(cx) };
         // The site's ways first, as the dispatch arm asks them: every
         // layout the site has seen, an accessor's way among them.
         #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
@@ -1512,6 +1578,73 @@ heavy!(
         go(cx, cx.after(1))
     }
 );
+
+h!(
+    /// `GetProp`: `c = a.<name>` by the site cache's own-data hit, with no
+    /// wrapper around it and nothing out of line before the hand-off
+    /// (`ic_get_prop_own_slot`). Anything else is `h_get_prop_memo`'s, a
+    /// jump away. Each kind of read has a handler of its own (a site that
+    /// reads through its prototype chain starts at `h_get_prop_proto`,
+    /// `decode`): asked in one, the three cost it six saved registers and
+    /// two spills at its entry, which every read paid (prop_read 9% slower),
+    /// and asked in a second, the inherited read and the memo paid each
+    /// other's (proto_read 142 ms against 117).
+    #[inline(never)]
+    h_get_prop,
+    |cx| {
+        let o = Value::from_bits(cx.get(cx.a()));
+        let vm = cx.vm();
+        if let Some(v) = vm.ic_get_prop_own_slot(cx.d(), cx.ip(), o) {
+            cx.put(cx.c(), v.bits());
+            return go(cx, cx.after(1));
+        }
+        again!(cx, h_get_prop_memo)
+    }
+);
+
+h!(
+    /// `GetProp` at a site whose cache read through the prototype chain
+    /// when the runner decoded it: the stamped inherited-data way
+    /// (`ic_get_prop_proto_slot`); anything else is `h_get_prop`'s. Out of
+    /// line, as the handlers it jumps to.
+    #[inline(never)]
+    h_get_prop_proto,
+    |cx| {
+        let o = Value::from_bits(cx.get(cx.a()));
+        let vm = cx.vm();
+        if let Some(v) = vm.ic_get_prop_proto_slot(cx.d(), cx.ip(), o) {
+            cx.put(cx.c(), v.bits());
+            return go(cx, cx.after(1));
+        }
+        again!(cx, h_get_prop)
+    }
+);
+
+h!(
+    /// `GetProp` past the own-data hit: for a name of up to 8 bytes,
+    /// another layout's own data property from the (shape, key) memo.
+    /// Anything else (an inherited property, an accessor, a receiver with no
+    /// shape) is `h_get_prop_heavy`'s. Out of line: a handler only one
+    /// other jumps to is inlined into it, prologue and all.
+    #[inline(never)]
+    h_get_prop_memo,
+    |cx| {
+        let o = Value::from_bits(cx.get(cx.a()));
+        let vm = cx.vm();
+        // Another layout's own data property, by the (shape, key) memo.
+        if cx.b() & GETPROP_WORDS as u32 != 0 {
+            if let Some(v) = vm.ic_get_prop_mega_short(cx.d(), cx.ip(), o, cx.k(), cx.b() & 0xFF) {
+                cx.put(cx.c(), v.bits());
+                return go(cx, cx.after(1));
+            }
+        }
+        again!(cx, h_get_prop_heavy)
+    }
+);
+
+/// In `b` of a `GetProp` position: `k` holds the name's key word for the
+/// (shape, key) memo, and the low byte its length.
+const GETPROP_WORDS: u16 = 0x100;
 
 heavy!(
     /// `SetProp`: `a.<name> = b` by the dispatch arm's steps (a private
@@ -1819,6 +1952,23 @@ heavy!(
                 HeapObj::Str(_) if cx.k() == METHOD_CHAR_CODE_AT => {
                     vm.interp_char_code_at_fast(recv, Value::from_bits(cx.get(cx.b())))
                 }
+                // A Map's or WeakMap's `get`, `set`, `has` and `delete` by
+                // the dispatch arm's lane, reached from here rather than
+                // through `Vm::loop_method_builtin`: nothing in it runs
+                // program code, so the registers stand and only a collection
+                // can be due (a `set` that grew the map). What the lane
+                // declines goes on to the builtin dispatcher as before.
+                HeapObj::Map { .. } | HeapObj::WeakMap { .. } if argc == 1 || argc == 2 => {
+                    let key: &str = vm.func(cx.d() as usize).string_constants[name as usize].as_str();
+                    match vm.interp_map_method_fast(recv, key, base, arg_base, argc) {
+                        Ok(Some(v)) => {
+                            cx.put(cx.c(), v.bits());
+                            return after_alloc(cx, cx.after(1));
+                        }
+                        Ok(None) => None,
+                        Err(e) => return raise(cx, e),
+                    }
+                }
                 _ => None,
             }
         };
@@ -1850,7 +2000,7 @@ heavy!(
         let vm = cx.vm();
         let callee = Value::from_bits(cx.get(cx.a()));
         let ip = cx.ip();
-        let Some((fid, closure, desc)) = vm.lite_resolve(cx.d(), ip, callee) else { return out(cx) };
+        let Some((fid, closure, desc)) = vm.loop_resolve(cx.d(), ip, callee) else { return out(cx) };
         let (base, arg_base, argc) = (cx.frame_base(), cx.b() as u16, cx.k() as u16);
         if let Some(v) = vm.leaf_call(fid, closure, Value::UNDEFINED, false, base, arg_base, argc) {
             cx.put(cx.c(), v.bits());
@@ -1960,32 +2110,62 @@ heavy!(
     }
 );
 
+/// The running closure's upvalue list (`LoopTier::upv`), taken now if this
+/// frame has not read a captured variable yet. `false` when the frame has
+/// no closure. It takes the VM's address, not a `Cx`: a `Cx` passed by
+/// value is a copy on the caller's stack whose address the call takes, and a
+/// light handler with such a copy alive cannot hand off with a jump.
+#[cold]
+#[inline(never)]
+unsafe fn upval_list(vm: *mut c_void) -> bool {
+    let vm = &mut *(vm as *mut Vm);
+    let closure = vm.lite.loops.closure;
+    if closure == NO_CLOSURE || closure as usize >= vm.heap.len() {
+        return false;
+    }
+    match vm.heap.get(closure) {
+        HeapObj::Closure { upvalues, .. } => {
+            vm.lite.loops.upv = upvalues.as_ptr() as usize;
+            vm.lite.loops.upv_len = upvalues.len();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The cell of the running closure's captured variable `idx`, when it holds
 /// a value (a binding still in its dead zone is the dispatch arm's error).
 #[inline(always)]
 unsafe fn upval(cx: Cx, idx: u32) -> Option<(u32, Value)> {
     let vm = cx.vm();
-    let cell = vm.closure_upvalue(vm.lite.loops.closure, idx as u16);
+    if vm.lite.loops.upv == 0 && !upval_list(cx.vm) {
+        return None;
+    }
+    let t = &vm.lite.loops;
+    if idx as usize >= t.upv_len {
+        return None;
+    }
+    // SAFETY: `upv` is the running closure's list (`upval_list`), dropped at
+    // every frame change, and `idx` is in its bounds.
+    let cell = *(t.upv as *const u32).add(idx as usize);
     let v = vm.heap.cell_get(cell);
     (!v.is_uninitialized()).then_some((cell, v))
 }
 
-heavy!(
+h!(
     /// `UpvalGet`: `c` = the closure's captured variable `d`.
     h_upval_get,
-    b_upval_get,
-    |cx, go, out| {
+    |cx| {
         let Some((_, v)) = upval(cx, cx.d()) else { return out(cx) };
         cx.put(cx.c(), v.bits());
         go(cx, cx.after(1))
     }
 );
 
-heavy!(
+h!(
     /// `FuseUpvalGetMove`: `h_upval_get`, then `b = a`.
     h_upval_get_move,
-    b_upval_get_move,
-    |cx, go, out| {
+    |cx| {
         let Some((_, v)) = upval(cx, cx.d()) else { return out(cx) };
         cx.put(cx.c(), v.bits());
         cx.put(cx.b(), cx.get(cx.a()));
@@ -2376,7 +2556,7 @@ heavy!(
 /// operands. An instruction with no handler, or in a shape its handler does
 /// not take (two operands in one register where the handler reads after it
 /// writes, a global slot past the `nglobals` there are), leaves.
-fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usize) -> Op {
+fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usize, proto_site: &dyn Fn(usize) -> bool) -> Op {
     let op = |h: Handler, a: u16, b: u16, c: u16, d: u32, k: u64| Op {
         h,
         a: a as u32,
@@ -2509,7 +2689,23 @@ fn decode(f: &FuncProto, code: &[Instr], ip: usize, func_id: u32, nglobals: usiz
         Instr::GetProp { dst, obj, name } if named(name, "length") => op(h_get_length, obj, 0, dst, func_id, 0),
         // A private name's read or write is the dispatch arm's (brand
         // checks): it fills no way of the cache these two ask.
-        Instr::GetProp { dst, obj, name } if !private(name) => op(h_get_prop, obj, 0, dst, func_id, name as u64),
+        Instr::GetProp { dst, obj, name } if !private(name) => {
+            // A name of at most 8 bytes: its key word for the (shape, key)
+            // memo, which the light handler asks inline (`GETPROP_WORDS`).
+            let key = f.string_constants[name as usize].as_bytes();
+            #[cfg(feature = "jit")]
+            let mega = super::ic::ic_mega_enabled();
+            #[cfg(not(feature = "jit"))]
+            let mega = false;
+            // A site that has read through its prototype chain starts at
+            // the handler for that (`h_get_prop_proto`).
+            let h: Handler = if proto_site(ip) { h_get_prop_proto } else { h_get_prop };
+            if key.len() <= 8 && mega {
+                op(h, obj, GETPROP_WORDS | key.len() as u16, dst, func_id, super::ic::key_words(key).0)
+            } else {
+                op(h, obj, 0, dst, func_id, 0)
+            }
+        }
         Instr::SetProp { obj, val, name, strict } if !private(name) => {
             op(h_set_prop, obj, val, strict as u16, func_id, name as u64)
         }
@@ -2636,6 +2832,30 @@ struct LoopFn {
     open: bool,
 }
 
+/// A callee `Vm::loop_resolve` resolved: its identity and heap version, and
+/// its function, closure and frame description.
+#[derive(Clone, Copy)]
+struct RunCall {
+    bits: u64,
+    ver: u32,
+    fid: u32,
+    closure: u32,
+    desc: u32,
+}
+
+impl RunCall {
+    const EMPTY: RunCall = RunCall {
+        bits: u64::MAX,
+        ver: 0,
+        fid: 0,
+        closure: 0,
+        desc: 0,
+    };
+}
+
+/// `LoopTier::calls`' slots.
+const RUN_CALL_SLOTS: usize = 256;
+
 /// Back-edges a function's loops take in the dispatch loop before the
 /// runner is asked. Building a function's positions costs about what a few
 /// hundred handled instructions save, and most loops of a large program
@@ -2696,6 +2916,16 @@ pub(crate) struct LoopTier {
     /// and its function.
     closure: u32,
     func: u32,
+    /// The upvalue list of `closure` as (address, length), taken at the
+    /// frame's first captured-variable read and dropped at every frame
+    /// change (`Vm::loop_frame_is`, and an entry's end), as the dispatch
+    /// loops keep theirs: a closure's list is fixed when `MakeClosure` makes
+    /// it, and the running frame roots the closure. 0: not taken.
+    upv: usize,
+    upv_len: usize,
+    /// Callees the call handlers resolved (`Vm::loop_resolve`), each in the
+    /// slot its heap index names. Empty until the first call.
+    calls: Vec<RunCall>,
     /// The stack pointer below which a back-edge returns to the runner's
     /// loop (`back`).
     stack_floor: usize,
@@ -2726,6 +2956,9 @@ impl Default for LoopTier {
             fuel: 0,
             closure: 0,
             func: 0,
+            upv: 0,
+            upv_len: 0,
+            calls: Vec::new(),
             stack_floor: 0,
             stack_trips: 0,
             entries: 0,
@@ -2884,7 +3117,8 @@ impl<'p> Vm<'p> {
         }
         let f = self.func(i);
         let nglobals = self.globals.len();
-        let ops: Box<[Op]> = (0..code.len()).map(|ip| decode(f, code, ip, func_id, nglobals)).collect();
+        let proto_site = |ip: usize| self.ic_way0_is_proto(func_id, ip);
+        let ops: Box<[Op]> = (0..code.len()).map(|ip| decode(f, code, ip, func_id, nglobals, &proto_site)).collect();
         let at = ops.as_ptr();
         // Its loop heads: the distinct targets of its backward jumps.
         let mut heads: Vec<u32> = code
@@ -2918,6 +3152,53 @@ impl<'p> Vm<'p> {
             return Some((fid, closure, callee, self.lean_call_desc(fid)));
         }
         self.lite_method(at, func_id, ip, recv, name)
+    }
+
+    /// A `Call`'s plain-function callee: its function, closure and frame
+    /// description (`lean_call_desc`), by the callee's identity and heap
+    /// version, else the site's call cache (`ic_call`). The lite loop's
+    /// cache (`lite_resolve`) keeps only the functions the lite loop runs, so
+    /// a call of any other one (a closure of a function with a `try`, a
+    /// generator's maker) recomputed its description from the function's
+    /// record on every call.
+    #[inline(always)]
+    fn loop_resolve(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
+        if callee.is_heap() {
+            let idx = callee.heap_index();
+            if let Some(e) = self.lite.loops.calls.get(idx as usize & (RUN_CALL_SLOTS - 1)) {
+                if e.bits == callee.bits() && e.ver == self.heap.version_of(idx) {
+                    return Some((e.fid, e.closure, e.desc));
+                }
+            }
+        }
+        self.loop_resolve_miss(func_id, ip, callee)
+    }
+
+    /// [`Self::loop_resolve`] past its cache, which it fills: the site's call
+    /// cache, else the plain function itself (`ic_plain_fn`, what that cache
+    /// fills from). A site that many callees reach in turn (a table of
+    /// sixteen closures) disables its cache, which then answers nothing.
+    #[inline(never)]
+    fn loop_resolve_miss(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32, u32)> {
+        let (fid, closure) = match self.ic_call(func_id, ip, callee) {
+            Some(call) => (call.fid, call.closure),
+            None => self.ic_plain_fn(callee)?,
+        };
+        let desc = self.lean_call_desc(fid);
+        if callee.is_heap() {
+            let idx = callee.heap_index();
+            if self.lite.loops.calls.is_empty() {
+                self.lite.loops.calls = vec![RunCall::EMPTY; RUN_CALL_SLOTS];
+            }
+            self.lite.loops.calls[idx as usize & (RUN_CALL_SLOTS - 1)] = RunCall {
+                bits: callee.bits(),
+                ver: self.heap.version_of(idx),
+                fid,
+                closure,
+                desc,
+            };
+        }
+        Some((fid, closure, desc))
     }
 
     /// `GetProp` of a heap receiver past the site's ways: the dispatch
@@ -3089,6 +3370,7 @@ impl<'p> Vm<'p> {
         t.regs = regs;
         t.closure = closure;
         t.func = func_id;
+        t.upv = 0;
     }
 
     /// A call the runner makes of `fid`, which is not a leaf: push its
@@ -3351,6 +3633,7 @@ impl<'p> Vm<'p> {
         {
             let t = &mut self.lite.loops;
             (t.code, t.ops, t.regs, t.closure, t.func, t.floor, t.fuel, t.stack_floor) = outer;
+            t.upv = 0;
         }
         if threw {
             LOOP_THROWN

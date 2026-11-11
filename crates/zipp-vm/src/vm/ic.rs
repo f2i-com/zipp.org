@@ -169,7 +169,7 @@ pub(crate) const IC_NO_FIB_GLOBAL: u32 = u32::MAX;
 /// calls, as before), for an A/B on one binary.
 #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
 #[inline]
-fn ic_mega_enabled() -> bool {
+pub(crate) fn ic_mega_enabled() -> bool {
     if crate::WASM_STATIC_SWITCHES {
         return true;
     }
@@ -1462,6 +1462,41 @@ impl<'p> Vm<'p> {
         Some(v)
     }
 
+    /// [`Self::ic_get_prop_mega`] for a name of at most 8 bytes whose key word
+    /// the caller computed once (`key_words`: `w0`, the second word 0): the
+    /// (shape, key) memo's own data slot, with nothing out of line and the
+    /// site's cell left as it is. The loop runner's light `GetProp` handler
+    /// asks it; the memo's switch (`ic_mega_enabled`) was asked when the
+    /// handler's position was built.
+    #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_mega_short(&self, func_id: u32, ip: usize, recv: Value, w0: u64, len: u32) -> Option<Value> {
+        if !recv.is_heap() || !self.deferred_ns_state.is_empty() || !self.interp_own_resolve_vm_is_interpreter() {
+            return None;
+        }
+        if !self.ic_cell(func_id, ip).is_some_and(SiteCell::knows_own) {
+            return None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT || !crate::heap::fid_mirror_plain(mir.fid) {
+            return None;
+        }
+        let e = self.own_slot_cache[own_slot_index(mir.shape, w0, len as usize)].get();
+        if e.shape != mir.shape || e.len != len || e.w0 != w0 || e.w1 != 0 || e.slot & OwnSlot::ACCESSOR != 0 {
+            return None;
+        }
+        // SAFETY: the mirror's shape proves `vals` is the map's live value
+        // column, and the memo's answer for that shape that it holds the slot.
+        Some(unsafe { *(mir.vals as *const Value).add((e.slot & !OwnSlot::FLAGS) as usize) })
+    }
+
+    /// [`Self::ic_get_prop_mega_short`] without the JIT's mirrors: no memo.
+    #[cfg(all(not(feature = "jit"), not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_mega_short(&self, _func_id: u32, _ip: usize, _recv: Value, _w0: u64, _len: u32) -> Option<Value> {
+        None
+    }
+
     /// The proto-chain leg of [`Vm::ic_walk`], starting from the link OUT of
     /// `idx` (whose own map already missed). Also used for `super` fills with
     /// the synthesized prototype object as the anchor.
@@ -2364,6 +2399,107 @@ impl<'p> Vm<'p> {
         (hm.key_get(s) == Some(key) && !hm.attr_at(s).accessor).then(|| hm.val_at(s))
     }
 
+    /// [`Self::ic_get_prop_own_hit`]'s own-data half alone, with nothing out
+    /// of line: the receiver's own data slot by the site's own read or its
+    /// first way, in one of the program's own functions (`ic_func_eligible`'s
+    /// first answer; an eval's or a module's code is the heavy handler's).
+    /// The loop runner's light `GetProp` handler asks it. A handler that
+    /// calls out of line before its hand-off, or holds a stack address a call
+    /// took (`ic_func_eligible`'s switches initialize a `OnceLock` through a
+    /// closure on the stack), loses the hand-off's jump in a profile-guided
+    /// build.
+    #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_own_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if !recv.is_heap() || func_id as usize >= self.main_func_count {
+            return None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT
+            || !crate::heap::fid_mirror_plain(mir.fid)
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        let cell = self.ic_cell(func_id, ip)?;
+        if let Some(slot) = cell.own_read(mir.shape) {
+            // SAFETY: as in `ic_get_prop_own_hit`.
+            return Some(unsafe { *(mir.vals as *const Value).add(slot as usize) });
+        }
+        let site = cell.site.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            // SAFETY: as in `ic_get_prop_own_hit`.
+            IcEntry::OwnData { shape, slot } if shape == mir.shape => {
+                Some(unsafe { *(mir.vals as *const Value).add(slot as usize) })
+            }
+            _ => None,
+        }
+    }
+
+    /// The loop runner's second `GetProp` check, after
+    /// [`Self::ic_get_prop_own_slot`] missed: the site's way 0 when it is a
+    /// stamped inherited-data way, as `ic_get_prop_way0` answers it, every
+    /// step of `ic_proto_stamped` inline. `None` for anything else.
+    #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_proto_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if !recv.is_heap() || func_id as usize >= self.main_func_count {
+            return None;
+        }
+        let mir = self.heap.hot_mirror_of(recv.heap_index());
+        if mir.shape == crate::shape::DICT
+            || !crate::heap::fid_mirror_plain(mir.fid)
+            || !self.deferred_ns_state.is_empty()
+        {
+            return None;
+        }
+        let site = self.ic_cell(func_id, ip)?.site.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::ProtoData {
+                recv_shape,
+                first,
+                ref hops,
+                slot,
+            } if recv_shape == mir.shape
+                && site.stamp0.get() == self.heap.chain_epoch
+                && self.interp_own_resolve_vm_is_interpreter() =>
+            {
+                self.ic_proto_stamped(recv.heap_index(), mir.fid, first, hops, slot)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the `GetProp` site at `ip` of function `func_id` has read
+    /// through its prototype chain: its way 0 is an inherited-data entry.
+    /// The loop runner starts such a site at its inherited-read handler.
+    #[cfg(all(feature = "jit", not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    pub(crate) fn ic_way0_is_proto(&self, func_id: u32, ip: usize) -> bool {
+        self.ic_cell(func_id, ip)
+            .and_then(|c| c.site.as_deref())
+            .is_some_and(|s| s.n > 0 && matches!(s.entries[0], IcEntry::ProtoData { .. }))
+    }
+
+    /// [`Self::ic_way0_is_proto`] without stamped ways to read.
+    #[cfg(all(not(feature = "jit"), not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    pub(crate) fn ic_way0_is_proto(&self, _func_id: u32, _ip: usize) -> bool {
+        false
+    }
+
+    /// [`Self::ic_get_prop_proto_slot`] without the JIT's mirrors and
+    /// stamps: the heavy handler's.
+    #[cfg(all(not(feature = "jit"), not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_proto_slot(&self, _func_id: u32, _ip: usize, _recv: Value) -> Option<Value> {
+        None
+    }
+
     /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
     #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
@@ -2394,6 +2530,33 @@ impl<'p> Vm<'p> {
             IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
                 self.ic_get_way0_tail(idx, site, crate::shape::DICT, 0)
             }
+            _ => None,
+        }
+    }
+
+    /// [`Self::ic_get_prop_own_slot`] without the JIT's mirrors: the map's
+    /// own shape.
+    #[cfg(all(not(feature = "jit"), not(any(feature = "safe-sandbox", feature = "meter-only"))))]
+    #[inline(always)]
+    pub(crate) fn ic_get_prop_own_slot(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
+        if func_id as usize >= self.main_func_count {
+            return None;
+        }
+        let (_, m) = self.ic_recv_map(recv)?;
+        let cell = self.ic_cell(func_id, ip)?;
+        let sh = m.shape();
+        if sh == crate::shape::DICT {
+            return None;
+        }
+        if let Some(slot) = cell.own_read(sh) {
+            return Some(m.val_at(slot as usize));
+        }
+        let site = cell.site.as_deref()?;
+        if site.n == 0 {
+            return None;
+        }
+        match site.entries[0] {
+            IcEntry::OwnData { shape, slot } if sh == shape => Some(m.val_at(slot as usize)),
             _ => None,
         }
     }

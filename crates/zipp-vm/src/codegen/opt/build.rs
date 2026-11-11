@@ -1524,6 +1524,17 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
             bpreds[s].push(b);
         }
     }
+    // The entry block is built from the parameters alone, with no phi: a
+    // jump back to the function's first instruction (`while (n > 0) n--;`
+    // as the start of a body) would have every value the loop carries read
+    // as the parameter it began as, on every iteration, and the loop would
+    // never end. Such a function stays with Tier C.
+    if !bpreds[0].is_empty() {
+        if crate::jitlog_enabled() {
+            eprintln!("[jit] Tier O fn{func_id} declines: a jump targets its first instruction");
+        }
+        return None;
+    }
 
     // ── liveness ── per block, then per position (live before each op).
     // In a body with handler ops, what the interpreter may resume at

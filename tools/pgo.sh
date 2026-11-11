@@ -602,7 +602,7 @@ for cargo_config in "$CARGO_HOME_CANONICAL/config" "$CARGO_HOME_CANONICAL/config
   fi
 done
 
-PGO_BUILD_CONTRACT='zipp-pgo-build-v2;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;pe-stack=reserve-268435456,commit-4096;rustflags=target-cpu=x86-64,linker-flavor=lld-link,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2'
+PGO_BUILD_CONTRACT='zipp-pgo-build-v3;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;pe-stack=reserve-268435456,commit-4096;rustflags=target-cpu=x86-64,linker-flavor=lld-link,llvm-args=-disable-icp,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2'
 PGO_BUILD_ENV_POLICY='zipp-pgo-build-env-allowlist-v2'
 FORWARDED_ENV_NAMES=(
   PATH HOME USERPROFILE SystemRoot SYSTEMROOT WINDIR COMSPEC PATHEXT TEMP TMP TMPDIR
@@ -857,7 +857,14 @@ build_recipe_sha256() {
   } | sha256_stream
 }
 BUILD_RECIPE_SHA256="$(build_recipe_sha256)"
-USE_RUSTFLAGS="-Cprofile-use=$PROFDATA_RUSTC"$'\x1f''-Ctarget-cpu=x86-64'$'\x1f''-Clinker-flavor=lld-link'
+# Indirect-call promotion off: from the training profile it rewrote the loop
+# runner's hand-offs (`vm/loop_tier.rs`), each an indirect call of the next
+# handler in tail position, into "is it this hot handler? then its body
+# inlined here" chains whose other paths were calls, not jumps; a handler grew
+# to kilobytes with a frame, and the chain grew the native stack until the
+# runner noticed. Which hand-offs it rewrote changed from one profile to the
+# next.
+USE_RUSTFLAGS="-Cprofile-use=$PROFDATA_RUSTC"$'\x1f''-Ctarget-cpu=x86-64'$'\x1f''-Clinker-flavor=lld-link'$'\x1f''-Cllvm-args=-disable-icp'
 run_cargo_build "$USE_RUSTFLAGS" "$PROFILE_SHA256" "$BUILD_RECIPE_SHA256"
 verify_training_recipe_unchanged
 verify_source_and_tools_unchanged
@@ -912,7 +919,7 @@ expected_source_snapshot = os.environ["ZIPP_PGO_EXPECTED_SOURCE_SNAPSHOT_SHA256"
 digest = re.compile(r"[0-9a-f]{64}")
 checks = {
     "rustflags source": identity.get("rustflags_source") == "CARGO_ENCODED_RUSTFLAGS",
-    "canonical rustflags": identity.get("rustflags") == "-Cprofile-use=<redacted-path> -Ctarget-cpu=x86-64 -Clinker-flavor=lld-link",
+    "canonical rustflags": identity.get("rustflags") == "-Cprofile-use=<redacted-path> -Ctarget-cpu=x86-64 -Clinker-flavor=lld-link -Cllvm-args=-disable-icp",
     "target": identity.get("target") == "x86_64-pc-windows-msvc",
     "profile": identity.get("profile") == "release",
     "opt level": identity.get("opt_level") == "3",
