@@ -15,7 +15,11 @@
 #   3. the profiles of both passes merged by the selected toolchain's
 #      llvm-profdata;
 #   4. the release build with that profile, where
-#      `cargo build --release --target TARGET` leaves the binary.
+#      `cargo build --release --target TARGET` leaves the binary. On x86-64
+#      LLVM's indirect-call promotion is off there, as in tools/pgo.sh: the
+#      loop runner's handlers hand off to each other by indirect calls in
+#      tail position, and promotion rewrote some of them from the profile
+#      into inlined chains whose other paths stayed calls, nesting the stack.
 #
 # This is the corpus tools/pgo.sh trains the canonical benchmark build on;
 # that script adds the provenance contract and the structural comparison of
@@ -123,9 +127,11 @@ recipe_sha256=$({
 echo "merged profile sha256 $profile_sha256, training corpus sha256 $recipe_sha256"
 
 echo "== stage 4/4: profile-guided release build =="
+use_flags="-Cprofile-use=$work_n/merged.profdata"
+if [[ $target == x86_64-* ]]; then use_flags="$use_flags -Cllvm-args=-disable-icp"; fi
 ZIPP_PGO_PROFILE_SHA256=$profile_sha256 \
   ZIPP_PGO_TRAINING_RECIPE_SHA256=$recipe_sha256 \
-  RUSTFLAGS="$base_flags -Cprofile-use=$work_n/merged.profdata" \
+  RUSTFLAGS="$base_flags $use_flags" \
   cargo build --locked --release --package zipp-cli --bin zipp --target "$target" ${features[@]+"${features[@]}"}
 binary="target/$target/release/$exe"
 "$binary" --version | grep -E '^(zipp |pgo profile sha256)'
