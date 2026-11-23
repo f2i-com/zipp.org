@@ -5295,6 +5295,26 @@ impl Jit {
         self.fn_state[i] = s;
     }
 
+    /// A human-readable perf-map symbol. JIT function IDs identify the exact
+    /// body, while the source function name makes CPU profiles actionable.
+    /// Only called by the lazy perf-map label callback when profiling is on.
+    fn perf_map_label(func_id: u32, name: &str, tier: &str) -> String {
+        let mut label = format!("fn{func_id}");
+        if !name.is_empty() {
+            label.push('_');
+            label.extend(name.chars().take(64).map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') {
+                    ch
+                } else {
+                    '_'
+                }
+            }));
+        }
+        label.push('_');
+        label.push_str(tier);
+        label
+    }
+
     /// Attempt to compile `proto` (id `func_id`). On success it becomes
     /// available via `get`; on failure the id is blacklisted and never retried.
     /// `self_call_helper` is the address of the depth-guarded Rust trampoline
@@ -5380,7 +5400,9 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "whole-fn")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -5426,7 +5448,9 @@ impl Jit {
                 let entry = f.entry();
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} tier-o"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "tier-o")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.opt_bodies.insert(func_id);
@@ -5434,7 +5458,9 @@ impl Jit {
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    crate::vm::prof::pc::register(at, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "int-body")
+                    });
                     self.int_bodies.insert(func_id, a);
                 }
                 // A body with handler ops mutates its frame's handler stack:
@@ -5575,13 +5601,17 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "whole-fn")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    crate::vm::prof::pc::register(at, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "int-body")
+                    });
                     self.int_bodies.insert(func_id, a);
                 }
                 // An `arguments` body (or a sloppy body reading legacy
@@ -5662,7 +5692,9 @@ impl Jit {
                 );
             }
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "whole-fn")
+            });
             self.compiled.insert(func_id, f);
             self.set_fn_state(func_id, FN_COMPILED);
             return;
@@ -7310,5 +7342,23 @@ impl Jit {
             ("call_counters", self.counts.iter().filter(|&&c| c != 0).count() as u64),
             ("blacklisted_functions", self.blacklist.len() as u64),
         ]
+    }
+}
+#[cfg(test)]
+mod perf_map_label_tests {
+    use super::Jit;
+
+    #[test]
+    fn jit_symbols_keep_function_id_and_sanitize_user_defined_names() {
+        assert_eq!(Jit::perf_map_label(42, "", "whole-fn"), "fn42_whole-fn");
+        assert_eq!(
+            Jit::perf_map_label(42, "read node", "whole-fn"),
+            "fn42_read_node_whole-fn"
+        );
+        let name = Jit::perf_map_label(7, "foo\n\t<bar>/baz", "tier-o");
+        assert_eq!(name, "fn7_foo___bar__baz_tier-o");
+        assert!(!name.chars().any(char::is_whitespace));
+        let huge = Jit::perf_map_label(0, &"x".repeat(1000), "whole-fn");
+        assert_eq!(huge.len(), 3 + 1 + 64 + 1 + 8);
     }
 }
