@@ -1206,6 +1206,89 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Single-probe find-or-insert for `Set.prototype.add(val)`:
+    /// computes the hash tag and walks the probe chain ONCE instead of twice
+    /// (`coll_find` + `coll_index_insert`) on every new insertion.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) fn set_add_fast(&mut self, idx: u32, val: Value) {
+        if val.is_heap() {
+            self.heap.flatten(val.heap_index());
+        }
+        let indexed_outcome: Option<bool> = {
+            let Vm {
+                heap,
+                collection_index,
+                ..
+            } = self;
+            if let Some(ix) = collection_index.get_mut(&idx) {
+                let tag = ix.key_tag(heap, val);
+                let found_or_slot = {
+                    let HeapObj::Set(items) = heap.get(idx) else {
+                        return;
+                    };
+                    let mut i = tag as usize & ix.mask;
+                    let mut first_tomb: Option<usize> = None;
+                    loop {
+                        let (st, sm) = ix.table[i];
+                        if sm == META_EMPTY {
+                            break Err(first_tomb.unwrap_or(i));
+                        }
+                        if sm == META_TOMB {
+                            if first_tomb.is_none() {
+                                first_tomb = Some(i);
+                            }
+                        } else if st == tag && svz_eq(heap, items[sm as usize], val) {
+                            break Ok(sm as usize);
+                        }
+                        i = (i + 1) & ix.mask;
+                    }
+                };
+                match found_or_slot {
+                    Ok(_) => Some(false),
+                    Err(insert_slot) => {
+                        let pos = if let HeapObj::Set(items) = heap.get_mut(idx) {
+                            let p = items.len();
+                            items.push(val);
+                            p as u32
+                        } else {
+                            return;
+                        };
+                        if (ix.used + 1) * 2 >= ix.table.len() {
+                            ix.grow();
+                            ix.insert_raw(tag, pos);
+                        } else {
+                            let was_empty = ix.table[insert_slot].1 == META_EMPTY;
+                            ix.table[insert_slot] = (tag, pos);
+                            if was_empty {
+                                ix.used += 1;
+                            }
+                        }
+                        ix.live += 1;
+                        Some(true)
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(inserted) = indexed_outcome {
+            if inserted {
+                self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, val);
+            }
+            return;
+        }
+        if self.coll_find(idx, val).is_none() {
+            let mut pushed = None;
+            if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                pushed = Some(items.len());
+                items.push(val);
+            }
+            if let Some(p) = pushed {
+                self.coll_index_insert(idx, val, p);
+            }
+        }
+    }
+
     /// Index maintenance for WeakMap/WeakSet. The key is deliberately not sent
     /// through the ordinary collection insert barrier: recording it as a young
     /// value would turn the weak edge into a strong nursery root for the epoch.

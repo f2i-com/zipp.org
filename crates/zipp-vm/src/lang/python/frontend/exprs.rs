@@ -1118,6 +1118,20 @@ impl<'a> Emitter<'a> {
     /// runtime.
     pub fn jump_on_truth(&mut self, value: Reg, when: bool) -> R<Vec<usize>> {
         let jump = |e: &mut Self, cond: Reg| if when { e.jump_if_true(cond) } else { e.jump_if_false(cond) };
+        if self.fast {
+            let cond = self.alloc()?;
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyTruth { dst: cond, v: value, rt, slow: 0 })?;
+            let taken = jump(self, cond)?;
+            let over = self.jump()?;
+            let here = self.here();
+            self.patch_slow(at, here)?;
+            let t = self.helper("truth", &[value])?;
+            let taken2 = jump(self, t)?;
+            let here = self.here();
+            self.patch(over, here)?;
+            return Ok(vec![taken, taken2]);
+        }
         let is_bool = self.typeof_is(value, "boolean")?;
         let own_bool = self.jump_if_true(is_bool)?;
         let is_int = self.typeof_is(value, "bigint")?;
@@ -1969,6 +1983,64 @@ impl<'a> Emitter<'a> {
         for j in fused {
             self.patch(j, here)?;
         }
+        // Direct `sep.join([e1, ..., ek])` / `sep.join((e1, ..., ek))` fast path:
+        // when `f === R.SJOIN`, pass `[obj, e1..ek]` straight to `R.SJOIN_DIRECT`
+        // (`strop = 36`), avoiding temporary `NewArray` + `PySeq` allocations.
+        if self.fast && name == "join" && n == 1 {
+            let direct_seq = match &args[0] {
+                ast::Expr::List(l)
+                    if !l.elts.is_empty()
+                        && l.elts.len() <= 7
+                        && l.elts.iter().all(|e| !matches!(e, ast::Expr::Starred(_))) =>
+                {
+                    Some((false, l.elts.as_slice()))
+                }
+                ast::Expr::Tuple(t)
+                    if !t.elts.is_empty()
+                        && t.elts.len() <= 7
+                        && t.elts.iter().all(|e| !matches!(e, ast::Expr::Starred(_))) =>
+                {
+                    Some((true, t.elts.as_slice()))
+                }
+                _ => None,
+            };
+            if let Some((is_tuple, elts)) = direct_seq {
+                let mut elem_regs = Vec::with_capacity(elts.len());
+                for e in elts {
+                    elem_regs.push(self.expr(e, depth)?);
+                }
+                let dst = self.alloc()?;
+                let unbound = self.jump_if_false(prepend)?;
+                let expected = self.prop(self.r_rt, "SJOIN")?;
+                let same = self.alloc()?;
+                self.emit(Instr::Eq { dst: same, a: f, b: expected })?;
+                let other = self.jump_if_false(same)?;
+                let sj = self.prop(self.r_rt, "SJOIN_DIRECT")?;
+                let mut sj_args = Vec::with_capacity(1 + elem_regs.len());
+                sj_args.push(obj);
+                sj_args.extend_from_slice(&elem_regs);
+                let r = self.call_with(sj, &sj_args)?;
+                self.emit(Instr::Move { dst, src: r })?;
+                let done_fast = self.jump()?;
+                let here = self.here();
+                self.patch(other, here)?;
+                let arr = self.array(&elem_regs)?;
+                let seq = self.seq_of(arr, is_tuple)?;
+                let r = self.call_with(f, &[obj, seq])?;
+                self.emit(Instr::Move { dst, src: r })?;
+                let done_bound = self.jump()?;
+                let here = self.here();
+                self.patch(unbound, here)?;
+                let arr = self.array(&elem_regs)?;
+                let seq = self.seq_of(arr, is_tuple)?;
+                let r = self.call_with(f, &[seq])?;
+                self.emit(Instr::Move { dst, src: r })?;
+                let here = self.here();
+                self.patch(done_fast, here)?;
+                self.patch(done_bound, here)?;
+                return Ok(dst);
+            }
+        }
         let mut regs = Vec::with_capacity(n);
         for a in args {
             regs.push(self.expr(a, depth)?);
@@ -2284,6 +2356,38 @@ impl<'a> Emitter<'a> {
         // argument, a record its loop asks the class of.)
         let inline = self.inlinable(node, kind);
         if let Some(scope) = inline {
+            if self.fast
+                && kind == "<listcomp>"
+                && generators.len() == 1
+                && elts.len() == 1
+                && !generators[0].is_async
+                && generators[0].ifs.is_empty()
+            {
+                let display_elts = match &generators[0].iter {
+                    ast::Expr::Tuple(t)
+                        if t.elts.len() <= 8
+                            && t.elts.iter().all(|e| !matches!(e, ast::Expr::Starred(_))) =>
+                    {
+                        Some(t.elts.as_slice())
+                    }
+                    ast::Expr::List(l)
+                        if l.elts.len() <= 8
+                            && l.elts.iter().all(|e| !matches!(e, ast::Expr::Starred(_))) =>
+                    {
+                        Some(l.elts.as_slice())
+                    }
+                    _ => None,
+                };
+                if let Some(display_elts) = display_elts {
+                    return self.inline_listcomp_unrolled(
+                        scope,
+                        &generators[0].target,
+                        display_elts,
+                        elts[0],
+                        depth,
+                    );
+                }
+            }
             if let Some(display) = self.display_steps(&generators[0].iter, depth)? {
                 return self.inline_comprehension(scope, kind, generators, elts, Outer::Display(display), depth);
             }
@@ -2353,6 +2457,90 @@ impl<'a> Emitter<'a> {
         let id = *self.table.by_offset.get(&key)?;
         let scope = &self.table.scopes[id];
         (scope.inline && scope.name == kind).then_some(id)
+    }
+
+    /// Unrolled inline list comprehension over a small (`<= 8`) non-starred
+    /// tuple/list display with a single filter-free synchronous clause: evaluates
+    /// the outer display elements in the enclosing scope, runs the target
+    /// assignment + element expression for each in the comprehension scope, and
+    /// materializes the output list in one `NewArray` + `PySeq`.
+    fn inline_listcomp_unrolled(
+        &mut self,
+        scope: usize,
+        target: &ast::Expr,
+        display_elts: &[ast::Expr],
+        elt: &ast::Expr,
+        depth: usize,
+    ) -> R<Reg> {
+        // Snapshot each display element into its own fresh register so later
+        // target assignments or walrus side-effects in `elt` can never alias
+        // or overwrite a previously evaluated display value.
+        let mut src_regs = Vec::with_capacity(display_elts.len());
+        for e in display_elts {
+            let v = self.expr(e, depth)?;
+            let tmp = self.alloc()?;
+            self.emit(Instr::Move { dst: tmp, src: v })?;
+            src_regs.push(tmp);
+        }
+        // Reserve the contiguous `NewArray` argument window upfront so each
+        // iteration immediately snapshots its `elt` value into `out_base + k`
+        // before the next iteration overwrites the loop target register.
+        let argc = src_regs.len() as u16;
+        let out_base = if argc == 0 { 0 } else { self.block(src_regs.len())? };
+        let saved_scope = std::mem::replace(&mut self.scope, scope);
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_definite = std::mem::take(&mut self.definite);
+        let saved_generator = std::mem::replace(&mut self.proto.is_generator, false);
+        let parent = &self.table.scopes[saved_scope];
+        let body_res: R<()> = (|| {
+            let scope_ref = self.scope();
+            for (name, k) in &scope_ref.symbols {
+                if *k == SymKind::Outer {
+                    let reg = *saved_locals
+                        .get(name)
+                        .ok_or_else(|| format!("Python emitter: inline comprehension misses {name}"))?;
+                    self.locals.insert(name.clone(), reg);
+                    if saved_definite.contains(name) && !parent.deleted.contains(name) {
+                        self.definite.insert(name.clone());
+                    }
+                    continue;
+                }
+                if *k != SymKind::Local {
+                    if *k == SymKind::Free && !self.cells.contains_key(name) {
+                        return Err(format!("Python emitter: inline comprehension misses the cell {name}"));
+                    }
+                    continue;
+                }
+                if name == ".0" {
+                    continue;
+                }
+                let reg = self.alloc()?;
+                let unbound = self.unbound()?;
+                self.emit(Instr::Move { dst: reg, src: unbound })?;
+                self.locals.insert(name.clone(), reg);
+            }
+            for (k, &src) in src_regs.iter().enumerate() {
+                self.assign(target, src, depth + 1)?;
+                let v = self.expr(elt, depth + 1)?;
+                self.emit(Instr::Move {
+                    dst: out_base + k as u16,
+                    src: v,
+                })?;
+            }
+            Ok(())
+        })();
+        self.proto.is_generator = saved_generator;
+        self.definite = saved_definite;
+        self.locals = saved_locals;
+        self.scope = saved_scope;
+        body_res?;
+        let arr = self.alloc()?;
+        self.emit(Instr::NewArray {
+            dst: arr,
+            arg_base: out_base,
+            argc,
+        })?;
+        self.seq_of(arr, false)
     }
 
     /// Lower an [`inlinable`](Emitter::inlinable) comprehension in place:

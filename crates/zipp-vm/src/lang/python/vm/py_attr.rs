@@ -257,7 +257,7 @@ impl<'p> Vm<'p> {
     /// generator's or a coroutine's (whose call makes an object). `cls` has
     /// the entry's stamp.
     #[inline]
-    fn py_accessor(&self, cls: Value, table: usize, e: &PyIc, entry_key: &str, argc: usize) -> Option<PyAccessor> {
+    pub(super) fn py_accessor(&self, cls: Value, table: usize, e: &PyIc, entry_key: &str, argc: usize) -> Option<PyAccessor> {
         let f = self.py_table_at(cls, table, e.b, e.pos)?;
         if !f.is_heap() {
             return None;
@@ -315,7 +315,7 @@ impl<'p> Vm<'p> {
         if !simple {
             return None;
         }
-        let inner = self.py_ic(a.fid, 1);
+        let inner = self.py_ic_for_class(a.fid, 1, e.a);
         if inner.kind == want && inner.a == e.a && inner.hver == e.hver && inner.c == e.c {
             Some((inner.d, inner.pos))
         } else {
@@ -396,8 +396,8 @@ impl<'p> Vm<'p> {
         let Some((mut l, mut n)) = self.py_attrs_of(dict) else {
             return false;
         };
-        // Fast path: cached fresh-instance append plan (layout 0, len 0 -> final_layout).
-        if l == 0 && n == 0 {
+        // Fast path: cached fresh-instance append plan (layout ROOT, len 0 -> final_layout).
+        if l == super::py_table::layout::ROOT && n == 0 {
             if let Some(plan) = self
                 .py_rt
                 .as_deref()
@@ -436,7 +436,7 @@ impl<'p> Vm<'p> {
         let mut vals = [Value::UNDEFINED; MAX];
         let mut arg_idx = [0u8; MAX];
         let mut stamp: Option<(u32, u64)> = None;
-        let mut all_fresh_append = l == 0 && n == 0;
+        let mut all_fresh_append = l == super::py_table::layout::ROOT && n == 0;
         let mut single_stamp = true;
         for i in 0..stores {
             let Some(&Instr::PySetAttr { val, .. }) = code.get(1 + i) else {
@@ -1190,19 +1190,27 @@ impl<'p> Vm<'p> {
         }
         let stamp = self.py_cls_stamp(cls);
         if !dict.is_undefined() {
-            // A user class's function, unless the instance dict shadows it.
+            // A user class's function (`gm`), or an inherited non-unboxing
+            // builtin method (`gb`), unless the instance dict shadows it.
             let name = self.py_const_name(func_id, key)?;
-            if let Some((_, s, m)) = self.py_table_entry(cls, ty.gm, "gm", name) {
-                if self.py_plain_rec(m) {
-                    let k = self.resolve_const_slot(func_id, key);
-                    let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
-                    // The entry keeps the function itself (see the builtin
-                    // method's entry below).
-                    if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
-                        self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: m.bits(), c: ver, d: l });
-                    }
-                    return lacks.then_some(m);
+            let found = self
+                .py_table_entry(cls, ty.gm, "gm", name)
+                .filter(|&(_, _, m)| self.py_plain_rec(m))
+                .or_else(|| {
+                    let gb_name: &str =
+                        self.func(func_id as usize).string_constants[gb as usize].as_str();
+                    self.py_table_entry(cls, ty.gb, "gb", gb_name)
+                        .filter(|&(_, _, b)| self.py_plain_rec(b))
+                });
+            if let Some((_, s, m)) = found {
+                let k = self.resolve_const_slot(func_id, key);
+                let (lacks, l) = self.py_store_lacks(dict, name, k, 0)?;
+                // The entry keeps the function itself (see the builtin
+                // method's entry below).
+                if let (Some((hver, ver)), Ok(pos)) = (stamp, u32::try_from(s)) {
+                    self.py_ic_put(func_id, ip, PyIc { kind: ic::METHOD, pos, hver, a: cls.bits(), b: m.bits(), c: ver, d: l });
                 }
+                return lacks.then_some(m);
             }
             return None;
         }
@@ -1529,8 +1537,124 @@ impl<'p> Vm<'p> {
             }
         }
         let map = self.py_attrs_new(cap);
-        let obj = self.py_alloc_like_ready(tmpl, inst_shape, &[cls, map])?;
+        let obj = self.py_alloc_inst_fast(cls, map)?;
         Some((obj, entry, init))
+    }
+
+    /// Fused `PyNew` + immediate `StorePlan` `__init__` for compiled code
+    /// (`Vm::jit_py_new_init`): when the site's `ic::NEW` entry matches `cls`
+    /// and its `__init__` has a cached fresh-instance [`StorePlan`] for `cls`
+    /// matching the `n` arguments already staged at `regs[base + win + 1 ..]`,
+    /// allocates `PyAttrs` already populated at `plan.final_layout` and the
+    /// instance record `{cls, dict}` in one shot — eliminating the second FFI
+    /// call, the second `refresh_mirror`, and redundant stamp checks.
+    /// Returns `None` with zero side effects if any guard declines.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(super) fn py_new_store_fused(
+        &mut self,
+        func_id: u32,
+        ip: usize,
+        cls: Value,
+        rt: Value,
+        n: usize,
+        base: usize,
+        win: u16,
+    ) -> Option<Value> {
+        if n == 0 || n > STORE_BODY_MAX as usize || !cls.is_heap() || super::prof_py::on() || !py_new_hits_enabled() {
+            return None;
+        }
+        let ci = cls.heap_index();
+        let e = self.py_ic(func_id, ip);
+        if e.kind != ic::NEW || e.a != cls.bits() || self.heap.version_of(ci) != e.hver {
+            return None;
+        }
+        let p = self.py_rt_for(rt)?;
+        let (ctors, tmpl, inst_shape, inst_tmpl_hver, ver_slot) = (
+            p.ctors,
+            p.inst_tmpl,
+            p.inst_shape,
+            p.inst_tmpl_hver,
+            p.ty?.ver,
+        );
+        if inst_shape == crate::shape::DICT {
+            return None;
+        }
+        let want = match ctors.is_heap().then(|| self.heap.get(ctors.heap_index())) {
+            Some(HeapObj::Array(items)) => *items.get(n)?,
+            _ => return None,
+        };
+        let (pos, islot) = (e.pos as usize, e.d as usize);
+        let (init, cls_ver) = match self.heap.get(ci) {
+            HeapObj::Object(m)
+                if !m.is_ctor
+                    && pos < m.slot_len()
+                    && islot < m.slot_len()
+                    && ver_slot < m.slot_len()
+                    && !m.is_accessor_at(pos)
+                    && !m.is_accessor_at(islot)
+                    && !m.is_accessor_at(ver_slot)
+                    && want.is_heap()
+                    && m.val_at(pos).bits() == want.bits()
+                    && m.val_at(islot).bits() == e.b =>
+            {
+                (Value::from_bits(e.b), m.val_at(ver_slot).bits())
+            }
+            _ => return None,
+        };
+        if !init.is_heap() || self.heap.version_of(init.heap_index()) != e.c as u32 {
+            return None;
+        }
+        let s = (e.c >> 32) as u16 as usize;
+        let entry = match self.heap.get(init.heap_index()) {
+            HeapObj::Object(m) if !m.is_ctor && s < m.slot_len() && !m.is_accessor_at(s) => m.val_at(s),
+            _ => return None,
+        };
+        if !entry.is_heap() {
+            return None;
+        }
+        let init_fid = match self.heap.get(entry.heap_index()) {
+            HeapObj::Func(id) => *id,
+            HeapObj::Closure { func, .. } => *func,
+            _ => return None,
+        };
+        let plan = p.store_plans.get(init_fid as usize).copied().flatten()?;
+        let stores = plan.count as usize;
+        if plan.cls_bits != cls.bits()
+            || plan.cls_hver != e.hver
+            || plan.cls_ver != cls_ver
+            || stores == 0
+            || stores > STORE_BODY_MAX as usize
+        {
+            return None;
+        }
+        if self.func(init_fid as usize).param_count as usize != n + 1 {
+            return None;
+        }
+        let tmpl_ok = (inst_tmpl_hver != u32::MAX
+            && tmpl.is_heap()
+            && self.heap.version_of(tmpl.heap_index()) == inst_tmpl_hver)
+            || self.py_alloc_like_ok(tmpl, inst_shape);
+        if !tmpl_ok {
+            return None;
+        }
+        // Every stored value must come from ctor arguments `1..=n` (not `self` at index 0).
+        let arg_start = base + win as usize;
+        if arg_start + n >= self.regs.len() {
+            return None;
+        }
+        let mut staged = [Value::UNDEFINED; STORE_BODY_MAX as usize];
+        for i in 0..stores {
+            let a = plan.arg_idx[i] as usize;
+            if a == 0 || a > n {
+                return None;
+            }
+            staged[i] = self.regs[arg_start + a];
+        }
+        let mut vals = self.heap.take_arr_buf(stores);
+        vals.extend_from_slice(&staged[..stores]);
+        let dict = Value::heap(self.heap.alloc_py_attrs(plan.final_layout, vals));
+        self.py_alloc_inst_fast(cls, dict)
     }
 
     /// `__zipp_py_smfind(cls, self, name)` with the runtime's `R` as `this`:
@@ -1543,9 +1667,11 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(crate) fn py_smfind(&mut self, cls: Value, this_self: Value, name: Value, rt: Value) -> Value {
         match self.py_smfind_hit(cls, this_self, name, rt) {
-            Some((f, slot)) => {
-                if let HeapObj::Object(m) = self.heap.get_mut(rt.heap_index()) {
-                    m.set_val_at(slot, Value::TRUE);
+            Some((f, write_slot)) => {
+                if let Some(slot) = write_slot {
+                    if let HeapObj::Object(m) = self.heap.get_mut(rt.heap_index()) {
+                        m.set_val_at(slot, Value::TRUE);
+                    }
                 }
                 f
             }
@@ -1553,7 +1679,10 @@ impl<'p> Vm<'p> {
         }
     }
 
-    fn py_smfind_hit(&mut self, cls: Value, this_self: Value, name: Value, rt: Value) -> Option<(Value, usize)> {
+    /// Cached super-method hit `(f, write_slot)` where `write_slot` is
+    /// `Some(slot)` if `R.mself` must be written to `Value::TRUE` or `None` if
+    /// `R.mself` is already `Value::TRUE`.
+    pub(super) fn py_smfind_hit(&mut self, cls: Value, this_self: Value, name: Value, rt: Value) -> Option<(Value, Option<usize>)> {
         if !this_self.is_heap() || !name.is_heap() || !cls.is_heap() {
             return None;
         }
@@ -1607,7 +1736,8 @@ impl<'p> Vm<'p> {
                     if slot < r.slot_len() && super::py_rt::key_eq(r.key_at(slot), "mself") {
                         let a = r.attr_at(slot);
                         if !a.accessor && a.writable {
-                            return Some((Value::from_bits(ce.f), slot));
+                            let write_slot = (r.val_at(slot) != Value::TRUE).then_some(slot);
+                            return Some((Value::from_bits(ce.f), write_slot));
                         }
                     }
                 }
@@ -1646,6 +1776,7 @@ impl<'p> Vm<'p> {
         if a.accessor || !a.writable {
             return None;
         }
+        let write_slot = (r.val_at(slot) != Value::TRUE).then_some(slot);
         if let (Some(tv), Some(p)) = (t_ver, self.py_rt.as_deref()) {
             let name_ver_now = self.heap.version_of(ni);
             p.smfind_cache[cache_idx].set(super::py_rt::SmfindEntry {
@@ -1659,6 +1790,6 @@ impl<'p> Vm<'p> {
                 f: f.bits(),
             });
         }
-        Some((f, slot))
+        Some((f, write_slot))
     }
 }

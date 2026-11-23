@@ -69,7 +69,8 @@ pub(crate) mod hint {
     pub const GS: usize = 18;
     pub const GLOBALS: usize = 19;
     pub const DEFAULTS: usize = 20;
-    pub const COUNT: usize = 21;
+    pub const CELLS: usize = 21;
+    pub const COUNT: usize = 22;
 }
 
 /// Kinds of [`PyIc`] entries.
@@ -154,6 +155,11 @@ pub(super) mod ic {
     pub const CALL_STORE: u8 = 23;
     pub const CALL_LEAF: u8 = 24;
     pub const CALL_REC: u8 = 25;
+    /// `PyDictGet` on layout-mode storage where layout `d` is proven to lack
+    /// the key (`PyAttrs` only; layouts are immutable per id).
+    pub const DICT_GET_ABSENT: u8 = 26;
+    /// `PyCall` targeting an exception class's positional entry (`R.EXCENTRY[argc]`).
+    pub const CALL_EXC: u8 = 27;
 }
 
 /// Alternate entries a site keeps (see `Vm::py_ic_class`).
@@ -224,6 +230,8 @@ pub(super) struct TySlots {
     pub sp: usize,
     pub gv: usize,
     pub ver: usize,
+    pub truth_ver: usize,
+    pub truth_kind: usize,
 }
 
 /// Direct-mapped string hash cache size (power of two).
@@ -284,6 +292,30 @@ pub(crate) struct StorePlan {
     pub arg_idx: [u8; 8],
 }
 
+/// Pre-resolved plan for fused `PyNew` + `StorePlan` `__init__` (`Vm::jit_py_new_fused_fast`).
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+#[derive(Clone, Copy)]
+pub(crate) struct NewFusedPlan {
+    pub cls_bits: u64,
+    pub cls_hver: u32,
+    pub cls_ver: u64,
+    pub ver_slot: u16,
+    pub ctor_slot: u16,
+    pub want_bits: u64,
+    pub init_slot: u16,
+    pub init_bits: u64,
+    pub init_hver: u32,
+    pub init_entry_slot: u16,
+    pub entry_bits: u64,
+    pub inst_tmpl: Value,
+    pub inst_tmpl_hver: u32,
+    pub inst_shape: u32,
+    pub plan_idx: u16,
+    pub final_layout: u32,
+    pub count: u8,
+    pub arg_idx: [u8; 8],
+}
+
 /// The registry.
 pub(crate) struct PyRt {
     /// The runtime's helper object `R`.
@@ -292,6 +324,7 @@ pub(crate) struct PyRt {
     pub(super) t_tuple: Value,
     pub(super) t_dict: Value,
     pub(super) t_set: Value,
+    pub(super) t_frozenset: Value,
     pub(super) t_str: Value,
     pub(super) t_slice: Value,
     pub(super) t_module: Value,
@@ -318,6 +351,20 @@ pub(crate) struct PyRt {
     pub(super) ty: Option<TySlots>,
     /// `R.mself`'s slot.
     pub(super) mself_slot: Option<usize>,
+    /// `R.SMFNATIVE` (cached for O(1) `super()` lookup inside `py_leaf`).
+    pub(super) smfnative: Value,
+    /// Heap versions of `seq_tmpl` / `inst_tmpl` / `exc_tmpl` when validated
+    /// plain for `py_alloc_like_ready` (`u32::MAX` when unvalidated).
+    pub(super) seq_tmpl_hver: u32,
+    pub(super) inst_tmpl_hver: u32,
+    pub(super) exc_tmpl_hver: u32,
+    /// Indices into `plans` for `seq_tmpl` / `inst_tmpl` / `exc_tmpl` (`u16::MAX` when uncached).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) seq_plan_idx: u16,
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) inst_plan_idx: u16,
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) exc_plan_idx: u16,
     /// For recording a frame as `R.addframe` does (see
     /// [`Vm::py_addframe`]): `R.FILES` (file names by module index), the
     /// frame entry template `R.FRAMETMPL` and its shape (`shape::DICT`:
@@ -354,6 +401,9 @@ pub(crate) struct PyRt {
     pub(super) store_bodies: Vec<u8>,
     /// Cached validated store-body plans per code object (`Vm::py_store_call`).
     pub(super) store_plans: Vec<Option<StorePlan>>,
+    /// Pre-resolved fused `PyNew` + `StorePlan` entries for JIT (`jit_py_new_fused_fast`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    pub(super) new_fused_plans: std::cell::RefCell<Vec<NewFusedPlan>>,
     /// Cached acyclic leaf-body scans per code object (`vm::py_leaf`).
     pub(super) leaf_bodies: Vec<super::py_attr::py_leaf::LeafSlot>,
     /// Compiled native x86-64 micro-JIT bodies for pure-int self-recursive
@@ -366,6 +416,10 @@ pub(crate) struct PyRt {
     /// template's `Arc` changed its count twice per record.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(super) plans: Vec<crate::bytecode::StaticKeyPlan>,
+    /// One-shot flag set when `jit_py_leaf_noalloc` (or `py_leaf_call_site`)
+    /// bailed out of a leaf call so the immediate fallback (`jit_py_call` /
+    /// `py_step_call`) pushes the frame directly instead of re-running `py_leaf`.
+    pub(super) skip_leaf_once: Cell<bool>,
     /// Direct-mapped cache of Python `hash(s)` keyed by `(heap_idx, version)`.
     pub(crate) str_hashes: Box<[Cell<StrHashEntry>]>,
     /// Direct-mapped cache of `super().method()` lookups (`Vm::py_smfind`).
@@ -461,6 +515,7 @@ impl PyRt {
             t_tuple: Value::UNDEFINED,
             t_dict: Value::UNDEFINED,
             t_set: Value::UNDEFINED,
+            t_frozenset: Value::UNDEFINED,
             t_str: Value::UNDEFINED,
             t_slice: Value::UNDEFINED,
             t_module: Value::UNDEFINED,
@@ -480,6 +535,16 @@ impl PyRt {
             dict_slots: [1, 2],
             ty: None,
             mself_slot: None,
+            smfnative: Value::UNDEFINED,
+            seq_tmpl_hver: u32::MAX,
+            inst_tmpl_hver: u32::MAX,
+            exc_tmpl_hver: u32::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            seq_plan_idx: u16::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            inst_plan_idx: u16::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            exc_plan_idx: u16::MAX,
             files: Value::UNDEFINED,
             exc_entries: Value::UNDEFINED,
             frame_tmpl: Value::UNDEFINED,
@@ -497,11 +562,14 @@ impl PyRt {
             layouts: Default::default(),
             store_bodies: Vec::new(),
             store_plans: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+            new_fused_plans: std::cell::RefCell::new(Vec::new()),
             leaf_bodies: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             rec_jits: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             plans: Vec::new(),
+            skip_leaf_once: Cell::new(false),
             str_hashes: (0..STR_HASH_CACHE_LEN).map(|_| Cell::new(StrHashEntry::default())).collect(),
             smfind_cache: (0..SMFIND_CACHE_LEN).map(|_| Cell::new(SmfindEntry::default())).collect(),
             isinstance_cache: (0..ISINST_CACHE_LEN).map(|_| Cell::new(IsInstEntry::default())).collect(),
@@ -532,6 +600,7 @@ fn caches(i: &crate::bytecode::Instr) -> bool {
             | Instr::PyNew { .. }
             | Instr::PyCallEntry { .. }
             | Instr::PyCall { .. }
+            | Instr::PyDictGet { .. }
     )
 }
 
@@ -651,9 +720,6 @@ impl<'p> Vm<'p> {
         let Some((_, tb_slot)) = self.py_exc_record(e, r, false) else {
             return false;
         };
-        if !self.py_alloc_like_ok(tmpl, shape) {
-            return false;
-        }
         let ei = e.heap_index();
         let HeapObj::Object(m) = self.heap.get(ei) else {
             return false;
@@ -683,8 +749,61 @@ impl<'p> Vm<'p> {
         if tbfn.is_some_and(|t| t.bits() == f.bits()) {
             return false;
         }
+        // Fast lazy raw-pair path: for standard `exc_shape` records, record
+        // raw `[Value::int(line), f]` pairs directly in slot 9 (`frames`)
+        // without allocating `{file, line, name, fn}` Objects or calling
+        // `set_prop`. `core.js:normFrames` expands them lazily only when a
+        // traceback/location is actually inspected.
+        if exc_layout {
+            match frames {
+                None => {
+                    if tbline.is_number() && tbline.as_f64() == -1.0 {
+                        if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                            m.set_val_at(tb_slot, Value::int(line));
+                        }
+                    }
+                    let mut buf = self.heap.take_arr_buf(4);
+                    buf.push(Value::int(line));
+                    buf.push(f);
+                    let arr_idx = self.heap.alloc_array_settled(buf);
+                    let arr = Value::heap(arr_idx);
+                    self.heap.write_barrier_val(ei, arr);
+                    if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                        m.set_val_at(9, arr);
+                    }
+                    return true;
+                }
+                Some(fr) if fr.is_heap()
+                    && (self.array_js_len.is_empty() || !self.array_js_len.contains_key(&fr.heap_index()))
+                    && (self.arr_props.is_empty() || !self.arr_props.contains_key(&fr.heap_index())) =>
+                {
+                    let fi = fr.heap_index();
+                    let raw_ok = matches!(
+                        self.heap.get(fi),
+                        HeapObj::Array(items) if (items.is_empty() || items[0].is_int()) && items.len() / 2 < keep
+                    );
+                    if raw_ok {
+                        if tbline.is_number() && tbline.as_f64() == -1.0 {
+                            if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                                m.set_val_at(tb_slot, Value::int(line));
+                            }
+                        }
+                        self.heap.write_barrier_val(fi, f);
+                        if let HeapObj::Array(items) = self.heap.get_mut(fi) {
+                            items.push(Value::int(line));
+                            items.push(f);
+                        }
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
         // `frames`: none yet, or an Array with room whose last entry was not
         // left open by `f` (else the runtime closes that entry).
+        if !self.py_alloc_like_ok(tmpl, shape) {
+            return false;
+        }
         if let Some(fr) = frames {
             if !fr.is_heap() || self.array_js_len.contains_key(&fr.heap_index()) || self.arr_props.contains_key(&fr.heap_index()) {
                 return false;
@@ -816,6 +935,7 @@ impl<'p> Vm<'p> {
         rt.t_tuple = own(self, "TTUPLE");
         rt.t_dict = own(self, "TDICT");
         rt.t_set = own(self, "TSET");
+        rt.t_frozenset = own(self, "TFROZENSET");
         rt.t_str = own(self, "TSTR");
         rt.t_slice = own(self, "TSLICE");
         rt.t_module = own(self, "TMODULE");
@@ -845,6 +965,56 @@ impl<'p> Vm<'p> {
         rt.seq_shape = self.py_template_shape(rt.seq_tmpl, &SEQ_KEYS);
         rt.inst_shape = self.py_template_shape(rt.inst_tmpl, &INST_KEYS);
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut cache_plan = |tmpl: Value, shape: u32| -> (u32, u16) {
+            if !self.py_alloc_like_ok(tmpl, shape) {
+                return (u32::MAX, u16::MAX);
+            }
+            let hver = self.heap.version_of(tmpl.heap_index());
+            let idx = match self.heap.get(tmpl.heap_index()) {
+                HeapObj::Object(m) => match m.prop_keys() {
+                    crate::heap::PropKeys::Planned { all, .. } => {
+                        if let Some(i) = rt.plans.iter().position(|k| all.is(k)) {
+                            i as u16
+                        } else if rt.plans.len() < 8 {
+                            let i = rt.plans.len() as u16;
+                            rt.plans.push(all.to_plan());
+                            i
+                        } else {
+                            u16::MAX
+                        }
+                    }
+                    _ => u16::MAX,
+                },
+                _ => u16::MAX,
+            };
+            (hver, idx)
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let (sh, si) = cache_plan(rt.seq_tmpl, rt.seq_shape);
+            rt.seq_tmpl_hver = sh;
+            rt.seq_plan_idx = si;
+            let (ih, ii) = cache_plan(rt.inst_tmpl, rt.inst_shape);
+            rt.inst_tmpl_hver = ih;
+            rt.inst_plan_idx = ii;
+            let (eh, ei) = cache_plan(rt.exc_tmpl, rt.exc_shape);
+            rt.exc_tmpl_hver = eh;
+            rt.exc_plan_idx = ei;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            if self.py_alloc_like_ok(rt.seq_tmpl, rt.seq_shape) {
+                rt.seq_tmpl_hver = self.heap.version_of(rt.seq_tmpl.heap_index());
+            }
+            if self.py_alloc_like_ok(rt.inst_tmpl, rt.inst_shape) {
+                rt.inst_tmpl_hver = self.heap.version_of(rt.inst_tmpl.heap_index());
+            }
+            if self.py_alloc_like_ok(rt.exc_tmpl, rt.exc_shape) {
+                rt.exc_tmpl_hver = self.heap.version_of(rt.exc_tmpl.heap_index());
+            }
+        }
+        rt.smfnative = own(self, "SMFNATIVE");
         let slice_tmpl = own(self, "SLICETMPL");
         rt.slice_shape = self.py_template_shape(slice_tmpl, &SLICE_KEYS);
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
@@ -861,8 +1031,8 @@ impl<'p> Vm<'p> {
         }
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
-            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_slice, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
-            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries,
+            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_frozenset, rt.t_str, rt.t_slice, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
+            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries, rt.smfnative,
         ];
         keep.extend_from_slice(&rt.istypes);
         let pi = pins.heap_index();
@@ -948,6 +1118,8 @@ impl<'p> Vm<'p> {
             sp: at("sp")?,
             gv: at("gv")?,
             ver: at("ver")?,
+            truth_ver: at("truthVer")?,
+            truth_kind: at("truthKind")?,
         })
     }
 
@@ -1236,6 +1408,37 @@ impl<'p> Vm<'p> {
             }
             *ents = kept;
         }
+    }
+
+    /// Read-only polymorphic lookup: returns the current entry when its `a`
+    /// matches `key`, else any alternate way in `alts` matching `key`.
+    #[inline]
+    pub(super) fn py_ic_for_class(&self, func_id: u32, ip: usize, key: u64) -> PyIc {
+        let Some(p) = self.py_rt.as_deref() else {
+            return PyIc::default();
+        };
+        let Some(Some(fic)) = p.ics.get(func_id as usize) else {
+            return PyIc::default();
+        };
+        let Some(&s) = fic.slot_of.get(ip) else {
+            return PyIc::default();
+        };
+        if s == u16::MAX {
+            return PyIc::default();
+        }
+        let s = s as usize;
+        let e = fic.ents[s];
+        if e.a == key || e.kind == 0 {
+            return e;
+        }
+        if let Some(ents) = fic.alts.as_deref().and_then(|all| all.get(s)) {
+            for a in ents {
+                if a.kind != 0 && a.a == key {
+                    return *a;
+                }
+            }
+        }
+        e
     }
 
     /// This site's cache entry for the class (or record) whose bits are

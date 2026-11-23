@@ -440,6 +440,7 @@ impl Vm<'_> {
         // the home can still be young. Treat the side-table entry as a real
         // holder edge so a minor cannot sweep the home out from under `super`.
         self.store_barrier(crate::heap::gcoracle::CLOSURE_HOME, closure, home);
+        self.heap.clear_leaf(closure);
         self.closure_home.insert(closure, home, self.heap.len());
     }
 
@@ -452,6 +453,7 @@ impl Vm<'_> {
             closure,
             new_target,
         );
+        self.heap.clear_leaf(closure);
         self.closure_new_target.insert(closure, new_target);
     }
 
@@ -1332,7 +1334,7 @@ impl Vm<'_> {
         // window, so the appended suffix is the exact freed set in sweep order.
         // Reuse it rather than allocating and filling a duplicate `Vec<u32>`.
         let free_before = self.heap.free_indices().len();
-        let swept = self.heap.sweep_young(&marks);
+        let (swept, swept_class) = self.heap.sweep_young_classes(&marks);
         // The young log now lists what the sweep made ready, dead like the
         // freed slots and in the same tables.
         let recycled = self.heap.young_log().len();
@@ -1371,7 +1373,7 @@ impl Vm<'_> {
         self.heap.remset_reset();
         self.heap.vremset_reset();
         let free_after = self.heap.free_indices().len();
-        if swept > 0 {
+        if swept_class {
             self.invalidate_class_member_cache();
         }
         gcstats::record(
@@ -2183,12 +2185,9 @@ impl Vm<'_> {
                     let i = v.heap_index() as usize;
                     if i < n && !marks[i] {
                         marks[i] = true;
-                        #[cfg(feature = "jit")]
-                        if !self.heap.is_flat_str_mirror(i) {
+                        if !self.heap.is_leaf_slot(i) {
                             stack.push(v.heap_index());
                         }
-                        #[cfg(not(feature = "jit"))]
-                        stack.push(v.heap_index());
                     }
                 }
             }};

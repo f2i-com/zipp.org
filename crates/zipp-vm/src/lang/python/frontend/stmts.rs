@@ -1262,6 +1262,86 @@ impl<'a> Emitter<'a> {
     // ---- try / with -----------------------------------------------------------------
     fn try_stmt(&mut self, s: &ast::StmtTry, depth: usize) -> R<()> {
         let has_finally = !s.finalbody.is_empty();
+        // Fast handler-free path for `try: [x =] d[k] except KeyError: <trivial>`
+        // when `d` and `k` are provably non-raising (definite locals/constants),
+        // `h.name` is `None`, and `<trivial>` cannot raise or observe `exc_info`:
+        // probe `PyDictLookup` on exact `dict` and verify `KeyError` via non-raising
+        // `PyGlobal` === `R.E.KeyError`. Any miss/rebind falls straight into the
+        // full `PushHandler` + body + catch path below with zero observable diff.
+        let mut fast_done: Vec<usize> = Vec::new();
+        if self.fast && !has_finally && s.orelse.is_empty() && s.handlers.len() == 1 && s.body.len() == 1 {
+            let ast::ExceptHandler::ExceptHandler(h) = &s.handlers[0];
+            let pure_operand = |e: &ast::Expr| -> bool {
+                match e {
+                    ast::Expr::Constant(c) => matches!(
+                        c.value,
+                        ast::Constant::None
+                            | ast::Constant::Bool(_)
+                            | ast::Constant::Int(_)
+                            | ast::Constant::Float(_)
+                            | ast::Constant::Str(_)
+                    ),
+                    ast::Expr::Name(n) => {
+                        let id = n.id.as_str();
+                        self.sym_kind(id) == SymKind::Local && self.is_definite(id)
+                    }
+                    _ => false,
+                }
+            };
+            let target_and_sub = match &s.body[0] {
+                ast::Stmt::Expr(e) => match e.value.as_ref() {
+                    ast::Expr::Subscript(sub) if !matches!(sub.slice.as_ref(), ast::Expr::Slice(_)) => {
+                        Some((None, sub))
+                    }
+                    _ => None,
+                },
+                ast::Stmt::Assign(a) if a.targets.len() == 1 => match (&a.targets[0], a.value.as_ref()) {
+                    (ast::Expr::Name(t), ast::Expr::Subscript(sub))
+                        if self.sym_kind(t.id.as_str()) == SymKind::Local
+                            && !matches!(sub.slice.as_ref(), ast::Expr::Slice(_)) =>
+                    {
+                        Some((Some(t.id.as_str()), sub))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let exc_global_name = match h.type_.as_deref() {
+                Some(ast::Expr::Name(n)) if self.sym_kind(n.id.as_str()) == SymKind::Global => Some(n.id.as_str()),
+                _ => None,
+            };
+            if h.name.is_none() && self.is_trivial_except_body(&h.body) {
+                if let (Some((target_local, sub)), Some(exc_name)) = (target_and_sub, exc_global_name) {
+                    if pure_operand(&sub.value) && pure_operand(&sub.slice) {
+                        let o = self.expr(&sub.value, depth)?;
+                        let k = self.expr(&sub.slice, depth)?;
+                        let val = self.alloc()?;
+                        let rt = self.r_rt;
+                        let at_lookup = self.emit(Instr::PyDictLookup { dst: val, d: o, k, rt, absent: 0, slow: 0 })?;
+                        if let Some(tname) = target_local {
+                            self.store_name(tname, val)?;
+                        }
+                        fast_done.push(self.jump()?);
+                        let on_absent = self.here();
+                        self.patch_absent(at_lookup, on_absent)?;
+                        let globals = self.globals_for_py_global()?;
+                        let spec = self.alloc()?;
+                        let key_const = self.string_const(exc_name);
+                        let at_glob = self.emit(Instr::PyGlobal { dst: spec, globals, rt, key: key_const, slow: 0 })?;
+                        let key_err = self.prop(rt, "KEYERROR")?;
+                        let is_ke = self.alloc()?;
+                        self.emit(Instr::Eq { dst: is_ke, a: spec, b: key_err })?;
+                        let not_ke = self.jump_if_false(is_ke)?;
+                        self.block_suite(&h.body, depth)?;
+                        fast_done.push(self.jump()?);
+                        let fallback = self.here();
+                        self.patch_slow(at_lookup, fallback)?;
+                        self.patch_slow(at_glob, fallback)?;
+                        self.patch(not_ke, fallback)?;
+                    }
+                }
+            }
+        }
         let (kind_reg, val_reg) = (self.alloc()?, self.alloc()?);
         let fin_push = if has_finally {
             let at = self.emit(Instr::PushFinally {
@@ -1364,6 +1444,9 @@ impl<'a> Emitter<'a> {
         } else {
             let end = self.here();
             for j in &to_finally {
+                self.patch(*j, end)?;
+            }
+            for j in &fast_done {
                 self.patch(*j, end)?;
             }
         }

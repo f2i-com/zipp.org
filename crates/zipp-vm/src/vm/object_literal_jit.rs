@@ -118,11 +118,11 @@ pub(crate) extern "win64" fn jit_new_object(vm: *mut core::ffi::c_void, hint: u3
     crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
-        let idx = vm
-            .heap
-            .alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(
-                hint as usize,
-            ))));
+        let idx = if hint > 0 {
+            vm.heap.alloc_ctor_object(hint as usize, None)
+        } else {
+            vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())))
+        };
         vm.realm_born(idx, vm.obj_proto);
         Value::heap(idx).bits()
     })

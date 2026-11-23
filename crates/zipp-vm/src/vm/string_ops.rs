@@ -874,7 +874,33 @@ impl<'p> Vm<'p> {
             // through to the general path.
             "replace" | "replaceAll" => {
                 let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                if let Some(v) = self.replace_plain_strings_fast(idx, arg0, repl, name == "replaceAll")? {
+                if let Some(re) = self.as_regexp(arg0) {
+                    let primitive_string = repl.is_heap()
+                        && matches!(
+                            self.heap.get(repl.heap_index()),
+                            HeapObj::Str(_) | HeapObj::Cons { .. }
+                        );
+                    let direct = primitive_string || self.is_callable(repl);
+                    if direct && self.regexp_replace_fast_ok(re) {
+                        let global = matches!(
+                            self.heap.get(re),
+                            HeapObj::RegExp(re) if re.flags.contains('g')
+                        );
+                        if name == "replace" {
+                            return Ok(Some(self.regex_replace(idx, re, repl, global)?));
+                        } else if global
+                            && self.regexp_method_is_intrinsic(
+                                re,
+                                "@@match",
+                                native::REGEXP_SYM_MATCH,
+                            )
+                        {
+                            return Ok(Some(self.regex_replace(idx, re, repl, true)?));
+                        }
+                    }
+                } else if let Some(v) =
+                    self.replace_plain_strings_fast(idx, arg0, repl, name == "replaceAll")?
+                {
                     return Ok(Some(v));
                 }
             }
@@ -1005,6 +1031,74 @@ impl<'p> Vm<'p> {
                 }
                 return self.string_search(idx, name, args).map(Some);
             }
+            // RegExp-driven string methods read the heap string directly via `idx`
+            // without needing the owned `js_recv` clone below (saving O(N) full-string
+            // copies on every `.replace(/.../)`, `.match(/.../)`, `.search(/.../)`,
+            // `.matchAll(/.../)`, `.split(/.../)`, and `.replaceAll(/.../g)` call).
+            "search" => {
+                if self.is_object_value(arg0) {
+                    let searcher = self.get_prop(arg0, "@@search")?;
+                    if searcher != Value::UNDEFINED && searcher != Value::NULL {
+                        return Ok(Some(self.call_value(
+                            searcher,
+                            arg0,
+                            &[Value::heap(idx)],
+                        )?));
+                    }
+                }
+                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
+                let searcher = self.get_prop(rxv, "@@search")?;
+                return Ok(Some(self.call_value(searcher, rxv, &[Value::heap(idx)])?));
+            }
+            "match" => {
+                if let Some(re) = self.as_regexp(arg0) {
+                    if self.regexp_method_is_intrinsic(re, "@@match", native::REGEXP_SYM_MATCH) {
+                        return Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?));
+                    }
+                }
+                if self.is_object_value(arg0) {
+                    let matcher = self.get_prop(arg0, "@@match")?;
+                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
+                        return Ok(Some(self.call_value(matcher, arg0, &[Value::heap(idx)])?));
+                    }
+                }
+                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
+                let matcher = self.get_prop(rxv, "@@match")?;
+                return Ok(Some(self.call_value(matcher, rxv, &[Value::heap(idx)])?));
+            }
+            "matchAll" => {
+                if matchall_pristine_enabled() {
+                    if let Some(r) = self.matchall_pristine_dispatch(Value::heap(idx), arg0) {
+                        return r.map(Some);
+                    }
+                }
+                let regexp = arg0;
+                let s_val = Value::heap(idx);
+                if self.is_object_value(regexp) {
+                    if self.is_regexp(regexp)? {
+                        let flags_v = self.get_prop(regexp, "flags")?;
+                        let flags = self.to_js_string(flags_v)?;
+                        if !flags.contains('g') {
+                            return Err(Thrown::from_static(
+                                "TypeError: String.prototype.matchAll called with a non-global RegExp argument",
+                            ));
+                        }
+                    }
+                    let matcher = self.get_prop(regexp, "@@matchAll")?;
+                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
+                        return Ok(Some(self.call_value(matcher, regexp, &[s_val])?));
+                    }
+                }
+                let gflag = self.alloc_str("g".to_string());
+                let rx = self.regexp_create(regexp, gflag)?;
+                let matcher = self.get_prop(rx, "@@matchAll")?;
+                return Ok(Some(self.call_value(matcher, rx, &[s_val])?));
+            }
+            "split" if self.as_regexp(arg0).is_some_and(|re| self.regexp_split_fast_ok(re)) => {
+                let re = self.as_regexp(arg0).unwrap();
+                let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                return Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?));
+            }
             _ => {}
         }
         // Other methods need owned content (slice/replace/split/…): the exact
@@ -1091,159 +1185,8 @@ impl<'p> Vm<'p> {
                 let js = crate::heap::JsStr::from_wtf8(out);
                 Ok(Some(Value::heap(self.heap.alloc_js(js))))
             }
-            "search" => {
-                // Per spec, an OBJECT regexp's `@@search` method overrides the
-                // default (a real RegExp's RegExp.prototype[@@search] is found here
-                // too, routing through the same regexp_search_impl). A primitive
-                // argument is NOT consulted — it builds a RegExp. Mirrors `matchAll`.
-                if self.is_object_value(arg0) {
-                    let searcher = self.get_prop(arg0, "@@search")?;
-                    if searcher != Value::UNDEFINED && searcher != Value::NULL {
-                        return Ok(Some(self.call_value(
-                            searcher,
-                            arg0,
-                            &[Value::heap(idx)],
-                        )?));
-                    }
-                }
-                // Build a RegExp from the (non-object) argument, then Invoke its
-                // @@search — honouring a monkeypatched RegExp.prototype[@@search]
-                // (the unpatched native routes through regexp_search_impl, same result).
-                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
-                let searcher = self.get_prop(rxv, "@@search")?;
-                Ok(Some(self.call_value(searcher, rxv, &[Value::heap(idx)])?))
-            }
-            "match" => {
-                // A RegExp whose `@@match` is the intrinsic data property (no own
-                // shadow, the prototype slot untouched): the Get is unobservable
-                // and the call is `regexp_match_impl`, without the generic call.
-                if let Some(re) = self.as_regexp(arg0) {
-                    if self.regexp_method_is_intrinsic(re, "@@match", native::REGEXP_SYM_MATCH) {
-                        return Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?));
-                    }
-                }
-                // An OBJECT regexp's `@@match` overrides the default (a real RegExp's
-                // RegExp.prototype[@@match] routes through the same regexp_match_impl);
-                // a primitive argument builds a RegExp. Mirrors `matchAll`.
-                if self.is_object_value(arg0) {
-                    let matcher = self.get_prop(arg0, "@@match")?;
-                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
-                        return Ok(Some(self.call_value(matcher, arg0, &[Value::heap(idx)])?));
-                    }
-                }
-                // Build a RegExp, then Invoke its @@match — honouring a monkeypatched
-                // RegExp.prototype[@@match] (the unpatched native routes through
-                // regexp_match_impl, same result).
-                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
-                let matcher = self.get_prop(rxv, "@@match")?;
-                Ok(Some(self.call_value(matcher, rxv, &[Value::heap(idx)])?))
-            }
-            "matchAll" => {
-                // ── pristine dispatch shortcut (the B77 retry) ── the
-                // primitive-receiver path (`"s".matchAll(re)`) lands HERE, not
-                // in string_symbol_method; same proof, same fall-through.
-                if matchall_pristine_enabled() {
-                    if let Some(r) = self.matchall_pristine_dispatch(Value::heap(idx), arg0) {
-                        return r.map(Some);
-                    }
-                }
-                let regexp = arg0;
-                let s_val = Value::heap(idx);
-                // Per spec the `@@matchAll` method is only consulted when `regexp`
-                // is an OBJECT — a primitive argument must NOT trigger a
-                // `Number.prototype[@@matchAll]` getter etc. (it builds a RegExp).
-                if self.is_object_value(regexp) {
-                    // A real RegExp argument must be global (spec: IsRegExp +
-                    // RequireObjectCoercible(flags) + 'g' check).
-                    //
-                    // IsRegExp is OBSERVABLE: it reads `@@match` and ToBoolean's
-                    // the result, and that read must happen BEFORE Get(flags).
-                    // `as_regexp(..).is_some()` answered the same question for a
-                    // plain RegExp while performing no property lookup at all, so
-                    // on the PRIMITIVE-receiver path (`"s".matchAll(re)`, which
-                    // lands here rather than in string_symbol_method) a user
-                    // `@@match` getter never fired — staging/sm/String/matchAll.js
-                    // counts those calls and requires exactly two. It was also
-                    // wrong for a non-RegExp object carrying a truthy `@@match`,
-                    // which the spec still requires to be global.
-                    if self.is_regexp(regexp)? {
-                        let flags_v = self.get_prop(regexp, "flags")?;
-                        let flags = self.to_js_string(flags_v)?;
-                        if !flags.contains('g') {
-                            return Err(Thrown::from_static(
-                                "TypeError: String.prototype.matchAll called with a non-global RegExp argument",
-                            ));
-                        }
-                    }
-                    let matcher = self.get_prop(regexp, "@@matchAll")?;
-                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
-                        return Ok(Some(self.call_value(matcher, regexp, &[s_val])?));
-                    }
-                }
-                // Otherwise RegExpCreate(regexp, "g") and use its @@matchAll.
-                let gflag = self.alloc_str("g".to_string());
-                let rx = self.regexp_create(regexp, gflag)?;
-                let matcher = self.get_prop(rx, "@@matchAll")?;
-                Ok(Some(self.call_value(matcher, rx, &[s_val])?))
-            }
-            // The internal splitter IS `RegExp.prototype[@@split]`, so taking it
-            // directly is unobservable only while that is the method a
-            // `GetMethod(re, @@split)` would find (`regexp_split_fast_ok`). A
-            // user `@@split` — own, on the prototype, or on a subclass — takes
-            // the generic `"split"` arm below, which performs the lookup.
-            "split" if self.as_regexp(arg0).is_some_and(|re| self.regexp_split_fast_ok(re)) => {
-                let re = self.as_regexp(arg0).unwrap();
-                let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?))
-            }
-            "replace" if self.as_regexp(arg0).is_some() => {
-                let re = self.as_regexp(arg0).unwrap();
-                let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                // The internal fast path is valid only for a PLAIN regex: its
-                // [[Prototype]] is %RegExp.prototype% and exec/@@replace are
-                // still the intrinsics. A SUBCLASS instance (overridden exec)
-                // or a patched prototype must run the OBSERVABLE @@replace
-                // protocol — user exec result, `groups` via Get (incl. the
-                // prototype chain), GetSubstitution $<name> via Get.
-                // An object replacement's ToString (or callable invocation)
-                // participates in the observable @@replace ordering.  In
-                // particular `repl.toString()` may install `re.exec` before the
-                // first RegExpExec lookup.  The internal matcher proves exec
-                // before it coerces the replacement, so reserve it for an
-                // already-primitive string and send every effectful shape to
-                // the full Symbol.replace protocol below.
-                let primitive_string = repl.is_heap()
-                    && matches!(
-                        self.heap.get(repl.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. }
-                    );
-                // A callable replacement is not coerced at all, and the
-                // protocol first calls it after its exec loop has collected
-                // every match (the legacy statics then name the last one), so
-                // nothing it does can reach the matcher either: the internal
-                // matcher's `(match, ...captures, position, input[, groups])`
-                // calls are the protocol's. Through the protocol each match
-                // cost an exec result array and five property reads on it,
-                // four times what Node pays for `s.replace(/\d/g, f)`.
-                let direct = primitive_string || self.is_callable(repl);
-                if direct && self.regexp_replace_fast_ok(re) {
-                    let global = matches!(
-                        self.heap.get(re),
-                        HeapObj::RegExp(re) if re.flags.contains('g')
-                    );
-                    Ok(Some(self.regex_replace(idx, re, repl, global)?))
-                } else {
-                    Ok(Some(
-                        self.string_replace_plain(idx, &js_recv, arg0, repl, false)?,
-                    ))
-                }
-            }
-            // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
-            // which performs the spec step-2 checks (IsRegExp → global-flag, GetMethod
-            // @@replace) with the proper observable Get/ToString semantics. (Routing a
-            // real RegExp through the @@replace protocol here, rather than the internal
-            // regex_replace, is what makes a custom `flags`/`@@match`/`@@replace`
-            // observable.)
+            // NB: `search`, `match`, `matchAll`, pristine RegExp `split`, and
+            // pristine RegExp `replace`/`replaceAll` are handled before `js.clone()` above.
             "split" => {
                 // A custom @@split fully overrides the default algorithm and runs
                 // FIRST — before any ToString / ToUint32 — receiving the receiver
@@ -2217,6 +2160,65 @@ impl<'p> Vm<'p> {
             crate::heap::wtf8_push_cp(&mut out, u as u32);
         }
         Ok(crate::heap::JsStr::from_wtf8(out))
+    }
+
+    /// Single-argument `String.fromCodePoint(v)` fast helper (zero `Vec<Value>`
+    /// allocation and zero heap allocation for ASCII code points `0..128`).
+    #[inline]
+    pub(crate) fn string_from_code_point_1(&mut self, v: Value) -> Result<Value, Thrown> {
+        self.preflight_native_iteration_work(1)?;
+        let cp = if v.is_int() {
+            let i = v.as_int();
+            if !(0..=0x10FFFF).contains(&i) {
+                return Err(Thrown(format!("RangeError: Invalid code point {i}")));
+            }
+            i as u32
+        } else {
+            let n = self.to_number_strict(v)?;
+            if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
+                return Err(Thrown(format!("RangeError: Invalid code point {n}")));
+            }
+            n as u32
+        };
+        if cp < 128 {
+            Ok(Value::heap(cp))
+        } else {
+            self.preflight_guest_string_size(4)?;
+            let mut out = Vec::with_capacity(4);
+            crate::heap::wtf8_push_cp(&mut out, cp);
+            Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
+        }
+    }
+
+    /// `String.fromCodePoint(...codes)` shared by `STR_FROM_CODE_POINT` and
+    /// `Instr::StaticFn(StringFromCodePoint)`.
+    pub(crate) fn string_from_code_points_val(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        if args.is_empty() {
+            self.preflight_native_iteration_work(0)?;
+            Ok(Value::heap(crate::heap::INTERN_EMPTY))
+        } else if args.len() == 1 {
+            self.string_from_code_point_1(args[0])
+        } else {
+            self.preflight_native_iteration_work(args.len() as u64)?;
+            let capacity = args
+                .len()
+                .checked_mul(4)
+                .filter(|&n| n <= MAX_STRING_BYTES)
+                .ok_or_else(invalid_string_length)?;
+            self.preflight_guest_string_size(capacity)?;
+            let mut out: Vec<u8> = Vec::new();
+            out.try_reserve_exact(capacity)
+                .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
+            for &v in args {
+                let n = self.to_number_strict(v)?;
+                if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
+                    return Err(Thrown(format!("RangeError: Invalid code point {n}")));
+                }
+                crate::heap::wtf8_push_cp(&mut out, n as u32);
+            }
+            let js = crate::heap::JsStr::from_wtf8(out);
+            Ok(Value::heap(self.heap.alloc_js(js)))
+        }
     }
 
     /// String.prototype.replace / replaceAll with a NON-regexp searchValue.

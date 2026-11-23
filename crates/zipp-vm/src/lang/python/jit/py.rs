@@ -101,6 +101,7 @@ pub(crate) fn py_op_edges(i: &Instr) -> Option<(u32, Option<u32>)> {
         | Instr::PyMethod { slow, .. }
         | Instr::PyModGet { slow, .. }
         | Instr::PyLen { slow, .. }
+        | Instr::PyTruth { slow, .. }
         | Instr::PyAttrFn { slow, .. }
         | Instr::PyCaught { slow, .. }
         | Instr::PyClassAttr { slow, .. }
@@ -156,7 +157,7 @@ pub(crate) fn py_op_regs(i: &Instr) -> Option<(Vec<u16>, Vec<u16>)> {
         Instr::PySetAttr { obj, val, .. } => (vec![obj, val], None),
         Instr::PyIsInstance { dst, v, t, rt, .. } => (vec![v, t, rt], Some(dst)),
         Instr::PyMethod { dst, obj, rt, .. } | Instr::PyModGet { dst, obj, rt, .. } => (vec![obj, rt], Some(dst)),
-        Instr::PyLen { dst, v, rt, .. } => (vec![v, rt], Some(dst)),
+        Instr::PyLen { dst, v, rt, .. } | Instr::PyTruth { dst, v, rt, .. } => (vec![v, rt], Some(dst)),
         Instr::PyAttrFn { dst, obj, .. } => (vec![obj], Some(dst)),
         Instr::PySeq { dst, items, rt, .. } => (vec![items, rt], Some(dst)),
         Instr::PyRaise { e, rt, .. } => (vec![e, rt], None),
@@ -617,6 +618,81 @@ fn float_cond_jump(ops: &mut crate::codegen::X64Asm, op: crate::bytecode::PyCmpO
     dynasm!(ops ; => skip);
 }
 
+/// Emit a fused `PyNew` + immediate `PyCall` (`Vm::jit_py_new_init`) when the
+/// caller proved `code[ip + 1]` is `PyCall { dst: init_dst, f: this_f,
+/// arg_base: dst, argc: n + 1 }`. On `1` (fused `StorePlan` hit) it jumps to
+/// `after_init` (`ip + 2`), skipping the `PyCall`; on `0` (plain `py_new`) it
+/// falls through to `ip + 1`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_py_new_init(
+    ops: &mut crate::codegen::X64Asm,
+    func_id: u32,
+    ip: usize,
+    dst: u16,
+    entry: u16,
+    this_f: u16,
+    init_dst: u16,
+    cls: u16,
+    rt: u16,
+    n: u16,
+    after_init: dynasmrt::DynamicLabel,
+    labels: &PyLabels,
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
+) {
+    let done = ops.new_dynamic_label();
+    #[cfg(not(feature = "safe-sandbox"))]
+    if let Some(plan_id) = new_fused_plan_at(ip) {
+        let miss = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, QWORD plan_id as i64
+            ; mov r8, [rbx + dreg(cls)]
+            ; lea r9, [rbx + dreg(dst + 1)]
+            ; mov rax, QWORD crate::vm::Vm::jit_py_new_fused_fast as *const () as usize as i64
+            ; call rax
+            ; mov [rsp + 32], rax
+        );
+        refetch(ops);
+        dynasm!(ops
+            ; mov rax, [rsp + 32]
+            ; mov r10, QWORD PY_SLOW_BITS as i64
+            ; cmp rax, r10
+            ; je => miss
+            ; mov [rbx + dreg(dst)], rax
+            ; mov r10, QWORD crate::value::Value::NULL.bits() as i64
+            ; mov [rbx + dreg(init_dst)], r10
+            ; jmp => after_init
+            ; => miss
+        );
+    }
+    let outs = dst as u64 | (entry as u64) << 16 | (this_f as u64) << 32 | (init_dst as u64) << 48;
+    let ins = cls as u64 | (rt as u64) << 16 | (n as u64) << 32;
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rdx, rbx
+        ; mov r8, QWORD site(func_id, ip) as i64
+        ; mov r9, QWORD outs as i64
+        ; mov rax, QWORD ins as i64
+        ; mov [rsp + 32], rax
+        ; mov rax, QWORD crate::vm::Vm::jit_py_new_init as *const () as usize as i64
+        ; call rax
+        ; mov [rsp + 32], rax
+    );
+    refetch(ops);
+    dynasm!(ops
+        ; mov rax, [rsp + 32]
+        ; cmp rax, 1
+        ; je => after_init
+        ; test rax, rax
+        ; jz => done
+        ; mov r10, QWORD PY_SLOW_BITS as i64
+        ; cmp rax, r10
+        ; je => labels.slow
+        ; jmp => labels.bail
+        ; => done
+    );
+}
+
 /// Emit a fused Python instruction: its inline fast paths where it has
 /// them, then the out-of-line step (a direct helper for the arithmetic and
 /// comparisons, `Vm::jit_py_op` for the rest). `refetch` follows every helper
@@ -877,12 +953,28 @@ pub(crate) fn emit_py_op(
             );
         }
         // A subscript store: inline fast path for exact `list` overwrite,
-        // else `Vm::jit_py_set_item`.
+        // non-allocating `jit_py_set_item_dict` for exact `dict` (no GC/refetch),
+        // else full `Vm::jit_py_set_item`.
         Instr::PySetItem { o, k, v, seq, dict, .. } if !crate::vm::prof_py::on() => {
             let miss = ops.new_dynamic_label();
             if emit_py_set_item_inline(ops, o, k, v, seq, miss, done) {
                 dynasm!(ops ; => miss);
             }
+            let slow_set = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(dict)]
+                ; mov [rsp + 32], rax
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(o)]
+                ; mov r8, [rbx + dreg(k)]
+                ; mov r9, [rbx + dreg(v)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_set_item_dict as *const () as usize as i64
+                ; call rax
+                ; test rax, rax
+                ; jz => done
+                ; => slow_set
+            );
+            let _ = slow_set;
             let packed = o as u64 | (k as u64) << 16 | (v as u64) << 32 | (seq as u64) << 48;
             dynasm!(ops
                 ; mov rcx, rdi
@@ -944,6 +1036,21 @@ pub(crate) fn emit_py_op(
             emit_py_value_call_noalloc(ops, h, [V::Reg(f), V::Imm(site(func_id, ip)), V::Imm(name as u64), V::None], dst, labels);
         }
         Instr::PyGlobal { dst, globals, rt, key, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(globals)]
+                ; mov r8, [rbx + dreg(rt)]
+                ; mov r9, QWORD site(func_id, ip) as i64
+                ; mov rax, QWORD crate::vm::Vm::jit_py_global_hit as *const () as usize as i64
+                ; call rax
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => miss
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+                ; => miss
+            );
             let h = crate::vm::Vm::jit_py_global as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(globals), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(key as u64)], dst, labels, refetch);
         }
@@ -968,6 +1075,10 @@ pub(crate) fn emit_py_op(
             emit_py_value_call(ops, h, [V::Reg(obj), V::Reg(rt), V::Imm(site(func_id, ip)), V::Imm(keys)], dst, labels, refetch);
         }
         Instr::PyClassOf { dst, obj, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_class_of_inline(ops, dst, obj, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_class_of as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(obj), V::None, V::None, V::None], dst, labels);
         }
@@ -975,9 +1086,14 @@ pub(crate) fn emit_py_op(
             let h = crate::vm::Vm::jit_py_caught as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(e), V::Reg(line), V::Reg(rt), V::None], dst, labels);
         }
-        // An instance dict's entry (`PyDictGet`): as a value helper, with
-        // `PY_ABSENT_BITS` the fall-through that leaves `dst` untouched.
+        // An instance dict's entry (`PyDictGet`): inline guard for proved-absent
+        // layouts (`ic::DICT_GET_ABSENT`), else value helper with `PY_ABSENT_BITS`
+        // leaving `dst` untouched.
         Instr::PyDictGet { dst, obj, key, absent, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_dict_get_inline(ops, ip, obj, absent, miss, labels.slow, done) {
+                dynasm!(ops ; => miss);
+            }
             let keys = key as u64 | (absent as u64) << 32;
             dynasm!(ops
                 ; mov rcx, rdi
@@ -1040,6 +1156,10 @@ pub(crate) fn emit_py_op(
             );
         }
         Instr::PyIsInstance { dst, v, t, rt, .. } if !crate::vm::prof_py::on() => {
+            let miss = ops.new_dynamic_label();
+            if emit_py_isinstance_inline(ops, ip, dst, v, t, miss, done) {
+                dynasm!(ops ; => miss);
+            }
             let h = crate::vm::Vm::jit_py_isinstance as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(t), V::Reg(rt), V::Imm(site(func_id, ip))], dst, labels);
         }
@@ -1049,6 +1169,10 @@ pub(crate) fn emit_py_op(
                 dynasm!(ops ; => miss);
             }
             let h = crate::vm::Vm::jit_py_len as *const () as usize;
+            emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
+        }
+        Instr::PyTruth { dst, v, rt, .. } if !crate::vm::prof_py::on() => {
+            let h = crate::vm::Vm::jit_py_truth as *const () as usize;
             emit_py_value_call_noalloc(ops, h, [V::Reg(v), V::Reg(rt), V::None, V::None], dst, labels);
         }
         Instr::PySeq { dst, items, rt, tuple, .. } if !crate::vm::prof_py::on() => {
@@ -1068,19 +1192,35 @@ pub(crate) fn emit_py_op(
             emit_py_value_call(ops, h, [V::Reg(cls), V::Reg(args), V::Reg(rt), V::None], dst, labels, refetch);
         }
         // A generator's step (a `for` over a generator, every iteration):
-        // through `Vm::jit_py_gen_next`, which resumes it as the step does.
-        // Its bail answer covers a raise in the body and a nesting too deep.
+        // try the pure non-allocating fast stepper first (no GC poll or
+        // `refetch`), falling back to `Vm::jit_py_gen_next` for start/finish/bail.
         Instr::PyGenNext { dst, next, this, .. } if !crate::vm::prof_py::on() => {
+            let slow_gen = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(next)]
+                ; mov r8, [rbx + dreg(this)]
+                ; mov rax, QWORD crate::vm::Vm::jit_py_gen_next_fast as *const () as usize as i64
+                ; call rax
+                ; mov r10, QWORD PY_SLOW_BITS as i64
+                ; cmp rax, r10
+                ; je => slow_gen
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => done
+                ; => slow_gen
+            );
             let h = crate::vm::Vm::jit_py_gen_next as *const () as usize;
             emit_py_value_call(ops, h, [V::Reg(next), V::Reg(this), V::Imm(ip as u64), V::None], dst, labels, refetch);
         }
-        // A call: inline `math.sqrt` when planned, else `Vm::jit_py_call`.
+        // A call: inline-guarded `__zipp_py_strm` fast path (including inline
+        // `math.sqrt`) or inline-guarded frameless Python leaf (`jit_py_leaf_noalloc`),
+        // else `Vm::jit_py_call`.
         Instr::PyCall { dst, f, arg_base, argc, .. } if !crate::vm::prof_py::on() => {
-            if argc == 1 {
-                let miss = ops.new_dynamic_label();
-                if emit_py_sqrt_inline(ops, ip, dst, f, arg_base, miss, done) {
-                    dynasm!(ops ; => miss);
-                }
+            let miss = ops.new_dynamic_label();
+            if emit_py_strm_inline(ops, ip, dst, f, arg_base, argc, miss, done, refetch)
+                || emit_py_leaf_inline(ops, ip, dst, f, arg_base, argc, miss, done)
+            {
+                dynasm!(ops ; => miss);
             }
             let regs = f as u64 | (arg_base as u64) << 16 | (argc as u64) << 32 | (dst as u64) << 48;
             emit_py_step_with(ops, crate::vm::Vm::jit_py_call as *const () as usize, func_id, ip, Some(regs), labels, refetch);
@@ -1425,6 +1565,44 @@ pub(crate) fn emit_py_array_append(
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
         ; je => bail
+    );
+}
+
+/// Fused `NewArray` + immediate `PySeq` in a Python loop (`argc <= 8`):
+/// allocates both the backing `Array` and the `{cls, items}` sequence record
+/// in one helper call and jumps to `after_seq` (`ip + 2`), falling through to
+/// the unfused `NewArray` on guard miss.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_py_new_seq(
+    ops: &mut crate::codegen::X64Asm,
+    arr_dst: u16,
+    seq_dst: u16,
+    arg_base: u16,
+    argc: u16,
+    rt: u16,
+    tuple: bool,
+    after_seq: dynasmrt::DynamicLabel,
+    refetch: &mut dyn FnMut(&mut crate::codegen::X64Asm),
+) {
+    let packed = (arr_dst as u64)
+        | ((seq_dst as u64) << 16)
+        | ((arg_base as u64) << 32)
+        | ((argc as u64) << 48)
+        | ((tuple as u64) << 52);
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rdx, rbx
+        ; mov r8, QWORD packed as i64
+        ; mov r9, [rbx + dreg(rt)]
+        ; mov rax, QWORD crate::vm::Vm::jit_py_new_seq as *const () as usize as i64
+        ; call rax
+        ; mov [rsp + 32], rax
+    );
+    refetch(ops);
+    dynasm!(ops
+        ; mov rax, [rsp + 32]
+        ; test rax, rax
+        ; jz => after_seq
     );
 }
 

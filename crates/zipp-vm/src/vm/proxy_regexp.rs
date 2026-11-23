@@ -51,6 +51,17 @@ const fn regexp_protocol_intrinsic_index(native_id: u16) -> Option<usize> {
     }
 }
 
+/// Count UTF-16 code units in a valid UTF-8 byte slice without decoding chars.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn utf16_len_of_utf8(bytes: &[u8]) -> usize {
+    let mut units = 0usize;
+    for &b in bytes {
+        units += ((b as i8) >= -0x40) as usize + (b >= 0xF0) as usize;
+    }
+    units
+}
+
 /// Convert an already-ToLength-clamped integer to a host index without the
 /// wasm32 `u64 as usize` wraparound. RegExp search indices beyond the largest
 /// host-addressable string index are semantically just out of range, so
@@ -2782,16 +2793,17 @@ impl<'p> Vm<'p> {
         {
             return Ok(None);
         }
-        let unicode = match self.heap.get(re) {
+        let (fbits, unicode) = match self.heap.get(re) {
             HeapObj::RegExp(r) => {
-                let f = r.core.flags.as_bytes();
-                if !f.contains(&b'g') || f.contains(&b'y') {
+                let b = r.core.flag_bits;
+                if b & ITFB_GLOBAL == 0 || b & ITFB_STICKY != 0 {
                     return Ok(None);
                 }
-                f.contains(&b'u') || f.contains(&b'v')
+                (b, b & ITFB_UNICODE != 0)
             }
             _ => return Ok(None),
         };
+        let _ = fbits;
         if !self.regexp_exec_fast_ok(re)
             || !self.regexp_last_index_writable(re)
             || !self.regexp_pristine_flag_accessors_ok(re, Value::heap(re))
@@ -2803,10 +2815,88 @@ impl<'p> Vm<'p> {
         self.heap.flatten(s_idx);
         let _gc = self.gc_lock_guard();
         self.regexp_write_last_index(re, Value::int(0))?;
-        let (is_ascii, ascii_units) = match self.heap.get(s_idx) {
-            HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
-            _ => (false, 0),
+        let (is_ascii, is_wellformed, subj_units_fast) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.is_ascii(), js.is_wellformed(), js.units()),
+            _ => (false, false, 0),
         };
+        // Direct WTF-8/UTF-8 `memmem` fast path for pure, non-empty,
+        // case-sensitive, surrogate-free literal regexes on well-formed
+        // subjects (handles BOTH ASCII and UTF-16/Unicode subjects with zero
+        // Vec<u16> decode and one shared match string).
+        if is_wellformed && subj_units_fast <= u32::MAX as usize {
+            let lit_hit = match (self.heap.get(re), self.heap.get(s_idx)) {
+                (HeapObj::RegExp(r), HeapObj::Str(js)) => {
+                    r.core.pure_literal_finder().map(|lit| {
+                        let hay = js.as_bytes();
+                        let mut count = 0usize;
+                        let mut last_byte_start = 0usize;
+                        for pos in lit.finder.find_iter(hay) {
+                            count += 1;
+                            last_byte_start = pos;
+                        }
+                        let last_u16_start = if count == 0 {
+                            0
+                        } else if is_ascii {
+                            last_byte_start
+                        } else {
+                            utf16_len_of_utf8(&hay[..last_byte_start])
+                        };
+                        (
+                            count,
+                            last_u16_start,
+                            lit.utf16_len,
+                            lit.finder.needle().to_vec(),
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some((count, last_u16_start, lit_u16_len, needle)) = lit_hit {
+                self.preflight_native_iteration_work(count as u64 + 1)?;
+                if count == 0 {
+                    return Ok(Some(Value::NULL));
+                }
+                let lit_val = if needle.len() == 1 && needle[0] < 128 {
+                    Value::heap(needle[0] as u32)
+                } else if needle.len() == 2
+                    && needle[0].is_ascii_digit()
+                    && needle[1].is_ascii_digit()
+                {
+                    Value::heap(
+                        crate::heap::INTERN_PAD2_START
+                            + ((needle[0] - b'0') as u32 * 10 + (needle[1] - b'0') as u32),
+                    )
+                } else {
+                    let mut js = if needle.is_ascii() {
+                        crate::heap::JsStr::from_ascii(needle)
+                    } else {
+                        crate::heap::JsStr::from_wtf8(needle)
+                    };
+                    js.freeze_shared();
+                    Value::heap(self.heap.alloc_str_settled(js))
+                };
+                let mut elems: Vec<Value> = if count <= crate::heap::ARR_POOL_MAX_CAP {
+                    self.heap.take_arr_buf(count)
+                } else {
+                    let mut v = Vec::new();
+                    v.try_reserve_exact(count).map_err(|_| {
+                        Thrown::from_static("RangeError: RegExp match-result allocation failed")
+                    })?;
+                    v
+                };
+                elems.resize(count, lit_val);
+                self.regexp_record_statics_literal(
+                    input,
+                    s_idx,
+                    last_u16_start,
+                    last_u16_start + lit_u16_len,
+                    subj_units_fast,
+                    is_ascii,
+                );
+                return Ok(Some(Value::heap(self.heap.alloc_array_settled(elems))));
+            }
+        }
+        let ascii_units = subj_units_fast;
         let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
         let mut last: Option<regress::Match> = None;
         let u16s: Vec<u16> = if is_ascii {
@@ -2924,10 +3014,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let unicode = match self.heap.get(re) {
-            HeapObj::RegExp(r) => {
-                let f = r.core.flags.as_bytes();
-                f.contains(&b'u') || f.contains(&b'v')
-            }
+            HeapObj::RegExp(r) => r.core.flag_bits & ITFB_UNICODE != 0,
             _ => return Ok(None),
         };
         let lim: u64 = if limit.is_undefined() {
@@ -3444,7 +3531,11 @@ impl<'p> Vm<'p> {
         // flag bits used to be fused into the same heap.get as the slot, so a
         // recompile that added `g` never updated lastIndex and one that dropped
         // `y` still clobbered it.
-        let li = host_index_saturating(self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1));
+        let li = if li_v.is_int() {
+            li_v.as_int().max(0) as usize
+        } else {
+            host_index_saturating(self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1))
+        };
         let (global, sticky, has_indices, unicode) = match prebits {
             // Pre-decoded at iterator creation (B118): `lastIndex` was a
             // number (checked by the caller), so no user code ran above and
@@ -3460,31 +3551,13 @@ impl<'p> Vm<'p> {
             }
             None => match self.heap.get(re_idx) {
                 HeapObj::RegExp(re) => {
-                    let crate::heap::RegExpCore { flags, .. } = &*re.core;
-                    if slim_exec_enabled() {
-                        // B124: one pass over the ≤8-byte flag string instead
-                        // of four `contains` scans. Same heap.get, same spec
-                        // position (AFTER ToLength — a `lastIndex.valueOf`
-                        // may `compile()`, and this reads what it left).
-                        let (mut g, mut y, mut d, mut u) = (false, false, false, false);
-                        for b in flags.bytes() {
-                            match b {
-                                b'g' => g = true,
-                                b'y' => y = true,
-                                b'd' => d = true,
-                                b'u' | b'v' => u = true,
-                                _ => {}
-                            }
-                        }
-                        (g, y, d, u)
-                    } else {
-                        (
-                            flags.contains('g'),
-                            flags.contains('y'),
-                            flags.contains('d'),
-                            flags.contains('u') || flags.contains('v'),
-                        )
-                    }
+                    let b = re.core.flag_bits;
+                    (
+                        b & ITFB_GLOBAL != 0,
+                        b & ITFB_STICKY != 0,
+                        b & ITFB_INDICES != 0,
+                        b & ITFB_UNICODE != 0,
+                    )
                 }
                 _ => {
                     return Err(Thrown::from_static(
@@ -3539,6 +3612,41 @@ impl<'p> Vm<'p> {
                 0,
             )
         };
+        // Pure-literal `.test()` fast path (`!build && !stateful`): searches
+        // the flat well-formed WTF-8/UTF-8 bytes directly via `memmem::Finder`
+        // without allocating a `Vec<u16>` or constructing a `BacktrackExecutor`.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !build && !stateful {
+            let lit_res = match (self.heap.get(re_idx), self.heap.get(s_idx)) {
+                (HeapObj::RegExp(re), HeapObj::Str(js))
+                    if js.is_wellformed() && js.units() <= u32::MAX as usize =>
+                {
+                    re.core.pure_literal_finder().map(|lit| {
+                        let hay = js.as_bytes();
+                        lit.finder.find(hay).map(|byte_start| {
+                            let mstart = if is_ascii {
+                                byte_start
+                            } else {
+                                utf16_len_of_utf8(&hay[..byte_start])
+                            };
+                            (mstart, mstart + lit.utf16_len, js.units())
+                        })
+                    })
+                }
+                _ => None,
+            };
+            if let Some(found_lit) = lit_res {
+                return match found_lit {
+                    None => Ok(Value::NULL),
+                    Some((mstart, mend, subj_units)) => {
+                        self.regexp_record_statics_literal(
+                            input_val, s_idx, mstart, mend, subj_units, is_ascii,
+                        );
+                        Ok(Value::TRUE)
+                    }
+                };
+            }
+        }
         #[cfg(feature = "safe-sandbox")]
         let (u16s, mut subject_units_reservation) = if is_ascii {
             // While an exec runs, no subject's buffer but its own is held.
@@ -3763,7 +3871,8 @@ impl<'p> Vm<'p> {
         let result_reservation = self
             .instrument_reserve_regex_transient(result_bytes)
             .map_err(|message| Thrown(message.into()))?;
-        let result = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mk);
+        let result =
+            self.regexp_build_result(Some(re_idx), &m, input_val, mstart, mend, has_indices, &mk);
         #[cfg(feature = "safe-sandbox")]
         drop(result_reservation);
         #[cfg(not(feature = "safe-sandbox"))]
@@ -3917,6 +4026,38 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Deferred Annex B statics for a pure-literal match (0 capture groups,
+    /// `subj_units <= u32::MAX`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn regexp_record_statics_literal(
+        &mut self,
+        input_val: Value,
+        s_idx: u32,
+        mstart: usize,
+        mend: usize,
+        subj_units: usize,
+        ascii: bool,
+    ) {
+        let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
+        ranges[0] = Some((mstart as u32, mend as u32));
+        ranges[2] = Some((0, mstart as u32));
+        ranges[3] = Some((mend as u32, subj_units as u32));
+        if self.regexp_last.len() == 14 {
+            self.regexp_last[0] = input_val;
+        } else {
+            self.regexp_last.clear();
+            self.regexp_last.push(input_val);
+            self.regexp_last.resize(14, Value::UNDEFINED);
+        }
+        self.regexp_last_lazy = Some(RegexpLastLazy {
+            subj: input_val,
+            subj_idx: s_idx,
+            ranges,
+            ascii,
+        });
+    }
+
     /// Build the RegExpBuiltinExec result array for successful match `m`:
     /// element 0 the whole-match slice, one element per capture, the compact
     /// `index`/`input`/`groups`/`indices` record, and (under `/d`) the
@@ -3930,6 +4071,7 @@ impl<'p> Vm<'p> {
     #[inline]
     fn regexp_build_result<F>(
         &mut self,
+        re_idx: Option<u32>,
         m: &regress::Match,
         input_val: Value,
         mstart: usize,
@@ -3953,30 +4095,69 @@ impl<'p> Vm<'p> {
             };
             elems.push(v);
         }
-        let named: Vec<(String, Option<std::ops::Range<usize>>)> =
-            m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
-        let groups = if named.is_empty() {
-            Value::UNDEFINED
-        } else {
-            let mut gm = ObjMap::with_capacity(named.len());
-            for (name, r) in &named {
-                let v = match r {
-                    Some(r) => m
-                        .captures
-                        .iter()
-                        .zip(elems.iter().skip(1))
-                        .find_map(|(capture, value)| {
-                            (capture.as_ref() == Some(r)).then_some(*value)
-                        })
-                        .expect("named capture range originates in the indexed capture list"),
-                    None => Value::UNDEFINED,
-                };
-                gm.set(name, v);
+        let re_core = re_idx.and_then(|idx| match self.heap.get(idx) {
+            HeapObj::RegExp(re) if re.core.regex.has_named_groups() => {
+                Some(std::sync::Arc::clone(&re.core))
             }
-            let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+            _ => None,
+        });
+        let cached_gp = re_core.as_deref().and_then(|c| c.groups_plan_cached());
+        let mut named_fallback: Option<Vec<(String, Option<std::ops::Range<usize>>)>> = None;
+        let groups = if let Some(gp) = cached_gp {
+            let n = gp.cap_indices.len();
+            let mut stack_vals = [Value::UNDEFINED; 16];
+            let mut heap_vals: Vec<Value>;
+            let vals: &mut [Value] = if n <= 16 {
+                &mut stack_vals[..n]
+            } else {
+                heap_vals = vec![Value::UNDEFINED; n];
+                &mut heap_vals
+            };
+            for (slot, cap_list) in gp.cap_indices.iter().enumerate() {
+                let mut val = Value::UNDEFINED;
+                for &ci in cap_list.iter() {
+                    let ci = ci as usize;
+                    if m.captures[ci].is_some() {
+                        val = elems[1 + ci];
+                        break;
+                    }
+                }
+                vals[slot] = val;
+            }
+            let gidx = self.heap.alloc_finalized(&gp.plan, vals, gp.shape);
             // The groups object is OrdinaryObjectCreate(null) — no prototype.
             self.proto_of.insert(gidx, Value::NULL);
             Value::heap(gidx)
+        } else if re_idx.is_some() && re_core.is_none() {
+            Value::UNDEFINED
+        } else {
+            let named: Vec<(String, Option<std::ops::Range<usize>>)> =
+                m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
+            let v = if named.is_empty() {
+                Value::UNDEFINED
+            } else {
+                let mut gm = ObjMap::with_capacity(named.len());
+                for (name, r) in &named {
+                    let v = match r {
+                        Some(r) => m
+                            .captures
+                            .iter()
+                            .zip(elems.iter().skip(1))
+                            .find_map(|(capture, value)| {
+                                (capture.as_ref() == Some(r)).then_some(*value)
+                            })
+                            .expect("named capture range originates in the indexed capture list"),
+                        None => Value::UNDEFINED,
+                    };
+                    gm.set(name, v);
+                }
+                let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+                // The groups object is OrdinaryObjectCreate(null) — no prototype.
+                self.proto_of.insert(gidx, Value::NULL);
+                Value::heap(gidx)
+            };
+            named_fallback = Some(named);
+            v
         };
         let arr_idx = self.alloc_array_current_realm(elems).heap_index();
         let index_v = Value::num(mstart as f64);
@@ -4005,20 +4186,47 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 });
             }
-            let idx_groups = if named.is_empty() {
-                Value::UNDEFINED
-            } else {
-                let mut gm = ObjMap::with_capacity(named.len());
-                for (name, r) in &named {
-                    let v = match r {
-                        Some(r) => mk(self, r),
-                        None => Value::UNDEFINED,
-                    };
-                    gm.set(name, v);
+            let idx_groups = if let Some(gp) = cached_gp {
+                let n = gp.cap_indices.len();
+                let mut stack_vals = [Value::UNDEFINED; 16];
+                let mut heap_vals: Vec<Value>;
+                let vals: &mut [Value] = if n <= 16 {
+                    &mut stack_vals[..n]
+                } else {
+                    heap_vals = vec![Value::UNDEFINED; n];
+                    &mut heap_vals
+                };
+                for (slot, cap_list) in gp.cap_indices.iter().enumerate() {
+                    let mut val = Value::UNDEFINED;
+                    for &ci in cap_list.iter() {
+                        if let Some(r) = &m.captures[ci as usize] {
+                            val = mk(self, r);
+                            break;
+                        }
+                    }
+                    vals[slot] = val;
                 }
-                let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+                let gidx = self.heap.alloc_finalized(&gp.plan, vals, gp.shape);
                 self.proto_of.insert(gidx, Value::NULL);
                 Value::heap(gidx)
+            } else if let Some(ref named) = named_fallback {
+                if named.is_empty() {
+                    Value::UNDEFINED
+                } else {
+                    let mut gm = ObjMap::with_capacity(named.len());
+                    for (name, r) in named {
+                        let v = match r {
+                            Some(r) => mk(self, r),
+                            None => Value::UNDEFINED,
+                        };
+                        gm.set(name, v);
+                    }
+                    let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+                    self.proto_of.insert(gidx, Value::NULL);
+                    Value::heap(gidx)
+                }
+            } else {
+                Value::UNDEFINED
             };
             let indices_arr = self.alloc_array_current_realm(idx_elems).heap_index();
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4234,7 +4442,8 @@ impl<'p> Vm<'p> {
             true,
             &mka,
         );
-        let arr = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
+        let arr =
+            self.regexp_build_result(Some(re_idx), &m, input_val, mstart, mend, has_indices, &mka);
         (arr, (mstart == mend).then_some(mend))
     }
 
@@ -4290,7 +4499,7 @@ impl<'p> Vm<'p> {
             true,
             &mka,
         );
-        let out = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
+        let out = self.regexp_build_result(None, &m, input_val, mstart, mend, has_indices, &mka);
         // Hand the capture Vec back to the scratch slot so the next publish
         // re-mallocs nothing (the caller took it from there).
         let mut caps = m.captures;
@@ -4444,25 +4653,33 @@ impl<'p> Vm<'p> {
         if r.start == r.end {
             return Value::heap(crate::heap::INTERN_EMPTY);
         }
-        let (whole, one_ascii, subject_ascii, len) = match self.heap.get(s_idx) {
+        let (whole, interned, subject_ascii, len) = match self.heap.get(s_idx) {
             HeapObj::Str(js) => {
                 let b = js.as_bytes();
                 let sl = &b[r.clone()];
                 let whole = r.start == 0 && r.end == b.len();
-                let one = if sl.len() == 1 && sl[0] < 128 {
-                    Some(sl[0])
+                let intern = if sl.len() == 1 && sl[0] < 128 {
+                    Some(sl[0] as u32)
+                } else if sl.len() == 2
+                    && sl[0].is_ascii_digit()
+                    && sl[1].is_ascii_digit()
+                {
+                    Some(
+                        crate::heap::INTERN_PAD2_START
+                            + ((sl[0] - b'0') as u32 * 10 + (sl[1] - b'0') as u32),
+                    )
                 } else {
                     None
                 };
-                (whole, one, js.is_ascii() && ascii_slice_fast(), sl.len())
+                (whole, intern, js.is_ascii() && ascii_slice_fast(), sl.len())
             }
             _ => return Value::heap(crate::heap::INTERN_EMPTY),
         };
         if whole {
             return Value::heap(s_idx);
         }
-        if let Some(ch) = one_ascii {
-            return Value::heap(ch as u32);
+        if let Some(id) = interned {
+            return Value::heap(id);
         }
         let mut bytes = self.heap.take_byte_buf(len);
         if let HeapObj::Str(js) = self.heap.get(s_idx) {
@@ -4482,10 +4699,11 @@ impl<'p> Vm<'p> {
     /// marker) or one without a `lastIndex` key and not frozen. Otherwise the
     /// full set_prop runs (a non-writable lastIndex must throw).
     pub(crate) fn regexp_write_last_index(&mut self, re_idx: u32, v: Value) -> Result<(), Thrown> {
-        let fast = match self.arr_props.get(&re_idx) {
-            None => true,
-            Some(m) => !m.frozen && m.pos("lastIndex").is_none(),
-        };
+        let fast = self.arr_props.is_empty()
+            || match self.arr_props.get(&re_idx) {
+                None => true,
+                Some(m) => !m.frozen && m.pos("lastIndex").is_none(),
+            };
         if fast {
             if let HeapObj::RegExp(re) = self.heap.get_mut(re_idx) {
                 re.last_index = v;
@@ -4818,7 +5036,7 @@ impl<'p> Vm<'p> {
                 });
                 if let (Some(k), Some(rc)) = (cache_key, compiled.as_ref()) {
                     #[cfg(feature = "safe-sandbox")]
-                    const REGEX_TWIN_CACHE_LIMIT: usize = 32;
+                    const REGEX_TWIN_CACHE_LIMIT: usize = 256;
                     #[cfg(not(feature = "safe-sandbox"))]
                     const REGEX_TWIN_CACHE_LIMIT: usize = 512;
                     if self.regex_compile_cache.len() >= REGEX_TWIN_CACHE_LIMIT {
@@ -5130,6 +5348,41 @@ impl<'p> Vm<'p> {
                 _ => return None,
             }
         }
+    }
+
+    /// Pure proof for Tier-C `jit_get_iterator` over a `RegExpStringIterator`:
+    /// verifies `@@iterator` is pristine `ITER_SELF` and that no `"return"`
+    /// property exists anywhere on its prototype chain (so `jit_iter_close_finally`
+    /// skipping `IteratorClose` on normal/break completion is exact).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn regexp_string_iter_jit_fast_ok(&self, it: Value) -> bool {
+        if self.regexp_string_iters.is_empty() {
+            return false;
+        }
+        if self
+            .regexp_string_iter_intrinsic_method(it, "@@iterator", crate::vm::native::ITER_SELF)
+            .is_none()
+        {
+            return false;
+        }
+        let no_return = |idx: u32| -> bool {
+            matches!(self.heap.get(idx), HeapObj::Object(m) if m.pos("return").is_none())
+        };
+        if !no_return(self.regexp_string_iter_proto)
+            || !no_return(self.iterator_proto_root)
+            || !no_return(self.obj_proto)
+        {
+            return false;
+        }
+        let iter_root_proto_ok = match self.proto_of.get_copied(self.iterator_proto_root) {
+            None => true,
+            Some(v) => v.is_heap() && v.heap_index() == self.obj_proto,
+        };
+        let obj_proto_ok = match self.proto_of.get_copied(self.obj_proto) {
+            None => true,
+            Some(v) => v == Value::NULL,
+        };
+        iter_root_proto_ok && obj_proto_ok
     }
 
     /// Pure guard for the source `GetIterator` at the exact scalar outer-loop
@@ -5694,8 +5947,15 @@ impl<'p> Vm<'p> {
         let mka =
             |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
         let _gc = self.gc_lock_guard();
-        let out =
-            self.regexp_build_result(&m, string, p.mstart as usize, p.mend as usize, false, &mka);
+        let out = self.regexp_build_result(
+            None,
+            &m,
+            string,
+            p.mstart as usize,
+            p.mend as usize,
+            false,
+            &mka,
+        );
         let mut caps = m.captures;
         caps.clear();
         self.matchall_caps_scratch = caps;
@@ -5908,6 +6168,7 @@ impl<'p> Vm<'p> {
         let mka =
             |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
         let out = self.regexp_build_result(
+            None,
             &m,
             pending.subject,
             p.mstart as usize,
@@ -6398,11 +6659,12 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()) {
             return self.regex_replace_ascii(s_idx, re, repl, global);
         }
-        // Encode the subject ONCE; every regress range below indexes into it.
+        // Encode the subject ONCE (reusing the cached UTF-16 buffer across
+        // repeated regex passes over the same non-ASCII document).
         #[cfg(feature = "safe-sandbox")]
         let (u16s, _subject_units_reservation) = regex_subject_units(self, Value::heap(s_idx))?;
         #[cfg(not(feature = "safe-sandbox"))]
-        let u16s: Vec<u16> = self.value_units(Value::heap(s_idx));
+        let u16s: Vec<u16> = self.regex_subject_units_take(Value::heap(s_idx));
         #[cfg(feature = "safe-sandbox")]
         let matches: Vec<regress::Match> = {
             let (limits, output_bytes) = self.instrument_regex_collection_limits();
@@ -6483,6 +6745,8 @@ impl<'p> Vm<'p> {
         // subject copy/rebuild. Strings are immutable, so the same heap value is
         // observably identical to a fresh copy.
         if matches.is_empty() {
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.regex_subject_units_put(Value::heap(s_idx), u16s);
             return Ok(Value::heap(s_idx));
         }
         // Intrinsic RegExpExec refreshes the Annex-B RegExp statics for every
@@ -6699,6 +6963,8 @@ impl<'p> Vm<'p> {
         regex_append_units(self, &mut out_reservation, &mut out, &u16s[last..])?;
         #[cfg(not(feature = "safe-sandbox"))]
         push_units(&mut out, &u16s[last..]);
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.regex_subject_units_put(Value::heap(s_idx), u16s);
         #[cfg(feature = "safe-sandbox")]
         return Ok(regex_wtf8_to_heap(self, &mut out_reservation, out));
         #[cfg(not(feature = "safe-sandbox"))]
@@ -6813,6 +7079,92 @@ impl<'p> Vm<'p> {
         // `//` and hit this.)
         if matches.is_empty() {
             return Ok(Value::heap(s_idx));
+        }
+        // Fast path for non-callable replacements on non-safe-sandbox builds:
+        // update Annex-B statics first, then borrow the flat ASCII subject in
+        // place (zero `subject.to_string()` clone), skip per-match `rep: Vec<u8>`
+        // allocation when the replacement contains no `$`, and finalize directly
+        // with `JsStr::from_ascii` when the replacement is ASCII.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if !callable {
+            let subj_len = self.heap_str_units(s_idx);
+            if let Some(m) = matches.last() {
+                let (mstart, mend) = (m.start(), m.end());
+                let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                    vm.ascii_slice_value(s_idx, r)
+                };
+                self.regexp_record_statics(
+                    m,
+                    Value::heap(s_idx),
+                    s_idx,
+                    mstart,
+                    mend,
+                    subj_len,
+                    subj_len <= u32::MAX as usize,
+                    true,
+                    &mk,
+                );
+            }
+            let has_dollar = repl_tmpl.contains(&b'$');
+            let repl_ascii = repl_tmpl.is_ascii();
+            let subject: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            let mut out: Vec<u8> = Vec::with_capacity(subject.len() + 16);
+            let mut last = 0usize;
+            if !has_dollar {
+                for m in &matches {
+                    let (st, en) = (m.start(), m.end());
+                    if st < last {
+                        continue;
+                    }
+                    out.extend_from_slice(&subject.as_bytes()[last..st]);
+                    if !repl_tmpl.is_empty() {
+                        if repl_tmpl.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
+                            return Err(Thrown::from_static("RangeError: Invalid string length"));
+                        }
+                        if repl_ascii {
+                            out.extend_from_slice(&repl_tmpl);
+                        } else {
+                            crate::heap::wtf8_push(&mut out, &repl_tmpl);
+                        }
+                    }
+                    last = en;
+                }
+            } else {
+                let mut rep: Vec<u8> = Vec::new();
+                for m in &matches {
+                    let (st, en) = (m.start(), m.end());
+                    if st < last {
+                        continue;
+                    }
+                    out.extend_from_slice(&subject.as_bytes()[last..st]);
+                    let limit = MAX_STRING_BYTES.saturating_sub(out.len());
+                    rep.clear();
+                    let src = SubSource::Match(SubSubject::Ascii(subject), m);
+                    expand_replacement_pieces(&repl_tmpl, &src, &mut |piece| {
+                        if piece.wtf8_len() > limit.saturating_sub(rep.len()) {
+                            return Err(Thrown::from_static("RangeError: Invalid string length"));
+                        }
+                        piece.append(&mut rep);
+                        Ok(())
+                    })?;
+                    if repl_ascii {
+                        out.extend_from_slice(&rep);
+                    } else {
+                        crate::heap::wtf8_push(&mut out, &rep);
+                    }
+                    last = en;
+                }
+            }
+            out.extend_from_slice(&subject.as_bytes()[last..]);
+            let js = if repl_ascii {
+                crate::heap::JsStr::from_ascii(out)
+            } else {
+                crate::heap::JsStr::from_wtf8(out)
+            };
+            return Ok(Value::heap(self.heap.alloc_js(js)));
         }
         // Own the subject (one memcpy) so the heap allocs below can't
         // invalidate the borrow; ASCII ⇒ valid UTF-8, sliceable as &str.

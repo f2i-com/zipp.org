@@ -110,7 +110,7 @@ impl<'p> Vm<'p> {
             let (HeapObj::Str(hay), HeapObj::Str(n)) = (self.heap.get(ci), self.heap.get(ni)) else {
                 return None;
             };
-            if !hay.is_ascii() || !n.is_ascii() {
+            if !hay.is_wellformed() || !n.is_wellformed() {
                 return None;
             }
             let (h, n) = (hay.as_bytes(), n.as_bytes());
@@ -175,11 +175,13 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// A dict's or set's key test for [`Vm::py_in`]: its table's lookup.
+    /// A dict's, set's or frozenset's key test for [`Vm::py_in`]: its table's lookup.
     fn py_in_keyed(&mut self, ci: u32, cls: Value, rt: Value, needle: Value) -> Option<bool> {
-        let (td, ts) = self.py_rt_for(rt).map(|p| (p.t_dict.bits(), p.t_set.bits()))?;
-        let dict = cls.bits() == td;
-        if !dict && cls.bits() != ts {
+        let (td, ts, tfs) = self
+            .py_rt_for(rt)
+            .map(|p| (p.t_dict.bits(), p.t_set.bits(), p.t_frozenset.bits()))?;
+        let cb = cls.bits();
+        if cb != td && cb != ts && cb != tfs {
             return None;
         }
         let map = self.py_hint_field(hint::MAP, ci, "map")?;

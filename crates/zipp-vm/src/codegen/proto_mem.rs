@@ -871,11 +871,7 @@ env_off_switch! {
 #[inline]
 fn tierc_cold_bail_op(instr: &Instr) -> Option<bool> {
     match *instr {
-        Instr::JsonStringify { .. } | Instr::JsonParse { .. } => Some(true),
-        Instr::CallWithThisSpread { .. }
-        | Instr::ArrayFrom { .. }
-        | Instr::DeleteIndex { .. }
-        | Instr::Pow { .. } => Some(false),
+        Instr::Pow { .. } => Some(false),
         _ => None,
     }
 }
@@ -1060,6 +1056,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // plants chains INSIDE function bodies Tier C compiles today
             // (markdown-render's span()/block builders), so rejecting the op
             // would un-compile them — the exact B56 regression mode.
+            | Instr::StrConcat { .. }
             | Instr::StrConcatChain { .. } => {}
             Instr::Mod { .. } => {
                 if !tierc_mod_enabled() {
@@ -1129,6 +1126,20 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 ..
             } if !py && (exclude_start as u64) <= 0xFFFF && (exclude_count as u64) <= 0xFFFF => {}
             Instr::MathSpread { .. } if !py => {}
+            // DOM / spread / collection / JSON ops routed via `jit_cold_op_ic`
+            // (call protocol): keeps hot DOM helpers in Tier C without
+            // cold-bail evictions or whole-function blacklisting.
+            Instr::ArrayFrom { .. }
+            | Instr::NewMap { .. }
+            | Instr::NewSet { .. }
+            | Instr::CallWithThisSpread { .. }
+            | Instr::NewSpread { .. }
+            | Instr::DeleteIndex { .. }
+            | Instr::JsonStringify { .. }
+            | Instr::JsonParse { .. }
+                if !py => {}
+            Instr::CallMethodSpread { name, .. }
+                if !py && (name as usize) < proto.string_constants.len() => {}
             // `Object.values(o)` / `Object.entries(o)`: the region's
             // `jit_obj_enum_ic` (a getter, a replaced builtin is user code).
             Instr::ObjectValues { .. } | Instr::ObjectEntries { .. } if !py => {}
@@ -1610,6 +1621,7 @@ pub(crate) fn activation_free(proto: &FuncProto) -> bool {
                 | Instr::TypeOfIs { .. }
                 | Instr::TypeOfSame { .. }
                 | Instr::StrAppendInPlace { .. }
+                | Instr::StrConcat { .. }
                 | Instr::StrConcatChain { .. }
                 | Instr::StrAppendIndex { .. }
                 | Instr::AddRightPair { .. }
@@ -1770,6 +1782,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             // W11/B124 staleness: the table was frozen pre-W11) failed closed
             // as a full window zero-fill on EVERY cross call into a callee
             // containing a fused chain (243k fills/run on router+react).
+            | Instr::StrConcat { dst, a, b }
             | Instr::StrConcatChain { dst, a, b }
             | Instr::Lt { dst, a, b }
             | Instr::Le { dst, a, b }
@@ -1816,6 +1829,11 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::MathSpread {
                 dst, callee, this_v, args, ..
             } => (u3(callee, this_v, args), Some(dst)),
+            Instr::NewMap { dst, src } | Instr::NewSet { dst, src } => {
+                (src.map_or_else(u0, u1), Some(dst))
+            }
+            Instr::CallMethodSpread { dst, obj, args, .. } => (u2(obj, args), Some(dst)),
+            Instr::NewSpread { dst, callee, args } => (u2(callee, args), Some(dst)),
             // The iterator's own bits come back into its register.
             Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => (u1(iter), Some(iter)),
             Instr::NewRegExp {
@@ -4179,8 +4197,12 @@ pub(crate) fn compile_proto_mem(
         if direct_entry_bases {
             dynasm!(ops
                 ; mov r13, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
-                ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
             );
+            if has_prop || do_method {
+                dynasm!(ops
+                    ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
+                );
+            }
         } else {
             dynasm!(ops
                 ; mov rcx, rdi
@@ -5382,19 +5404,74 @@ pub(crate) fn compile_proto_mem(
                     ; call rax
                 );
             }
-            Instr::Throw { .. }
-            | Instr::JsonStringify { .. }
-            | Instr::JsonParse { .. }
-            | Instr::CallWithThisSpread { .. }
-            | Instr::ArrayFrom { .. }
-            | Instr::DeleteIndex { .. }
-            | Instr::Pow { .. } => {
+            Instr::Throw { .. } | Instr::Pow { .. } => {
                 // Cold bail-only op (or Python Throw): resume in the
                 // interpreter at `ip` (after lazy-try pushes via `epilogue`).
                 dynasm!(ops
                     ; mov DWORD [rsi], ip as i32
                     ; jmp => epilogue
                 );
+            }
+            Instr::ArrayFrom { dst, .. }
+            | Instr::NewMap { dst, .. }
+            | Instr::NewSet { dst, .. }
+            | Instr::CallMethodSpread { dst, .. }
+            | Instr::CallWithThisSpread { dst, .. }
+            | Instr::NewSpread { dst, .. }
+            | Instr::DeleteIndex { dst, .. }
+            | Instr::JsonStringify { dst, .. }
+            | Instr::JsonParse { dst, .. }
+                if !py =>
+            {
+                let cold_op: u16 = match proto.code[ip] {
+                    Instr::ArrayFrom { .. } => 2,
+                    Instr::NewMap { .. } => 3,
+                    Instr::NewSet { .. } => 4,
+                    Instr::CallMethodSpread { .. } => 5,
+                    Instr::CallWithThisSpread { .. } => 6,
+                    Instr::NewSpread { .. } => 7,
+                    Instr::DeleteIndex { .. } => 8,
+                    Instr::JsonStringify { .. } => 9,
+                    Instr::JsonParse { .. } => 10,
+                    _ => unreachable!(),
+                };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    cold_op,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::StrConcat { dst, a, b } => {
+                let done_sc = ops.new_dynamic_label();
+                emit_concat_memo_fast(&mut ops, dst, a, b, done_sc);
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(b)]
+                    ; mov rax, QWORD heap.concat as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                dynasm!(ops ; => done_sc);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::EndFinally { kind_reg, val_reg } => {
                 // A return resuming in a lazy body goes to that body's
@@ -11045,8 +11122,11 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; mov eax, DWORD [rax + r10 * 4]
         ; cmp DWORD [r11 + 8], eax
         ; jne => slow
-        ; cmp DWORD [r11 + 20], 0
-        ; je => class_hit
+        ; mov eax, DWORD [r11 + 20]
+        ; test eax, eax
+        ; jz => class_hit
+        ; cmp eax, crate::vm::CLASS_PROP_GETTER as i32
+        ; je => slow
         ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
         ; cmp DWORD [r11 + 12], eax
         ; jne => slow

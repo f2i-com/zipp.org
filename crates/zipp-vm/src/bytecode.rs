@@ -2437,6 +2437,19 @@ pub enum Instr {
         rt: Reg,
         slow: u32,
     },
+    /// `dst = bool(v)` (Python truthiness): handles `bool`, `None`, `int`,
+    /// `float`, `str`, `list`/`tuple`/`bytes`, `dict`/`set`/`frozenset`, and
+    /// any non-type user class instance whose class cached `truthVer === ver &&
+    /// truthKind === 1` (no `__bool__` / `__len__`). Anything else jumps to
+    /// `slow`, leaving `dst` untouched.
+    #[allow(dead_code)] // emitted by the Python frontend only
+    #[cfg(not(feature = "wasm-lite"))]
+    PyTruth {
+        dst: Reg,
+        v: Reg,
+        rt: Reg,
+        slow: u32,
+    },
     /// A property's Python accessor function for `obj.<key>`: for a plain
     /// object `obj` whose own data `cls` (this site's inline cache) is a
     /// plain object whose own data `ga` (`set`: `sa`) table does not hold
@@ -5204,6 +5217,8 @@ pub enum StaticFn {
     ArrayOf,
     /// `String.fromCharCode(...codes)` — string from UTF-16 code units.
     StringFromCharCode,
+    /// `String.fromCodePoint(...codes)` — string from Unicode code points.
+    StringFromCodePoint,
     /// `Number.isInteger(x)` — no coercion.
     NumberIsInteger,
     /// `Number.isNaN(x)` — no coercion.
@@ -5242,6 +5257,7 @@ impl StaticFn {
             ("Promise", "any") => StaticFn::PromiseAny,
             ("Array", "of") => StaticFn::ArrayOf,
             ("String", "fromCharCode") => StaticFn::StringFromCharCode,
+            ("String", "fromCodePoint") => StaticFn::StringFromCodePoint,
             ("Number", "isInteger") => StaticFn::NumberIsInteger,
             ("Number", "isNaN") => StaticFn::NumberIsNaN,
             ("Number", "isFinite") => StaticFn::NumberIsFinite,

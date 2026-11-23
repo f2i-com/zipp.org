@@ -23,8 +23,8 @@ const STATIC_KEY_PLAN_MAX_BYTES: usize = 64 * 1024;
 /// whole parser, 31 KB of a module.
 pub(crate) fn check_regex_literal(text: &str, flags: &str) -> R<()> {
     let code_points: Vec<u32> = text.chars().map(u32::from).collect();
-    match regress::Regex::from_unicode(code_points.iter().copied(), flags) {
-        Ok(_) => Ok(()),
+    match regress::Regex::validate_unicode(code_points.iter().copied(), flags) {
+        Ok(()) => Ok(()),
         Err(err) => Err(format!("SyntaxError: invalid regular expression /{text}/{flags}: {err}")),
     }
 }

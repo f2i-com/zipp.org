@@ -18,10 +18,14 @@ fn is_start_anchored(n: &Node) -> bool {
             multiline,
         } => !multiline,
         Node::Cat(nodes) => {
-            // For concatenation, check if the first node is start-anchored
-            nodes.first().is_some_and(is_start_anchored)
+            // Skip leading Empty nodes and check if the first substantive node is start-anchored.
+            nodes
+                .iter()
+                .find(|node| !matches!(node, Node::Empty))
+                .is_some_and(is_start_anchored)
         }
         Node::CaptureGroup { contents, .. } => is_start_anchored(contents),
+        Node::Alt(left, right) => is_start_anchored(left) && is_start_anchored(right),
         // Other nodes are not anchored
         _ => false,
     }
@@ -109,19 +113,32 @@ impl AbstractStartPredicate {
     }
 }
 
-/// Compute any start-predicate for a node..
-/// If this returns None, then the instruction is conceptually zero-width (e.g.
-/// lookahead assertion) and does not contribute to the predicate.
-/// If this returns StartPredicate::Arbitrary, then there is no predicate.
-fn compute_start_predicate(n: &Node) -> Option<AbstractStartPredicate> {
-    let arbitrary = Some(AbstractStartPredicate::Arbitrary);
-    match n {
-        Node::ByteSequence(bytevec) => Some(AbstractStartPredicate::Sequence(bytevec.clone())),
-        Node::ByteSet(bytes) => Some(AbstractStartPredicate::Set(Box::new(ByteBitmap::new(
-            bytes,
-        )))),
+/// Result of start-predicate analysis for a node.
+enum Pred {
+    /// Consumes nothing (zero-width assertion or empty node).
+    Empty,
+    /// May consume a byte matching the predicate, or consume nothing.
+    Optional(AbstractStartPredicate),
+    /// Always consumes a byte matching the predicate.
+    Always(AbstractStartPredicate),
+}
 
-        Node::Empty => arbitrary,
+/// Compute any start-predicate for a node.
+fn compute_start_predicate(n: &Node) -> Pred {
+    let arbitrary = Pred::Always(AbstractStartPredicate::Arbitrary);
+    match n {
+        Node::ByteSequence(bytevec) => {
+            if bytevec.is_empty() {
+                Pred::Empty
+            } else {
+                Pred::Always(AbstractStartPredicate::Sequence(bytevec.clone()))
+            }
+        }
+        Node::ByteSet(bytes) => Pred::Always(AbstractStartPredicate::Set(Box::new(
+            ByteBitmap::new(bytes),
+        ))),
+
+        Node::Empty | Node::Anchor { .. } | Node::WordBoundary { .. } => Pred::Empty,
         Node::Goal => arbitrary,
         Node::BackRef { .. } | Node::NamedBackRef { .. } => arbitrary,
 
@@ -131,65 +148,123 @@ fn compute_start_predicate(n: &Node) -> Option<AbstractStartPredicate> {
                 .iter()
                 .map(|&c| utf8_first_byte(c))
                 .collect::<Vec<_>>();
-            Some(AbstractStartPredicate::Set(Box::new(ByteBitmap::new(
+            Pred::Always(AbstractStartPredicate::Set(Box::new(ByteBitmap::new(
                 &bytes,
             ))))
         }
 
-        // We assume that most char nodes have been optimized to ByteSeq or AnyBytes2, so skip
-        // these.
-        // TODO: we could support icase through bitmap of de-folded first bytes.
-        Node::Char { .. } => arbitrary,
+        // Case-sensitive literal characters (kept as Node::Char when utf16 is enabled).
+        &Node::Char { c, icase: false } => {
+            if let Some(ch) = char::from_u32(c) {
+                let mut buf = [0u8; 4];
+                let bytes = ch.encode_utf8(&mut buf).as_bytes().to_vec();
+                Pred::Always(AbstractStartPredicate::Sequence(bytes))
+            } else {
+                arbitrary
+            }
+        }
+        Node::Char { icase: true, .. } => arbitrary,
 
-        // Cats return the first non-None value, if any.
-        Node::Cat(nodes) => nodes.iter().filter_map(compute_start_predicate).next(),
+        // Walk Cat skipping zero-width nodes, merging optional prefixes with what follows,
+        // and coalescing adjacent literal Char / ByteSequence nodes into a longer sequence.
+        Node::Cat(nodes) => {
+            let mut acc: Option<AbstractStartPredicate> = None;
+            let mut idx = 0usize;
+            while idx < nodes.len() {
+                // Fast path: when no optional prefix precedes us, coalesce adjacent
+                // case-sensitive literal chars / byte sequences into one memmem needle.
+                if acc.is_none() {
+                    let mut seq: Option<Vec<u8>> = None;
+                    let mut j = idx;
+                    while j < nodes.len() {
+                        match &nodes[j] {
+                            Node::ByteSequence(bv) if !bv.is_empty() => {
+                                seq.get_or_insert_with(Vec::new).extend_from_slice(bv);
+                                j += 1;
+                            }
+                            &Node::Char { c, icase: false } => {
+                                if let Some(ch) = char::from_u32(c) {
+                                    let mut buf = [0u8; 4];
+                                    seq.get_or_insert_with(Vec::new)
+                                        .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let Some(bytes) = seq {
+                        return Pred::Always(AbstractStartPredicate::Sequence(bytes));
+                    }
+                }
+                match compute_start_predicate(&nodes[idx]) {
+                    Pred::Empty => {}
+                    Pred::Optional(p) => {
+                        acc = Some(match acc {
+                            Some(a) => AbstractStartPredicate::disjunction(a, p),
+                            None => p,
+                        });
+                    }
+                    Pred::Always(p) => {
+                        return Pred::Always(match acc {
+                            Some(a) => AbstractStartPredicate::disjunction(a, p),
+                            None => p,
+                        });
+                    }
+                }
+                idx += 1;
+            }
+            match acc {
+                Some(a) => Pred::Optional(a),
+                None => Pred::Empty,
+            }
+        }
 
         // MatchAny (aka .) is too common to do a fast prefix search for.
-        Node::MatchAny => arbitrary,
-
-        // MatchAnyExceptLineTerminator (aka .) is too common to do a fast prefix search for.
-        Node::MatchAnyExceptLineTerminator => arbitrary,
-
-        // TODO: can probably exploit some of these.
-        Node::Anchor { .. } => arbitrary,
-        Node::WordBoundary { .. } => arbitrary,
+        Node::MatchAny | Node::MatchAnyExceptLineTerminator => arbitrary,
 
         // Capture groups delegate to their contents.
         Node::CaptureGroup { contents, .. } => compute_start_predicate(contents),
 
-        // Zero-width assertions are one of the few instructions that impose no start predicate.
-        Node::LookaroundAssertion { .. } => None,
+        // Positive lookaheads constrain the bytes at the current position; other
+        // lookarounds impose no byte predicate here.
+        Node::LookaroundAssertion {
+            negate: false,
+            backwards: false,
+            contents,
+            ..
+        } => match compute_start_predicate(contents) {
+            Pred::Always(p) => Pred::Always(p),
+            _ => Pred::Empty,
+        },
+        Node::LookaroundAssertion { .. } => Pred::Empty,
 
-        Node::Loop { loopee, quant, .. } => {
-            // TODO: we could try to join two predicates if the loop were optional.
-            if quant.min > 0 {
-                compute_start_predicate(loopee)
-            } else {
-                arbitrary
+        Node::Loop { loopee, quant, .. } | Node::Loop1CharBody { loopee, quant } => {
+            if quant.max == Some(0) {
+                return Pred::Empty;
+            }
+            match compute_start_predicate(loopee) {
+                Pred::Empty => Pred::Empty,
+                Pred::Always(p) if quant.min == 0 => Pred::Optional(p),
+                Pred::Optional(p) => Pred::Optional(p),
+                Pred::Always(p) => Pred::Always(p),
             }
         }
 
-        Node::Loop1CharBody { loopee, quant } => {
-            // TODO: we could try to join two predicates if the loop were optional.
-            if quant.min > 0 {
-                compute_start_predicate(loopee)
-            } else {
-                arbitrary
+        // Disjunction of our two arms, preserving whether either arm can match empty.
+        Node::Alt(left, right) => match (compute_start_predicate(left), compute_start_predicate(right)) {
+            (Pred::Empty, Pred::Empty) => Pred::Empty,
+            (Pred::Empty, Pred::Always(p) | Pred::Optional(p))
+            | (Pred::Always(p) | Pred::Optional(p), Pred::Empty) => Pred::Optional(p),
+            (Pred::Always(x), Pred::Always(y)) => {
+                Pred::Always(AbstractStartPredicate::disjunction(x, y))
             }
-        }
-
-        // This one is interesting - we compute the disjunction of the predicates of our two arms.
-        Node::Alt(left, right) => {
-            if let (Some(x), Some(y)) = (
-                compute_start_predicate(left),
-                compute_start_predicate(right),
-            ) {
-                Some(AbstractStartPredicate::disjunction(x, y))
-            } else {
-                // This indicates that one of our branches could match the empty string.
-                arbitrary
+            (Pred::Always(x) | Pred::Optional(x), Pred::Always(y) | Pred::Optional(y)) => {
+                Pred::Optional(AbstractStartPredicate::disjunction(x, y))
             }
-        }
+        },
 
         // Brackets get a bitmap.
         Node::Bracket(bc) => {
@@ -202,7 +277,7 @@ fn compute_start_predicate(n: &Node) -> Option<AbstractStartPredicate> {
                 &bc.cps
             };
             let bitmap = cps_to_first_byte_bitmap(cps);
-            Some(AbstractStartPredicate::Set(bitmap))
+            Pred::Always(AbstractStartPredicate::Set(bitmap))
         }
     }
 }
@@ -414,7 +489,8 @@ pub fn predicate_for_re(re: &ir::Regex) -> StartPredicate {
         return StartPredicate::StartAnchored;
     }
 
-    compute_start_predicate(&re.node)
-        .unwrap_or(AbstractStartPredicate::Arbitrary)
-        .resolve_to_insn()
+    match compute_start_predicate(&re.node) {
+        Pred::Always(p) => p.resolve_to_insn(),
+        Pred::Empty | Pred::Optional(_) => StartPredicate::Arbitrary,
+    }
 }

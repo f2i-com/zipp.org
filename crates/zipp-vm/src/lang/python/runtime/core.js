@@ -87,7 +87,7 @@ var __zipp_py = (function () {
             bases: bases, mro: null, dict: dict || new Map(), id: nextId++, isType: true, code: constructCode, fast: typeFast,
             ga: Object.create(null), sa: Object.create(null), gm: Object.create(null), gb: Object.create(null),
             gp: Object.create(null), sp: Object.create(null), gx: Object.create(null),
-            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null), ver: 0 };
+            userClass: false, flagged: false, gs: Object.create(null), gv: Object.create(null), ver: 0, truthVer: -1, truthKind: 0, truthFn: undefined };
         t.mro = computeMro(t);
         return t;
     }
@@ -239,8 +239,26 @@ var __zipp_py = (function () {
     // The innermost recorded frame holds the line its own frame was running;
     // the global line is only re-stamped when a line changes, so after a call
     // returns it can still name the callee's last line (another module).
+    // Lazily expand raw `[encLine, fn, ...]` frame pairs written natively by
+    // `Vm::py_addframe` into `{file, line, name, fn}` objects only when a
+    // traceback or location is actually inspected (or JS `R.addframe` runs).
+    function normFrames(exc) {
+        if (exc === null || exc === undefined || typeof exc !== "object") return undefined;
+        const fr = exc.frames;
+        if (fr === undefined || fr.length === 0 || typeof fr[0] !== "number") return fr;
+        const out = [];
+        for (let i = 0; i + 1 < fr.length; i += 2) {
+            const enc = fr[i], f = fr[i + 1];
+            out.push({ file: files[Math.floor(enc / 1000000)] || "?", line: enc % 1000000,
+                name: f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>", fn: f });
+        }
+        exc.frames = out;
+        return out;
+    }
+    rt.normFrames = normFrames;
     rt.excLocation = function (e) {
-        const fr = e.frames !== undefined && e.frames.length ? e.frames[0] : null;
+        const list = normFrames(e);
+        const fr = list !== undefined && list.length ? list[0] : null;
         if (fr !== null && fr.file !== "?" && fr.line > 0) return " (" + fr.file + ":" + fr.line + ")";
         return locationText(e.tbline);
     };
@@ -298,7 +316,7 @@ var __zipp_py = (function () {
     R.TBKEEP = KEEP_INNER;
     const frameName = (f) => f !== null && typeof f === "object" && typeof f.name === "string" ? f.name : "<module>";
     function pushFrame(exc, frame) {
-        let frames = exc.frames;
+        let frames = normFrames(exc);
         if (frames === undefined) frames = exc.frames = [];
         if (frames.length < KEEP_INNER) frames.push(frame);
         else {
@@ -330,7 +348,7 @@ var __zipp_py = (function () {
         const exc = normexc(e);
         const enc = typeof line === "number" ? line : 0;
         if (exc.tbline === -1) exc.tbline = enc;
-        let frames = exc.frames;
+        let frames = normFrames(exc);
         if (frames === undefined) frames = exc.frames = [];
         else if (frames.length !== 0 && frames[frames.length - 1].open === f) {
             const last = frames[frames.length - 1];
@@ -351,7 +369,7 @@ var __zipp_py = (function () {
         if (exc.tbfn !== null && exc.tbfn !== undefined) out.push(caughtFrame(exc));
         const outer = exc.outerFrames || [];
         for (let i = outer.length - 1; i >= 0; i--) out.push(outer[i]);
-        const frames = exc.frames || [];
+        const frames = normFrames(exc) || [];
         for (let i = frames.length - 1; i >= 0; i--) out.push(frames[i]);
         return out;
     }
@@ -467,7 +485,7 @@ var __zipp_py = (function () {
     // AttributeError or ImportError naming what was missing ("Did you
     // mean"), as lib/traceback.py's `_compute_suggestion_error` computes it.
     function suggestionText(exc, entries) {
-        const own = (k) => exc.dict instanceof Map ? exc.dict.get(k) : undefined;
+        const own = (k) => exc.dict !== null && exc.dict !== undefined && typeof exc.dict.get === "function" ? exc.dict.get(k) : undefined;
         const sortedStrs = (xs) => xs.filter((x) => typeof x === "string").sort(rt.compareStrings);
         const dirOf = (o) => { const d = rt.call(rt.builtins.get("dir"), [o], null); return d !== null && typeof d === "object" && Array.isArray(d.items) ? d.items : []; };
         try {
@@ -540,7 +558,7 @@ var __zipp_py = (function () {
     function formatExcOnly(exc, entries) {
         const s = safeStr(exc, "exception") + suggestionText(exc, entries), t = excTypeName(typeOf(exc));
         let out = s ? t + ": " + s + "\n" : t + "\n";
-        const notes = exc.dict instanceof Map ? exc.dict.get("__notes__") : undefined;
+        const notes = exc.dict !== null && exc.dict !== undefined && typeof exc.dict.get === "function" ? exc.dict.get("__notes__") : undefined;
         if (notes !== undefined && notes !== null) {
             if (typeof notes === "object" && (notes.cls === T.list || notes.cls === T.tuple)) {
                 for (const n of notes.items) out += safeStr(n, "note").split("\n").map((l) => l + "\n").join("");
@@ -941,20 +959,25 @@ var __zipp_py = (function () {
             }
         }
         if (dict !== undefined) {
-            // No data descriptor: a dict hit is the answer from now on, until
-            // the name changes on the class (`forgetName`).
-            if (t.userClass === true && (attr === undefined || attr === null || typeof attr !== "object" || attr.cls === T.function) && name !== "__dict__") {
+            // No data descriptor (line 935 already returned on any data
+            // descriptor): a dict hit wins from now on, until the name
+            // changes on the class (`forgetName`).
+            if (t.userClass === true && name !== "__dict__") {
                 t.ga[name] = true; if (t.flagged !== true) noteFlagged(t);
             }
             const v = dict.get(name);
             if (v !== undefined) return v;
             if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
-            // A plain class attribute (an int, float, str or bool): the
-            // answer for an instance dict without the name, until the name
-            // changes on the class (`gv`, read by the emitter's `PyClassAttr`).
-            const ta = typeof attr;
-            if (t.userClass === true && t.ga[name] === true && (ta === "bigint" || ta === "number" || ta === "string" || ta === "boolean")) {
-                t.gv[name] = attr; if (t.flagged !== true) noteFlagged(t);
+            // Any non-descriptor class attribute (None, primitive, or plain
+            // object lacking `__get__`, such as a class-level list/set/dict/
+            // compiled regex): the answer when the instance dict lacks the
+            // name, until the name changes on the class (`gv`, read by
+            // `PyClassAttr` / `PyGetAttr`).
+            if (t.userClass === true && t.ga[name] === true && attr !== undefined) {
+                const ta = typeof attr;
+                if (attr === null || ta !== "object" || (attr.cls !== T.function && lookupType(attr.cls || ObjectType, "__get__") === undefined)) {
+                    t.gv[name] = attr; if (t.flagged !== true) noteFlagged(t);
+                }
             }
         }
         if (attr !== undefined) return descrGet(attr, obj, t);
@@ -1554,6 +1577,7 @@ var __zipp_py = (function () {
     function initReturned(r) { fail(TypeError, "__init__() should return None, not '" + typeOf(r).name + "'"); }
     // An instance's attribute storage (`vm::py_table::layout`, op 23).
     const ATTRS = __zipp_py_table;
+    rt.attrs = ATTRS;
     const CTOR_ENTRY = [
         function () { const obj = { cls: this, dict: ATTRS(23) }; const init = this.ctorInit; if (init !== null) { const r = init.c1(obj); if (r !== null) initReturned(r); } return obj; },
         function (a) { const obj = { cls: this, dict: ATTRS(23) }; const r = this.ctorInit.c2(obj, a); if (r !== null) initReturned(r); return obj; },
@@ -1627,9 +1651,9 @@ var __zipp_py = (function () {
         if (!isSubclass(cls, base)) fail(TypeError, base.name + ".__new__(" + cls.name + "): " + cls.name + " is not a subtype of " + base.name);
         const v = rt.constructors.get(base)(args, kwargs, cls);
         if (cls === base) return v;
-        if (v === null || typeof v !== "object") return { cls: cls, pyval: v, dict: new Map() };
+        if (v === null || typeof v !== "object") return { cls: cls, pyval: v, dict: ATTRS(23) };
         if (v.cls !== cls) v.cls = cls;
-        if (v.dict === undefined || v.dict === null) v.dict = new Map();
+        if (v.dict === undefined || v.dict === null) v.dict = ATTRS(23);
         return v;
     };
     rt.constructors = new Map();          // builtin type -> (args, kwargs, cls) => value

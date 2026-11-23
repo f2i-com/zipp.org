@@ -655,8 +655,8 @@ fn parse_vfs_files_map(
     running_bytes: &mut usize,
 ) -> Result<(), String> {
     let mut budget = HostValueBudget::new(262_144, MAX_PROJECT_VFS_BYTES.saturating_mul(2));
-    let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-    let entries = match from_js_bounded(files, 0, &seen, &mut budget)? {
+    let mut seen = None;
+    let entries = match from_js_bounded(files, 0, &mut seen, &mut budget)? {
         HostValue::Object(entries) => entries,
         _ => return Err("TypeError: files must be a plain object mapping paths to string or {base64}".into()),
     };
@@ -770,7 +770,7 @@ pub struct Engine {
     #[cfg(feature = "php")]
     php_hooks: Option<PhpHooks>,
     /// Script symbol name → global slot. Preamble names are excluded.
-    slots: Vec<(String, u32, SymbolScope)>,
+    slots: HashMap<String, u32>,
     helpers: Helpers,
     bridges: Rc<RefCell<Bridges>>,
     /// What a failed initialization printed before its error, kept for
@@ -834,7 +834,7 @@ impl Engine {
             #[cfg(feature = "php")]
             php_hooks: None,
             failed_init_console: Vec::new(),
-            slots: Vec::new(),
+            slots: HashMap::new(),
             helpers: Helpers::default(),
             bridges: Rc::new(RefCell::new(Bridges::default())),
             script_origin: ScriptOrigin::default(),
@@ -1650,45 +1650,42 @@ impl Engine {
                 return Err(JsValue::from_str(&e));
             }
 
-            let mut slots = Vec::new();
+            let syms = st.symbols();
+            let mut slots = HashMap::new();
             let mut exposed = Vec::new();
-            for s in st.symbols() {
-                // Non-JS frontends' only JS bindings are the private runtime
-                // bootstrap; never expose them as user globals.
-                if matches!(
-                    language,
-                    zipp_vm::frontend::LanguageId::Python
-                        | zipp_vm::frontend::LanguageId::Php
-                        | zipp_vm::frontend::LanguageId::Rust
-                ) {
-                    continue;
+            if !matches!(
+                language,
+                zipp_vm::frontend::LanguageId::Python
+                    | zipp_vm::frontend::LanguageId::Php
+                    | zipp_vm::frontend::LanguageId::Rust
+            ) {
+                for s in &syms {
+                    // Preamble names are engine plumbing, with one exception: the host
+                    // needs a slot for the bridge objects it also writes to (it syncs
+                    // `window.__foo` keys both ways), so those stay visible. Hosts are
+                    // expected to exclude them from what they treat as script state.
+                    if PREAMBLE_BINDINGS.contains(&s.name.as_str())
+                        && !EXPOSED_PREAMBLE.contains(&s.name.as_str())
+                    {
+                        continue;
+                    }
+                    let scope = match s.scope {
+                        SymbolScope::Function => "function",
+                        SymbolScope::Variable => "variable",
+                    };
+                    exposed.push((
+                        s.name.clone(),
+                        HostValue::Object(vec![
+                            ("index".into(), HostValue::Number(s.index as f64)),
+                            ("scope".into(), HostValue::String(scope.into())),
+                        ]),
+                    ));
+                    slots.insert(s.name.clone(), s.index);
                 }
-                // Preamble names are engine plumbing, with one exception: the host
-                // needs a slot for the bridge objects it also writes to (it syncs
-                // `window.__foo` keys both ways), so those stay visible. Hosts are
-                // expected to exclude them from what they treat as script state.
-                if PREAMBLE_BINDINGS.contains(&s.name.as_str())
-                    && !EXPOSED_PREAMBLE.contains(&s.name.as_str())
-                {
-                    continue;
-                }
-                let scope = match s.scope {
-                    SymbolScope::Function => "function",
-                    SymbolScope::Variable => "variable",
-                };
-                exposed.push((
-                    s.name.clone(),
-                    HostValue::Object(vec![
-                        ("index".into(), HostValue::Number(s.index as f64)),
-                        ("scope".into(), HostValue::String(scope.into())),
-                    ]),
-                ));
-                slots.push((s.name, s.index, s.scope));
             }
 
             let find = |n: &str| {
-                st.symbols()
-                    .into_iter()
+                syms.iter()
                     .find(|s| s.name == n)
                     .map(|s| s.index)
             };
@@ -2035,11 +2032,11 @@ impl Engine {
         }
         budget.charge_node().map_err(|error| self.to_js_error(error))?;
         budget.ensure_nodes(idx.len()).map_err(|error| self.to_js_error(error))?;
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
+        let mut seen: Option<js_sys::WeakSet<js_sys::Object>> = None;
         let mut converted = Vec::with_capacity(idx.len());
         for (n, i) in idx.into_iter().enumerate() {
             let raw = checked_array_get(&values, n as u32, "values").map_err(|error| self.to_js_error(error))?;
-            let value = from_js_bounded(&raw, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
+            let value = from_js_bounded(&raw, 0, &mut seen, &mut budget).map_err(|error| self.to_js_error(error))?;
             converted.push((i, value));
         }
         if let Some(st) = self.state.as_mut() {
@@ -2059,12 +2056,7 @@ impl Engine {
                 .usage_error("call_function is unavailable for the experimental Python frontend"));
         }
         self.ensure_live()?;
-        let Some(slot) = self
-            .slots
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, i, _)| *i)
-        else {
+        let Some(&slot) = self.slots.get(name) else {
             self.note_error_kind("usage");
             return Err(JsValue::from_str(&format!(
                 "zipp: no such function '{name}'"
@@ -2428,8 +2420,8 @@ impl Engine {
         let mut budget = HostValueBudget::default();
         budget.charge_node().map_err(|error| self.to_js_error(error))?;
         budget.charge_string(event_type).map_err(|error| self.to_js_error(error))?;
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-        let event = from_js_bounded(&event, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
+        let mut seen: Option<js_sys::WeakSet<js_sys::Object>> = None;
+        let event = from_js_bounded(&event, 0, &mut seen, &mut budget).map_err(|error| self.to_js_error(error))?;
         let args = [HostValue::String(event_type.to_string()), event];
         let (Some(slot), Some(st)) = (self.helpers.dispatch_event, self.state.as_mut()) else {
             return Ok(0);
@@ -2570,8 +2562,8 @@ impl Engine {
         })?;
         let mut budget = HostValueBudget::default();
         budget.charge_node().map_err(|error| self.to_js_error(error))?;
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-        let result = from_js_bounded(&result, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
+        let mut seen: Option<js_sys::WeakSet<js_sys::Object>> = None;
+        let result = from_js_bounded(&result, 0, &mut seen, &mut budget).map_err(|error| self.to_js_error(error))?;
         let args = [HostValue::Number(call_id), result];
         let (Some(slot), Some(st)) = (self.helpers.resolve_host_call, self.state.as_mut()) else {
             return Ok(false);
@@ -3410,8 +3402,8 @@ impl PhpApp {
         let parsed = js_sys::JSON::parse(json)
             .map_err(|_| JsValue::from_str("SyntaxError: invalid overlay JSON"))?;
         let mut budget = HostValueBudget::new(262_144, MAX_PROJECT_VFS_BYTES.saturating_mul(2));
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-        let val = from_js_bounded(&parsed, 0, &seen, &mut budget).map_err(to_js_error)?;
+        let mut seen = None;
+        let val = from_js_bounded(&parsed, 0, &mut seen, &mut budget).map_err(to_js_error)?;
         let HostValue::Object(entries) = val else {
             return Err(JsValue::from_str("TypeError: overlay JSON must be an object"));
         };
@@ -4483,8 +4475,11 @@ fn require_array(v: &JsValue, label: &str) -> Result<(), String> {
 }
 
 fn checked_array_length(v: &JsValue, label: &str) -> Result<u32, String> {
-    let raw = js_sys::Reflect::get(v, &JsValue::from_str("length"))
-        .map_err(|_| inspection_error(label))?;
+    let raw = LENGTH_KEY.with(|cell| {
+        let key = cell.get_or_init(|| JsValue::from_str("length"));
+        js_sys::Reflect::get(v, key)
+    })
+    .map_err(|_| inspection_error(label))?;
     let Some(length) = raw.as_f64() else {
         return Err(inspection_error(label));
     };
@@ -4628,15 +4623,25 @@ fn write_json(v: &HostValue, out: &mut String, budget: &mut HostValueBudget) -> 
 fn write_json_string(s: &str, out: &mut String) {
     use std::fmt::Write;
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b < 0x20 || b == b'"' || b == b'\\' {
+            if start < i {
+                out.push_str(&s[start..i]);
             }
-            c => out.push(c),
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                _ => {
+                    let _ = write!(out, "\\u{:04x}", b);
+                }
+            }
+            start = i + 1;
         }
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
 }
@@ -4725,6 +4730,30 @@ mod console_transport_tests {
 }
 
 fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue, String> {
+    to_js_inner(v, 0, budget)
+}
+
+fn to_js_inner(v: &HostValue, depth: usize, budget: &mut HostValueBudget) -> Result<JsValue, String> {
+    if depth <= 1
+        && matches!(
+            v,
+            HostValue::Array(items) if items.len() >= 4
+        )
+        || (depth <= 1
+            && matches!(
+                v,
+                HostValue::Object(pairs) if pairs.len() >= 2
+            ))
+    {
+        let mut try_budget = budget.clone();
+        let mut text = String::new();
+        if write_json(v, &mut text, &mut try_budget) {
+            if let Ok(parsed) = js_sys::JSON::parse(&text) {
+                *budget = try_budget;
+                return Ok(parsed);
+            }
+        }
+    }
     budget.charge_node()?;
     match v {
         HostValue::Undefined => Ok(JsValue::UNDEFINED),
@@ -4753,7 +4782,7 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
             budget.ensure_nodes(items.len())?;
             let a = js_sys::Array::new_with_length(items.len() as u32);
             for (i, it) in items.iter().enumerate() {
-                a.set(i as u32, to_js_bounded(it, budget)?);
+                a.set(i as u32, to_js_inner(it, depth + 1, budget)?);
             }
             Ok(a.into())
         }
@@ -4762,7 +4791,7 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
             let o = js_sys::Object::new();
             for (k, val) in pairs {
                 budget.charge_string(k)?;
-                let value = to_js_bounded(val, budget)?;
+                let value = to_js_inner(val, depth + 1, budget)?;
                 define_own(&o, k, &value)?;
             }
             if !pairs.is_empty() {
@@ -4806,6 +4835,8 @@ thread_local! {
     /// Short strings already made on the host side (`host_string`).
     static HOST_STRINGS: RefCell<std::collections::HashMap<Box<str>, JsValue>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Cached `"length"` property key for [`checked_array_length`].
+    static LENGTH_KEY: std::cell::OnceCell<JsValue> = const { std::cell::OnceCell::new() };
 }
 
 /// Strings at most this long are kept once made (`host_string`), and at most
@@ -4890,14 +4921,14 @@ fn release_data_descriptor() {
 
 fn from_js(v: &JsValue) -> Result<HostValue, String> {
     let mut budget = HostValueBudget::default();
-    let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-    from_js_bounded(v, 0, &seen, &mut budget)
+    let mut seen: Option<js_sys::WeakSet<js_sys::Object>> = None;
+    from_js_bounded(v, 0, &mut seen, &mut budget)
 }
 
 fn from_js_bounded(
     v: &JsValue,
     depth: usize,
-    seen: &js_sys::WeakSet<js_sys::Object>,
+    seen: &mut Option<js_sys::WeakSet<js_sys::Object>>,
     budget: &mut HostValueBudget,
 ) -> Result<HostValue, String> {
     budget.charge_node()?;
@@ -4954,10 +4985,11 @@ fn from_js_bounded(
     }
     if checked_is_array(v, "host value")? {
         let object: js_sys::Object = v.clone().unchecked_into();
-        if seen.has(&object) {
+        if seen.as_ref().is_some_and(|s| s.has(&object)) {
             return Ok(HostValue::Null);
         }
-        seen.add(&object);
+        seen.get_or_insert_with(js_sys::WeakSet::<js_sys::Object>::new_typed)
+            .add(&object);
         let result = (|| {
             let len = checked_array_length(v, "host array")?;
             budget.ensure_nodes(len as usize)?;
@@ -4968,7 +5000,9 @@ fn from_js_bounded(
             }
             Ok(HostValue::Array(items))
         })();
-        seen.delete(&object);
+        if let Some(s) = seen.as_ref() {
+            s.delete(&object);
+        }
         return result;
     }
     if v.is_function() {
@@ -4976,10 +5010,11 @@ fn from_js_bounded(
     }
     if v.is_object() {
         let object: js_sys::Object = v.clone().unchecked_into();
-        if seen.has(&object) {
+        if seen.as_ref().is_some_and(|s| s.has(&object)) {
             return Ok(HostValue::Null);
         }
-        seen.add(&object);
+        seen.get_or_insert_with(js_sys::WeakSet::<js_sys::Object>::new_typed)
+            .add(&object);
         let result = (|| {
             let keys: JsValue = try_object_keys(v)
                 .map_err(|_| inspection_error("host object"))?
@@ -5018,7 +5053,9 @@ fn from_js_bounded(
             }
             Ok(HostValue::Object(pairs))
         })();
-        seen.delete(&object);
+        if let Some(s) = seen.as_ref() {
+            s.delete(&object);
+        }
         return result;
     }
     Ok(HostValue::Opaque)

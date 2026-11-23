@@ -1277,8 +1277,12 @@
                         if (sub.waiters.length > 0) {
                             sub.waiters.shift()(Ok(item));
                         } else {
-                            if (sub.queue.length >= obj.bus.cap) {
-                                sub.queue.shift();
+                            if (sub.queue.length - sub.qhead >= obj.bus.cap) {
+                                sub.queue[sub.qhead++] = undefined;
+                                if (sub.qhead >= 64 && sub.qhead * 2 >= sub.queue.length) {
+                                    sub.queue = sub.queue.slice(sub.qhead);
+                                    sub.qhead = 0;
+                                }
                                 sub.lagged++;
                             }
                             sub.queue.push(item);
@@ -1287,7 +1291,7 @@
                     return Ok(subs.length);
                 }
                 if (name === "subscribe") {
-                    const sub = { queue: [], waiters: [], lagged: 0, closed: false };
+                    const sub = { queue: [], qhead: 0, waiters: [], lagged: 0, closed: false };
                     obj.bus.subs.push(sub);
                     return { __rs: 15, kind: "broadcast_rx", bus: obj.bus, sub: sub };
                 }
@@ -1303,7 +1307,13 @@
                         sub.lagged = 0;
                         return Promise.resolve(Err(R.mkEnumTuple("RecvError", "Lagged", [n])));
                     }
-                    if (sub.queue.length > 0) return Promise.resolve(Ok(sub.queue.shift()));
+                    if (sub.qhead < sub.queue.length) {
+                        const v = sub.queue[sub.qhead];
+                        sub.queue[sub.qhead++] = undefined;
+                        if (sub.qhead === sub.queue.length) { sub.queue.length = 0; sub.qhead = 0; }
+                        else if (sub.qhead >= 64 && sub.qhead * 2 >= sub.queue.length) { sub.queue = sub.queue.slice(sub.qhead); sub.qhead = 0; }
+                        return Promise.resolve(Ok(v));
+                    }
                     if (sub.closed) return Promise.resolve(Err(R.mkEnumUnit("RecvError", "Closed", null)));
                     let waiter = null;
                     const p = new Promise(function (resolve) {
@@ -1333,7 +1343,13 @@
                 if (name === "recv") {
                     const ch = obj.ch;
                     trackSpawnResource(obj);
-                    if (ch.queue.length > 0) return Promise.resolve(Some(ch.queue.shift()));
+                    if (ch.qhead < ch.queue.length) {
+                        const v = ch.queue[ch.qhead];
+                        ch.queue[ch.qhead++] = undefined;
+                        if (ch.qhead === ch.queue.length) { ch.queue.length = 0; ch.qhead = 0; }
+                        else if (ch.qhead >= 64 && ch.qhead * 2 >= ch.queue.length) { ch.queue = ch.queue.slice(ch.qhead); ch.qhead = 0; }
+                        return Promise.resolve(Some(v));
+                    }
                     if (ch.closed) return Promise.resolve(None);
                     let waiter = null;
                     const p = new Promise(function (resolve) {
@@ -1348,7 +1364,14 @@
                 }
                 if (name === "try_recv") {
                     const ch = obj.ch;
-                    return ch.queue.length > 0 ? Ok(ch.queue.shift()) : Err(R.mkEnumUnit("TryRecvError", "Empty", null));
+                    if (ch.qhead < ch.queue.length) {
+                        const v = ch.queue[ch.qhead];
+                        ch.queue[ch.qhead++] = undefined;
+                        if (ch.qhead === ch.queue.length) { ch.queue.length = 0; ch.qhead = 0; }
+                        else if (ch.qhead >= 64 && ch.qhead * 2 >= ch.queue.length) { ch.queue = ch.queue.slice(ch.qhead); ch.qhead = 0; }
+                        return Ok(v);
+                    }
+                    return Err(R.mkEnumUnit("TryRecvError", "Empty", null));
                 }
                 break;
             case "tokio_interval":
@@ -1809,7 +1832,7 @@
         }
         if (parent === "broadcast" && last === "channel") {
             const bus = { cap: Math.max(1, Number(deref(args[0])) | 0), subs: [] };
-            const sub = { queue: [], waiters: [], lagged: 0, closed: false };
+            const sub = { queue: [], qhead: 0, waiters: [], lagged: 0, closed: false };
             bus.subs.push(sub);
             return R.mkTuple([
                 { __rs: 15, kind: "broadcast_tx", bus: bus },
@@ -1817,7 +1840,7 @@
             ]);
         }
         if (parent === "mpsc" && (last === "channel" || last === "unbounded_channel")) {
-            const ch = { queue: [], waiters: [] };
+            const ch = { queue: [], qhead: 0, waiters: [] };
             return R.mkTuple([
                 { __rs: 15, kind: "mpsc_tx", ch: ch },
                 { __rs: 15, kind: "mpsc_rx", ch: ch }

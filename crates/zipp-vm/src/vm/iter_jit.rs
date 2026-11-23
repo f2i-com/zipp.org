@@ -47,11 +47,18 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
             return crate::codegen::SELF_CALL_DEOPT;
         }
         let idx = v.heap_index();
+        // Fast identity iterables: Array, Set, Map, String (`builtin_iter_fast`),
+        // and pristine `RegExpStringIterator` (`s.matchAll(re)`).
+        if vm.realm_global_objs.is_empty() {
+            return if vm.builtin_iter_fast(v, true) || vm.regexp_string_iter_jit_fast_ok(v) {
+                v_bits
+            } else {
+                crate::codegen::SELF_CALL_DEOPT
+            };
+        }
         if !matches!(vm.heap.get(idx), HeapObj::Array(_)) {
             return crate::codegen::SELF_CALL_DEOPT;
         }
-        // Any named side-table property or prototype override could shadow or
-        // redirect `@@iterator`; both are rare on iterated arrays.
         if vm.arr_props.get(&idx).is_some() || vm.proto_of.get(&idx).is_some() {
             return crate::codegen::SELF_CALL_DEOPT;
         }
@@ -64,16 +71,9 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
                 _ => false,
             }
         };
-        // The last two proofs include no `return` reachable for a `break` to
-        // call: only a real iterator carries one (the interpreter arm makes
-        // it). The root realm serves all three from the version memos.
-        let proven = if vm.realm_global_objs.is_empty() {
-            vm.builtin_iter_fast(v, true)
-        } else {
-            pristine_data(vm.arr_proto, "@@iterator", vm.default_array_iter)
-                && pristine_data(vm.array_iter_proto, "next", vm.default_array_iter_next)
-                && vm.array_iter_proto_pristine()
-        };
+        let proven = pristine_data(vm.arr_proto, "@@iterator", vm.default_array_iter)
+            && pristine_data(vm.array_iter_proto, "next", vm.default_array_iter_next)
+            && vm.array_iter_proto_pristine();
         if !proven {
             return crate::codegen::SELF_CALL_DEOPT;
         }
@@ -96,15 +96,24 @@ pub(crate) extern "win64" fn jit_iter_prime(vm: *mut core::ffi::c_void, it_bits:
             if it.heap_index() as usize >= vm.heap.len() {
                 return crate::codegen::SELF_CALL_DEOPT;
             }
-            if matches!(
-                vm.heap.get(it.heap_index()),
+            match vm.heap.get(it.heap_index()) {
+                HeapObj::Iterator { .. } => {
+                    if let Some(next_v) = vm.regexp_string_iter_intrinsic_method(
+                        it,
+                        "next",
+                        crate::vm::native::ITER_NEXT,
+                    ) {
+                        return next_v.bits();
+                    }
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
                 HeapObj::Object(_)
-                    | HeapObj::Proxy { .. }
-                    | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper(_)
-                    | HeapObj::Intl { .. }
-            ) {
-                return crate::codegen::SELF_CALL_DEOPT;
+                | HeapObj::Proxy { .. }
+                | HeapObj::IterHelper(_)
+                | HeapObj::Intl { .. } => {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                _ => {}
             }
         }
         Value::UNDEFINED.bits()

@@ -1011,9 +1011,14 @@
             rt.nativeEntry = install;
             native("strip", 2, 1); native("lstrip", 2, 2); native("rstrip", 2, 3);
             native("strip", 1, 1); native("lstrip", 1, 2); native("rstrip", 1, 3);
-            native("split", 1, 4); native("split", 2, 4); native("replace", 3, 5);
+            native("split", 1, 4); native("split", 2, 4); native("split", 3, 4);
+            native("rsplit", 1, 26); native("rsplit", 2, 26); native("rsplit", 3, 26);
+            native("splitlines", 1, 27); native("splitlines", 2, 27);
+            native("replace", 3, 5); native("replace", 4, 5);
             native("find", 2, 6); native("find", 3, 6); native("find", 4, 6);
+            native("index", 2, 25); native("index", 3, 25); native("index", 4, 25);
             native("rfind", 2, 22); native("rfind", 3, 22); native("rfind", 4, 22);
+            native("rindex", 2, 24); native("rindex", 3, 24); native("rindex", 4, 24);
             native("count", 2, 23); native("count", 3, 23); native("count", 4, 23);
             native("join", 2, 7); native("lower", 1, 8); native("upper", 1, 9);
             native("startswith", 2, 18); native("startswith", 3, 18); native("startswith", 4, 18);
@@ -1028,6 +1033,13 @@
         const fjoin = function (...parts) { let out = ""; for (let i = 0; i < parts.length; i++) { const p = parts[i]; out += typeof p === "string" ? p : typeof p === "bigint" ? "" + p : R.fmt(p, "", 0); } return rt.checkedText(out); };
         for (let n = 1; n <= 12; n++) { FJ["j" + n] = fjoin; FJ["c" + n] = STRM !== null ? STRM : fjoin; }
         R.FJOIN = FJ;
+        // Direct `sep.join([e1, ..., ek])`: passes elements directly without
+        // constructing an intermediate list.
+        R.SJOIN = S.dict.get("join");
+        const SJ = { strop: 36, ltmpl: null, ttype: null };
+        const sjoin = function (sep, ...parts) { return R.SJOIN.c2(sep, list(parts)); };
+        for (let n = 2; n <= 9; n++) { SJ["j" + n] = sjoin; SJ["c" + n] = STRM !== null ? STRM : sjoin; }
+        R.SJOIN_DIRECT = SJ;
     }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
     // isdigit adds Digit (superscripts, circled and parenthesized digits,
@@ -1043,6 +1055,14 @@
     // the titlecase category, as in CPython's unicode ctype table.
     method(S, "isupper", 1, (a) => { const s = strSelf(a); return /\p{Uppercase}/u.test(s) && !/[\p{Lowercase}\p{Lt}]/u.test(s); });
     method(S, "islower", 1, (a) => { const s = strSelf(a); return /\p{Lowercase}/u.test(s) && !/[\p{Uppercase}\p{Lt}]/u.test(s); });
+    if (rt.nativeEntry !== null) {
+        rt.nativeEntry(S.dict.get("isspace"), 1, 28);
+        rt.nativeEntry(S.dict.get("isdigit"), 1, 29);
+        rt.nativeEntry(S.dict.get("isalpha"), 1, 30);
+        rt.nativeEntry(S.dict.get("isalnum"), 1, 31);
+        rt.nativeEntry(S.dict.get("islower"), 1, 32);
+        rt.nativeEntry(S.dict.get("isupper"), 1, 33);
+    }
     method(S, "istitle", 1, (a) => {
         let cased = false, prevCased = false;
         for (const ch of strSelf(a)) {
@@ -1354,6 +1374,12 @@
     method(L, "__repr__", 1, (a) => rt.baseRepr(a[0]));
     L.dict.set("__hash__", null);
     function sortItems(items, key, reverse) {
+        // Native all-in-one sort (op 4): evaluates plain/leaf/tuple-key lambdas
+        // and sorts + permutes in Rust without intermediate JS arrays or loops.
+        if (rt.PYORD !== null && items.length > 1) {
+            const res = rt.PYORD(4, items, key, reverse ? 1 : 0, T.tuple);
+            if (res !== undefined) return res;
+        }
         // As CPython: reverse=True reverses, sorts stably and reverses back,
         // so equal items keep their order and `<` sees the same operands.
         // Each key through the key function's one-argument entry when it
@@ -2084,6 +2110,10 @@
     def("callable", 1, (a) => isCallable(a[0]));
     def("chr", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0 || n > 0x10FFFF) fail(E.ValueError, "chr() arg not in range(0x110000)"); return String.fromCodePoint(n); });
     def("ord", 1, (a) => { const s = needStr(a[0], "ord() expected string of length 1, but"); const cps = codepoints(s); if (cps.length !== 1) fail(E.TypeError, "ord() expected a character, but string of length " + cps.length + " found"); return BigInt(cps[0].codePointAt(0)); });
+    if (rt.nativeEntry !== null) {
+        rt.nativeEntry(B.get("ord"), 1, 34);
+        rt.nativeEntry(B.get("chr"), 1, 35);
+    }
     def("round", 2, (a) => roundValue(a[0], a[1]), 1);
     def("divmod", 2, (a) => {
         const x = a[0], y = a[1];
@@ -2587,7 +2617,8 @@
             dst.cause = src.cause;
             dst.context = src.context;
             dst.suppress = src.suppress;
-            if (src.frames !== undefined) dst.frames = src.frames.slice();
+            const srcFrames = rt.normFrames(src);
+            if (srcFrames !== undefined) dst.frames = srcFrames.slice();
             dst.tbline = src.tbline;
             const notes = src.dict.get("__notes__");
             if (notes !== undefined) {
@@ -2798,7 +2829,7 @@
                     if (!(attr.unboxSelf === true && obj !== null && typeof obj === "object" && obj.pyval !== undefined)) {
                         const n = argc + 1, arity = attr.arity;
                         const noDict = obj === null || typeof obj !== "object" || obj.dict === undefined;
-                        if (noDict && t.userClass !== true && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
+                        if ((noDict || (t.userClass === true && attr.unboxSelf !== true)) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
                             t.gb[name + "#" + argc] = attr; rt.noteFlagged(t);
                         }
                         R.mself = true;
@@ -2925,7 +2956,7 @@
 (function (R) {
     "use strict";
     const rt = R.__rt, T = rt.T;
-    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set; R.TSLICE = T.slice;
+    R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set; R.TFROZENSET = T.frozenset; R.TSLICE = T.slice;
     // The two classes whose instances' `__class__` is not their `cls` as
     // `getattr` answers it (a module's globals, a super proxy's MRO).
     R.TMODULE = T.module; R.TSUPER = T.super;

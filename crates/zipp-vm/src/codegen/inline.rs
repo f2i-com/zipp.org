@@ -515,12 +515,10 @@ pub(crate) fn emit_inline_leaf_call(
                 ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
                 ; cmp QWORD [r11 + r10 * 8], 0
                 ; jne => fallback
-                ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
-                ; jne => fallback
-                ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
-                ; jne => fallback
-                ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
-                ; jne => fallback
+                ; movzx r11d, BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32]
+                ; or r11b, BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32]
+                ; or r11b, BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32]
+                ; jnz => fallback
             );
             if jitlog {
                 // Diagnostic builds alone pay this call.  The marker is a
@@ -637,12 +635,6 @@ pub(crate) fn emit_inline_leaf_call(
             );
         }
     }
-    dynasm!(ops
-        // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
-        // register file (near-MAX_FRAMES recursion) → take the helper.
-        ; cmp QWORD [rsp + leaf_flag_off], 0
-        ; je => fallback
-    );
     // A common pure scanner predicate has four helper crossings in its generic
     // expansion: three dense-array reads and one `charCodeAt`.  The exact body
     // recognizer records its four live global slots; one read-only helper can
@@ -748,6 +740,11 @@ pub(crate) fn emit_inline_leaf_call(
         }
     }
     dynasm!(ops
+        // ── headroom flag ── only the boxed expansion below carves a scratch
+        // window inside the register file (`span_code_unit_pred` and
+        // `typed_lane` run directly in registers/caller slots).
+        ; cmp QWORD [rsp + leaf_flag_off], 0
+        ; je => fallback
         // ── arg binding ── reg 0 (callee `this`) = undefined; positional args
         // into W+1.. (a leaf with simple_params binds args positionally). Args
         // beyond `param_count`/`argc` are ignored by a leaf body (no

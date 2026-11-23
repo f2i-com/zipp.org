@@ -685,8 +685,19 @@ pub(crate) fn int_unadmitted_ips(
     // reallocates the Vec and re-boxes by a tag.
     let pinned_int_arr = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| {
-            ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
+            let k = ta_plan.pins[j as usize].kind;
+            k == ARR_INT_PIN_KIND || (admit_dv && k == crate::codegen::ARR_INT_HOLEY_PIN_KIND)
         })
+    };
+    // GPR-routed (`admit_dv`) pinned dense-Array `key in arr`: answered inline
+    // against the snapshot (entry-guarded on `TA_SNAP_INDEX_ABSENT`), so holey
+    // integer loops (`if (i in a) sum += a[i]`) stay on the unboxed GPR tier.
+    let pinned_hasprop = |ip: usize| -> bool {
+        admit_dv
+            && ta_plan
+                .access
+                .get(&ip)
+                .is_some_and(|&j| crate::codegen::is_arr_pin(ta_plan.pins[j as usize].kind))
     };
     let pinned_len = |ip: usize| -> bool {
         ta_plan
@@ -731,9 +742,16 @@ pub(crate) fn int_unadmitted_ips(
             Instr::GetIndex { .. } if pinned_int_read(s + off) => {}
             Instr::SetIndex { .. } if pinned_i32_write(s + off) => {}
             // Dense all-Int Array read, and (behind `int_arr_store_enabled`)
-            // its guarded in-place Int store; see `pinned_int_arr`.
+            // its guarded in-place Int store; see `pinned_int_arr`. Holey Int
+            // arrays (`ARR_INT_HOLEY_PIN_KIND`) admit reads only, never stores.
             Instr::GetIndex { .. } if pinned_int_arr(s + off) => {}
-            Instr::SetIndex { .. } if pinned_int_arr(s + off) && int_arr_store_enabled() => {}
+            Instr::SetIndex { .. }
+                if ta_plan
+                    .access
+                    .get(&(s + off))
+                    .is_some_and(|&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
+                    && int_arr_store_enabled() => {}
+            Instr::HasProp { brand: false, .. } if pinned_hasprop(s + off) => {}
             // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.

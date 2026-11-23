@@ -130,6 +130,7 @@ impl<'p> Vm<'p> {
             return PY_BAIL;
         }
         let v = unsafe { &mut *(vm as *mut Vm) };
+        let mut skip_leaf = v.py_rt.as_deref().is_some_and(|p| p.skip_leaf_once.replace(false));
         let (f, arg_base, argc, dst) = (ops as u16, (ops >> 16) as u16, (ops >> 32) as u16, (ops >> 48) as u16);
         let start = v.regs.as_ptr() as usize;
         let addr = regs as usize;
@@ -141,17 +142,36 @@ impl<'p> Vm<'p> {
                 let fv = v.get(base, f);
                 let e = v.py_ic((packed >> 32) as u32, ip);
                 if let Some((at, op)) = v.py_strm_hit(&e, fv) {
-                    if !matches!(op, 6 | 10 | 11 | 14..=19) {
+                    if !matches!(op, 6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34) {
                         v.maybe_gc();
                     }
-                    if op == 11 {
-                        let fi = fv.heap_index();
-                        if v.ic_obj_ok(fi) {
-                            if let HeapObj::Object(m) = v.heap.get(fi) {
-                                if !m.is_ctor && m.shape() != crate::shape::DICT {
-                                    v.heap.refresh_mirror(fi);
-                                }
+                    // Keep the builtin record's hot mirror settled so planned
+                    // inline `PyStrmInline` guards hit on subsequent iterations.
+                    let fi = fv.heap_index();
+                    if v.heap.hot_mirror_of(fi).shape == crate::shape::DICT && v.ic_obj_ok(fi) {
+                        if let HeapObj::Object(m) = v.heap.get(fi) {
+                            if !m.is_ctor && m.shape() != crate::shape::DICT {
+                                v.heap.refresh_mirror(fi);
                             }
+                        }
+                    }
+                    // Fast path: `py_strm_try_fast_op` never runs guest code,
+                    // so avoid `at_call_cap`, `jit_call_depth`, and `with_argv`
+                    // closure overhead when it answers directly.
+                    let n = argc as usize;
+                    let arg_start = base + arg_base as usize;
+                    if n <= 4 {
+                        let mut argv = [Value::UNDEFINED; 4];
+                        argv[..n].copy_from_slice(&v.regs[arg_start..arg_start + n]);
+                        if let Some(x) = v.py_strm_try_fast_op(fv, &argv[..n], at, op) {
+                            v.set(base, dst, x);
+                            return PY_NEXT;
+                        }
+                    } else {
+                        let res = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_strm_try_fast_op(fv, argv, at, op));
+                        if let Some(x) = res {
+                            v.set(base, dst, x);
+                            return PY_NEXT;
                         }
                     }
                     if v.at_call_cap() {
@@ -159,7 +179,7 @@ impl<'p> Vm<'p> {
                         return PY_BAIL;
                     }
                     v.jit_call_depth += 1;
-                    let r = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_op(fv, argv, at, op));
+                    let r = v.with_argv(base, arg_base, argc, |vm, argv| vm.py_str_method_fallback_entry(fv, argv));
                     v.jit_call_depth -= 1;
                     return match r {
                         Ok(x) => {
@@ -190,13 +210,33 @@ impl<'p> Vm<'p> {
                         }
                     }
                     super::py_rt::ic::CALL_LEAF => {
-                        if let Some(x) = v.py_leaf_call_site(&e, fv, base, arg_base, argc) {
-                            v.set(base, dst, x);
-                            return PY_NEXT;
+                        if !skip_leaf {
+                            if fv.is_heap() {
+                                let fi = fv.heap_index();
+                                if v.heap.hot_mirror_of(fi).shape == crate::shape::DICT && v.ic_obj_ok(fi) {
+                                    if let HeapObj::Object(m) = v.heap.get(fi) {
+                                        if !m.is_ctor && m.shape() != crate::shape::DICT {
+                                            v.heap.refresh_mirror(fi);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(x) = v.py_leaf_call_site(&e, fv, base, arg_base, argc) {
+                                v.set(base, dst, x);
+                                return PY_NEXT;
+                            }
+                            if e.a == fv.bits() {
+                                skip_leaf = true;
+                            }
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+        if skip_leaf {
+            if let Some(p) = v.py_rt.as_deref() {
+                p.skip_leaf_once.set(true);
             }
         }
         Self::jit_py_op(vm, regs, packed)
@@ -447,6 +487,18 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Non-allocating `PyGlobal` fast hit (`py_global_hit` only): takes all 4
+    /// arguments in registers and never allocates (caller skips `refetch`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_global_hit(vm: *mut core::ffi::c_void, g: u64, rt: u64, packed: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let (func_id, ip) = ((packed >> 32) as u32, packed as u32 as usize);
+        match vm.py_global_hit(func_id, ip, Value::from_bits(g), Value::from_bits(rt)) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
     /// `PyGlobal` from compiled code: `py_global_hit` first (no allocation),
     /// else `py_global`.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -526,16 +578,250 @@ impl<'p> Vm<'p> {
     pub(crate) extern "win64" fn jit_py_dict_get(vm: *mut core::ffi::c_void, o: u64, packed: u64, keys: u64) -> u64 {
         use crate::vm::py_ops::PyDictGot;
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        let (func_id, ip) = ((packed >> 32) as u32, packed as u32 as usize);
+        let ov = Value::from_bits(o);
+        let absent = (keys >> 32) != 0;
+        // Zero-GC fast path for proved-absent layouts (`ic::DICT_GET_ABSENT`).
+        if let Some(map) = vm.py_inst_map(ov) {
+            if let HeapObj::PyAttrs { layout, .. } = vm.heap.get(map) {
+                let e = vm.py_ic(func_id, ip);
+                if e.kind == super::py_rt::ic::DICT_GET_ABSENT && e.d == *layout {
+                    return if absent {
+                        crate::codegen::PY_ABSENT_BITS
+                    } else {
+                        crate::codegen::PY_SLOW_BITS
+                    };
+                }
+            }
+        }
         vm.maybe_gc();
-        match vm.py_dict_get((packed >> 32) as u32, Value::from_bits(o), keys as u32, (keys >> 32) != 0) {
+        match vm.py_dict_get(func_id, ip, ov, keys as u32, absent) {
             Ok(PyDictGot::Value(v)) => v.bits(),
             Ok(PyDictGot::Absent) => crate::codegen::PY_ABSENT_BITS,
             Ok(PyDictGot::Slow) => crate::codegen::PY_SLOW_BITS,
             Err(t) => {
-                vm.py_step_failed(packed as u32 as usize);
+                vm.py_step_failed(ip);
                 vm.jit_thrown_to_sentinel(t)
             }
         }
+    }
+
+    /// Direct thin helper for planned non-allocating `__zipp_py_strm` ops
+    /// (`6 | 10 | 11 | 12..=19 | 22..=25 | 28..=34`): the caller's inline
+    /// x86-64 guard already verified `this`, its shape, heap version, entry
+    /// slot, and `strop == op`. `packed = (op as u16) | (argc << 16) | (at << 32)`.
+    /// Returns the result bits or `PY_SLOW_BITS` to fall back to `jit_py_call`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_strm_noalloc(
+        vm: *mut core::ffi::c_void,
+        this: u64,
+        packed: u64,
+        argv: *const u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let op = (packed as u16) as i32;
+        let argc = ((packed >> 16) & 0xFFFF) as usize;
+        if argc == 2 && matches!(op, 6 | 18 | 19) {
+            let a0 = Value::from_bits(unsafe { *argv });
+            let a1 = Value::from_bits(unsafe { *argv.add(1) });
+            if let Some(v) = vm.py_strm_affix_find_2(op, a0, a1) {
+                return v.bits();
+            }
+        }
+        let at = (packed >> 32) as usize;
+        if argc == 0 || argc > 8 {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        let res = if argc <= 4 {
+            let mut args = [Value::UNDEFINED; 4];
+            for (i, slot) in args[..argc].iter_mut().enumerate() {
+                *slot = Value::from_bits(unsafe { *argv.add(i) });
+            }
+            vm.py_strm_try_fast_op(Value::from_bits(this), &args[..argc], at, op)
+        } else {
+            let mut args = [Value::UNDEFINED; 8];
+            for (i, slot) in args[..argc].iter_mut().enumerate() {
+                *slot = Value::from_bits(unsafe { *argv.add(i) });
+            }
+            vm.py_strm_try_fast_op(Value::from_bits(this), &args[..argc], at, op)
+        };
+        match res {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// Direct thin helper for planned allocating `__zipp_py_strm` ops
+    /// (e.g. `strip`, `split`, `replace`, `join`, `lower`, `upper`, `fjoin`):
+    /// polls GC once then dispatches directly to `py_strm_try_fast_op`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_strm_alloc(
+        vm: *mut core::ffi::c_void,
+        this: u64,
+        packed: u64,
+        argv: *const u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let op = (packed as u16) as i32;
+        let argc = ((packed >> 16) & 0xFFFF) as usize;
+        let at = (packed >> 32) as usize;
+        if op == 20 && argc == 2 {
+            let a0 = Value::from_bits(unsafe { *argv });
+            let a1 = Value::from_bits(unsafe { *argv.add(1) });
+            vm.maybe_gc();
+            return match vm.py_fstr_join2(a0, a1) {
+                Some(v) => v.bits(),
+                None => crate::codegen::PY_SLOW_BITS,
+            };
+        }
+        if argc == 0 || argc > 8 {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        let res = if argc <= 4 {
+            let mut args = [Value::UNDEFINED; 4];
+            for (i, slot) in args[..argc].iter_mut().enumerate() {
+                *slot = Value::from_bits(unsafe { *argv.add(i) });
+            }
+            vm.maybe_gc();
+            vm.py_strm_try_fast_op(Value::from_bits(this), &args[..argc], at, op)
+        } else {
+            let mut args = [Value::UNDEFINED; 8];
+            for (i, slot) in args[..argc].iter_mut().enumerate() {
+                *slot = Value::from_bits(unsafe { *argv.add(i) });
+            }
+            vm.maybe_gc();
+            vm.py_strm_try_fast_op(Value::from_bits(this), &args[..argc], at, op)
+        };
+        match res {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// Direct thin helper for planned frameless Python leaf calls
+    /// (`emit_py_leaf_inline`): inline guard already verified `fv`, shape,
+    /// heap version, and entry slot. Never allocates or pushes a frame (so no
+    /// GC poll and no `refetch`). Returns result bits or `PY_SLOW_BITS`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_leaf_noalloc(
+        vm: *mut core::ffi::c_void,
+        fv_bits: u64,
+        packed: u64,
+        argv: *const u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let fid = packed as u32;
+        let main_end = (packed >> 32) as u16;
+        let reg_slots = (packed >> 48) as u8;
+        let argc = ((packed >> 56) & 0xF) as usize;
+        let params = ((packed >> 60) & 0xF) as u8;
+        if argc > 12 {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        let raw_args = if argc == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(argv, argc) }
+        };
+        let info = super::py_attr::py_leaf::LeafInfo {
+            main_end,
+            params,
+            reg_slots,
+            native_eligible: true,
+        };
+        match vm.py_leaf_exec_bits(fid, Value::from_bits(fv_bits), info, raw_args) {
+            Some(v) => v.bits(),
+            None => {
+                if let Some(p) = vm.py_rt.as_deref() {
+                    p.skip_leaf_once.set(true);
+                }
+                crate::codegen::PY_SLOW_BITS
+            }
+        }
+    }
+
+    /// Fast non-allocating generator step (`py_gen_next_fast`) called before
+    /// `jit_py_gen_next` so hot generator loops skip `maybe_gc()` and `refetch`.
+    /// Returns yielded value bits or `PY_SLOW_BITS` to fall back.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_gen_next_fast(vm: *mut core::ffi::c_void, next: u64, this: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let nv = Value::from_bits(next);
+        if !nv.is_heap() || !matches!(vm.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::PY_GEN) {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        match vm.py_gen_next_fast(Value::from_bits(this)) {
+            Some(v) => v.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// Pre-planned fused `PyNew` + `StorePlan` `__init__` helper: verifies the
+    /// cached class/init/template versions directly from `PyRt::new_fused_plans`
+    /// and allocates `PyAttrs` + instance `Object` via `alloc_finalized` in one
+    /// shot. Returns the new instance bits or `PY_SLOW_BITS` on guard miss.
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    pub(crate) extern "win64" fn jit_py_new_fused_fast(
+        vm: *mut core::ffi::c_void,
+        plan_id: u64,
+        cls_bits: u64,
+        argv: *const u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let (final_layout, count, arg_idx, plan_idx, inst_shape) = {
+            let Some(p) = vm.py_rt.as_deref_mut() else {
+                return crate::codegen::PY_SLOW_BITS;
+            };
+            let Some(pl) = p.new_fused_plans.get_mut().get(plan_id as usize) else {
+                return crate::codegen::PY_SLOW_BITS;
+            };
+            if cls_bits != pl.cls_bits {
+                return crate::codegen::PY_SLOW_BITS;
+            }
+            let ci = Value::from_bits(cls_bits).heap_index();
+            if vm.heap.version_of(ci) != pl.cls_hver {
+                return crate::codegen::PY_SLOW_BITS;
+            }
+            let cls_ok = match vm.heap.get(ci) {
+                HeapObj::Object(m) => {
+                    m.val_at(pl.ctor_slot as usize).bits() == pl.want_bits
+                        && m.val_at(pl.init_slot as usize).bits() == pl.init_bits
+                        && m.val_at(pl.ver_slot as usize).bits() == pl.cls_ver
+                }
+                _ => false,
+            };
+            if !cls_ok {
+                return crate::codegen::PY_SLOW_BITS;
+            }
+            let init_idx = Value::from_bits(pl.init_bits).heap_index();
+            if vm.heap.version_of(init_idx) != pl.init_hver {
+                return crate::codegen::PY_SLOW_BITS;
+            }
+            let init_ok = match vm.heap.get(init_idx) {
+                HeapObj::Object(m) => m.val_at(pl.init_entry_slot as usize).bits() == pl.entry_bits,
+                _ => false,
+            };
+            if !init_ok || vm.heap.version_of(pl.inst_tmpl.heap_index()) != pl.inst_tmpl_hver {
+                return crate::codegen::PY_SLOW_BITS;
+            }
+            (pl.final_layout, pl.count as usize, pl.arg_idx, pl.plan_idx as usize, pl.inst_shape)
+        };
+        vm.maybe_gc();
+        let mut vals = vm.heap.take_arr_buf(count);
+        for &ai in &arg_idx[..count] {
+            vals.push(Value::from_bits(unsafe { *argv.add(ai as usize - 1) }));
+        }
+        let dict = Value::heap(vm.heap.alloc_py_attrs(final_layout, vals));
+        let Some(p) = vm.py_rt.as_deref() else {
+            return crate::codegen::PY_SLOW_BITS;
+        };
+        let idx = vm.heap.alloc_finalized(
+            &p.plans[plan_idx],
+            &[Value::from_bits(cls_bits), dict],
+            inst_shape,
+        );
+        vm.realm_born(idx, vm.obj_proto);
+        Value::heap(idx).bits()
     }
 
     /// `PyDictLookup` from compiled code: `py_dict_lookup` (never allocates).
@@ -593,6 +879,16 @@ impl<'p> Vm<'p> {
         }
         match vm.py_len(vv, Value::from_bits(rt)).and_then(|n| Value::small_bigint(n as i128)) {
             Some(b) => b.bits(),
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// `PyTruth` from compiled code: `py_truth` (never allocates).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_truth(vm: *mut core::ffi::c_void, v: u64, rt: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        match vm.py_truth(Value::from_bits(v), Value::from_bits(rt)) {
+            Some(b) => Value::bool(b).bits(),
             None => crate::codegen::PY_SLOW_BITS,
         }
     }
@@ -656,7 +952,7 @@ impl<'p> Vm<'p> {
         }
         // Pure non-allocating in-register fast step: no GC safe point or
         // nested interpreter frame needed.
-        if let Some(Ok(v)) = vm.py_gen_next_fast(Value::from_bits(this)) {
+        if let Some(v) = vm.py_gen_next_fast(Value::from_bits(this)) {
             return v.bits();
         }
         vm.maybe_gc();
@@ -675,6 +971,113 @@ impl<'p> Vm<'p> {
                 vm.jit_thrown_to_sentinel(t)
             }
         }
+    }
+
+    /// Fast non-allocating `PySetItem` for exact `dict` records (`d[k] = v`):
+    /// takes operands directly in registers, skips `maybe_gc()` and `refetch`.
+    /// Returns 0 on success or `PY_SLOW_BITS` to fall back to `jit_py_set_item`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_set_item_dict(
+        vm: *mut core::ffi::c_void,
+        o: u64,
+        k: u64,
+        v: u64,
+        dict: u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        if vm.py_set_item_dict_fast(
+            Value::from_bits(o),
+            Value::from_bits(k),
+            Value::from_bits(v),
+            Value::from_bits(dict),
+        ) {
+            0
+        } else {
+            crate::codegen::PY_SLOW_BITS
+        }
+    }
+
+    /// Fused `NewArray { dst: arr_dst, arg_base, argc }` + `PySeq { dst: seq_dst,
+    /// items: arr_dst, rt, tuple }` for small literals (`argc <= 8`): allocates
+    /// the backing `Array` and the `{cls, items}` sequence record in one FFI
+    /// call with a single GC poll and refetch. Writes both `regs[arr_dst]` and
+    /// `regs[seq_dst]` and returns `0` on success, or `PY_SLOW_BITS` (with zero
+    /// mutations) to fall through to the unfused pair.
+    /// `packed = arr_dst | (seq_dst << 16) | (arg_base << 32) | (argc << 48) | (tuple << 52)`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_new_seq(
+        vm: *mut core::ffi::c_void,
+        regs: *const u64,
+        packed: u64,
+        rt: u64,
+    ) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let start = vm.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr < start || (addr - start) % 8 != 0 {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        let base = (addr - start) / 8;
+        let arr_dst = packed as u16;
+        let seq_dst = (packed >> 16) as u16;
+        let arg_base = (packed >> 32) as u16;
+        let argc = ((packed >> 48) & 0xF) as usize;
+        let tuple = (packed >> 52) != 0;
+        if argc > 8 {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        let arg_end = base + arg_base as usize + argc;
+        if arg_end > vm.regs.len()
+            || base + arr_dst as usize >= vm.regs.len()
+            || base + seq_dst as usize >= vm.regs.len()
+        {
+            return crate::codegen::PY_SLOW_BITS;
+        }
+        vm.maybe_gc();
+        let (cls, shape, plan_idx) = match vm.py_rt_for(Value::from_bits(rt)) {
+            Some(p) => {
+                if p.seq_tmpl_hver == u32::MAX
+                    || !p.seq_tmpl.is_heap()
+                    || vm.heap.version_of(p.seq_tmpl.heap_index()) != p.seq_tmpl_hver
+                {
+                    return crate::codegen::PY_SLOW_BITS;
+                }
+                let cls = if tuple { p.t_tuple } else { p.t_list };
+                (cls, p.seq_shape, p.seq_plan_idx)
+            }
+            None => return crate::codegen::PY_SLOW_BITS,
+        };
+        let mut items = vm.heap.take_arr_buf(argc);
+        let astart = base + arg_base as usize;
+        items.extend_from_slice(&vm.regs[astart..astart + argc]);
+        let arr_idx = vm.heap.alloc_array_settled(items);
+        vm.realm_born(arr_idx, vm.arr_proto);
+        let arr_val = Value::heap(arr_idx);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let seq_val = if plan_idx != u16::MAX {
+            let Some(p) = vm.py_rt.as_deref() else {
+                return crate::codegen::PY_SLOW_BITS;
+            };
+            let idx = vm.heap.alloc_finalized(&p.plans[plan_idx as usize], &[cls, arr_val], shape);
+            vm.realm_born(idx, vm.obj_proto);
+            Value::heap(idx)
+        } else {
+            let Some(v) = vm.py_alloc_seq_fast(cls, arr_val) else {
+                return crate::codegen::PY_SLOW_BITS;
+            };
+            v
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let seq_val = {
+            let _ = (shape, plan_idx);
+            let Some(v) = vm.py_alloc_seq_fast(cls, arr_val) else {
+                return crate::codegen::PY_SLOW_BITS;
+            };
+            v
+        };
+        vm.set(base, arr_dst, arr_val);
+        vm.set(base, seq_dst, seq_val);
+        0
     }
 
     /// `PySetItem` from compiled code: `py_set_item` over the registers the
@@ -733,6 +1136,51 @@ impl<'p> Vm<'p> {
         vm.maybe_gc();
         let (c, r) = (vm.get(base, cls), vm.get(base, rt));
         match vm.py_new((site >> 32) as u32, site as u32 as usize, c, r, n as usize) {
+            Some((obj, e, t)) => {
+                vm.set(base, dst, obj);
+                vm.set(base, entry, e);
+                vm.set(base, this_f, t);
+                0
+            }
+            None => crate::codegen::PY_SLOW_BITS,
+        }
+    }
+
+    /// Fused `PyNew` + immediate `PyCall` of a `StorePlan` `__init__`:
+    /// `outs = dst | entry << 16 | this_f << 32 | init_dst << 48`,
+    /// `ins = cls | rt << 16 | n << 32`.
+    /// Returns `1` when fused construction+init completed (caller jumps past
+    /// the following `PyCall`), `0` when plain `py_new` completed (caller
+    /// executes `PyCall`), `PY_SLOW_BITS` for slow edge, `SELF_CALL_DEOPT` to bail.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) extern "win64" fn jit_py_new_init(vm: *mut core::ffi::c_void, regs: *const u64, site: u64, outs: u64, ins: u64) -> u64 {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let start = vm.regs.as_ptr() as usize;
+        let addr = regs as usize;
+        if addr < start || (addr - start) % 8 != 0 {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let base = (addr - start) / 8;
+        let (dst, entry, this_f, init_dst) = (
+            outs as u16,
+            (outs >> 16) as u16,
+            (outs >> 32) as u16,
+            (outs >> 48) as u16,
+        );
+        let (cls, rt, n) = (ins as u16, (ins >> 16) as u16, (ins >> 32) as u16);
+        let max_reg = dst.max(entry).max(this_f).max(init_dst).max(cls).max(rt);
+        if base + max_reg as usize >= vm.regs.len() || base + dst as usize + n as usize >= vm.regs.len() {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        vm.maybe_gc();
+        let (c, r) = (vm.get(base, cls), vm.get(base, rt));
+        let (func_id, ip) = ((site >> 32) as u32, site as u32 as usize);
+        if let Some(obj) = vm.py_new_store_fused(func_id, ip, c, r, n as usize, base, dst) {
+            vm.set(base, dst, obj);
+            vm.set(base, init_dst, Value::NULL);
+            return 1;
+        }
+        match vm.py_new(func_id, ip, c, r, n as usize) {
             Some((obj, e, t)) => {
                 vm.set(base, dst, obj);
                 vm.set(base, entry, e);
@@ -817,6 +1265,7 @@ impl<'p> Vm<'p> {
             | Instr::PyMethod { .. }
             | Instr::PyModGet { .. }
             | Instr::PyLen { .. }
+            | Instr::PyTruth { .. }
             | Instr::PyAttrFn { .. }
             | Instr::PyRaise { .. }
             | Instr::PyCaught { .. }

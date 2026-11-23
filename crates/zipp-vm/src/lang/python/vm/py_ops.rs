@@ -115,7 +115,7 @@ impl<'p> Vm<'p> {
             }
             Instr::PyDictGet { dst, obj, key, absent, slow } => {
                 let o = self.get(base, obj);
-                match self.py_dict_get(func_id, o, key, absent)? {
+                match self.py_dict_get(func_id, ip, o, key, absent)? {
                     PyDictGot::Value(v) => {
                         self.set(base, dst, v);
                         ip + 1
@@ -369,6 +369,16 @@ impl<'p> Vm<'p> {
                     None => slow as usize,
                 }
             }
+            Instr::PyTruth { dst, v, rt, slow } => {
+                let (vv, rv) = (self.get(base, v), self.get(base, rt));
+                match self.py_truth(vv, rv) {
+                    Some(b) => {
+                        self.set(base, dst, Value::bool(b));
+                        ip + 1
+                    }
+                    None => slow as usize,
+                }
+            }
             Instr::PyAttrFn { dst, obj, key, set, slow } => {
                 let o = self.get(base, obj);
                 match self.py_attr_fn(func_id, ip, o, key, set) {
@@ -505,7 +515,7 @@ impl<'p> Vm<'p> {
         }
         let fi = f.heap_index();
         let e = self.py_ic(func_id, ip);
-        if matches!(e.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC) && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
+        if matches!(e.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC) && e.a == f.bits() && self.heap.version_of(fi) == e.hver {
             if let HeapObj::Object(m) = self.heap.get(fi) {
                 let pos = e.pos as usize;
                 if pos < m.slot_len() && !m.is_accessor_at(pos) {
@@ -544,6 +554,7 @@ impl<'p> Vm<'p> {
         let crate::bytecode::Instr::PyCall { dst, f, arg_base, argc, slow } = *instr else {
             return Ok(ip + 1);
         };
+        let skip_leaf = self.py_rt.as_deref().is_some_and(|p| p.skip_leaf_once.replace(false));
         let fv = self.get(base, f);
         let r = match self.py_call_target(func_id, ip, fv, argc) {
             PyCallee::Lean(lean, kind) => {
@@ -559,11 +570,21 @@ impl<'p> Vm<'p> {
                         argv[..n].copy_from_slice(&self.regs[start..start + n]);
                         self.py_rec_exec(lean.fid, fv, &argv[..n])
                     }
-                    ic::CALL_LEAF if argc <= lean.params => {
+                    ic::CALL_LEAF if !skip_leaf && argc <= lean.params => {
                         self.py_leaf_exec_window(lean.fid, fv, base, arg_base, argc)
                     }
                     ic::CALL_STORE if argc == lean.params => {
-                        self.py_leaf_exec_window(lean.fid, fv, base, arg_base, argc)
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        let stored = self.py_store_body(lean.fid).is_some_and(|stores| {
+                            self.with_argv(base, arg_base, argc, |vm, argv| vm.py_store_call(lean.fid, stores, argv))
+                        });
+                        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                        let stored = false;
+                        if stored {
+                            Some(Value::NULL)
+                        } else {
+                            self.py_leaf_exec_window(lean.fid, fv, base, arg_base, argc)
+                        }
                     }
                     _ => None,
                 };
@@ -692,7 +713,7 @@ impl<'p> Vm<'p> {
     #[inline]
     fn py_strm_site(&mut self, func_id: u32, ip: usize, f: Value) -> usize {
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::CALL_ENTRY || e.a != f.bits() {
+        if e.kind != ic::CALL_ENTRY || e.a != f.bits() || self.heap.version_of(f.heap_index()) != e.hver {
             return usize::MAX;
         }
         if e.d != 0 {
@@ -801,7 +822,12 @@ impl<'p> Vm<'p> {
     fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> PyCallee {
         const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
         let cached = self.py_ic(func_id, ip);
-        if matches!(cached.kind, ic::CALL_PLAIN..=ic::CALL_REC) && cached.c != 0 && cached.a == f.bits() {
+        if cached.kind == ic::CALL_EXC && cached.c != 0 && cached.a == f.bits() {
+            if let Some(lean) = self.py_lean_hit(&cached, f) {
+                return PyCallee::Exc(lean.fid, lean.closure, lean.entry);
+            }
+            self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_ENTRY, b: 0, c: 0, d: 0, ..cached });
+        } else if matches!(cached.kind, ic::CALL_PLAIN..=ic::CALL_REC) && cached.c != 0 && cached.a == f.bits() {
             if let Some(lean) = self.py_lean_hit(&cached, f) {
                 return PyCallee::Lean(lean, cached.kind);
             }
@@ -826,6 +852,11 @@ impl<'p> Vm<'p> {
             return PyCallee::Other(e);
         }
         if self.py_exc_entry(e, argc) {
+            let c = fid as u64 | ((p.reg_count.max(1) as u64) << 32) | ((p.param_count as u64) << 48);
+            let now = self.py_ic(func_id, ip);
+            if matches!(now.kind, ic::CALL_ENTRY | ic::CALL_PLAIN..=ic::CALL_REC | ic::CALL_EXC) && now.a == f.bits() {
+                self.py_ic_put(func_id, ip, PyIc { kind: ic::CALL_EXC, b: e.bits(), c, d: closure, ..now });
+            }
             return PyCallee::Exc(fid, closure, e);
         }
         // What `setup_call` binds as it is given for this callee: strict,
@@ -890,7 +921,9 @@ impl<'p> Vm<'p> {
             return None;
         }
         let at = (e.d - 1) as usize;
-        if at < m.slot_len() && !m.is_accessor_at(at) && super::py_rt::key_eq(m.key_at(at), "strop") {
+        // `version_of(fi) == e.hver` guarantees `m`'s key layout and accessor
+        // flags are unchanged since `py_strm_site` located `"strop"` at `at`.
+        if at < m.slot_len() && !m.is_accessor_at(at) {
             let op = m.val_at(at);
             if op.is_int() {
                 return Some((at, op.as_int()));
@@ -919,8 +952,12 @@ impl<'p> Vm<'p> {
     /// Array is garbage) when that declines.
     fn py_new_exc(&mut self, cls: Value, base: usize, arg_base: u16, argc: u16) -> Option<Value> {
         let rt = self.py_rt.as_deref()?.r;
-        let args: Vec<Value> = (0..argc as usize).map(|i| self.get(base, arg_base + i as u16)).collect();
-        let arr = Value::heap(self.heap.alloc(HeapObj::Array(args)));
+        let n = argc as usize;
+        let mut args = self.heap.take_arr_buf(n);
+        for i in 0..n {
+            args.push(self.get(base, arg_base + i as u16));
+        }
+        let arr = Value::heap(self.heap.alloc_array_settled(args));
         let e = self.py_make_exc(cls, arr, rt)?;
         // `e.context = null` (the record `py_make_exc` builds: slot 4).
         if let HeapObj::Object(m) = self.heap.get_mut(e.heap_index()) {
@@ -1241,17 +1278,35 @@ impl<'p> Vm<'p> {
     /// the instance `o`'s attribute storage: what `map_method`'s `get`
     /// answers for it, asked of layout-mode storage directly (the step went
     /// through the method's name), sorted as the instruction's `absent`
-    /// flag sorts it.
-    pub(super) fn py_dict_get(&mut self, func_id: u32, o: Value, key: u32, absent: bool) -> Result<PyDictGot, Thrown> {
+    /// flag sorts it. Caches proved-absent layouts in `ic::DICT_GET_ABSENT`.
+    pub(super) fn py_dict_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, absent: bool) -> Result<PyDictGot, Thrown> {
         let Some(map) = self.py_inst_map(o) else {
             return Ok(PyDictGot::Slow);
         };
+        if let HeapObj::PyAttrs { layout, .. } = self.heap.get(map) {
+            let layout = *layout;
+            let e = self.py_ic(func_id, ip);
+            if e.kind == ic::DICT_GET_ABSENT && e.d == layout {
+                return Ok(if absent { PyDictGot::Absent } else { PyDictGot::Slow });
+            }
+            let k = self.resolve_const_slot(func_id, key);
+            if let Some(slot) = self.py_layout_find(layout, k) {
+                let v = self.py_attrs_at(Value::heap(map), layout, slot).unwrap_or(Value::UNDEFINED);
+                return Ok(match (v.is_undefined(), absent) {
+                    (false, false) => PyDictGot::Value(v),
+                    (true, true) => PyDictGot::Absent,
+                    _ => PyDictGot::Slow,
+                });
+            }
+            self.py_ic_put(
+                func_id,
+                ip,
+                PyIc { kind: ic::DICT_GET_ABSENT, pos: 0, hver: 0, a: 0, b: 0, c: 0, d: layout },
+            );
+            return Ok(if absent { PyDictGot::Absent } else { PyDictGot::Slow });
+        }
         let k = self.resolve_const_slot(func_id, key);
-        let v = if matches!(self.heap.get(map), HeapObj::PyAttrs { .. }) {
-            self.py_attrs_get(Value::heap(map), k).flatten().unwrap_or(Value::UNDEFINED)
-        } else {
-            self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED)
-        };
+        let v = self.map_method(map, "get", &[k])?.unwrap_or(Value::UNDEFINED);
         Ok(match (v.is_undefined(), absent) {
             (false, false) => PyDictGot::Value(v),
             (true, true) => PyDictGot::Absent,
@@ -1297,9 +1352,9 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) if items.last().is_none_or(|v| !v.is_hole()) => {}
             _ => return None,
         }
-        if self.arr_props.contains_key(&idx)
-            || self.array_js_len.contains_key(&idx)
-            || self.proto_of.contains_key(&idx)
+        if (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+            || (!self.array_js_len.is_empty() && self.array_js_len.contains_key(&idx))
+            || (!self.proto_of.is_empty() && self.proto_of.contains_key(&idx))
             || self.array_proto_has_index
             || !self.array_pop_is_intrinsic()
         {
@@ -1390,6 +1445,79 @@ impl<'p> Vm<'p> {
         Some(Value::heap(idx))
     }
 
+    /// Direct inline allocation of a sequence record `{cls, items}` using
+    /// `PyRt`'s pre-cached template plan index (`seq_plan_idx`), bypassing
+    /// `py_alloc_like_ready`'s plan scan when `seq_tmpl` is unchanged.
+    #[inline(always)]
+    pub(super) fn py_alloc_seq_fast(&mut self, cls: Value, items: Value) -> Option<Value> {
+        let (tmpl, shape, hver) = {
+            let p = self.py_rt.as_deref()?;
+            (p.seq_tmpl, p.seq_shape, p.seq_tmpl_hver)
+        };
+        if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let p = self.py_rt.as_deref()?;
+                let pi = p.seq_plan_idx;
+                if pi != u16::MAX {
+                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], &[cls, items], shape);
+                    self.realm_born(idx, self.obj_proto);
+                    return Some(Value::heap(idx));
+                }
+            }
+            return self.py_alloc_like_ready(tmpl, shape, &[cls, items]);
+        }
+        self.py_alloc_like(tmpl, shape, &[cls, items])
+    }
+
+    /// Direct inline allocation of an instance record `{cls, dict}` using
+    /// `PyRt`'s pre-cached `inst_plan_idx`.
+    #[inline(always)]
+    pub(super) fn py_alloc_inst_fast(&mut self, cls: Value, dict: Value) -> Option<Value> {
+        let (tmpl, shape, hver) = {
+            let p = self.py_rt.as_deref()?;
+            (p.inst_tmpl, p.inst_shape, p.inst_tmpl_hver)
+        };
+        if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let p = self.py_rt.as_deref()?;
+                let pi = p.inst_plan_idx;
+                if pi != u16::MAX {
+                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], &[cls, dict], shape);
+                    self.realm_born(idx, self.obj_proto);
+                    return Some(Value::heap(idx));
+                }
+            }
+            return self.py_alloc_like_ready(tmpl, shape, &[cls, dict]);
+        }
+        self.py_alloc_like(tmpl, shape, &[cls, dict])
+    }
+
+    /// Direct inline allocation of an exception record using `PyRt`'s
+    /// pre-cached `exc_plan_idx`.
+    #[inline(always)]
+    pub(super) fn py_alloc_exc_fast(&mut self, vals: &[Value; 10]) -> Option<Value> {
+        let (tmpl, shape, hver) = {
+            let p = self.py_rt.as_deref()?;
+            (p.exc_tmpl, p.exc_shape, p.exc_tmpl_hver)
+        };
+        if hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == hver {
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let p = self.py_rt.as_deref()?;
+                let pi = p.exc_plan_idx;
+                if pi != u16::MAX {
+                    let idx = self.heap.alloc_finalized(&p.plans[pi as usize], vals, shape);
+                    self.realm_born(idx, self.obj_proto);
+                    return Some(Value::heap(idx));
+                }
+            }
+            return self.py_alloc_like_ready(tmpl, shape, vals);
+        }
+        self.py_alloc_like(tmpl, shape, vals)
+    }
+
     /// The runtime's `makeExc(cls, args)` for [`Instr::PyMakeExc`] and the
     /// native `__zipp_py_exc`: the record its literal builds (see the
     /// instruction), or `None` when an input is not of the expected shape.
@@ -1403,12 +1531,21 @@ impl<'p> Vm<'p> {
             HeapObj::Array(a) if a.len() <= (1 << 24) => {}
             _ => return None,
         }
-        if self.array_js_len.contains_key(&args.heap_index()) {
+        if !self.array_js_len.is_empty() && self.array_js_len.contains_key(&args.heap_index()) {
             return None;
         }
         let p = self.py_rt_for(rt)?;
-        let (tmpl, exc_shape, seq_tmpl, seq_shape, ttuple, stack) = (p.exc_tmpl, p.exc_shape, p.seq_tmpl, p.seq_shape, p.t_tuple, p.excstack);
-        if !stack.is_heap() || self.array_js_len.contains_key(&stack.heap_index()) {
+        let (tmpl, exc_shape, exc_hver, seq_tmpl, seq_shape, seq_hver, ttuple, stack) = (
+            p.exc_tmpl,
+            p.exc_shape,
+            p.exc_tmpl_hver,
+            p.seq_tmpl,
+            p.seq_shape,
+            p.seq_tmpl_hver,
+            p.t_tuple,
+            p.excstack,
+        );
+        if !stack.is_heap() || (!self.array_js_len.is_empty() && self.array_js_len.contains_key(&stack.heap_index())) {
             return None;
         }
         // `excStack.length ? excStack[excStack.length - 1] : null`.
@@ -1421,14 +1558,17 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         // Both templates are checked before anything is allocated.
-        if !self.py_alloc_like_ok(tmpl, exc_shape) || !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+        let exc_ok = (exc_hver != u32::MAX && tmpl.is_heap() && self.heap.version_of(tmpl.heap_index()) == exc_hver)
+            || self.py_alloc_like_ok(tmpl, exc_shape);
+        let seq_ok = (seq_hver != u32::MAX && seq_tmpl.is_heap() && self.heap.version_of(seq_tmpl.heap_index()) == seq_hver)
+            || self.py_alloc_like_ok(seq_tmpl, seq_shape);
+        if !exc_ok || !seq_ok {
             return None;
         }
-        let tuple = self.py_alloc_like_ready(seq_tmpl, seq_shape, &[ttuple, args])?;
-        let map = self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
-        self.adopt_native_result_realm(map, self.map_proto);
-        let vals = [cls, Value::heap(map), tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0), Value::UNDEFINED];
-        self.py_alloc_like_ready(tmpl, exc_shape, &vals)
+        let tuple = self.py_alloc_seq_fast(ttuple, args)?;
+        let map = self.py_attrs_new(0);
+        let vals = [cls, map, tuple, Value::NULL, context, Value::int(-1), Value::FALSE, Value::NULL, Value::int(0), Value::UNDEFINED];
+        self.py_alloc_exc_fast(&vals)
     }
 
     /// The Array for [`Instr::PyUnpack`].
@@ -1650,8 +1790,7 @@ impl<'p> Vm<'p> {
         self.py_repair_seq_arr_mirror(items_idx);
         let p = self.py_rt_for(rt)?;
         let cls = if tuple { p.t_tuple } else { p.t_list };
-        let (tmpl, shape) = (p.seq_tmpl, p.seq_shape);
-        self.py_alloc_like(tmpl, shape, &[cls, items])
+        self.py_alloc_seq_fast(cls, items)
     }
 
     /// `len(v)` for [`Instr::PyLen`].
@@ -1663,7 +1802,14 @@ impl<'p> Vm<'p> {
             return self.py_str_len(v);
         }
         let p = self.py_rt_for(rt)?;
-        let (tl, tt, td, ts) = (p.t_list.bits(), p.t_tuple.bits(), p.t_dict.bits(), p.t_set.bits());
+        let (tl, tt, td, ts, tfs, tb) = (
+            p.t_list.bits(),
+            p.t_tuple.bits(),
+            p.t_dict.bits(),
+            p.t_set.bits(),
+            p.t_frozenset.bits(),
+            p.istypes[5].bits(),
+        );
         // A record of the sequence or dict template's shape, read once (its
         // class, then its items or its `size`, at their slots), as the
         // general code below reads it in three passes.
@@ -1672,7 +1818,7 @@ impl<'p> Vm<'p> {
             let shape = m.shape();
             if !m.is_ctor && shape != crate::shape::DICT {
                 let cls = m.val_at(0).bits();
-                if shape == seq_shape && (cls == tl || cls == tt) {
+                if shape == seq_shape && (cls == tl || cls == tt || cls == tb) {
                     let items = m.val_at(1);
                     if !items.is_heap() {
                         return None;
@@ -1682,7 +1828,7 @@ impl<'p> Vm<'p> {
                         _ => None,
                     };
                 }
-                if shape == dict_shape && (cls == td || cls == ts) {
+                if shape == dict_shape && (cls == td || cls == ts || cls == tfs) {
                     let size = m.val_at(size_slot);
                     if !size.is_number() {
                         return None;
@@ -1693,7 +1839,7 @@ impl<'p> Vm<'p> {
             }
         }
         let cls = self.py_cls_of(v)?.bits();
-        if cls == tl || cls == tt {
+        if cls == tl || cls == tt || cls == tb {
             let (_, items) = self.py_seq_parts(v)?;
             if !items.is_heap() {
                 return None;
@@ -1703,13 +1849,129 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
         }
-        if cls == td || cls == ts {
+        if cls == td || cls == ts || cls == tfs {
             let (_, size) = self.py_dict_field(v.heap_index(), 1)?;
             if !size.is_number() {
                 return None;
             }
             let n = size.as_f64();
             return (n >= 0.0 && n.fract() == 0.0 && n < 9_007_199_254_740_992.0).then_some(n as usize);
+        }
+        None
+    }
+
+    /// Python truthiness of `v` for [`Instr::PyTruth`], matching `types.js:truth`.
+    /// Returns `None` when a custom `__bool__` or `__len__` must be invoked.
+    pub(super) fn py_truth(&mut self, v: Value, rt: Value) -> Option<bool> {
+        if v == Value::TRUE {
+            return Some(true);
+        }
+        if v == Value::FALSE || v == Value::NULL || v.is_undefined() {
+            return Some(false);
+        }
+        if let Some(n) = v.small_bigint_val() {
+            return Some(n != 0);
+        }
+        if v.is_number() {
+            return Some(v.as_f64() != 0.0);
+        }
+        if !v.is_heap() {
+            return None;
+        }
+        let idx = v.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Str(s) => return Some(s.units() != 0),
+            HeapObj::Cons { len, .. } => return Some(*len != 0),
+            HeapObj::BigInt(n) => return Some(*n != 0),
+            HeapObj::BigIntBig(b) => return Some(b.sign() != num_bigint::Sign::NoSign),
+            _ => {}
+        }
+        let p = self.py_rt_for(rt)?;
+        let (tl, tt, td, ts, tfs, tb) = (
+            p.t_list.bits(),
+            p.t_tuple.bits(),
+            p.t_dict.bits(),
+            p.t_set.bits(),
+            p.t_frozenset.bits(),
+            p.istypes[5].bits(),
+        );
+        let (seq_shape, dict_shape, inst_shape, size_slot, ty) =
+            (p.seq_shape, p.dict_shape, p.inst_shape, p.dict_slots[1], p.ty);
+        let mut is_plain_inst_shape = false;
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            let shape = m.shape();
+            if !m.is_ctor && shape != crate::shape::DICT {
+                let cls = m.val_at(0).bits();
+                if shape == seq_shape && (cls == tl || cls == tt || cls == tb) {
+                    let items = m.val_at(1);
+                    if !items.is_heap() {
+                        return None;
+                    }
+                    return match self.heap.get(items.heap_index()) {
+                        HeapObj::Array(a) => Some(!a.is_empty()),
+                        _ => None,
+                    };
+                }
+                if shape == dict_shape && (cls == td || cls == ts || cls == tfs) {
+                    let size = m.val_at(size_slot);
+                    return size.is_number().then(|| size.as_f64() != 0.0);
+                }
+                if shape == inst_shape {
+                    is_plain_inst_shape = true;
+                }
+            }
+        }
+        let cls_v = self.py_cls_of(v)?;
+        let cls = cls_v.bits();
+        if cls == tl || cls == tt || cls == tb {
+            let (_, items) = self.py_seq_parts(v)?;
+            if !items.is_heap() {
+                return None;
+            }
+            return match self.heap.get(items.heap_index()) {
+                HeapObj::Array(a) => Some(!a.is_empty()),
+                _ => None,
+            };
+        }
+        if cls == td || cls == ts || cls == tfs {
+            let (_, size) = self.py_dict_field(idx, 1)?;
+            return size.is_number().then(|| size.as_f64() != 0.0);
+        }
+        let ty = ty?;
+        if !is_plain_inst_shape {
+            let HeapObj::Object(m) = self.heap.get(idx) else {
+                return None;
+            };
+            if m.is_ctor
+                || m.pos("isType")
+                    .is_some_and(|s| !m.is_accessor_at(s) && m.val_at(s) == Value::TRUE)
+            {
+                return None;
+            }
+        }
+        if cls_v.is_heap() {
+            if let HeapObj::Object(cm) = self.heap.get(cls_v.heap_index()) {
+                if !cm.is_ctor
+                    && ty.truth_kind < cm.slot_len()
+                    && ty.truth_ver < cm.slot_len()
+                    && ty.ver < cm.slot_len()
+                    && super::py_rt::key_eq(cm.key_at(ty.ver), "ver")
+                    && super::py_rt::key_eq(cm.key_at(ty.truth_ver), "truthVer")
+                    && super::py_rt::key_eq(cm.key_at(ty.truth_kind), "truthKind")
+                {
+                    let ver = cm.val_at(ty.ver);
+                    let tver = cm.val_at(ty.truth_ver);
+                    let tkind = cm.val_at(ty.truth_kind);
+                    if ver.is_number()
+                        && tver.is_number()
+                        && ver.as_f64() == tver.as_f64()
+                        && tkind.is_number()
+                        && tkind.as_f64() == 1.0
+                    {
+                        return Some(true);
+                    }
+                }
+            }
         }
         None
     }
@@ -1749,20 +2011,90 @@ impl<'p> Vm<'p> {
         Some(v)
     }
 
-    /// `isinstance(v, t)` for [`Instr::PyIsInstance`].
+    /// `isinstance(v, t)` for [`Instr::PyIsInstance`], including tuple RHS
+    /// `isinstance(v, (A, B, ...))` over plain types.
     #[inline(never)]
     pub(super) fn py_isinstance(&mut self, func_id: u32, ip: usize, v: Value, t: Value, rt: Value) -> Option<bool> {
         if !t.is_heap() {
             return None;
         }
         let p = self.py_rt_for(rt)?;
-        let (ty, istypes) = (p.ty?, p.istypes);
+        let (ty, istypes, t_tuple) = (p.ty?, p.istypes, p.t_tuple.bits());
         let ti = t.heap_index();
-        // `t` a type: this site's entry, else its own `isType`.
+        let resolve_val_cls = |vm: &Self| -> Option<Value> {
+            let prim = if v == Value::NULL {
+                Some(0)
+            } else if v == Value::TRUE || v == Value::FALSE {
+                Some(1)
+            } else if v.is_number() {
+                Some(3)
+            } else if v.is_small_bigint() {
+                Some(2)
+            } else if !v.is_heap() {
+                return None;
+            } else if vm.heap.is_str_like(v.heap_index()) {
+                Some(4)
+            } else if matches!(vm.heap.get(v.heap_index()), HeapObj::BigInt(_) | HeapObj::BigIntBig(_)) {
+                Some(2)
+            } else {
+                None
+            };
+            match prim {
+                Some(i) => Some(istypes[i]),
+                None => {
+                    let c = vm.py_cls_of(v)?;
+                    vm.py_plain_rec(c).then_some(c)
+                }
+            }
+        };
+        // `t` a type: this site's entry, else its own `isType` (or a tuple of plain types).
         let e = self.py_ic(func_id, ip);
         if !(e.kind == ic::IS_TYPE && e.a == t.bits() && self.heap.version_of(ti) == e.hver) {
-            if self.py_ty_field(ti, ty.is_type, "isType")? != Value::TRUE {
-                return None;
+            if self.py_ty_field(ti, ty.is_type, "isType") != Some(Value::TRUE) {
+                // Tuple of types: `isinstance(v, (A, B, ...))`.
+                if self.py_cls_of(t)?.bits() != t_tuple {
+                    return None;
+                }
+                let (_, items) = self.py_seq_parts(t)?;
+                if !items.is_heap() {
+                    return None;
+                }
+                let mut elems = [Value::UNDEFINED; 16];
+                let count = match self.heap.get(items.heap_index()) {
+                    HeapObj::Array(a) if a.len() <= elems.len() => {
+                        for (dst, &el) in elems.iter_mut().zip(a.iter()) {
+                            *dst = el;
+                        }
+                        a.len()
+                    }
+                    _ => return None,
+                };
+                let c = resolve_val_cls(self)?;
+                let type_type = self.py_hint_field(super::py_rt::hint::HIT_CLS, istypes[0].heap_index(), "cls")?;
+                // Validate every element before returning `false` (CPython checks left-to-right,
+                // returning `true` on the first match and validating types up to that point).
+                for &el in &elems[..count] {
+                    if !el.is_heap() {
+                        return None;
+                    }
+                    let ei = el.heap_index();
+                    if self.py_ty_field(ei, ty.is_type, "isType") != Some(Value::TRUE) {
+                        return None;
+                    }
+                    let el_cls = self.py_hint_field(super::py_rt::hint::HIT_CLS, ei, "cls")?;
+                    if el_cls != type_type {
+                        return None;
+                    }
+                    if c.bits() == el.bits() {
+                        return Some(true);
+                    }
+                    if self.py_mro_contains_cached(c, el, ty)? {
+                        if el.bits() != istypes[5].bits() {
+                            return Some(true);
+                        }
+                    }
+                }
+                return Some(false);
             }
             // Custom metaclasses (e.g. ABCMeta) may override `__instancecheck__`.
             let t_cls = self.py_hint_field(super::py_rt::hint::HIT_CLS, ti, "cls")?;
@@ -1773,33 +2105,7 @@ impl<'p> Vm<'p> {
             let hver = self.heap.version_of(ti);
             self.py_ic_put(func_id, ip, PyIc { kind: ic::IS_TYPE, pos: 0, hver, a: t.bits(), b: 0, c: 0, d: 0 });
         }
-        let prim = if v == Value::NULL {
-            Some(0)
-        } else if v == Value::TRUE || v == Value::FALSE {
-            Some(1)
-        } else if v.is_number() {
-            Some(3)
-        } else if v.is_small_bigint() {
-            Some(2)
-        } else if !v.is_heap() {
-            return None;
-        } else if self.heap.is_str_like(v.heap_index()) {
-            Some(4)
-        } else if matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_) | HeapObj::BigIntBig(_)) {
-            Some(2)
-        } else {
-            None
-        };
-        let c = match prim {
-            Some(i) => istypes[i],
-            None => {
-                let c = self.py_cls_of(v)?;
-                if !self.py_plain_rec(c) {
-                    return None;
-                }
-                c
-            }
-        };
+        let c = resolve_val_cls(self)?;
         if c.bits() == t.bits() {
             return Some(true);
         }
@@ -1810,21 +2116,25 @@ impl<'p> Vm<'p> {
         (t.bits() != istypes[5].bits()).then_some(true)
     }
 
-    /// `s[k]` for [`Instr::PyStrItem`]: ASCII single index or step-1 slice.
+    /// `s[k]` for [`Instr::PyStrItem`]: well-formed BMP (incl. ASCII) single
+    /// index or step-1 slice.
     fn py_str_item(&mut self, s: Value, k: Value) -> Option<Value> {
         if !s.is_heap() || !self.heap.is_str_like(s.heap_index()) {
             return None;
         }
         let idx = s.heap_index();
         self.heap.flatten(idx);
-        let len = {
+        let (len, is_ascii) = {
             let HeapObj::Str(st) = self.heap.get(idx) else {
                 return None;
             };
-            if !st.is_ascii() {
+            if st.is_ascii() {
+                (st.as_bytes().len(), true)
+            } else if st.is_wellformed() && !st.has_surrogate() {
+                (st.units(), false)
+            } else {
                 return None;
             }
-            st.as_bytes().len()
         };
         let n = len as i128;
         if let Some(i) = self.bigint_i128(k) {
@@ -1832,11 +2142,29 @@ impl<'p> Vm<'p> {
             if at < 0 || at >= n {
                 return None;
             }
-            let HeapObj::Str(st) = self.heap.get(idx) else {
-                return None;
+            let at = at as usize;
+            if is_ascii {
+                let HeapObj::Str(st) = self.heap.get(idx) else {
+                    return None;
+                };
+                // A one-character ASCII str is the interned string at its byte.
+                return Some(Value::heap(st.as_bytes()[at] as u32));
+            }
+            let char_bytes: Option<Vec<u8>> = {
+                let HeapObj::Str(st) = self.heap.get(idx) else {
+                    return None;
+                };
+                let (ba, bb) = st.bmp_byte_range(at, at + 1);
+                let b = &st.as_bytes()[ba..bb];
+                if b.len() == 1 && b[0] < 128 {
+                    return Some(Value::heap(b[0] as u32));
+                }
+                Some(b.to_vec())
             };
-            // A one-character ASCII str is the interned string at its byte.
-            return Some(Value::heap(st.as_bytes()[at as usize] as u32));
+            let bytes = char_bytes?;
+            return Some(Value::heap(
+                self.heap.alloc_js(crate::heap::JsStr::from_bmp_utf8(bytes, 1)),
+            ));
         }
         if !k.is_heap() {
             return None;
@@ -1891,11 +2219,29 @@ impl<'p> Vm<'p> {
             return None;
         }
         self.charge_steps(slice_len as i64);
-        Some(self.ascii_slice_value(idx, lo..hi))
+        if is_ascii {
+            return Some(self.ascii_slice_value(idx, lo..hi));
+        }
+        let slice_bytes = {
+            let HeapObj::Str(st) = self.heap.get(idx) else {
+                return None;
+            };
+            let (ba, bb) = st.bmp_byte_range(lo, hi);
+            let b = &st.as_bytes()[ba..bb];
+            if b.len() == 1 && b[0] < 128 {
+                return Some(Value::heap(b[0] as u32));
+            }
+            b.to_vec()
+        };
+        Some(Value::heap(
+            self.heap
+                .alloc_js(crate::heap::JsStr::from_bmp_utf8(slice_bytes, slice_len)),
+        ))
     }
 
     /// `len(s)` for [`Instr::PyStrLen`]: the code points of a str with no
-    /// lone surrogate (as the runtime's `strLen` counts them).
+    /// lone surrogate (as the runtime's `strLen` counts them). O(1) for ASCII
+    /// and well-formed BMP strings via `JsStr::has_surrogate()`.
     fn py_str_len(&mut self, s: Value) -> Option<usize> {
         if !s.is_heap() || !self.heap.is_str_like(s.heap_index()) {
             return None;
@@ -1905,14 +2251,16 @@ impl<'p> Vm<'p> {
         let HeapObj::Str(st) = self.heap.get(idx) else {
             return None;
         };
-        let bytes = st.as_bytes();
         if st.is_ascii() {
-            return Some(bytes.len());
+            return Some(st.as_bytes().len());
         }
-        if !crate::heap::wtf8_is_wellformed(bytes) {
+        if !st.is_wellformed() {
             return None;
         }
-        Some(bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count())
+        if !st.has_surrogate() {
+            return Some(st.units());
+        }
+        Some(st.as_bytes().iter().filter(|&&b| b & 0xC0 != 0x80).count())
     }
 
     /// [`Vm::py_map_get`] with the entry's position.
@@ -1941,7 +2289,7 @@ impl<'p> Vm<'p> {
 
     /// `o.dict` when it is a `Map` or a table (a Python instance's attribute
     /// storage, which answers `map_method` alike: `vm::py_table::layout`).
-    fn py_inst_map(&self, o: Value) -> Option<u32> {
+    pub(super) fn py_inst_map(&self, o: Value) -> Option<u32> {
         let (_, d) = self.py_inst_parts(o)?;
         (d.is_heap() && matches!(self.heap.get(d.heap_index()), HeapObj::Map { .. } | HeapObj::PyAttrs { .. } | HeapObj::PyTable(_)))
             .then(|| d.heap_index())
@@ -1962,15 +2310,7 @@ impl<'p> Vm<'p> {
         let HeapObj::Str(s) = self.heap.get(idx) else {
             return Value::bool(true);
         };
-        if s.is_ascii() {
-            return Value::bool(false);
-        }
-        let bytes = s.as_bytes();
-        let found = bytes
-            .iter()
-            .enumerate()
-            .any(|(i, &b)| b >= 0xF0 || (b == 0xED && bytes.get(i + 1).is_some_and(|&n| n >= 0xA0)));
-        Value::bool(found)
+        Value::bool(s.has_surrogate())
     }
 
     /// `__zipp_py_ord(0, a, b)`: -1, 0 or 1 as `a` orders against `b`;
@@ -2010,6 +2350,19 @@ impl<'p> Vm<'p> {
                 Some(o) => Value::int(o as i32),
                 None => Value::UNDEFINED,
             });
+        }
+        // Op 4: all-in-one native sort `PYORD(4, items, key, reverse, T.tuple)`.
+        // Evaluates pure side-effect-free key lambdas (including zero-allocation
+        // tuple-key lambdas like `lambda v: (v % 10, -v)` and `lambda kv: (-kv[1], kv[0])`),
+        // sorts stably with CPython's exact `reverse` tie-breaking, and returns the
+        // sorted `Array` directly without intermediate JS loops or permutation arrays.
+        if op == Value::int(4) {
+            return Ok(self.py_ord_sort_all(args).unwrap_or(Value::UNDEFINED));
+        }
+        // Op 5: O(N) top-k selection `PYORD(5, items, k, largest, T.tuple)` for
+        // `heapq.nsmallest` / `heapq.nlargest` with `key=None` over small ints.
+        if op == Value::int(5) {
+            return Ok(self.py_ord_topk(args).unwrap_or(Value::UNDEFINED));
         }
         if (op != Value::int(1) && op != Value::int(2)) || !a.is_heap() {
             return Ok(Value::UNDEFINED);
@@ -2053,6 +2406,198 @@ impl<'p> Vm<'p> {
         self.charge_steps(i64::try_from(cost).unwrap_or(i64::MAX));
         let out: Vec<Value> = order.into_iter().map(|i| Value::int(i as i32)).collect();
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// `__zipp_py_ord(5, items, k, largest)`: O(N) top-k selection for
+    /// `heapq.nsmallest` / `heapq.nlargest` with `key=None` over small ints
+    /// (`1 <= k <= 64`). Preserves exact CPython first-seen tie order and
+    /// returns `None` (zero side effects) on any non-small-int element.
+    fn py_ord_topk(&mut self, args: &[Value]) -> Option<Value> {
+        let items_v = args.get(1).copied()?;
+        let k_v = args.get(2).copied()?;
+        let largest = args.get(3).copied() == Some(Value::int(1));
+        if !k_v.is_int() {
+            return None;
+        }
+        let k = usize::try_from(k_v.as_int()).ok()?;
+        if k == 0 || k > 64 || !items_v.is_heap() {
+            return None;
+        }
+        if !self.array_js_len.is_empty() && self.array_js_len.contains_key(&items_v.heap_index()) {
+            return None;
+        }
+        let n = match self.heap.get(items_v.heap_index()) {
+            HeapObj::Array(items) if items.len() > 1 => items.len(),
+            _ => return None,
+        };
+        let cost = (n as u64).saturating_mul(ORD_STEPS_PER_UNIT);
+        if !self.native_kernel_admits(cost, k.saturating_mul(64)) {
+            return None;
+        }
+        let mut top = [(0i64, Value::UNDEFINED); 64];
+        let mut len = 0usize;
+        {
+            let HeapObj::Array(items) = self.heap.get(items_v.heap_index()) else {
+                return None;
+            };
+            if largest {
+                for &v in items {
+                    let x = v.small_bigint_val()?;
+                    if len == k {
+                        if x <= top[k - 1].0 {
+                            continue;
+                        }
+                        let mut pos = k - 1;
+                        while pos > 0 && x > top[pos - 1].0 {
+                            top[pos] = top[pos - 1];
+                            pos -= 1;
+                        }
+                        top[pos] = (x, v);
+                    } else {
+                        let mut pos = len;
+                        while pos > 0 && x > top[pos - 1].0 {
+                            top[pos] = top[pos - 1];
+                            pos -= 1;
+                        }
+                        top[pos] = (x, v);
+                        len += 1;
+                    }
+                }
+            } else {
+                for &v in items {
+                    let x = v.small_bigint_val()?;
+                    if len == k {
+                        if x >= top[k - 1].0 {
+                            continue;
+                        }
+                        let mut pos = k - 1;
+                        while pos > 0 && x < top[pos - 1].0 {
+                            top[pos] = top[pos - 1];
+                            pos -= 1;
+                        }
+                        top[pos] = (x, v);
+                    } else {
+                        let mut pos = len;
+                        while pos > 0 && x < top[pos - 1].0 {
+                            top[pos] = top[pos - 1];
+                            pos -= 1;
+                        }
+                        top[pos] = (x, v);
+                        len += 1;
+                    }
+                }
+            }
+        }
+        if self.instr_rec.is_some() {
+            self.charge_steps(i64::try_from(cost).unwrap_or(i64::MAX));
+        }
+        let mut out = Vec::with_capacity(len);
+        for &(_, v) in &top[..len] {
+            out.push(v);
+        }
+        let arr_idx = self.heap.alloc_array_settled(out);
+        self.realm_born(arr_idx, self.arr_proto);
+        Some(Value::heap(arr_idx))
+    }
+
+    /// `__zipp_py_ord(4, items, key, reverse, T.tuple)`: all-in-one native sort
+    /// for `sortItems` (`builtins.js`). Handles `key === null` and pure
+    /// side-effect-free key lambdas (both plain leaf keys like `lambda r: r[0]`
+    /// and zero-allocation tuple keys like `lambda v: (v % 10, -v)` or
+    /// `lambda kv: (-kv[1], kv[0])`), returning the sorted `Array` directly or
+    /// `None` (zero side effects) to fall back to `sortItems`.
+    fn py_ord_sort_all(&mut self, args: &[Value]) -> Option<Value> {
+        let items_v = args.get(1).copied()?;
+        let key = args.get(2).copied()?;
+        let reverse = args.get(3).copied() == Some(Value::int(1));
+        let tuple = args.get(4).copied()?;
+        if !items_v.is_heap() || (!self.array_js_len.is_empty() && self.array_js_len.contains_key(&items_v.heap_index())) {
+            return None;
+        }
+        let mut values: Vec<Value> = match self.heap.get(items_v.heap_index()) {
+            HeapObj::Array(items) if items.len() > 1 => items.clone(),
+            _ => return None,
+        };
+        let n = values.len();
+        let log = (usize::BITS - n.leading_zeros()) as u64;
+        let extra = if key == Value::NULL { 0 } else { (n as u64).saturating_mul(16) };
+        let cost = (n as u64)
+            .saturating_mul(log + 1)
+            .saturating_mul(ORD_STEPS_PER_UNIT)
+            .saturating_add(extra);
+        if !self.native_kernel_admits(cost, n.saturating_mul(64)) {
+            return None;
+        }
+        if reverse {
+            values.reverse();
+        }
+        let mut keys = Vec::with_capacity(n);
+        if key == Value::NULL {
+            for &v in &values {
+                keys.push(self.py_ord_key_rec(v, 0, tuple, false)?);
+            }
+        } else {
+            if super::prof_py::on() || !self.py_plain_rec(key) {
+                return None;
+            }
+            let entry = self.py_own_data(key.heap_index(), "c1")?;
+            if !entry.is_heap() {
+                return None;
+            }
+            let fid = match self.heap.get(entry.heap_index()) {
+                HeapObj::Func(id) => *id,
+                HeapObj::Closure { func, .. } => *func,
+                _ => return None,
+            };
+            if let Some(tk) = super::py_attr::py_leaf::py_leaf_tuple_key_scan(self.func(fid as usize)) {
+                let mut elems = [Value::UNDEFINED; 4];
+                for &v in &values {
+                    let klen = self.py_leaf_exec_tuple_key(fid, key, tk, v, &mut elems)?;
+                    let mut seq = Vec::with_capacity(klen);
+                    for &ev in &elems[..klen] {
+                        seq.push(self.py_ord_key_rec(ev, 0, tuple, false)?);
+                    }
+                    keys.push(OrdKey::Seq(seq));
+                }
+            } else {
+                let info = self.py_leaf_info(fid)?;
+                if !super::py_attr::py_leaf::py_leaf_is_pure_1arg(self.func(fid as usize), info) {
+                    return None;
+                }
+                for &v in &values {
+                    let kv = self.py_leaf_exec_pure_1arg(fid, key, info, v)?;
+                    keys.push(self.py_ord_key_rec(kv, 0, tuple, false)?);
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        if !self.py_ord_sort_columns(&keys, &mut order) {
+            let undecided = std::cell::Cell::new(false);
+            order.sort_by(|&i, &j| match self.py_ord_cmp(&keys[i], &keys[j]) {
+                Some(o) => o,
+                None => {
+                    undecided.set(true);
+                    std::cmp::Ordering::Equal
+                }
+            });
+            if undecided.get() {
+                return None;
+            }
+        }
+        if self.instr_rec.is_some() {
+            self.charge_steps(i64::try_from(cost).unwrap_or(i64::MAX));
+        }
+        let mut out = self.heap.take_arr_buf(n);
+        if reverse {
+            for i in order.into_iter().rev() {
+                out.push(values[i]);
+            }
+        } else {
+            for i in order {
+                out.push(values[i]);
+            }
+        }
+        Some(Value::heap(self.heap.alloc_array_settled(out)))
     }
 
     /// Sort `order` (the identity) by `keys` as [`Vm::py_ord_cmp`] orders
@@ -2637,6 +3182,26 @@ impl<'p> Vm<'p> {
             return Ok(None);
         };
         Ok(self.py_table_get(map, k))
+    }
+
+    /// Fast non-allocating `d[k] = v` for exact `dict` records of `dict_shape`:
+    /// never allocates on the VM heap and never invokes guest code, so compiled
+    /// code (`jit_py_set_item_dict`) skips `maybe_gc()` and `refetch(ops)`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(super) fn py_set_item_dict_fast(&mut self, o: Value, k: Value, v: Value, dict: Value) -> bool {
+        let Some((idx, map, size_slot)) = self.py_dict_rec_fast(o, dict) else {
+            return false;
+        };
+        let Some(Ok((n, inserted))) = self.py_table_set_ex(map, k, v) else {
+            return false;
+        };
+        if inserted {
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.set_val_at(size_slot, Value::num(n as f64));
+            }
+        }
+        true
     }
 
     pub(super) fn py_set_item(&mut self, o: Value, k: Value, v: Value, seq: Value, dict: Value) -> Result<bool, Thrown> {

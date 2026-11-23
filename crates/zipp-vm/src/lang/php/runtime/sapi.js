@@ -325,7 +325,7 @@
         const eq = s.indexOf("=");
         const envCell = rt.globalScope.get("_ENV");
         if (!envCell || !envCell.v || envCell.v.__php !== 1) return false;
-        if (eq < 0) envCell.v.m.delete(s);
+        if (eq < 0) { envCell.v._list = false; envCell.v._e = null; envCell.v.m.delete(s); }
         else rt.arrSetInPlace(envCell.v, s.slice(0, eq), s.slice(eq + 1));
         return true;
     });

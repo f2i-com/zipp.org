@@ -4455,6 +4455,7 @@ pub(crate) use helpers_misc::iter_region_stats;
 pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_shape_set_barrier;
+pub(crate) use proxy_regexp::{ITFB_GLOBAL, ITFB_INDICES, ITFB_STICKY, ITFB_UNICODE};
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use proxy_regexp::rx_scalar_exec_enabled;

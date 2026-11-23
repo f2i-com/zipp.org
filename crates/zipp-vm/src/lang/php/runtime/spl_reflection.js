@@ -1061,7 +1061,7 @@
             { name: "offsetExists", vis: 0, builtin: function (k) { return R.idxIsset(this.__arr, k); } },
             { name: "offsetGet", vis: 0, builtin: function (k) { return R.idxGet(this.__arr, k, true); } },
             { name: "offsetSet", vis: 0, builtin: function (k, v) { if (k === null) rt.arrPushInPlace(this.__arr, v); else rt.arrSetInPlace(this.__arr, k, v); } },
-            { name: "offsetUnset", vis: 0, builtin: function (k) { this.__arr.m.delete(rt.arrKey(k)); } },
+            { name: "offsetUnset", vis: 0, builtin: function (k) { this.__arr._list = false; this.__arr._e = null; this.__arr.m.delete(rt.arrKey(k)); } },
         ]
     });
 
@@ -1086,7 +1086,7 @@
             { name: "offsetExists", vis: 0, builtin: function (k) { return R.idxIsset(this.__arr, k); } },
             { name: "offsetGet", vis: 0, builtin: function (k) { return R.idxGet(this.__arr, k, true); } },
             { name: "offsetSet", vis: 0, builtin: function (k, v) { if (k === null) rt.arrPushInPlace(this.__arr, v); else rt.arrSetInPlace(this.__arr, k, v); } },
-            { name: "offsetUnset", vis: 0, builtin: function (k) { this.__arr.m.delete(rt.arrKey(k)); } },
+            { name: "offsetUnset", vis: 0, builtin: function (k) { this.__arr._list = false; this.__arr._e = null; this.__arr.m.delete(rt.arrKey(k)); } },
             { name: "append", vis: 0, builtin: function (v) { rt.arrPushInPlace(this.__arr, v); } },
         ]
     });
@@ -2247,6 +2247,7 @@
         const out = rt.makeArr();
         for (const v of a.m.values()) {
             const k = rt.arrKey(rt.deref(v));
+            out._list = false; out._e = null;
             out.m.set(k, (out.m.get(k) || 0n) + 1n);
         }
         return out;
@@ -2351,6 +2352,7 @@
                 if (dv && dv.__php === 1) { walk(dv); continue; }
                 const cell = rt.isRef(v) ? v : rt.mkRef(dv);
                 arr.hasRefs = true;
+                arr._e = null;
                 arr.m.set(k, cell);
                 const callArgs = arg !== undefined ? [cell, k, arg] : [cell, k];
                 rt.call(cb, callArgs, null, null, false);

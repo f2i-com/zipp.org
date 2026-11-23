@@ -102,13 +102,52 @@ impl SmallArraySet for [u8; 4] {
 
     #[inline(always)]
     fn find_in(self, rhs: &[u8]) -> Option<usize> {
-        // TODO.
-        for (idx, byte) in rhs.iter().enumerate() {
-            if self.contains(*byte) {
+        #[cfg(all(target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+        {
+            if rhs.len() >= 16 {
+                return unsafe { find_in_4_sse2(self, rhs) };
+            }
+        }
+        for (idx, &byte) in rhs.iter().enumerate() {
+            if self.contains(byte) {
                 return Some(idx);
             }
         }
         None
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+#[inline]
+unsafe fn find_in_4_sse2(needles: [u8; 4], rhs: &[u8]) -> Option<usize> {
+    use core::arch::x86_64::*;
+    unsafe {
+        let n0 = _mm_set1_epi8(needles[0] as i8);
+        let n1 = _mm_set1_epi8(needles[1] as i8);
+        let n2 = _mm_set1_epi8(needles[2] as i8);
+        let n3 = _mm_set1_epi8(needles[3] as i8);
+        let ptr = rhs.as_ptr();
+        let len = rhs.len();
+        let mut off = 0usize;
+        loop {
+            let v = _mm_loadu_si128(ptr.add(off) as *const __m128i);
+            let m0 = _mm_cmpeq_epi8(v, n0);
+            let m1 = _mm_cmpeq_epi8(v, n1);
+            let m2 = _mm_cmpeq_epi8(v, n2);
+            let m3 = _mm_cmpeq_epi8(v, n3);
+            let hit = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
+            let mask = _mm_movemask_epi8(hit) as u32;
+            if mask != 0 {
+                return Some(off + mask.trailing_zeros() as usize);
+            }
+            off += 16;
+            if off >= len {
+                return None;
+            }
+            if off + 16 > len {
+                off = len - 16;
+            }
+        }
     }
 }
 
@@ -194,12 +233,14 @@ impl ByteSet for AsciiBitmap {
 }
 
 /// A bitmap covering all bytes.
+/// Stored as two 16-byte nibble lookup tables so SSSE3/AVX2 `pshufb` search
+/// reads the tables directly with zero setup cost:
+/// - `self.0[lo]` (`lo = val & 0xF`) holds bit `1 << ((val >> 4) & 7)` for `val < 128`.
+/// - `self.0[16 + lo]` holds bit `1 << ((val >> 4) & 7)` for `val >= 128`.
 #[derive(Default, Copy, Clone, PartialEq, Eq)]
-#[repr(align(4))]
-pub struct ByteBitmap([u16; 16]);
+#[repr(align(16))]
+pub struct ByteBitmap([u8; 32]);
 
-// TODO: the codegen here is pretty horrible; LLVM is emitting a sequence of
-// halfword instructions. Consider using a union?
 impl ByteBitmap {
     /// Construct from a sequence of bytes.
     pub fn new(bytes: &[u8]) -> ByteBitmap {
@@ -213,32 +254,24 @@ impl ByteBitmap {
     /// \return whether this bitmap contains a given byte val.
     #[inline(always)]
     pub fn contains(&self, val: u8) -> bool {
-        let byte = val >> 4;
-        let bit = val & 0xF;
-        (self.0[byte as usize] & (1 << bit)) != 0
+        let idx = ((val & 0x80) >> 3) | (val & 0x0F);
+        let bit = (val >> 4) & 0x7;
+        (self.0[idx as usize] & (1 << bit)) != 0
     }
 
     /// Set a bit in this bitmap.
     #[inline(always)]
     pub fn set(&mut self, val: u8) {
-        let byte = val >> 4;
-        let bit = val & 0xF;
-        self.0[byte as usize] |= 1 << bit;
+        let idx = ((val & 0x80) >> 3) | (val & 0x0F);
+        let bit = (val >> 4) & 0x7;
+        self.0[idx as usize] |= 1 << bit;
     }
 
-    /// Set every byte in `lo..=hi`, a word at a time.
+    /// Set every byte in `lo..=hi`.
     pub fn set_range(&mut self, lo: u8, hi: u8) {
         debug_assert!(lo <= hi);
-        let (lo, hi) = (lo as usize, hi as usize);
-        let last_word = hi >> 4;
-        let mut word = lo >> 4;
-        let mut from = lo & 0xF;
-        while word <= last_word {
-            let to = if word == last_word { hi & 0xF } else { 0xF };
-            // Bits `from..=to` of the word.
-            self.0[word] |= ((0xFFFF_u32 << from) & (0xFFFF_u32 >> (15 - to))) as u16;
-            from = 0;
-            word += 1;
+        for b in lo..=hi {
+            self.set(b);
         }
     }
 
@@ -262,6 +295,15 @@ impl ByteBitmap {
         self.0.iter().map(|v| v.count_ones()).sum()
     }
 
+    /// True if no non-ASCII byte (`0x80..=0xFF`) is set in this bitmap.
+    #[cfg(all(feature = "std", target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+    #[inline(always)]
+    fn is_ascii_only(&self) -> bool {
+        let hi0 = u64::from_ne_bytes(self.0[16..24].try_into().unwrap());
+        let hi1 = u64::from_ne_bytes(self.0[24..32].try_into().unwrap());
+        (hi0 | hi1) == 0
+    }
+
     /// Return ourselves as an array of a fixed length.
     /// Panics if the array is not large enough.
     #[allow(clippy::wrong_self_convention)]
@@ -278,66 +320,192 @@ impl ByteBitmap {
         array
     }
 
-    /// \return the index of the first byte in the slice that is present in this
-    /// bitmap, using some unsafe tricks.
-    #[cfg(not(feature = "prohibit-unsafe"))]
     #[inline(always)]
-    fn unsafe_find_in_slice(&self, bytes: &[u8]) -> Option<usize> {
-        type Chunk = u32;
-        let bm = &self.0;
-
-        let mut offset = 0;
-        let (prefix, body, suffix) = unsafe { bytes.align_to::<Chunk>() };
-        for &byte in prefix.iter() {
+    fn scalar_find_in(&self, bytes: &[u8]) -> Option<usize> {
+        for (idx, &byte) in bytes.iter().enumerate() {
             if self.contains(byte) {
-                return Some(offset);
+                return Some(idx);
             }
-            offset += 1;
-        }
-
-        for &chunk in body {
-            // Use LE. Here index 0 is the earliest address.
-            let byte_idxs = ((chunk >> 4) & 0x0F0F0F0F).to_le_bytes();
-            let bit_idxs = (chunk & 0x0F0F0F0F).to_le_bytes();
-            if (bm[byte_idxs[0] as usize] & (1 << bit_idxs[0])) != 0 {
-                return Some(offset);
-            }
-            if (bm[byte_idxs[1] as usize] & (1 << bit_idxs[1])) != 0 {
-                return Some(offset + 1);
-            }
-            if (bm[byte_idxs[2] as usize] & (1 << bit_idxs[2])) != 0 {
-                return Some(offset + 2);
-            }
-            if (bm[byte_idxs[3] as usize] & (1 << bit_idxs[3])) != 0 {
-                return Some(offset + 3);
-            }
-            offset += 4;
-        }
-
-        for &byte in suffix.iter() {
-            if self.contains(byte) {
-                return Some(offset);
-            }
-            offset += 1;
         }
         None
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn find_in_ssse3(&self, bytes: &[u8]) -> Option<usize> {
+        use core::arch::x86_64::*;
+        const BIT_LO: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+        const BIT_HI: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128];
+        unsafe {
+            let tbl_lo = _mm_load_si128(self.0.as_ptr() as *const __m128i);
+            let bit_lo = _mm_loadu_si128(BIT_LO.as_ptr() as *const __m128i);
+            let mask_0f = _mm_set1_epi8(0x0F);
+            let zero = _mm_setzero_si128();
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            let mut off = 0usize;
+            if self.is_ascii_only() {
+                loop {
+                    let v = _mm_loadu_si128(ptr.add(off) as *const __m128i);
+                    let lo = _mm_and_si128(v, mask_0f);
+                    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    let hit = _mm_and_si128(
+                        _mm_shuffle_epi8(tbl_lo, lo),
+                        _mm_shuffle_epi8(bit_lo, hi),
+                    );
+                    let mask = (!(_mm_movemask_epi8(_mm_cmpeq_epi8(hit, zero)) as u32)) & 0xFFFF;
+                    if mask != 0 {
+                        return Some(off + mask.trailing_zeros() as usize);
+                    }
+                    off += 16;
+                    if off >= len {
+                        return None;
+                    }
+                    if off + 16 > len {
+                        off = len - 16;
+                    }
+                }
+            } else {
+                let tbl_hi = _mm_load_si128(self.0.as_ptr().add(16) as *const __m128i);
+                let bit_hi = _mm_loadu_si128(BIT_HI.as_ptr() as *const __m128i);
+                loop {
+                    let v = _mm_loadu_si128(ptr.add(off) as *const __m128i);
+                    let lo = _mm_and_si128(v, mask_0f);
+                    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    let hit_lo = _mm_and_si128(
+                        _mm_shuffle_epi8(tbl_lo, lo),
+                        _mm_shuffle_epi8(bit_lo, hi),
+                    );
+                    let hit_hi = _mm_and_si128(
+                        _mm_shuffle_epi8(tbl_hi, lo),
+                        _mm_shuffle_epi8(bit_hi, hi),
+                    );
+                    let hit = _mm_or_si128(hit_lo, hit_hi);
+                    let mask = (!(_mm_movemask_epi8(_mm_cmpeq_epi8(hit, zero)) as u32)) & 0xFFFF;
+                    if mask != 0 {
+                        return Some(off + mask.trailing_zeros() as usize);
+                    }
+                    off += 16;
+                    if off >= len {
+                        return None;
+                    }
+                    if off + 16 > len {
+                        off = len - 16;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn find_in_avx2(&self, bytes: &[u8]) -> Option<usize> {
+        use core::arch::x86_64::*;
+        const BIT_LO: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+        const BIT_HI: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128];
+        unsafe {
+            let tbl_lo = _mm256_broadcastsi128_si256(_mm_load_si128(self.0.as_ptr() as *const __m128i));
+            let bit_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(BIT_LO.as_ptr() as *const __m128i));
+            let mask_0f = _mm256_set1_epi8(0x0F);
+            let zero = _mm256_setzero_si256();
+            let ptr = bytes.as_ptr();
+            let len = bytes.len();
+            let mut off = 0usize;
+            if self.is_ascii_only() {
+                loop {
+                    let v = _mm256_loadu_si256(ptr.add(off) as *const __m256i);
+                    let lo = _mm256_and_si256(v, mask_0f);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
+                    let hit = _mm256_and_si256(
+                        _mm256_shuffle_epi8(tbl_lo, lo),
+                        _mm256_shuffle_epi8(bit_lo, hi),
+                    );
+                    let mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero)) as u32);
+                    if mask != 0 {
+                        return Some(off + mask.trailing_zeros() as usize);
+                    }
+                    off += 32;
+                    if off >= len {
+                        return None;
+                    }
+                    if off + 32 > len {
+                        off = len - 32;
+                    }
+                }
+            } else {
+                let tbl_hi = _mm256_broadcastsi128_si256(_mm_load_si128(
+                    self.0.as_ptr().add(16) as *const __m128i,
+                ));
+                let bit_hi =
+                    _mm256_broadcastsi128_si256(_mm_loadu_si128(BIT_HI.as_ptr() as *const __m128i));
+                loop {
+                    let v = _mm256_loadu_si256(ptr.add(off) as *const __m256i);
+                    let lo = _mm256_and_si256(v, mask_0f);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
+                    let hit_lo = _mm256_and_si256(
+                        _mm256_shuffle_epi8(tbl_lo, lo),
+                        _mm256_shuffle_epi8(bit_lo, hi),
+                    );
+                    let hit_hi = _mm256_and_si256(
+                        _mm256_shuffle_epi8(tbl_hi, lo),
+                        _mm256_shuffle_epi8(bit_hi, hi),
+                    );
+                    let hit = _mm256_or_si256(hit_lo, hit_hi);
+                    let mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, zero)) as u32);
+                    if mask != 0 {
+                        return Some(off + mask.trailing_zeros() as usize);
+                    }
+                    off += 32;
+                    if off >= len {
+                        return None;
+                    }
+                    if off + 32 > len {
+                        off = len - 32;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
+#[inline(always)]
+fn bitmap_simd_level() -> u8 {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    // 0 = uninit, 1 = scalar, 2 = ssse3, 3 = avx2
+    static LEVEL: AtomicU8 = AtomicU8::new(0);
+    match LEVEL.load(Ordering::Relaxed) {
+        0 => {
+            let lvl = if std::is_x86_feature_detected!("avx2") {
+                3
+            } else if std::is_x86_feature_detected!("ssse3") {
+                2
+            } else {
+                1
+            };
+            LEVEL.store(lvl, Ordering::Relaxed);
+            lvl
+        }
+        lvl => lvl,
     }
 }
 
 impl ByteSearcher for ByteBitmap {
     #[inline(always)]
     fn find_in(&self, bytes: &[u8]) -> Option<usize> {
-        #[cfg(feature = "prohibit-unsafe")]
+        #[cfg(all(feature = "std", target_arch = "x86_64", not(feature = "prohibit-unsafe")))]
         {
-            for (idx, byte) in bytes.iter().enumerate() {
-                if self.contains(*byte) {
-                    return Some(idx);
+            if bytes.len() >= 16 {
+                let lvl = bitmap_simd_level();
+                if lvl == 3 && bytes.len() >= 32 {
+                    return unsafe { self.find_in_avx2(bytes) };
+                }
+                if lvl >= 2 {
+                    return unsafe { self.find_in_ssse3(bytes) };
                 }
             }
-            return None;
         }
-        #[cfg(not(feature = "prohibit-unsafe"))]
-        return self.unsafe_find_in_slice(bytes);
+        self.scalar_find_in(bytes)
     }
 }
 
@@ -406,5 +574,57 @@ mod tests {
     fn literal_search() {
         assert_eq!([0, 1, 2, 3].find_in(&[4, 5, 6, 7]), None);
         assert_eq!([0, 1, 2, 3].find_in(&[]), None);
+        // Exercise SSE2 16-byte loop + overlapping tail across all lengths 0..64.
+        let needles = [b'a', b'e', b'i', b'o'];
+        for len in 0..=64usize {
+            let mut buf = vec![b'x'; len];
+            assert_eq!(needles.find_in(&buf), None);
+            for pos in 0..len {
+                buf[pos] = needles[pos & 3];
+                assert_eq!(needles.find_in(&buf), Some(pos), "len={len} pos={pos}");
+                buf[pos] = b'x';
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_simd_exhaustive() {
+        // Test every single byte 0..=255 in its own bitmap across lengths 0..72.
+        for target in 0..=255u8 {
+            let bm = make_bitmap(&[target]);
+            let fill = target.wrapping_add(1);
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+                let mut buf = vec![fill; len];
+                assert_eq!(bm.find_in(&buf), None, "target={target} len={len}");
+                if len > 0 {
+                    for &pos in &[0, len / 2, len - 1] {
+                        buf[pos] = target;
+                        assert_eq!(
+                            bm.find_in(&buf),
+                            Some(pos),
+                            "target={target} len={len} pos={pos}"
+                        );
+                        buf[pos] = fill;
+                    }
+                }
+            }
+        }
+        // Test multi-byte ASCII and inverted (non-ASCII) bitmaps across all lengths 0..70.
+        let ascii_bm = make_bitmap(b"0123456789");
+        let mut non_ascii_bm = make_bitmap(b"abc");
+        non_ascii_bm.set(0x80);
+        non_ascii_bm.set(0xC3);
+        non_ascii_bm.set(0xFF);
+        for (bm, hit, miss) in [(&ascii_bm, b'7', b'z'), (&non_ascii_bm, 0xC3u8, b'z')] {
+            for len in 0..=70usize {
+                let mut buf = vec![miss; len];
+                assert_eq!(bm.find_in(&buf), None);
+                for pos in 0..len {
+                    buf[pos] = hit;
+                    assert_eq!(bm.find_in(&buf), Some(pos), "hit={hit} len={len} pos={pos}");
+                    buf[pos] = miss;
+                }
+            }
+        }
     }
 }

@@ -630,26 +630,63 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
     }
     let n = f.code.len();
     let param_top: Reg = f.param_count;
+    // Single O(n) pre-scan: collect back-edges, all jumps, and check whether
+    // any self-append `Add { dst: r, a: r }` (r > param_top) exists at all.
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
+    let mut has_self_add = false;
+    for (j, instr) in f.code.iter().enumerate() {
+        match *instr {
+            Instr::Jump { target } if (target as usize) < j => {
+                back_edges.push((target as usize, j));
+            }
+            Instr::Add { dst, a, .. } if dst == a && dst > param_top => {
+                has_self_add = true;
+            }
+            _ => {}
+        }
+    }
+    if back_edges.is_empty() || !has_self_add {
+        return;
+    }
+    // Precompute jump-target bitmap and branch list ONCE per function instead
+    // of O(L * C * n) inside the nested back-edge × accumulator loops.
+    let mut targets = vec![false; n];
+    let mut all_jumps: Vec<(usize, usize)> = Vec::new();
+    for (jp, instr) in f.code.iter().enumerate() {
+        match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => {
+                let t = target as usize;
+                all_jumps.push((jp, t));
+                if t < n {
+                    targets[t] = true;
+                }
+            }
+            Instr::PushFinally { target, .. } | Instr::JumpFinally { target, .. } => {
+                let t = target as usize;
+                if t < n {
+                    targets[t] = true;
+                }
+            }
+            Instr::PushHandler { catch_target, .. } => {
+                let t = catch_target as usize;
+                if t < n {
+                    targets[t] = true;
+                }
+            }
+            _ => {}
+        }
+    }
     let mut rewrites: Vec<usize> = Vec::new();
-    for j in 0..n {
-        let start = match f.code[j] {
-            Instr::Jump { target } if (target as usize) < j => target as usize,
-            _ => continue,
-        };
-        let end = j;
+    for (start, end) in back_edges {
         // Not enclosed by another back-edge, and no OUTSIDE jump into the
         // interior (falling in at `start`, or a pre-loop jump TO `start`, is
         // the canonical entry and fine).
         let mut enclosed = false;
-        for (jp, instr) in f.code.iter().enumerate() {
-            let target = match *instr {
-                Instr::Jump { target }
-                | Instr::JumpIfFalse { target, .. }
-                | Instr::JumpIfTrue { target, .. }
-                | Instr::JumpIfNotLt { target, .. }
-                | Instr::JumpIfNotLe { target, .. } => target as usize,
-                _ => continue,
-            };
+        for &(jp, target) in &all_jumps {
             if target < jp && (target, jp) != (start, end) && target <= start && jp >= end {
                 enclosed = true; // an enclosing back-edge
                 break;
@@ -684,28 +721,8 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
                     && f.constants.get(idx as usize).copied().map(is_string_const).unwrap_or(false))
             });
             let Some(init_ip) = init_ip else { continue };
-            // Jump targets of the whole function — block boundaries for the
-            // dead-Move dominating-write scan. Ops outside the enumerated set
-            // (PushHandler etc.) are handled by the scan's own barrier.
-            let mut targets = vec![false; n];
-            for instr in f.code.iter() {
-                let t = match *instr {
-                    Instr::Jump { target }
-                    | Instr::JumpIfFalse { target, .. }
-                    | Instr::JumpIfTrue { target, .. }
-                    | Instr::JumpIfNotLt { target, .. }
-                    | Instr::JumpIfNotLe { target, .. }
-                    | Instr::PushFinally { target, .. }
-                    | Instr::JumpFinally { target, .. } => target as usize,
-                    Instr::PushHandler { catch_target, .. } => catch_target as usize,
-                    _ => continue,
-                };
-                if t < n {
-                    targets[t] = true;
-                }
-            }
-            for (ip, _) in f.code.iter().enumerate() {
-                if ip == init_ip || appends.contains(&ip) || ip > end {
+            for ip in 0..=end {
+                if ip == init_ip || appends.contains(&ip) {
                     continue; // the exempt sites; post-loop is unrestricted
                 }
                 // The discarded statement value of `out += x`: a Move of `r`
@@ -743,14 +760,33 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
 /// accumulator is never aliased. Numeric accumulators (`sum += x`) keep `Add` and
 /// stay on the faster integer region. `is_top_level` is true for the script body.
 pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool) {
-    let n = f.code.len();
+    // Fast O(n) pre-scan: skip immediately when the function has no back-edges,
+    // no candidate Add/AddRightPair, or no global stores.
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
+    let mut has_add = false;
+    let mut has_global_store = false;
+    for (j, instr) in f.code.iter().enumerate() {
+        match *instr {
+            Instr::Jump { target } if (target as usize) < j => {
+                back_edges.push((target as usize, j));
+            }
+            Instr::Add { .. } | Instr::AddRightPair { in_place: false, .. } => {
+                has_add = true;
+            }
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {
+                has_global_store = true;
+            }
+            _ => {}
+        }
+    }
+    if back_edges.is_empty() || !has_add || !has_global_store {
+        return;
+    }
     // (ip, in_place)
     let mut rewrites: Vec<(usize, bool)> = Vec::new();
-    for j in 0..n {
-        let start = match f.code[j] {
-            Instr::Jump { target } if (target as usize) < j => target as usize,
-            _ => continue,
-        };
+    for (start, j) in back_edges {
         for k in start..=j {
             let (dst, a) = match f.code[k] {
                 Instr::Add { dst, a, .. }
@@ -845,6 +881,15 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
 /// can observe it; the interpreter retains it as the slow path's GC root.
 pub(crate) fn rewrite_append_indexes(f: &mut FuncProto) {
     if !append_index_fuse_enabled() || f.code.len() < 2 {
+        return;
+    }
+    // Over 99.9% of functions emit zero `StrAppendInPlace` ops; avoid
+    // allocating `targets = vec![false; n]` and scanning twice when none exist.
+    if !f
+        .code
+        .iter()
+        .any(|i| matches!(i, Instr::StrAppendInPlace { .. }))
+    {
         return;
     }
     let n = f.code.len();

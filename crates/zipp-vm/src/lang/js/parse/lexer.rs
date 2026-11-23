@@ -1060,6 +1060,41 @@ impl<'s> Lexer<'s> {
         let start = self.pos;
         self.pos += 1; // ` or }
         let raw_start = self.pos;
+        // Fast path for plain ASCII template chunks with no escapes, no CR,
+        // and no non-ASCII bytes (the overwhelming majority of template literals).
+        if self.exact.is_none() {
+            let bytes = self.src;
+            let mut p = raw_start;
+            let mut plain_tail: Option<bool> = None;
+            while p < bytes.len() {
+                let b = bytes[p];
+                if b == b'`' {
+                    plain_tail = Some(true);
+                    break;
+                }
+                if b == b'$' && bytes.get(p + 1) == Some(&b'{') {
+                    plain_tail = Some(false);
+                    break;
+                }
+                if b == b'\\' || b == b'\r' || b >= 0x80 {
+                    break;
+                }
+                p += 1;
+            }
+            if let Some(tail) = plain_tail {
+                self.pos = p + if tail { 1 } else { 2 };
+                // SAFETY: every byte in `raw_start..p` was checked `< 0x80`.
+                let s = std::str::from_utf8(&bytes[raw_start..p])
+                    .unwrap_or_default()
+                    .to_owned();
+                return Ok(TokenKind::Template {
+                    cooked: Some(StrVal::Utf8(s.clone())),
+                    raw: StrVal::Utf8(s),
+                    head,
+                    tail,
+                });
+            }
+        }
         let mut units: Vec<u16> = Vec::new();
         // An invalid escape is only fatal in an untagged template, which the
         // lexer cannot know, so record it and let the parser decide.
@@ -1318,6 +1353,35 @@ impl<'s> Lexer<'s> {
         }
 
         // Decimal: digits [. digits] [(e|E) [+|-] digits]
+        // Zero-allocation fast path for plain decimal integers up to 15 digits
+        // (no `_`, `.`, `e`/`E`, or `n` suffix): every integer in `0..10^15` is
+        // exact in IEEE-754 `f64` (`< 2^53`).
+        if kind == NumKind::Decimal && self.peek().is_ascii_digit() {
+            let bytes = self.src;
+            let mut p = self.pos;
+            let mut val: u64 = 0;
+            let mut digits = 0usize;
+            while p < bytes.len() && bytes[p].is_ascii_digit() && digits < 15 {
+                val = val * 10 + (bytes[p] - b'0') as u64;
+                p += 1;
+                digits += 1;
+            }
+            let next = bytes.get(p).copied().unwrap_or(0);
+            if digits > 0
+                && !next.is_ascii_digit()
+                && next != b'.'
+                && next != b'_'
+                && next != b'n'
+                && (next | 0x20) != b'e'
+            {
+                self.pos = p;
+                self.reject_ident_after(start)?;
+                return Ok(TokenKind::Num(NumLit {
+                    value: val as f64,
+                    kind,
+                }));
+            }
+        }
         let mut text = String::new();
         self.read_digits_into(&mut text, 10)?;
         if self.peek() == b'.' {

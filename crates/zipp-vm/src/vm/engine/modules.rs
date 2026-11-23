@@ -823,9 +823,23 @@ impl<'p> Vm<'p> {
         // dependency loop: `module_loading` holds exactly the in-flight
         // ancestors throughout it.
         let module_root = self.module_root.clone();
-        let canon_of = |dir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
-            let raw = crate::vm::node::resolve::specifier_path(dir, spec);
-            canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw)
+        // Deduplicate unique specifiers across all 4 import passes below so
+        // `import { a, b, ..., j } from 'pkg'` resolves and canonicalizes
+        // `'pkg'` once instead of 4× per named binding.
+        let mut canon_cache: rustc_hash::FxHashMap<&str, std::path::PathBuf> = Default::default();
+        for e in &imports {
+            if e.specifier == "<module source>" || canon_cache.contains_key(e.specifier.as_str()) {
+                continue;
+            }
+            let raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
+            let resolved = canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw);
+            canon_cache.insert(e.specifier.as_str(), resolved);
+        }
+        let canon_of_cached = |spec: &str| -> &std::path::Path {
+            canon_cache
+                .get(spec)
+                .map(std::path::PathBuf::as_path)
+                .unwrap_or_else(|| std::path::Path::new(""))
         };
         use crate::bytecode::ImportName as IN;
         // EARLY-PREPARE eligibility: every Named/Default import resolves
@@ -841,12 +855,12 @@ impl<'p> Vm<'p> {
         let early_prepare = imports.iter().all(|e| match &e.import {
             IN::Named(n) => {
                 e.mtype.is_none()
-                    && canon_of(dir.as_deref(), &e.specifier) == path
+                    && canon_of_cached(&e.specifier) == path.as_path()
                     && own_cslot(n).is_some()
             }
             IN::Default => {
                 e.mtype.is_none()
-                    && canon_of(dir.as_deref(), &e.specifier) == path
+                    && canon_of_cached(&e.specifier) == path.as_path()
                     && own_cslot("default").is_some()
             }
             _ => true,
@@ -859,21 +873,21 @@ impl<'p> Vm<'p> {
         for e in &imports {
             match &e.import {
                 IN::Named(n)
-                    if e.mtype.is_none() && canon_of(dir.as_deref(), &e.specifier) == path =>
+                    if e.mtype.is_none() && canon_of_cached(&e.specifier) == path.as_path() =>
                 {
                     if let Some(c) = own_cslot(n) {
                         self_aliases.insert(e.local_slot, c);
                     }
                 }
                 IN::Default
-                    if e.mtype.is_none() && canon_of(dir.as_deref(), &e.specifier) == path =>
+                    if e.mtype.is_none() && canon_of_cached(&e.specifier) == path.as_path() =>
                 {
                     if let Some(c) = own_cslot("default") {
                         self_aliases.insert(e.local_slot, c);
                     }
                 }
                 IN::Namespace if e.mtype.is_none() => {
-                    let canon = canon_of(dir.as_deref(), &e.specifier);
+                    let canon = canon_of_cached(&e.specifier).to_path_buf();
                     let slot = self.module_ns_slot(&canon)?;
                     import_aliases.insert(e.local_slot, slot);
                 }
@@ -881,7 +895,7 @@ impl<'p> Vm<'p> {
                     let key = if e.specifier == "<module source>" {
                         std::path::PathBuf::from("<module source>")
                     } else {
-                        canon_of(dir.as_deref(), &e.specifier)
+                        canon_of_cached(&e.specifier).to_path_buf()
                     };
                     let slot = self.module_source_slot(&key)?;
                     import_aliases.insert(e.local_slot, slot);
@@ -1019,11 +1033,18 @@ impl<'p> Vm<'p> {
         let import_res = (|| -> Result<(), Thrown> {
             // LOADING phase: every requested module (including phase-import
             // requests) must resolve to a readable file BEFORE linking starts.
-            // A failure here is a HOST error (TypeError) — it takes precedence
-            // over any link-time SyntaxError a sibling request would raise.
+            // Deduplicate unique specifiers in declaration order so repeated
+            // named bindings from the same specifier resolve once.
+            let mut resolved_specs: rustc_hash::FxHashMap<
+                &str,
+                (std::path::PathBuf, std::path::PathBuf),
+            > = Default::default();
             for e in &imports {
                 // The synthetic `<module source>` host module has no file.
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
+                    continue;
+                }
+                if resolved_specs.contains_key(e.specifier.as_str()) {
                     continue;
                 }
                 let dep_raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
@@ -1038,9 +1059,7 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 })?;
-                if dep_canon == path {
-                    continue; // self-reference: already loaded
-                }
+                resolved_specs.insert(e.specifier.as_str(), (dep_raw, dep_canon));
             }
             for e in &imports {
                 // The synthetic `<module source>` host module has no file to
@@ -1053,8 +1072,15 @@ impl<'p> Vm<'p> {
                 if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
                     continue;
                 }
-                let dep_raw = crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
-                let dep_canon = self.resolve_module_path(&dep_raw)?;
+                let (dep_raw, dep_canon) = match resolved_specs.get(e.specifier.as_str()) {
+                    Some((r, c)) => (r.clone(), c.clone()),
+                    None => {
+                        let dep_raw =
+                            crate::vm::node::resolve::specifier_path(dir.as_deref(), &e.specifier);
+                        let dep_canon = self.resolve_module_path(&dep_raw)?;
+                        (dep_raw, dep_canon)
+                    }
+                };
                 // A TYPED import (json/text) is a DISTINCT module record even
                 // for the importing file itself — never self/in-flight.
                 let is_self = dep_canon == path && e.mtype.is_none();

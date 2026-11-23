@@ -57,17 +57,17 @@ fn init() -> bool {
 }
 
 /// The fused instructions, in [`op_of`]'s numbering.
-const OPS: [&str; 31] = [
+const OPS: [&str; 32] = [
     "PyArith", "PyAddImm", "PyCompare", "PyJumpCompare", "PyClassOf", "PyDictGet", "PyDictSet", "PyCallEntry",
     "PyGetItem", "PySetItem", "PyGlobal", "PyStrItem", "PyStrLen", "PyGetAttr", "PySetAttr", "PyIsInstance",
     "PyGenNext", "PyMethod", "PyModGet", "PyLen", "PyAttrFn", "PySeq", "PyRaise", "PyCaught", "PyClassAttr",
-    "PyDictLookup", "PyUnpack", "PyMakeExc", "PyExcPop", "PyNew", "PyCall",
+    "PyDictLookup", "PyUnpack", "PyMakeExc", "PyExcPop", "PyNew", "PyCall", "PyTruth",
 ];
 
 #[allow(clippy::declare_interior_mutable_const)]
 const Z: AtomicU64 = AtomicU64::new(0);
-static HIT: [AtomicU64; 31] = [Z; 31];
-static SLOW: [AtomicU64; 31] = [Z; 31];
+static HIT: [AtomicU64; 32] = [Z; 32];
+static SLOW: [AtomicU64; 32] = [Z; 32];
 
 /// A fused instruction's number and slow edge.
 fn op_of(i: &Instr) -> Option<(usize, u32)> {
@@ -103,6 +103,7 @@ fn op_of(i: &Instr) -> Option<(usize, u32)> {
         Instr::PyExcPop { slow, .. } => (28, slow),
         Instr::PyNew { slow, .. } => (29, slow.into()),
         Instr::PyCall { slow, .. } => (30, slow),
+        Instr::PyTruth { slow, .. } => (31, slow),
         _ => return None,
     })
 }

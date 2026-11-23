@@ -457,15 +457,25 @@ fn hoistable_pins(
             // a TA kind and refuses here — as it already declines the
             // register tiers.
             Instr::SetIndex { .. } => pin_kind_at(ip).is_some_and(|k| k < 9),
-            // A pinned `.length` read (string units / dense-Array len).
-            Instr::GetProp { .. } => {
+            // A pinned `.length` read (string units / dense-Array len / TypedArray len).
+            Instr::GetProp { name, .. } => {
                 captured_math_get(ip)
                     || arr_push_pin(proto, ip, ta_plan).is_some()
                     || matches!(
                         pin_kind_at(ip),
                         Some(STR_PIN_KIND) | Some(DV_PIN_KIND) | Some(ARR_INT_PIN_KIND)
                     )
+                    || (proto
+                        .string_constants
+                        .get(name as usize)
+                        .map(String::as_str)
+                        == Some("length")
+                        && pin_kind_at(ip).is_some_and(int_length_pin_kind))
             }
+            // A pinned dense-Array `key in arr` (GPR-routed `HasProp`): pure
+            // inline bounds + hole check with `TA_SNAP_INDEX_ABSENT` verified at
+            // entry — no user code, no allocation, no GC.
+            Instr::HasProp { brand: false, .. } => pin_kind_at(ip).is_some_and(is_arr_pin),
             // A pinned `charCodeAt` (direct byte load) or DV `get*` (inline
             // guarded byte load) — no user code, no allocation, cannot
             // detach/resize. Any OTHER CallMethod can run arbitrary user code
@@ -1067,7 +1077,9 @@ fn plan_region_cold_inner(
                 Instr::GetIndex { .. } => {
                     if (!admit_bitwise && (k == 7 || k == 8))
                         || (admit_bitwise
-                            && (int_ta_load_kind(k).is_some() || k == ARR_INT_PIN_KIND))
+                            && (int_ta_load_kind(k).is_some()
+                                || k == ARR_INT_PIN_KIND
+                                || (admit_dv && k == crate::codegen::ARR_INT_HOLEY_PIN_KIND)))
                     {
                         return true;
                     }
@@ -1216,6 +1228,15 @@ fn plan_region_cold_inner(
     // other tier's plan is unchanged.
     let pinned_arr_push =
         |ip: usize| -> bool { admit_bitwise && arr_push_pin(proto, ip, ta_plan).is_some() };
+    let pinned_hasprop = |ip: usize| -> bool {
+        admit_bitwise
+            && admit_dv
+            && matches!(code[ip], Instr::HasProp { brand: false, .. })
+            && ta_plan
+                .access
+                .get(&ip)
+                .is_some_and(|&j| is_arr_pin(ta_plan.pins[j as usize].kind))
+    };
     // Capture-first lowering deliberately recycles call temporaries across the
     // exact push prefix (a prior numeric arg/result can become the next boxed
     // receiver).  Those receiver registers require the already-proven
@@ -1278,6 +1299,11 @@ fn plan_region_cold_inner(
             }
             if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+                    recv.insert(obj);
+                }
+            }
+            if pinned_hasprop(s + off) {
+                if let Instr::HasProp { obj, .. } = *instr {
                     recv.insert(obj);
                 }
             }
@@ -1415,6 +1441,7 @@ fn plan_region_cold_inner(
                     {
                         Some(obj)
                     }
+                    Instr::HasProp { obj, .. } if pinned_hasprop(s + off) => Some(obj),
                     Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                         if pinned_str(s + off)
                             || pinned_len(s + off)
@@ -1493,6 +1520,9 @@ fn plan_region_cold_inner(
                                 Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
                                     if pinned_elem(s + off) =>
                                 {
+                                    Some((obj, false))
+                                }
+                                Instr::HasProp { obj, .. } if pinned_hasprop(s + off) => {
                                     Some((obj, false))
                                 }
                                 Instr::CallMethod { obj, .. } if pinned_dv(s + off) => {
@@ -1603,6 +1633,7 @@ fn plan_region_cold_inner(
                             {
                                 Some(obj)
                             }
+                            Instr::HasProp { obj, .. } if pinned_hasprop(ip) => Some(obj),
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                                 if pinned_str(ip)
                                     || pinned_len(ip)
@@ -2237,6 +2268,11 @@ fn plan_region_cold_inner(
                     decline!("GetIndex/SetIndex (element not a pinned TypedArray)");
                 }
             }
+            Instr::HasProp { .. } => {
+                if !pinned_hasprop(s + off) {
+                    decline!("HasProp (receiver not a pinned dense Array)");
+                }
+            }
             _ => {}
         }
         let (def, dty): (Option<u16>, VTy) = match *instr {
@@ -2326,6 +2362,7 @@ fn plan_region_cold_inner(
             // tiers have no `Not` arm and still decline at their emitter's
             // catch-all, exactly as today).
             Instr::Not { dst, .. } if admit_bitwise && int_push_enabled() => (Some(dst), VTy::Bool),
+            Instr::HasProp { dst, .. } if pinned_hasprop(s + off) => (Some(dst), VTy::Bool),
             Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
             _ => (None, VTy::Num),
         };
@@ -2526,6 +2563,11 @@ fn plan_region_cold_inner(
                     numeric.push(b);
                 }
             }
+            if pinned_hasprop(s + off) {
+                if let Instr::HasProp { key, .. } = *instr {
+                    numeric.push(key);
+                }
+            }
             for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
                 if ro_live_in.contains(&u) && !numeric.contains(&u) {
                     decline!("read-only live-in used where a number isn't required");
@@ -2558,6 +2600,13 @@ fn plan_region_cold_inner(
             };
             if bad {
                 decline!("pinned index operand is not numeric");
+            }
+        }
+        if pinned_hasprop(s + off) {
+            if let Instr::HasProp { key, .. } = *instr {
+                if ty.get(&key) != Some(&VTy::Num) {
+                    decline!("pinned HasProp key operand is not numeric");
+                }
             }
         }
         // A pinned-DV get* reads its pos from an f64 home (cvttsd2si) and — for
@@ -2859,6 +2908,7 @@ fn plan_region_cold_inner(
             {
                 Some(dst)
             }
+            Instr::HasProp { dst, .. } if pinned_hasprop(ip) => Some(dst),
             _ => None,
         })
         .collect();
@@ -3259,13 +3309,14 @@ fn plan_region_cold_inner(
             let Some(&j) = ta_plan.access.get(&ip) else {
                 continue;
             };
-            // STRINGS only: immutable, so length is a constant once identity
-            // holds (entry-guarded — `hoist_pins` membership is the
-            // precondition). A dense-Array length is also region-stable under
-            // the predicate, but its GetProp dst is not typed as a def today
-            // (it rides the ro_live_in path), so it fails `first_seen` below
-            // and keeps its per-iteration read.
-            if !hoist_pins.contains(&j) || ta_plan.pins[j as usize].kind != STR_PIN_KIND {
+            // Hoist immutable lengths whose identity is entry-guarded by
+            // `hoist_pins`: strings, plus TypedArray / dense-Array `.length` on
+            // the integer tier (`hoist_pins` already proved nothing in the
+            // region can detach, resize, push, or grow the pinned receiver).
+            let kind = ta_plan.pins[j as usize].kind;
+            if !hoist_pins.contains(&j)
+                || !(kind == STR_PIN_KIND || (admit_bitwise && int_length_pin_kind(kind)))
+            {
                 continue;
             }
             if def_count.get(&dst) == Some(&1)
@@ -4999,7 +5050,7 @@ pub(crate) fn plan_type_splits(
                     tainted.insert(dst);
                 }
             }
-            Instr::Not { dst, .. } => {
+            Instr::Not { dst, .. } | Instr::HasProp { dst, .. } => {
                 tainted.insert(dst);
                 for u in instr_uses(&code[ip]) {
                     tainted.insert(u);
@@ -5598,7 +5649,7 @@ pub(crate) fn instr_uses_into(i: &Instr, out: &mut Vec<u16>) {
         Instr::PyGenNext { next, this, .. } => out.extend_from_slice(&[next, this]),
         Instr::PyMethod { obj, rt, .. } => out.extend_from_slice(&[obj, rt]),
         Instr::PyModGet { obj, rt, .. } => out.extend_from_slice(&[obj, rt]),
-        Instr::PyLen { v, rt, .. } => out.extend_from_slice(&[v, rt]),
+        Instr::PyLen { v, rt, .. } | Instr::PyTruth { v, rt, .. } => out.extend_from_slice(&[v, rt]),
         Instr::PyAttrFn { obj, .. } => out.push(obj),
         Instr::PySeq { items, rt, .. } => out.extend_from_slice(&[items, rt]),
         Instr::PyRaise { e, rt, .. } => out.extend_from_slice(&[e, rt]),

@@ -1559,6 +1559,7 @@ impl<'p> Vm<'p> {
                     | Instr::PyGenNext { .. }
                     | Instr::PyModGet { .. }
                     | Instr::PyLen { .. }
+                    | Instr::PyTruth { .. }
                     | Instr::PyAttrFn { .. }
                     | Instr::PySeq { .. }
                     | Instr::PyRaise { .. }
@@ -1604,6 +1605,7 @@ impl<'p> Vm<'p> {
                     | Instr::PyMethod { .. }
                     | Instr::PyModGet { .. }
                     | Instr::PyLen { .. }
+                    | Instr::PyTruth { .. }
                     | Instr::PyAttrFn { .. }
                     | Instr::PySeq { .. }
                     | Instr::PyRaise { .. }
@@ -2377,102 +2379,14 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewMap { dst, src } => {
-                        // Entries are added through the `set` adder resolved off the
-                        // new map, so an overridden `Map.prototype.set` is honoured
-                        // (the builtin set inserts + normalizes -0 itself).
-                        let m = Value::heap(self.heap.alloc(HeapObj::Map {
-                            keys: Vec::new(),
-                            vals: Vec::new(),
-                        }));
-                        if let Some(s) = src {
-                            let sv = self.get(base, s);
-                            if !sv.is_nullish() {
-                                let adder = self.get_member(m, "set", m)?;
-                                if !self.is_callable(adder) {
-                                    return Err(Thrown(
-                                        "TypeError: Map.prototype.set is not callable".into(),
-                                    ));
-                                }
-                                // AddEntriesFromIterable: step the iterator lazily;
-                                // each entry must be an Object; read k/v and call the
-                                // adder; an abrupt completion runs IteratorClose.
-                                let iter = self.get_iterator_object(sv)?;
-                                let mut native_work = 0u64;
-                                loop {
-                                    let e = match self.iterator_step(iter)? {
-                                        Some(v) => v,
-                                        None => break,
-                                    };
-                                    native_work = native_work.saturating_add(1);
-                                    if let Err(err) =
-                                        self.preflight_native_iteration_work(native_work)
-                                    {
-                                        self.iterator_close_quiet(iter);
-                                        return Err(err);
-                                    }
-                                    if !self.is_object_value(e) {
-                                        self.iterator_close_quiet(iter);
-                                        return Err(Thrown(
-                                            "TypeError: Map iterable entry is not an object".into(),
-                                        ));
-                                    }
-                                    let k = match self.get_index(e, Value::int(0)) {
-                                        Ok(k) => k,
-                                        Err(err) => {
-                                            self.iterator_close_quiet(iter);
-                                            return Err(err);
-                                        }
-                                    };
-                                    let v = match self.get_index(e, Value::int(1)) {
-                                        Ok(v) => v,
-                                        Err(err) => {
-                                            self.iterator_close_quiet(iter);
-                                            return Err(err);
-                                        }
-                                    };
-                                    if let Err(err) = self.call_value(adder, m, &[k, v]) {
-                                        self.iterator_close_quiet(iter);
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                        }
+                        let sv = src.map(|s| self.get(base, s));
+                        let m = self.exec_new_map(sv)?;
                         self.set(base, dst, m);
                         ip += 1;
                     }
                     Instr::NewSet { dst, src } => {
-                        let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
-                        if let Some(s) = src {
-                            let sv = self.get(base, s);
-                            if !sv.is_nullish() {
-                                let adder = self.get_member(set_v, "add", set_v)?;
-                                if !self.is_callable(adder) {
-                                    return Err(Thrown(
-                                        "TypeError: Set.prototype.add is not callable".into(),
-                                    ));
-                                }
-                                // Lazy iteration + IteratorClose on an abrupt adder.
-                                let iter = self.get_iterator_object(sv)?;
-                                let mut native_work = 0u64;
-                                loop {
-                                    let e = match self.iterator_step(iter)? {
-                                        Some(v) => v,
-                                        None => break,
-                                    };
-                                    native_work = native_work.saturating_add(1);
-                                    if let Err(err) =
-                                        self.preflight_native_iteration_work(native_work)
-                                    {
-                                        self.iterator_close_quiet(iter);
-                                        return Err(err);
-                                    }
-                                    if let Err(err) = self.call_value(adder, set_v, &[e]) {
-                                        self.iterator_close_quiet(iter);
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                        }
+                        let sv = src.map(|s| self.get(base, s));
+                        let set_v = self.exec_new_set(sv)?;
                         self.set(base, dst, set_v);
                         ip += 1;
                     }
@@ -2686,6 +2600,31 @@ impl<'p> Vm<'p> {
                         use crate::bytecode::StaticFn as S;
                         let callee = self.get(base, callee);
                         let this_v = self.get(base, this_v);
+                        if argc == 1 && self.static_fn_is_intrinsic(op, callee, this_v) {
+                            let a0 = self.get(base, arg_base);
+                            let fast = match op {
+                                S::StringFromCodePoint => {
+                                    Some(self.string_from_code_point_1(a0)?)
+                                }
+                                S::StringFromCharCode => {
+                                    Some(self.string_from_char_codes_val(&[a0])?)
+                                }
+                                S::NumberIsInteger => Some(Value::bool(num_is_integer(a0))),
+                                S::NumberIsNaN => {
+                                    Some(Value::bool(a0.is_double() && a0.as_f64().is_nan()))
+                                }
+                                S::NumberIsFinite => Some(Value::bool(num_is_finite(a0))),
+                                S::NumberIsSafeInteger => {
+                                    Some(Value::bool(num_is_safe_integer(a0)))
+                                }
+                                _ => None,
+                            };
+                            if let Some(v) = fast {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             args.push(self.get(base, arg_base + i));
@@ -3422,7 +3361,7 @@ impl<'p> Vm<'p> {
                                 GetAct::None => {}
                             }
                         }
-                        #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+                        #[cfg(not(feature = "jit"))]
                         if let Some(v) = self.ic_get_prop_own_hit(func_id, ip, o) {
                             self.set(base, dst, v);
                             ip += 1;
@@ -3471,8 +3410,8 @@ impl<'p> Vm<'p> {
                         // After the private names, which fill no way: a private
                         // read paid this probe's site and receiver fetches for
                         // nothing, a twentieth of a class's private-heavy method.
-                        #[cfg(not(feature = "safe-sandbox"))]
                         if let Some(v) = self.ic_get_prop_proto_hit(func_id, ip, o, key) {
+                            #[cfg(all(feature = "jit", not(feature = "safe-sandbox")))]
                             self.ic_proto_hit_settle(o);
                             self.set(base, dst, v);
                             ip += 1;
@@ -3670,7 +3609,7 @@ impl<'p> Vm<'p> {
                                 SetAct::None => {}
                             }
                         }
-                        #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+                        #[cfg(not(feature = "jit"))]
                         if self.ic_set_prop_own_hit(func_id, ip, o, v) {
                             ip += 1;
                             continue;
@@ -6737,6 +6676,7 @@ impl<'p> Vm<'p> {
                 // the astral scalar — see `string_from_char_codes`.
                 self.string_from_char_codes_val(&args)?
             }
+            S::StringFromCodePoint => self.string_from_code_points_val(&args)?,
             S::ObjectAssign => self.object_assign(&args)?,
             S::ObjectFromEntries => self.object_from_entries(a0)?,
             S::PromiseResolve => {

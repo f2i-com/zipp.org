@@ -161,7 +161,7 @@ const RUNTIME_MANY_LOOPS: u8 = 8;
 /// steps, whose many short library loops compiled at 8 back-edges cost more
 /// than they saved, while every long-running loop still compiles within its
 /// first thousand iterations.
-pub const PY_OSR_THRESHOLD: u32 = 1024;
+pub const PY_OSR_THRESHOLD: u32 = 256;
 
 /// How many times a compiled region may "deopt" (a native run that resumes
 /// INSIDE the region — a type guard bailed — rather than exiting cleanly) before
@@ -1086,9 +1086,20 @@ pub const ARR_INT_PIN_KIND: u8 = 252;
 /// that re-checks the element actually loaded.
 pub const ARR_NUM_PIN_KIND: u8 = 251;
 
-/// All three dense-Array pin kinds — same snapshot and same memory-path treatment.
+/// `TaPin::kind` for a dense Array observed to hold only Int-tagged elements
+/// and holes (`Value::HOLE`, with at least one Int) at OSR compile time.
+/// Identical to `ARR_PIN_KIND` in layout, snapshotting, and memory-path use,
+/// while allowing the GPR integer tier to compile hole-aware loops (`if (i in a)
+/// sum += a[i]`) unboxed: `HasProp` tests for `HOLE` inline, and `GetIndex`
+/// re-checks the element's Int tag on every read.
+pub const ARR_INT_HOLEY_PIN_KIND: u8 = 250;
+
+/// All four dense-Array pin kinds — same snapshot and same memory-path treatment.
 pub fn is_arr_pin(kind: u8) -> bool {
-    kind == ARR_PIN_KIND || kind == ARR_INT_PIN_KIND || kind == ARR_NUM_PIN_KIND
+    kind == ARR_PIN_KIND
+        || kind == ARR_INT_PIN_KIND
+        || kind == ARR_NUM_PIN_KIND
+        || kind == ARR_INT_HOLEY_PIN_KIND
 }
 
 /// Compile-time plan for inline TypedArray element access in a memory-path

@@ -752,6 +752,7 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyMethod { slow: dst, .. })
             | Some(Instr::PyModGet { slow: dst, .. })
             | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyTruth { slow: dst, .. })
             | Some(Instr::PyAttrFn { slow: dst, .. })
             | Some(Instr::PySeq { slow: dst, .. })
             | Some(Instr::PyRaise { slow: dst, .. })
@@ -852,6 +853,7 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyMethod { slow: dst, .. })
             | Some(Instr::PyModGet { slow: dst, .. })
             | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyTruth { slow: dst, .. })
             | Some(Instr::PyAttrFn { slow: dst, .. })
             | Some(Instr::PySeq { slow: dst, .. })
             | Some(Instr::PyRaise { slow: dst, .. })
@@ -1397,6 +1399,18 @@ impl<'a> Emitter<'a> {
     /// the runtime's test); anything else asks the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
         let dst = self.alloc()?;
+        if self.fast {
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyTruth { dst, v: value, rt, slow: 0 })?;
+            let end = self.jump()?;
+            let here = self.here();
+            self.patch_slow(at, here)?;
+            let r = self.helper("truth", &[value])?;
+            self.emit(Instr::Move { dst, src: r })?;
+            let here = self.here();
+            self.patch(end, here)?;
+            return Ok(dst);
+        }
         let is_bool = self.typeof_is(value, "boolean")?;
         let slow = self.jump_if_false(is_bool)?;
         self.emit(Instr::Move { dst, src: value })?;
@@ -1842,6 +1856,15 @@ impl<'a> Emitter<'a> {
                 }
                 self.global_read(globals, name)
             }
+        }
+    }
+    /// Register holding the globals holder for `Instr::PyGlobal` (`REG_FUNC`
+    /// under lazy globals, otherwise the module globals Map).
+    pub(super) fn globals_for_py_global(&mut self) -> R<Reg> {
+        if self.lazy_globals {
+            Ok(REG_FUNC)
+        } else {
+            self.globals()
         }
     }
     /// A global read with fast paths on: one fused `PyGlobal`, which makes

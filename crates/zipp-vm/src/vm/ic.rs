@@ -623,9 +623,7 @@ impl SiteCell {
     }
 
     /// The slot of the key in a receiver of `shape`, if the cell knows it.
-    /// (The safe profile has no inline hits to ask.)
     #[inline(always)]
-    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_read(&self, shape: u32) -> Option<u32> {
         (self.own_shape.get() == shape).then_some(self.own_slot.get() & !Self::WRITE_PROVEN)
     }
@@ -641,7 +639,6 @@ impl SiteCell {
 
     /// The slot a write of the key may store to in a receiver of `shape`.
     #[inline(always)]
-    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_write(&self, shape: u32) -> Option<u32> {
         let slot = self.own_slot.get();
         (self.own_shape.get() == shape && slot & Self::WRITE_PROVEN != 0)
@@ -2864,7 +2861,6 @@ impl<'p> Vm<'p> {
     /// key's data property — without the call's site probe, receiver fetch
     /// and namespace test first. A site reading one inherited name or one
     /// absent field through many layouts took the whole call on every read.
-    #[cfg(not(feature = "safe-sandbox"))]
     #[inline(never)]
     fn ic_proto_hit_other_shape(
         &self,
@@ -3016,13 +3012,13 @@ impl<'p> Vm<'p> {
 
     /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
-    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+    #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
         // The receiver first: the dispatch loop asks before its `length` and
         // shapeless-receiver leaves, so a string's or an array's `.length`
         // must fail here before the site lookup, not after it.
-        let (idx, m) = self.ic_recv_map(recv)?;
+        let (_idx, m) = self.ic_recv_map(recv)?;
         if !self.ic_func_eligible(func_id) {
             return None;
         }
@@ -3041,8 +3037,9 @@ impl<'p> Vm<'p> {
             IcEntry::OwnData { shape, slot } => {
                 (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
             }
+            #[cfg(not(feature = "safe-sandbox"))]
             IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
-                self.ic_get_way0_tail(idx, site, crate::shape::DICT, 0)
+                self.ic_get_way0_tail(_idx, site, crate::shape::DICT, 0)
             }
             _ => None,
         }
@@ -3101,7 +3098,6 @@ impl<'p> Vm<'p> {
     /// slot still the key's data property), so the same answer or `None` and
     /// the full call. `o.m` through a prototype took the full call's site
     /// probe and way scan on every read: 11 ns against QuickJS's 1.
-    #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_proto_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
         // The site's way 0 before the receiver's map: an own-data site, which
@@ -3625,6 +3621,21 @@ impl<'p> Vm<'p> {
                         recv_shape,
                     },
                 );
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if recv_shape != crate::shape::DICT {
+                    if let Some(crate::bytecode::Instr::GetProp { name, .. }) =
+                        self.func(func_id as usize).code.get(ip).copied()
+                    {
+                        let key_id = self.prop_key_id(func_id, name);
+                        crate::vm::helpers_misc::class_prop_memo_put_getter(
+                            self,
+                            recv_shape,
+                            class,
+                            key_id,
+                            getter.bits(),
+                        );
+                    }
+                }
                 match self.ic_plain_fn(getter) {
                     Some((fid, closure)) => GetAct::Accessor {
                         fid,
@@ -4232,7 +4243,7 @@ impl<'p> Vm<'p> {
 
     /// [`Self::ic_set_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
-    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+    #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub(crate) fn ic_set_prop_own_hit(
         &mut self,
@@ -4263,6 +4274,7 @@ impl<'p> Vm<'p> {
                 }
                 let (cached, slot) = match site.entries[0] {
                     IcEntry::OwnData { shape, slot } => (shape, slot),
+                    #[cfg(not(feature = "safe-sandbox"))]
                     IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
                     _ => return false,
                 };

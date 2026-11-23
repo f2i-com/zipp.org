@@ -419,7 +419,14 @@ impl Scope {
     }
 
     fn push_lex(&mut self, name: &str, kind: BindKind, pos: u32) {
-        self.lex.push((name.into(), kind, pos));
+        let owned: Name = name.into();
+        if self.lex_index.is_some() {
+            if let Some(index) = self.lex_index.as_mut() {
+                let all_functions = index.entry(owned.clone()).or_insert(true);
+                *all_functions &= kind == BindKind::Function;
+            }
+        }
+        self.lex.push((owned, kind, pos));
         if self.lex_index.is_none() && self.lex.len() >= NAME_INDEX_MIN {
             let mut index = rustc_hash::FxHashMap::default();
             for (n, k, _) in &self.lex {
@@ -427,9 +434,6 @@ impl Scope {
                 *all_functions &= *k == BindKind::Function;
             }
             self.lex_index = Some(index);
-        } else if let Some(index) = self.lex_index.as_mut() {
-            let all_functions = index.entry(name.into()).or_insert(true);
-            *all_functions &= kind == BindKind::Function;
         }
     }
 
@@ -438,11 +442,13 @@ impl Scope {
         if self.has_var(name) {
             return;
         }
-        self.var.push((name.into(), pos));
+        let owned: Name = name.into();
+        if let Some(index) = self.var_index.as_mut() {
+            index.insert(owned.clone());
+        }
+        self.var.push((owned, pos));
         if self.var_index.is_none() && self.var.len() >= NAME_INDEX_MIN {
             self.var_index = Some(self.var.iter().map(|(n, _)| n.clone()).collect());
-        } else if let Some(index) = self.var_index.as_mut() {
-            index.insert(name.into());
         }
     }
 }

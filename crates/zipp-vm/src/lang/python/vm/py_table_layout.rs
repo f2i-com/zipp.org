@@ -262,7 +262,9 @@ impl<'p> Vm<'p> {
     /// Store `v` at `slot` of `idx` (layout-mode storage).
     #[inline]
     pub(crate) fn py_attrs_put(&mut self, idx: u32, slot: usize, v: Value) {
-        self.heap.write_barrier_val(idx, v);
+        if v.is_heap() {
+            self.heap.write_barrier_val(idx, v);
+        }
         if let HeapObj::PyAttrs { vals, .. } = self.heap.get_mut(idx) {
             if let Some(x) = vals.get_mut(slot) {
                 *x = v;
@@ -274,7 +276,9 @@ impl<'p> Vm<'p> {
     /// under the layout `to`, and republish its mirror.
     #[inline]
     pub(crate) fn py_attrs_push(&mut self, idx: u32, to: u32, v: Value) {
-        self.heap.write_barrier_val(idx, v);
+        if v.is_heap() {
+            self.heap.write_barrier_val(idx, v);
+        }
         if let HeapObj::PyAttrs { layout, vals } = self.heap.get_mut(idx) {
             vals.push(v);
             *layout = to;

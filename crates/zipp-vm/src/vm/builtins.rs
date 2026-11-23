@@ -5464,6 +5464,11 @@ impl<'p> Vm<'p> {
             "has" => Ok(Some(Value::bool(self.coll_find(idx, a0).is_some()))),
             "add" => {
                 let val = normalize_zero(a0);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    self.set_add_fast(idx, val);
+                }
+                #[cfg(feature = "safe-sandbox")]
                 if self.coll_find(idx, val).is_none() {
                     let mut pushed = None;
                     if let HeapObj::Set(items) = self.heap.get_mut(idx) {

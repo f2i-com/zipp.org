@@ -6229,6 +6229,28 @@ fn shape_prop_memo_put(vm: &mut Vm, shape: u32, key_id: u32, slot: u32, writable
     vm.shape_prop_memo[b + 1] = e0;
 }
 
+/// Probe `Vm::shape_prop_memo` (2-way) to check whether `(shape, key_id)` is
+/// known to be `SHAPE_PROP_CLASS_MISS` (receiver's own shape does not own key).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn shape_prop_memo_is_class_miss(vm: &Vm, shape: u32, key_id: u32) -> bool {
+    if shape == crate::shape::DICT || vm.shape_prop_memo.is_empty() {
+        return false;
+    }
+    let b = shape_prop_memo_bucket(shape, key_id);
+    let e0 = vm.shape_prop_memo[b];
+    if e0.shape == shape && e0.key_id == key_id {
+        return e0.slot == crate::vm::SHAPE_PROP_CLASS_MISS;
+    }
+    let e1 = vm.shape_prop_memo[b + 1];
+    e1.shape == shape && e1.key_id == key_id && e1.slot == crate::vm::SHAPE_PROP_CLASS_MISS
+}
+
+/// Sentinel stored in `ClassPropMemo::check_chain` for cached `Walked::ClassGetter`
+/// entries (`0` = method, `1` = absent with chain_epoch check, `2` = getter fn).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const CLASS_PROP_GETTER: u32 = 2;
+
 /// Direct-mapped slot index into `Vm::class_prop_memo` (16384 slots).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline(always)]
@@ -6248,6 +6270,7 @@ fn class_prop_memo_get(vm: &Vm, class_id: u32, key_id: u32) -> Option<u64> {
     let e = vm.class_prop_memo[class_prop_memo_slot(class_id, key_id)];
     if e.class_id != class_id
         || e.key_id != key_id
+        || e.check_chain >= CLASS_PROP_GETTER
         || e.class_epoch != vm.class_proto_epoch
         || e.class_ver != vm.heap.version_of(class_id)
     {
@@ -6257,6 +6280,64 @@ fn class_prop_memo_get(vm: &Vm, class_id: u32, key_id: u32) -> Option<u64> {
         return None;
     }
     Some(e.value_bits)
+}
+
+/// Probe `Vm::class_prop_memo` for a cached `Walked::ClassGetter` keyed by
+/// `(class_id, key_id)`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn class_prop_memo_get_getter(vm: &Vm, class_id: u32, key_id: u32) -> Option<u64> {
+    if vm.class_prop_memo.is_empty() {
+        return None;
+    }
+    let e = vm.class_prop_memo[class_prop_memo_slot(class_id, key_id)];
+    if e.class_id != class_id
+        || e.key_id != key_id
+        || e.check_chain != CLASS_PROP_GETTER
+        || e.class_epoch != vm.class_proto_epoch
+        || e.class_ver != vm.heap.version_of(class_id)
+    {
+        return None;
+    }
+    Some(e.value_bits)
+}
+
+/// Record a canonical `(class_id, key_id) -> getter_bits` entry into
+/// `Vm::class_prop_memo` (with `check_chain == CLASS_PROP_GETTER`), and mark
+/// `(recv_shape, key_id)` as `SHAPE_PROP_CLASS_MISS` in `shape_prop_memo`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn class_prop_memo_put_getter(
+    vm: &mut Vm,
+    recv_shape: u32,
+    class_id: u32,
+    key_id: u32,
+    getter_bits: u64,
+) {
+    if key_id == 0 || recv_shape == crate::shape::DICT {
+        return;
+    }
+    if vm.class_prop_memo.is_empty() {
+        vm.class_prop_memo = vec![crate::vm::ClassPropMemo::EMPTY; crate::vm::CLASS_PROP_MEMO_SLOTS];
+        vm.class_prop_memo_raw = vm.class_prop_memo.as_ptr() as u64;
+    }
+    let s = class_prop_memo_slot(class_id, key_id);
+    vm.class_prop_memo[s] = crate::vm::ClassPropMemo {
+        class_id,
+        key_id,
+        class_ver: vm.heap.version_of(class_id),
+        chain_epoch: 0,
+        class_epoch: vm.class_proto_epoch,
+        check_chain: CLASS_PROP_GETTER,
+        value_bits: getter_bits,
+    };
+    shape_prop_memo_put(
+        vm,
+        recv_shape,
+        key_id,
+        crate::vm::SHAPE_PROP_CLASS_MISS,
+        false,
+    );
 }
 
 /// Record a canonical `(class_id, key_id) -> value_bits` entry into
@@ -8410,7 +8491,11 @@ fn jit_class_read_fill(vm: &mut Vm, obj: Value, key: &str, site_idx: u32, func: 
             nhops,
             hops,
         } if c == class && nhops as usize <= 5 => (Value::UNDEFINED.bits(), nhops, hops),
-        crate::vm::ic::Walked::ClassGetter { .. } => {
+        crate::vm::ic::Walked::ClassGetter { class: c, getter } => {
+            if c == class && recv_shape != crate::shape::DICT {
+                let key_id = vm.prop_key_id(func, name);
+                class_prop_memo_put_getter(vm, recv_shape, class, key_id, getter.bits());
+            }
             if recv_shape != crate::shape::DICT
                 && jit_acc_route_enabled()
                 && vm.jit_acc_route.len() < JIT_SHAPE_SLOT_MAX
@@ -8717,6 +8802,24 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
     // Nursery barrier + B6 oracle: docs/archive/NURSERY_DESIGN.md §1 case 1, the JIT miss
     // route. IC-HIT stores run the barrier in the emitted probe instead.
+    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
+    // `re.lastIndex = n`: while no defineProperty/freeze has recorded
+    // attributes for it, the property is the writable struct slot, so the Set
+    // is the store (checked BEFORE `jit_add_way_hit` since RegExp has no
+    // shape in the hot mirror; barrier still runs if storing a heap value).
+    if key == "lastIndex"
+        && (vm.arr_props.is_empty() || !vm.arr_props.contains_key(&idx))
+        && matches!(vm.heap.get(idx), HeapObj::RegExp(_))
+    {
+        let val = Value::from_bits(val_bits);
+        if val.is_heap() {
+            vm.store_barrier(crate::heap::gcoracle::JIT_SET_PROP, idx, val);
+        }
+        if let HeapObj::RegExp(re) = vm.heap.get_mut(idx) {
+            re.last_index = val;
+        }
+        return 0;
+    }
     vm.store_barrier(
         crate::heap::gcoracle::JIT_SET_PROP,
         idx,
@@ -8724,16 +8827,6 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     );
     if jit_add_way_hit(vm, site_idx, func_id, name_idx, idx, val_bits) {
         return 0;
-    }
-    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
-    // `re.lastIndex = n`: while no defineProperty/freeze has recorded
-    // attributes for it, the property is the writable struct slot, so the Set
-    // is the store (the barrier ran above).
-    if key == "lastIndex" && !vm.arr_props.contains_key(&idx) {
-        if let HeapObj::RegExp(re) = vm.heap.get_mut(idx) {
-            re.last_index = Value::from_bits(val_bits);
-            return 0;
-        }
     }
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
@@ -10851,6 +10944,70 @@ pub(crate) extern "win64" fn jit_iter_next(
             None => {}
         }
     }
+    // ── plain Set positional walk ── skips tombstones (`Value::HOLE`) without
+    // leaving native code or requiring a frame.
+    if let HeapObj::Set(items) = vm.heap.get(it_heap_idx) {
+        let idx_reg = idx_reg as usize;
+        let mut cur = crate::vm::helpers_numeric::array_index(Value::from_bits(unsafe {
+            *regs.add(idx_reg)
+        }))
+        .unwrap_or(0);
+        while cur < items.len() && items[cur].is_hole() {
+            cur += 1;
+        }
+        if cur < items.len() {
+            let v = items[cur];
+            unsafe {
+                *regs.add(value_dst) = v.bits();
+                *regs.add(done_dst) = Value::bool(false).bits();
+                *regs.add(idx_reg) = Value::int((cur + 1) as i32).bits();
+            }
+        } else {
+            unsafe {
+                *regs.add(done_dst) = Value::bool(true).bits();
+                *regs.add(idx_reg) = Value::int(cur as i32).bits();
+            }
+        }
+        iterstats::native_step();
+        return 0;
+    }
+    // ── pristine RegExpStringIterator (`s.matchAll(re)`) ── steps directly
+    // through `regexp_string_iter_step` (which uses the fused drained batch
+    // path on flat ASCII subjects) without deopting out of Tier C.
+    if !vm.regexp_string_iters.is_empty() && vm.regexp_string_iters.contains_key(&it_heap_idx) {
+        let next_v = Value::from_bits(unsafe { *regs.add(next_reg) });
+        if next_v.is_heap()
+            && matches!(
+                vm.heap.get(next_v.heap_index()),
+                HeapObj::Native(crate::vm::native::ITER_NEXT)
+            )
+        {
+            let base =
+                unsafe { (regs as *const u64).offset_from(vm.regs.as_ptr() as *const u64) }
+                    as usize;
+            if vm.frames.last().is_some_and(|f| f.base == base) {
+                return catch_effectful_jit_u64(|| match vm.regexp_string_iter_step(it_heap_idx) {
+                    Some(Ok((v, false))) => {
+                        unsafe {
+                            *regs.add(value_dst) = v.bits();
+                            *regs.add(done_dst) = Value::bool(false).bits();
+                        }
+                        iterstats::native_step();
+                        0
+                    }
+                    Some(Ok((_, true))) => {
+                        unsafe {
+                            *regs.add(done_dst) = Value::bool(true).bits();
+                        }
+                        iterstats::native_step();
+                        0
+                    }
+                    Some(Err(t)) => vm.jit_thrown_to_sentinel(t),
+                    None => crate::codegen::SELF_CALL_DEOPT,
+                });
+            }
+        }
+    }
     // Everything else, a user `next` included: the interpreter's own step, run
     // to completion (`at_call_cap`: the frames its
     // calls would need).
@@ -11180,6 +11337,7 @@ fn static_fn_intrinsic(op: crate::bytecode::StaticFn) -> (&'static str, u16) {
         S::PromiseAny => ("Promise", native::PROMISE_ANY),
         S::ArrayOf => ("Array", native::ARR_OF),
         S::StringFromCharCode => ("String", native::STR_FROM_CHAR_CODE),
+        S::StringFromCodePoint => ("String", native::STR_FROM_CODE_POINT),
         S::NumberIsInteger => ("Number", native::NUM_IS_INTEGER),
         S::NumberIsNaN => ("Number", native::NUM_IS_NAN),
         S::NumberIsFinite => ("Number", native::NUM_IS_FINITE),

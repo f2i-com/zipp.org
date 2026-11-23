@@ -31,7 +31,7 @@
     rt.arrKey = arrKey;
 
     function makeArr() {
-        return { __php: 1, m: new Map(), next: 0n, shared: false, hasRefs: false, pos: 0 };
+        return { __php: 1, m: new Map(), next: 0n, shared: false, hasRefs: false, pos: 0, _list: true, _e: null };
     }
     rt.makeArr = makeArr;
     R.__newMap = function () { return new Map(); };
@@ -48,6 +48,7 @@
         out.next = a.next;
         out.pos = a.pos;
         out.hasRefs = a.hasRefs;
+        out._list = a._list;
         if (!a.hasRefs) {
             for (const [k, v] of a.m) {
                 if (v !== null && typeof v === "object" && v.__php === 1) v.shared = true;
@@ -76,6 +77,8 @@
     function arrSetInPlace(a, key, val) {
         const k = arrKey(key);
         const v = (val !== null && typeof val === "object") ? rt.share(val) : val;
+        if (a._list && !(typeof k === "bigint" && k >= 0n && k < a.next)) a._list = false;
+        a._e = null;
         if (a.hasRefs) {
             const existing = a.m.get(k);
             if (rt.isRef(existing)) {
@@ -93,6 +96,8 @@
     function arrPushInPlace(a, val) {
         const k = a.next;
         const v = (val !== null && typeof val === "object") ? rt.share(val) : val;
+        if (k >= rt.I64_MAX) a._list = false;
+        a._e = null;
         a.m.set(k, v);
         a.next = k < rt.I64_MAX ? k + 1n : rt.I64_MAX;
     }
@@ -105,6 +110,7 @@
         const out = makeArr();
         if (v === null || v === undefined) return out;
         if (v && v.__php === 2) {
+            out._list = false;
             for (const k in v.props) out.m.set(k, rt.share(rt.deref(v.props[k])));
             return out;
         }
@@ -125,12 +131,15 @@
     R.arrRefLit = function (a, key, ref) {
         const r = rt.isRef(ref) ? ref : rt.mkRef(ref);
         a.hasRefs = true;
+        a._e = null;
         if (key === undefined) {
             const k = a.next;
+            if (k >= rt.I64_MAX) a._list = false;
             a.m.set(k, r);
             a.next = k < rt.I64_MAX ? k + 1n : rt.I64_MAX;
         } else {
             const k = arrKey(key);
+            if (a._list && !(typeof k === "bigint" && k >= 0n && k < a.next)) a._list = false;
             a.m.set(k, r);
             if (typeof k === "bigint" && k >= a.next) a.next = k + 1n;
         }
@@ -241,6 +250,8 @@
                             if (val.__php === 5) val = val.v;
                             if (val !== null && typeof val === "object" && val.__php === 1) val.shared = true;
                         }
+                        a._list = false;
+                        a._e = null;
                         a.m.set(key, val);
                         return a;
                     }
@@ -249,6 +260,8 @@
                         if (val.__php === 5) val = val.v;
                         if (val !== null && typeof val === "object" && val.__php === 1) val.shared = true;
                     }
+                    if (a._list && (key < 0n || key >= a.next)) a._list = false;
+                    a._e = null;
                     a.m.set(key, val);
                     if (key >= a.next) a.next = key < rt.I64_MAX ? key + 1n : rt.I64_MAX;
                     return a;
@@ -297,6 +310,8 @@
                 if (val !== null && typeof val === "object" && val.__php === 1) val.shared = true;
             }
             const k = a.next;
+            if (k >= rt.I64_MAX) a._list = false;
+            a._e = null;
             a.m.set(k, val);
             a.next = k < rt.I64_MAX ? k + 1n : rt.I64_MAX;
             return a;
@@ -329,6 +344,8 @@
             const k = arrKey(key);
             if (!container.m.has(k)) return container;
             const a = cow(container);
+            a._list = false;
+            a._e = null;
             a.m.delete(k);
             return a;
         }
@@ -359,7 +376,11 @@
                 const child = a.m.has(ck) ? a.m.get(ck) : null;
                 const updated = rec(child, depth + 1);
                 if (rt.isRef(child)) child.v = updated;
-                else a.m.set(ck, updated);
+                else {
+                    if (a._list && !(typeof ck === "bigint" && ck >= 0n && ck <= a.next && ck < rt.I64_MAX)) a._list = false;
+                    a._e = null;
+                    a.m.set(ck, updated);
+                }
                 if (typeof ck === "bigint" && ck >= a.next) a.next = ck + 1n;
                 return a;
             }
@@ -386,7 +407,7 @@
                 const child = a.m.get(ck);
                 const updated = rec(child, depth + 1);
                 if (rt.isRef(child)) child.v = updated;
-                else a.m.set(ck, updated);
+                else { a._e = null; a.m.set(ck, updated); }
                 return a;
             }
             return cur;
@@ -416,6 +437,8 @@
             if (!rt.isRef(entry)) {
                 entry = rt.mkRef(entry === undefined ? null : entry);
                 a.hasRefs = true;
+                if (a._list && !(typeof k === "bigint" && k >= 0n && k <= a.next && k < rt.I64_MAX)) a._list = false;
+                a._e = null;
                 a.m.set(k, entry);
                 if (typeof k === "bigint" && k >= a.next) a.next = k + 1n;
             }
@@ -517,6 +540,7 @@
                 if (!rt.isRef(entry)) {
                     entry = rt.mkRef(entry);
                     it.arr.hasRefs = true;
+                    it.arr._e = null;
                     it.arr.m.set(k, entry);
                 }
                 it.key = k;
@@ -631,12 +655,16 @@
     });
     reg("array_key_last", function (arr) {
         const a = asArr(arr, "array_key_last");
+        if (a.m.size === 0) return null;
+        if (a._list) return a.next - 1n;
+        if (a._e !== null && a._e !== undefined) return a._e[a._e.length - 1][0];
         let last = null;
         for (const k of a.m.keys()) last = k;
         return last;
     });
     reg("array_is_list", function (arr) {
         const a = asArr(arr, "array_is_list");
+        if (a._list) return true;
         let i = 0n;
         for (const k of a.m.keys()) {
             if (k !== i) return false;
@@ -655,14 +683,22 @@
     reg("array_pop", function (arrRef) {
         const a = cow(asArr(arrRef, "array_pop"));
         if (a.m.size === 0) return null;
+        a._e = null;
         let lastKey, lastVal;
-        for (const [k, v] of a.m) { lastKey = k; lastVal = v; }
-        a.m.delete(lastKey);
-        if (typeof lastKey === "bigint" && lastKey + 1n === a.next) {
-            // Recompute next max int key
-            let mx = -1n;
-            for (const k of a.m.keys()) if (typeof k === "bigint" && k > mx) mx = k;
-            a.next = mx + 1n;
+        if (a._list) {
+            lastKey = a.next - 1n;
+            lastVal = a.m.get(lastKey);
+            a.m.delete(lastKey);
+            a.next = lastKey;
+        } else {
+            for (const [k, v] of a.m) { lastKey = k; lastVal = v; }
+            a.m.delete(lastKey);
+            if (typeof lastKey === "bigint" && lastKey + 1n === a.next) {
+                // Recompute next max int key
+                let mx = -1n;
+                for (const k of a.m.keys()) if (typeof k === "bigint" && k > mx) mx = k;
+                a.next = mx + 1n;
+            }
         }
         if (rt.isRef(arrRef)) arrRef.v = a;
         return rt.share(rt.deref(lastVal));
@@ -817,6 +853,7 @@
         for (const [k, v] of a.m) {
             const r = rt.isRef(v) ? v : rt.mkRef(v);
             a.hasRefs = true;
+            a._e = null;
             a.m.set(k, r);
             const args = arguments.length >= 3 ? [r, k, rt.deref(arg)] : [r, k];
             rt.call(cb, args, null, null, false);
@@ -1080,7 +1117,10 @@
     reg("uksort", function (a, cb) { return sortHelper(a, cb, true, true, false); }, 1);
 
     // ---- Internal array cursor ----
-    function cursorEntries(a) { return Array.from(a.m.entries()); }
+    function cursorEntries(a) {
+        if (a._e === null || a._e === undefined) a._e = Array.from(a.m.entries());
+        return a._e;
+    }
     reg("reset", function (arrRef) {
         const a = cow(asArr(arrRef, "reset"));
         a.pos = 0;

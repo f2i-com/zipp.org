@@ -2841,6 +2841,28 @@ pub(crate) fn compile_region_int_gpr(
             dynasm!(ops ; cmp QWORD [rsp + ta_base + 32 * j as i32], 0 ; je => entry_bail);
         }
     }
+    // Pinned dense-Array `HasProp` (`key in arr`) needs `TA_SNAP_INDEX_ABSENT`
+    // so holes and positive OOB indices answer `false` inline without walking
+    // the prototype chain. Because an INT-GPR region never calls arbitrary user
+    // code, checking the protector flag once at entry proves it for the whole run.
+    let mut hasprop_pins: Vec<usize> = Vec::new();
+    for ip in s..=e {
+        if matches!(proto.code[ip], Instr::HasProp { brand: false, .. }) {
+            if let Some(&j) = ta_plan.access.get(&ip) {
+                let ju = j as usize;
+                if !hasprop_pins.contains(&ju) {
+                    hasprop_pins.push(ju);
+                }
+            }
+        }
+    }
+    for j in hasprop_pins {
+        dynasm!(ops
+            ; test QWORD [rsp + ta_base + 32 * j as i32 + 24],
+                crate::vm::TA_SNAP_INDEX_ABSENT as i32
+            ; jz => entry_bail
+        );
+    }
     // All helper calls are now behind us. Raw slots are not GC roots and the
     // proven body issues no calls/re-entry; initialize only their high-word
     // EMPTY marker. Any later numeric definition overwrites the whole qword.
@@ -3627,6 +3649,60 @@ pub(crate) fn compile_region_int_gpr(
                 emit_icmp_flags_gpr(&mut ops, src(a), src(b), &lazy);
                 dynasm!(ops ; jg => t); // !(a<=b), SIGNED
             }
+            // ── pinned dense-Array `key in arr` ── entry verified
+            // `TA_SNAP_INDEX_ABSENT`, so holes and positive OOB indices are
+            // `false` inline; negative keys deopt (ordinary named properties
+            // like "-1" are not covered by the indexed-prototype protector).
+            // Both the in-bounds `cmp rax, rdx` (ZF=1 iff HOLE) and the OOB
+            // `xor Rd(d), Rd(d)` (ZF=1) leave ZF=0 iff present, enabling direct
+            // `flag_cmp` fusion with a following `JumpIfFalse`/`JumpIfTrue`.
+            Instr::HasProp {
+                dst,
+                key,
+                brand: false,
+                ..
+            } => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = gh(plan, dst);
+                let deopt = ops.new_dynamic_label();
+                let absent = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
+                }
+                emit_src64_canon(&mut ops, src(key), 1, &lazy); // rcx = canonical i64 index
+                dynasm!(ops
+                    ; test rcx, rcx
+                    ; js => deopt                                // negative key → interp
+                    ; cmp rcx, [rsp + off + 16]                  // unsigned: 0 <= i < len?
+                    ; jae => absent                              // positive OOB → false
+                    ; mov rdx, [rsp + off + 8]                   // pinned items base
+                    ; mov rax, [rdx + rcx * 8]                   // items[i]
+                    ; mov rdx, QWORD ARR_HOLE_BITS as i64
+                    ; cmp rax, rdx                               // ZF=1 iff HOLE
+                    ; setne al
+                    ; movzx Rd(d), al                            // zero-extends to Rq(d), preserves ZF
+                    ; jmp => done
+                    ; => absent
+                    ; xor Rd(d), Rd(d)                           // Rq(d) = 0, ZF=1
+                    ; jmp => done
+                    ; => deopt
+                );
+                emit_store_ip(&mut ops, ip_slot, rip_at);
+                dynasm!(ops
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                flag_cmp = Some((ip, dst, Cmp::Ne));
+            }
             // ── pinned element read ── same guards and deopt contract as the
             // xmm arm; only the home moves differ (and the dense-array tag
             // check scratches rdx, not r10 — rdx's base value is dead by then).
@@ -3655,7 +3731,9 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]           // pinned base
                 );
-                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND
+                    || ta_plan.pins[j].kind == crate::codegen::ARR_INT_HOLEY_PIN_KIND
+                {
                     dynasm!(ops
                         ; mov rax, [rdx + rcx * 8]       // items[i] (Value bits)
                         ; mov rdx, rax

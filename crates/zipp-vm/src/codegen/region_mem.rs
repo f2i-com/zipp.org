@@ -5421,14 +5421,86 @@ pub(crate) fn compile_region_mem(
                     target.map(|t| region_target(t, start, end, &in_region, &mut exit_stubs, &mut ops));
                 let labels = PyLabels { slow, target, bail };
                 let (vb, icb) = (heap.versions_base, heap.ic_base);
-                emit_py_op(&mut ops, heap.func_id, ip, instr, &labels, &mut |ops| {
-                    if refetch_pinned {
-                        emit_refetch_pinned(ops, vb, Some(icb));
+                let mut did_fused_new = false;
+                #[cfg(feature = "python")]
+                if meter.is_none() && !crate::vm::prof_py::on() {
+                    if let Instr::PyNew { dst, entry, this_f, cls, rt, n, .. } = *instr {
+                        if n > 0 && ip + 2 <= e && emitted(ip + 1) && emitted(ip + 2) {
+                            if let Some(&Instr::PyCall {
+                                dst: init_dst,
+                                f: call_f,
+                                arg_base,
+                                argc,
+                                ..
+                            }) = proto.code.get(ip + 1)
+                            {
+                                if call_f == this_f && arg_base == dst && argc == n + 1 {
+                                    // `jit_py_new_init` sets `init_dst = None` on fused hit, so
+                                    // also skip the immediate `init_dst == None` guard when
+                                    // `ip + 2..=ip + 4` is `LoadNull; Eq; JumpIfTrue`.
+                                    let mut after_ip = ip + 2;
+                                    if ip + 4 <= e {
+                                        if let (
+                                            Some(&Instr::LoadNull { dst: none_r }),
+                                            Some(&Instr::Eq { dst: is_none, a, b }),
+                                            Some(&Instr::JumpIfTrue { cond, target }),
+                                        ) = (
+                                            proto.code.get(ip + 2),
+                                            proto.code.get(ip + 3),
+                                            proto.code.get(ip + 4),
+                                        ) {
+                                            let t = target as usize;
+                                            if cond == is_none
+                                                && ((a == init_dst && b == none_r) || (b == init_dst && a == none_r))
+                                                && t >= s
+                                                && t <= e
+                                                && emitted(t)
+                                            {
+                                                after_ip = t;
+                                            }
+                                        }
+                                    }
+                                    let after_init = in_region[after_ip - s];
+                                    emit_py_new_init(
+                                        &mut ops,
+                                        heap.func_id,
+                                        ip,
+                                        dst,
+                                        entry,
+                                        this_f,
+                                        init_dst,
+                                        cls,
+                                        rt,
+                                        n,
+                                        after_init,
+                                        &labels,
+                                        &mut |ops| {
+                                            if refetch_pinned {
+                                                emit_refetch_pinned(ops, vb, Some(icb));
+                                            }
+                                            if let Some((snap, plan, cache)) = ta_refetch {
+                                                emit_cross_refetch_ta(ops, snap, plan, cache);
+                                            }
+                                        },
+                                    );
+                                    did_fused_new = true;
+                                }
+                            }
+                        }
                     }
-                    if let Some((snap, plan, cache)) = ta_refetch {
-                        emit_cross_refetch_ta(ops, snap, plan, cache);
-                    }
-                });
+                }
+                #[cfg(not(feature = "python"))]
+                let _ = &mut did_fused_new;
+                if !did_fused_new {
+                    emit_py_op(&mut ops, heap.func_id, ip, instr, &labels, &mut |ops| {
+                        if refetch_pinned {
+                            emit_refetch_pinned(ops, vb, Some(icb));
+                        }
+                        if let Some((snap, plan, cache)) = ta_refetch {
+                            emit_cross_refetch_ta(ops, snap, plan, cache);
+                        }
+                    });
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LoadBigInt { dst, value } => {
@@ -5453,6 +5525,45 @@ pub(crate) fn compile_region_mem(
             }
             Instr::NewArray { dst, arg_base, argc } if py => {
                 let (vb, icb) = (heap.versions_base, heap.ic_base);
+                #[cfg(feature = "python")]
+                if meter.is_none()
+                    && !crate::vm::prof_py::on()
+                    && argc <= 8
+                    && ip + 2 <= e
+                    && emitted(ip + 1)
+                    && emitted(ip + 2)
+                {
+                    if let Some(&Instr::PySeq {
+                        dst: seq_dst,
+                        items,
+                        rt,
+                        tuple,
+                        ..
+                    }) = proto.code.get(ip + 1)
+                    {
+                        if items == dst {
+                            let after_seq = in_region[ip + 2 - s];
+                            emit_py_new_seq(
+                                &mut ops,
+                                dst,
+                                seq_dst,
+                                arg_base,
+                                argc,
+                                rt,
+                                tuple,
+                                after_seq,
+                                &mut |ops| {
+                                    if refetch_pinned {
+                                        emit_refetch_pinned(ops, vb, Some(icb));
+                                    }
+                                    if let Some((snap, plan, cache)) = ta_refetch {
+                                        emit_cross_refetch_ta(ops, snap, plan, cache);
+                                    }
+                                },
+                            );
+                        }
+                    }
+                }
                 emit_py_new_array(&mut ops, proto.reg_count, dst, arg_base, argc, bail, &mut |ops| {
                     if refetch_pinned {
                         emit_refetch_pinned(ops, vb, Some(icb));
@@ -6067,14 +6178,15 @@ fn emit_cross3_invoke(
     let c3 = iv.c3;
     dynasm!(ops
         // Stash the callee bits (the finish helper needs them; r10/rax die at
-        // the enter call).
+        // the enter call). Combine all five rare slow-path flag bytes into a
+        // single branch before mutating any state.
         ; mov [rsp + c3 + 48], rax
-        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
-        ; jne => fb
-        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
-        ; jne => fb
-        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
-        ; jne => fb
+        ; movzx r11d, BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32]
+        ; or r11b, BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32]
+        ; or r11b, BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32]
+        ; or r11b, BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32]
+        ; or r11b, BYTE [rdi + JIT_GC_STRESS_OFFSET as i32]
+        ; jnz => fb
         ; cmp DWORD [rdi + depth], crate::vm::native_call_cap() as i32
         ; jae => fb
         // B199: the live entry table replaces the baked-entry/global-epoch
@@ -6093,6 +6205,13 @@ fn emit_cross3_invoke(
             // scratch tail. B244 uses that word for its epoch cache instead.
             ; mov [rsp + iv.c3 + 56], r11
         );
+    } else if inline_regs {
+        dynasm!(ops
+            // On the inline_regs lane `+32` (the helper-path result spill) is
+            // unused, so cache the verified entry pointer there instead of
+            // reloading `[JIT_CROSS_TABLE_RAW_OFFSET] + fid*32` before `call`.
+            ; mov [rsp + iv.c3 + 32], r11
+        );
     }
     let route_ok = ops.new_dynamic_label();
     dynasm!(ops
@@ -6107,10 +6226,6 @@ fn emit_cross3_invoke(
         ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], r11d
         ; jne => fb
         ; => route_ok
-        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
-        ; jne => fb
-        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
-        ; jne => fb
     );
     if !skip_act_inline {
         dynasm!(ops
@@ -6324,14 +6439,20 @@ fn emit_cross3_invoke(
         ; mov r8, rdi
     );
     if array_epoch_cache.is_some() {
-        dynasm!(ops
-            // The VM is single-mutator and no routing mutation occurs between
-            // the entry/mask guard above and this reload. The optional legacy
-            // enter helper changes only window/activation state. Re-reading the
-            // live table frees the scratch tail for B244's epoch cache.
-            ; mov rax, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
-            ; mov rax, [rax + (iv.fid as i32) * 32]
-        );
+        if inline_regs {
+            dynasm!(ops
+                ; mov rax, [rsp + iv.c3 + 32]
+            );
+        } else {
+            dynasm!(ops
+                // The VM is single-mutator and no routing mutation occurs between
+                // the entry/mask guard above and this reload. The optional legacy
+                // enter helper changes only window/activation state. Re-reading the
+                // live table frees the scratch tail for B244's epoch cache.
+                ; mov rax, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+                ; mov rax, [rax + (iv.fid as i32) * 32]
+            );
+        }
     } else {
         dynasm!(ops
             ; mov rax, [rsp + iv.c3 + 56]
@@ -6385,22 +6506,20 @@ fn emit_cross3_invoke(
         ; jne => slow
         // -- clean native return --
         ; dec DWORD [rdi + depth]
-        ; and rdx, -4
     );
     if inline_regs {
-        let regs_ptr = JIT_REGS_PTR_OFFSET as i32;
         let regs_len = JIT_REGS_LEN_OFFSET as i32;
         dynasm!(ops
-            // Logical truncate: backing Values stay initialized and inactive,
-            // so restoring the explicit length is the whole operation.
-            ; mov r11, [rdi + regs_ptr]
-            ; sub rdx, r11
-            ; shr rdx, 3
-            ; mov [rdi + regs_len], rdx
+            // Logical truncate: the entry (inline or grow) advanced `regs_len`
+            // by exactly `iv.callee_regs`, and a clean return leaves nested
+            // windows balanced, so subtracting `callee_regs` restores `regs_len`
+            // without reloading `regs_ptr`.
+            ; sub QWORD [rdi + regs_len], iv.callee_regs as i32
             ; mov [rbx + dreg(iv.dst)], rax
         );
     } else {
         dynasm!(ops
+            ; and rdx, -4
             ; mov [rsp + c3 + 32], rax
             ; mov rcx, rdi
             ; mov rax, QWORD heap.window_close as i64
