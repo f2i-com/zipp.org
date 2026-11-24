@@ -3468,7 +3468,9 @@ pub(crate) fn compile_region_mem(
                             emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                         }
                     }
-                    if str_pin.is_some() {
+                    let emitted_cc_fast =
+                        str_pin.is_some() || (key == "charCodeAt" && blocks.is_none());
+                    if emitted_cc_fast {
                         dynasm!(ops ; => cc_done);
                     }
                     let lane_done = ops.new_dynamic_label();

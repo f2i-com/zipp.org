@@ -6338,6 +6338,7 @@ impl Jit {
                 let encloses_reg = self.regions.iter().any(|(&(f, _), r)| {
                     f == func_id
                         && !r.is_mem
+                        && !r.is_int
                         && r.start >= start
                         && r.end <= end
                         && (r.start != start || r.end != end)
@@ -6549,7 +6550,6 @@ impl Jit {
                     },
                 );
                 self.note_reg_region_installed(func_id, false);
-                self.evict_enclosing_mem_regions(func_id, start, end);
                 self.yield_tier_c_to_region(func_id);
                 return;
             }
@@ -6575,6 +6575,7 @@ impl Jit {
         let encloses_reg = self.regions.iter().any(|(&(f, _), r)| {
             f == func_id
                 && !r.is_mem
+                && !r.is_int
                 && r.start >= start
                 && r.end <= end
                 && (r.start != start || r.end != end)
