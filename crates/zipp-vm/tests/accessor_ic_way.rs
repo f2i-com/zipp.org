@@ -490,6 +490,64 @@ fn gate_setter_introduced_after_region_compiled() {
     );
 }
 
+/// Subclass instance `.constructor` must resolve to the subclass even when its
+/// parent prototype was already materialized and the subclass prototype was not.
+#[test]
+fn subclass_constructor_with_unmaterialized_proto() {
+    assert_matches_node(
+        r#""use strict";
+        class Base {
+            constructor(v) { this.v = v; }
+            tag() { return this.v; }
+        }
+        class Sub extends Base {
+            constructor() { super("sub"); }
+        }
+        // Materialize Base.prototype without touching Sub.prototype.
+        void Base.prototype;
+        const s = new Sub();
+        const s2 = new s.constructor();
+        console.log(s.constructor.name, s2.v, s2 instanceof Sub);
+        "#,
+    );
+}
+
+/// Megamorphic ES6 class getters across >8 subclasses plus Tier C cold-op /
+/// `String.fromCodePoint` / `for-of Set` paths must match Node identically.
+#[test]
+fn megamorphic_class_getters_and_tierc_dom_ops() {
+    assert_matches_node(
+        r#""use strict";
+        class Base {
+            constructor(v) { this._v = v; }
+            get val() { return this._v + 1; }
+        }
+        const classes = [];
+        for (let i = 0; i < 12; i++) {
+            class Sub extends Base {
+                constructor(v) { super(v); this["k" + i] = i; }
+            }
+            classes.push(Sub);
+        }
+        const objs = classes.map((C, i) => new C(i * 10));
+        function readAll(arr) {
+            const seen = new Set(arr);
+            const m = new Map();
+            let sum = 0;
+            for (const o of seen) {
+                sum += o.val;
+                m.set(o, o.val);
+            }
+            const cp = String.fromCodePoint(65) + String.fromCodePoint(0x1F600);
+            return Array.from(m.values()).reduce((a, b) => a + b, 0) + ":" + sum + ":" + cp.length;
+        }
+        let last = "";
+        for (let r = 0; r < 60; r++) last = readAll(objs);
+        console.log(last);
+        "#,
+    );
+}
+
 /// The mechanism case, CHILD half (a no-op unless spawned by
 /// `zz_gate_evicts_once_then_serves_natively` — the env latches force a fresh
 /// process). A data-only function goes hot and compiles with NO accessor

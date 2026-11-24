@@ -39,15 +39,27 @@ fn native_has_name_length_uncached(id: u16) -> bool {
 
 pub(crate) const CLASS_MEMBER_CACHE_SLOTS: usize = 1024;
 
+#[inline]
+fn key_words4(b: &[u8]) -> [u64; 4] {
+    let mut buf = [0u8; 32];
+    let n = b.len().min(32);
+    buf[..n].copy_from_slice(&b[..n]);
+    [
+        u64::from_ne_bytes(buf[0..8].try_into().unwrap()),
+        u64::from_ne_bytes(buf[8..16].try_into().unwrap()),
+        u64::from_ne_bytes(buf[16..24].try_into().unwrap()),
+        u64::from_ne_bytes(buf[24..32].try_into().unwrap()),
+    ]
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ClassMemberSlot {
     pub(crate) class: u32,
     pub(crate) proto_epoch: u32,
     pub(crate) gc_epoch: u32,
     pub(crate) len: u16,
-    pub(crate) kind: u8, // 0 = empty, 1 = Miss, 2 = Method, 3 = Accessor
-    pub(crate) w0: u64,
-    pub(crate) w1: u64,
+    pub(crate) kind: u8, // 0 = empty, 1 = Miss, 2 = Method, 3 = Accessor, 4 = Live
+    pub(crate) w: [u64; 4],
     pub(crate) v0: u64,
     pub(crate) v1: u64,
 }
@@ -59,8 +71,7 @@ impl ClassMemberSlot {
         gc_epoch: 0,
         len: 0,
         kind: 0,
-        w0: 0,
-        w1: 0,
+        w: [0; 4],
         v0: 0,
         v1: 0,
     };
@@ -1072,49 +1083,54 @@ impl<'p> Vm<'p> {
     pub(crate) fn class_member_lookup(&self, inst: u32, class: u32, key: &str) -> ClassLookup {
         let b = key.as_bytes();
         let public = b.first() != Some(&b'#');
-        let cache_key = if public && b.len() <= 16 {
-            let (w0, w1) = crate::vm::ic::key_words(b);
-            let slot_idx = ((class.wrapping_mul(0x9E37_79B1)
-                ^ (w0 as u32).wrapping_mul(0x85EB_CA77)
-                ^ ((w0 >> 32) as u32).wrapping_mul(0xC2B2_AE35)
-                ^ (b.len() as u32)) as usize)
-                & (CLASS_MEMBER_CACHE_SLOTS - 1);
+        // Check per-instance explicit `[[Prototype]]` first (O(1) flat SlotTable
+        // read): avoids hashing/class-load for re-prototyped instances AND lets
+        // non-reprototyped instances of a `reproto_instances` class remain 100%
+        // cacheable in `class_member_cache`.
+        if public {
+            if let Some(p) = self.proto_of.get_copied(inst) {
+                return ClassLookup::Live(p);
+            }
+        }
+        let cache_key = if b.len() <= 32 {
+            let w = key_words4(b);
+            let mut h = class.wrapping_mul(0x9E37_79B1) ^ (b.len() as u32);
+            let m0 = w[0] ^ w[2].rotate_left(13);
+            let m1 = w[1] ^ w[3].rotate_left(29);
+            h ^= (m0 as u32).wrapping_mul(0x85EB_CA77);
+            h ^= ((m0 >> 32) as u32).wrapping_mul(0xC2B2_AE35);
+            h ^= (m1 as u32).wrapping_mul(0x27D4_EB2D);
+            h ^= ((m1 >> 32) as u32).wrapping_mul(0x1656_67B1);
+            let slot_idx = (h as usize) & (CLASS_MEMBER_CACHE_SLOTS - 1);
             let e = self.class_member_cache[slot_idx].get();
             if e.kind != 0
                 && e.gc_epoch == self.class_member_gc_epoch
                 && e.proto_epoch == self.class_proto_epoch
                 && e.class == class
                 && e.len == b.len() as u16
-                && e.w0 == w0
-                && e.w1 == w1
+                && e.w == w
             {
                 return match e.kind {
                     1 => ClassLookup::Miss,
                     2 => ClassLookup::Method(Value::from_bits(e.v0)),
-                    _ => ClassLookup::Accessor {
+                    3 => ClassLookup::Accessor {
                         getter: Value::from_bits(e.v0),
                         setter: Value::from_bits(e.v1),
                     },
+                    _ => ClassLookup::Live(Value::from_bits(e.v0)),
                 };
             }
-            Some((slot_idx, w0, w1))
+            Some((slot_idx, w))
         } else {
             None
         };
         let mut cur = Some(class);
-        let mut first = true;
-        let mut cacheable = cache_key.is_some();
+        let cacheable = cache_key.is_some();
         while let Some(cidx) = cur {
             let HeapObj::Class(c) = self.heap.get(cidx) else {
                 break;
             };
             if public {
-                if first && c.reproto_instances {
-                    cacheable = false;
-                    if let Some(p) = self.proto_of.get_copied(inst) {
-                        return ClassLookup::Live(p);
-                    }
-                }
                 if c.proto_dirty {
                     // Resume at the NEAREST level whose prototype exists, not
                     // at this farther diverged one: a nearer prototype can
@@ -1124,14 +1140,44 @@ impl<'p> Vm<'p> {
                     let mut lvl = Some(class);
                     while let Some(l) = lvl {
                         if let Some(&p) = self.prototypes.get(&l) {
-                            return ClassLookup::Live(Value::heap(p));
+                            let pv = Value::heap(p);
+                            if cacheable {
+                                if let Some((slot_idx, w)) = cache_key {
+                                    self.class_member_cache[slot_idx].set(ClassMemberSlot {
+                                        class,
+                                        proto_epoch: self.class_proto_epoch,
+                                        gc_epoch: self.class_member_gc_epoch,
+                                        len: b.len() as u16,
+                                        kind: 4,
+                                        w,
+                                        v0: pv.bits(),
+                                        v1: 0,
+                                    });
+                                }
+                            }
+                            return ClassLookup::Live(pv);
                         }
                         // A level whose prototype was never made still owns
                         // its `constructor` (the class), which no table holds
                         // and the farther prototype resumed at would answer
                         // with its own class instead.
                         if key == "constructor" {
-                            return ClassLookup::Method(Value::heap(l));
+                            let lv = Value::heap(l);
+                            if cacheable {
+                                if let Some((slot_idx, w)) = cache_key {
+                                    self.class_member_cache[slot_idx].set(ClassMemberSlot {
+                                        class,
+                                        proto_epoch: self.class_proto_epoch,
+                                        gc_epoch: self.class_member_gc_epoch,
+                                        len: b.len() as u16,
+                                        kind: 2,
+                                        w,
+                                        v0: lv.bits(),
+                                        v1: 0,
+                                    });
+                                }
+                            }
+                            return ClassLookup::Method(lv);
                         }
                         if l == cidx {
                             break;
@@ -1143,18 +1189,16 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            first = false;
             if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
                 if cacheable {
-                    if let Some((slot_idx, w0, w1)) = cache_key {
+                    if let Some((slot_idx, w)) = cache_key {
                         self.class_member_cache[slot_idx].set(ClassMemberSlot {
                             class,
                             proto_epoch: self.class_proto_epoch,
                             gc_epoch: self.class_member_gc_epoch,
                             len: b.len() as u16,
                             kind: 2,
-                            w0,
-                            w1,
+                            w,
                             v0: v.bits(),
                             v1: 0,
                         });
@@ -1174,15 +1218,14 @@ impl<'p> Vm<'p> {
                 let g = getter.unwrap_or(Value::UNDEFINED);
                 let s = setter.unwrap_or(Value::UNDEFINED);
                 if cacheable {
-                    if let Some((slot_idx, w0, w1)) = cache_key {
+                    if let Some((slot_idx, w)) = cache_key {
                         self.class_member_cache[slot_idx].set(ClassMemberSlot {
                             class,
                             proto_epoch: self.class_proto_epoch,
                             gc_epoch: self.class_member_gc_epoch,
                             len: b.len() as u16,
                             kind: 3,
-                            w0,
-                            w1,
+                            w,
                             v0: g.bits(),
                             v1: s.bits(),
                         });
@@ -1196,15 +1239,14 @@ impl<'p> Vm<'p> {
             cur = c.parent;
         }
         if cacheable {
-            if let Some((slot_idx, w0, w1)) = cache_key {
+            if let Some((slot_idx, w)) = cache_key {
                 self.class_member_cache[slot_idx].set(ClassMemberSlot {
                     class,
                     proto_epoch: self.class_proto_epoch,
                     gc_epoch: self.class_member_gc_epoch,
                     len: b.len() as u16,
                     kind: 1,
-                    w0,
-                    w1,
+                    w,
                     v0: 0,
                     v1: 0,
                 });
@@ -1405,7 +1447,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Object(m) if !m.is_ctor => m,
                         _ => break,
                     };
-                    match m.pos(key) {
+                    match self.own_pos(m, key) {
                         Some(i) => Ok((m.attr_at(i), m.val_at(i))),
                         None => Err(m.class),
                     }
@@ -1447,7 +1489,20 @@ impl<'p> Vm<'p> {
                                 cur = p;
                                 continue;
                             }
-                            ClassLookup::Miss => break,
+                            ClassLookup::Miss => {
+                                // An unmaterialized class prototype still owns
+                                // its `constructor` back-reference; fall back to
+                                // `get_member_slow` so `prototype_of` resolves it.
+                                if key == "constructor" {
+                                    break;
+                                }
+                                let p = self.class_instance_live_proto(ci, class);
+                                if !p.is_heap() {
+                                    return Ok(Value::UNDEFINED);
+                                }
+                                cur = p;
+                                continue;
+                            }
                         }
                     }
                     Err(None) => {}

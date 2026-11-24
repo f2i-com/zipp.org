@@ -226,6 +226,7 @@ var __zipp_php = (function () {
         arr.hasRefs = true;
         for (const [k, cell] of globalScope) {
             if (k === "GLOBALS") continue;
+            arr._list = false; arr._e = null;
             arr.m.set(k, cell);
         }
         return arr;
@@ -482,6 +483,7 @@ var __zipp_php = (function () {
             const out = rt.cloneArr(a);
             for (const [k, v] of b.m) {
                 if (!out.m.has(k)) {
+                    out._list = false; out._e = null;
                     out.m.set(k, share(deref(v)));
                     if (typeof k === "bigint" && k >= out.next) out.next = k + 1n;
                 }

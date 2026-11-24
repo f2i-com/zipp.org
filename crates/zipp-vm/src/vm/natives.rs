@@ -5977,58 +5977,7 @@ impl<'p> Vm<'p> {
                 // half stays a real lone surrogate — see `string_from_char_codes`.
                 self.string_from_char_codes_val(args)?
             }
-            STR_FROM_CODE_POINT => {
-                // WTF-8 build: a surrogate code point passes through as a real
-                // lone surrogate (and a high+low argument pair canonicalizes
-                // into the astral scalar, matching the UTF-16 join semantics).
-                if args.is_empty() {
-                    self.preflight_native_iteration_work(0)?;
-                    Value::heap(crate::heap::INTERN_EMPTY)
-                } else if args.len() == 1 {
-                    self.preflight_native_iteration_work(1)?;
-                    let cp = if args[0].is_int() {
-                        let i = args[0].as_int();
-                        if !(0..=0x10FFFF).contains(&i) {
-                            return Err(Thrown(format!("RangeError: Invalid code point {i}")));
-                        }
-                        i as u32
-                    } else {
-                        let n = self.to_number_strict(args[0])?;
-                        if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
-                            return Err(Thrown(format!("RangeError: Invalid code point {n}")));
-                        }
-                        n as u32
-                    };
-                    if cp < 128 {
-                        Value::heap(cp)
-                    } else {
-                        self.preflight_guest_string_size(4)?;
-                        let mut out = Vec::with_capacity(4);
-                        crate::heap::wtf8_push_cp(&mut out, cp);
-                        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
-                    }
-                } else {
-                    self.preflight_native_iteration_work(args.len() as u64)?;
-                    let capacity = args
-                        .len()
-                        .checked_mul(4)
-                        .filter(|&n| n <= MAX_STRING_BYTES)
-                        .ok_or_else(invalid_native_string_length)?;
-                    self.preflight_guest_string_size(capacity)?;
-                    let mut out: Vec<u8> = Vec::new();
-                    out.try_reserve_exact(capacity)
-                        .map_err(|_| Thrown::from_static("RangeError: string allocation failed"))?;
-                    for &v in args {
-                        let n = self.to_number_strict(v)?;
-                        if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
-                            return Err(Thrown(format!("RangeError: Invalid code point {n}")));
-                        }
-                        crate::heap::wtf8_push_cp(&mut out, n as u32);
-                    }
-                    let js = crate::heap::JsStr::from_wtf8(out);
-                    Value::heap(self.heap.alloc_js(js))
-                }
-            }
+            STR_FROM_CODE_POINT => self.string_from_code_points_val(args)?,
             // Date static methods as values.
             DATE_NOW => Value::num(crate::vm::clock::now_epoch_ms()),
             DATE_PARSE => {

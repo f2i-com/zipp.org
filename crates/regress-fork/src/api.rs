@@ -656,6 +656,17 @@ impl Regex {
         Self::from_unicode(pattern.chars().map(u32::from), flags)
     }
 
+    /// Parse-only validation of a regex pattern and flags (skipping optimization,
+    /// start-predicate construction, and bytecode emission).
+    pub fn validate_unicode<I, F>(pattern: I, flags: F) -> Result<(), Error>
+    where
+        I: Iterator<Item = u32> + Clone,
+        F: Into<Flags>,
+    {
+        let flags = flags.into();
+        parse::try_parse(pattern, flags).map(|_| ())
+    }
+
     /// Construct a regex by parsing `pattern` with `flags`, where
     /// `pattern` is an iterator of `u32` Unicode codepoints.
     /// An Error may be returned if the syntax is invalid.
@@ -907,6 +918,9 @@ impl Regex {
     /// start filter first tried every later position. Always the classical
     /// executor (never the optional linear tier).
     pub fn match_at_ascii(&self, text: &str, start: usize) -> Option<Match> {
+        if !self.cr.start_pred.matches_at(text.as_bytes(), start) {
+            return None;
+        }
         <classicalbacktrack::BacktrackExecutor<'_, indexing::AsciiInput<'_>> as exec::Executor<
             '_,
             '_,
@@ -923,6 +937,9 @@ impl Regex {
         start: usize,
         limits: MatchLimits,
     ) -> (Option<Match>, MatchUsage) {
+        if !self.cr.start_pred.matches_at(text.as_bytes(), start) {
+            return (None, MatchUsage::UNMETERED);
+        }
         let mut ex = classicalbacktrack::BacktrackExecutor::<indexing::AsciiInput<'_>>::with_limits(
             &self.cr, text, limits,
         );
@@ -999,6 +1016,13 @@ impl Regex {
         self.cr.group_names.is_some()
     }
 
+    /// Raw per-capture-group names in capture index order (empty string for
+    /// unnamed groups), or `None` if the pattern has no named capture groups.
+    #[inline]
+    pub fn group_names(&self) -> Option<&[Box<str>]> {
+        self.cr.group_names.as_deref()
+    }
+
     /// Number of numbered capture groups in the compiled program. This is a
     /// structural property of the pattern and is used by allocation-free
     /// consumers to prove an indexed capture is an own result element before
@@ -1006,6 +1030,35 @@ impl Regex {
     #[inline]
     pub fn capture_count(&self) -> usize {
         self.cr.groups as usize
+    }
+
+    /// If this compiled regex matches one fixed, case-sensitive, surrogate-free
+    /// literal string (no captures, loops, anchors, or assertions), returns
+    /// that exact UTF-8 string.
+    pub fn pure_literal(&self) -> Option<String> {
+        if self.cr.flags.icase || self.cr.groups != 0 || self.cr.loops != 0 {
+            return None;
+        }
+        let mut out = String::new();
+        let mut saw_goal = false;
+        for insn in &self.cr.insns {
+            if saw_goal {
+                return None;
+            }
+            match insn {
+                &crate::insn::Insn::Char(c) => {
+                    let ch = char::from_u32(c)?;
+                    out.push(ch);
+                }
+                crate::insn::Insn::ByteSeq(seq) => {
+                    let s = core::str::from_utf8(seq.bytes()).ok()?;
+                    out.push_str(s);
+                }
+                crate::insn::Insn::Goal => saw_goal = true,
+                _ => return None,
+            }
+        }
+        saw_goal.then_some(out)
     }
 
     /// PATCH (test hook, see rxjit.rs): whether this regex's JIT slot holds
@@ -1122,6 +1175,9 @@ impl Regex {
         start: usize,
         limits: MatchLimits,
     ) -> (Option<Match>, MatchUsage) {
+        if !self.unit_may_start(text, start) {
+            return (None, MatchUsage::UNMETERED);
+        }
         let input = Utf16Input::new(text, self.cr.flags.unicode_mode());
         let mut ex = classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits);
         let found = ex.match_at(start);
@@ -1151,6 +1207,9 @@ impl Regex {
         start: usize,
         limits: MatchLimits,
     ) -> (Option<Match>, MatchUsage) {
+        if !self.unit_may_start(text, start) {
+            return (None, MatchUsage::UNMETERED);
+        }
         let input = Ucs2Input::from_code_units(text, self.cr.flags.unicode_mode());
         let mut ex = classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits);
         let found = ex.match_at(start);

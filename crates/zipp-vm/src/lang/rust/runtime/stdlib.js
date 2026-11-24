@@ -71,8 +71,9 @@
         switch (v.__rs) {
             case 4: return v.s;
             case 5: return v.ch;
-            case 7:
             case 12:
+                return rt.dequeToArray(v).map(toJsonRaw);
+            case 7:
             case 13:
                 return v.items.map(toJsonRaw);
             case 3:
@@ -1602,10 +1603,10 @@
                 break;
             }
             case "VecDeque":
-                if (last === "new" || last === "with_capacity" || last === "default") return { __rs: 12, items: [] };
+                if (last === "new" || last === "with_capacity" || last === "default") return rt.mkDeque(null);
                 if (last === "from") {
                     const a = deref(args[0]);
-                    return { __rs: 12, items: a && a.__rs === 7 ? a.items.map(cloneVal) : [] };
+                    return rt.mkDeque(a && a.__rs === 7 ? a.items.map(cloneVal) : null);
                 }
                 break;
             case "BinaryHeap":

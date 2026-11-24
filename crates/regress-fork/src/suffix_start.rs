@@ -91,13 +91,40 @@ impl Plan {
 
 #[cfg(feature = "std")]
 #[inline]
-fn switched_off(name: &str) -> bool {
-    std::env::var_os(name).is_some()
+fn suffix_start_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_RX_SUFFIX_START").is_some())
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn suffix_required_prefix_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_RX_SUFFIX_REQUIRED_PREFIX").is_some())
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn suffix_runliteral_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("ZIPP_NO_RX_SUFFIX_RUNLITERAL").is_some())
 }
 
 #[cfg(not(feature = "std"))]
 #[inline]
-fn switched_off(_name: &str) -> bool {
+fn suffix_start_disabled() -> bool {
+    false
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn suffix_required_prefix_disabled() -> bool {
+    false
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn suffix_runliteral_disabled() -> bool {
     false
 }
 
@@ -311,10 +338,11 @@ fn suffix_is_independent(node: &Node) -> bool {
 }
 
 fn run_literal(nodes: &[Node]) -> Option<Plan> {
-    let Node::CaptureGroup { contents, .. } = nodes.first()? else {
-        return None;
+    let first = match nodes.first()? {
+        Node::CaptureGroup { contents, .. } => contents.as_ref(),
+        other => other,
     };
-    let (class, min, max) = class_run(contents)?;
+    let (class, min, max) = class_run(first)?;
     if max.is_some_and(|m| m < min) {
         return None;
     }
@@ -352,16 +380,16 @@ fn run_literal(nodes: &[Node]) -> Option<Plan> {
 /// Derive a plan for the byte-optimized ASCII twin.  Callers must not attach
 /// this result to the ordinary Unicode program.
 pub(crate) fn derive(re: &Regex) -> Option<Plan> {
-    if switched_off("ZIPP_NO_RX_SUFFIX_START") || re.flags.icase || re.flags.unicode_mode() {
+    if suffix_start_disabled() || re.flags.icase || re.flags.unicode_mode() {
         return None;
     }
     let nodes = top_nodes(&re.node);
-    if !switched_off("ZIPP_NO_RX_SUFFIX_REQUIRED_PREFIX") {
+    if !suffix_required_prefix_disabled() {
         if let Some(plan) = required_prefix(nodes) {
             return Some(plan);
         }
     }
-    if !switched_off("ZIPP_NO_RX_SUFFIX_RUNLITERAL") {
+    if !suffix_runliteral_disabled() {
         return run_literal(nodes);
     }
     None

@@ -2235,6 +2235,17 @@ impl<'p> Vm<'p> {
                         self.arr_intrinsic_memo[nid] = entry;
                     } else {
                         self.str_intrinsic_memo[nid] = entry;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if nid == STR_MEMO_CHAR_CODE_AT && self.realm_global_objs.is_empty() {
+                            if let HeapObj::Object(map) = self.heap.get(proto) {
+                                // SAFETY: slot was just verified within `map` and is
+                                // guarded by `str_proto_cca_ver == versions[str_proto]`.
+                                self.str_proto_cca_slot_ptr =
+                                    unsafe { map.vals_ptr_raw().add(slot as usize) as u64 };
+                                self.str_proto_cca_fn_bits = expected_bits;
+                                self.str_proto_cca_ver = self.heap.version_of(proto);
+                            }
+                        }
                     }
                 }
                 true
@@ -2497,10 +2508,26 @@ impl<'p> Vm<'p> {
     /// deleted, accessorized, or replaced.  Child-realm code must likewise use
     /// that realm's prototype image through ordinary Get+Call.
     pub(crate) fn string_case_method_is_intrinsic(&self, name: &str) -> bool {
-        if !matches!(name, "toUpperCase" | "toLowerCase")
-            || self.str_proto == 0
-            || self.active_realm_proto(self.str_proto) != self.str_proto
-        {
+        let memo_id = match name {
+            "toUpperCase" => 19,
+            "toLowerCase" => 20,
+            _ => return false,
+        };
+        if self.str_proto == 0 {
+            return false;
+        }
+        if self.realm_global_objs.is_empty() {
+            if let Some((ver, slot, fn_bits)) = self.str_intrinsic_memo[memo_id] {
+                if self.heap.version_of(self.str_proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get_for_ic(self.str_proto) {
+                        if map.val_get_ref(slot as usize).is_some_and(|v| v.bits() == fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if self.active_realm_proto(self.str_proto) != self.str_proto {
             return false;
         }
         match self.heap.get(self.str_proto) {
@@ -5464,6 +5491,11 @@ impl<'p> Vm<'p> {
             "has" => Ok(Some(Value::bool(self.coll_find(idx, a0).is_some()))),
             "add" => {
                 let val = normalize_zero(a0);
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    self.set_add_fast(idx, val);
+                }
+                #[cfg(feature = "safe-sandbox")]
                 if self.coll_find(idx, val).is_none() {
                     let mut pushed = None;
                     if let HeapObj::Set(items) = self.heap.get_mut(idx) {

@@ -287,11 +287,20 @@ impl<'p> Vm<'p> {
     /// live ([`Vm::py_strm_bytes`]) once every operand has been flattened --
     /// each method used to copy its receiver and every str argument into a
     /// fresh buffer before doing any work.
+    #[inline]
     fn py_strm_flat(&mut self, v: Value) -> Option<(u32, bool)> {
-        if !v.is_heap() || !self.heap.is_str_like(v.heap_index()) {
+        if !v.is_heap() {
             return None;
         }
         let idx = v.heap_index();
+        // Fast path: 99%+ of Python strings are already flat `HeapObj::Str`.
+        if let HeapObj::Str(s) = self.heap.get(idx) {
+            let ascii = s.is_ascii();
+            return (ascii || s.is_wellformed()).then_some((idx, ascii));
+        }
+        if !self.heap.is_str_like(idx) {
+            return None;
+        }
         self.heap.flatten(idx);
         let HeapObj::Str(s) = self.heap.get(idx) else {
             return None;
@@ -322,27 +331,95 @@ impl<'p> Vm<'p> {
     /// [`Vm::py_strm_new`] of bytes known to be ASCII when `ascii` (cut from
     /// or joined of ASCII strs only): made without the scan `from_wtf8`
     /// runs over every result to find that out again.
+    #[inline]
     fn py_strm_new_as(&mut self, bytes: Vec<u8>, ascii: bool) -> Value {
         if ascii {
-            Value::heap(self.heap.alloc_js(JsStr::from_ascii(bytes)))
+            match bytes.len() {
+                0 => {
+                    self.heap.return_byte_buf(bytes);
+                    Value::heap(crate::heap::INTERN_EMPTY)
+                }
+                1 => {
+                    let b = bytes[0] as u32;
+                    self.heap.return_byte_buf(bytes);
+                    Value::heap(b)
+                }
+                _ => Value::heap(self.heap.alloc_str_settled(JsStr::from_ascii(bytes))),
+            }
         } else {
             self.py_strm_new(bytes)
         }
     }
 
+    /// Ultra-thin 2-arg fast path for `startswith` (18), `endswith` (19), and
+    /// `find` (6) called directly from `jit_py_strm_noalloc` without copying
+    /// arguments or entering the 900-line `py_strm_fast_op` match.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn py_strm_affix_find_2(&mut self, op: i32, a0: Value, a1: Value) -> Option<Value> {
+        let (s_idx, ascii) = self.py_strm_flat(a0)?;
+        let (sub_idx, _) = self.py_strm_flat(a1)?;
+        if op == 18 || op == 19 {
+            let (found, compared) = {
+                let s = self.py_strm_bytes(s_idx);
+                let sub = self.py_strm_bytes(sub_idx);
+                (
+                    if op == 18 { s.starts_with(sub) } else { s.ends_with(sub) },
+                    sub.len().min(s.len()),
+                )
+            };
+            if self.instr_rec.is_some() {
+                self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
+            }
+            return Some(Value::bool(found));
+        }
+        // op == 6 (`find`)
+        let (found, scanned) = {
+            let s = self.py_strm_bytes(s_idx);
+            let sub = self.py_strm_bytes(sub_idx);
+            let at = if sub.is_empty() {
+                Some(0)
+            } else if sub.len() == 1 {
+                memchr::memchr(sub[0], s)
+            } else if sub.len() > s.len() {
+                None
+            } else {
+                memchr::memmem::find(s, sub)
+            };
+            let scanned = at.map_or(s.len(), |i| i + sub.len());
+            (
+                at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() }),
+                scanned,
+            )
+        };
+        if self.instr_rec.is_some() {
+            self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
+        }
+        Some(match found {
+            None => Value::small_bigint(-1)?,
+            Some(cps) => Value::small_bigint(cps as i128)?,
+        })
+    }
+
+    /// `__zipp_py_strm` fast path only (never runs guest code): returns `None`
+    /// when `py_str_method_fallback` must handle the call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn py_strm_try_fast_op(&mut self, this: Value, args: &[Value], at: usize, op: i32) -> Option<Value> {
+        self.py_strm_fast_op(this, args, at, op)
+    }
+
+    /// `__zipp_py_strm` fallback when [`Vm::py_strm_try_fast_op`] declined.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn py_str_method_fallback_entry(&mut self, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        self.py_str_method_fallback(this, args)
+    }
+
     /// `__zipp_py_strm`, called as `builtin.c<n>(...args)`.
     pub(crate) fn py_str_method(&mut self, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         self.py_str_method_at(this, args, usize::MAX)
-    }
-
-    /// `__zipp_py_strm` from a call site that already read `strop` (`op`) at
-    /// `at` from the builtin record while checking its entry.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn py_str_method_op(&mut self, this: Value, args: &[Value], at: usize, op: i32) -> Result<Value, Thrown> {
-        if let Some(v) = self.py_strm_fast_op(this, args, at, op) {
-            return Ok(v);
-        }
-        self.py_str_method_fallback(this, args)
     }
 
     /// [`Vm::py_str_method`] from a call site that remembers the slot of
@@ -466,12 +543,146 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Parse optional `start`/`end` slice bounds in `args[2..]` for a well-formed
+    /// ASCII or BMP string `s_idx`. Returns `None` to fall back to JS (non-int
+    /// bound or astral string), `Some(None)` for an empty/out-of-range window
+    /// (`lo > hi`), or `Some(Some((byte_lo, byte_hi, cp_lo)))`.
+    fn py_strm_bmp_bounds(&self, s_idx: u32, args: &[Value]) -> Option<Option<(usize, usize, usize)>> {
+        let HeapObj::Str(st) = self.heap.get(s_idx) else {
+            return None;
+        };
+        if st.is_ascii() {
+            return match self.py_strm_bounds(args, st.as_bytes().len())? {
+                None => Some(None),
+                Some((lo, hi)) => Some(Some((lo, hi, lo))),
+            };
+        }
+        if !st.is_wellformed() || st.has_surrogate() {
+            return None;
+        }
+        let cp_len = st.units();
+        match self.py_strm_bounds(args, cp_len)? {
+            None => Some(None),
+            Some((cp_lo, cp_hi)) => {
+                let (ba, bb) = st.bmp_byte_range(cp_lo, cp_hi);
+                Some(Some((ba, bb, cp_lo)))
+            }
+        }
+    }
+
+    /// Test `startswith` (`starts == true`) or `endswith` against a single str
+    /// or a tuple of strs over byte slice `win` of `s_idx`.
+    fn py_strm_affix(
+        &mut self,
+        this: Value,
+        at: usize,
+        s_idx: u32,
+        ba: usize,
+        bb: usize,
+        affix_arg: Value,
+        starts: bool,
+    ) -> Option<Value> {
+        if let Some((affix_idx, _)) = self.py_strm_flat(affix_arg) {
+            let (found, compared) = {
+                let win = &self.py_strm_bytes(s_idx)[ba..bb];
+                let affix = self.py_strm_bytes(affix_idx);
+                (
+                    if starts { win.starts_with(affix) } else { win.ends_with(affix) },
+                    affix.len().min(win.len()),
+                )
+            };
+            self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
+            return Some(Value::bool(found));
+        }
+        if !affix_arg.is_heap() {
+            return None;
+        }
+        let ttype = match self.py_rt.as_deref() {
+            Some(p) if p.t_tuple.is_heap() => p.t_tuple,
+            _ => self.py_strm_seq_types(this, at)?.1,
+        };
+        let (cls, arr) = self.py_seq_parts(affix_arg)?;
+        if cls.bits() != ttype.bits() || !arr.is_heap() {
+            return None;
+        }
+        let arr_idx = arr.heap_index();
+        let mut elem_idxs = [0u32; 16];
+        let count = match self.heap.get(arr_idx) {
+            HeapObj::Array(a) if a.len() <= elem_idxs.len() => a.len(),
+            _ => return None,
+        };
+        for i in 0..count {
+            let el = match self.heap.get(arr_idx) {
+                HeapObj::Array(a) => a[i],
+                _ => return None,
+            };
+            let (ei, _) = self.py_strm_flat(el)?;
+            elem_idxs[i] = ei;
+        }
+        let (found, compared) = {
+            let win = &self.py_strm_bytes(s_idx)[ba..bb];
+            let mut matched = false;
+            let mut work = 0usize;
+            for &ei in &elem_idxs[..count] {
+                let affix = self.py_strm_bytes(ei);
+                work += affix.len().min(win.len());
+                if if starts { win.starts_with(affix) } else { win.ends_with(affix) } {
+                    matched = true;
+                    break;
+                }
+            }
+            (matched, work)
+        };
+        self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
+        Some(Value::bool(found))
+    }
+
     fn py_strm_fast_op(&mut self, this: Value, args: &[Value], at: usize, op: i32) -> Option<Value> {
         match (op, args.len()) {
             (12, 2) => return self.py_heap_op(this, args, true, at),
             (14..=17, 2) => return self.py_bisect_op(this, args, op, at),
             (13, 1) => return self.py_heap_op(this, args, false, at),
             (20, _) => return self.py_fstr_join(args),
+            // Direct `o[lo:hi]` / `o[lo:hi:step]` without allocating a slice record.
+            (37, 3) | (37, 4) => return self.py_slice_get(args),
+            // Native `re.Pattern.search` (38), `match` (39), `fullmatch` (40).
+            (38..=40, 2) | (38 | 39, 3) => return self.py_re_exec(this, args, op),
+            // Native `re.Pattern.sub` (41).
+            (41, 3) | (41, 4) => return self.py_re_sub(args),
+            // `ord(ch)` of a 1-code-point well-formed str.
+            (34, 1) => {
+                let (s_idx, ascii) = self.py_strm_flat(args[0])?;
+                let cp = {
+                    let b = self.py_strm_bytes(s_idx);
+                    if ascii {
+                        if b.len() != 1 {
+                            return None;
+                        }
+                        b[0] as u32
+                    } else {
+                        let s = std::str::from_utf8(b).ok()?;
+                        let mut it = s.chars();
+                        let c = it.next()?;
+                        if it.next().is_some() {
+                            return None;
+                        }
+                        c as u32
+                    }
+                };
+                return Some(self.make_bigint(cp as i128));
+            }
+            // `chr(n)` for a valid Unicode scalar `0..=0x10FFFF`.
+            (35, 1) => {
+                let n = self.bigint_i128(args[0])?;
+                if !(0..=0x10FFFF).contains(&n) {
+                    return None;
+                }
+                let cp = n as u32;
+                if cp < 128 {
+                    return Some(Value::heap(cp));
+                }
+                return Some(Value::heap(self.heap.alloc_js(JsStr::from_code_point(cp))));
+            }
             // `hash(s)` of a str: `strHash` (`runtime/types.js`), computed
             // by the function the engine's own tables hash a str key with,
             // so the two cannot differ. It fits the int kept in the value.
@@ -504,8 +715,9 @@ impl<'p> Vm<'p> {
         let n = self.py_strm_bytes(s_idx).len() as u64;
         let out = match (op, args.len()) {
             // Whitespace cut from the ends: an ASCII str's by its bytes, any
-            // other's by its code points.
-            (1..=3, 1) => {
+            // other's by its code points. Also handles explicit `None` arg
+            // (`s.strip(None)`).
+            (1..=3, 1) | (1..=3, 2) if args.len() == 1 || args[1] == Value::NULL => {
                 let trimmed = {
                     let s = self.py_strm_bytes(s_idx);
                     let (i, j) = if ascii {
@@ -542,99 +754,138 @@ impl<'p> Vm<'p> {
                 }
             }
             // Both strs are well formed, so equal bytes at an end are equal
-            // code points there (an affix starts on a code point's first
-            // byte, and so does the text it matches).
+            // code points there. Supports single str or tuple of strs.
             (18, 2) | (19, 2) => {
-                let (affix_idx, _) = self.py_strm_flat(args[1])?;
-                let (found, compared) = {
-                    let s = self.py_strm_bytes(s_idx);
-                    let affix = self.py_strm_bytes(affix_idx);
-                    (if op == 18 { s.starts_with(affix) } else { s.ends_with(affix) }, affix.len().min(s.len()))
-                };
-                self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
-                return Some(Value::bool(found));
+                let blen = self.py_strm_bytes(s_idx).len();
+                return self.py_strm_affix(this, at, s_idx, 0, blen, args[1], op == 18);
             }
             (18, 3) | (18, 4) | (19, 3) | (19, 4) => {
-                if !ascii {
-                    return None;
-                }
-                let (affix_idx, _) = self.py_strm_flat(args[1])?;
-                let s_len = self.py_strm_bytes(s_idx).len();
-                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                let Some((ba, bb, _)) = self.py_strm_bmp_bounds(s_idx, args)? else {
                     return Some(Value::FALSE);
                 };
-                let (found, compared) = {
-                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
-                    let affix = self.py_strm_bytes(affix_idx);
-                    (if op == 18 { win.starts_with(affix) } else { win.ends_with(affix) }, affix.len().min(win.len()))
-                };
-                self.charge_steps(i64::try_from(compared).unwrap_or(i64::MAX));
-                return Some(Value::bool(found));
+                return self.py_strm_affix(this, at, s_idx, ba, bb, args[1], op == 18);
             }
             (1..=3, 2) => {
-                let (chars_idx, _) = self.py_strm_flat(args[1])?;
+                let (chars_idx, chars_ascii) = self.py_strm_flat(args[1])?;
                 let trimmed = {
-                    let set = std::str::from_utf8(self.py_strm_bytes(chars_idx)).ok()?;
-                    let text = std::str::from_utf8(self.py_strm_bytes(s_idx)).ok()?;
-                    let cut = |c: char| set.contains(c);
-                    let r = match op {
-                        1 => text.trim_matches(cut),
-                        2 => text.trim_start_matches(cut),
-                        _ => text.trim_end_matches(cut),
-                    };
-                    let i = r.as_ptr() as usize - text.as_ptr() as usize;
-                    (r.len() != text.len()).then_some((i, i + r.len()))
+                    let s = self.py_strm_bytes(s_idx);
+                    let cb = self.py_strm_bytes(chars_idx);
+                    if cb.is_empty() || s.is_empty() {
+                        None
+                    } else if ascii && chars_ascii {
+                        // 128-bit ASCII byte set on the stack: zero UTF-8
+                        // validation and zero char decoding.
+                        let mut bits = [0u64; 2];
+                        for &b in cb {
+                            bits[(b >> 6) as usize] |= 1u64 << (b & 63);
+                        }
+                        let has = |b: u8| (bits[(b >> 6) as usize] & (1u64 << (b & 63))) != 0;
+                        let (mut i, mut j) = (0usize, s.len());
+                        if op != 3 {
+                            while i < j && has(s[i]) {
+                                i += 1;
+                            }
+                        }
+                        if op != 2 {
+                            while j > i && has(s[j - 1]) {
+                                j -= 1;
+                            }
+                        }
+                        (j - i != s.len()).then_some((i, j))
+                    } else {
+                        let set = std::str::from_utf8(cb).ok()?;
+                        let text = std::str::from_utf8(s).ok()?;
+                        let cut = |c: char| set.contains(c);
+                        let r = match op {
+                            1 => text.trim_matches(cut),
+                            2 => text.trim_start_matches(cut),
+                            _ => text.trim_end_matches(cut),
+                        };
+                        let i = r.as_ptr() as usize - text.as_ptr() as usize;
+                        (r.len() != text.len()).then_some((i, i + r.len()))
+                    }
                 };
                 match trimmed {
                     None => return Some(args[0]),
                     Some((i, j)) => {
-                        let bytes = self.py_strm_copy(s_idx, i, j);
-                        self.py_strm_new_as(bytes, ascii)
+                        let out = if ascii && j == i {
+                            Value::heap(crate::heap::INTERN_EMPTY)
+                        } else if ascii && j - i == 1 {
+                            Value::heap(self.py_strm_bytes(s_idx)[i] as u32)
+                        } else {
+                            let bytes = self.py_strm_copy(s_idx, i, j);
+                            self.py_strm_new_as(bytes, ascii)
+                        };
+                        if self.instr_rec.is_some() {
+                            self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
+                        }
+                        return Some(out);
                     }
                 }
             }
-            (4, 1) => {
+            (4, 1) | (4, 2) | (4, 3) if args.len() == 1 || args[1] == Value::NULL => {
                 if !ascii {
                     return None;
                 }
-                const STACK_PARTS: usize = 32;
-                let mut stack = [(0usize, 0usize); STACK_PARTS];
+                let maxsplit: Option<usize> = if args.len() == 3 {
+                    let m = self.bigint_i128(args[2])?;
+                    if m < 0 { None } else { Some(usize::try_from(m).unwrap_or(usize::MAX)) }
+                } else {
+                    None
+                };
+                const STACK_PARTS: usize = 16;
+                let mut stack = [(0u32, 0u32); STACK_PARTS];
                 let mut count = 0usize;
-                let mut spill: Vec<(usize, usize)> = Vec::new();
+                let mut spill: Vec<(u32, u32)> = Vec::new();
                 {
                     let s = self.py_strm_bytes(s_idx);
                     let mut i = 0;
+                    let mut splits = 0usize;
                     while i < s.len() {
                         while i < s.len() && py_space(s[i]) {
                             i += 1;
                         }
-                        let start = i;
-                        while i < s.len() && !py_space(s[i]) {
-                            i += 1;
+                        if i >= s.len() {
+                            break;
                         }
-                        if i > start {
-                            if spill.is_empty() && count < STACK_PARTS {
-                                stack[count] = (start, i);
-                                count += 1;
-                            } else {
-                                if spill.is_empty() {
-                                    spill.reserve(STACK_PARTS * 2);
-                                    spill.extend_from_slice(&stack[..count]);
-                                }
-                                spill.push((start, i));
+                        let start = i;
+                        let end = if maxsplit.is_some_and(|m| splits >= m) {
+                            i = s.len();
+                            s.len()
+                        } else {
+                            while i < s.len() && !py_space(s[i]) {
+                                i += 1;
                             }
+                            splits += 1;
+                            i
+                        };
+                        if spill.is_empty() && count < STACK_PARTS {
+                            stack[count] = (start as u32, end as u32);
+                            count += 1;
+                        } else {
+                            if spill.is_empty() {
+                                spill.reserve(STACK_PARTS * 2);
+                                spill.extend_from_slice(&stack[..count]);
+                            }
+                            spill.push((start as u32, end as u32));
                         }
                     }
                 }
-                let slice: &[(usize, usize)] = if spill.is_empty() { &stack[..count] } else { &spill };
+                let slice: &[(u32, u32)] = if spill.is_empty() { &stack[..count] } else { &spill };
                 return self.py_strm_list(this, s_idx, slice, at, ascii);
             }
-            (4, 2) => {
+            (4, 2) | (4, 3) => {
                 let (sep_idx, _) = self.py_strm_flat(args[1])?;
-                const STACK_PARTS: usize = 32;
-                let mut stack = [(0usize, 0usize); STACK_PARTS];
+                let maxsplit: Option<usize> = if args.len() == 3 {
+                    let m = self.bigint_i128(args[2])?;
+                    if m < 0 { None } else { Some(usize::try_from(m).unwrap_or(usize::MAX)) }
+                } else {
+                    None
+                };
+                const STACK_PARTS: usize = 16;
+                let mut stack = [(0u32, 0u32); STACK_PARTS];
                 let mut count = 0usize;
-                let mut spill: Vec<(usize, usize)> = Vec::new();
+                let mut spill: Vec<(u32, u32)> = Vec::new();
                 let ok = {
                     let s = self.py_strm_bytes(s_idx);
                     let sep = self.py_strm_bytes(sep_idx);
@@ -643,30 +894,42 @@ impl<'p> Vm<'p> {
                     } else {
                         let mut push_part = |a: usize, b: usize| {
                             if spill.is_empty() && count < STACK_PARTS {
-                                stack[count] = (a, b);
+                                stack[count] = (a as u32, b as u32);
                                 count += 1;
                             } else {
                                 if spill.is_empty() {
                                     spill.reserve(STACK_PARTS * 2);
                                     spill.extend_from_slice(&stack[..count]);
                                 }
-                                spill.push((a, b));
+                                spill.push((a as u32, b as u32));
                             }
                         };
                         let mut start = 0;
-                        if sep.len() == 1 {
-                            let needle = sep[0];
-                            while let Some(rel) = memchr::memchr(needle, &s[start..]) {
-                                let at = start + rel;
-                                push_part(start, at);
-                                start = at + 1;
-                            }
-                        } else {
-                            let finder = memchr::memmem::Finder::new(sep);
-                            while let Some(rel) = finder.find(&s[start..]) {
-                                let at = start + rel;
-                                push_part(start, at);
-                                start = at + sep.len();
+                        let mut splits = 0usize;
+                        let limit = maxsplit.unwrap_or(usize::MAX);
+                        if limit > 0 {
+                            if sep.len() == 1 {
+                                let needle = sep[0];
+                                while splits < limit {
+                                    let Some(rel) = memchr::memchr(needle, &s[start..]) else {
+                                        break;
+                                    };
+                                    let at = start + rel;
+                                    push_part(start, at);
+                                    start = at + 1;
+                                    splits += 1;
+                                }
+                            } else {
+                                let finder = memchr::memmem::Finder::new(sep);
+                                while splits < limit {
+                                    let Some(rel) = finder.find(&s[start..]) else {
+                                        break;
+                                    };
+                                    let at = start + rel;
+                                    push_part(start, at);
+                                    start = at + sep.len();
+                                    splits += 1;
+                                }
                             }
                         }
                         push_part(start, s.len());
@@ -676,13 +939,158 @@ impl<'p> Vm<'p> {
                 if !ok {
                     return None;
                 }
-                let slice: &[(usize, usize)] = if spill.is_empty() { &stack[..count] } else { &spill };
+                let slice: &[(u32, u32)] = if spill.is_empty() { &stack[..count] } else { &spill };
                 return self.py_strm_list(this, s_idx, slice, at, ascii);
             }
-            (5, 3) => {
+            (26, 1) | (26, 2) | (26, 3) if args.len() == 1 || args[1] == Value::NULL => {
+                if !ascii {
+                    return None;
+                }
+                let maxsplit: Option<usize> = if args.len() == 3 {
+                    let m = self.bigint_i128(args[2])?;
+                    if m < 0 { None } else { Some(usize::try_from(m).unwrap_or(usize::MAX)) }
+                } else {
+                    None
+                };
+                let mut parts: Vec<(u32, u32)> = Vec::new();
+                {
+                    let s = self.py_strm_bytes(s_idx);
+                    let mut i = s.len();
+                    let mut splits = 0usize;
+                    while i > 0 {
+                        while i > 0 && py_space(s[i - 1]) {
+                            i -= 1;
+                        }
+                        if i == 0 {
+                            break;
+                        }
+                        let end = i;
+                        let start = if maxsplit.is_some_and(|m| splits >= m) {
+                            i = 0;
+                            0
+                        } else {
+                            while i > 0 && !py_space(s[i - 1]) {
+                                i -= 1;
+                            }
+                            splits += 1;
+                            i
+                        };
+                        parts.push((start as u32, end as u32));
+                    }
+                }
+                parts.reverse();
+                return self.py_strm_list(this, s_idx, &parts, at, ascii);
+            }
+            (26, 2) | (26, 3) => {
+                let (sep_idx, _) = self.py_strm_flat(args[1])?;
+                let maxsplit: Option<usize> = if args.len() == 3 {
+                    let m = self.bigint_i128(args[2])?;
+                    if m < 0 { None } else { Some(usize::try_from(m).unwrap_or(usize::MAX)) }
+                } else {
+                    None
+                };
+                let mut parts: Vec<(u32, u32)> = Vec::new();
+                let ok = {
+                    let s = self.py_strm_bytes(s_idx);
+                    let sep = self.py_strm_bytes(sep_idx);
+                    if sep.is_empty() {
+                        false
+                    } else {
+                        let mut end = s.len();
+                        let mut splits = 0usize;
+                        let limit = maxsplit.unwrap_or(usize::MAX);
+                        if limit > 0 {
+                            if sep.len() == 1 {
+                                let needle = sep[0];
+                                while splits < limit {
+                                    let Some(pos) = memchr::memrchr(needle, &s[..end]) else {
+                                        break;
+                                    };
+                                    parts.push(((pos + 1) as u32, end as u32));
+                                    end = pos;
+                                    splits += 1;
+                                }
+                            } else {
+                                let finder = memchr::memmem::FinderRev::new(sep);
+                                while splits < limit {
+                                    let Some(pos) = finder.rfind(&s[..end]) else {
+                                        break;
+                                    };
+                                    parts.push(((pos + sep.len()) as u32, end as u32));
+                                    end = pos;
+                                    splits += 1;
+                                }
+                            }
+                        }
+                        parts.push((0, end as u32));
+                        true
+                    }
+                };
+                if !ok {
+                    return None;
+                }
+                parts.reverse();
+                return self.py_strm_list(this, s_idx, &parts, at, ascii);
+            }
+            (27, 1) | (27, 2) => {
+                if !ascii {
+                    return None;
+                }
+                let keepends = match args.get(1).copied() {
+                    None => false,
+                    Some(v) if v == Value::FALSE || v == Value::NULL => false,
+                    Some(v) if v == Value::TRUE => true,
+                    Some(v) => match self.bigint_i128(v) {
+                        Some(0) => false,
+                        Some(_) => true,
+                        None => return None,
+                    },
+                };
+                let mut parts: Vec<(u32, u32)> = Vec::new();
+                {
+                    let s = self.py_strm_bytes(s_idx);
+                    let mut i = 0usize;
+                    let len = s.len();
+                    while i < len {
+                        let start = i;
+                        while i < len
+                            && !matches!(
+                                s[i],
+                                b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e
+                            )
+                        {
+                            i += 1;
+                        }
+                        let line_end = i;
+                        if i < len {
+                            if s[i] == b'\r' && i + 1 < len && s[i + 1] == b'\n' {
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        parts.push((start as u32, (if keepends { i } else { line_end }) as u32));
+                    }
+                }
+                return self.py_strm_list(this, s_idx, &parts, at, true);
+            }
+            (5, 3) | (5, 4) => {
                 let (old_idx, _) = self.py_strm_flat(args[1])?;
                 let (new_idx, new_ascii) = self.py_strm_flat(args[2])?;
-                let mut out = self.heap.take_byte_buf(0);
+                let limit: usize = if args.len() == 4 {
+                    let c = self.bigint_i128(args[3])?;
+                    if c == 0 {
+                        let units = match self.heap.get(s_idx) {
+                            HeapObj::Str(st) => st.units(),
+                            _ => return None,
+                        };
+                        return (units <= STRM_MAX_TEXT).then_some(args[0]);
+                    }
+                    if c < 0 { usize::MAX } else { usize::try_from(c).unwrap_or(usize::MAX) }
+                } else {
+                    usize::MAX
+                };
+                let mut out = self.heap.take_byte_buf(n as usize);
                 let replaced = {
                     let s = self.py_strm_bytes(s_idx);
                     let old = self.py_strm_bytes(old_idx);
@@ -693,7 +1101,7 @@ impl<'p> Vm<'p> {
                     if old.len() == 1 {
                         let needle = old[0];
                         if let Some(first) = memchr::memchr(needle, s) {
-                            if new.len() == 1 {
+                            if new.len() == 1 && limit == usize::MAX {
                                 out.reserve(s.len());
                                 out.extend_from_slice(s);
                                 let repl = new[0];
@@ -708,10 +1116,15 @@ impl<'p> Vm<'p> {
                                 out.reserve(s.len());
                                 let mut last = 0;
                                 let mut at = first;
+                                let mut done = 0usize;
                                 loop {
                                     out.extend_from_slice(&s[last..at]);
                                     out.extend_from_slice(new);
                                     last = at + 1;
+                                    done += 1;
+                                    if done >= limit {
+                                        break;
+                                    }
                                     match memchr::memchr(needle, &s[last..]) {
                                         Some(rel) => at = last + rel,
                                         None => break,
@@ -729,10 +1142,15 @@ impl<'p> Vm<'p> {
                             out.reserve(s.len());
                             let mut last = 0;
                             let mut at = first;
+                            let mut done = 0usize;
                             loop {
                                 out.extend_from_slice(&s[last..at]);
                                 out.extend_from_slice(new);
                                 last = at + old.len();
+                                done += 1;
+                                if done >= limit {
+                                    break;
+                                }
                                 match finder.find(&s[last..]) {
                                     Some(rel) => at = last + rel,
                                     None => break,
@@ -756,7 +1174,7 @@ impl<'p> Vm<'p> {
                 }
                 self.py_strm_new_as(out, ascii && new_ascii)
             }
-            (6, 2) => {
+            (6, 2) | (25, 2) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
                 // The match position, as a count of code points before it.
                 let (found, scanned) = {
@@ -775,22 +1193,19 @@ impl<'p> Vm<'p> {
                     (at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() }), scanned)
                 };
                 self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
-                return Some(match found {
-                    None => self.make_bigint(-1),
-                    Some(cps) => self.make_bigint(cps as i128),
-                });
+                return match found {
+                    None if op == 25 => None,
+                    None => Some(self.make_bigint(-1)),
+                    Some(cps) => Some(self.make_bigint(cps as i128)),
+                };
             }
-            (6, 3) | (6, 4) => {
-                if !ascii {
-                    return None;
-                }
+            (6, 3) | (6, 4) | (25, 3) | (25, 4) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
-                let s_len = self.py_strm_bytes(s_idx).len();
-                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
-                    return Some(self.make_bigint(-1));
+                let Some((ba, bb, cp_lo)) = self.py_strm_bmp_bounds(s_idx, args)? else {
+                    return if op == 25 { None } else { Some(self.make_bigint(-1)) };
                 };
                 let (found, scanned) = {
-                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let win = &self.py_strm_bytes(s_idx)[ba..bb];
                     let sub = self.py_strm_bytes(sub_idx);
                     let at = if sub.is_empty() {
                         Some(0)
@@ -802,15 +1217,25 @@ impl<'p> Vm<'p> {
                         memchr::memmem::find(win, sub)
                     };
                     let scanned = at.map_or(win.len(), |i| i + sub.len());
-                    (at.map(|i| lo + i), scanned)
+                    (
+                        at.map(|i| {
+                            if ascii {
+                                cp_lo + i
+                            } else {
+                                cp_lo + win[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count()
+                            }
+                        }),
+                        scanned,
+                    )
                 };
                 self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
-                return Some(match found {
-                    None => self.make_bigint(-1),
-                    Some(pos) => self.make_bigint(pos as i128),
-                });
+                return match found {
+                    None if op == 25 => None,
+                    None => Some(self.make_bigint(-1)),
+                    Some(pos) => Some(self.make_bigint(pos as i128)),
+                };
             }
-            (22, 2) => {
+            (22, 2) | (24, 2) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
                 let (found, scanned) = {
                     let s = self.py_strm_bytes(s_idx);
@@ -828,22 +1253,19 @@ impl<'p> Vm<'p> {
                     (at.map(|i| if ascii { i } else { s[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count() }), scanned)
                 };
                 self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
-                return Some(match found {
-                    None => self.make_bigint(-1),
-                    Some(cps) => self.make_bigint(cps as i128),
-                });
+                return match found {
+                    None if op == 24 => None,
+                    None => Some(self.make_bigint(-1)),
+                    Some(cps) => Some(self.make_bigint(cps as i128)),
+                };
             }
-            (22, 3) | (22, 4) => {
-                if !ascii {
-                    return None;
-                }
+            (22, 3) | (22, 4) | (24, 3) | (24, 4) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
-                let s_len = self.py_strm_bytes(s_idx).len();
-                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
-                    return Some(self.make_bigint(-1));
+                let Some((ba, bb, cp_lo)) = self.py_strm_bmp_bounds(s_idx, args)? else {
+                    return if op == 24 { None } else { Some(self.make_bigint(-1)) };
                 };
                 let (found, scanned) = {
-                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let win = &self.py_strm_bytes(s_idx)[ba..bb];
                     let sub = self.py_strm_bytes(sub_idx);
                     let at = if sub.is_empty() {
                         Some(win.len())
@@ -855,13 +1277,23 @@ impl<'p> Vm<'p> {
                         memchr::memmem::rfind(win, sub)
                     };
                     let scanned = at.map_or(win.len(), |i| win.len() - i);
-                    (at.map(|i| lo + i), scanned)
+                    (
+                        at.map(|i| {
+                            if ascii {
+                                cp_lo + i
+                            } else {
+                                cp_lo + win[..i].iter().filter(|&&b| b & 0xC0 != 0x80).count()
+                            }
+                        }),
+                        scanned,
+                    )
                 };
                 self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
-                return Some(match found {
-                    None => self.make_bigint(-1),
-                    Some(pos) => self.make_bigint(pos as i128),
-                });
+                return match found {
+                    None if op == 24 => None,
+                    None => Some(self.make_bigint(-1)),
+                    Some(pos) => Some(self.make_bigint(pos as i128)),
+                };
             }
             (23, 2) => {
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
@@ -883,19 +1315,19 @@ impl<'p> Vm<'p> {
                 return Some(self.make_bigint(cnt as i128));
             }
             (23, 3) | (23, 4) => {
-                if !ascii {
-                    return None;
-                }
                 let (sub_idx, _) = self.py_strm_flat(args[1])?;
-                let s_len = self.py_strm_bytes(s_idx).len();
-                let Some((lo, hi)) = self.py_strm_bounds(args, s_len)? else {
+                let Some((ba, bb, _)) = self.py_strm_bmp_bounds(s_idx, args)? else {
                     return Some(self.make_bigint(0));
                 };
                 let (cnt, scanned) = {
-                    let win = &self.py_strm_bytes(s_idx)[lo..hi];
+                    let win = &self.py_strm_bytes(s_idx)[ba..bb];
                     let sub = self.py_strm_bytes(sub_idx);
                     let c = if sub.is_empty() {
-                        win.len() + 1
+                        if ascii {
+                            win.len() + 1
+                        } else {
+                            win.iter().filter(|&&b| b & 0xC0 != 0x80).count() + 1
+                        }
                     } else if sub.len() == 1 {
                         memchr::memchr_iter(sub[0], win).count()
                     } else if sub.len() > win.len() {
@@ -907,6 +1339,35 @@ impl<'p> Vm<'p> {
                 };
                 self.charge_steps(i64::try_from(scanned).unwrap_or(i64::MAX));
                 return Some(self.make_bigint(cnt as i128));
+            }
+            (36, 2..=9) => {
+                // Direct `sep.join([e1, ..., ek])` (`R.SJOIN_DIRECT`): `args[0]`
+                // is `sep` (`s_idx`), `args[1..]` are the string elements.
+                let mut part_idxs = [0u32; 8];
+                let count = args.len() - 1;
+                let sep_len = self.py_strm_bytes(s_idx).len();
+                let mut total = 0usize;
+                let mut all_ascii = ascii;
+                for i in 0..count {
+                    let (pidx, pascii) = self.py_strm_flat(args[1 + i])?;
+                    part_idxs[i] = pidx;
+                    all_ascii &= pascii;
+                    total += self.py_strm_bytes(pidx).len() + if i > 0 { sep_len } else { 0 };
+                    if total > STRM_MAX_TEXT * 3 {
+                        return None;
+                    }
+                }
+                let mut out = self.heap.take_byte_buf(total);
+                {
+                    let sep = self.py_strm_bytes(s_idx);
+                    for (i, &pidx) in part_idxs[..count].iter().enumerate() {
+                        if i > 0 {
+                            out.extend_from_slice(sep);
+                        }
+                        out.extend_from_slice(self.py_strm_bytes(pidx));
+                    }
+                }
+                self.py_strm_new_as(out, all_ascii)
             }
             (7, 2) => {
                 let items = args[1];
@@ -1009,6 +1470,52 @@ impl<'p> Vm<'p> {
                 bytes[1..].make_ascii_lowercase();
                 self.py_strm_new_as(bytes, true)
             }
+            // ASCII character-classification predicates (non-ASCII falls back
+            // to the full Unicode regexes in `builtins.js`).
+            (28..=33, 1) => {
+                if !ascii {
+                    return None;
+                }
+                let res = {
+                    let b = self.py_strm_bytes(s_idx);
+                    match op {
+                        28 => !b.is_empty() && b.iter().all(|&c| py_space(c)),
+                        29 => !b.is_empty() && b.iter().all(u8::is_ascii_digit),
+                        30 => !b.is_empty() && b.iter().all(u8::is_ascii_alphabetic),
+                        31 => !b.is_empty() && b.iter().all(u8::is_ascii_alphanumeric),
+                        32 => {
+                            let mut has_lower = false;
+                            let mut ok = true;
+                            for &c in b {
+                                if c.is_ascii_uppercase() {
+                                    ok = false;
+                                    break;
+                                }
+                                if c.is_ascii_lowercase() {
+                                    has_lower = true;
+                                }
+                            }
+                            ok && has_lower
+                        }
+                        _ => {
+                            let mut has_upper = false;
+                            let mut ok = true;
+                            for &c in b {
+                                if c.is_ascii_lowercase() {
+                                    ok = false;
+                                    break;
+                                }
+                                if c.is_ascii_uppercase() {
+                                    has_upper = true;
+                                }
+                            }
+                            ok && has_upper
+                        }
+                    }
+                };
+                self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
+                return Some(Value::bool(res));
+            }
             _ => return None,
         };
         // `rt.checkedText`: the runtime's text limit, in UTF-16 units.
@@ -1017,7 +1524,9 @@ impl<'p> Vm<'p> {
                 return None;
             }
         }
-        self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
+        if self.instr_rec.is_some() {
+            self.charge_steps(i64::try_from(n).unwrap_or(i64::MAX));
+        }
         Some(out)
     }
 
@@ -1034,45 +1543,107 @@ impl<'p> Vm<'p> {
     /// A list of the strs that are `s_idx`'s bytes at `parts` (pieces of an
     /// ASCII str when `ascii`), made from the record's `ltmpl` (an empty
     /// list).
-    fn py_strm_list(&mut self, this: Value, s_idx: u32, parts: &[(usize, usize)], at: usize, ascii: bool) -> Option<Value> {
+    fn py_strm_list(&mut self, this: Value, s_idx: u32, parts: &[(u32, u32)], at: usize, ascii: bool) -> Option<Value> {
         if parts.len() > (1 << 24) {
             return None;
         }
-        let tmpl = self.py_strm_prop_at(this.heap_index(), at.saturating_add(1), hint::LTMPL, "ltmpl")?;
-        // A list record as a list display's `PySeq` allocates one: laid out
-        // like the template (the same `sequence` literal made both), its
-        // class the template's own. A template of another layout is copied
-        // whole instead.
-        let seq_shape = self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape);
-        let like = if self.py_alloc_like_ok(tmpl, seq_shape) { self.py_seq_parts(tmpl).map(|(cls, _)| cls) } else { None };        let copy = match like {
+        // Fast path: read the runtime's cached `(seq_tmpl, seq_shape, t_list)`
+        // directly instead of probing `ltmpl` on the builtin record every call.
+        let (tmpl, seq_shape, like) = match self.py_rt.as_deref() {
+            Some(p)
+                if p.seq_shape != crate::shape::DICT
+                    && p.t_list.is_heap()
+                    && ((p.seq_tmpl_hver != u32::MAX
+                        && p.seq_tmpl.is_heap()
+                        && self.heap.version_of(p.seq_tmpl.heap_index()) == p.seq_tmpl_hver)
+                        || self.py_alloc_like_ok(p.seq_tmpl, p.seq_shape)) =>
+            {
+                (p.seq_tmpl, p.seq_shape, Some(p.t_list))
+            }
+            _ => {
+                let tmpl = self.py_strm_prop_at(this.heap_index(), at.saturating_add(1), hint::LTMPL, "ltmpl")?;
+                let seq_shape = self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape);
+                let like = if self.py_alloc_like_ok(tmpl, seq_shape) {
+                    self.py_seq_parts(tmpl).map(|(cls, _)| cls)
+                } else {
+                    None
+                };
+                (tmpl, seq_shape, like)
+            }
+        };
+        let copy = match like {
             Some(_) => None,
             None => Some(self.py_json_template(tmpl, &["cls", "items"])?),
         };
-        let total: u64 = parts.iter().map(|&(a, b)| (b - a) as u64).sum();
+        let total: u64 = if self.instr_rec.is_some() {
+            parts.iter().map(|&(a, b)| (b - a) as u64).sum()
+        } else {
+            0
+        };
         let mut items = self.heap.take_arr_buf(parts.len());
-        for &(a, b) in parts {
-            let v = if ascii && b - a == 1 {
+        for &(a32, b32) in parts {
+            let (a, b) = (a32 as usize, b32 as usize);
+            let len = b - a;
+            let v = if len == 0 {
+                Value::heap(crate::heap::INTERN_EMPTY)
+            } else if ascii && len == 1 {
                 Value::heap(self.py_strm_bytes(s_idx)[a] as u32)
             } else {
                 let bytes = self.py_strm_copy(s_idx, a, b);
-                self.py_strm_new_as(bytes, ascii)
+                if ascii {
+                    Value::heap(self.heap.alloc_str_settled(JsStr::from_ascii(bytes)))
+                } else {
+                    self.py_strm_new(bytes)
+                }
             };
             items.push(v);
         }
-        let arr_idx = self.heap.alloc(HeapObj::Array(items));
+        let arr_idx = self.heap.alloc_array_settled(items);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.heap.repair_arr_mirror(arr_idx);
         let arr = Value::heap(arr_idx);
         let list = match (like, copy) {
-            (Some(cls), _) => self.py_alloc_like_ready(tmpl, seq_shape, &[cls, arr])?,
+            (Some(cls), _) => {
+                if self.py_rt.as_deref().is_some_and(|p| p.seq_tmpl.bits() == tmpl.bits()) {
+                    self.py_alloc_seq_fast(cls, arr)?
+                } else {
+                    self.py_alloc_like_ready(tmpl, seq_shape, &[cls, arr])?
+                }
+            }
             (None, Some((mut rec, slot))) => {
                 rec.set_val_at(slot, arr);
                 self.alloc_object_current_realm(rec)
             }
             (None, None) => return None,
         };
-        self.charge_steps(i64::try_from(total).unwrap_or(i64::MAX));
+        if self.instr_rec.is_some() {
+            self.charge_steps(i64::try_from(total).unwrap_or(i64::MAX));
+        }
         Some(list)
+    }
+
+    /// Ultra-fast 2-part f-string join (`f"prefix{int}"`) called directly from
+    /// `jit_py_strm_alloc` without entering the full `py_strm_fast_op` match.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn py_fstr_join2(&mut self, a0: Value, a1: Value) -> Option<Value> {
+        if let Some(n) = a1.small_bigint_val() {
+            let (idx, a_ascii) = self.py_strm_flat(a0)?;
+            let slen = self.py_strm_bytes(idx).len();
+            let total = slen + 20;
+            if a_ascii && total <= STRM_MAX_TEXT {
+                let mut out = self.heap.take_byte_buf(total);
+                out.extend_from_slice(self.py_strm_bytes(idx));
+                push_decimal_i64(&mut out, n);
+                let len = out.len();
+                let v = self.py_strm_new_as(out, true);
+                if self.instr_rec.is_some() {
+                    self.charge_steps(i64::try_from(len).unwrap_or(i64::MAX));
+                }
+                return Some(v);
+            }
+        }
+        self.py_fstr_join(&[a0, a1])
     }
 
     /// `R.FJOIN.c<n>(...parts)` (op 20): what its `j<n>` answers (`out +=
@@ -1093,10 +1664,12 @@ impl<'p> Vm<'p> {
                 if a_ascii && total <= STRM_MAX_TEXT {
                     let mut out = self.heap.take_byte_buf(total);
                     out.extend_from_slice(self.py_strm_bytes(idx));
-                    push_decimal(&mut out, n as i128);
+                    push_decimal_i64(&mut out, n);
                     let len = out.len();
                     let v = self.py_strm_new_as(out, true);
-                    self.charge_steps(i64::try_from(len).unwrap_or(i64::MAX));
+                    if self.instr_rec.is_some() {
+                        self.charge_steps(i64::try_from(len).unwrap_or(i64::MAX));
+                    }
                     return Some(v);
                 }
             }
@@ -1161,8 +1734,66 @@ impl<'p> Vm<'p> {
     }
 }
 
+/// Two-digit lookup table for fast decimal formatting (`00..99`).
+const DEC_PAIRS: &[u8; 200] = b"00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
+/// Fast decimal formatting for 64-bit signed ints (covers every immediate
+/// small BigInt without `u128` division).
+#[inline]
+fn push_decimal_i64(out: &mut Vec<u8>, n: i64) {
+    let mut m = n.unsigned_abs();
+    if m < 10 {
+        if n < 0 {
+            out.push(b'-');
+        }
+        out.push(b'0' + m as u8);
+        return;
+    }
+    if m < 100 && n >= 0 {
+        let p = (m as usize) * 2;
+        out.extend_from_slice(&DEC_PAIRS[p..p + 2]);
+        return;
+    }
+    let mut buf = [0u8; 24];
+    let mut i = buf.len();
+    while m >= 100 {
+        let rem = (m % 100) as usize * 2;
+        m /= 100;
+        i -= 2;
+        buf[i] = DEC_PAIRS[rem];
+        buf[i + 1] = DEC_PAIRS[rem + 1];
+    }
+    if m >= 10 {
+        let rem = (m as usize) * 2;
+        i -= 2;
+        buf[i] = DEC_PAIRS[rem];
+        buf[i + 1] = DEC_PAIRS[rem + 1];
+    } else {
+        i -= 1;
+        buf[i] = b'0' + m as u8;
+    }
+    if n < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
 /// The decimal digits of `n` (a `-` first when negative), appended.
 fn push_decimal(out: &mut Vec<u8>, n: i128) {
+    if let Ok(n64) = i64::try_from(n) {
+        push_decimal_i64(out, n64);
+        return;
+    }
     let mut buf = [0u8; 40];
     let mut i = buf.len();
     let mut m = n.unsigned_abs();
@@ -1227,10 +1858,14 @@ impl<'p> Vm<'p> {
         if !seq.is_heap() || !this.is_heap() {
             return None;
         }
-        let (tmpl, ttype) = self.py_strm_seq_types(this, at)?;
-        // The two records' `cls` and `items` at their slots (one shape
-        // compare each for records of the usual layout).
-        let (list_cls, _) = self.py_seq_parts(tmpl)?;
+        let (list_cls, ttype) = match self.py_rt.as_deref() {
+            Some(p) if p.t_list.is_heap() && p.t_tuple.is_heap() => (p.t_list, p.t_tuple),
+            _ => {
+                let (tmpl, ttype) = self.py_strm_seq_types(this, at)?;
+                let (list_cls, _) = self.py_seq_parts(tmpl)?;
+                (list_cls, ttype)
+            }
+        };
         let (cls, arr) = self.py_seq_parts(seq)?;
         if cls.bits() != list_cls.bits() && !(tuple_too && cls.bits() == ttype.bits()) {
             return None;
@@ -1244,11 +1879,62 @@ impl<'p> Vm<'p> {
     /// `a[x] < a[y]` (`moving` standing for [`MOVING`]), when the two are
     /// ordered: compared where they live, as far as Python's `<` reads
     /// them (`Vm::py_ord_lt_values`).
+    #[inline]
     fn py_heap_lt(&mut self, arr: u32, moving: Value, x: usize, y: usize, tuple: Value) -> Option<bool> {
         let a = if x == MOVING { moving } else { self.py_arr_at(arr, x)? };
         let b = if y == MOVING { moving } else { self.py_arr_at(arr, y)? };
+        // Fast path 1: two immediate small ints (covers `bisect.insort` / int heaps).
+        if let (Some(ia), Some(ib)) = (a.small_bigint_val(), b.small_bigint_val()) {
+            if self.instr_rec.is_some() {
+                self.charge_steps(8);
+            }
+            return Some(ia < ib);
+        }
+        // Fast path 2: two plain tuple records whose element 0 are immediate small ints
+        // that differ (covers priority-queue tuples `(priority, ...)` such as k-way merge).
+        if a.is_heap() && b.is_heap() {
+            let seq_shape = self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape);
+            if seq_shape != crate::shape::DICT {
+                let tbits = tuple.bits();
+                let items_of = |v: Value| -> Option<u32> {
+                    match self.heap.get(v.heap_index()) {
+                        HeapObj::Object(m) if !m.is_ctor && m.shape() == seq_shape && m.val_at(0).bits() == tbits => {
+                            let arr_v = m.val_at(1);
+                            arr_v.is_heap().then(|| arr_v.heap_index())
+                        }
+                        _ => None,
+                    }
+                };
+                if let (Some(ai), Some(bi)) = (items_of(a), items_of(b)) {
+                    if let (HeapObj::Array(ax), HeapObj::Array(bx)) = (self.heap.get(ai), self.heap.get(bi)) {
+                        if let (Some(&x0), Some(&y0)) = (ax.first(), bx.first()) {
+                            if let (Some(ia), Some(ib)) = (x0.small_bigint_val(), y0.small_bigint_val()) {
+                                if ia != ib {
+                                    if self.instr_rec.is_some() {
+                                        self.charge_steps(8);
+                                    }
+                                    return Some(ia < ib);
+                                }
+                                if let (Some(&x1), Some(&y1)) = (ax.get(1), bx.get(1)) {
+                                    if let (Some(ia1), Some(ib1)) = (x1.small_bigint_val(), y1.small_bigint_val()) {
+                                        if ia1 != ib1 {
+                                            if self.instr_rec.is_some() {
+                                                self.charge_steps(8);
+                                            }
+                                            return Some(ia1 < ib1);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let lt = self.py_ord_lt_values(a, b, tuple)?;
-        self.charge_steps(8);
+        if self.instr_rec.is_some() {
+            self.charge_steps(8);
+        }
         Some(lt)
     }
 
@@ -1280,14 +1966,14 @@ impl<'p> Vm<'p> {
             }
             // `up`: the item rises past every parent it is below.
             let mut pos = n;
-            let mut path = [0usize; 32];
+            let mut path = [0u32; 24];
             let mut plen = 0usize;
             while pos > 0 {
                 let parent = (pos - 1) >> 1;
                 if !self.py_heap_lt(arr, item, MOVING, parent, tuple)? {
                     break;
                 }
-                path[plen] = parent;
+                path[plen] = parent as u32;
                 plen += 1;
                 pos = parent;
             }
@@ -1295,8 +1981,9 @@ impl<'p> Vm<'p> {
                 a.push(item);
                 let mut hole = n;
                 for &parent in &path[..plen] {
-                    a[hole] = a[parent];
-                    hole = parent;
+                    let p = parent as usize;
+                    a[hole] = a[p];
+                    hole = p;
                 }
                 a[hole] = item;
             })?;
@@ -1310,7 +1997,7 @@ impl<'p> Vm<'p> {
         let m = n - 1;
         // `down` from the root with `last` there: a hole sift, as
         // `lt(h[l], h[m])` then `lt(h[r], h[m])` compare it.
-        let mut moves = [0usize; 32];
+        let mut moves = [0u32; 24];
         let mut mlen = 0usize;
         let mut i = 0usize;
         if m > 0 {
@@ -1327,7 +2014,7 @@ impl<'p> Vm<'p> {
                 if best == MOVING {
                     break;
                 }
-                moves[mlen] = best;
+                moves[mlen] = best as u32;
                 mlen += 1;
                 i = best;
             }
@@ -1337,8 +2024,9 @@ impl<'p> Vm<'p> {
             if m > 0 {
                 let mut hole = 0;
                 for &child in &moves[..mlen] {
-                    a[hole] = a[child];
-                    hole = child;
+                    let c = child as usize;
+                    a[hole] = a[c];
+                    hole = c;
                 }
                 a[hole] = last;
             }
@@ -1432,13 +2120,22 @@ impl<'p> Vm<'p> {
 
     /// A two-item tuple made from the record's template.
     fn py_iter_pair(&mut self, rec: u32, a: Value, b: Value) -> Option<Value> {
-        self.py_iter_tuple(rec, vec![a, b])
+        let mut buf = self.heap.take_arr_buf(2);
+        buf.push(a);
+        buf.push(b);
+        self.py_iter_tuple(rec, buf)
     }
 
     /// A tuple of `items` made from the record's template.
     fn py_iter_tuple(&mut self, rec: u32, items: Vec<Value>) -> Option<Value> {
         let tmpl = self.py_strm_prop(rec, hint::ITMPL, "tmpl")?;
         let ttype = self.py_strm_prop(rec, hint::ITTYPE, "ttype")?;
+        if self.py_rt.as_deref().is_some_and(|p| p.seq_tmpl.bits() == tmpl.bits()) {
+            let arr_idx = self.heap.alloc_array_settled(items);
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            self.heap.repair_arr_mirror(arr_idx);
+            return self.py_alloc_seq_fast(ttype, Value::heap(arr_idx));
+        }
         let (mut obj, slot) = self.py_json_template(tmpl, &["cls", "items"])?;
         let items = Value::heap(self.heap.alloc(HeapObj::Array(items)));
         obj.set_val_at(0, ttype);
@@ -1889,6 +2586,647 @@ impl<'p> Vm<'p> {
             self.regex_subject_units_put(text_val, u16s);
         }
         Ok(self.alloc_array_current_realm(out))
+    }
+
+    /// Unwrap a primitive `str` or an unmodified `str` subclass (`pyval`) for
+    /// native slice and `re` fast paths. Returns `(str_val, is_primitive)`.
+    #[inline]
+    fn py_unwrap_str_val(&self, v: Value) -> Option<(Value, bool)> {
+        if !v.is_heap() {
+            return None;
+        }
+        if self.heap.is_str_like(v.heap_index()) {
+            return Some((v, true));
+        }
+        let cls = self.py_cls_of(v)?;
+        if (self.py_sub_kind(cls) & super::py_rt::SUB_STR_GET) == 0 {
+            return None;
+        }
+        let pyval = self.py_own_data(v.heap_index(), "pyval")?;
+        if pyval.is_heap() && self.heap.is_str_like(pyval.heap_index()) {
+            Some((pyval, false))
+        } else {
+            None
+        }
+    }
+
+    /// `R.SLICEGET.c3(o, lo, hi)` / `.c4(o, lo, hi, step)` (op 37): direct
+    /// slicing of `str`, unmodified `str` subclasses, `list`, and `tuple`
+    /// without allocating a Python `slice` record.
+    fn py_slice_get(&mut self, args: &[Value]) -> Option<Value> {
+        let o = args[0];
+        let lo_v = args[1];
+        let hi_v = args[2];
+        let step_v = args.get(3).copied().unwrap_or(Value::NULL);
+        let step: i128 = if step_v == Value::NULL {
+            1
+        } else {
+            let s = self.bigint_i128(step_v)?;
+            if s != 1 && s != -1 {
+                return None;
+            }
+            s
+        };
+        // 1. `str` or unmodified `str` subclass.
+        if let Some((s_val, is_prim)) = self.py_unwrap_str_val(o) {
+            let s_idx = s_val.heap_index();
+            self.heap.flatten(s_idx);
+            let (len, is_ascii) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => (st.as_bytes().len(), true),
+                HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (st.units(), false),
+                _ => return None,
+            };
+            let n = len as i128;
+            if step == 1 {
+                let lo = if lo_v == Value::NULL {
+                    0usize
+                } else {
+                    let i = self.bigint_i128(lo_v)?;
+                    if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+                };
+                let hi = if hi_v == Value::NULL {
+                    len
+                } else {
+                    let i = self.bigint_i128(hi_v)?;
+                    if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+                };
+                if lo >= hi {
+                    return Some(Value::heap(crate::heap::INTERN_EMPTY));
+                }
+                if lo == 0 && hi == len && is_prim {
+                    return Some(o);
+                }
+                let slice_len = hi - lo;
+                if slice_len > STRM_MAX_TEXT {
+                    return None;
+                }
+                #[cfg(feature = "instrument")]
+                if self.instr_rec.is_some() && slice_len > 1024 {
+                    return None;
+                }
+                self.charge_steps(slice_len as i64);
+                if is_ascii {
+                    return Some(self.ascii_slice_value(s_idx, lo..hi));
+                }
+                let slice_bytes = {
+                    let HeapObj::Str(st) = self.heap.get(s_idx) else {
+                        return None;
+                    };
+                    let (ba, bb) = st.bmp_byte_range(lo, hi);
+                    let b = &st.as_bytes()[ba..bb];
+                    if b.len() == 1 && b[0] < 128 {
+                        return Some(Value::heap(b[0] as u32));
+                    }
+                    b.to_vec()
+                };
+                return Some(Value::heap(
+                    self.heap.alloc_js(JsStr::from_bmp_utf8(slice_bytes, slice_len)),
+                ));
+            }
+            // step == -1 (ASCII fast path)
+            if !is_ascii {
+                return None;
+            }
+            if len == 0 {
+                return Some(Value::heap(crate::heap::INTERN_EMPTY));
+            }
+            let start = if lo_v == Value::NULL {
+                n - 1
+            } else {
+                let i = self.bigint_i128(lo_v)?;
+                if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+            };
+            let stop = if hi_v == Value::NULL {
+                -1
+            } else {
+                let i = self.bigint_i128(hi_v)?;
+                if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+            };
+            if start <= stop {
+                return Some(Value::heap(crate::heap::INTERN_EMPTY));
+            }
+            let count = (start - stop) as usize;
+            if count > STRM_MAX_TEXT {
+                return None;
+            }
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() && count > 1024 {
+                return None;
+            }
+            self.charge_steps(count as i64);
+            let mut buf = self.heap.take_byte_buf(count);
+            let src = &self.py_strm_bytes(s_idx)[(stop + 1) as usize..=(start as usize)];
+            buf.extend(src.iter().rev().copied());
+            return Some(self.py_strm_new_as(buf, true));
+        }
+
+        // 2. Exact `list` or `tuple`.
+        let (t_list, t_tuple, seq_tmpl, seq_shape) = {
+            let p = self.py_rt.as_deref()?;
+            if p.seq_shape == crate::shape::DICT {
+                return None;
+            }
+            (p.t_list, p.t_tuple, p.seq_tmpl, p.seq_shape)
+        };
+        let (cls, items) = self.py_seq_parts(o)?;
+        if cls.bits() != t_list.bits() && cls.bits() != t_tuple.bits() {
+            return None;
+        }
+        if !items.is_heap() {
+            return None;
+        }
+        let items_idx = items.heap_index();
+        let len = match self.heap.get(items_idx) {
+            HeapObj::Array(a) => a.len(),
+            _ => return None,
+        };
+        let n = len as i128;
+        let out_vec: Vec<Value> = if step == 1 {
+            let lo = if lo_v == Value::NULL {
+                0usize
+            } else {
+                let i = self.bigint_i128(lo_v)?;
+                if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+            };
+            let hi = if hi_v == Value::NULL {
+                len
+            } else {
+                let i = self.bigint_i128(hi_v)?;
+                if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+            };
+            if lo >= hi {
+                Vec::new()
+            } else {
+                let count = hi - lo;
+                #[cfg(feature = "instrument")]
+                if self.instr_rec.is_some() && count > 1024 {
+                    return None;
+                }
+                self.charge_steps(count as i64);
+                let mut buf = self.heap.take_arr_buf(count);
+                let ok = {
+                    let HeapObj::Array(a) = self.heap.get(items_idx) else {
+                        return None;
+                    };
+                    let slice = &a[lo..hi];
+                    if slice.iter().any(|v| v.is_hole() || v.is_undefined()) {
+                        false
+                    } else {
+                        buf.extend_from_slice(slice);
+                        true
+                    }
+                };
+                if !ok {
+                    return None;
+                }
+                buf
+            }
+        } else {
+            if len == 0 {
+                Vec::new()
+            } else {
+                let start = if lo_v == Value::NULL {
+                    n - 1
+                } else {
+                    let i = self.bigint_i128(lo_v)?;
+                    if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+                };
+                let stop = if hi_v == Value::NULL {
+                    -1
+                } else {
+                    let i = self.bigint_i128(hi_v)?;
+                    if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+                };
+                if start <= stop {
+                    Vec::new()
+                } else {
+                    let count = (start - stop) as usize;
+                    #[cfg(feature = "instrument")]
+                    if self.instr_rec.is_some() && count > 1024 {
+                        return None;
+                    }
+                    self.charge_steps(count as i64);
+                    let mut buf = self.heap.take_arr_buf(count);
+                    let ok = {
+                        let HeapObj::Array(a) = self.heap.get(items_idx) else {
+                            return None;
+                        };
+                        let slice = &a[(stop + 1) as usize..=(start as usize)];
+                        if slice.iter().any(|v| v.is_hole() || v.is_undefined()) {
+                            false
+                        } else {
+                            buf.extend(slice.iter().rev().copied());
+                            true
+                        }
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    buf
+                }
+            }
+        };
+        if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+            return None;
+        }
+        let arr = self.alloc_array_current_realm(out_vec);
+        self.py_alloc_like_ready(seq_tmpl, seq_shape, &[cls, arr])
+    }
+
+    /// Native `re.Pattern.search` (38), `match` (39), `fullmatch` (40) for
+    /// non-bytes patterns on BMP/ASCII `str` (and unmodified `str` subclasses):
+    /// bypasses `patRun` / `sticky` / `rt.hasSurrogate` / `execAt` / `mk`.
+    fn py_re_exec(&mut self, this: Value, args: &[Value], op: i32) -> Option<Value> {
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        let p = args[0];
+        let raw = args[1];
+        if !p.is_heap() {
+            return None;
+        }
+        let (s_val, _) = self.py_unwrap_str_val(raw)?;
+        let s_idx = s_val.heap_index();
+        self.heap.flatten(s_idx);
+        let n = match self.heap.get(s_idx) {
+            HeapObj::Str(st) if st.is_ascii() => st.as_bytes().len(),
+            HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => st.units(),
+            _ => return None,
+        };
+        let re_key = match op {
+            38 => "re",
+            39 => "sticky",
+            _ => "full",
+        };
+        let re_val = {
+            let HeapObj::Object(pm) = self.heap.get(p.heap_index()) else {
+                return None;
+            };
+            if pm.is_ctor {
+                return None;
+            }
+            let is_bytes_slot = pm.pos("isBytes").filter(|&s| !pm.is_accessor_at(s))?;
+            if pm.val_at(is_bytes_slot) != Value::FALSE {
+                return None;
+            }
+            let re_slot = pm.pos(re_key).filter(|&s| !pm.is_accessor_at(s))?;
+            pm.val_at(re_slot)
+        };
+        if !re_val.is_heap() || !matches!(self.heap.get(re_val.heap_index()), HeapObj::RegExp(_)) {
+            return None;
+        }
+        let pos = if let Some(&pos_v) = args.get(2) {
+            let i = self.bigint_i128(pos_v)?;
+            i.clamp(0, n as i128) as usize
+        } else {
+            0usize
+        };
+        let re_idx = re_val.heap_index();
+        self.set_regexp_last_index(re_idx, pos as u64);
+        let m = self.regexp_exec(re_idx, s_val).ok()?;
+        if m == Value::NULL {
+            return Some(Value::NULL);
+        }
+        let mtmpl = self.py_own_data(this.heap_index(), "mtmpl")?;
+        if !mtmpl.is_heap() {
+            return None;
+        }
+        let (mtmpl_shape, cls_match) = match self.heap.get(mtmpl.heap_index()) {
+            HeapObj::Object(mm) if !mm.is_ctor && mm.slot_len() == 9 => (mm.shape(), mm.val_at(0)),
+            _ => return None,
+        };
+        self.py_alloc_like(
+            mtmpl,
+            mtmpl_shape,
+            &[
+                cls_match,
+                m,
+                s_val,
+                raw,
+                s_val,
+                p,
+                Value::num(pos as f64),
+                Value::num(n as f64),
+                Value::NULL,
+            ],
+        )
+    }
+
+    /// Native `re.Pattern.sub` (41) for non-bytes patterns with string
+    /// replacements (literal or simple `\1`..`\99` / standard escapes) on
+    /// well-formed BMP/ASCII `str` (and unmodified `str` subclasses).
+    fn py_re_sub(&mut self, args: &[Value]) -> Option<Value> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = args;
+            return None;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() {
+                return None;
+            }
+            let p = args[0];
+            let repl = args[1];
+            let raw = args[2];
+            if !p.is_heap() {
+                return None;
+            }
+            let count: usize = if let Some(&cv) = args.get(3) {
+                let c = self.bigint_i128(cv)?;
+                if c < 0 {
+                    return None;
+                }
+                usize::try_from(c).ok()?
+            } else {
+                0
+            };
+            let (s_val, _) = self.py_unwrap_str_val(raw)?;
+            let (repl_idx, repl_ascii) = self.py_strm_flat(repl)?;
+            let s_idx = s_val.heap_index();
+            self.heap.flatten(s_idx);
+            let (s_ascii, s_len) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => (true, st.as_bytes().len()),
+                HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (false, st.units()),
+                _ => return None,
+            };
+            let (re_val, ngroups) = {
+                let HeapObj::Object(pm) = self.heap.get(p.heap_index()) else {
+                    return None;
+                };
+                if pm.is_ctor {
+                    return None;
+                }
+                let is_bytes_slot = pm.pos("isBytes").filter(|&s| !pm.is_accessor_at(s))?;
+                if pm.val_at(is_bytes_slot) != Value::FALSE {
+                    return None;
+                }
+                let re_slot = pm.pos("re").filter(|&s| !pm.is_accessor_at(s))?;
+                let ng_slot = pm.pos("ngroups").filter(|&s| !pm.is_accessor_at(s))?;
+                let ng_v = pm.val_at(ng_slot);
+                if !ng_v.is_number() || ng_v.as_f64() < 0.0 {
+                    return None;
+                }
+                (pm.val_at(re_slot), ng_v.as_f64() as usize)
+            };
+            if !re_val.is_heap() {
+                return None;
+            }
+            let re_idx = re_val.heap_index();
+            let unicode = match self.heap.get(re_idx) {
+                HeapObj::RegExp(r) => r.flags.contains('u') || r.flags.contains('v'),
+                _ => return None,
+            };
+
+            #[derive(Clone, Copy)]
+            enum SubPart {
+                Lit(usize, usize),
+                Byte(u8),
+                Group(usize),
+            }
+            let mut parts: Vec<SubPart> = Vec::new();
+            let mut has_group = false;
+            {
+                let rb = self.py_strm_bytes(repl_idx);
+                if !rb.contains(&b'\\') {
+                    if !rb.is_empty() {
+                        parts.push(SubPart::Lit(0, rb.len()));
+                    }
+                } else {
+                    let mut i = 0usize;
+                    let mut lit_start = 0usize;
+                    while i < rb.len() {
+                        if rb[i] != b'\\' {
+                            i += 1;
+                            continue;
+                        }
+                        if i > lit_start {
+                            parts.push(SubPart::Lit(lit_start, i));
+                        }
+                        i += 1;
+                        let d = *rb.get(i)?;
+                        match d {
+                            b'\\' => { parts.push(SubPart::Byte(b'\\')); i += 1; }
+                            b'n' => { parts.push(SubPart::Byte(b'\n')); i += 1; }
+                            b't' => { parts.push(SubPart::Byte(b'\t')); i += 1; }
+                            b'r' => { parts.push(SubPart::Byte(b'\r')); i += 1; }
+                            b'f' => { parts.push(SubPart::Byte(0x0c)); i += 1; }
+                            b'v' => { parts.push(SubPart::Byte(0x0b)); i += 1; }
+                            b'a' => { parts.push(SubPart::Byte(0x07)); i += 1; }
+                            b'b' => { parts.push(SubPart::Byte(0x08)); i += 1; }
+                            b'1'..=b'9' => {
+                                // Octal escape (3 octal digits starting with 1..7) -> JS fallback.
+                                if d <= b'7'
+                                    && rb.get(i + 1).is_some_and(|&c| (b'0'..=b'7').contains(&c))
+                                    && rb.get(i + 2).is_some_and(|&c| (b'0'..=b'7').contains(&c))
+                                {
+                                    return None;
+                                }
+                                let mut num = (d - b'0') as usize;
+                                i += 1;
+                                if let Some(&d2) = rb.get(i).filter(|&&c| c.is_ascii_digit()) {
+                                    num = num * 10 + (d2 - b'0') as usize;
+                                    i += 1;
+                                }
+                                if num == 0 || num > ngroups {
+                                    return None;
+                                }
+                                has_group = true;
+                                parts.push(SubPart::Group(num));
+                            }
+                            _ => return None,
+                        }
+                        lit_start = i;
+                    }
+                    if lit_start < rb.len() {
+                        parts.push(SubPart::Lit(lit_start, rb.len()));
+                    }
+                }
+            }
+
+            if s_ascii {
+                self.ensure_regexp_ascii_twin_deferred(re_idx, s_len);
+                let _gc = self.gc_lock_guard();
+                let matches: Vec<regress::Match> = {
+                    let subj = match self.heap.get(s_idx) {
+                        HeapObj::Str(js) => js.as_str_wf(),
+                        _ => return None,
+                    };
+                    let HeapObj::RegExp(r) = self.heap.get(re_idx) else {
+                        return None;
+                    };
+                    let regex = match r.ascii_twin.get() {
+                        Some(Some(twin)) => &**twin,
+                        _ => &*r.regex,
+                    };
+                    let mut it = regex.find_from_ascii(subj, 0);
+                    let Some(first) = it.next() else {
+                        return Some(s_val);
+                    };
+                    let mut ms = Vec::new();
+                    ms.push(first);
+                    if count != 1 {
+                        for m in it {
+                            ms.push(m);
+                            if count > 0 && ms.len() >= count {
+                                break;
+                            }
+                        }
+                    }
+                    ms
+                };
+                if has_group {
+                    for m in &matches {
+                        for &pt in &parts {
+                            if let SubPart::Group(g) = pt {
+                                if m.captures.get(g - 1).and_then(|c| c.as_ref()).is_none() {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+                let both_ascii = repl_ascii;
+                let mut out = self.heap.take_byte_buf(s_len + 32);
+                {
+                    let sb = self.py_strm_bytes(s_idx);
+                    let rb = self.py_strm_bytes(repl_idx);
+                    let mut last = 0usize;
+                    for m in &matches {
+                        let r = m.range();
+                        out.extend_from_slice(&sb[last..r.start]);
+                        for &pt in &parts {
+                            match pt {
+                                SubPart::Lit(a, b) => out.extend_from_slice(&rb[a..b]),
+                                SubPart::Byte(b) => out.push(b),
+                                SubPart::Group(g) => {
+                                    if let Some(cr) = &m.captures[g - 1] {
+                                        out.extend_from_slice(&sb[cr.start..cr.end]);
+                                    }
+                                }
+                            }
+                        }
+                        last = r.end;
+                        if out.len() > STRM_MAX_TEXT * 3 {
+                            self.heap.return_byte_buf(out);
+                            return None;
+                        }
+                    }
+                    out.extend_from_slice(&sb[last..]);
+                }
+                if (both_ascii && out.len() > STRM_MAX_TEXT) || out.len() > STRM_MAX_TEXT * 3 {
+                    self.heap.return_byte_buf(out);
+                    return None;
+                }
+                let out_len = out.len();
+                let res = self.py_strm_new_as(out, both_ascii);
+                if !both_ascii {
+                    if let HeapObj::Str(st) = self.heap.get(res.heap_index()) {
+                        if st.units() > STRM_MAX_TEXT {
+                            return None;
+                        }
+                    }
+                }
+                self.charge_steps(out_len as i64);
+                return Some(res);
+            }
+
+            // Non-ASCII BMP path (`!has_surrogate()`): match over cached UTF-16 units.
+            let _gc = self.gc_lock_guard();
+            let u16s = self.regex_subject_units_take(s_val);
+            let matches: Vec<regress::Match> = {
+                let HeapObj::RegExp(r) = self.heap.get(re_idx) else {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                };
+                let regex = &r.core.regex;
+                let mut ms = Vec::new();
+                if unicode {
+                    let mut it = regex.find_from_utf16(&u16s, 0);
+                    if let Some(first) = it.next() {
+                        ms.push(first);
+                        if count != 1 {
+                            for m in it {
+                                ms.push(m);
+                                if count > 0 && ms.len() >= count {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut it = regex.find_from_ucs2(&u16s, 0);
+                    if let Some(first) = it.next() {
+                        ms.push(first);
+                        if count != 1 {
+                            for m in it {
+                                ms.push(m);
+                                if count > 0 && ms.len() >= count {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                ms
+            };
+            if matches.is_empty() {
+                self.regex_subject_units_put(s_val, u16s);
+                return Some(s_val);
+            }
+            if has_group {
+                for m in &matches {
+                    for &pt in &parts {
+                        if let SubPart::Group(g) = pt {
+                            if m.captures.get(g - 1).and_then(|c| c.as_ref()).is_none() {
+                                self.regex_subject_units_put(s_val, u16s);
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            let repl_utf8 = match std::str::from_utf8(self.py_strm_bytes(repl_idx)) {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                }
+            };
+            let mut out_u16: Vec<u16> = Vec::with_capacity(u16s.len() + 32);
+            let mut last = 0usize;
+            for m in &matches {
+                let r = m.range();
+                out_u16.extend_from_slice(&u16s[last..r.start]);
+                for &pt in &parts {
+                    match pt {
+                        SubPart::Lit(a, b) => out_u16.extend(repl_utf8[a..b].encode_utf16()),
+                        SubPart::Byte(b) => out_u16.push(b as u16),
+                        SubPart::Group(g) => {
+                            if let Some(cr) = &m.captures[g - 1] {
+                                out_u16.extend_from_slice(&u16s[cr.start..cr.end]);
+                            }
+                        }
+                    }
+                }
+                last = r.end;
+                if out_u16.len() > STRM_MAX_TEXT {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                }
+            }
+            out_u16.extend_from_slice(&u16s[last..]);
+            self.regex_subject_units_put(s_val, u16s);
+            if out_u16.len() > STRM_MAX_TEXT {
+                return None;
+            }
+            let out_len = out_u16.len();
+            let res = self.units_value(&out_u16);
+            self.charge_steps(out_len as i64);
+            Some(res)
+        }
     }
 
     /// `__zipp_py_write(op, to_stderr, payload)`: direct Python stdout/stderr

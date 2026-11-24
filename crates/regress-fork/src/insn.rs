@@ -258,6 +258,31 @@ pub enum StartPredicate {
     StartAnchored,
 }
 
+impl StartPredicate {
+    /// Fast necessary condition for whether a match can start at byte offset `start`
+    /// of a byte-addressed (`AsciiInput` / `Utf8Input`) subject.
+    #[inline(always)]
+    pub(crate) fn matches_at(&self, bytes: &[u8], start: usize) -> bool {
+        match self {
+            StartPredicate::Arbitrary => true,
+            StartPredicate::StartAnchored => start == 0,
+            StartPredicate::ByteSet1([b]) => bytes.get(start) == Some(b),
+            StartPredicate::ByteSet2([a, b]) => {
+                bytes.get(start).is_some_and(|&x| x == *a || x == *b)
+            }
+            StartPredicate::ByteSet3([a, b, c]) => {
+                bytes.get(start).is_some_and(|&x| x == *a || x == *b || x == *c)
+            }
+            StartPredicate::ByteSeq(finder) => bytes
+                .get(start..)
+                .is_some_and(|tail| tail.starts_with(finder.needle())),
+            StartPredicate::ByteBracket(bitmap) => {
+                bytes.get(start).is_some_and(|&x| bitmap.contains(x))
+            }
+        }
+    }
+}
+
 /// The search for a match's first byte, whichever form it takes. A search
 /// asks once per attempt, so deciding the form there costs next to nothing,
 /// and the search loop exists once per input type instead of once per form.

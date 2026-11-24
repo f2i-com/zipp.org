@@ -69,7 +69,8 @@ pub(crate) mod hint {
     pub const GS: usize = 18;
     pub const GLOBALS: usize = 19;
     pub const DEFAULTS: usize = 20;
-    pub const COUNT: usize = 21;
+    pub const CELLS: usize = 21;
+    pub const COUNT: usize = 22;
 }
 
 /// Kinds of [`PyIc`] entries.
@@ -154,6 +155,11 @@ pub(super) mod ic {
     pub const CALL_STORE: u8 = 23;
     pub const CALL_LEAF: u8 = 24;
     pub const CALL_REC: u8 = 25;
+    /// `PyDictGet` on layout-mode storage where layout `d` is proven to lack
+    /// the key (`PyAttrs` only; layouts are immutable per id).
+    pub const DICT_GET_ABSENT: u8 = 26;
+    /// `PyCall` targeting an exception class's positional entry (`R.EXCENTRY[argc]`).
+    pub const CALL_EXC: u8 = 27;
 }
 
 /// Alternate entries a site keeps (see `Vm::py_ic_class`).
@@ -224,6 +230,47 @@ pub(super) struct TySlots {
     pub sp: usize,
     pub gv: usize,
     pub ver: usize,
+    pub truth_ver: usize,
+    pub truth_kind: usize,
+    pub truth_fn: usize,
+    pub dict: usize,
+}
+
+/// Bitmask cached in `PyRt::sub_kind_cache` for builtin subclasses whose
+/// dunders are unmodified along the MRO ahead of the builtin base.
+pub(super) const SUB_DICT_GET: u16 = 1 << 0;
+pub(super) const SUB_DICT_SET: u16 = 1 << 1;
+pub(super) const SUB_DICT_LEN: u16 = 1 << 2;
+pub(super) const SUB_STR_GET: u16 = 1 << 3;
+pub(super) const SUB_STR_LEN: u16 = 1 << 4;
+/// `dict` subclass that does not override `__getitem__`, even if it defines
+/// `__missing__` (e.g. `collections.Counter`, `defaultdict`): key HITS bypass
+/// `__missing__`, while misses take the slow edge.
+pub(super) const SUB_DICT_GET_HIT: u16 = 1 << 5;
+/// `str` subclass that inherits `str.__hash__` and `str.__eq__` (e.g. `bs4.NavigableString`).
+pub(super) const SUB_STR_HASH_EQ: u16 = 1 << 6;
+/// `list` subclass with unmodified `__getitem__` / `__setitem__` / `__len__`&`__bool__`
+/// (e.g. `bs4.AttributeValueList`).
+pub(super) const SUB_LIST_GET: u16 = 1 << 7;
+pub(super) const SUB_LIST_SET: u16 = 1 << 8;
+pub(super) const SUB_LIST_LEN: u16 = 1 << 9;
+/// `tuple` subclass with unmodified `__getitem__` / `__len__`&`__bool__` / `__hash__`&`__eq__`
+/// (e.g. `NamedTuple` classes in `soupsieve`).
+pub(super) const SUB_TUPLE_GET: u16 = 1 << 10;
+pub(super) const SUB_TUPLE_LEN: u16 = 1 << 11;
+pub(super) const SUB_TUPLE_HASH_EQ: u16 = 1 << 12;
+
+/// Direct-mapped builtin-subclass capability cache size (power of two).
+pub(crate) const SUB_KIND_CACHE_LEN: usize = 64;
+
+/// Cached builtin-subclass dunder flags keyed by `(cls, cls_hver, cls_ver)`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SubKindEntry {
+    pub cls: u64,
+    pub hver: u32,
+    pub ver: u64,
+    /// `0` = empty slot, else `1 + flags` (so a validated `0` flags is `1`).
+    pub tag: u16,
 }
 
 /// Direct-mapped string hash cache size (power of two).
@@ -284,6 +331,30 @@ pub(crate) struct StorePlan {
     pub arg_idx: [u8; 8],
 }
 
+/// Pre-resolved plan for fused `PyNew` + `StorePlan` `__init__` (`Vm::jit_py_new_fused_fast`).
+#[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+#[derive(Clone, Copy)]
+pub(crate) struct NewFusedPlan {
+    pub cls_bits: u64,
+    pub cls_hver: u32,
+    pub cls_ver: u64,
+    pub ver_slot: u16,
+    pub ctor_slot: u16,
+    pub want_bits: u64,
+    pub init_slot: u16,
+    pub init_bits: u64,
+    pub init_hver: u32,
+    pub init_entry_slot: u16,
+    pub entry_bits: u64,
+    pub inst_tmpl: Value,
+    pub inst_tmpl_hver: u32,
+    pub inst_shape: u32,
+    pub plan_idx: u16,
+    pub final_layout: u32,
+    pub count: u8,
+    pub arg_idx: [u8; 8],
+}
+
 /// The registry.
 pub(crate) struct PyRt {
     /// The runtime's helper object `R`.
@@ -292,9 +363,14 @@ pub(crate) struct PyRt {
     pub(super) t_tuple: Value,
     pub(super) t_dict: Value,
     pub(super) t_set: Value,
+    pub(super) t_frozenset: Value,
     pub(super) t_str: Value,
     pub(super) t_slice: Value,
     pub(super) t_module: Value,
+    pub(super) t_method: Value,
+    pub(super) t_list_iter: Value,
+    pub(super) t_type: Value,
+    pub(super) stop: Value,
     pub(super) ebase: Value,
     /// `R.ISTYPES`: the types of None, bool, int, float and str, and bytes.
     pub(super) istypes: [Value; 6],
@@ -318,6 +394,21 @@ pub(crate) struct PyRt {
     pub(super) ty: Option<TySlots>,
     /// `R.mself`'s slot.
     pub(super) mself_slot: Option<usize>,
+    /// `R.SMFNATIVE` (cached for O(1) `super()` lookup inside `py_leaf`).
+    pub(super) smfnative: Value,
+    /// Heap versions of `seq_tmpl` / `inst_tmpl` / `exc_tmpl` when validated
+    /// plain for `py_alloc_like_ready` (`u32::MAX` when unvalidated).
+    pub(super) seq_tmpl_hver: u32,
+    pub(super) inst_tmpl_hver: u32,
+    pub(super) exc_tmpl_hver: u32,
+    /// Indices into `plans` for `seq_tmpl` / `inst_tmpl` / `exc_tmpl` (`u16::MAX` when uncached).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) seq_plan_idx: u16,
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(super) inst_plan_idx: u16,
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[allow(dead_code)]
+    pub(super) exc_plan_idx: u16,
     /// For recording a frame as `R.addframe` does (see
     /// [`Vm::py_addframe`]): `R.FILES` (file names by module index), the
     /// frame entry template `R.FRAMETMPL` and its shape (`shape::DICT`:
@@ -331,6 +422,8 @@ pub(crate) struct PyRt {
     pub(super) tb_keep: usize,
     /// The generator record shape `vm::py_gen` found plain.
     pub(super) gen_shape: Cell<u32>,
+    /// The `T.list_iterator` record shape (`cls`, `seq`, `i`, `next`) `vm::py_gen` found plain.
+    pub(super) list_iter_shape: Cell<u32>,
     /// Shapes of function records (`R.func`'s literal, and the shapes its
     /// appends lead to) seen with their `globals` at `func_globals_slot`
     /// (`shape::DICT`: an empty place), for `Vm::py_globals_of`.
@@ -354,6 +447,9 @@ pub(crate) struct PyRt {
     pub(super) store_bodies: Vec<u8>,
     /// Cached validated store-body plans per code object (`Vm::py_store_call`).
     pub(super) store_plans: Vec<Option<StorePlan>>,
+    /// Pre-resolved fused `PyNew` + `StorePlan` entries for JIT (`jit_py_new_fused_fast`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+    pub(super) new_fused_plans: std::cell::RefCell<Vec<NewFusedPlan>>,
     /// Cached acyclic leaf-body scans per code object (`vm::py_leaf`).
     pub(super) leaf_bodies: Vec<super::py_attr::py_leaf::LeafSlot>,
     /// Compiled native x86-64 micro-JIT bodies for pure-int self-recursive
@@ -366,12 +462,18 @@ pub(crate) struct PyRt {
     /// template's `Arc` changed its count twice per record.
     #[cfg(not(feature = "safe-sandbox"))]
     pub(super) plans: Vec<crate::bytecode::StaticKeyPlan>,
+    /// One-shot flag set when `jit_py_leaf_noalloc` (or `py_leaf_call_site`)
+    /// bailed out of a leaf call so the immediate fallback (`jit_py_call` /
+    /// `py_step_call`) pushes the frame directly instead of re-running `py_leaf`.
+    pub(super) skip_leaf_once: Cell<bool>,
     /// Direct-mapped cache of Python `hash(s)` keyed by `(heap_idx, version)`.
     pub(crate) str_hashes: Box<[Cell<StrHashEntry>]>,
     /// Direct-mapped cache of `super().method()` lookups (`Vm::py_smfind`).
     pub(super) smfind_cache: Box<[Cell<SmfindEntry>]>,
     /// Direct-mapped cache of MRO membership checks (`py_isinstance`, `py_exc_record`).
     pub(super) isinstance_cache: Box<[Cell<IsInstEntry>]>,
+    /// Direct-mapped cache of unmodified `dict`/`str` subclass dunder flags.
+    pub(super) sub_kind_cache: Box<[Cell<SubKindEntry>]>,
 }
 
 /// The first bytes of the string constant a Python code object's frame
@@ -452,6 +554,235 @@ pub(super) const INST_KEYS: [&str; 2] = ["cls", "dict"];
 pub(super) const FRAME_KEYS: [&str; 4] = ["file", "line", "name", "fn"];
 /// A slice record's keys (`R.slice`'s literal, `R.SLICETMPL`).
 pub(super) const SLICE_KEYS: [&str; 4] = ["cls", "start", "stop", "step"];
+/// A dict/set/frozenset record's keys.
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+pub(super) const DICT_KEYS: [&str; 3] = ["cls", "map", "size"];
+
+#[inline]
+pub(crate) fn py_seq_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(SEQ_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+#[inline]
+pub(crate) fn py_inst_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(INST_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+#[inline]
+pub(crate) fn py_exc_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(EXC_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+#[inline]
+pub(crate) fn py_dict_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(DICT_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+#[inline]
+pub(crate) fn py_slice_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(SLICE_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
+#[inline]
+pub(crate) fn py_frame_static_plan() -> &'static crate::bytecode::StaticKeyPlan {
+    static PLAN: std::sync::OnceLock<crate::bytecode::StaticKeyPlan> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        crate::bytecode::StaticKeyPlan::new(FRAME_KEYS.iter().map(|&s| s.to_owned()).collect())
+    })
+}
+
+/// Read a class record's own non-accessor field at `slot` expecting `name`.
+#[inline]
+fn py_ty_field_in(heap: &crate::heap::Heap, ci: u32, slot: usize, name: &str) -> Option<Value> {
+    let HeapObj::Object(m) = heap.get(ci) else {
+        return None;
+    };
+    if m.is_ctor || slot >= m.slot_len() || m.is_accessor_at(slot) || !key_eq(m.key_at(slot), name) {
+        return None;
+    }
+    Some(m.val_at(slot))
+}
+
+/// Cached builtin-subclass dunder capability bitmask (`SUB_*`) for class `cls`,
+/// callable with just `(&Heap, &PyRt)` (used by both `Vm::py_sub_kind` and
+/// `py_table::classify`).
+#[inline]
+pub(super) fn py_sub_kind_in(heap: &crate::heap::Heap, p: &PyRt, cls: Value) -> u16 {
+    if !cls.is_heap() {
+        return 0;
+    }
+    let cb = cls.bits();
+    let (t_dict, t_str, t_list, t_tuple) = (
+        p.t_dict.bits(),
+        p.t_str.bits(),
+        p.t_list.bits(),
+        p.t_tuple.bits(),
+    );
+    if cb == t_dict {
+        return SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN;
+    }
+    if cb == t_str {
+        return SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ;
+    }
+    if cb == t_list {
+        return SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN;
+    }
+    if cb == t_tuple {
+        return SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ;
+    }
+    let Some(ty) = p.ty else {
+        return 0;
+    };
+    let ci = cls.heap_index();
+    let hver = heap.version_of(ci);
+    let ver = match heap.get(ci) {
+        HeapObj::Object(m)
+            if !m.is_ctor && ty.ver < m.slot_len() && key_eq(m.key_at(ty.ver), "ver") =>
+        {
+            m.val_at(ty.ver).bits()
+        }
+        _ => return 0,
+    };
+    let slot = (ci as usize) & (SUB_KIND_CACHE_LEN - 1);
+    let ce = p.sub_kind_cache[slot].get();
+    if ce.tag != 0 && ce.cls == cb && ce.hver == hver && ce.ver == ver {
+        return ce.tag - 1;
+    }
+    py_sub_kind_slow_in(heap, p, cls, ci, hver, ver, slot, ty, t_dict, t_str, t_list, t_tuple)
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn py_sub_kind_slow_in(
+    heap: &crate::heap::Heap,
+    p: &PyRt,
+    cls: Value,
+    ci: u32,
+    hver: u32,
+    ver: u64,
+    slot: usize,
+    ty: TySlots,
+    t_dict: u64,
+    t_str: u64,
+    t_list: u64,
+    t_tuple: u64,
+) -> u16 {
+    let mut flags = 0u16;
+    if let Some(mro) = py_ty_field_in(heap, ci, ty.mro, "mro") {
+        if mro.is_heap() {
+            if let HeapObj::Array(items) = heap.get(mro.heap_index()) {
+                // Scan MRO ancestors ahead of the matched builtin base to clear
+                // any dunder overridden by a subclass.
+                let check_ancestors = |ancs: &[Value], init: u16, mask: fn(&[u8], &mut u16)| -> u16 {
+                    let mut f = init;
+                    for &anc in ancs {
+                        let Some(dval) = anc
+                            .is_heap()
+                            .then(|| py_ty_field_in(heap, anc.heap_index(), ty.dict, "dict"))
+                            .flatten()
+                        else {
+                            return 0;
+                        };
+                        if !dval.is_heap() {
+                            return 0;
+                        }
+                        let HeapObj::Map { keys, .. } = heap.get(dval.heap_index()) else {
+                            return 0;
+                        };
+                        for &k in keys {
+                            if k.is_hole() {
+                                continue;
+                            }
+                            if !k.is_heap() {
+                                return 0;
+                            }
+                            let HeapObj::Str(s) = heap.get(k.heap_index()) else {
+                                return 0;
+                            };
+                            mask(s.as_bytes(), &mut f);
+                        }
+                        if f == 0 {
+                            break;
+                        }
+                    }
+                    f
+                };
+                if let Some(pos) = items.iter().position(|x| x.bits() == t_dict) {
+                    flags = check_ancestors(
+                        &items[..pos],
+                        SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN,
+                        |b, f| match b {
+                            b"__getitem__" => *f &= !(SUB_DICT_GET | SUB_DICT_GET_HIT),
+                            b"__missing__" => *f &= !SUB_DICT_GET,
+                            b"__setitem__" => *f &= !SUB_DICT_SET,
+                            b"__len__" | b"__bool__" => *f &= !SUB_DICT_LEN,
+                            _ => {}
+                        },
+                    );
+                } else if let Some(pos) = items.iter().position(|x| x.bits() == t_str) {
+                    flags = check_ancestors(
+                        &items[..pos],
+                        SUB_STR_GET | SUB_STR_LEN | SUB_STR_HASH_EQ,
+                        |b, f| match b {
+                            b"__getitem__" => *f &= !SUB_STR_GET,
+                            b"__len__" | b"__bool__" => *f &= !SUB_STR_LEN,
+                            b"__hash__" | b"__eq__" => *f &= !SUB_STR_HASH_EQ,
+                            _ => {}
+                        },
+                    );
+                } else if let Some(pos) = items.iter().position(|x| x.bits() == t_list) {
+                    flags = check_ancestors(
+                        &items[..pos],
+                        SUB_LIST_GET | SUB_LIST_SET | SUB_LIST_LEN,
+                        |b, f| match b {
+                            b"__getitem__" => *f &= !SUB_LIST_GET,
+                            b"__setitem__" => *f &= !SUB_LIST_SET,
+                            b"__len__" | b"__bool__" => *f &= !SUB_LIST_LEN,
+                            _ => {}
+                        },
+                    );
+                } else if let Some(pos) = items.iter().position(|x| x.bits() == t_tuple) {
+                    flags = check_ancestors(
+                        &items[..pos],
+                        SUB_TUPLE_GET | SUB_TUPLE_LEN | SUB_TUPLE_HASH_EQ,
+                        |b, f| match b {
+                            b"__getitem__" => *f &= !SUB_TUPLE_GET,
+                            b"__len__" | b"__bool__" => *f &= !SUB_TUPLE_LEN,
+                            b"__hash__" | b"__eq__" => *f &= !SUB_TUPLE_HASH_EQ,
+                            _ => {}
+                        },
+                    );
+                }
+            }
+        }
+    }
+    p.sub_kind_cache[slot].set(SubKindEntry {
+        cls: cls.bits(),
+        hver,
+        ver,
+        tag: flags + 1,
+    });
+    flags
+}
 
 impl PyRt {
     fn new(r: Value) -> PyRt {
@@ -461,9 +792,14 @@ impl PyRt {
             t_tuple: Value::UNDEFINED,
             t_dict: Value::UNDEFINED,
             t_set: Value::UNDEFINED,
+            t_frozenset: Value::UNDEFINED,
             t_str: Value::UNDEFINED,
             t_slice: Value::UNDEFINED,
             t_module: Value::UNDEFINED,
+            t_method: Value::UNDEFINED,
+            t_list_iter: Value::UNDEFINED,
+            t_type: Value::UNDEFINED,
+            stop: Value::UNDEFINED,
             ebase: Value::UNDEFINED,
             istypes: [Value::UNDEFINED; 6],
             builtins: Value::UNDEFINED,
@@ -480,12 +816,23 @@ impl PyRt {
             dict_slots: [1, 2],
             ty: None,
             mself_slot: None,
+            smfnative: Value::UNDEFINED,
+            seq_tmpl_hver: u32::MAX,
+            inst_tmpl_hver: u32::MAX,
+            exc_tmpl_hver: u32::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            seq_plan_idx: u16::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            inst_plan_idx: u16::MAX,
+            #[cfg(not(feature = "safe-sandbox"))]
+            exc_plan_idx: u16::MAX,
             files: Value::UNDEFINED,
             exc_entries: Value::UNDEFINED,
             frame_tmpl: Value::UNDEFINED,
             frame_shape: crate::shape::DICT,
             tb_keep: 0,
             gen_shape: Cell::new(crate::shape::DICT),
+            list_iter_shape: Cell::new(crate::shape::DICT),
             func_shapes: Cell::new([crate::shape::DICT; 4]),
             func_globals_slot: Cell::new(0),
             gen_rt: Cell::new(None),
@@ -497,14 +844,18 @@ impl PyRt {
             layouts: Default::default(),
             store_bodies: Vec::new(),
             store_plans: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
+            new_fused_plans: std::cell::RefCell::new(Vec::new()),
             leaf_bodies: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             rec_jits: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             plans: Vec::new(),
+            skip_leaf_once: Cell::new(false),
             str_hashes: (0..STR_HASH_CACHE_LEN).map(|_| Cell::new(StrHashEntry::default())).collect(),
             smfind_cache: (0..SMFIND_CACHE_LEN).map(|_| Cell::new(SmfindEntry::default())).collect(),
             isinstance_cache: (0..ISINST_CACHE_LEN).map(|_| Cell::new(IsInstEntry::default())).collect(),
+            sub_kind_cache: (0..SUB_KIND_CACHE_LEN).map(|_| Cell::new(SubKindEntry::default())).collect(),
         }
     }
 }
@@ -532,6 +883,7 @@ fn caches(i: &crate::bytecode::Instr) -> bool {
             | Instr::PyNew { .. }
             | Instr::PyCallEntry { .. }
             | Instr::PyCall { .. }
+            | Instr::PyDictGet { .. }
     )
 }
 
@@ -651,9 +1003,6 @@ impl<'p> Vm<'p> {
         let Some((_, tb_slot)) = self.py_exc_record(e, r, false) else {
             return false;
         };
-        if !self.py_alloc_like_ok(tmpl, shape) {
-            return false;
-        }
         let ei = e.heap_index();
         let HeapObj::Object(m) = self.heap.get(ei) else {
             return false;
@@ -683,8 +1032,61 @@ impl<'p> Vm<'p> {
         if tbfn.is_some_and(|t| t.bits() == f.bits()) {
             return false;
         }
+        // Fast lazy raw-pair path: for standard `exc_shape` records, record
+        // raw `[Value::int(line), f]` pairs directly in slot 9 (`frames`)
+        // without allocating `{file, line, name, fn}` Objects or calling
+        // `set_prop`. `core.js:normFrames` expands them lazily only when a
+        // traceback/location is actually inspected.
+        if exc_layout {
+            match frames {
+                None => {
+                    if tbline.is_number() && tbline.as_f64() == -1.0 {
+                        if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                            m.set_val_at(tb_slot, Value::int(line));
+                        }
+                    }
+                    let mut buf = self.heap.take_arr_buf(4);
+                    buf.push(Value::int(line));
+                    buf.push(f);
+                    let arr_idx = self.heap.alloc_array_settled(buf);
+                    let arr = Value::heap(arr_idx);
+                    self.heap.write_barrier_val(ei, arr);
+                    if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                        m.set_val_at(9, arr);
+                    }
+                    return true;
+                }
+                Some(fr) if fr.is_heap()
+                    && (self.array_js_len.is_empty() || !self.array_js_len.contains_key(&fr.heap_index()))
+                    && (self.arr_props.is_empty() || !self.arr_props.contains_key(&fr.heap_index())) =>
+                {
+                    let fi = fr.heap_index();
+                    let raw_ok = matches!(
+                        self.heap.get(fi),
+                        HeapObj::Array(items) if (items.is_empty() || items[0].is_int()) && items.len() / 2 < keep
+                    );
+                    if raw_ok {
+                        if tbline.is_number() && tbline.as_f64() == -1.0 {
+                            if let HeapObj::Object(m) = self.heap.get_mut(ei) {
+                                m.set_val_at(tb_slot, Value::int(line));
+                            }
+                        }
+                        self.heap.write_barrier_val(fi, f);
+                        if let HeapObj::Array(items) = self.heap.get_mut(fi) {
+                            items.push(Value::int(line));
+                            items.push(f);
+                        }
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
         // `frames`: none yet, or an Array with room whose last entry was not
         // left open by `f` (else the runtime closes that entry).
+        if !self.py_alloc_like_ok(tmpl, shape) {
+            return false;
+        }
         if let Some(fr) = frames {
             if !fr.is_heap() || self.array_js_len.contains_key(&fr.heap_index()) || self.arr_props.contains_key(&fr.heap_index()) {
                 return false;
@@ -816,9 +1218,14 @@ impl<'p> Vm<'p> {
         rt.t_tuple = own(self, "TTUPLE");
         rt.t_dict = own(self, "TDICT");
         rt.t_set = own(self, "TSET");
+        rt.t_frozenset = own(self, "TFROZENSET");
         rt.t_str = own(self, "TSTR");
         rt.t_slice = own(self, "TSLICE");
         rt.t_module = own(self, "TMODULE");
+        rt.t_method = own(self, "TMETHOD");
+        rt.t_list_iter = own(self, "TLISTITER");
+        rt.t_type = own(self, "TTYPE");
+        rt.stop = own(self, "STOP");
         rt.ebase = own(self, "EBASE");
         rt.builtins = own(self, "BUILTINS");
         rt.excstack = own(self, "EXCSTACK");
@@ -845,6 +1252,56 @@ impl<'p> Vm<'p> {
         rt.seq_shape = self.py_template_shape(rt.seq_tmpl, &SEQ_KEYS);
         rt.inst_shape = self.py_template_shape(rt.inst_tmpl, &INST_KEYS);
         rt.exc_shape = self.py_template_shape(rt.exc_tmpl, &EXC_KEYS);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut cache_plan = |tmpl: Value, shape: u32| -> (u32, u16) {
+            if !self.py_alloc_like_ok(tmpl, shape) {
+                return (u32::MAX, u16::MAX);
+            }
+            let hver = self.heap.version_of(tmpl.heap_index());
+            let idx = match self.heap.get(tmpl.heap_index()) {
+                HeapObj::Object(m) => match m.prop_keys() {
+                    crate::heap::PropKeys::Planned { all, .. } => {
+                        if let Some(i) = rt.plans.iter().position(|k| all.is(k)) {
+                            i as u16
+                        } else if rt.plans.len() < 8 {
+                            let i = rt.plans.len() as u16;
+                            rt.plans.push(all.to_plan());
+                            i
+                        } else {
+                            u16::MAX
+                        }
+                    }
+                    _ => u16::MAX,
+                },
+                _ => u16::MAX,
+            };
+            (hver, idx)
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let (sh, si) = cache_plan(rt.seq_tmpl, rt.seq_shape);
+            rt.seq_tmpl_hver = sh;
+            rt.seq_plan_idx = si;
+            let (ih, ii) = cache_plan(rt.inst_tmpl, rt.inst_shape);
+            rt.inst_tmpl_hver = ih;
+            rt.inst_plan_idx = ii;
+            let (eh, ei) = cache_plan(rt.exc_tmpl, rt.exc_shape);
+            rt.exc_tmpl_hver = eh;
+            rt.exc_plan_idx = ei;
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            if self.py_alloc_like_ok(rt.seq_tmpl, rt.seq_shape) {
+                rt.seq_tmpl_hver = self.heap.version_of(rt.seq_tmpl.heap_index());
+            }
+            if self.py_alloc_like_ok(rt.inst_tmpl, rt.inst_shape) {
+                rt.inst_tmpl_hver = self.heap.version_of(rt.inst_tmpl.heap_index());
+            }
+            if self.py_alloc_like_ok(rt.exc_tmpl, rt.exc_shape) {
+                rt.exc_tmpl_hver = self.heap.version_of(rt.exc_tmpl.heap_index());
+            }
+        }
+        rt.smfnative = own(self, "SMFNATIVE");
         let slice_tmpl = own(self, "SLICETMPL");
         rt.slice_shape = self.py_template_shape(slice_tmpl, &SLICE_KEYS);
         rt.dict_shape = self.py_template_shape(dict, &["cls", "map", "size"]);
@@ -861,8 +1318,8 @@ impl<'p> Vm<'p> {
         }
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
-            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_str, rt.t_slice, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
-            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries,
+            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_frozenset, rt.t_str, rt.t_slice, rt.t_module, rt.t_method, rt.t_list_iter, rt.t_type, rt.stop, rt.ebase, rt.builtins, rt.excstack,
+            rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries, rt.smfnative,
         ];
         keep.extend_from_slice(&rt.istypes);
         let pi = pins.heap_index();
@@ -948,6 +1405,10 @@ impl<'p> Vm<'p> {
             sp: at("sp")?,
             gv: at("gv")?,
             ver: at("ver")?,
+            truth_ver: at("truthVer")?,
+            truth_kind: at("truthKind")?,
+            truth_fn: at("truthFn")?,
+            dict: at("dict")?,
         })
     }
 
@@ -1006,8 +1467,19 @@ impl<'p> Vm<'p> {
             return None;
         }
         let by_name = || {
-            let c = m.pos("cls").filter(|&s| !m.is_accessor_at(s))?;
-            let d = m.pos("dict").filter(|&s| !m.is_accessor_at(s));
+            let slen = m.slot_len();
+            let c = if slen > 0 && !m.is_accessor_at(0) && key_eq(m.key_at(0), "cls") {
+                0
+            } else {
+                m.pos("cls").filter(|&s| !m.is_accessor_at(s))?
+            };
+            let d = if slen > 1 && !m.is_accessor_at(1) && key_eq(m.key_at(1), "dict") {
+                Some(1)
+            } else if slen > 2 && !m.is_accessor_at(2) && key_eq(m.key_at(2), "dict") {
+                Some(2)
+            } else {
+                m.pos("dict").filter(|&s| !m.is_accessor_at(s))
+            };
             Some((m.val_at(c), d.map_or(Value::UNDEFINED, |s| m.val_at(s))))
         };
         // `shape::DICT` is also what the registry holds for a template it
@@ -1051,6 +1523,9 @@ impl<'p> Vm<'p> {
                     return Some(m.val_at(0));
                 }
             }
+        }
+        if m.slot_len() > 0 && !m.is_accessor_at(0) && key_eq(m.key_at(0), "cls") {
+            return Some(m.val_at(0));
         }
         let c = m.pos("cls").filter(|&s| !m.is_accessor_at(s))?;
         Some(m.val_at(c))
@@ -1156,6 +1631,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Cached builtin-subclass dunder capability bitmask (`SUB_*`) for class
+    /// `cls`. Returns 0 for non-subclasses or any class whose MRO ahead of the
+    /// builtin base overrides the relevant dunder.
+    #[inline]
+    pub(super) fn py_sub_kind(&self, cls: Value) -> u16 {
+        match self.py_rt.as_deref() {
+            Some(p) => py_sub_kind_in(&self.heap, p, cls),
+            None => 0,
+        }
+    }
+
     /// This site's cache entry (kind 0 when it has none).
     #[inline]
     pub(super) fn py_ic(&self, func_id: u32, ip: usize) -> PyIc {
@@ -1236,6 +1722,37 @@ impl<'p> Vm<'p> {
             }
             *ents = kept;
         }
+    }
+
+    /// Read-only polymorphic lookup: returns the current entry when its `a`
+    /// matches `key`, else any alternate way in `alts` matching `key`.
+    #[inline]
+    pub(super) fn py_ic_for_class(&self, func_id: u32, ip: usize, key: u64) -> PyIc {
+        let Some(p) = self.py_rt.as_deref() else {
+            return PyIc::default();
+        };
+        let Some(Some(fic)) = p.ics.get(func_id as usize) else {
+            return PyIc::default();
+        };
+        let Some(&s) = fic.slot_of.get(ip) else {
+            return PyIc::default();
+        };
+        if s == u16::MAX {
+            return PyIc::default();
+        }
+        let s = s as usize;
+        let e = fic.ents[s];
+        if e.a == key || e.kind == 0 {
+            return e;
+        }
+        if let Some(ents) = fic.alts.as_deref().and_then(|all| all.get(s)) {
+            for a in ents {
+                if a.kind != 0 && a.a == key {
+                    return *a;
+                }
+            }
+        }
+        e
     }
 
     /// This site's cache entry for the class (or record) whose bits are

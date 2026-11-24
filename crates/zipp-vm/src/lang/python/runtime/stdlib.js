@@ -35,6 +35,7 @@
     // The '0' flag, or an explicit '0' fill with '=' alignment.
     const zeroPadded = (s) => (s.zero && s.align === undefined) || (s.fill === "0" && s.align === "=");
     function applyAlign(body, s, defaultAlign, signChar) {
+        if (s.width === 0) return (signChar || "") + body;
         let fill = s.fill, align = s.align;
         if (align === undefined) { if (s.zero && s.type !== "s") { fill = "0"; align = "="; } else align = defaultAlign; }
         if (fill === undefined) fill = s.zero && align === "=" ? "0" : " ";
@@ -249,15 +250,26 @@
     }
     function formatValue(v, spec) {
         if (typeof v === "string") {
+            if (spec === "") return v;
             const s = parseSpec(spec);
             if (s.type !== undefined && s.type !== "s") fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'str'");
             if (s.sign !== "-" && spec.includes(s.sign)) fail(E.ValueError, "Sign not allowed in string format specifier");
             let body = v; if (s.precision !== null) body = codepoints(v).slice(0, s.precision).join("");
             return applyAlign(body, s, "<", "");
         }
+        if (typeof v === "bigint" && spec === "") return v.toString();
         if (typeof v === "boolean" && spec === "") return v ? "True" : "False";
         if (isInt(v)) return formatInt(asInt(v), parseSpec(spec));
-        if (typeof v === "number") { const s = parseSpec(spec); if (s.type && "bcdoxXn".includes(s.type)) fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'float'"); return formatFloat(v, s, s.type); }
+        if (typeof v === "number") {
+            if (spec === "") {
+                if (Number.isNaN(v)) return "nan";
+                if (!Number.isFinite(v)) return v < 0 ? "-inf" : "inf";
+                return (v < 0 || Object.is(v, -0) ? "-" : "") + rt.floatRepr(Math.abs(v));
+            }
+            const s = parseSpec(spec);
+            if (s.type && "bcdoxXn".includes(s.type)) fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'float'");
+            return formatFloat(v, s, s.type);
+        }
         if (v === null && spec === "") return "None";
         const m = typeMethod(v, "__format__");
         // An int/float/str subclass instance formats its value unless it defines __format__.
@@ -1894,7 +1906,7 @@
         // deque, tuple subclasses such as OrderedDict, defaultdict, Counter).
         // Native fields (an exception's args, a deque's maxlen, a boxed
         // value) carry over; typed-array buffers are duplicated by deepcopy.
-        const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "map", "size"]);
+        const SKIP = new Set(["id", "dictView", "cls", "dict", "items", "buf", "map", "size"]);
         const ATOMIC = new Set([T.function, T.module, T.builtin_function_or_method, T.range, T.bytes, T.property, T.classmethod, T.staticmethod, T.complex]);
         const isAtomic = (v) => v === null || typeof v !== "object" || v.cls === undefined || isType(v) || ATOMIC.has(v.cls) || (v.cls === T.frozenset && v.dict === undefined);
         const objectReduce = rt.ObjectType.dict.get("__reduce__");
@@ -1925,6 +1937,11 @@
                 } else for (const [k, x] of v.dict) o.dict.set(k, f(x));
             }
             if (Array.isArray(v.items)) { const items = []; for (const x of v.items) items.push(f(x)); o.items = items; }
+            if (Array.isArray(v.buf) && typeof v.head === "number" && typeof v.len === "number") {
+                const nb = new Array(v.buf.length), m = v.buf.length - 1, h = v.head, n = v.len;
+                for (let i = 0; i < n; i++) { const idx = (h + i) & m; nb[idx] = f(v.buf[idx]); }
+                o.buf = nb;
+            }
             if (v.map !== undefined && isInstance(v, T.dict)) {
                 const setitem = typeMethod(v, "__setitem__");
                 const plain = setitem === undefined || setitem === null || setitem.isBase === true;
@@ -2949,32 +2966,133 @@
         Counter.dict.set("__neg__", builtin("__neg__", 1, (a) => { const out = rt.construct(Counter, [], null); for (const [k, v] of dictEntries(a[0])) if (cmp("lt", v, 0n)) dictSet(out, k, R.unop("neg", v)); return out; }));
         for (const [name, op] of [["__add__", "add"], ["__sub__", "sub"], ["__or__", "or"], ["__and__", "and"]]) Counter.dict.set(name, builtin(name, 2, (a) => { const out = rt.construct(Counter, [], null); const keys = new Set(); const all = []; for (const [k] of dictEntries(a[0])) { const kk = rt.keyOf(k); if (!keys.has(kk)) { keys.add(kk); all.push(k); } } for (const [k] of dictEntries(a[1])) { const kk = rt.keyOf(k); if (!keys.has(kk)) { keys.add(kk); all.push(k); } } for (const k of all) { const x = dictGet(a[0], k) || 0n, y = dictGet(a[1], k) || 0n; let v; if (op === "add") v = R.binop("add", x, y); else if (op === "sub") v = R.binop("sub", x, y); else if (op === "or") v = cmp("gt", x, y) ? x : y; else v = cmp("lt", x, y) ? x : y; if (cmp("gt", v, 0n)) dictSet(out, k, v); } return out; }));
         g.set("Counter", Counter);
+        // Circular ring buffer for O(1) append/appendleft/pop/popleft.
+        const dqArr = (d) => {
+            const n = d.len, b = d.buf, m = b.length - 1, h = d.head;
+            const out = new Array(n);
+            for (let i = 0; i < n; i++) out[i] = b[(h + i) & m];
+            return out;
+        };
+        const dqGrow = (d) => {
+            const old = d.buf, cap = old.length, n = d.len, m = cap - 1, h = d.head;
+            const nb = new Array(cap << 1);
+            for (let i = 0; i < n; i++) nb[i] = old[(h + i) & m];
+            d.buf = nb; d.head = 0;
+        };
+        const dqPush = (d, v) => {
+            if (d.maxlen === 0) return;
+            if (d.maxlen !== null && d.len === d.maxlen) {
+                const mask = d.buf.length - 1;
+                d.buf[d.head] = undefined;
+                d.buf[(d.head + d.len) & mask] = v;
+                d.head = (d.head + 1) & mask;
+                return;
+            }
+            if (d.len === d.buf.length) dqGrow(d);
+            d.buf[(d.head + d.len) & (d.buf.length - 1)] = v;
+            d.len++;
+        };
+        const dqPushLeft = (d, v) => {
+            if (d.maxlen === 0) return;
+            if (d.maxlen !== null && d.len === d.maxlen) {
+                const mask = d.buf.length - 1;
+                d.buf[(d.head + d.len - 1) & mask] = undefined;
+                d.head = (d.head - 1) & mask;
+                d.buf[d.head] = v;
+                return;
+            }
+            if (d.len === d.buf.length) dqGrow(d);
+            d.head = (d.head - 1) & (d.buf.length - 1);
+            d.buf[d.head] = v;
+            d.len++;
+        };
+        const dqPop = (d) => {
+            if (d.len === 0) fail(E.IndexError, "pop from an empty deque");
+            d.len--;
+            const idx = (d.head + d.len) & (d.buf.length - 1);
+            const v = d.buf[idx]; d.buf[idx] = undefined;
+            return v;
+        };
+        const dqPopLeft = (d) => {
+            if (d.len === 0) fail(E.IndexError, "pop from an empty deque");
+            const v = d.buf[d.head]; d.buf[d.head] = undefined;
+            d.head = (d.head + 1) & (d.buf.length - 1);
+            d.len--;
+            return v;
+        };
+        const dqSetFrom = (d, arr) => {
+            let cap = 8; while (cap < arr.length) cap <<= 1;
+            const nb = new Array(cap);
+            for (let i = 0; i < arr.length; i++) nb[i] = arr[i];
+            d.buf = nb; d.head = 0; d.len = arr.length;
+        };
         const Deque = pyClass("deque", "collections", {
-            __init__: (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; a[0].items = a[1] === undefined || a[1] === null ? [] : drain(a[1]); const ml = a[2] !== undefined ? a[2] : kwget(kw, "maxlen", null); a[0].maxlen = ml === null ? null : Number(needInt(ml)); if (a[0].maxlen !== null) while (a[0].items.length > a[0].maxlen) a[0].items.shift(); return null; },
-            append: (a) => { a[0].items.push(a[1]); if (a[0].maxlen !== null && a[0].items.length > a[0].maxlen) a[0].items.shift(); return null; },
-            appendleft: (a) => { a[0].items.unshift(a[1]); if (a[0].maxlen !== null && a[0].items.length > a[0].maxlen) a[0].items.pop(); return null; },
-            pop: (a) => { if (!a[0].items.length) fail(E.IndexError, "pop from an empty deque"); return a[0].items.pop(); },
-            popleft: (a) => { if (!a[0].items.length) fail(E.IndexError, "pop from an empty deque"); return a[0].items.shift(); },
-            extend: (a) => { for (const x of drain(a[1])) { a[0].items.push(x); if (a[0].maxlen !== null && a[0].items.length > a[0].maxlen) a[0].items.shift(); } return null; },
-            extendleft: (a) => { for (const x of drain(a[1])) { a[0].items.unshift(x); if (a[0].maxlen !== null && a[0].items.length > a[0].maxlen) a[0].items.pop(); } return null; },
-            clear: (a) => { a[0].items.length = 0; return null; },
-            rotate: (a) => { const n = a[1] === undefined ? 1 : Number(needInt(a[1])); const it = a[0].items; if (!it.length) return null; const k = ((n % it.length) + it.length) % it.length; a[0].items = it.slice(it.length - k).concat(it.slice(0, it.length - k)); return null; },
-            __len__: (a) => BigInt(a[0].items.length),
-            __iter__: (a) => iter(list(a[0].items)),
-            __getitem__: (a) => getitem(list(a[0].items), a[1]),
-            __setitem__: (a) => { a[0].items[Number(needInt(a[1]))] = a[2]; return null; },
-            __contains__: (a) => rt.contains(list(a[0].items), a[1]),
-            __bool__: (a) => a[0].items.length > 0,
-            __repr__: (a) => "deque(" + repr(list(a[0].items)) + (a[0].maxlen !== null ? ", maxlen=" + a[0].maxlen : "") + ")",
-            __eq__: (a) => a[1] !== null && typeof a[1] === "object" && a[1].items !== undefined ? eq(list(a[0].items), list(a[1].items)) : NOTIMPL,
-            count: (a) => BigInt(rt.acount(a[0].items, (x) => eq(x, a[1]))),
-            index: (a) => { const i = rt.aindex(a[0].items, (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "not in deque"); return BigInt(i); },
-            remove: (a) => { const i = rt.aindex(a[0].items, (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "deque.remove(x): x not in deque"); a[0].items.splice(i, 1); return null; },
-            reverse: (a) => { a[0].items.reverse(); return null; },
-            copy: (a) => { const o = rt.construct(a[0].cls, [list(a[0].items)], null); o.maxlen = a[0].maxlen; return o; },
+            __init__: (a) => {
+                const kw = a[a.length - 1] instanceof Map ? a.pop() : null;
+                const d = a[0];
+                const ml = a[2] !== undefined ? a[2] : kwget(kw, "maxlen", null);
+                const max = ml === null ? null : Number(needInt(ml));
+                if (max !== null && max < 0) fail(E.ValueError, "maxlen must be non-negative");
+                d.maxlen = max;
+                const src = a[1] === undefined || a[1] === null ? [] : drain(a[1]);
+                const trimmed = max !== null && src.length > max ? src.slice(src.length - max) : src;
+                dqSetFrom(d, trimmed);
+                return null;
+            },
+            append: (a) => { dqPush(a[0], a[1]); return null; },
+            appendleft: (a) => { dqPushLeft(a[0], a[1]); return null; },
+            pop: (a) => dqPop(a[0]),
+            popleft: (a) => dqPopLeft(a[0]),
+            extend: (a) => { const d = a[0]; for (const x of drain(a[1])) dqPush(d, x); return null; },
+            extendleft: (a) => { const d = a[0]; for (const x of drain(a[1])) dqPushLeft(d, x); return null; },
+            clear: (a) => { a[0].buf = new Array(8); a[0].head = 0; a[0].len = 0; return null; },
+            rotate: (a) => {
+                const d = a[0], n = a[1] === undefined ? 1 : Number(needInt(a[1]));
+                if (d.len <= 1) return null;
+                const k = ((n % d.len) + d.len) % d.len;
+                if (k === 0) return null;
+                if (k <= (d.len >> 1)) { for (let i = 0; i < k; i++) dqPushLeft(d, dqPop(d)); }
+                else { for (let i = 0; i < d.len - k; i++) dqPush(d, dqPopLeft(d)); }
+                return null;
+            },
+            __len__: (a) => BigInt(a[0].len),
+            __iter__: (a) => iter(list(dqArr(a[0]))),
+            __getitem__: (a) => {
+                const d = a[0];
+                if (isInt(a[1])) {
+                    let i = Number(asInt(a[1]));
+                    if (i < 0) i += d.len;
+                    if (i < 0 || i >= d.len) fail(E.IndexError, "deque index out of range");
+                    return d.buf[(d.head + i) & (d.buf.length - 1)];
+                }
+                return getitem(list(dqArr(d)), a[1]);
+            },
+            __setitem__: (a) => {
+                const d = a[0];
+                let i = Number(needInt(a[1]));
+                if (i < 0) i += d.len;
+                if (i < 0 || i >= d.len) fail(E.IndexError, "deque index out of range");
+                d.buf[(d.head + i) & (d.buf.length - 1)] = a[2];
+                return null;
+            },
+            __contains__: (a) => rt.contains(list(dqArr(a[0])), a[1]),
+            __bool__: (a) => a[0].len > 0,
+            __repr__: (a) => "deque(" + repr(list(dqArr(a[0]))) + (a[0].maxlen !== null ? ", maxlen=" + a[0].maxlen : "") + ")",
+            __eq__: (a) => a[1] !== null && typeof a[1] === "object" && (a[1].cls === Deque || isInstance(a[1], Deque)) ? eq(list(dqArr(a[0])), list(dqArr(a[1]))) : NOTIMPL,
+            count: (a) => BigInt(rt.acount(dqArr(a[0]), (x) => eq(x, a[1]))),
+            index: (a) => { const i = rt.aindex(dqArr(a[0]), (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "not in deque"); return BigInt(i); },
+            remove: (a) => { const arr = dqArr(a[0]); const i = rt.aindex(arr, (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "deque.remove(x): x not in deque"); arr.splice(i, 1); dqSetFrom(a[0], arr); return null; },
+            reverse: (a) => { const arr = dqArr(a[0]); arr.reverse(); dqSetFrom(a[0], arr); return null; },
+            copy: (a) => { const o = rt.construct(a[0].cls, [list(dqArr(a[0]))], null); o.maxlen = a[0].maxlen; return o; },
         });
         Deque.dict.get("__init__").kwnames = true;
-        rt.allocators.set(Deque, (cls) => ({ cls: cls, items: [], maxlen: null }));
+        Deque.dict.get("append").c2 = function (d, v) { dqPush(d, v); return null; };
+        Deque.dict.get("appendleft").c2 = function (d, v) { dqPushLeft(d, v); return null; };
+        Deque.dict.get("pop").c1 = function (d) { return dqPop(d); };
+        Deque.dict.get("popleft").c1 = function (d) { return dqPopLeft(d); };
+        Deque.dict.get("__len__").c1 = function (d) { return BigInt(d.len); };
+        Deque.dict.get("__bool__").c1 = function (d) { return d.len > 0; };
+        rt.allocators.set(Deque, (cls) => ({ cls: cls, buf: new Array(8), head: 0, len: 0, maxlen: null }));
         Deque.dict.set("maxlen", { cls: T.property, fget: builtin("maxlen", 1, (a) => a[0].maxlen === null ? null : BigInt(a[0].maxlen)), fset: null, fdel: null, doc: null });
         g.set("deque", Deque);
         const cgCol = { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => rt.makeGenericAlias(a[0], a[1])) };
@@ -2986,7 +3104,7 @@
             const defaults = drain(kwget(kw, "defaults", list([])));
             const cls = rt.newType(name, [T.tuple], new Map(), "main");
             cls.dict.set("_fields", tuple(fields.slice()));
-            const init = builtin("__new__", -1, (b) => { const kwm = b[b.length - 1] instanceof Map ? b.pop() : null; const items = b.slice(1); if (kwm) for (const [k, v] of kwm) { const i = fields.indexOf(k); if (i < 0) fail(E.TypeError, "unexpected keyword " + k); items[i] = v; } for (let i = items.length; i < fields.length; i++) { const d = defaults[i - (fields.length - defaults.length)]; if (d === undefined) fail(E.TypeError, name + " missing required argument: '" + fields[i] + "'"); items[i] = d; } if (items.length > fields.length) fail(E.TypeError, name + " takes " + fields.length + " positional arguments but " + items.length + " were given"); const o = { cls: b[0], items: items, dict: new Map() }; return o; });
+            const init = builtin("__new__", -1, (b) => { const kwm = b[b.length - 1] instanceof Map ? b.pop() : null; const items = b.slice(1); if (kwm) for (const [k, v] of kwm) { const i = fields.indexOf(k); if (i < 0) fail(E.TypeError, "unexpected keyword " + k); items[i] = v; } for (let i = items.length; i < fields.length; i++) { const d = defaults[i - (fields.length - defaults.length)]; if (d === undefined) fail(E.TypeError, name + " missing required argument: '" + fields[i] + "'"); items[i] = d; } if (items.length > fields.length) fail(E.TypeError, name + " takes " + fields.length + " positional arguments but " + items.length + " were given"); const o = { cls: b[0], items: items, dict: rt.attrs(23) }; return o; });
             init.kwnames = true;
             cls.dict.set("__new__", { cls: T.staticmethod, func: init });
             cls.dict.set("__init__", builtin("__init__", -1, () => null));
@@ -3187,8 +3305,16 @@
         fn(g, "heapreplace", 2, (a) => { const h = a[0].items; const top = h[0]; h[0] = a[1]; down(h, 0); return top; });
         // Pushes and pops of plain items natively (`vm::py_str`, ops 12, 13).
         if (rt.nativeEntry !== null) { rt.nativeEntry(g.get("heappush"), 2, 12); rt.nativeEntry(g.get("heappop"), 1, 13); }
-        fnkw(g, "nlargest", (a) => { const kw = kwOf(a, ["key"]); return list(rt.sortItems(drain(a[1]), kwget(kw, "key", null), true).slice(0, Number(needInt(a[0])))); });
-        fnkw(g, "nsmallest", (a) => { const kw = kwOf(a, ["key"]); return list(rt.sortItems(drain(a[1]), kwget(kw, "key", null), false).slice(0, Number(needInt(a[0])))); });
+        const topk = (a, largest) => {
+            const kw = kwOf(a, ["key"]), k = Number(needInt(a[0])), key = kwget(kw, "key", null);
+            if (key === null && rt.PYORD !== null && k > 0 && k <= 64 && a[1] !== null && typeof a[1] === "object" && (a[1].cls === T.list || a[1].cls === T.tuple)) {
+                const r = rt.PYORD(5, a[1].items, k, largest ? 1 : 0);
+                if (r !== undefined) return list(r);
+            }
+            return list(rt.sortItems(drain(a[1]), key, largest).slice(0, k));
+        };
+        fnkw(g, "nlargest", (a) => topk(a, true));
+        fnkw(g, "nsmallest", (a) => topk(a, false));
     });
     mod("bisect", (g) => {
         // bisect_*(a, x, lo=0, hi=None, *, key=None) over any sequence;
@@ -3638,16 +3764,43 @@
                 const m = re.exec(raw);
                 return m === null ? null : mk(m, raw, P, pos, n, pairs, raw, raw);
             };
-            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pSub = Pattern.dict.get("sub");
-            pSearch.c2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
-            pSearch.c3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
-            pMatch.c2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
-            pMatch.c3 = function (P, s, pos) { const r = patRun(P, sticky(P), s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
-            pSub.c3 = function (P, repl, s) { return subImpl(P, repl, s, 0, false); };
-            pSub.c4 = function (P, repl, s, count) { return subImpl(P, repl, s, Number(needInt(count)), false); };
-            const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mGroup = Match.dict.get("group");
+            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
+            let RE_STRM = null;
+            try { RE_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { RE_STRM = null; }
+            const mtmpl = { cls: Match, m: null, s: null, raw: null, t: null, p: null, pos: 0, endpos: 0, pairs: null };
+            const sJ2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const sJ3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            const mJ2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const mJ3 = function (P, s, pos) { const r = patRun(P, sticky(P), s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            const fJ2 = function (P, s) { const r = patRun(P, full(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const subJ3 = function (P, repl, s) { return subImpl(P, repl, s, 0, false); };
+            const subJ4 = function (P, repl, s, count) { return subImpl(P, repl, s, Number(needInt(count)), false); };
+            if (RE_STRM !== null) {
+                pSearch.strop = 38; pSearch.mtmpl = mtmpl; pSearch.j2 = sJ2; pSearch.j3 = sJ3; pSearch.c2 = RE_STRM; pSearch.c3 = RE_STRM;
+                pMatch.strop = 39; pMatch.mtmpl = mtmpl; pMatch.j2 = mJ2; pMatch.j3 = mJ3; pMatch.c2 = RE_STRM; pMatch.c3 = RE_STRM;
+                pFull.strop = 40; pFull.mtmpl = mtmpl; pFull.j2 = fJ2; pFull.c2 = RE_STRM;
+                pSub.strop = 41; pSub.j3 = subJ3; pSub.j4 = subJ4; pSub.c3 = RE_STRM; pSub.c4 = RE_STRM;
+            } else {
+                pSearch.c2 = sJ2; pSearch.c3 = sJ3;
+                pMatch.c2 = mJ2; pMatch.c3 = mJ3;
+                pFull.c2 = fJ2;
+                pSub.c3 = subJ3; pSub.c4 = subJ4;
+            }
+            pFindall.c2 = function (P, s) {
+                if (typeof s === "string" && !P.isBytes && RE_FINDALL_NATIVE !== null) {
+                    const fast = RE_FINDALL_NATIVE(P.re, s, 0, FINDALL_TUPLE_TMPL);
+                    if (fast !== undefined) return list(fast);
+                }
+                return this.code([P, s]);
+            };
+            pSplit.c2 = function (P, s) { return this.code([P, s]); };
+            const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mSpan = Match.dict.get("span"), mGroup = Match.dict.get("group");
             mStart.c1 = function (M) { const m = M.m; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, m.index) : m.index); };
+            mStart.c2 = function (M, gi) { return BigInt(span(M, gi)[0]); };
             mEnd.c1 = function (M) { const m = M.m; const u = m.index + m[0].length; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, u) : u); };
+            mEnd.c2 = function (M, gi) { return BigInt(span(M, gi)[1]); };
+            mSpan.c1 = function (M) { const m = M.m, u0 = m.index, u1 = u0 + m[0].length; return tuple(M.pairs !== null ? [BigInt(cpFromUtf16(M.pairs, u0)), BigInt(cpFromUtf16(M.pairs, u1))] : [BigInt(u0), BigInt(u1)]); };
+            mSpan.c2 = function (M, gi) { const sp = span(M, gi); return tuple([BigInt(sp[0]), BigInt(sp[1])]); };
             mGroup.c1 = function (M) { return M.p.isBytes ? latin1ToBytes(M.m[0]) : M.m[0]; };
             mGroup.c2 = function (M, gi) {
                 if (typeof gi === "bigint") {
@@ -3684,6 +3837,12 @@
                 else if (isBytesLike(repl)) fail(E.TypeError, "cannot use a bytes replacement with a string pattern");
             }
             const literal = replStr !== null && !replStr.includes("\\");
+            // Fast native regex replace for literal non-bytes unlimited `sub`:
+            // avoids JS match-object / slice loop and hits Rust `regex_replace_ascii`.
+            if (literal && count === 0 && !withCount && !P.isBytes) {
+                const jsRepl = replStr.includes("$") ? replStr.replace(/\$/g, "$$$$") : replStr;
+                return rt.checkedText(s.replace(re, jsRepl));
+            }
             let pairs = null, n0 = 0;
             if (!literal) { strInfo(s); pairs = rt.infoPairs; n0 = rt.infoLen; }
             while (pos <= s.length) {
@@ -3707,7 +3866,12 @@
         // whole astral character, never into the middle of its pair.
         function charWidth(s, i) { const c = s.charCodeAt(i); return c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00 ? 2 : 1; }
         const cache = new Map();
+        const strCache0 = new Map();
         function compile(pattern, flags) {
+            if (flags === 0n && typeof pattern === "string") {
+                const hit0 = strCache0.get(pattern);
+                if (hit0 !== undefined) return hit0;
+            }
             if (pattern !== null && typeof pattern === "object" && pattern.cls === Pattern) {
                 if (flags !== 0n) fail(E.ValueError, "cannot process flags argument with a compiled pattern");
                 return pattern;
@@ -3726,14 +3890,16 @@
             }
             const key = (isB ? "B:" : "S:") + srcText + " " + flags;
             const hit = cache.get(key);
-            if (hit !== undefined) return hit;
+            if (hit !== undefined) { if (!isB && flags === 0n) strCache0.set(srcText, hit); return hit; }
             const t = translate(srcText, effFlags);
             let re;
             try { re = new RegExp(t.source, (t.ignoreCase ? "i" : "") + "gu"); } catch (e) { fail(error, "bad pattern: " + (e && e.message)); }
             const flagsOut = isB ? (flags & ~32n) : (t.flags & 256n ? t.flags : t.flags | 32n);
             const p = { cls: Pattern, re: re, src: srcVal, isBytes: isB, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
-            if (cache.size > 512) cache.clear();
-            cache.set(key, p); return p;
+            if (cache.size > 512) { cache.clear(); strCache0.clear(); }
+            cache.set(key, p);
+            if (!isB && flags === 0n) strCache0.set(srcText, p);
+            return p;
         }
         const flagsOf = (a, k, kw) => { const f = a[k] !== undefined ? a[k] : kwget(kw, "flags", 0n); return isInt(f) ? asInt(f) : fail(E.TypeError, "flags must be an int"); };
         fnkw(g, "compile", (a) => { const kw = kwOf(a, ["flags"]); return compile(a[0], flagsOf(a, 1, kw)); });
@@ -3742,12 +3908,40 @@
         fnkw(g, "subn", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], a[2], Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); });
         // re.split(pattern, string, maxsplit=0, flags=0)
         fnkw(g, "split", (a) => { const kw = kwOf(a, ["maxsplit", "flags"]); return call(Pattern.dict.get("split"), [compile(a[0], flagsOf(a, 3, kw)), a[1], a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)], null); });
+        // Positional fast entries on module-level `re.*` functions to bypass
+        // `kwOf` / `call` trampolines on common calls.
+        {
+            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
+            const cCompile = g.get("compile");
+            cCompile.c1 = function (pat) { return compile(pat, 0n); };
+            cCompile.c2 = function (pat, fl) { return compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")); };
+            const cSearch = g.get("search");
+            cSearch.c2 = function (pat, s) { return pSearch.c2(compile(pat, 0n), s); };
+            cSearch.c3 = function (pat, s, fl) { return pSearch.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
+            const cMatch = g.get("match");
+            cMatch.c2 = function (pat, s) { return pMatch.c2(compile(pat, 0n), s); };
+            cMatch.c3 = function (pat, s, fl) { return pMatch.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
+            const cFull = g.get("fullmatch");
+            cFull.c2 = function (pat, s) { return pFull.c2(compile(pat, 0n), s); };
+            cFull.c3 = function (pat, s, fl) { return pFull.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
+            const cFindall = g.get("findall");
+            cFindall.c2 = function (pat, s) { return pFindall.c2(compile(pat, 0n), s); };
+            cFindall.c3 = function (pat, s, fl) { return pFindall.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
+            const cSub = g.get("sub");
+            cSub.c3 = function (pat, repl, s) { return pSub.c3(compile(pat, 0n), repl, s); };
+            cSub.c4 = function (pat, repl, s, cnt) { return pSub.c4(compile(pat, 0n), repl, s, cnt); };
+            const cSubn = g.get("subn");
+            cSubn.c3 = function (pat, repl, s) { return subImpl(compile(pat, 0n), repl, s, 0, true); };
+            const cSplit = g.get("split");
+            cSplit.c2 = function (pat, s) { return pSplit.code([compile(pat, 0n), s]); };
+            cSplit.c3 = function (pat, s, max) { return pSplit.code([compile(pat, 0n), s, max]); };
+        }
         // Only the characters special in a pattern are escaped (3.7+).
         fn(g, "escape", 1, (a) => {
             if (isBytesLike(a[0])) return latin1ToBytes(bytesToLatin1(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c));
             return needStr(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c);
         });
-        fn(g, "purge", 0, () => { cache.clear(); return null; });
+        fn(g, "purge", 0, () => { cache.clear(); strCache0.clear(); return null; });
         g.set("error", error); g.set("Pattern", Pattern); g.set("Match", Match);
     });
 
@@ -3824,7 +4018,38 @@
                     const post = rt.lookupType(cls, "__post_init__"); if (post !== undefined) call(descrGet(post, self, cls), initVars, null);
                     return null;
                 });
-                init.kwnames = true; cls.dict.set("__init__", init);
+                init.kwnames = true;
+                // Positional fast entries when no InitVar and no __post_init__
+                // (avoids args array + kwMap check on dataclass construction).
+                if (params.every((f) => !f.initVar) && rt.lookupType(cls, "__post_init__") === undefined) {
+                    const initParams = params.filter((f) => f.init);
+                    const minReq = initParams.filter((f) => f.dflt === MISSING && f.factory === MISSING).length;
+                    const maxPos = Math.min(initParams.length, 6);
+                    const runPos = function (self, a1, a2, a3, a4, a5, a6, argc) {
+                        const d = self.dict;
+                        let pi = 0;
+                        for (let i = 0; i < params.length; i++) {
+                            const f = params[i];
+                            let v;
+                            if (!f.init) v = f.factory !== MISSING ? call(f.factory, [], null) : f.dflt;
+                            else if (pi < argc) { const k = pi++; v = k === 0 ? a1 : k === 1 ? a2 : k === 2 ? a3 : k === 3 ? a4 : k === 4 ? a5 : a6; }
+                            else if (f.factory !== MISSING) v = call(f.factory, [], null);
+                            else v = f.dflt;
+                            d.set(f.name, v);
+                        }
+                        return null;
+                    };
+                    for (let n = minReq; n <= maxPos; n++) {
+                        if (n === 0) init.c1 = function (s) { return runPos(s, undefined, undefined, undefined, undefined, undefined, undefined, 0); };
+                        else if (n === 1) init.c2 = function (s, a1) { return runPos(s, a1, undefined, undefined, undefined, undefined, undefined, 1); };
+                        else if (n === 2) init.c3 = function (s, a1, a2) { return runPos(s, a1, a2, undefined, undefined, undefined, undefined, 2); };
+                        else if (n === 3) init.c4 = function (s, a1, a2, a3) { return runPos(s, a1, a2, a3, undefined, undefined, undefined, 3); };
+                        else if (n === 4) init.c5 = function (s, a1, a2, a3, a4) { return runPos(s, a1, a2, a3, a4, undefined, undefined, 4); };
+                        else if (n === 5) init.c6 = function (s, a1, a2, a3, a4, a5) { return runPos(s, a1, a2, a3, a4, a5, undefined, 5); };
+                        else if (n === 6) init.c7 = function (s, a1, a2, a3, a4, a5, a6) { return runPos(s, a1, a2, a3, a4, a5, a6, 6); };
+                    }
+                }
+                cls.dict.set("__init__", init);
             }
             if (truth(kwget(kw, "repr", true)) && !cls.dict.has("__repr__")) cls.dict.set("__repr__", builtin("__repr__", 1, (a) => cls.qualname + "(" + rt.amap(rt.afilter(fields, (f) => f.repr), (f) => f.name + "=" + repr(a[0].dict.get(f.name))).join(", ") + ")"));
             if (truth(kwget(kw, "eq", true)) && !cls.dict.has("__eq__")) cls.dict.set("__eq__", builtin("__eq__", 2, (a) => { if (typeOf(a[1]) !== typeOf(a[0])) return NOTIMPL; return rt.aevery(rt.afilter(fields, (f) => f.compare), (f) => eq(a[0].dict.get(f.name), a[1].dict.get(f.name))); }));

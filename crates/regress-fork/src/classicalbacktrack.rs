@@ -105,10 +105,6 @@ macro_rules! rxstat {
 
 #[derive(Clone, Debug)]
 enum BacktrackInsn<Input: InputIndexer> {
-    /// Nothing more to backtrack.
-    /// This "backstops" our stack.
-    Exhausted,
-
     /// Restore the IP and position.
     SetPosition { ip: IP, pos: Input::Position },
 
@@ -444,41 +440,71 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
     #[inline(always)]
     pub(crate) fn new_with_limits(
         re: &'a CompiledRegex,
-        entry: Input::Position,
+        _entry: Input::Position,
         limits: MatchLimits,
     ) -> Self {
+        Self {
+            re,
+            bts: Vec::new(),
+            s: State {
+                loops: Vec::new(),
+                groups: Vec::new(),
+            },
+            skip_hint: None,
+            budget: MatchBudget::new(limits),
+        }
+    }
+
+    /// Lazily allocate the interpreter's loop/group state vectors on first
+    /// interpreter entry so `rx-jit` hits and fast-rejected attempts allocate
+    /// nothing.
+    #[inline(always)]
+    fn ensure_state(&mut self, entry: Input::Position) -> bool {
+        let need_loops = self.re.loops as usize;
+        let need_groups = self.re.groups as usize;
+        if (need_loops == 0 || !self.s.loops.is_empty())
+            && (need_groups == 0 || !self.s.groups.is_empty())
+        {
+            return true;
+        }
+        self.ensure_state_cold(entry, need_loops, need_groups)
+    }
+
+    #[cold]
+    fn ensure_state_cold(
+        &mut self,
+        entry: Input::Position,
+        need_loops: usize,
+        need_groups: usize,
+    ) -> bool {
         #[cfg(feature = "bounded-backtracking")]
         {
-            let mut budget = MatchBudget::new(limits);
-            budget.consume((re.loops as usize).saturating_add(re.groups as usize));
-            let loops = budget
-                .try_vec_filled(re.loops as usize, LoopData::new(entry))
-                .unwrap_or_default();
-            let groups = budget
-                .try_vec_filled(re.groups as usize, GroupData::new())
-                .unwrap_or_default();
-            let mut this = Self {
-                re,
-                bts: Vec::new(),
-                s: State { loops, groups },
-                skip_hint: None,
-                budget,
-            };
-            this.push_backtrack(BacktrackInsn::Exhausted);
-            this
+            if !self.budget.consume(need_loops.saturating_add(need_groups)) {
+                return false;
+            }
+            if need_loops > 0 && self.s.loops.is_empty() {
+                let Some(v) = self.budget.try_vec_filled(need_loops, LoopData::new(entry)) else {
+                    return false;
+                };
+                self.s.loops = v;
+            }
+            if need_groups > 0 && self.s.groups.is_empty() {
+                let Some(v) = self.budget.try_vec_filled(need_groups, GroupData::new()) else {
+                    return false;
+                };
+                self.s.groups = v;
+            }
+            true
         }
         #[cfg(not(feature = "bounded-backtracking"))]
         {
-            Self {
-                re,
-                bts: vec![BacktrackInsn::Exhausted],
-                s: State {
-                    loops: vec![LoopData::new(entry); re.loops as usize],
-                    groups: vec![GroupData::new(); re.groups as usize],
-                },
-                skip_hint: None,
-                budget: MatchBudget::new(limits),
+            if need_loops > 0 && self.s.loops.is_empty() {
+                self.s.loops = vec![LoopData::new(entry); need_loops];
             }
+            if need_groups > 0 && self.s.groups.is_empty() {
+                self.s.groups = vec![GroupData::new(); need_groups];
+            }
+            true
         }
     }
 
@@ -1054,7 +1080,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             let saved_groups = self.s.groups.iat(range.clone()).to_vec();
             let mut saved_bts = Vec::new();
             core::mem::swap(&mut self.bts, &mut saved_bts);
-            self.push_backtrack(BacktrackInsn::Exhausted);
             let matched = self.try_at_pos(*input, ip, pos).is_some();
             core::mem::swap(&mut self.bts, &mut saved_bts);
 
@@ -1089,17 +1114,6 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             // outer stack remains live. Both capacities stay charged.
             let mut saved_bts = Vec::new();
             core::mem::swap(&mut self.bts, &mut saved_bts);
-            if !self.push_backtrack(BacktrackInsn::Exhausted) {
-                core::mem::swap(&mut self.bts, &mut saved_bts);
-                let inner_bytes = saved_bts
-                    .capacity()
-                    .saturating_mul(core::mem::size_of::<BacktrackInsn<Input>>());
-                drop(saved_bts);
-                self.budget.release_scratch_capacity(inner_bytes);
-                drop(saved_groups);
-                self.budget.release_scratch_capacity(saved_group_bytes);
-                return false;
-            }
 
             let matched = self.try_at_pos(*input, ip, pos).is_some();
             core::mem::swap(&mut self.bts, &mut saved_bts);
@@ -1177,16 +1191,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             if !self.budget.consume(1) {
                 return false;
             }
-            // We always have a single Exhausted instruction backstopping our stack,
-            // so we do not need to check for empty bts.
-            debug_assert!(!self.bts.is_empty(), "Backtrack stack should not be empty");
-            let bt = match self.bts.last_mut() {
-                Some(bt) => bt,
-                None => rs_unreachable!("BT stack should never be empty"),
+            let Some(bt) = self.bts.last_mut() else {
+                return false;
             };
             match bt {
-                BacktrackInsn::Exhausted => return false,
-
                 BacktrackInsn::SetPosition {
                     ip: saved_ip,
                     pos: saved_pos,
@@ -1492,12 +1500,12 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         mut pos: Input::Position,
     ) -> Option<Input::Position> {
         let dir = Forward;
-        if self.budget.exhausted() {
+        if self.budget.exhausted() || !self.ensure_state(inp.left_end()) {
             return None;
         }
         debug_assert!(
-            self.bts.len() == 1,
-            "Should be only initial exhausted backtrack insn"
+            self.bts.is_empty(),
+            "Backtrack stack should start empty"
         );
         // TODO: we are inconsistent about passing Input by reference or value.
         let input = &inp;
@@ -1507,7 +1515,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         #[allow(clippy::never_loop)]
         'nextinsn: loop {
             if !self.budget.consume(1) {
-                self.truncate_backtrack(1);
+                self.truncate_backtrack(0);
                 return None;
             }
             'backtrack: loop {
@@ -1632,7 +1640,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
 
                     &Insn::BeginCaptureGroup(cg_idx) => {
                         if !self.enter_group::<Forward>(cg_idx, pos) {
-                            self.truncate_backtrack(1);
+                            self.truncate_backtrack(0);
                             return None;
                         }
                         next_or_bt!(true)
@@ -1649,7 +1657,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                             id: cg_idx,
                             data: old,
                         }) {
-                            self.truncate_backtrack(1);
+                            self.truncate_backtrack(0);
                             return None;
                         }
                         let cg = self.s.groups.mat(cg_idx as usize);
@@ -1663,7 +1671,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     } => match self.backref(input, dir, &[cg_idx], icase, &mut pos) {
                         Some(matched) => next_or_bt!(matched),
                         None => {
-                            self.truncate_backtrack(1);
+                            self.truncate_backtrack(0);
                             return None;
                         }
                     },
@@ -1672,7 +1680,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         match self.backref(input, dir, groups, *icase, &mut pos) {
                             Some(matched) => next_or_bt!(matched),
                             None => {
-                                self.truncate_backtrack(1);
+                                self.truncate_backtrack(0);
                                 return None;
                             }
                         }
@@ -1685,7 +1693,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         }
                         BackStep::Fail => break 'backtrack,
                         BackStep::Abort => {
-                            self.truncate_backtrack(1);
+                            self.truncate_backtrack(0);
                             return None;
                         }
                     },
@@ -1723,7 +1731,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                             ip: secondary as IP,
                             pos,
                         }) {
-                            self.truncate_backtrack(1);
+                            self.truncate_backtrack(0);
                             return None;
                         }
                         next_or_bt!(true);
@@ -1789,7 +1797,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
 
                     Insn::Goal => {
                         // Keep all but the initial give-up bts.
-                        self.truncate_backtrack(1);
+                        self.truncate_backtrack(0);
                         return Some(pos);
                     }
 
@@ -1806,7 +1814,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             } else {
                 // We have exhausted the backtracking stack.
                 debug_assert!(
-                    self.budget.exhausted() || self.bts.len() == 1,
+                    self.budget.exhausted() || self.bts.is_empty(),
                     "Should have exhausted backtrack stack"
                 );
                 return None;
@@ -1994,8 +2002,12 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             if let Some(code) = re.rxjit.acquire(re) {
                 let origin = inp.left_end();
                 let groups = &mut self.matcher.s.groups;
+                let ngroups = re.groups as usize;
                 let outcome =
                     crate::rxjit::run_attempt(code, bytes, inp.pos_to_offset(pos), |g, s, e| {
+                        if groups.is_empty() {
+                            groups.resize(ngroups, GroupData::new());
+                        }
                         let gd = groups.mat(g);
                         gd.start = (s != u64::MAX).then(|| origin + s as usize);
                         gd.end = (e != u64::MAX).then(|| origin + e as usize);
@@ -2020,6 +2032,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     }
 
     fn successful_match(&mut self, start: Input::Position, end: Input::Position) -> Match {
+        let ngroups = self.matcher.re.groups as usize;
         // We want to simultaneously map our groups to offsets, and clear the groups.
         // A for loop is the easiest way to do this while satisfying the borrow checker.
         // TODO: avoid allocating so much.
@@ -2027,7 +2040,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         let Some(captures) = self
             .matcher
             .budget
-            .try_capture_vec_with_capacity(self.matcher.s.groups.len())
+            .try_capture_vec_with_capacity(ngroups)
         else {
             return Match {
                 range: 0..0,
@@ -2038,7 +2051,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         #[cfg(not(feature = "bounded-backtracking"))]
         let mut captures = Vec::new();
         #[cfg(not(feature = "bounded-backtracking"))]
-        captures.reserve_exact(self.matcher.s.groups.len());
+        captures.reserve_exact(ngroups);
         // The result is built first and filled where it is returned: a
         // captures vector filled in a local and then moved into the result
         // was copied with 16-byte loads over the pushes' 8-byte stores, which
@@ -2048,19 +2061,25 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             captures,
             group_names: self.matcher.re.group_names.clone(),
         };
-        for gd in self.matcher.s.groups.iter_mut() {
-            if !self.matcher.budget.consume(1) {
-                break;
+        if self.matcher.s.groups.is_empty() && ngroups > 0 {
+            if self.matcher.budget.consume(ngroups) {
+                m.captures.resize(ngroups, None);
             }
-            m.captures.push(match gd.as_range() {
-                Some(r) => Some(Range {
-                    start: self.input.pos_to_offset(r.start),
-                    end: self.input.pos_to_offset(r.end),
-                }),
-                None => None,
-            });
-            gd.start = None;
-            gd.end = None;
+        } else {
+            for gd in self.matcher.s.groups.iter_mut() {
+                if !self.matcher.budget.consume(1) {
+                    break;
+                }
+                m.captures.push(match gd.as_range() {
+                    Some(r) => Some(Range {
+                        start: self.input.pos_to_offset(r.start),
+                        end: self.input.pos_to_offset(r.end),
+                    }),
+                    None => None,
+                });
+                gd.start = None;
+                gd.end = None;
+            }
         }
         m.range = self.input.pos_to_offset(start)..self.input.pos_to_offset(end);
         m
@@ -2154,7 +2173,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                             rxstat!(ATTEMPTS);
                             let origin = inp.left_end();
                             let groups = &mut self.matcher.s.groups;
+                            let ngroups = re.groups as usize;
                             let outcome = sess.attempt(inp.pos_to_offset(pos), |g, s, e| {
+                                if groups.is_empty() {
+                                    groups.resize(ngroups, GroupData::new());
+                                }
                                 let gd = groups.mat(g);
                                 gd.start = (s != u64::MAX).then(|| origin + s as usize);
                                 gd.end = (e != u64::MAX).then(|| origin + e as usize);
@@ -2251,10 +2274,15 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     /// resetting each `GroupData` exactly as `successful_match` does, without
     /// building a `Match` (no per-match captures Vec, no group-name clone).
     fn take_group_ranges(&mut self, out: &mut Vec<Option<Range<usize>>>) -> bool {
-        if !self.matcher.budget.consume(self.matcher.s.groups.len()) {
+        let ngroups = self.matcher.re.groups as usize;
+        if !self.matcher.budget.consume(ngroups) {
             return false;
         }
         out.clear();
+        if self.matcher.s.groups.is_empty() && ngroups > 0 {
+            out.resize(ngroups, None);
+            return true;
+        }
         for gd in self.matcher.s.groups.iter_mut() {
             out.push(gd.as_range().map(|r| Range {
                 start: self.input.pos_to_offset(r.start),
@@ -2413,7 +2441,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                                 rxstat!(ATTEMPTS);
                                 let origin = inp.left_end();
                                 let groups = &mut self.matcher.s.groups;
+                                let ngroups = re.groups as usize;
                                 let outcome = sess.attempt(inp.pos_to_offset(pos), |g, s, e| {
+                                    if groups.is_empty() {
+                                        groups.resize(ngroups, GroupData::new());
+                                    }
                                     let gd = groups.mat(g);
                                     gd.start = (s != u64::MAX).then(|| origin + s as usize);
                                     gd.end = (e != u64::MAX).then(|| origin + e as usize);

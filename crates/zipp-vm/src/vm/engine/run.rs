@@ -2162,16 +2162,21 @@ impl<'p> Vm<'p> {
         if self.global_this == 0 {
             return false;
         }
-        let HeapObj::Object(m) = self.heap.get(self.global_this) else {
-            return false;
+        let gver = self.heap.version_of(self.global_this);
+        let epoch = self.global_route_epoch;
+        let slot = (idx as usize) & 1023;
+        let cached = self.global_real_own_cache[slot].get();
+        if cached.3 != 0 && cached.0 == idx && cached.1 == gver && cached.2 == epoch {
+            return cached.3 == 2;
+        }
+        let found = match self.heap.get(self.global_this) {
+            HeapObj::Object(m) if !m.is_empty() => self
+                .global_slot_name_ref(idx)
+                .is_some_and(|n| m.pos(n).is_some()),
+            _ => false,
         };
-        if m.is_empty() {
-            return false;
-        }
-        match self.global_slot_name_ref(idx) {
-            Some(n) => m.pos(n).is_some(),
-            None => false,
-        }
+        self.global_real_own_cache[slot].set((idx, gver, epoch, if found { 2 } else { 1 }));
+        found
     }
 
     /// Return global slot `slot` to the never-initialized sentinel — the ONE way a

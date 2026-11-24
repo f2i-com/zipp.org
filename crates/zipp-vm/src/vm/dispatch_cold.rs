@@ -636,54 +636,11 @@ impl<'p> Vm<'p> {
                 callee,
                 this_v,
             } => {
-                // The compiler FUSES single-argument `JSON.stringify(v)`
-                // into this op (compile/calls.rs), so it never reaches
-                // `call_native`'s JSON_STRINGIFY arm — only the
-                // replacer form does. Tagging only that arm left a
-                // stringify-dominated workload reporting 100% `interp`.
                 let v = self.get(base, val);
+                let space_v = self.get(base, space);
                 let callee = self.get(base, callee);
                 let this_v = self.get(base, this_v);
-                if !self.static_builtin_is_intrinsic(
-                    "JSON",
-                    native::JSON_STRINGIFY,
-                    callee,
-                    this_v,
-                ) {
-                    let result = self.call_value(callee, this_v, &[v])?;
-                    self.set(base, dst, result);
-                    ip += 1;
-                    return Ok(ColdFlow::Next(ip));
-                }
-                let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonStringify);
-                let indent = self.json_indent(self.get(base, space));
-                // `JSON.stringify(undefined)` (and of a function) is undefined.
-                // This op is the single-arg form: no replacer / allowlist.
-                let _gc = self.gc_lock_guard();
-                let plain = self.json_plain_stringify(v, &indent);
-                let result = match plain {
-                    Some(s) => self.alloc_str(s),
-                    None => {
-                        let mut m = crate::heap::ObjMap::new();
-                        m.set("", v);
-                        let wrapper =
-                            Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                        let mut visited = Vec::new();
-                        match self.json_value(
-                            wrapper,
-                            "",
-                            v,
-                            &indent,
-                            0,
-                            &mut visited,
-                            Value::UNDEFINED,
-                            None,
-                        )? {
-                            Some(s) => self.json_stringify_result(s, &indent),
-                            None => Value::UNDEFINED,
-                        }
-                    }
-                };
+                let result = self.exec_json_stringify(v, space_v, callee, this_v)?;
                 self.set(base, dst, result);
                 ip += 1;
             }
@@ -693,38 +650,10 @@ impl<'p> Vm<'p> {
                 callee,
                 this_v,
             } => {
-                // Fused single-argument `JSON.parse(s)` — same story as
-                // `JsonStringify` above. The `json-parse` samples seen
-                // before this came from the reviver form via
-                // `mathjson.rs`; the fused op was untagged.
                 let arg = self.get(base, a);
                 let callee = self.get(base, callee);
                 let this_v = self.get(base, this_v);
-                if !self.static_builtin_is_intrinsic(
-                    "JSON",
-                    native::JSON_PARSE,
-                    callee,
-                    this_v,
-                ) {
-                    let result = self.call_value(callee, this_v, &[arg])?;
-                    self.set(base, dst, result);
-                    ip += 1;
-                    return Ok(ColdFlow::Next(ip));
-                }
-                let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
-                // ToString (invokes toString/valueOf; throws TypeError for a Symbol).
-                // EXACT bytes for a string argument (raw lone surrogates
-                // inside JSON string literals are preserved).
-                let s: Vec<u8> = if arg.is_heap() && self.heap.is_str_like(arg.heap_index())
-                {
-                    self.heap
-                        .str_wtf8_cow(arg.heap_index())
-                        .unwrap()
-                        .into_owned()
-                } else {
-                    self.to_js_string(arg)?.into_bytes()
-                };
-                let v = self.json_parse(&s)?; // propagates SyntaxError as a throw
+                let v = self.exec_json_parse(arg, callee, this_v)?;
                 self.set(base, dst, v);
                 ip += 1;
             }
@@ -4565,15 +4494,18 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                 }
-                if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+                if !self.jit.metered() {
+                    let direct_on = crate::codegen::direct_ic_miss_enabled();
                     for (ip, instr) in proto_ref.code.iter().enumerate() {
                         let is_set = match instr {
                             Instr::GetProp { .. } => false,
                             Instr::SetProp { .. } => true,
                             _ => continue,
                         };
-                        if self.ic_site_is_rotating_own(func_id, ip, is_set) {
+                        if direct_on && self.ic_site_is_rotating_own(func_id, ip, is_set) {
                             self.jit.preseed_direct_miss_site(func_id, ip as u32);
+                        } else if self.ic_site_has_accessor(func_id, ip) {
+                            self.jit.preseed_acc_site(func_id, ip as u32);
                         }
                     }
                 }
@@ -4804,5 +4736,155 @@ impl<'p> Vm<'p> {
             &cross_plan,
         );
         self.try_run_osr(func_id, t as u32, base)
+    }
+
+    /// Shared `Instr::NewMap` execution for interpreter dispatch and Tier C.
+    pub(crate) fn exec_new_map(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
+        let m = Value::heap(self.heap.alloc(HeapObj::Map {
+            keys: Vec::new(),
+            vals: Vec::new(),
+        }));
+        if let Some(sv) = src_val {
+            if !sv.is_nullish() {
+                let adder = self.get_member(m, "set", m)?;
+                if !self.is_callable(adder) {
+                    return Err(Thrown(
+                        "TypeError: Map.prototype.set is not callable".into(),
+                    ));
+                }
+                let iter = self.get_iterator_object(sv)?;
+                let mut native_work = 0u64;
+                loop {
+                    let e = match self.iterator_step(iter)? {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    native_work = native_work.saturating_add(1);
+                    if let Err(err) = self.preflight_native_iteration_work(native_work) {
+                        self.iterator_close_quiet(iter);
+                        return Err(err);
+                    }
+                    if !self.is_object_value(e) {
+                        self.iterator_close_quiet(iter);
+                        return Err(Thrown(
+                            "TypeError: Map iterable entry is not an object".into(),
+                        ));
+                    }
+                    let k = match self.get_index(e, Value::int(0)) {
+                        Ok(k) => k,
+                        Err(err) => {
+                            self.iterator_close_quiet(iter);
+                            return Err(err);
+                        }
+                    };
+                    let v = match self.get_index(e, Value::int(1)) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            self.iterator_close_quiet(iter);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = self.call_value(adder, m, &[k, v]) {
+                        self.iterator_close_quiet(iter);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(m)
+    }
+
+    /// Shared `Instr::NewSet` execution for interpreter dispatch and Tier C.
+    pub(crate) fn exec_new_set(&mut self, src_val: Option<Value>) -> Result<Value, Thrown> {
+        let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
+        if let Some(sv) = src_val {
+            if !sv.is_nullish() {
+                let adder = self.get_member(set_v, "add", set_v)?;
+                if !self.is_callable(adder) {
+                    return Err(Thrown(
+                        "TypeError: Set.prototype.add is not callable".into(),
+                    ));
+                }
+                let iter = self.get_iterator_object(sv)?;
+                let mut native_work = 0u64;
+                loop {
+                    let e = match self.iterator_step(iter)? {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    native_work = native_work.saturating_add(1);
+                    if let Err(err) = self.preflight_native_iteration_work(native_work) {
+                        self.iterator_close_quiet(iter);
+                        return Err(err);
+                    }
+                    if let Err(err) = self.call_value(adder, set_v, &[e]) {
+                        self.iterator_close_quiet(iter);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(set_v)
+    }
+
+    /// Shared `Instr::JsonStringify` execution for interpreter dispatch and Tier C.
+    pub(crate) fn exec_json_stringify(
+        &mut self,
+        v: Value,
+        space_v: Value,
+        callee: Value,
+        this_v: Value,
+    ) -> Result<Value, Thrown> {
+        if !self.static_builtin_is_intrinsic("JSON", native::JSON_STRINGIFY, callee, this_v) {
+            return self.call_value(callee, this_v, &[v]);
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonStringify);
+        let indent = self.json_indent(space_v);
+        let _gc = self.gc_lock_guard();
+        let plain = self.json_plain_stringify(v, &indent);
+        Ok(match plain {
+            Some(s) => self.alloc_str(s),
+            None => {
+                let mut m = crate::heap::ObjMap::new();
+                m.set("", v);
+                let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                let mut visited = Vec::new();
+                match self.json_value(
+                    wrapper,
+                    "",
+                    v,
+                    &indent,
+                    0,
+                    &mut visited,
+                    Value::UNDEFINED,
+                    None,
+                )? {
+                    Some(s) => self.json_stringify_result(s, &indent),
+                    None => Value::UNDEFINED,
+                }
+            }
+        })
+    }
+
+    /// Shared `Instr::JsonParse` execution for interpreter dispatch and Tier C.
+    pub(crate) fn exec_json_parse(
+        &mut self,
+        arg: Value,
+        callee: Value,
+        this_v: Value,
+    ) -> Result<Value, Thrown> {
+        if !self.static_builtin_is_intrinsic("JSON", native::JSON_PARSE, callee, this_v) {
+            return self.call_value(callee, this_v, &[arg]);
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
+        let s: Vec<u8> = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
+            self.heap
+                .str_wtf8_cow(arg.heap_index())
+                .unwrap()
+                .into_owned()
+        } else {
+            self.to_js_string(arg)?.into_bytes()
+        };
+        self.json_parse(&s)
     }
 }

@@ -3195,7 +3195,7 @@ impl<'p> Vm<'p> {
                 let rc = std::sync::Arc::new(r);
                 if let Some(k) = cache_key {
                     #[cfg(feature = "safe-sandbox")]
-                    const REGEX_CACHE_LIMIT: usize = 32;
+                    const REGEX_CACHE_LIMIT: usize = 256;
                     #[cfg(not(feature = "safe-sandbox"))]
                     const REGEX_CACHE_LIMIT: usize = 512;
                     if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {

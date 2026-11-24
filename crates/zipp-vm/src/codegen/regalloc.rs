@@ -503,6 +503,380 @@ env_off_switch! {
     fn boxref_own_getter_enabled() = "ZIPP_NO_BOXREF_OWN_GETTER"
 }
 
+env_off_switch! {
+    /// Same-binary A/B switch for the counted Float32Array/Float64Array inner
+    /// dot-product/MAC prefix in DOUBLE regions.
+    fn ta_mac_loop_enabled() = "ZIPP_NO_TA_MAC_LOOP"
+}
+
+struct TaMacLoop {
+    col: u16,
+    cols: u16,
+    sum: u16,
+    base1: Option<u16>,
+    base2: Option<u16>,
+    pin1: usize,
+    kind1: u8,
+    pin2: usize,
+    kind2: u8,
+    exit_target: u32,
+}
+
+fn match_ta_mac_loop(
+    proto: &FuncProto,
+    ip: usize,
+    end: usize,
+    plan: &RegionPlan,
+    ta_plan: &TaPinPlan,
+) -> Option<TaMacLoop> {
+    let code = &proto.code;
+    let Instr::JumpIfNotLt {
+        a: col,
+        b: cols,
+        target: exit_target,
+    } = code[ip]
+    else {
+        return None;
+    };
+    let exit_ip = exit_target as usize;
+    if exit_ip < ip + 7 || exit_ip > ip + 9 || exit_ip - 1 > end {
+        return None;
+    }
+    let loop_end = exit_ip - 1;
+    // Must end with a direct back-edge to `ip` and have no internal jump targets.
+    if !matches!(code[loop_end], Instr::Jump { target } if target as usize == ip) {
+        return None;
+    }
+    for k in (ip + 1)..=loop_end {
+        if plan.jump_targets.contains(&k) {
+            return None;
+        }
+    }
+    let mut cur = ip + 1;
+    let mut temps = [u16::MAX; 5];
+    let mut ntemps = 0usize;
+    let mut push_temp = |r: u16| {
+        if ntemps < temps.len() {
+            temps[ntemps] = r;
+            ntemps += 1;
+        }
+    };
+    // Operand 1: optional `Add { dst: idx1, base1 + col }` then `GetIndex { dst: v1, key }`.
+    let (base1, v1, pin1, kind1) = {
+        let mut base = None;
+        let mut key_reg = col;
+        if let Instr::Add { dst, a, b } = code[cur] {
+            if a == col && b != col {
+                base = Some(b);
+                key_reg = dst;
+                push_temp(dst);
+                cur += 1;
+            } else if b == col && a != col {
+                base = Some(a);
+                key_reg = dst;
+                push_temp(dst);
+                cur += 1;
+            }
+        }
+        let Instr::GetIndex { dst: v, key, .. } = code.get(cur).copied()? else {
+            return None;
+        };
+        if key != key_reg {
+            return None;
+        }
+        let j = *ta_plan.access.get(&cur)? as usize;
+        if !plan.hoist_pins.contains(&(j as u8)) {
+            return None;
+        }
+        let kind = ta_plan.pins[j].kind;
+        if kind != 7 && kind != 8 {
+            return None;
+        }
+        push_temp(v);
+        cur += 1;
+        (base, v, j, kind)
+    };
+    // Operand 2: optional `Add { dst: idx2, base2 + col }` then `GetIndex { dst: v2, key }`.
+    let (base2, v2, pin2, kind2) = {
+        let mut base = None;
+        let mut key_reg = col;
+        if let Instr::Add { dst, a, b } = code.get(cur).copied()? {
+            if a == col && b != col {
+                base = Some(b);
+                key_reg = dst;
+                push_temp(dst);
+                cur += 1;
+            } else if b == col && a != col {
+                base = Some(a);
+                key_reg = dst;
+                push_temp(dst);
+                cur += 1;
+            }
+        }
+        let Instr::GetIndex { dst: v, key, .. } = code.get(cur).copied()? else {
+            return None;
+        };
+        if key != key_reg {
+            return None;
+        }
+        let j = *ta_plan.access.get(&cur)? as usize;
+        if !plan.hoist_pins.contains(&(j as u8)) {
+            return None;
+        }
+        let kind = ta_plan.pins[j].kind;
+        if kind != 7 && kind != 8 {
+            return None;
+        }
+        push_temp(v);
+        cur += 1;
+        (base, v, j, kind)
+    };
+    // Mul, Add (sum += prod), AddInt (col += 1), Jump(ip).
+    let Instr::Mul { dst: prod, a: ma, b: mb } = code.get(cur).copied()? else {
+        return None;
+    };
+    if !((ma == v1 && mb == v2) || (ma == v2 && mb == v1)) {
+        return None;
+    }
+    push_temp(prod);
+    cur += 1;
+    let Instr::Add { dst: sum, a: aa, b: ab } = code.get(cur).copied()? else {
+        return None;
+    };
+    if !((aa == sum && ab == prod) || (ab == sum && aa == prod)) {
+        return None;
+    }
+    cur += 1;
+    let Instr::AddInt { dst: ci_dst, a: ci_a, imm: 1, .. } = code.get(cur).copied()? else {
+        return None;
+    };
+    if ci_dst != col || ci_a != col || cur + 1 != loop_end {
+        return None;
+    }
+    // Distinct Xmm homes and no write-through/split-recv aliasing on mutated homes.
+    let col_h = match plan.reg_home.get(&col)? {
+        Home::Xmm(h) => *h,
+        _ => return None,
+    };
+    let cols_h = match plan.reg_home.get(&cols)? {
+        Home::Xmm(h) => *h,
+        _ => return None,
+    };
+    let sum_h = match plan.reg_home.get(&sum)? {
+        Home::Xmm(h) => *h,
+        _ => return None,
+    };
+    if col == cols
+        || col == sum
+        || cols == sum
+        || col_h == cols_h
+        || col_h == sum_h
+        || cols_h == sum_h
+        || plan.write_through.contains(&col)
+        || plan.write_through.contains(&sum)
+        || plan.split_recvs.contains(&col)
+        || plan.split_recvs.contains(&sum)
+    {
+        return None;
+    }
+    for b_opt in [base1, base2] {
+        if let Some(br) = b_opt {
+            let bh = match plan.reg_home.get(&br)? {
+                Home::Xmm(h) => *h,
+                _ => return None,
+            };
+            if br == col || br == sum || bh == col_h || bh == sum_h {
+                return None;
+            }
+        }
+    }
+    // Verify none of the internal temps are live/read outside `ip..=loop_end`.
+    let temp_slice = &temps[..ntemps];
+    for &t in temp_slice {
+        if t == col || t == cols || t == sum || Some(t) == base1 || Some(t) == base2 {
+            return None;
+        }
+        if plan.write_through.contains(&t) || plan.split_recvs.contains(&t) {
+            return None;
+        }
+    }
+    for (k, instr) in code.iter().enumerate() {
+        if k >= ip && k <= loop_end {
+            continue;
+        }
+        for u in crate::codegen::instr_uses(instr) {
+            if temp_slice.contains(&u) {
+                return None;
+            }
+        }
+    }
+    Some(TaMacLoop {
+        col,
+        cols,
+        sum,
+        base1,
+        base2,
+        pin1,
+        kind1,
+        pin2,
+        kind2,
+        exit_target,
+    })
+}
+
+/// Emit a pure-prefix, bit-identical counted Float32Array/Float64Array MAC loop
+/// using only scratch `rax/rcx/rdx/xmm0/xmm1` and Win64 shadow `[rsp + 0..32]`.
+fn emit_ta_mac_loop_prefix(
+    ops: &mut crate::codegen::X64Asm,
+    m: &TaMacLoop,
+    plan: &RegionPlan,
+    ta_base: i32,
+    after_loop: dynasmrt::DynamicLabel,
+) {
+    let col_h = xh(plan, m.col);
+    let cols_h = xh(plan, m.cols);
+    let sum_h = xh(plan, m.sum);
+    let off1 = ta_base + 32 * m.pin1 as i32;
+    let off2 = ta_base + 32 * m.pin2 as i32;
+    let fallback = ops.new_dynamic_label();
+    let loop4 = ops.new_dynamic_label();
+    let tail = ops.new_dynamic_label();
+    let loop1 = ops.new_dynamic_label();
+    let done_mac = ops.new_dynamic_label();
+    let sum_ok = ops.new_dynamic_label();
+
+    // 1. Empty-trip check: if !(col < cols) (including NaN), exit directly.
+    dynasm!(ops
+        ; ucomisd Rx(col_h), Rx(cols_h)
+        ; jae => after_loop
+        ; jp => after_loop
+    );
+    // Helper: check Xmm home is exact non-negative integer <= 2^40, store to `[rsp + slot]`.
+    let emit_int_check = |ops: &mut crate::codegen::X64Asm, h: u8, slot: i32| {
+        dynasm!(ops
+            ; cvttsd2si rax, Rx(h)
+            ; test rax, rax
+            ; js => fallback
+            ; mov rcx, QWORD (1i64 << 40)
+            ; cmp rax, rcx
+            ; ja => fallback
+            ; cvtsi2sd xmm0, rax
+            ; ucomisd xmm0, Rx(h)
+            ; jne => fallback
+            ; jp => fallback
+            ; mov [rsp + slot], rax
+        );
+    };
+    emit_int_check(ops, col_h, 0);
+    emit_int_check(ops, cols_h, 8);
+    match m.base1 {
+        Some(b1) => emit_int_check(ops, xh(plan, b1), 16),
+        None => dynasm!(ops ; mov QWORD [rsp + 16], 0),
+    }
+    match m.base2 {
+        Some(b2) => emit_int_check(ops, xh(plan, b2), 24),
+        None => dynasm!(ops ; mov QWORD [rsp + 24], 0),
+    }
+    // 2. Hoisted bounds checks: base1 + cols <= len1 && base2 + cols <= len2.
+    dynasm!(ops
+        ; mov rax, [rsp + 16]
+        ; add rax, [rsp + 8]
+        ; cmp rax, [rsp + off1 + 16]
+        ; ja => fallback
+        ; mov rax, [rsp + 24]
+        ; add rax, [rsp + 8]
+        ; cmp rax, [rsp + off2 + 16]
+        ; ja => fallback
+    );
+    // 3. Element pointers `rax` (pin1) and `rdx` (pin2), trip count `rcx = cols - col`.
+    dynasm!(ops
+        ; mov rcx, [rsp + 16]
+        ; add rcx, [rsp + 0]
+        ; mov rax, [rsp + off1 + 8]
+    );
+    if m.kind1 == 7 {
+        dynasm!(ops ; lea rax, [rax + rcx * 4]);
+    } else {
+        dynasm!(ops ; lea rax, [rax + rcx * 8]);
+    }
+    dynasm!(ops
+        ; mov rcx, [rsp + 24]
+        ; add rcx, [rsp + 0]
+        ; mov rdx, [rsp + off2 + 8]
+    );
+    if m.kind2 == 7 {
+        dynasm!(ops ; lea rdx, [rdx + rcx * 4]);
+    } else {
+        dynasm!(ops ; lea rdx, [rdx + rcx * 8]);
+    }
+    dynasm!(ops
+        ; mov rcx, [rsp + 8]
+        ; sub rcx, [rsp + 0]
+        ; cmp rcx, 4
+        ; jb => tail
+        ; => loop4
+    );
+    let s1 = if m.kind1 == 7 { 4i32 } else { 8i32 };
+    let s2 = if m.kind2 == 7 { 4i32 } else { 8i32 };
+    for lane in 0..4i32 {
+        let o1 = lane * s1;
+        let o2 = lane * s2;
+        if m.kind1 == 7 {
+            dynasm!(ops ; movss xmm0, [rax + o1] ; cvtss2sd xmm0, xmm0);
+        } else {
+            dynasm!(ops ; movsd xmm0, [rax + o1]);
+        }
+        if m.kind2 == 7 {
+            dynasm!(ops ; movss xmm1, [rdx + o2] ; cvtss2sd xmm1, xmm1);
+        } else {
+            dynasm!(ops ; movsd xmm1, [rdx + o2]);
+        }
+        dynasm!(ops
+            ; mulsd xmm0, xmm1
+            ; addsd Rx(sum_h), xmm0
+        );
+    }
+    dynasm!(ops
+        ; add rax, 4 * s1
+        ; add rdx, 4 * s2
+        ; sub rcx, 4
+        ; cmp rcx, 4
+        ; jae => loop4
+        ; => tail
+        ; test rcx, rcx
+        ; jz => done_mac
+        ; => loop1
+    );
+    if m.kind1 == 7 {
+        dynasm!(ops ; movss xmm0, [rax] ; cvtss2sd xmm0, xmm0);
+    } else {
+        dynasm!(ops ; movsd xmm0, [rax]);
+    }
+    if m.kind2 == 7 {
+        dynasm!(ops ; movss xmm1, [rdx] ; cvtss2sd xmm1, xmm1);
+    } else {
+        dynasm!(ops ; movsd xmm1, [rdx]);
+    }
+    dynasm!(ops
+        ; mulsd xmm0, xmm1
+        ; addsd Rx(sum_h), xmm0
+        ; add rax, s1
+        ; add rdx, s2
+        ; dec rcx
+        ; jnz => loop1
+        ; => done_mac
+        // Canonicalize sum once if any element produced NaN.
+        ; ucomisd Rx(sum_h), Rx(sum_h)
+        ; jnp => sum_ok
+        ; mov rax, QWORD QNAN_BITS as i64
+        ; movq Rx(sum_h), rax
+        ; => sum_ok
+        ; movaps Rx(col_h), Rx(cols_h)
+        ; jmp => after_loop
+        ; => fallback
+    );
+}
+
 /// Register-promoting region codegen: each region value lives in a fixed xmm
 /// (numbers) or gpr (booleans) home for the whole loop. Live-in values are
 /// loaded + type-guarded ONCE at entry; the loop body is then pure register SSE
@@ -801,6 +1175,24 @@ pub(crate) fn compile_region_regalloc(
         let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
+        }
+        if meter.is_none()
+            && ta_mac_loop_enabled()
+            && matches!(proto.code[ip], Instr::JumpIfNotLt { .. })
+        {
+            if let Some(mac) = match_ta_mac_loop(proto, ip, e, &plan, ta_plan) {
+                let after =
+                    region_target(mac.exit_target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                emit_ta_mac_loop_prefix(&mut ops, &mac, &plan, ta_base, after);
+                if crate::jitlog_enabled() {
+                    eprintln!(
+                        "[jit] DOUBLE region [{start},{end}] ta-mac prefix at ip={ip}..{}",
+                        mac.exit_target - 1
+                    );
+                }
+                flag_cmp = None;
+                lc = None;
+            }
         }
         // A hoisted constant's home was filled in the prologue; the body op is a
         // no-op (fall through to the next ip, its label preserved for jumps).

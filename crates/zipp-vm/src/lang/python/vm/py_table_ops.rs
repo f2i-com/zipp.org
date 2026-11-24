@@ -150,9 +150,16 @@ impl<'p> Vm<'p> {
                 None => t,
             },
             ops::NEW => {
+                let tt = self
+                    .py_rt
+                    .as_deref()
+                    .map(|p| p.t_type)
+                    .filter(|v| v.is_heap())
+                    .unwrap_or_else(|| arg(4));
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    type_type: tt,
                     seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let table = PyTable::with_kinds(t == Value::TRUE, kinds);
@@ -179,11 +186,11 @@ impl<'p> Vm<'p> {
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    type_type: self.py_rt.as_deref().map_or(Value::UNDEFINED, |p| p.t_type),
                     seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let mut steps = 0;
-                let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
-                let h = native_hash_cached(&self.heap, cache, &kinds, t, &mut steps);
+                let h = native_hash_cached(&self.heap, self.py_rt.as_deref(), &kinds, t, &mut steps);
                 self.charge_steps(steps as i64);
                 h.map_or(Value::UNDEFINED, |h| self.make_bigint(i128::from(h)))
             }
@@ -266,8 +273,7 @@ impl<'p> Vm<'p> {
         let mut steps = 0;
         let found = {
             let t = table_at(&self.heap, storage)?;
-            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
-            let (at, _) = native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?;
+            let (at, _) = native_lookup_cached(&self.heap, self.py_rt.as_deref(), &t.kinds, t, key, &mut steps)?;
             at.map(|i| if t.is_set() { Value::TRUE } else { t.value_at(i).unwrap_or(Value::UNDEFINED) })
         };
         self.charge_steps(steps as i64);
@@ -286,8 +292,7 @@ impl<'p> Vm<'p> {
         // without detaching/re-attaching the table or running key barriers.
         let (is_set, kinds, len, probe) = {
             let t = table_at(&self.heap, storage)?;
-            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
-            let p = native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?;
+            let p = native_lookup_cached(&self.heap, self.py_rt.as_deref(), &t.kinds, t, key, &mut steps)?;
             (t.is_set(), t.kinds, t.len(), p)
         };
         let idx = storage.heap_index();
@@ -308,9 +313,9 @@ impl<'p> Vm<'p> {
                 self.pt_flat_key(key);
                 let mut t = self.pt_take(idx);
                 let r = if is_set {
-                    add_hashed(&self.heap, &kinds, &mut t, h, key, Value::UNDEFINED, &mut steps)
+                    add_hashed_rt(&self.heap, self.py_rt.as_deref(), &kinds, &mut t, h, key, Value::UNDEFINED, &mut steps)
                 } else {
-                    add_hashed(&self.heap, &kinds, &mut t, h, key, val, &mut steps)
+                    add_hashed_rt(&self.heap, self.py_rt.as_deref(), &kinds, &mut t, h, key, val, &mut steps)
                 };
                 let new_len = t.len();
                 self.pt_put(idx, t);
@@ -353,8 +358,7 @@ impl<'p> Vm<'p> {
         let mut steps = 0;
         let at = {
             let t = table_at(&self.heap, storage)?;
-            let cache = self.py_rt.as_deref().map(|p| &*p.str_hashes);
-            native_lookup_cached(&self.heap, cache, &t.kinds, t, key, &mut steps)?.0
+            native_lookup_cached(&self.heap, self.py_rt.as_deref(), &t.kinds, t, key, &mut steps)?.0
         };
         self.charge_steps(steps as i64);
         let Some(i) = at else {
@@ -584,6 +588,7 @@ impl<'p> Vm<'p> {
         let kinds = PyKinds {
             tuple: p.t_tuple,
             frozenset: Value::UNDEFINED,
+            type_type: p.t_type,
             seq_shape: p.seq_shape,
         };
         let (tl, td) = (p.t_list, p.t_dict);

@@ -2083,8 +2083,23 @@ pub struct Vm<'p> {
     /// `class_member_cache` never hands out a reclaimed heap index.
     pub(crate) class_member_gc_epoch: u32,
     /// Direct-mapped cache over `Vm::class_member_lookup` for clean class chains
-    /// and public keys <= 16 bytes, keyed by `(class, proto_epoch, gc_epoch, key)`.
+    /// and public/private keys <= 32 bytes, keyed by `(class, proto_epoch, gc_epoch, key)`.
     pub(crate) class_member_cache: Box<[std::cell::Cell<props::ClassMemberSlot>]>,
+    /// Direct-mapped cache over `Vm::global_real_own_route(idx)`, keyed by
+    /// `(idx, global_this_ver, global_route_epoch)` -> `0=empty, 1=false, 2=true`.
+    pub(crate) global_real_own_cache: Box<[std::cell::Cell<(u32, u32, u32, u8)>]>,
+    /// 256-slot ASCII `toLowerCase`/`toUpperCase` identity cache for short
+    /// strings (`<= 32B`, e.g. DOM tag names `"DIV"` -> `"div"`):
+    /// `(src_idx, src_ver, dst_idx, dst_ver, tag: 0=empty, 1=lower, 2=upper)`.
+    /// Both `src` and `dst` are frozen so neither can mutate in place; returning
+    /// the same `dst_idx` eliminates repeat allocations AND lets subsequent
+    /// `table[tag.toLowerCase()]` hit `emit_keyed_memo_get_stub` in O(1).
+    pub(crate) ascii_case_cache: Box<[(u32, u32, u32, u32, u8)]>,
+    /// Direct-mapped shape transition cache for `jit_append_data_prop` keyed by
+    /// `(before_shape, packed_name)` -> `after_shape`, avoiding thread-local
+    /// `SHAPE_TABLE` lookups on repeated object-literal appends.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) static_append_shape_cache: Box<[(u32, u64, u32)]>,
     /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
     /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
     /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
@@ -2484,6 +2499,16 @@ pub struct Vm<'p> {
     /// every cache for each one. Pure memo: every hit rechecks it live.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_add_ways: Vec<AddWay>,
+    /// Direct-mapped polymorphic property-append memo keyed by
+    /// `(before_shape, class_or_proto, key_id)`: serves polymorphic DOM/AST
+    /// constructors (`Node`, `Element`, `HTMLElement`) whose `this.x = v`
+    /// sites see dozens of subclasses without thrashing 1-way `jit_add_ways`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_add_memo: Vec<AddMemoEntry>,
+    /// Direct-mapped Symbol-keyed class-instance property-append memo for
+    /// `jit_set_index` (`this[NEXT] = ...` in LinkeDOM constructors).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    sym_add_memo: Vec<SymAddMemoEntry>,
     /// The class method each JIT `GetProp` site last read off a class
     /// instance, by IC site index (`helpers_misc::ClassRead`): no way of the
     /// emitted probe serves a key that lives on the class, so every read
@@ -3803,10 +3828,9 @@ pub struct Vm<'p> {
     /// buffer once allocated) for direct x86-64 `keyed_memo_get_stub` probing.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) keyed_slot_memo_raw: u64,
-    /// Write-through non-empty flags for `deferred_ns_state` and
-    /// `module_namespaces` so x86-64 stubs guard them in 1 byte load.
+    /// Write-through non-empty flag for `deferred_ns_state` so x86-64 stubs
+    /// guard it in 1 byte load.
     pub(crate) deferred_ns_nonempty: u8,
-    pub(crate) mod_ns_nonempty: u8,
     /// Snapshot of pristine `%Function.prototype%` (`shape`, `"call"` slot,
     /// `FN_CALL` native bits) and `Array`/`Array.isArray` bits recorded at the
     /// end of `setup_globals` for native `fn.call` and `Array.isArray` stubs.
@@ -3833,6 +3857,14 @@ pub struct Vm<'p> {
     pub(crate) arr_proto_iter_slot_ptr: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) arr_proto_iter_ver: u32,
+    /// Snapshot of pristine `%String.prototype%.charCodeAt` slot pointer,
+    /// value bits, and `%String.prototype%` version for inline ASCII `charCodeAt`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) str_proto_cca_slot_ptr: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) str_proto_cca_fn_bits: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) str_proto_cca_ver: u32,
     /// Ordinary functions whose `prototype` was made non-writable
     /// (`Object.defineProperty(f, "prototype", {writable: false})`,
     /// `Object.freeze(f)`). Each also has a `fn_proto_override` entry (its
@@ -4455,6 +4487,7 @@ pub(crate) use helpers_misc::iter_region_stats;
 pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_shape_set_barrier;
+pub(crate) use proxy_regexp::{ITFB_GLOBAL, ITFB_INDICES, ITFB_STICKY, ITFB_UNICODE};
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use proxy_regexp::rx_scalar_exec_enabled;

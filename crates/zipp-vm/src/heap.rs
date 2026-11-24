@@ -1881,12 +1881,19 @@ pub struct ObjMap {
     /// every JIT'd `m[i]` (which deopts to the interpreter). None of those four
     /// names can shadow an element, so the precise question is this bit.
     has_element_key: bool,
-    /// A planned literal observed a mutation or an out-of-order AppendDataProp.
-    /// From that point malformed/replayed appends use descriptor-safe `define`
-    /// rather than the compiler-proof-only unchecked push. Fits existing bool
-    /// padding, preserving ObjMap's pinned size.
-    planned_append_failed: bool,
+    /// Bit 0 (`OBJ_FLAG_PLANNED_FAILED`): a planned literal observed a mutation
+    /// or an out-of-order AppendDataProp.
+    /// Bit 1 (`OBJ_FLAG_DICT_PINNED`): an exotic/namespace/global/arr_proto map
+    /// pinned to dictionary mode for good (`pin_dict` / `pin_mirror_dict`), so
+    /// `object_mirror_fid` never sets the plain-object bit (`FID_MIRROR_CLASS`)
+    /// even if `refresh_mirror` runs later.
+    /// Fits in the single byte formerly held by `planned_append_failed`,
+    /// preserving ObjMap's pinned 112-byte size.
+    extra_flags: u8,
 }
+
+const OBJ_FLAG_PLANNED_FAILED: u8 = 1 << 0;
+const OBJ_FLAG_DICT_PINNED: u8 = 1 << 1;
 
 impl Clone for ObjMap {
     /// Field by field, except `key_bytes`, which is counted again: a cloned
@@ -1907,7 +1914,7 @@ impl Clone for ObjMap {
             index: self.index.clone(),
             numeric_index: self.numeric_index.clone(),
             has_element_key: self.has_element_key,
-            planned_append_failed: self.planned_append_failed,
+            extra_flags: self.extra_flags,
             class_proto: self.class_proto,
             shape: self.shape,
         }
@@ -1931,7 +1938,7 @@ impl std::fmt::Debug for ObjMap {
             index,
             numeric_index,
             has_element_key,
-            planned_append_failed,
+            extra_flags,
             class_proto,
             shape,
             key_bytes: _,
@@ -1949,7 +1956,7 @@ impl std::fmt::Debug for ObjMap {
             .field("index", index)
             .field("numeric_index", numeric_index)
             .field("has_element_key", has_element_key)
-            .field("planned_append_failed", planned_append_failed)
+            .field("extra_flags", extra_flags)
             .field("class_proto", class_proto)
             .field("shape", shape)
             .finish()
@@ -2741,7 +2748,7 @@ impl ObjMap {
             || self.sealed
             || self.is_raw_json
             || self.has_element_key
-            || self.planned_append_failed
+            || self.extra_flags != 0
             || self.index.is_some()
             || self.numeric_index.is_some()
         {
@@ -3238,7 +3245,7 @@ impl ObjMap {
         m.index = self.index.clone();
         m.numeric_index = self.numeric_index.clone();
         m.has_element_key = self.has_element_key;
-        m.planned_append_failed = self.planned_append_failed;
+        m.extra_flags = self.extra_flags & OBJ_FLAG_PLANNED_FAILED;
         // The copy is a consistent map, holes and all; a fresh literal has
         // no reason to carry them.
         m.compact();
@@ -3385,7 +3392,7 @@ impl ObjMap {
             index,
             numeric_index,
             has_element_key,
-            planned_append_failed,
+            extra_flags,
             class_proto,
             shape: shape_slot,
             key_bytes,
@@ -3421,7 +3428,7 @@ impl ObjMap {
         *index = None;
         *numeric_index = None;
         *has_element_key = plan.has_element_key();
-        *planned_append_failed = false;
+        *extra_flags = 0;
         *class_proto = false;
         *shape_slot = shape;
         // The same cold tails `finalized_from_store` builds, on the same
@@ -3583,11 +3590,27 @@ impl ObjMap {
             index: None,
             numeric_index: None,
             has_element_key: false,
-            planned_append_failed: false,
+            extra_flags: 0,
             class_proto: false,
             shape: crate::shape::EMPTY,
             key_bytes: 0,
         }
+    }
+
+    #[inline(always)]
+    fn planned_append_failed(&self) -> bool {
+        (self.extra_flags & OBJ_FLAG_PLANNED_FAILED) != 0
+    }
+
+    #[inline(always)]
+    fn mark_planned_append_failed(&mut self) {
+        self.extra_flags |= OBJ_FLAG_PLANNED_FAILED;
+    }
+
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    #[inline(always)]
+    pub(crate) fn is_dict_pinned(&self) -> bool {
+        (self.extra_flags & OBJ_FLAG_DICT_PINNED) != 0
     }
 
     /// Flag this map as a class's materialized prototype (see
@@ -3600,8 +3623,10 @@ impl ObjMap {
 
     /// Drop this map to dictionary mode for good: an object whose
     /// properties are not all in its map (a module namespace's live
-    /// bindings) can then never match a shape-keyed cache way.
+    /// bindings, deferred namespaces, globalThis, arr_proto) can then never
+    /// match a shape-keyed cache way or plain-object mirror probe.
     pub fn pin_dict(&mut self) {
+        self.extra_flags |= OBJ_FLAG_DICT_PINNED;
         self.shape_to_dict();
     }
 
@@ -3748,7 +3773,7 @@ impl ObjMap {
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     #[inline]
     pub(crate) fn planned_next_static_key(&self, key: &str) -> bool {
-        if self.planned_append_failed {
+        if self.planned_append_failed() {
             return false;
         }
         let PropKeys::Planned { all, visible_len } = &self.keys else {
@@ -3836,7 +3861,9 @@ impl ObjMap {
     /// their attributes (only the value changes). The JIT inline cache uses the
     /// return to bump the object's version on a key-add.
     pub fn set(&mut self, key: &str, val: Value) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(key) {
             self.vals[i] = val;
             false
@@ -3889,7 +3916,9 @@ impl ObjMap {
                 });
             }
             _ => {
-                self.planned_append_failed |= self.keys.is_planned();
+                if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
                 self.push_key(key.to_string());
             }
         }
@@ -3978,7 +4007,9 @@ impl ObjMap {
     /// then handed each key to `set` as a `&str`, so every first insertion
     /// allocated a second copy of a string the parser had already allocated.
     pub fn set_owned(&mut self, key: String, val: Value) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(&key) {
             self.vals[i] = val;
             false
@@ -3992,7 +4023,9 @@ impl ObjMap {
     /// with non-default enumerability). Overwrites any existing slot. Returns
     /// `true` if a new key was appended.
     pub fn define(&mut self, key: &str, val: Value, attr: PropAttr) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(key) {
             // Redefining an EXISTING property's attributes is not an append, so
             // the transition tree cannot describe the result — unless nothing
@@ -4042,7 +4075,9 @@ impl ObjMap {
             prop_tag(&key),
             "push_data_tagged: caller's tag is wrong"
         );
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
         self.push_key(key);
@@ -4056,7 +4091,7 @@ impl ObjMap {
     /// mismatch (including malformed bytecode) falls back to the exact owned
     /// append path, materializing only the already-visible prefix.
     pub fn push_static_data(&mut self, key: &str, val: Value) {
-        if !self.planned_append_failed && self.keys.advance_if_next(key) {
+        if !self.planned_append_failed() && self.keys.advance_if_next(key) {
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
             self.shape_pushed(key, &PropAttr::data());
@@ -4065,15 +4100,49 @@ impl ObjMap {
             return;
         }
         if self.keys.is_planned() {
-            self.planned_append_failed = true;
+            self.mark_planned_append_failed();
         }
-        if self.planned_append_failed {
+        if self.planned_append_failed() {
             self.define(key, val, PropAttr::data());
         } else {
             // Legacy NewObject + compiler-proved AppendDataProp: retain the
             // historical no-lookup push used by the OFF comparator.
             self.push_data(key.to_string(), val);
         }
+    }
+
+    /// [`ObjMap::push_static_data`] with a VM-cached post-append shape
+    /// (`cached_after != 0`), bypassing thread-local `shape::add` (`LocalKey::with`)
+    /// on repeated object-literal appends. Returns the resulting shape.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn push_static_data_cached(&mut self, key: &str, val: Value, cached_after: u32) -> u32 {
+        if !self.planned_append_failed() && self.keys.advance_if_next(key) {
+            self.vals.push(val);
+            self.attrs.push(PropAttr::data());
+            if cached_after != 0 {
+                self.shape = cached_after;
+                debug_assert!(
+                    self.shape == crate::shape::DICT
+                        || crate::shape::len(self.shape) as usize == self.keys.len(),
+                    "cached shape drifted from the key vector it summarises"
+                );
+            } else {
+                self.shape_pushed(key, &PropAttr::data());
+            }
+            self.has_element_key |= key_names_element(key);
+            self.index_appended();
+            return self.shape;
+        }
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
+        if self.planned_append_failed() {
+            self.define(key, val, PropAttr::data());
+        } else {
+            self.push_data(key.to_string(), val);
+        }
+        self.shape
     }
 
     /// Remove `key`'s own property; returns whether it existed. Shifts later
@@ -4108,7 +4177,9 @@ impl ObjMap {
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
@@ -4671,6 +4742,10 @@ impl std::ops::Deref for StrBytes {
 const STR_MEMO_FROZEN: u8 = 1;
 #[cfg(not(feature = "safe-sandbox"))]
 const STR_MEMO_SUFFIX_HEAD: u8 = 2;
+/// Bit 2 of `JsStr::memo_state`: set iff the string holds any UTF-16 surrogate
+/// code unit (a 4-byte astral scalar `>= 0xF0` in UTF-8, or a lone surrogate
+/// in WTF-8). Gives O(1) `has_surrogate()` and O(1) BMP `py_str_len()`.
+const STR_MEMO_HAS_SURROGATE: u8 = 4;
 
 /// UTF-16 code units contributed by one Unicode scalar: 1 for BMP, 2 for an
 /// astral (supplementary-plane) scalar. This is THE unit/scalar switch — every
@@ -5004,17 +5079,21 @@ impl JsStr {
     /// path for every string the engine builds out of `&str` material.
     pub fn new(bytes: String) -> JsStr {
         let ascii = bytes.is_ascii();
-        let units = if ascii {
-            bytes.len()
+        let (units, memo_state) = if ascii {
+            (bytes.len(), 0u8)
         } else {
-            str_units(&bytes)
+            let has_sur = bytes.as_bytes().iter().any(|&b| b >= 0xF0);
+            (
+                str_units(&bytes),
+                if has_sur { STR_MEMO_HAS_SURROGATE } else { 0 },
+            )
         };
         JsStr {
             bytes: StrBytes::from_text(bytes),
             units: units as u32,
             ascii,
             wellformed: true,
-            memo_state: 0,
+            memo_state,
             cursor: Cell::new(0),
             marks: std::cell::OnceCell::new(),
         }
@@ -5084,6 +5163,7 @@ impl JsStr {
             "from_wtf8: non-canonical surrogate pair encoding"
         );
         let units = wtf8_units(&bytes);
+        let has_sur = !wellformed || bytes.iter().any(|&b| b >= 0xF0);
         let bytes = if wellformed {
             StrBytes::from_utf8(bytes)
         } else {
@@ -5094,7 +5174,7 @@ impl JsStr {
             ascii: false,
             wellformed: bytes.is_text_or(wellformed),
             bytes,
-            memo_state: 0,
+            memo_state: if has_sur { STR_MEMO_HAS_SURROGATE } else { 0 },
             cursor: Cell::new(0),
             marks: std::cell::OnceCell::new(),
         }
@@ -5113,7 +5193,32 @@ impl JsStr {
             ascii: left.ascii && right.ascii,
             wellformed: bytes.is_text_or(true),
             bytes,
-            memo_state: 0,
+            memo_state: (left.memo_state | right.memo_state) & STR_MEMO_HAS_SURROGATE,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// [`JsStr::concat_wellformed`] writing into a caller-supplied recycled
+    /// byte buffer (`Heap::byte_pool`), avoiding per-concat `mi_malloc`.
+    #[inline]
+    fn concat_wellformed_in_buf(
+        left: &JsStr,
+        right: &JsStr,
+        units: usize,
+        mut buf: Vec<u8>,
+    ) -> JsStr {
+        debug_assert!(left.wellformed && right.wellformed);
+        buf.extend_from_slice(left.as_bytes());
+        buf.extend_from_slice(right.as_bytes());
+        let ascii = left.ascii && right.ascii;
+        let bytes = StrBytes::from_utf8(buf);
+        JsStr {
+            units: units as u32,
+            ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: (left.memo_state | right.memo_state) & STR_MEMO_HAS_SURROGATE,
             cursor: Cell::new(0),
             marks: std::cell::OnceCell::new(),
         }
@@ -5138,7 +5243,7 @@ impl JsStr {
             ascii: self.ascii,
             wellformed: bytes.is_text_or(self.wellformed),
             bytes,
-            memo_state: 0,
+            memo_state: self.memo_state & STR_MEMO_HAS_SURROGATE,
             cursor: Cell::new(0),
             marks: std::cell::OnceCell::new(),
         }
@@ -5248,7 +5353,7 @@ impl JsStr {
     /// no in-place grower takes it for its own: every one of them declines a
     /// frozen accumulator and builds a fresh string.
     #[inline]
-    fn freeze_shared(&mut self) {
+    pub(crate) fn freeze_shared(&mut self) {
         self.memo_state |= STR_MEMO_FROZEN;
     }
 
@@ -5261,10 +5366,49 @@ impl JsStr {
         self.memo_state & STR_MEMO_SUFFIX_HEAD != 0
     }
 
+    /// True iff this string holds any UTF-16 surrogate unit (astral scalar or
+    /// lone surrogate). O(1) from `memo_state` bit 2.
+    #[cfg(feature = "python")]
+    #[inline]
+    pub(crate) fn has_surrogate(&self) -> bool {
+        self.memo_state & STR_MEMO_HAS_SURROGATE != 0
+    }
+
+    /// Fast byte range of code point indices `[lo, hi)` in a well-formed BMP
+    /// string (`self.wellformed && !self.has_surrogate()`), using `JsStr::seek`.
+    #[cfg(feature = "python")]
+    #[inline]
+    pub(crate) fn bmp_byte_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        debug_assert!(self.wellformed && !self.has_surrogate());
+        let (_, ba) = self.seek(lo);
+        let (_, bb) = self.seek(hi);
+        (ba, bb)
+    }
+
+    /// Build a slice from a known well-formed, surrogate-free (BMP) UTF-8 slice
+    /// of exact length `units`, skipping `wtf8_is_wellformed`/`wtf8_units` scans.
+    #[cfg(feature = "python")]
+    #[inline]
+    pub(crate) fn from_bmp_utf8(bytes: Vec<u8>, units: usize) -> JsStr {
+        let ascii = bytes.len() == units;
+        let bytes = StrBytes::from_utf8(bytes);
+        JsStr {
+            units: units as u32,
+            ascii,
+            wellformed: bytes.is_text_or(true),
+            bytes,
+            memo_state: 0,
+            cursor: Cell::new(0),
+            marks: std::cell::OnceCell::new(),
+        }
+    }
+
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn freeze_for_concat_memo(&mut self, suffix_head: bool) {
-        self.memo_state = STR_MEMO_FROZEN | if suffix_head { STR_MEMO_SUFFIX_HEAD } else { 0 };
+        self.memo_state = (self.memo_state & STR_MEMO_HAS_SURROGATE)
+            | STR_MEMO_FROZEN
+            | if suffix_head { STR_MEMO_SUFFIX_HEAD } else { 0 };
     }
 
     /// Cached seeded content hash (`seeded_bytes_hash(self.as_bytes())`).
@@ -5387,7 +5531,12 @@ impl JsStr {
             self.cursor.set(0);
         }
         self.units += str_units(add) as u32;
-        self.ascii &= add.is_ascii();
+        if !add.is_ascii() {
+            self.ascii = false;
+            if add.as_bytes().iter().any(|&b| b >= 0xF0) {
+                self.memo_state |= STR_MEMO_HAS_SURROGATE;
+            }
+        }
         self.bytes.push_text(add);
     }
 
@@ -5401,6 +5550,7 @@ impl JsStr {
             }
             self.units += add.units;
             self.ascii &= add.ascii;
+            self.memo_state |= add.memo_state & STR_MEMO_HAS_SURROGATE;
             self.bytes.push_all(&add.bytes);
             self.wellformed = self.bytes.is_text_or(true);
         } else {
@@ -5428,10 +5578,14 @@ impl JsStr {
         if self.wellformed && wtf8_is_wellformed(add) {
             // Surrogate-free on both sides: plain append, no seam possible.
             self.ascii = false;
+            if add.iter().any(|&b| b >= 0xF0) {
+                self.memo_state |= STR_MEMO_HAS_SURROGATE;
+            }
             self.bytes.push_utf8(add);
             self.wellformed = self.bytes.is_text_or(true);
         } else {
             self.ascii = false;
+            self.memo_state |= STR_MEMO_HAS_SURROGATE;
             wtf8_push(self.bytes.wtf8_mut(), add);
             let wellformed = wtf8_is_wellformed(&self.bytes);
             self.wellformed = self.bytes.settle(wellformed);
@@ -6539,12 +6693,53 @@ impl std::ops::Deref for RegExpData {
 /// unset = not yet computed, `None` = compile failed (fall back to `regex`),
 /// `Some(arc)` = the twin. Holds no `Value`s (an `Arc<regress::Regex>` is a
 /// pure compiled program), so GC need not trace it.
+/// Cached precomputed literal matcher for a pure, non-empty, case-sensitive,
+/// surrogate-free literal regex (`RegExpCore::pure_literal`).
+#[cfg(not(feature = "safe-sandbox"))]
+pub struct RegExpPureLiteral {
+    pub finder: Box<memchr::memmem::Finder<'static>>,
+    pub utf16_len: usize,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl std::fmt::Debug for RegExpPureLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegExpPureLiteral")
+            .field("needle_len", &self.finder.needle().len())
+            .field("utf16_len", &self.utf16_len)
+            .finish()
+    }
+}
+
+/// Cached `StaticKeyPlan` + settled shape + capture-index mapping for a regex
+/// with named capture groups (`RegExpCore::groups_plan`). Lets `exec()` build
+/// the `.groups` object via `Heap::alloc_finalized` with zero per-match key
+/// allocations and monomorphic shape ICs on `m.groups.foo`.
+#[derive(Debug)]
+pub struct RegExpGroupsPlan {
+    pub plan: crate::bytecode::StaticKeyPlan,
+    pub shape: u32,
+    /// For each unique named group in `plan.keys()` order, the 0-based capture
+    /// group indices sharing that name (usually len 1; >1 for ES2025 duplicate
+    /// named capture groups).
+    pub cap_indices: Box<[Box<[u32]>]>,
+}
+
 #[derive(Debug)]
 pub struct RegExpCore {
     pub regex: std::sync::Arc<regress::Regex>,
     pub source: std::sync::Arc<str>,
     pub flags: std::sync::Arc<str>,
+    /// Pre-decoded `ITFB_*` flag bits (`g`, `u|v`, `y`, `d`) computed once at
+    /// core construction so `exec`/`match`/`split` never rescan `flags.bytes()`.
+    pub flag_bits: u8,
     pub ascii_twin: std::sync::OnceLock<Option<std::sync::Arc<regress::Regex>>>,
+    /// Lazily derived pure-literal `memmem::Finder` for non-empty, surrogate-free,
+    /// case-sensitive literal patterns.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub pure_literal: std::sync::OnceLock<Option<RegExpPureLiteral>>,
+    /// Lazily derived `StaticKeyPlan` + shape for named-capture `.groups` objects.
+    pub groups_plan: std::sync::OnceLock<Option<RegExpGroupsPlan>>,
 }
 
 impl RegExpCore {
@@ -6554,12 +6749,86 @@ impl RegExpCore {
         source: std::sync::Arc<str>,
         flags: std::sync::Arc<str>,
     ) -> std::sync::Arc<Self> {
+        let mut flag_bits = 0u8;
+        for b in flags.bytes() {
+            match b {
+                b'g' => flag_bits |= crate::vm::ITFB_GLOBAL,
+                b'u' | b'v' => flag_bits |= crate::vm::ITFB_UNICODE,
+                b'y' => flag_bits |= crate::vm::ITFB_STICKY,
+                b'd' => flag_bits |= crate::vm::ITFB_INDICES,
+                _ => {}
+            }
+        }
         std::sync::Arc::new(Self {
             regex,
             source,
             flags,
+            flag_bits,
             ascii_twin: std::sync::OnceLock::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            pure_literal: std::sync::OnceLock::new(),
+            groups_plan: std::sync::OnceLock::new(),
         })
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub fn pure_literal_finder(&self) -> Option<&RegExpPureLiteral> {
+        self.pure_literal
+            .get_or_init(|| {
+                let lit = self.regex.pure_literal()?;
+                if lit.is_empty() {
+                    return None;
+                }
+                let utf16_len = lit.encode_utf16().count();
+                let finder = Box::new(memchr::memmem::Finder::new(lit.as_bytes()).into_owned());
+                Some(RegExpPureLiteral { finder, utf16_len })
+            })
+            .as_ref()
+    }
+
+    #[inline]
+    pub fn groups_plan_cached(&self) -> Option<&RegExpGroupsPlan> {
+        self.groups_plan
+            .get_or_init(|| {
+                let raw = self.regex.group_names()?;
+                let mut names: Vec<String> = Vec::new();
+                let mut indices: Vec<Vec<u32>> = Vec::new();
+                for (i, name) in raw.iter().enumerate() {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if let Some(pos) = names.iter().position(|n| n.as_str() == name.as_ref()) {
+                        indices[pos].push(i as u32);
+                    } else {
+                        names.push(name.to_string());
+                        indices.push(vec![i as u32]);
+                    }
+                }
+                if names.is_empty() {
+                    return None;
+                }
+                let plan = crate::bytecode::StaticKeyPlan::new(names);
+                if !plan.runtime_valid() || plan.has_element_key() {
+                    return None;
+                }
+                let data = crate::shape::attr_bits(true, true, true, false);
+                let shape = plan
+                    .keys()
+                    .iter()
+                    .fold(crate::shape::EMPTY, |s, k| crate::shape::add(s, k, data));
+                let cap_indices: Box<[Box<[u32]>]> = indices
+                    .into_iter()
+                    .map(Vec::into_boxed_slice)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                Some(RegExpGroupsPlan {
+                    plan,
+                    shape,
+                    cap_indices,
+                })
+            })
+            .as_ref()
     }
 }
 
@@ -7040,7 +7309,7 @@ fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
 #[cfg(feature = "jit")]
 #[inline(always)]
 fn object_mirror_fid(map: &ObjMap) -> u32 {
-    if map.is_ctor {
+    if map.is_ctor || map.is_dict_pinned() {
         FID_MIRROR_CTOR
     } else if let Some(class) = map.class {
         // A heap index is far below 2^31 (`class_mirror_fid`'s bound, which
@@ -8155,6 +8424,33 @@ const GEN_SCAN: u8 = 0b100;
 /// pushed at most once per epoch). Cleared wherever the slot's state is
 /// wholesale restamped (`alloc`, `free_slot`, the promote arms).
 const GEN_VLOG: u8 = 0b1000;
+/// GC leaf bit: set when this slot holds an occupant with ZERO outgoing GC
+/// edges (flat `Str`, `Func`, 0-upval non-heap-`this` `Closure`, `Date`,
+/// `BigInt`, `Native`, `ArrayBuffer`, `Temporal`, `TextCodec`) and no
+/// `closure_home` / `closure_new_target` entry. Cleared on `free_slot`,
+/// `replace` to a non-leaf, or `clear_leaf` (when recording a closure side-table
+/// edge). Lets the GC mark loop skip pushing/prefetching leaf slots using the
+/// 1-byte/slot `gen` array instead of touching `hot_mirror` or `objs`.
+const GEN_LEAF: u8 = 0b1_0000;
+
+#[inline(always)]
+fn is_obj_leaf(obj: &HeapObj) -> bool {
+    match obj {
+        HeapObj::Str(_)
+        | HeapObj::Func(_)
+        | HeapObj::Native(_)
+        | HeapObj::Date(_)
+        | HeapObj::ArrayBuffer { .. }
+        | HeapObj::Temporal { .. }
+        | HeapObj::TextCodec(_)
+        | HeapObj::BigInt(_)
+        | HeapObj::BigIntBig(_) => true,
+        HeapObj::Closure {
+            upvalues, this_val, ..
+        } => upvalues.is_empty() && !this_val.is_heap(),
+        _ => false,
+    }
+}
 
 /// Smallest live-object count that triggers a collection — below this the heap is
 /// trivially small and collecting would be pure overhead.
@@ -8806,12 +9102,40 @@ impl Heap {
         }
     }
 
-    /// True iff slot `idx` holds a non-empty flat `HeapObj::Str` (zero outgoing
-    /// GC edges, never in `closure_home` / `closure_new_target`).
+    /// True iff slot `idx` holds a non-empty flat `HeapObj::Str`.
     #[cfg(feature = "jit")]
     #[inline(always)]
     pub(crate) fn is_flat_str_mirror(&self, idx: usize) -> bool {
         self.hot_mirror[idx].fid == FID_MIRROR_STR
+    }
+
+    /// True iff slot `idx` holds a zero-edge GC leaf (no outgoing heap refs and
+    /// no `closure_home`/`closure_new_target` entry). Uses the dense 1-byte/slot
+    /// `gen` array when the nursery is active, falling back to `hot_mirror` for
+    /// flat strings when `ZIPP_NO_NURSERY=1`.
+    #[inline(always)]
+    pub(crate) fn is_leaf_slot(&self, idx: usize) -> bool {
+        if self.nursery {
+            (self.gen[idx] & GEN_LEAF) != 0
+        } else {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx].fid == FID_MIRROR_STR
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                false
+            }
+        }
+    }
+
+    /// Clear `GEN_LEAF` when attaching an external GC edge (`closure_home` or
+    /// `closure_new_target`) to an otherwise leaf callable slot.
+    #[inline(always)]
+    pub(crate) fn clear_leaf(&mut self, idx: u32) {
+        if self.nursery {
+            self.gen[idx as usize] &= !GEN_LEAF;
+        }
     }
 
     /// True iff slot `idx` holds a settled dense `HeapObj::Array` with a live
@@ -8876,6 +9200,9 @@ impl Heap {
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
+        if let HeapObj::Object(m) = &mut self.objs[idx as usize] {
+            m.pin_dict();
+        }
         #[cfg(feature = "jit")]
         {
             self.hot_mirror[idx as usize] = HotMirror::CLEAR;
@@ -8971,12 +9298,12 @@ impl Heap {
                 // `cap` itself — the old `cap - capacity` under-reserved and
                 // re-grew mid-build, exactly the malloc this pool removes.
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(4));
                 }
                 return v;
             }
             if cap > 0 {
-                return Vec::with_capacity(cap.max(4));
+                return Vec::with_capacity(cap.next_power_of_two().max(4));
             }
         }
         Vec::with_capacity(cap)
@@ -8988,19 +9315,20 @@ impl Heap {
     /// unused goes back through `return_byte_buf`.
     #[inline]
     pub(crate) fn take_byte_buf(&mut self, cap: usize) -> Vec<u8> {
+        if cap == 0 {
+            return Vec::new();
+        }
         #[cfg(not(feature = "safe-sandbox"))]
         if cap <= BYTE_POOL_MAX_CAP {
             self.byte_pool_asks += 1;
             if let Some(mut v) = self.byte_pool.pop() {
                 v.clear();
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
                 }
                 return v;
             }
-            if cap > 0 {
-                return Vec::with_capacity(if cap <= 32 { 32 } else { BYTE_POOL_MAX_CAP });
-            }
+            return Vec::with_capacity(cap.next_power_of_two().max(32).min(BYTE_POOL_MAX_CAP));
         }
         Vec::with_capacity(cap)
     }
@@ -9018,11 +9346,11 @@ impl Heap {
             if let Some(mut v) = self.upval_pool.pop() {
                 v.clear();
                 if v.capacity() < cap {
-                    v.reserve(cap);
+                    v.reserve(cap.next_power_of_two().max(4));
                 }
                 return v;
             }
-            return Vec::with_capacity(cap.max(4));
+            return Vec::with_capacity(cap.next_power_of_two().max(4));
         }
         Vec::with_capacity(cap)
     }
@@ -9764,13 +10092,19 @@ impl Heap {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn reuse_slot_stamp(&mut self, idx: u32) {
+        self.reuse_slot_stamp_with(idx, 0);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reuse_slot_stamp_with(&mut self, idx: u32, leaf: u8) {
         self.version_reuse(idx);
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);
-                self.gen[idx as usize] = GEN_YOUNG;
+                self.gen[idx as usize] = GEN_YOUNG | leaf;
             } else {
-                self.gen[idx as usize] = GEN_OLD;
+                self.gen[idx as usize] = GEN_OLD | leaf;
             }
         }
         if self.oracle {
@@ -9840,7 +10174,7 @@ impl Heap {
                         vals: 0,
                     };
                 }
-                self.reuse_slot_stamp(idx);
+                self.reuse_slot_stamp_with(idx, GEN_LEAF);
                 if self.oracle {
                     self.thin_stats[3] += 1;
                 }
@@ -9870,6 +10204,11 @@ impl Heap {
                 } else {
                     upvalues.as_ptr() as u64
                 };
+                let leaf = if upvalues.is_empty() && !this_val.is_heap() {
+                    GEN_LEAF
+                } else {
+                    0
+                };
                 self.reuse_slot_begin();
                 self.reuse_slot_write(
                     idx,
@@ -9889,7 +10228,7 @@ impl Heap {
                         vals: 0,
                     };
                 }
-                self.reuse_slot_stamp(idx);
+                self.reuse_slot_stamp_with(idx, leaf);
                 if self.oracle {
                     self.thin_stats[4] += 1;
                 }
@@ -10360,6 +10699,29 @@ impl Heap {
         }
     }
 
+    /// Pin a non-empty flat ASCII `HeapObj::Str` into the unused `this_mirror`
+    /// (length) and `upvals_mirror` (raw byte ptr) slots after marking it
+    /// `freeze_shared`, so Tier-C `charCodeAt`, `.length`, and `s[i]` can read
+    /// bytes inline without FFI. Cleared by `free_slot` and `replace`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn pin_ascii_str_mirror(&mut self, idx: u32) {
+        let i = idx as usize;
+        if i >= self.objs.len() || self.upvals_mirror[i] != 0 {
+            return;
+        }
+        if let HeapObj::Str(s) = &mut self.objs[i] {
+            let n = s.units();
+            if s.is_ascii() && n > 0 && n <= i32::MAX as usize {
+                s.freeze_shared();
+                let ptr = s.as_bytes().as_ptr() as u64;
+                self.hot_mirror[i] = HotMirror::STR;
+                self.this_mirror[i] = n as u64;
+                self.upvals_mirror[i] = ptr;
+            }
+        }
+    }
+
     /// Whether footprint growth asked for a payload walk, clearing the ask.
     #[cfg(feature = "instrument")]
     #[inline]
@@ -10435,6 +10797,7 @@ impl Heap {
         if self.live >= self.gc_threshold {
             self.gc_requested = true;
         }
+        let leaf = if is_obj_leaf(&obj) { GEN_LEAF } else { 0 };
         // Reuse a reclaimed slot when one is available (its version is bumped so a
         // stale inline-cache entry for the old occupant misses).
         if let Some(idx) = self.pop_free() {
@@ -10464,13 +10827,13 @@ impl Heap {
                     self.young.push(idx);
                     // Clears every bit: a recycled slot sheds the dead occupant's
                     // remset/scan state (the scan_roots prune keys off this).
-                    self.gen[idx as usize] = GEN_YOUNG;
+                    self.gen[idx as usize] = GEN_YOUNG | leaf;
                 } else {
                     // W9 static pretenure: OLD-clean, not logged — the minor
                     // never sees it; `gen == GEN_YOUNG ⇔ in the young log`
                     // holds by both halves being false. Clears GEN_SCAN too,
                     // same as the young stamp.
-                    self.gen[idx as usize] = GEN_OLD;
+                    self.gen[idx as usize] = GEN_OLD | leaf;
                 }
             }
             if self.oracle {
@@ -10511,9 +10874,9 @@ impl Heap {
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);
-                self.gen.push(GEN_YOUNG);
+                self.gen.push(GEN_YOUNG | leaf);
             } else {
-                self.gen.push(GEN_OLD);
+                self.gen.push(GEN_OLD | leaf);
             }
             self.recache_gen_raw();
         }
@@ -11001,7 +11364,7 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         self.ready_abandon();
         for &i in &self.young {
-            self.gen[i as usize] = GEN_OLD;
+            self.gen[i as usize] = (self.gen[i as usize] & GEN_LEAF) | GEN_OLD;
         }
         self.young.clear();
         self.invalidate_nonyoung_cache();
@@ -11040,9 +11403,17 @@ impl Heap {
     /// No double-free is possible: a young slot is never already on the free
     /// list here, because the free list is refilled only by sweeps and a
     /// freed slot re-enters the log only when `alloc` hands it out again.
+    #[cfg(test)]
     pub fn sweep_young(&mut self, marks: &[bool]) -> usize {
+        self.sweep_young_classes(marks).0
+    }
+
+    /// Reports `(swept_count, any_class_swept)` so minor GC only invalidates
+    /// `class_member_cache` when a `HeapObj::Class` is actually reclaimed.
+    pub fn sweep_young_classes(&mut self, marks: &[bool]) -> (usize, bool) {
         let mut log = std::mem::take(&mut self.young);
         let mut swept = 0;
+        let mut swept_class = false;
         #[cfg(not(feature = "safe-sandbox"))]
         {
             self.obj_pool_refill_scope(true);
@@ -11081,13 +11452,16 @@ impl Heap {
                         continue;
                     }
                 }
+                if matches!(self.objs[idx as usize], HeapObj::Class(_)) {
+                    swept_class = true;
+                }
                 self.free_slot(idx);
                 swept += 1;
             } else {
-                // Promote: OLD, keeping only the sticky scan bit — a stale
+                // Promote: OLD, keeping only the sticky scan & leaf bits — a stale
                 // GEN_VLOG must not survive promotion (W10).
                 let g = &mut self.gen[idx as usize];
-                *g = (*g & GEN_SCAN) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF)) | GEN_OLD;
             }
         }
         #[cfg(not(feature = "safe-sandbox"))]
@@ -11101,7 +11475,7 @@ impl Heap {
         #[cfg(feature = "safe-sandbox")]
         log.clear();
         self.young = log;
-        swept
+        (swept, swept_class)
     }
 
     // ── stage-3 write barrier + remembered set ─────────────────────────────
@@ -11723,6 +12097,179 @@ impl Heap {
             self.free.push(idx);
             return;
         }
+        // Fast path for dead dense Arrays: an Array's `hot_mirror` is always
+        // CLEAR, so we skip touching `hot_mirror` and skip the object/string/
+        // closure branches, directly recycling small buffers into `arr_pool`.
+        if matches!(&self.objs[idx as usize], HeapObj::Array(_)) {
+            #[cfg(feature = "jit")]
+            debug_assert_eq!(self.hot_mirror[idx as usize], HotMirror::CLEAR);
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                self.dirty_array_snapshots();
+                self.arr_mirror[idx as usize] = [0, 0];
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            let HeapObj::Array(v) =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            #[cfg(not(feature = "safe-sandbox"))]
+            {
+                let cap = v.capacity();
+                if self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=ARR_POOL_MAX_CAP).contains(&cap)
+                {
+                    self.arr_pool.push(v);
+                } else if cap > 0 && gc_courier::active() {
+                    let min = if self.courier_bulk {
+                        0
+                    } else {
+                        gc_courier::min_ship_bytes()
+                    };
+                    let b = cap * std::mem::size_of::<Value>();
+                    if b >= min {
+                        if b < gc_courier::COURIER_MIN_BYTES {
+                            self.courier_small_mass += b;
+                        }
+                        if self.oracle {
+                            self.courier_stats[1] += 1;
+                            self.courier_stats[2] += b as u64;
+                        }
+                        self.courier_batch.push(gc_courier::Item::Arr(v));
+                    } else {
+                        self.courier_small_mass += b;
+                        if self.oracle {
+                            self.courier_stats[3] += 1;
+                            self.courier_stats[4] += b as u64;
+                        }
+                        drop(v);
+                    }
+                } else {
+                    drop(v);
+                }
+            }
+            #[cfg(feature = "safe-sandbox")]
+            drop(v);
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
+        // Fast path for dead small pooled strings: clears `hot_mirror` and
+        // `atoms` and recycles the byte buffer directly into `byte_pool`
+        // without touching `arr_mirror`, object/closure branches, or courier.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if (self.byte_pool_want || self.byte_pool_asks != 0)
+            && self.obj_pool_refill
+            && obj_pool_enabled()
+            && matches!(&self.objs[idx as usize], HeapObj::Str(js) if (1..=BYTE_POOL_MAX_CAP).contains(&js.byte_capacity()))
+        {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            self.clear_atom(idx);
+            let HeapObj::Str(js) =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            self.byte_pool.push(js.into_byte_buf());
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
+        // Fast path for dead capturing closures: clears mirrors and recycles
+        // small upvalue buffers straight into `upval_pool` without touching
+        // `arr_mirror`, `atoms`, or `free_slot_tail`.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if matches!(&self.objs[idx as usize], HeapObj::Closure { .. }) {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                self.upvals_mirror[idx as usize] = 0;
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            let HeapObj::Closure { upvalues, .. } =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            let cap = upvalues.capacity();
+            if self.obj_pool_refill
+                && obj_pool_enabled()
+                && (1..=UPVAL_POOL_MAX_CAP).contains(&cap)
+            {
+                self.upval_pool.push(upvalues);
+            } else {
+                drop(upvalues);
+            }
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
+        // Fast path for dead Python layout-mode attribute storage: recycles
+        // small value buffers directly into `arr_pool`.
+        #[cfg(all(feature = "python", not(feature = "safe-sandbox")))]
+        if matches!(&self.objs[idx as usize], HeapObj::PyAttrs { .. }) {
+            #[cfg(feature = "jit")]
+            {
+                self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+            }
+            if self.payload_accounting.get() {
+                let payload = self.resident_payload_charged[idx as usize].replace(0);
+                self.resident_payload_current
+                    .set(self.resident_payload_current.get().saturating_sub(payload));
+            }
+            let HeapObj::PyAttrs { vals, .. } =
+                std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN))
+            else {
+                unreachable!()
+            };
+            let cap = vals.capacity();
+            if self.obj_pool_refill
+                && obj_pool_enabled()
+                && (1..=ARR_POOL_MAX_CAP).contains(&cap)
+            {
+                self.arr_pool.push(vals);
+            } else {
+                drop(vals);
+            }
+            self.version_retire(idx);
+            if self.nursery {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+            self.free.push(idx);
+            return;
+        }
         // B187 stage 3: capture the recycle signal BEFORE the mirror clears.
         // A settled (non-DICT) shape mirror means the occupant was born
         // finalized/appended and never structurally bumped without repair —
@@ -11776,7 +12323,14 @@ impl Heap {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             // The slot's next string is no atom (`Heap::atoms`).
-            HeapObj::Str(_) => self.clear_atom(idx),
+            HeapObj::Str(_) => {
+                self.clear_atom(idx);
+                #[cfg(feature = "jit")]
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
+            }
             #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
@@ -12236,7 +12790,7 @@ impl Heap {
             // Keeping only GEN_SCAN also strips any stale GEN_VLOG (W10) —
             // the value-grain dedup bit must not outlive its vremset entry.
             for g in &mut self.gen {
-                *g = (*g & GEN_SCAN) | GEN_OLD;
+                *g = (*g & (GEN_SCAN | GEN_LEAF)) | GEN_OLD;
             }
             self.remset.clear();
             self.vremset.clear();
@@ -12327,6 +12881,13 @@ impl Heap {
         if matches!(&obj, HeapObj::TypedArray { .. }) {
             self.has_typed_array = 1;
         }
+        if self.nursery {
+            if is_obj_leaf(&obj) {
+                self.gen[idx as usize] |= GEN_LEAF;
+            } else {
+                self.gen[idx as usize] &= !GEN_LEAF;
+            }
+        }
         #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
         let old = std::mem::replace(&mut self.objs[idx as usize], obj);
         // Replacing an Array discards the storage a compiled snapshot may
@@ -12342,6 +12903,13 @@ impl Heap {
         match &old {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+            }
+            #[cfg(feature = "jit")]
+            HeapObj::Str(_) => {
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
             }
             #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
@@ -12684,7 +13252,7 @@ impl Heap {
                 if non_empty {
                     self.hot_mirror[idx as usize] = HotMirror::STR;
                 }
-                self.reuse_slot_stamp(idx);
+                self.reuse_slot_stamp_with(idx, GEN_LEAF);
                 return idx;
             }
         }
@@ -12734,8 +13302,19 @@ impl Heap {
         {
             if l.wellformed && r.wellformed {
                 debug_assert_eq!(l.units() + r.units(), units);
+                let total = l.bytes.len() + r.bytes.len();
+                if total <= BYTE_POOL_MAX_CAP {
+                    let buf = self.take_byte_buf(total);
+                    let (HeapObj::Str(l), HeapObj::Str(r)) =
+                        (&self.objs[left as usize], &self.objs[right as usize])
+                    else {
+                        unreachable!()
+                    };
+                    let joined = JsStr::concat_wellformed_in_buf(l, r, units, buf);
+                    return self.alloc_str_settled(joined);
+                }
                 let joined = JsStr::concat_wellformed(l, r, units);
-                return self.alloc(HeapObj::Str(joined));
+                return self.alloc_str_settled(joined);
             }
         }
         let mut out = Vec::with_capacity(units * 3); // ≤ 3 WTF-8 bytes per UTF-16 unit
@@ -13081,8 +13660,72 @@ impl Heap {
     /// (`write_wtf8`/`wtf8_push` merge cross-segment surrogate pairs), so two
     /// equal unit sequences always have identical bytes.
     pub fn str_eq(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
         match (self.get(a), self.get(b)) {
             (HeapObj::Str(x), HeapObj::Str(y)) => x.as_bytes() == y.as_bytes(),
+            (HeapObj::Str(flat), HeapObj::Cons { len, .. })
+            | (HeapObj::Cons { len, .. }, HeapObj::Str(flat)) => {
+                if flat.units() != *len {
+                    return false;
+                }
+                let cons = if matches!(self.get(a), HeapObj::Cons { .. }) { a } else { b };
+                if flat.is_ascii() {
+                    // An all-ASCII target of the same UTF-16 length matches the
+                    // rope iff every leaf is ASCII and matches sequentially.
+                    let target = flat.as_bytes();
+                    let mut off = 0usize;
+                    let mut stack = [0u32; 32];
+                    let mut sp = 1usize;
+                    stack[0] = cons;
+                    let mut spill: Vec<u32> = Vec::new();
+                    while sp > 0 || !spill.is_empty() {
+                        let n = if let Some(v) = spill.pop() {
+                            v
+                        } else {
+                            sp -= 1;
+                            stack[sp]
+                        };
+                        match self.get(n) {
+                            HeapObj::Str(s) => {
+                                let sb = s.as_bytes();
+                                if !s.is_ascii()
+                                    || off + sb.len() > target.len()
+                                    || &target[off..off + sb.len()] != sb
+                                {
+                                    return false;
+                                }
+                                off += sb.len();
+                            }
+                            HeapObj::Cons { left, right, .. } => {
+                                if sp + 2 <= stack.len() && spill.is_empty() {
+                                    stack[sp] = *right;
+                                    stack[sp + 1] = *left;
+                                    sp += 2;
+                                } else {
+                                    spill.push(*right);
+                                    spill.push(*left);
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    return off == target.len();
+                }
+                let mut sc = Vec::new();
+                self.write_wtf8(cons, &mut sc);
+                sc.as_slice() == flat.as_bytes()
+            }
+            (HeapObj::Cons { len: la, .. }, HeapObj::Cons { len: lb, .. }) => {
+                if la != lb {
+                    return false;
+                }
+                let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                self.write_wtf8(a, &mut sa);
+                self.write_wtf8(b, &mut sb);
+                sa == sb
+            }
             _ => {
                 let (mut sa, mut sb) = (Vec::new(), Vec::new());
                 self.write_wtf8(a, &mut sa);

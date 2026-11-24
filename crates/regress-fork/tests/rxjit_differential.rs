@@ -111,11 +111,30 @@ fn corpus() -> Vec<(String, String, String)> {
     add("(a+)(a*)(a?)", "g", "aaaa");
     add("q(?:u)(x)?", "g", "quiz qu");
     add("[^a]+", "g", "abba");
-    // Unsupported subset (declines; both sides interpreted -> equal).
-    add("(a)\\1", "g", "aa ab");
-    add("a(?=b)", "g", "ab ac");
-    add("(?<=a)b", "g", "ab cb");
-    add("(ab)+", "g", "ababab");
+    // Backreferences, lookarounds, and general loops (EnterLoop/LoopAgain) —
+    // all now compiled natively and verified against both interpreter and Node.
+    add(r"(a)\1", "g", "aa ab");
+    add(r"(a)\1", "gi", "aA Aa ab");
+    add(r"\b(\w+)\s+\1\b", "g", "the the cat dog dog");
+    add(r"<([a-z]+)[^>]*>(.*?)<\/\1>", "g", "<b>hi</b> <em>yo</em>");
+    add(r"(a?)x\1", "g", "axaa x xa");
+    add(r"(abc\1)", "g", "abc abcabc");
+    add(r"a(?=b)", "g", "ab ac");
+    add(r"a(?!b)", "g", "ab ac");
+    add(r"(?<=a)b", "g", "ab cb");
+    add(r"(?<!no )milk", "g", "no milk hot milk milk");
+    add(r"(?<=\$)\d+(?:\.\d\d)?", "g", "$12.34 $5 99 $0.05");
+    add(r"\d+(?=kg)", "g", "10kg 20lb 3kg");
+    add(r"(ab)+", "g", "ababab");
+    add(r"(ab)+?", "g", "ababab");
+    add(r"(ab)*?", "g", "abab");
+    add(r"(?:(?:a?)?)+n", "g", "aaan a b");
+    add(r"(?:a*)*?b", "g", "aaab b");
+    add(r"(?:a*){2,4}", "g", "aaaaa");
+    add(r#""(?:[^"\\\n]|\\.)*""#, "g", r#""hi" "a\"b\\c" """#);
+    add(r"^-?\d+(?:\.\d+)?$", "g", "-3.5");
+    add(r"^(?:\w+\s)+end$", "g", "word0 word1 end");
+    add(r"(ab){0}c", "g", "abc c");
     add(r"A", "g", "A");
 
     // Deterministic fuzz over the supported subset.

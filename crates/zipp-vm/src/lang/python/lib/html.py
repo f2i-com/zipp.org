@@ -1,6 +1,7 @@
 """General functions for HTML manipulation (`html.escape` and `html.unescape`)."""
 import re
-from html.entities import html5 as _html5
+
+_html5 = None
 
 __all__ = ["escape", "unescape"]
 
@@ -81,6 +82,10 @@ def _replace_charref(s):
             return ""
         return chr(num)
     else:
+        global _html5
+        if _html5 is None:
+            from html.entities import html5 as _h5
+            _html5 = _h5
         if s in _html5:
             return _html5[s]
         for x in range(len(s) - 1, 1, -1):

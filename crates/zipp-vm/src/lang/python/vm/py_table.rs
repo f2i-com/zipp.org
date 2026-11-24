@@ -255,7 +255,11 @@ impl PyTable {
 
     /// Every value the table holds, for the collector.
     pub(crate) fn edges(&self) -> impl Iterator<Item = Value> + '_ {
-        self.keys.iter().chain(self.vals.iter()).copied().chain([self.kinds.tuple, self.kinds.frozenset])
+        self.keys
+            .iter()
+            .chain(self.vals.iter())
+            .copied()
+            .chain([self.kinds.tuple, self.kinds.frozenset, self.kinds.type_type])
     }
 
     /// Bytes owned beyond the struct (for heap accounting).
@@ -652,6 +656,10 @@ pub(crate) fn cpython_set_size(n: usize) -> usize {
 pub(crate) struct PyKinds {
     pub(crate) tuple: Value,
     pub(crate) frozenset: Value,
+    /// `TypeType` (`type`), so plain Python class objects (`cls === TypeType`,
+    /// immutable builtin metaclass) hash by their birth `id` and compare by
+    /// identity without guest code.
+    pub(crate) type_type: Value,
     /// The shape of a list or tuple record laid out as the runtime's
     /// sequence literal (`cls` at slot 0, `items` at slot 1; `shape::DICT`:
     /// none known), whose fields are then read at their slots.
@@ -664,6 +672,7 @@ impl Default for PyKinds {
         PyKinds {
             tuple: Value::UNDEFINED,
             frozenset: Value::UNDEFINED,
+            type_type: Value::UNDEFINED,
             seq_shape: crate::shape::DICT,
         }
     }
@@ -679,6 +688,8 @@ enum Kind<'h> {
     Tuple(&'h [Value]),
     /// A frozenset's storage.
     Frozen(Value),
+    /// A plain Python `type` object (`cls === TypeType`, `isType === true`): `(id, bits)`.
+    TypeObj(i64, u64),
 }
 
 /// An own data property of the plain object `idx`.
@@ -693,7 +704,12 @@ fn rec_field(heap: &Heap, idx: u32, key: &str) -> Option<Value> {
     (!m.is_accessor_at(s)).then(|| m.val_at(s))
 }
 
-fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
+fn classify<'h>(
+    heap: &'h Heap,
+    py_rt: Option<&super::py_rt::PyRt>,
+    kinds: &PyKinds,
+    v: Value,
+) -> Option<Kind<'h>> {
     if v.is_number() {
         return Some(Kind::Float(v.as_f64()));
     }
@@ -730,6 +746,39 @@ fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
                 }
             } else if cls == kinds.frozenset {
                 Some(Kind::Frozen(rec_field(heap, idx, "map")?))
+            } else if kinds.type_type.is_heap() && cls == kinds.type_type {
+                if rec_field(heap, idx, "isType") != Some(Value::TRUE) {
+                    return None;
+                }
+                let id_v = rec_field(heap, idx, "id")?;
+                if id_v.is_int() && id_v.as_int() > 0 {
+                    Some(Kind::TypeObj(i64::from(id_v.as_int()), v.bits()))
+                } else {
+                    None
+                }
+            } else if let Some(rt) = py_rt {
+                // Unmodified `str` subclasses (`bs4.NavigableString`) and
+                // `tuple` subclasses (`soupsieve` `NamedTuple`s) inherit
+                // builtin `__hash__` and `__eq__`.
+                let sk = super::py_rt::py_sub_kind_in(heap, rt, cls);
+                if (sk & super::py_rt::SUB_STR_HASH_EQ) != 0 {
+                    let pyval = rec_field(heap, idx, "pyval")?;
+                    if pyval.is_heap() && heap.is_str_like(pyval.heap_index()) {
+                        return Some(Kind::Str(pyval.heap_index()));
+                    }
+                    return None;
+                }
+                if (sk & super::py_rt::SUB_TUPLE_HASH_EQ) != 0 {
+                    let items = rec_field(heap, idx, "items")?;
+                    if !items.is_heap() {
+                        return None;
+                    }
+                    return match heap.get(items.heap_index()) {
+                        HeapObj::Array(a) if !a.iter().any(|x| x.is_hole()) => Some(Kind::Tuple(a)),
+                        _ => None,
+                    };
+                }
+                None
             } else {
                 None
             }
@@ -919,27 +968,29 @@ pub(crate) fn native_hash(heap: &Heap, kinds: &PyKinds, v: Value, steps: &mut u6
     hash_in(heap, None, kinds, v, 0, steps)
 }
 
-/// [`native_hash`] with the VM's direct-mapped string hash cache.
+/// [`native_hash`] with the VM's runtime registry (string hash cache and
+/// unmodified `str`/`tuple` subclass key support).
 pub(crate) fn native_hash_cached(
     heap: &Heap,
-    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    py_rt: Option<&super::py_rt::PyRt>,
     kinds: &PyKinds,
     v: Value,
     steps: &mut u64,
 ) -> Option<i64> {
-    hash_in(heap, cache, kinds, v, 0, steps)
+    hash_in(heap, py_rt, kinds, v, 0, steps)
 }
 
 fn hash_in(
     heap: &Heap,
-    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    py_rt: Option<&super::py_rt::PyRt>,
     kinds: &PyKinds,
     v: Value,
     depth: u32,
     steps: &mut u64,
 ) -> Option<i64> {
     *steps += 1;
-    Some(match classify(heap, kinds, v)? {
+    let cache = py_rt.map(|p| &*p.str_hashes);
+    Some(match classify(heap, py_rt, kinds, v)? {
         Kind::Float(x) => hash_f64(x),
         Kind::Int(n) => hash_i128(n),
         Kind::Big(b) => hash_big(b),
@@ -954,7 +1005,7 @@ fn hash_in(
             const P5: u64 = 2_870_177_450_012_600_261;
             let mut acc = P5;
             for &x in items {
-                let lane = hash_in(heap, cache, kinds, x, depth + 1, steps)?;
+                let lane = hash_in(heap, py_rt, kinds, x, depth + 1, steps)?;
                 acc = acc.wrapping_add((lane as u64).wrapping_mul(P2));
                 acc = acc.rotate_left(31);
                 acc = acc.wrapping_mul(P1);
@@ -968,9 +1019,10 @@ fn hash_in(
         }
         Kind::Frozen(_) => {
             let mut text = Vec::new();
-            key_text(heap, kinds, v, depth, &mut text, steps)?;
+            key_text(heap, py_rt, kinds, v, depth, &mut text, steps)?;
             hash_str_units(text.into_iter())
         }
+        Kind::TypeObj(id, _) => id,
     })
 }
 
@@ -981,12 +1033,20 @@ fn push_ascii(out: &mut Vec<u16>, s: &str) {
 
 /// The runtime's `keyStr(v)` (the text of `v`'s bucket key, which composes
 /// tuple and frozenset keys and hashes), as UTF-16 units.
-fn key_text(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, out: &mut Vec<u16>, steps: &mut u64) -> Option<()> {
+fn key_text(
+    heap: &Heap,
+    py_rt: Option<&super::py_rt::PyRt>,
+    kinds: &PyKinds,
+    v: Value,
+    depth: u32,
+    out: &mut Vec<u16>,
+    steps: &mut u64,
+) -> Option<()> {
     *steps += 1;
     if out.len() > (1 << 24) || depth > MAX_DEPTH {
         return None;
     }
-    match classify(heap, kinds, v)? {
+    match classify(heap, py_rt, kinds, v)? {
         Kind::Float(x) if x.is_nan() => out.push(u16::from(b'f')),
         Kind::Float(x) if x.is_finite() && x.fract() == 0.0 && x.abs() > SAFE as f64 => {
             push_ascii(out, "n");
@@ -1016,7 +1076,7 @@ fn key_text(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, out: &mut Vec<u1
         Kind::Tuple(items) => {
             push_ascii(out, "t(");
             for &x in items {
-                key_text(heap, kinds, x, depth + 1, out, steps)?;
+                key_text(heap, py_rt, kinds, x, depth + 1, out, steps)?;
                 out.push(u16::from(b','));
             }
             out.push(u16::from(b')'));
@@ -1029,7 +1089,7 @@ fn key_text(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, out: &mut Vec<u1
             let mut texts = Vec::new();
             for x in members {
                 let mut t = Vec::new();
-                key_text(heap, kinds, x, depth + 1, &mut t, steps)?;
+                key_text(heap, py_rt, kinds, x, depth + 1, &mut t, steps)?;
                 texts.push(t);
             }
             // JS's default sort: by UTF-16 code units. Insertion sort keeps
@@ -1052,16 +1112,32 @@ fn key_text(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, out: &mut Vec<u1
             }
             out.push(u16::from(b'}'));
         }
+        Kind::TypeObj(id, _) => {
+            out.push(u16::from(b'o'));
+            push_ascii(out, &id.to_string());
+        }
     }
     Some(())
 }
 
 /// Whether the runtime files `a` and `b` (native keys) in one bucket: their
 /// `keyOf` keys agree, which is their `keyStr` texts agreeing.
+#[allow(dead_code)]
 pub(crate) fn same_bucket(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, steps: &mut u64) -> Option<bool> {
+    same_bucket_rt(heap, None, kinds, a, b, steps)
+}
+
+fn same_bucket_rt(
+    heap: &Heap,
+    py_rt: Option<&super::py_rt::PyRt>,
+    kinds: &PyKinds,
+    a: Value,
+    b: Value,
+    steps: &mut u64,
+) -> Option<bool> {
     let (mut x, mut y) = (Vec::new(), Vec::new());
-    key_text(heap, kinds, a, 0, &mut x, steps)?;
-    key_text(heap, kinds, b, 0, &mut y, steps)?;
+    key_text(heap, py_rt, kinds, a, 0, &mut x, steps)?;
+    key_text(heap, py_rt, kinds, b, 0, &mut y, steps)?;
     Some(x == y)
 }
 
@@ -1070,10 +1146,18 @@ pub(crate) fn same_bucket(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, step
 /// equals anything, itself included (unboxed floats have no identity: the
 /// runtime's documented rule).
 pub(crate) fn native_eq(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, steps: &mut u64) -> Option<bool> {
-    eq_in(heap, kinds, a, b, 0, steps)
+    eq_in(heap, None, kinds, a, b, 0, steps)
 }
 
-fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &mut u64) -> Option<bool> {
+fn eq_in(
+    heap: &Heap,
+    py_rt: Option<&super::py_rt::PyRt>,
+    kinds: &PyKinds,
+    a: Value,
+    b: Value,
+    depth: u32,
+    steps: &mut u64,
+) -> Option<bool> {
     *steps += 1;
     if a == b && !a.is_number() {
         return Some(true);
@@ -1081,7 +1165,7 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
     if depth > MAX_DEPTH {
         return None;
     }
-    let (x, y) = (classify(heap, kinds, a)?, classify(heap, kinds, b)?);
+    let (x, y) = (classify(heap, py_rt, kinds, a)?, classify(heap, py_rt, kinds, b)?);
     Some(match (x, y) {
         (Kind::Float(p), Kind::Float(q)) => p == q,
         (Kind::Int(p), Kind::Int(q)) => p == q,
@@ -1099,7 +1183,7 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
                 return Some(false);
             }
             for (&s, &t) in p.iter().zip(q) {
-                if !eq_in(heap, kinds, s, t, depth + 1, steps)? {
+                if !eq_in(heap, py_rt, kinds, s, t, depth + 1, steps)? {
                     return Some(false);
                 }
             }
@@ -1112,15 +1196,17 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
             }
             let mut t = PyTable::new_set();
             for &e in &q {
-                native_add(heap, kinds, &mut t, e, steps).ok()?;
+                let h = hash_in(heap, py_rt, kinds, e, 0, steps)?;
+                add_hashed_rt(heap, py_rt, kinds, &mut t, h, e, Value::UNDEFINED, steps).ok()?;
             }
             for &e in &p {
-                if native_lookup(heap, kinds, &t, e, steps)?.0.is_none() {
+                if native_lookup_cached(heap, py_rt, kinds, &t, e, steps)?.0.is_none() {
                     return Some(false);
                 }
             }
             true
         }
+        (Kind::TypeObj(_, p), Kind::TypeObj(_, q)) => p == q,
         _ => false,
     })
 }
@@ -1129,15 +1215,15 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
 /// when the key or a same-hash stored key needs guest code.
 pub(crate) fn native_lookup_cached(
     heap: &Heap,
-    cache: Option<&[std::cell::Cell<super::py_rt::StrHashEntry>]>,
+    py_rt: Option<&super::py_rt::PyRt>,
     kinds: &PyKinds,
     t: &PyTable,
     key: Value,
     steps: &mut u64,
 ) -> Option<(Option<usize>, i64)> {
-    let h = native_hash_cached(heap, cache, kinds, key, steps)?;
+    let h = native_hash_cached(heap, py_rt, kinds, key, steps)?;
     let mut work = 0;
-    let found = t.lookup(h, &mut |k| native_eq(heap, kinds, k, key, &mut work), steps);
+    let found = t.lookup(h, &mut |k| eq_in(heap, py_rt, kinds, k, key, 0, &mut work), steps);
     *steps += work;
     match found? {
         Lookup::Found(i) => Some((Some(i), h)),
@@ -1145,6 +1231,7 @@ pub(crate) fn native_lookup_cached(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn native_lookup(
     heap: &Heap,
     kinds: &PyKinds,
@@ -1166,12 +1253,25 @@ pub(crate) fn add_hashed(
     val: Value,
     steps: &mut u64,
 ) -> Result<(usize, bool), Stop> {
+    add_hashed_rt(heap, None, kinds, t, h, key, val, steps)
+}
+
+pub(crate) fn add_hashed_rt(
+    heap: &Heap,
+    py_rt: Option<&super::py_rt::PyRt>,
+    kinds: &PyKinds,
+    t: &mut PyTable,
+    h: i64,
+    key: Value,
+    val: Value,
+    steps: &mut u64,
+) -> Result<(usize, bool), Stop> {
     let mut work = 0;
     let mut same: Vec<usize> = Vec::new();
     let found = t.walk(
         h,
         &mut |i| {
-            let r = native_eq(heap, kinds, t.keys[i], key, &mut work);
+            let r = eq_in(heap, py_rt, kinds, t.keys[i], key, 0, &mut work);
             if r == Some(false) {
                 same.push(i);
             }
@@ -1189,7 +1289,7 @@ pub(crate) fn add_hashed(
         // Any member of the bucket will do: they share its stamp.
         for &i in &same {
             let Some(k) = t.key_at(i) else { continue };
-            if same_bucket(heap, kinds, k, key, steps).ok_or(Stop::Guest(0))? {
+            if same_bucket_rt(heap, py_rt, kinds, k, key, steps).ok_or(Stop::Guest(0))? {
                 mate = Some(i);
                 break;
             }
@@ -1371,6 +1471,7 @@ pub(crate) fn size_probe(x: u64) -> u64 {
     let kinds = PyKinds {
         tuple: Value::from_bits(x),
         frozenset: Value::from_bits(x ^ 1),
+        type_type: Value::UNDEFINED,
         seq_shape: x as u32,
     };
     let mut steps = 0;

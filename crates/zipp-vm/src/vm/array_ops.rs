@@ -895,15 +895,11 @@ impl<'p> Vm<'p> {
         // reachable from the GC roots while the callback re-enters the interpreter
         // — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        let snapshot = self.array_snapshot(idx);
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        let snapshot_len = snapshot.len();
-        // The interpreter tail reads every element live below. It only needs the
-        // initially captured length, so do not allocate and fill a throwaway Vec
-        // on WASM/non-JIT builds. The callback-family routing gate admits only a
+        // The interpreter tail reads every element live below, and the call-free
+        // fused kernels below borrow the dense `HeapObj::Array` slice directly
+        // under `_gc`. Only the initial length is captured here (no throwaway
+        // `array_snapshot` clone). The callback-family routing gate admits only a
         // real, hole-free, non-overlaid, non-virtual dense Array here.
-        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
         let snapshot_len = match self.heap.get(idx) {
             HeapObj::Array(items) => items.len(),
             _ => 0,
@@ -999,24 +995,32 @@ impl<'p> Vm<'p> {
                                 self.regs[win + upv_base + k] = v;
                             }
                             let len = snapshot_len;
-                            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
-                            let snap_ptr = snapshot.as_ptr() as *const u64;
-                            let out_ptr = out.as_mut_ptr() as *mut u64;
-                            // SAFETY: `entry` is a valid win64 map kernel; the
-                            // window holds `reg_count` slots; `out` has capacity
-                            // `len` ≥ the returned count; the kernel is call-free
-                            // so none of these pointers move during the call.
-                            let kernel: extern "win64" fn(
-                                *mut u64,
-                                *const u64,
-                                usize,
-                                *mut u64,
-                            ) -> usize = unsafe { core::mem::transmute(entry) };
-                            let processed = kernel(window_ptr, snap_ptr, len, out_ptr);
-                            // The kernel wrote `out[0..processed]` densely.
-                            unsafe { out.set_len(processed) };
+                            let snap_ptr = match self.heap.get(idx) {
+                                HeapObj::Array(items) if items.len() >= len => {
+                                    Some(items.as_ptr() as *const u64)
+                                }
+                                _ => None,
+                            };
+                            if let Some(snap_ptr) = snap_ptr {
+                                let window_ptr =
+                                    unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                                let out_ptr = out.as_mut_ptr() as *mut u64;
+                                // SAFETY: `entry` is a valid win64 map kernel; the
+                                // window holds `reg_count` slots; `out` has capacity
+                                // `len` ≥ the returned count; the kernel is call-free
+                                // so none of these pointers move during the call.
+                                let kernel: extern "win64" fn(
+                                    *mut u64,
+                                    *const u64,
+                                    usize,
+                                    *mut u64,
+                                ) -> usize = unsafe { core::mem::transmute(entry) };
+                                let processed = kernel(window_ptr, snap_ptr, len, out_ptr);
+                                // The kernel wrote `out[0..processed]` densely.
+                                unsafe { out.set_len(processed) };
+                                start = processed;
+                            }
                             self.regs.truncate(win);
-                            start = processed;
                         }
                     }
                 }
@@ -1059,26 +1063,39 @@ impl<'p> Vm<'p> {
                                 self.regs[win + upv_base + k] = v;
                             }
                             let len = snapshot_len;
-                            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
-                            let snap_ptr = snapshot.as_ptr() as *const u64;
-                            let out_ptr = out.as_mut_ptr() as *mut u64;
-                            let mut kept: usize = 0;
-                            // SAFETY: valid win64 filter kernel; window has
-                            // reg_count slots; `out` capacity `len` ≥ kept; the
-                            // kernel is call-free so the pointers don't move.
-                            let kernel: extern "win64" fn(
-                                *mut u64,
-                                *const u64,
-                                usize,
-                                *mut u64,
-                                *mut usize,
-                            ) -> usize = unsafe { core::mem::transmute(entry) };
-                            let scanned =
-                                kernel(window_ptr, snap_ptr, len, out_ptr, &mut kept as *mut usize);
-                            // The kernel wrote `kept` elements into `out[0..kept]`.
-                            unsafe { out.set_len(kept) };
+                            let snap_ptr = match self.heap.get(idx) {
+                                HeapObj::Array(items) if items.len() >= len => {
+                                    Some(items.as_ptr() as *const u64)
+                                }
+                                _ => None,
+                            };
+                            if let Some(snap_ptr) = snap_ptr {
+                                let window_ptr =
+                                    unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                                let out_ptr = out.as_mut_ptr() as *mut u64;
+                                let mut kept: usize = 0;
+                                // SAFETY: valid win64 filter kernel; window has
+                                // reg_count slots; `out` capacity `len` ≥ kept; the
+                                // kernel is call-free so the pointers don't move.
+                                let kernel: extern "win64" fn(
+                                    *mut u64,
+                                    *const u64,
+                                    usize,
+                                    *mut u64,
+                                    *mut usize,
+                                ) -> usize = unsafe { core::mem::transmute(entry) };
+                                let scanned = kernel(
+                                    window_ptr,
+                                    snap_ptr,
+                                    len,
+                                    out_ptr,
+                                    &mut kept as *mut usize,
+                                );
+                                // The kernel wrote `kept` elements into `out[0..kept]`.
+                                unsafe { out.set_len(kept) };
+                                start = scanned;
+                            }
                             self.regs.truncate(win);
-                            start = scanned;
                         }
                     }
                 }
@@ -3925,7 +3942,10 @@ impl<'p> Vm<'p> {
                 // mutate it or shorten the array). For an index now past the live
                 // length: `find`/`findIndex` still visit it with `undefined` (they do
                 // not HasProperty-skip), while `some`/`every` skip it.
-                let len = self.array_snapshot(idx).len();
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
                 // A kernel-eligible predicate (`compile_scan_kernel`) over a
                 // dense Array with no index overlay runs the leading elements
                 // natively; the loop below goes on where it stopped short
@@ -3995,15 +4015,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let has_init = args.len() >= 2;
-                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                let snapshot = self.array_snapshot(idx);
-                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                let (snapshot_len, first) = (snapshot.len(), snapshot.first().copied());
-                // The non-JIT reducer reads every processed element live. Capture
-                // only the initial length and no-initial-value seed instead of
+                // Capture only the initial length and no-initial-value seed instead of
                 // cloning the complete dense store. Arrays with holes, overlays,
-                // or a virtual length were routed to array_like_iterate above.
-                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                // or a virtual length were routed to array_like_iterate above; the
+                // call-free fused reduce kernel borrows `HeapObj::Array` directly.
                 let (snapshot_len, first) = match self.heap.get(idx) {
                     HeapObj::Array(items) => (items.len(), items.first().copied()),
                     _ => (0, None),
@@ -4068,28 +4083,34 @@ impl<'p> Vm<'p> {
                                     let count = snapshot_len - start;
                                     let window_ptr =
                                         unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
-                                    let snap_ptr =
-                                        unsafe { snapshot.as_ptr().add(start) } as *const u64;
-                                    let mut acc_bits = acc.bits();
-                                    // SAFETY: valid win64 reduce kernel; window has
-                                    // reg_count slots; acc_bits is a live u64;
-                                    // call-free ⇒ none of these pointers move.
-                                    let kernel: extern "win64" fn(
-                                        *mut u64,
-                                        *const u64,
-                                        usize,
-                                        *mut u64,
-                                    )
-                                        -> usize = unsafe { core::mem::transmute(entry) };
-                                    let processed = kernel(
-                                        window_ptr,
-                                        snap_ptr,
-                                        count,
-                                        &mut acc_bits as *mut u64,
-                                    );
-                                    acc = Value::from_bits(acc_bits);
+                                    let snap_ptr = match self.heap.get(idx) {
+                                        HeapObj::Array(items) if items.len() >= snapshot_len => {
+                                            Some(unsafe { items.as_ptr().add(start) } as *const u64)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(snap_ptr) = snap_ptr {
+                                        let mut acc_bits = acc.bits();
+                                        // SAFETY: valid win64 reduce kernel; window has
+                                        // reg_count slots; acc_bits is a live u64;
+                                        // call-free ⇒ none of these pointers move.
+                                        let kernel: extern "win64" fn(
+                                            *mut u64,
+                                            *const u64,
+                                            usize,
+                                            *mut u64,
+                                        )
+                                            -> usize = unsafe { core::mem::transmute(entry) };
+                                        let processed = kernel(
+                                            window_ptr,
+                                            snap_ptr,
+                                            count,
+                                            &mut acc_bits as *mut u64,
+                                        );
+                                        acc = Value::from_bits(acc_bits);
+                                        start += processed;
+                                    }
                                     self.regs.truncate(win);
-                                    start += processed;
                                 }
                             }
                         }
@@ -4271,32 +4292,47 @@ impl<'p> Vm<'p> {
                         "TypeError: Reduce callback is not a function",
                     ));
                 }
-                let snapshot = self.array_snapshot(idx);
-                let mut i = snapshot.len();
+                let (mut i, last) = match self.heap.get(idx) {
+                    HeapObj::Array(items) => (items.len(), items.last().copied()),
+                    _ => (0, None),
+                };
                 let mut acc = if args.len() >= 2 {
                     args[1]
-                } else if i > 0 {
+                } else if let Some(last) = last {
                     i -= 1;
-                    snapshot[i]
+                    last
                 } else {
                     return Err(Thrown::from_static(
                         "TypeError: Reduce of empty array with no initial value",
                     ));
                 };
                 let receiver = Value::heap(idx);
+                let (native, win) = self.open_cb_window(cb, Value::UNDEFINED);
+                let mut err: Option<Thrown> = None;
                 while i > 0 {
                     i -= 1;
                     // Live read; skip an index now past the live length (a callback
                     // shortened the array) — reduceRight HasProperty-skips absent ones.
-                    let v = match self.array_dense_or_proto_get(idx, i)? {
-                        Some(v) => v,
-                        None => continue,
+                    let v = match self.array_dense_or_proto_get(idx, i) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
                     };
-                    acc = self.call_value(
-                        cb,
-                        Value::UNDEFINED,
-                        &[acc, v, Value::int(i as i32), receiver],
-                    )?;
+                    let call_args = [acc, v, Value::int(i as i32), receiver];
+                    match self.run_cb_elem(&native, win, cb, &call_args, Value::UNDEFINED) {
+                        Ok(r) => acc = r,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                self.regs.truncate(win);
+                if let Some(e) = err {
+                    return Err(e);
                 }
                 Ok(Some(acc))
             }
@@ -4338,24 +4374,45 @@ impl<'p> Vm<'p> {
                 // `len` is captured once; each element is read LIVE (a callback may mutate
                 // the array). findLast/findLastIndex visit EVERY index (no HasProperty
                 // skip), so an absent/hole index is the inherited value or undefined.
-                let len = self.array_snapshot(idx).len();
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                let (native, win) = self.open_cb_window(cb, this_arg);
+                let mut found: Result<Option<Value>, Thrown> = Ok(None);
                 for i in (0..len).rev() {
-                    let v = self
-                        .array_dense_or_proto_get(idx, i)?
-                        .unwrap_or(Value::UNDEFINED);
-                    let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
+                    let v = match self.array_dense_or_proto_get(idx, i) {
+                        Ok(opt) => opt.unwrap_or(Value::UNDEFINED),
+                        Err(e) => {
+                            found = Err(e);
+                            break;
+                        }
+                    };
+                    let call_args = [v, Value::int(i as i32), receiver];
+                    let r = match self.run_cb_elem(&native, win, cb, &call_args, this_arg) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            found = Err(e);
+                            break;
+                        }
+                    };
                     if self.truthy(r) {
-                        return Ok(Some(if name == "findLast" {
+                        found = Ok(Some(if name == "findLast" {
                             v
                         } else {
                             Value::int(i as i32)
                         }));
+                        break;
                     }
                 }
-                Ok(Some(if name == "findLast" {
-                    Value::UNDEFINED
-                } else {
-                    Value::int(-1)
+                self.regs.truncate(win);
+                Ok(Some(match found? {
+                    Some(v) => v,
+                    None => if name == "findLast" {
+                        Value::UNDEFINED
+                    } else {
+                        Value::int(-1)
+                    },
                 }))
             }
             "toSorted" => {

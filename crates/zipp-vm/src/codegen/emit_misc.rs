@@ -2263,9 +2263,15 @@ pub(crate) fn emit_arr_mirror_get(
     done: dynasmrt::DynamicLabel,
 ) {
     let slow = ops.new_dynamic_label();
+    let try_str = ops.new_dynamic_label();
     let have_key = ops.new_dynamic_label();
     let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
     let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    let hot_raw = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let hot_len = crate::vm::host_api::JIT_HOT_MIRROR_LEN_OFFSET as i32;
+    let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+    let upvals_raw = crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32;
+    let this_raw = crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32;
     dynasm!(ops
         ; mov rax, [rbx + dreg(obj)]
         ; mov r10, rax
@@ -2293,17 +2299,39 @@ pub(crate) fn emit_arr_mirror_get(
         ; => have_key
         ; mov ecx, eax                        // heap idx (low 32)
         ; cmp ecx, [rdi + arr_len]
-        ; jae => slow
+        ; jae => try_str
         ; mov r9, [rdi + arr_raw]
         ; shl rcx, 4
         ; add r9, rcx                         // the slot's [base, len]
         ; cmp rdx, [r9 + 8]
-        ; jae => slow
+        ; jae => try_str
         ; mov r9, [r9]
         ; mov rax, [r9 + rdx*8]
         ; mov r10, QWORD ARR_HOLE_BITS as i64
         ; cmp rax, r10
         ; je => slow
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        // Frozen flat ASCII string `s[i]`: single-ASCII chars are interned at
+        // heap slot == byte value (`Heap::new`), so no allocation or FFI needed.
+        ; => try_str
+        ; mov ecx, eax
+        ; cmp ecx, [rdi + hot_len]
+        ; jae => slow
+        ; mov r9, [rdi + hot_raw]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8 + hot_fid], crate::heap::FID_MIRROR_STR as i32
+        ; jne => slow
+        ; mov r9, [rdi + upvals_raw]
+        ; mov r9, [r9 + rcx*8]
+        ; test r9, r9
+        ; jz => slow
+        ; mov r10, [rdi + this_raw]
+        ; cmp rdx, [r10 + rcx*8]
+        ; jae => slow
+        ; movzx eax, BYTE [r9 + rdx]
+        ; mov r10, QWORD Value::heap(0).bits() as i64
+        ; or rax, r10
         ; mov [rbx + dreg(dst)], rax
         ; jmp => done
         ; => slow
@@ -2359,6 +2387,72 @@ pub(crate) fn emit_arr_mirror_has(
     );
 }
 
+/// Inline frozen flat-ASCII `str.charCodeAt(i)` fast path (zero FFI).
+/// Checks main realm + pristine `%String.prototype%.charCodeAt`, receiver
+/// `HotMirror::STR` + non-zero `upvals_mirror[idx]` byte pointer, and in-bounds
+/// non-negative Int index `i < this_mirror[idx]`. Jumps to `done_lbl` on hit
+/// with `dst` written; falls through on any miss (unpinned/non-ASCII/OOB/etc.).
+pub(crate) fn emit_inline_ascii_char_code_at(
+    ops: &mut crate::codegen::X64Asm,
+    dst: u16,
+    obj: u16,
+    arg_base: u16,
+    done_lbl: dynasmrt::DynamicLabel,
+) {
+    use crate::vm::host_api::{
+        JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
+        JIT_STR_PROTO_CCA_FN_BITS_OFFSET, JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET,
+        JIT_STR_PROTO_CCA_VER_OFFSET, JIT_STR_PROTO_IDX_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_UPVALS_MIRROR_RAW_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+    };
+    let cca_slow = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rdx, [rbx + dreg(obj)]
+        ; mov rax, rdx
+        ; shr rax, 48
+        ; cmp eax, 0x7FFD                           // TAG_HEAP >> 48
+        ; jne => cca_slow
+        ; mov r8, [rbx + dreg(arg_base)]
+        ; mov rax, r8
+        ; shr rax, 48
+        ; cmp eax, 0x7FF9                           // TAG_INT >> 48
+        ; jne => cca_slow
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => cca_slow
+        ; mov r11, [rdi + JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET as i32]
+        ; test r11, r11
+        ; jz => cca_slow
+        ; mov eax, DWORD [rdi + JIT_STR_PROTO_IDX_OFFSET as i32]
+        ; mov r10, [rdi + JIT_VERSIONS_RAW_OFFSET as i32]
+        ; mov r9d, DWORD [rdi + JIT_STR_PROTO_CCA_VER_OFFSET as i32]
+        ; cmp DWORD [r10 + rax * 4], r9d
+        ; jne => cca_slow
+        ; mov r10, [r11]
+        ; cmp r10, [rdi + JIT_STR_PROTO_CCA_FN_BITS_OFFSET as i32]
+        ; jne => cca_slow
+        ; mov ecx, edx
+        ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r10, [r10 + rcx * 8]
+        ; cmp DWORD [r10 + rcx * 8 + JIT_HOT_FID_OFF as i32],
+            crate::heap::FID_MIRROR_STR as i32
+        ; jne => cca_slow
+        ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov r11, [r11 + rcx * 8]
+        ; test r11, r11
+        ; jz => cca_slow
+        ; mov eax, r8d
+        ; mov r10, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+        ; cmp rax, [r10 + rcx * 8]
+        ; jae => cca_slow
+        ; movzx eax, BYTE [r11 + rax]
+        ; mov r10, QWORD Value::int(0).bits() as i64
+        ; or rax, r10
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done_lbl
+        ; => cca_slow
+    );
+}
+
 /// `dst = obj.length` for a dense Array through its array mirror entry, with
 /// no call: heap tag, the mirror's bounds, a live entry (a cleared one is
 /// `[0, 0]`; a live one's base is never null, an empty Vec's included), and
@@ -2376,8 +2470,14 @@ pub(crate) fn emit_arr_mirror_len(
     done: dynasmrt::DynamicLabel,
 ) {
     let miss = ops.new_dynamic_label();
+    let try_str = ops.new_dynamic_label();
     let arr_raw = crate::vm::host_api::JIT_ARR_MIRROR_RAW_OFFSET as i32;
     let arr_len = crate::vm::host_api::JIT_ARR_MIRROR_LEN_OFFSET as i32;
+    let hot_raw = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+    let hot_len = crate::vm::host_api::JIT_HOT_MIRROR_LEN_OFFSET as i32;
+    let hot_fid = crate::vm::host_api::JIT_HOT_FID_OFF as i32;
+    let upvals_raw = crate::vm::host_api::JIT_UPVALS_MIRROR_RAW_OFFSET as i32;
+    let this_raw = crate::vm::host_api::JIT_THIS_MIRROR_RAW_OFFSET as i32;
     dynasm!(ops
         ; mov rax, [rbx + dreg(obj)]
         ; mov r10, rax
@@ -2386,15 +2486,33 @@ pub(crate) fn emit_arr_mirror_len(
         ; jne => miss
         ; mov ecx, eax                        // heap idx (low 32)
         ; cmp ecx, [rdi + arr_len]
-        ; jae => miss
+        ; jae => try_str
         ; mov r9, [rdi + arr_raw]
         ; shl rcx, 4
         ; add r9, rcx                         // the slot's [base, len]
         ; cmp QWORD [r9], 0
-        ; je => miss                          // no live entry
+        ; je => try_str                       // no live Array entry
         ; mov rcx, [r9 + 8]
         ; cmp rcx, i32::MAX
         ; ja => miss                          // not an Int
+        ; mov rax, QWORD Value::int(0).bits() as i64
+        ; or rax, rcx
+        ; mov [rbx + dreg(dst)], rax
+        ; jmp => done
+        // Frozen flat ASCII string `.length`: non-configurable exotic property.
+        ; => try_str
+        ; mov ecx, eax
+        ; cmp ecx, [rdi + hot_len]
+        ; jae => miss
+        ; mov r9, [rdi + hot_raw]
+        ; lea r9, [r9 + rcx*8]
+        ; cmp DWORD [r9 + rcx*8 + hot_fid], crate::heap::FID_MIRROR_STR as i32
+        ; jne => miss
+        ; mov r9, [rdi + upvals_raw]
+        ; cmp QWORD [r9 + rcx*8], 0
+        ; je => miss
+        ; mov r9, [rdi + this_raw]
+        ; mov rcx, [r9 + rcx*8]
         ; mov rax, QWORD Value::int(0).bits() as i64
         ; or rax, rcx
         ; mov [rbx + dreg(dst)], rax

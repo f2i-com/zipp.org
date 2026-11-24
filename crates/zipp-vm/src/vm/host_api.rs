@@ -415,6 +415,18 @@ pub(crate) const JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET: usize =
 pub(crate) const JIT_ARR_PROTO_ITER_VER_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, arr_proto_iter_ver);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_STR_PROTO_IDX_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, str_proto);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_STR_PROTO_CCA_SLOT_PTR_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, str_proto_cca_slot_ptr);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_STR_PROTO_CCA_FN_BITS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, str_proto_cca_fn_bits);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_STR_PROTO_CCA_VER_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, str_proto_cca_ver);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, default_array_iter);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -444,9 +456,6 @@ pub(crate) const JIT_CLASS_PROP_MEMO_RAW_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_DEFERRED_NS_NONEMPTY_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, deferred_ns_nonempty);
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_MOD_NS_NONEMPTY_OFFSET: usize =
-    core::mem::offset_of!(Vm<'static>, mod_ns_nonempty);
 #[cfg(all(feature = "jit", target_arch = "x86_64", not(feature = "safe-sandbox")))]
 pub(crate) const JIT_INSTANCEOF_PAIR_MEMO_RAW_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, instanceof_pair_memo_raw);

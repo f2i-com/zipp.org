@@ -336,6 +336,7 @@ struct JitCtx {
     bt_base: *mut u64,  // 0x20: backtrack stack (32-byte entries)
     bt_limit: *mut u64, // 0x28: last allowed entry start
     skip_hint: u64,     // 0x30: out; u64::MAX = none
+    loops: *mut u64,    // 0x38: 2 slots per loop: [iters, entry]
 }
 
 /// Compiled native code for one regex. The entry reproduces one forward
@@ -346,12 +347,15 @@ pub(crate) struct JitCode {
     _buf: ExecutableBuffer,
     entry: unsafe extern "win64" fn(*mut JitCtx) -> i64,
     groups: usize,
+    loops: usize,
     /// Whether the emitted prologue sets all `2 * groups` capture slots to
     /// `u64::MAX` on every entry. When true the callers skip the Rust-side
     /// refill; when false (switch off, or too many groups to unroll) they
     /// must still do it. Recorded per compilation, so flipping the switch
     /// after a regex compiled cannot desynchronize the two.
     resets_groups: bool,
+    /// Whether the emitted prologue zeroes all `2 * loops` loop slots on entry.
+    resets_loops: bool,
 }
 
 // ExecutableBuffer is an immutable mapped region after finalize; the entry
@@ -373,12 +377,14 @@ pub(crate) enum Outcome {
 
 struct Scratch {
     groups: Vec<u64>,
+    loops: Vec<u64>,
     bt: Vec<u64>,
 }
 
 thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch {
         groups: Vec::new(),
+        loops: Vec::new(),
         // 1024 entries of 4 u64s to start; grows on demand.
         bt: vec![0u64; 4096],
     });
@@ -409,6 +415,13 @@ pub(crate) fn run_attempt(
             } else if !code.resets_groups {
                 s.groups.fill(u64::MAX);
             }
+            let need_loops = code.loops * 2;
+            if s.loops.len() != need_loops {
+                s.loops.clear();
+                s.loops.resize(need_loops, 0);
+            } else if !code.resets_loops && need_loops > 0 {
+                s.loops.fill(0);
+            }
             let mut ctx = JitCtx {
                 input: bytes.as_ptr(),
                 len: bytes.len() as u64,
@@ -418,6 +431,7 @@ pub(crate) fn run_attempt(
                 // Entries are 4 u64s; the last allowed entry starts 4 short.
                 bt_limit: unsafe { s.bt.as_mut_ptr().add(s.bt.len() - 4) },
                 skip_hint: u64::MAX,
+                loops: s.loops.as_mut_ptr(),
             };
             // SAFETY: the code only reads `bytes[0..len)`, reads/writes the
             // scratch arrays within the bounds passed here, and follows the
@@ -468,6 +482,7 @@ pub(crate) struct Session<'s> {
     code: &'s JitCode,
     ctx: JitCtx,
     groups: &'s mut Vec<u64>,
+    loops: &'s mut Vec<u64>,
     bt: &'s mut Vec<u64>,
 }
 
@@ -486,12 +501,25 @@ pub(crate) fn with_session<R>(
     SCRATCH.with(|s| match s.try_borrow_mut() {
         Ok(mut s) => {
             let s = &mut *s;
-            f(&mut Session::new(code, bytes, &mut s.groups, &mut s.bt))
+            f(&mut Session::new(
+                code,
+                bytes,
+                &mut s.groups,
+                &mut s.loops,
+                &mut s.bt,
+            ))
         }
         Err(_) => {
             let mut groups = Vec::new();
+            let mut loops = Vec::new();
             let mut bt = vec![0u64; 4096];
-            f(&mut Session::new(code, bytes, &mut groups, &mut bt))
+            f(&mut Session::new(
+                code,
+                bytes,
+                &mut groups,
+                &mut loops,
+                &mut bt,
+            ))
         }
     })
 }
@@ -501,6 +529,7 @@ impl<'s> Session<'s> {
         code: &'s JitCode,
         bytes: &[u8],
         groups: &'s mut Vec<u64>,
+        loops: &'s mut Vec<u64>,
         bt: &'s mut Vec<u64>,
     ) -> Self {
         // Establish the LENGTH (the scratch is shared across regexes on this
@@ -513,6 +542,13 @@ impl<'s> Session<'s> {
         } else if !code.resets_groups {
             groups.fill(u64::MAX);
         }
+        let need_loops = code.loops * 2;
+        if loops.len() != need_loops {
+            loops.clear();
+            loops.resize(need_loops, 0);
+        } else if !code.resets_loops && need_loops > 0 {
+            loops.fill(0);
+        }
         let ctx = JitCtx {
             input: bytes.as_ptr(),
             len: bytes.len() as u64,
@@ -522,11 +558,13 @@ impl<'s> Session<'s> {
             // Entries are 4 u64s; the last allowed entry starts 4 short.
             bt_limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
             skip_hint: u64::MAX,
+            loops: loops.as_mut_ptr(),
         };
         Self {
             code,
             ctx,
             groups,
+            loops,
             bt,
         }
     }
@@ -546,11 +584,14 @@ impl<'s> Session<'s> {
             // itself when it owns the reset (`resets_groups`); otherwise the
             // refill happens here, as it always did.
             //
-            // `self.groups` is never resized inside a session (only `bt` is,
-            // on the -2 retry below), so `ctx.groups` stays the pointer
-            // `Session::new` stored and needs no per-attempt re-store.
+            // `self.groups` and `self.loops` are never resized inside a session
+            // (only `bt` is, on the -2 retry below), so `ctx.groups`/`ctx.loops`
+            // stay the pointers `Session::new` stored.
             if !self.code.resets_groups {
                 self.groups.fill(u64::MAX);
+            }
+            if !self.code.resets_loops && !self.loops.is_empty() {
+                self.loops.fill(0);
             }
             self.ctx.start = start as u64;
             self.ctx.skip_hint = u64::MAX;
@@ -604,6 +645,12 @@ impl<'s> Session<'s> {
 /// interpreter is fine and the code-size risk is not worth it.
 const MAX_INSNS: usize = 4096;
 const MAX_GROUPS: usize = 1024;
+const MAX_LOOPS: usize = 256;
+
+enum LookStep {
+    Test(usize),
+    Seq(Vec<u8>),
+}
 
 enum Node {
     /// Consume one byte matching table `t`.
@@ -620,7 +667,32 @@ enum Node {
         possessive: bool,
         hint: bool,
     },
-    /// The consumed body of a preceding Loop; nothing may jump here.
+    /// General loop entry (`Insn::EnterLoop`).
+    EnterLoop {
+        id: u32,
+        min: u64,
+        max: u64,
+        greedy: bool,
+        exit: usize,
+    },
+    /// General loop back-edge (`Insn::LoopAgain`).
+    LoopAgain {
+        begin: usize,
+    },
+    /// Backreference to capture group `group`; `fold` is `Some(tbl)` for `icase`.
+    BackRef {
+        group: u32,
+        fold: Option<usize>,
+    },
+    /// Capture-free fixed-length lookahead or lookbehind assertion.
+    Lookaround {
+        negate: bool,
+        backward: bool,
+        steps: Vec<LookStep>,
+        total_len: usize,
+        continuation: usize,
+    },
+    /// The consumed body of a preceding Loop or Lookaround; nothing may jump here.
     Skip,
     Jump(usize),
     Alt(usize),
@@ -715,7 +787,7 @@ fn table_for(re: &CompiledRegex, insn: &Insn, tables: &mut Vec<[u8; 256]>) -> Op
 fn plan(re: &CompiledRegex) -> Option<Plan> {
     let insns = &re.insns;
     let n = insns.len();
-    if n == 0 || n > MAX_INSNS || re.groups as usize > MAX_GROUPS {
+    if n == 0 || n > MAX_INSNS || re.groups as usize > MAX_GROUPS || re.loops as usize > MAX_LOOPS {
         DECLINED_LIMITS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -760,6 +832,67 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
             i += 2;
             continue;
         }
+        if let &Insn::Lookahead {
+            negate,
+            start_group,
+            end_group,
+            continuation,
+        }
+        | &Insn::Lookbehind {
+            negate,
+            start_group,
+            end_group,
+            continuation,
+        } = insn
+        {
+            let backward = matches!(insn, Insn::Lookbehind { .. });
+            let cont = continuation as usize;
+            if start_group != end_group
+                || cont <= i + 1
+                || cont > n
+                || !matches!(insns[cont - 1], Insn::Goal)
+            {
+                return unsupported();
+            }
+            let mut steps = Vec::new();
+            let mut total_len = 0usize;
+            for body_insn in &insns[(i + 1)..(cont - 1)] {
+                let inner = if backward {
+                    match body_insn {
+                        Insn::Back(b) => b.as_ref(),
+                        _ => return unsupported(),
+                    }
+                } else {
+                    body_insn
+                };
+                if let Some(t) = table_for(re, inner, &mut tables) {
+                    steps.push(LookStep::Test(t));
+                    total_len = total_len.checked_add(1)?;
+                } else if let Insn::ByteSeq(seq) = inner {
+                    let bytes = seq.bytes().to_vec();
+                    total_len = total_len.checked_add(bytes.len())?;
+                    steps.push(LookStep::Seq(bytes));
+                } else {
+                    return unsupported();
+                }
+            }
+            if total_len > i32::MAX as usize {
+                DECLINED_LIMITS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            nodes.push(Node::Lookaround {
+                negate,
+                backward,
+                steps,
+                total_len,
+                continuation: cont,
+            });
+            for _ in (i + 1)..cont {
+                nodes.push(Node::Skip);
+            }
+            i = cont;
+            continue;
+        }
         if let Some(t) = table_for(re, insn, &mut tables) {
             nodes.push(Node::Test(t));
             i += 1;
@@ -773,6 +906,39 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
             &Insn::BeginCaptureGroup(g) => nodes.push(Node::Begin(g as u32)),
             &Insn::EndCaptureGroup(g) => nodes.push(Node::End(g as u32)),
             &Insn::ResetCaptureGroup(g) => nodes.push(Node::Reset(g as u32)),
+            Insn::EnterLoop(fields) => {
+                if i + 1 >= n || fields.loop_id as u32 >= re.loops {
+                    return unsupported();
+                }
+                nodes.push(Node::EnterLoop {
+                    id: fields.loop_id as u32,
+                    min: fields.min_iters as u64,
+                    max: if fields.max_iters == usize::MAX {
+                        u64::MAX
+                    } else {
+                        fields.max_iters as u64
+                    },
+                    greedy: fields.greedy,
+                    exit: fields.exit as usize,
+                });
+            }
+            &Insn::LoopAgain { begin } => nodes.push(Node::LoopAgain {
+                begin: begin as usize,
+            }),
+            &Insn::BackRef { group, icase } => {
+                if group >= re.groups {
+                    return unsupported();
+                }
+                let fold = icase.then(|| {
+                    let unicode = re.flags.unicode_mode();
+                    let mut t = [0u8; 256];
+                    for b in 0..=255u8 {
+                        t[b as usize] = ASCIICharProperties::fold(b, unicode);
+                    }
+                    intern(&mut tables, t)
+                });
+                nodes.push(Node::BackRef { group, fold });
+            }
             &Insn::StartOfLine { multiline } => {
                 let lt = build_table(&mut tables, ASCIICharProperties::is_line_terminator);
                 nodes.push(Node::Sol { multiline, lt });
@@ -792,23 +958,31 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
                 nodes.push(Node::Wb { invert, w });
             }
             Insn::ByteSeq(v) => nodes.push(Node::Seq(v.bytes().to_vec())),
-            // Everything else — EnterLoop/LoopAgain (general loops with
-            // loop-data bookkeeping and the ES empty-loop rule), BackRef,
-            // BackRefMulti, Lookahead, Lookbehind — stays interpreted.
+            // Everything else — BackRefMulti, complex Lookahead/Lookbehind —
+            // stays interpreted.
             _ => return unsupported(),
         }
         i += 1;
     }
-    // No branch may land on a consumed loop body.
+    // No branch may land on a consumed body or out of bounds.
     for node in &nodes {
-        let target = match node {
-            Node::Jump(t) | Node::Alt(t) => Some(*t),
-            _ => None,
-        };
-        if let Some(t) = target {
-            if t >= nodes.len() || matches!(nodes[t], Node::Skip) {
-                return unsupported();
+        match node {
+            &Node::Jump(t) | &Node::Alt(t) | &Node::EnterLoop { exit: t, .. } => {
+                if t >= nodes.len() || matches!(nodes[t], Node::Skip) {
+                    return unsupported();
+                }
             }
+            &Node::Lookaround { continuation: t, .. } => {
+                if t >= nodes.len() || matches!(nodes[t], Node::Skip) {
+                    return unsupported();
+                }
+            }
+            &Node::LoopAgain { begin } => {
+                if begin >= nodes.len() || !matches!(nodes[begin], Node::EnterLoop { .. }) {
+                    return unsupported();
+                }
+            }
+            _ => {}
         }
     }
     Some(Plan { nodes, tables })
@@ -830,6 +1004,12 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let nodes = &plan.nodes;
     let labels: Vec<DynamicLabel> = nodes.iter().map(|_| ops.new_dynamic_label()).collect();
+    let run_loop_labels: Vec<Option<DynamicLabel>> = nodes
+        .iter()
+        .map(|node| {
+            matches!(node, Node::EnterLoop { .. }).then(|| ops.new_dynamic_label())
+        })
+        .collect();
     let tbl_labels: Vec<DynamicLabel> = plan
         .tables
         .iter()
@@ -844,6 +1024,8 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         /// A lazy one-character loop's entry: handler, continuation, and
         /// the body's byte table.
         Lazy(DynamicLabel, DynamicLabel, usize),
+        /// A non-greedy general loop's entry: handler, loop body label, loop byte offset.
+        EnterNonGreedy(DynamicLabel, DynamicLabel, i32),
     }
     let mut handlers: Vec<Handler> = Vec::new();
 
@@ -886,6 +1068,18 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         for g in 0..ngroups {
             let off = (g as i32) * 16;
             dynasm!(ops ; movdqu [rbp + off], xmm0);
+        }
+    }
+    let nloops = re.loops as usize;
+    let resets_loops = nloops <= MAX_PROLOGUE_RESET_GROUPS;
+    if resets_loops && nloops > 0 {
+        dynasm!(ops
+            ; mov r10, [rdi + 0x38]
+            ; pxor xmm0, xmm0
+        );
+        for l in 0..nloops {
+            let off = (l as i32) * 16;
+            dynasm!(ops ; movdqu [r10 + off], xmm0);
         }
     }
 
@@ -1193,6 +1387,332 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
             Node::JustFail => {
                 dynasm!(ops ; jmp ->bt);
             }
+            &Node::EnterLoop {
+                id,
+                min,
+                max,
+                greedy,
+                exit,
+            } => {
+                let off = (id as i32) * 16;
+                let rl_lbl = run_loop_labels[ip].unwrap();
+                // EnterLoop: save old LoopData BEFORE resetting iters to 0.
+                dynasm!(ops
+                    ; mov r10, [rdi + 0x38]
+                    ; mov rax, [r10 + off]
+                    ; mov rcx, [r10 + off + 8]
+                    ; cmp r14, r15
+                    ; ja ->overflow
+                    ; lea rdx, [->rl]
+                    ; mov [r14], rdx
+                    ; mov QWORD [r14 + 8], off
+                    ; mov [r14 + 16], rax
+                    ; mov [r14 + 24], rcx
+                    ; add r14, 32
+                    ; mov QWORD [r10 + off], 0
+                    ; =>rl_lbl
+                    ; mov r10, [rdi + 0x38]
+                    ; mov rax, [r10 + off]
+                    ; mov rcx, [r10 + off + 8]
+                    // Empty-match rejection: if entry == pos && iters > min { bt }
+                    ; cmp rcx, rbx
+                    ; jne >not_empty
+                );
+                if min <= i32::MAX as u64 {
+                    dynasm!(ops ; cmp rax, min as i32 ; ja ->bt);
+                } else {
+                    dynasm!(ops ; mov rdx, QWORD min as i64 ; cmp rax, rdx ; ja ->bt);
+                }
+                dynasm!(ops ; not_empty:);
+                // Check do_taken = iters < max.
+                if max != u64::MAX {
+                    if max <= i32::MAX as u64 {
+                        dynasm!(ops ; cmp rax, max as i32 ; jb >can_take);
+                    } else {
+                        dynasm!(ops ; mov rdx, QWORD max as i64 ; cmp rax, rdx ; jb >can_take);
+                    }
+                    // do_taken == false: viable iff iters >= min.
+                    if min > 0 {
+                        if min <= i32::MAX as u64 {
+                            dynasm!(ops ; cmp rax, min as i32 ; jb ->bt);
+                        } else {
+                            dynasm!(ops ; mov rdx, QWORD min as i64 ; cmp rax, rdx ; jb ->bt);
+                        }
+                    }
+                    dynasm!(ops
+                        ; jmp =>labels[exit]
+                        ; can_take:
+                    );
+                }
+                // Now do_taken == true. Check do_not_taken = iters >= min.
+                if min > 0 {
+                    if min <= i32::MAX as u64 {
+                        dynasm!(ops ; cmp rax, min as i32 ; jb >only_taken);
+                    } else {
+                        dynasm!(ops ; mov rdx, QWORD min as i64 ; cmp rax, rdx ; jb >only_taken);
+                    }
+                }
+                // Both arms viable.
+                if greedy {
+                    let h = ops.new_dynamic_label();
+                    handlers.push(Handler::Alt(h, labels[exit]));
+                    dynasm!(ops
+                        ; cmp r14, r15
+                        ; ja ->overflow
+                        ; lea rdx, [=>h]
+                        ; mov [r14], rdx
+                        ; mov [r14 + 8], rbx
+                        ; add r14, 32
+                    );
+                } else {
+                    let h = ops.new_dynamic_label();
+                    handlers.push(Handler::EnterNonGreedy(h, labels[ip + 1], off));
+                    dynasm!(ops
+                        ; cmp r14, r15
+                        ; ja ->overflow
+                        ; lea rdx, [=>h]
+                        ; mov [r14], rdx
+                        ; mov [r14 + 8], rcx
+                        ; mov [r14 + 16], rax
+                        ; mov [r14 + 24], rbx
+                        ; add r14, 32
+                        ; mov [r10 + off + 8], rbx
+                        ; jmp =>labels[exit]
+                    );
+                }
+                if greedy || min > 0 {
+                    // prepare_to_enter_loop: save old LoopData, iters += 1, entry = pos.
+                    dynasm!(ops
+                        ; only_taken:
+                        ; cmp r14, r15
+                        ; ja ->overflow
+                        ; lea rdx, [->rl]
+                        ; mov [r14], rdx
+                        ; mov QWORD [r14 + 8], off
+                        ; mov [r14 + 16], rax
+                        ; mov [r14 + 24], rcx
+                        ; add r14, 32
+                        ; add rax, 1
+                        ; mov [r10 + off], rax
+                        ; mov [r10 + off + 8], rbx
+                    );
+                }
+            }
+            &Node::LoopAgain { begin } => {
+                let rl_lbl = run_loop_labels[begin].unwrap();
+                dynasm!(ops ; jmp =>rl_lbl);
+            }
+            &Node::BackRef { group, fold } => {
+                let off = (group as i32) * 16;
+                dynasm!(ops
+                    ; mov rax, [rbp + off]
+                    ; mov rdx, [rbp + off + 8]
+                    ; cmp rax, -1
+                    ; je >br_ok
+                    ; cmp rdx, -1
+                    ; je >br_ok
+                    ; sub rdx, rax
+                    ; je >br_ok
+                    ; mov rcx, r13
+                    ; sub rcx, rbx
+                    ; cmp rcx, rdx
+                    ; jb ->bt
+                    ; lea r8, [r12 + rax]
+                    ; lea r9, [r12 + rbx]
+                    ; xor ecx, ecx
+                );
+                if let Some(f_tbl) = fold {
+                    dynasm!(ops
+                        ; lea r11, [=>tbl_labels[f_tbl]]
+                        ; br_loop_i:
+                        ; movzx eax, BYTE [r8 + rcx]
+                        ; movzx r10d, BYTE [r9 + rcx]
+                        ; movzx eax, BYTE [r11 + rax]
+                        ; cmp al, BYTE [r11 + r10]
+                        ; jne ->bt
+                        ; add rcx, 1
+                        ; cmp rcx, rdx
+                        ; jb <br_loop_i
+                    );
+                } else {
+                    dynasm!(ops
+                        ; br_loop:
+                        ; movzx r10d, BYTE [r8 + rcx]
+                        ; cmp r10b, BYTE [r9 + rcx]
+                        ; jne ->bt
+                        ; add rcx, 1
+                        ; cmp rcx, rdx
+                        ; jb <br_loop
+                    );
+                }
+                dynasm!(ops
+                    ; add rbx, rdx
+                    ; br_ok:
+                );
+            }
+            Node::Lookaround {
+                negate,
+                backward,
+                steps,
+                total_len,
+                continuation,
+            } => {
+                if steps.is_empty() {
+                    if *negate {
+                        dynasm!(ops ; jmp ->bt);
+                    } else {
+                        dynasm!(ops ; jmp =>labels[*continuation]);
+                    }
+                } else {
+                    let fail_lbl = ops.new_dynamic_label();
+                    if *backward {
+                        dynasm!(ops
+                            ; cmp rbx, *total_len as i32
+                            ; jb =>fail_lbl
+                        );
+                        let mut back_off = 0i32;
+                        for step in steps {
+                            match step {
+                                &LookStep::Test(t) => {
+                                    back_off += 1;
+                                    let disp = -back_off;
+                                    dynasm!(ops
+                                        ; movzx eax, BYTE [r12 + rbx + disp]
+                                        ; lea rcx, [=>tbl_labels[t]]
+                                        ; cmp BYTE [rcx + rax], 0
+                                        ; je =>fail_lbl
+                                    );
+                                }
+                                LookStep::Seq(bytes) => {
+                                    back_off += bytes.len() as i32;
+                                    let base_disp = -back_off;
+                                    let mut sub = 0usize;
+                                    while sub < bytes.len() {
+                                        let rem = bytes.len() - sub;
+                                        let disp = base_disp + sub as i32;
+                                        if rem >= 8 {
+                                            let chunk = i64::from_le_bytes(
+                                                bytes[sub..sub + 8].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; mov rcx, QWORD chunk
+                                                ; mov rdx, [r12 + rbx + disp]
+                                                ; cmp rdx, rcx
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 8;
+                                        } else if rem >= 4 {
+                                            let chunk = i32::from_le_bytes(
+                                                bytes[sub..sub + 4].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; cmp DWORD [r12 + rbx + disp], chunk
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 4;
+                                        } else if rem >= 2 {
+                                            let chunk = i16::from_le_bytes(
+                                                bytes[sub..sub + 2].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; cmp WORD [r12 + rbx + disp], chunk
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 2;
+                                        } else {
+                                            dynasm!(ops
+                                                ; cmp BYTE [r12 + rbx + disp], bytes[sub] as i8
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        dynasm!(ops
+                            ; mov rax, rbx
+                            ; add rax, *total_len as i32
+                            ; cmp rax, r13
+                            ; ja =>fail_lbl
+                        );
+                        let mut fwd_off = 0i32;
+                        for step in steps {
+                            match step {
+                                &LookStep::Test(t) => {
+                                    let disp = fwd_off;
+                                    dynasm!(ops
+                                        ; movzx eax, BYTE [r12 + rbx + disp]
+                                        ; lea rcx, [=>tbl_labels[t]]
+                                        ; cmp BYTE [rcx + rax], 0
+                                        ; je =>fail_lbl
+                                    );
+                                    fwd_off += 1;
+                                }
+                                LookStep::Seq(bytes) => {
+                                    let base_disp = fwd_off;
+                                    let mut sub = 0usize;
+                                    while sub < bytes.len() {
+                                        let rem = bytes.len() - sub;
+                                        let disp = base_disp + sub as i32;
+                                        if rem >= 8 {
+                                            let chunk = i64::from_le_bytes(
+                                                bytes[sub..sub + 8].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; mov rcx, QWORD chunk
+                                                ; mov rdx, [r12 + rbx + disp]
+                                                ; cmp rdx, rcx
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 8;
+                                        } else if rem >= 4 {
+                                            let chunk = i32::from_le_bytes(
+                                                bytes[sub..sub + 4].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; cmp DWORD [r12 + rbx + disp], chunk
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 4;
+                                        } else if rem >= 2 {
+                                            let chunk = i16::from_le_bytes(
+                                                bytes[sub..sub + 2].try_into().unwrap(),
+                                            );
+                                            dynasm!(ops
+                                                ; cmp WORD [r12 + rbx + disp], chunk
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 2;
+                                        } else {
+                                            dynasm!(ops
+                                                ; cmp BYTE [r12 + rbx + disp], bytes[sub] as i8
+                                                ; jne =>fail_lbl
+                                            );
+                                            sub += 1;
+                                        }
+                                    }
+                                    fwd_off += bytes.len() as i32;
+                                }
+                            }
+                        }
+                    }
+                    if *negate {
+                        dynasm!(ops
+                            ; jmp ->bt
+                            ; =>fail_lbl
+                            ; jmp =>labels[*continuation]
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; jmp =>labels[*continuation]
+                            ; =>fail_lbl
+                            ; jmp ->bt
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1211,6 +1731,16 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         ; mov rdx, [r14 - 8]
         ; mov [rbp + rax], rcx
         ; mov [rbp + rax + 8], rdx
+        ; sub r14, 32
+        ; jmp ->bt
+        // Shared loop-data restore: [off, iters, entry]; keep unwinding.
+        ; ->rl:
+        ; mov r10, [rdi + 0x38]
+        ; mov rax, [r14 - 24]
+        ; mov rcx, [r14 - 16]
+        ; mov rdx, [r14 - 8]
+        ; mov [r10 + rax], rcx
+        ; mov [r10 + rax + 8], rdx
         ; sub r14, 32
         ; jmp ->bt
     );
@@ -1264,6 +1794,33 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                     ; jmp ->bt
                 );
             }
+            // EnterNonGreedyLoop: replace top entry with SetLoopData(orig_pos),
+            // push SetLoopData(entry_pos), advance iters/entry, enter body.
+            Handler::EnterNonGreedy(h, taken, off) => {
+                dynasm!(ops
+                    ; =>h
+                    ; mov rax, [r14 - 24]
+                    ; mov rcx, [r14 - 16]
+                    ; mov rbx, [r14 - 8]
+                    ; lea rdx, [->rl]
+                    ; mov [r14 - 32], rdx
+                    ; mov QWORD [r14 - 24], off
+                    ; mov [r14 - 16], rcx
+                    ; mov [r14 - 8], rax
+                    ; cmp r14, r15
+                    ; ja ->overflow
+                    ; mov [r14], rdx
+                    ; mov QWORD [r14 + 8], off
+                    ; mov [r14 + 16], rcx
+                    ; mov [r14 + 24], rbx
+                    ; add r14, 32
+                    ; mov r10, [rdi + 0x38]
+                    ; add rcx, 1
+                    ; mov [r10 + off], rcx
+                    ; mov [r10 + off + 8], rbx
+                    ; jmp =>taken
+                );
+            }
         }
     }
     dynasm!(ops
@@ -1302,6 +1859,8 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         _buf: buf,
         entry,
         groups: ngroups,
+        loops: nloops,
         resets_groups,
+        resets_loops,
     })
 }

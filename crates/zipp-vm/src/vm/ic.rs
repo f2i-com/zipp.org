@@ -623,9 +623,7 @@ impl SiteCell {
     }
 
     /// The slot of the key in a receiver of `shape`, if the cell knows it.
-    /// (The safe profile has no inline hits to ask.)
     #[inline(always)]
-    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_read(&self, shape: u32) -> Option<u32> {
         (self.own_shape.get() == shape).then_some(self.own_slot.get() & !Self::WRITE_PROVEN)
     }
@@ -641,7 +639,6 @@ impl SiteCell {
 
     /// The slot a write of the key may store to in a receiver of `shape`.
     #[inline(always)]
-    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn own_write(&self, shape: u32) -> Option<u32> {
         let slot = self.own_slot.get();
         (self.own_shape.get() == shape && slot & Self::WRITE_PROVEN != 0)
@@ -998,11 +995,11 @@ impl<'p> Vm<'p> {
     /// pinned.
     pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
         self.module_namespaces.insert(idx, slots);
-        self.mod_ns_nonempty = 1;
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             m.pin_dict();
         }
         self.heap.pin_mirror_dict(idx);
+        self.heap.bump_version(idx);
     }
 
     /// The site cache for `(func_id, ip)`, if this function is IC-eligible.
@@ -1233,7 +1230,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         let cell_shape = cell.own_shape.get();
-        if cell_shape == crate::shape::DICT || cell_shape == SiteCell::DICT_HINT {
+        if cell_shape == SiteCell::DICT_HINT || (is_set && cell_shape == crate::shape::DICT) {
             return false;
         }
         if is_set && (cell.own_slot.get() & SiteCell::WRITE_PROVEN) == 0 {
@@ -1247,6 +1244,7 @@ impl<'p> Vm<'p> {
         }
         let mut first_shape = crate::shape::DICT;
         let mut distinct_shapes = 0u32;
+        let mut saw_non_own_shaped = false;
         for e in &site.entries[..site.n as usize] {
             match *e {
                 IcEntry::OwnData { shape, .. } if shape != crate::shape::DICT => {
@@ -1257,14 +1255,51 @@ impl<'p> Vm<'p> {
                         distinct_shapes = 2;
                     }
                 }
-                IcEntry::AddData { .. } if is_set => {}
+                IcEntry::AddData { .. } | IcEntry::AddClass { .. } if is_set => {}
+                IcEntry::ClassMethod { recv_shape, .. }
+                | IcEntry::ClassMiss { recv_shape, .. }
+                | IcEntry::ProtoData {
+                    recv_shape,
+                    slot: u32::MAX,
+                    ..
+                } if !is_set && recv_shape != crate::shape::DICT => {
+                    saw_non_own_shaped = true;
+                }
                 _ => return false,
             }
         }
-        if distinct_shapes == 0 {
+        if distinct_shapes == 0 && !saw_non_own_shaped {
             return false;
         }
-        distinct_shapes >= 2 || cell_shape != first_shape || site.misses >= 4
+        distinct_shapes >= 2
+            || saw_non_own_shaped
+            || (distinct_shapes == 1
+                && cell_shape != crate::shape::DICT
+                && cell_shape != first_shape)
+            || site.misses >= 2
+    }
+
+    /// True when the `GetProp` / `SetProp` at `(func_id, ip)` has already
+    /// observed an accessor way (`OwnAcc`, `ProtoAcc`, `ClassGetter`, or
+    /// `ClassSetter`), so a first-time Tier-C compile can emit accessor arms
+    /// immediately instead of taking an `accessor site gate` eviction later.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_site_has_accessor(&self, func_id: u32, ip: usize) -> bool {
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return false;
+        };
+        let Some(site) = cell.site_ref() else {
+            return false;
+        };
+        site.entries[..site.n as usize].iter().any(|e| {
+            matches!(
+                e,
+                IcEntry::OwnAcc { .. }
+                    | IcEntry::ProtoAcc { .. }
+                    | IcEntry::ClassGetter { .. }
+                    | IcEntry::ClassSetter { .. }
+            )
+        })
     }
 
     /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
@@ -2864,7 +2899,6 @@ impl<'p> Vm<'p> {
     /// key's data property — without the call's site probe, receiver fetch
     /// and namespace test first. A site reading one inherited name or one
     /// absent field through many layouts took the whole call on every read.
-    #[cfg(not(feature = "safe-sandbox"))]
     #[inline(never)]
     fn ic_proto_hit_other_shape(
         &self,
@@ -3016,13 +3050,13 @@ impl<'p> Vm<'p> {
 
     /// [`Self::ic_get_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
-    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+    #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_own_hit(&self, func_id: u32, ip: usize, recv: Value) -> Option<Value> {
         // The receiver first: the dispatch loop asks before its `length` and
         // shapeless-receiver leaves, so a string's or an array's `.length`
         // must fail here before the site lookup, not after it.
-        let (idx, m) = self.ic_recv_map(recv)?;
+        let (_idx, m) = self.ic_recv_map(recv)?;
         if !self.ic_func_eligible(func_id) {
             return None;
         }
@@ -3041,8 +3075,9 @@ impl<'p> Vm<'p> {
             IcEntry::OwnData { shape, slot } => {
                 (sh != crate::shape::DICT && sh == shape).then(|| m.val_at(slot as usize))
             }
+            #[cfg(not(feature = "safe-sandbox"))]
             IcEntry::Private { .. } | IcEntry::PrivateMethod { .. } => {
-                self.ic_get_way0_tail(idx, site, crate::shape::DICT, 0)
+                self.ic_get_way0_tail(_idx, site, crate::shape::DICT, 0)
             }
             _ => None,
         }
@@ -3101,7 +3136,6 @@ impl<'p> Vm<'p> {
     /// slot still the key's data property), so the same answer or `None` and
     /// the full call. `o.m` through a prototype took the full call's site
     /// probe and way scan on every read: 11 ns against QuickJS's 1.
-    #[cfg(not(feature = "safe-sandbox"))]
     #[inline(always)]
     pub(crate) fn ic_get_prop_proto_hit(&self, func_id: u32, ip: usize, recv: Value, key: &str) -> Option<Value> {
         // The site's way 0 before the receiver's map: an own-data site, which
@@ -3625,6 +3659,21 @@ impl<'p> Vm<'p> {
                         recv_shape,
                     },
                 );
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if recv_shape != crate::shape::DICT {
+                    if let Some(crate::bytecode::Instr::GetProp { name, .. }) =
+                        self.func(func_id as usize).code.get(ip).copied()
+                    {
+                        let key_id = self.prop_key_id(func_id, name);
+                        crate::vm::helpers_misc::class_prop_memo_put_getter(
+                            self,
+                            recv_shape,
+                            class,
+                            key_id,
+                            getter.bits(),
+                        );
+                    }
+                }
                 match self.ic_plain_fn(getter) {
                     Some((fid, closure)) => GetAct::Accessor {
                         fid,
@@ -4232,7 +4281,7 @@ impl<'p> Vm<'p> {
 
     /// [`Self::ic_set_prop_own_hit`] without the JIT's mirrors: the map's own
     /// shape.
-    #[cfg(all(not(feature = "jit"), not(feature = "safe-sandbox")))]
+    #[cfg(not(feature = "jit"))]
     #[inline(always)]
     pub(crate) fn ic_set_prop_own_hit(
         &mut self,
@@ -4263,6 +4312,7 @@ impl<'p> Vm<'p> {
                 }
                 let (cached, slot) = match site.entries[0] {
                     IcEntry::OwnData { shape, slot } => (shape, slot),
+                    #[cfg(not(feature = "safe-sandbox"))]
                     IcEntry::Private { .. } => return self.ic_private_set_tail(func_id, ip, idx, val),
                     _ => return false,
                 };
@@ -4674,7 +4724,7 @@ impl<'p> Vm<'p> {
         hops: &mut [(u32, u32)],
         read: bool,
     ) -> Option<usize> {
-        if self.proto_of.has(idx) {
+        if self.proto_of.has(idx) || (read && key == "constructor") {
             return None;
         }
         let mut cur = class;
@@ -4691,10 +4741,11 @@ impl<'p> Vm<'p> {
                 Some(_) => return None,
             }
         }
-        if !matches!(self.class_member_lookup(idx, class, key), ClassLookup::Miss) {
-            return None;
-        }
-        let mut next = self.class_instance_live_proto(idx, class);
+        let mut next = match self.class_member_lookup(idx, class, key) {
+            ClassLookup::Miss => self.class_instance_live_proto(idx, class),
+            ClassLookup::Live(pv) => pv,
+            _ => return None,
+        };
         let mut n = 0usize;
         while next.is_heap() {
             let h = next.heap_index();

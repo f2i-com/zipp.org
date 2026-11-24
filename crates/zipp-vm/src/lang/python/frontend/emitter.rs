@@ -75,7 +75,7 @@ pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
 /// `MAX_DIRECT` (core.js) must agree.
-pub(super) const MAX_DIRECT: usize = 12;
+pub(super) const MAX_DIRECT: usize = 18;
 pub(super) const MAX_FUNCTIONS: usize = 32768;
 pub(super) const MAX_INSTRUCTIONS: usize = 1 << 20;
 /// Register 0 is `this` (the function object). The bound values follow as
@@ -752,6 +752,7 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyMethod { slow: dst, .. })
             | Some(Instr::PyModGet { slow: dst, .. })
             | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyTruth { slow: dst, .. })
             | Some(Instr::PyAttrFn { slow: dst, .. })
             | Some(Instr::PySeq { slow: dst, .. })
             | Some(Instr::PyRaise { slow: dst, .. })
@@ -852,6 +853,7 @@ impl<'a> Emitter<'a> {
             | Some(Instr::PyMethod { slow: dst, .. })
             | Some(Instr::PyModGet { slow: dst, .. })
             | Some(Instr::PyLen { slow: dst, .. })
+            | Some(Instr::PyTruth { slow: dst, .. })
             | Some(Instr::PyAttrFn { slow: dst, .. })
             | Some(Instr::PySeq { slow: dst, .. })
             | Some(Instr::PyRaise { slow: dst, .. })
@@ -1169,7 +1171,7 @@ impl<'a> Emitter<'a> {
     /// its parameters; anything else (including a count the function does
     /// not accept, which then raises) takes [`Emitter::call_positional`].
     pub fn call_with(&mut self, f: Reg, regs: &[Reg]) -> R<Reg> {
-        let ctor_site = std::mem::replace(&mut self.ctor_site, false) && regs.len() < 7 && regs.len() < MAX_DIRECT;
+        let ctor_site = std::mem::replace(&mut self.ctor_site, false) && regs.len() < 17 && regs.len() < MAX_DIRECT;
         if !self.fast || regs.len() > MAX_DIRECT {
             let args = self.array(regs)?;
             return self.call_positional(f, args);
@@ -1397,6 +1399,18 @@ impl<'a> Emitter<'a> {
     /// the runtime's test); anything else asks the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
         let dst = self.alloc()?;
+        if self.fast {
+            let rt = self.r_rt;
+            let at = self.emit(Instr::PyTruth { dst, v: value, rt, slow: 0 })?;
+            let end = self.jump()?;
+            let here = self.here();
+            self.patch_slow(at, here)?;
+            let r = self.helper("truth", &[value])?;
+            self.emit(Instr::Move { dst, src: r })?;
+            let here = self.here();
+            self.patch(end, here)?;
+            return Ok(dst);
+        }
         let is_bool = self.typeof_is(value, "boolean")?;
         let slow = self.jump_if_false(is_bool)?;
         self.emit(Instr::Move { dst, src: value })?;
@@ -1645,44 +1659,30 @@ impl<'a> Emitter<'a> {
         let seq = self.prop(self.r_rt, "TLIST")?;
         let dict = self.prop(self.r_rt, "TDICT")?;
         let at_get = self.emit(Instr::PyGetItem { dst, o, k, seq, dict, slow: 0, absent: 0 })?;
-        // An ASCII str, a tuple, else the helper (which also answers every
-        // miss).
+        // `PyGetItem` already handles exact `list`, `tuple`, `dict`, single-byte
+        // ASCII `str`, and unmodified `list`/`tuple`/`dict`/`str` subclasses.
+        // Only non-ASCII/sliced strings need `PyStrItem`, and everything else
+        // falls straight to the `getitem` helper (eliminating the redundant
+        // second `PyGetItem(TTUPLE)` and `PyDictLookup` probes on every miss).
         self.defer_cold(Vec::new(), vec![at_get], move |e| {
             let at_str = e.emit(Instr::PyStrItem { dst, s: o, k, slow: 0 })?;
             let str_done = e.jump()?;
             let here = e.here();
-            e.patch_slow(at_str, here)?;
-            let tuple = e.prop(e.r_rt, "TTUPLE")?;
-            let at = e.emit(Instr::PyGetItem { dst, o, k, seq: tuple, dict, slow: 0, absent: 0 })?;
-            let done = e.jump()?;
-            let here = e.here();
-            e.patch_slow(at, here)?;
-            // An exact dict: its entry (`PyDictLookup`), or for no entry the
-            // `KeyError(k)` the helper would raise, made and raised natively
-            // (`PyMakeExc`, `PyRaise`) as its `makeExc` and `throw` do. Both
-            // `PyGetItem`s go there directly for a key the dict lacks.
-            let rt = e.r_rt;
-            let at_look = e.emit(Instr::PyDictLookup { dst, d: o, k, rt, absent: 0, slow: 0 })?;
-            let look_done = e.jump()?;
-            let here = e.here();
-            e.patch_absent(at_look, here)?;
             e.patch_absent(at_get, here)?;
-            e.patch_absent(at, here)?;
+            let rt = e.r_rt;
             let args = e.array(&[k])?;
             let cls = e.prop(rt, "KEYERROR")?;
             let exc = e.alloc()?;
             let at_make = e.emit(Instr::PyMakeExc { dst: exc, cls, args, rt, slow: 0 })?;
             let at_raise = e.py_raise(exc, rt)?;
             let here = e.here();
-            e.patch_slow(at_look, here)?;
+            e.patch_slow(at_str, here)?;
             e.patch_slow(at_make, here)?;
             e.patch_slow(at_raise, here)?;
             let r = e.helper("getitem", &[o, k])?;
             e.emit(Instr::Move { dst, src: r })?;
             let here = e.here();
-            e.patch(done, here)?;
             e.patch(str_done, here)?;
-            e.patch(look_done, here)?;
             Ok(())
         });
         Ok(dst)
@@ -1842,6 +1842,15 @@ impl<'a> Emitter<'a> {
                 }
                 self.global_read(globals, name)
             }
+        }
+    }
+    /// Register holding the globals holder for `Instr::PyGlobal` (`REG_FUNC`
+    /// under lazy globals, otherwise the module globals Map).
+    pub(super) fn globals_for_py_global(&mut self) -> R<Reg> {
+        if self.lazy_globals {
+            Ok(REG_FUNC)
+        } else {
+            self.globals()
         }
     }
     /// A global read with fast paths on: one fused `PyGlobal`, which makes

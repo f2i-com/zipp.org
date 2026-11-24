@@ -947,7 +947,34 @@ impl<'p> Vm<'p> {
                         if all_num {
                             crate::codegen::ARR_NUM_PIN_KIND
                         } else {
-                            crate::codegen::ARR_PIN_KIND
+                            // Holey Int array (`packed` after `delete`, `slice`/`concat`
+                            // of holey windows): every sampled element is either an Int
+                            // or a hole, with at least one Int. Offers the array to the
+                            // GPR integer tier for `HasProp` + guarded `GetIndex`.
+                            let mut saw_int = false;
+                            let all_int_or_hole = items[..head].iter().all(|v| {
+                                if v.is_int() {
+                                    saw_int = true;
+                                    true
+                                } else {
+                                    v.is_hole()
+                                }
+                            }) && (n <= head || {
+                                let step = (n - head).div_ceil(64).max(1);
+                                items[head..].iter().step_by(step).all(|v| {
+                                    if v.is_int() {
+                                        saw_int = true;
+                                        true
+                                    } else {
+                                        v.is_hole()
+                                    }
+                                })
+                            });
+                            if all_int_or_hole && saw_int {
+                                crate::codegen::ARR_INT_HOLEY_PIN_KIND
+                            } else {
+                                crate::codegen::ARR_PIN_KIND
+                            }
                         }
                     }
                 }

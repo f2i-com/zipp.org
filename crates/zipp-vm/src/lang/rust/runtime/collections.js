@@ -83,10 +83,10 @@
         }
         if (v && v.__rs === 12) {
             let i = 0;
-            const items = v.items;
+            const n = v.len, b = v.buf, m = b.length - 1, h = v.head;
             return mkIter(function () {
-                if (i >= items.length) return ITER_DONE;
-                return items[i++];
+                if (i >= n) return ITER_DONE;
+                return b[(h + i++) & m];
             });
         }
         if (v && v.__rs === 13) {
@@ -407,7 +407,7 @@
                     for (let i = 0; i < all.length; i++) s.set.set(mapKeyOf(all[i]), all[i]);
                     return s;
                 }
-                if (target === "VecDeque") return { __rs: 12, items: all };
+                if (target === "VecDeque") return rt.mkDeque(all);
                 if (target === "Result") {
                     const vals = [];
                     for (let i = 0; i < all.length; i++) {
@@ -770,11 +770,17 @@
                 return undefined;
             case "pop":
                 if (!isOwned) R.panic("cannot call pop on &str");
-                if (obj.s.length === 0) return None;
                 {
-                    const chars = Array.from(obj.s);
-                    const last = chars.pop();
-                    obj.s = chars.join("");
+                    const n = obj.s.length;
+                    if (n === 0) return None;
+                    let take = 1;
+                    const lo = obj.s.charCodeAt(n - 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF && n >= 2) {
+                        const hi = obj.s.charCodeAt(n - 2);
+                        if (hi >= 0xD800 && hi <= 0xDBFF) take = 2;
+                    }
+                    const last = obj.s.slice(n - take);
+                    obj.s = obj.s.slice(0, n - take);
                     return Some(R.mkChar(last));
                 }
             case "clear":
@@ -905,15 +911,16 @@
             case "replacen": {
                 const from = strVal(args[0]), to = strVal(args[1]);
                 let count = Number(deref(args[2]));
-                let out = s, pos = 0;
-                while (count > 0 && from.length > 0) {
-                    const idx = out.indexOf(from, pos);
+                if (count <= 0 || from.length === 0) return R.mkString(s);
+                let out = "", pos = 0;
+                while (count > 0) {
+                    const idx = s.indexOf(from, pos);
                     if (idx < 0) break;
-                    out = out.slice(0, idx) + to + out.slice(idx + from.length);
-                    pos = idx + to.length;
+                    out += s.slice(pos, idx) + to;
+                    pos = idx + from.length;
                     count--;
                 }
-                return R.mkString(out);
+                return R.mkString(pos === 0 ? s : out + s.slice(pos));
             }
             case "repeat": return R.mkString(s.repeat(Number(deref(args[0]))));
             case "split": {
@@ -1586,26 +1593,36 @@
                 return mkIter(function () { return i >= entries.length ? ITER_DONE : entries[i++][1]; });
             }
             case "first_key_value": {
-                const entries = mapEntries(m);
-                return entries.length === 0 ? None : Some(R.mkTuple([entries[0][0], entries[0][1]]));
+                let best = null;
+                for (const e of m.map.values()) {
+                    if (best === null || cmpVal(e[0], best[0]) < 0) best = e;
+                }
+                return best === null ? None : Some(R.mkTuple([best[0], best[1]]));
             }
             case "last_key_value": {
-                const entries = mapEntries(m);
-                return entries.length === 0 ? None : Some(R.mkTuple([entries[entries.length - 1][0], entries[entries.length - 1][1]]));
+                let best = null;
+                for (const e of m.map.values()) {
+                    if (best === null || cmpVal(e[0], best[0]) > 0) best = e;
+                }
+                return best === null ? None : Some(R.mkTuple([best[0], best[1]]));
             }
             case "pop_first": {
-                const entries = mapEntries(m);
-                if (entries.length === 0) return None;
-                const e = entries[0];
-                m.map.delete(mapKeyOf(e[0]));
-                return Some(R.mkTuple([e[0], e[1]]));
+                let bestMk = null, best = null;
+                for (const [mk, e] of m.map) {
+                    if (best === null || cmpVal(e[0], best[0]) < 0) { bestMk = mk; best = e; }
+                }
+                if (best === null) return None;
+                m.map.delete(bestMk);
+                return Some(R.mkTuple([best[0], best[1]]));
             }
             case "pop_last": {
-                const entries = mapEntries(m);
-                if (entries.length === 0) return None;
-                const e = entries[entries.length - 1];
-                m.map.delete(mapKeyOf(e[0]));
-                return Some(R.mkTuple([e[0], e[1]]));
+                let bestMk = null, best = null;
+                for (const [mk, e] of m.map) {
+                    if (best === null || cmpVal(e[0], best[0]) > 0) { bestMk = mk; best = e; }
+                }
+                if (best === null) return None;
+                m.map.delete(bestMk);
+                return Some(R.mkTuple([best[0], best[1]]));
             }
             case "iter":
             case "into_iter":
@@ -1711,20 +1728,50 @@
     }
 
     // ---- VecDeque & BinaryHeap methods ----
+    function dequeGrow(d) {
+        const old = d.buf, cap = old.length, n = d.len, m = cap - 1, h = d.head;
+        const nb = new Array(cap << 1);
+        for (let i = 0; i < n; i++) nb[i] = old[(h + i) & m];
+        d.buf = nb;
+        d.head = 0;
+    }
     function callDequeMethod(d, name, args) {
         switch (name) {
-            case "len": return d.items.length;
-            case "is_empty": return d.items.length === 0;
-            case "clear": d.items.length = 0; return undefined;
-            case "push_back": d.items.push(args[0]); return undefined;
-            case "push_front": d.items.unshift(args[0]); return undefined;
-            case "pop_back": return d.items.length === 0 ? None : Some(d.items.pop());
-            case "pop_front": return d.items.length === 0 ? None : Some(d.items.shift());
-            case "front": return d.items.length === 0 ? None : Some(d.items[0]);
-            case "back": return d.items.length === 0 ? None : Some(d.items[d.items.length - 1]);
+            case "len": return d.len;
+            case "is_empty": return d.len === 0;
+            case "clear": d.buf = new Array(8); d.head = 0; d.len = 0; return undefined;
+            case "push_back":
+                if (d.len === d.buf.length) dequeGrow(d);
+                d.buf[(d.head + d.len) & (d.buf.length - 1)] = args[0];
+                d.len++;
+                return undefined;
+            case "push_front":
+                if (d.len === d.buf.length) dequeGrow(d);
+                d.head = (d.head - 1) & (d.buf.length - 1);
+                d.buf[d.head] = args[0];
+                d.len++;
+                return undefined;
+            case "pop_back": {
+                if (d.len === 0) return None;
+                d.len--;
+                const idx = (d.head + d.len) & (d.buf.length - 1);
+                const v = d.buf[idx];
+                d.buf[idx] = undefined;
+                return Some(v);
+            }
+            case "pop_front": {
+                if (d.len === 0) return None;
+                const v = d.buf[d.head];
+                d.buf[d.head] = undefined;
+                d.head = (d.head + 1) & (d.buf.length - 1);
+                d.len--;
+                return Some(v);
+            }
+            case "front": return d.len === 0 ? None : Some(d.buf[d.head]);
+            case "back": return d.len === 0 ? None : Some(d.buf[(d.head + d.len - 1) & (d.buf.length - 1)]);
             case "get": {
                 const i = Number(deref(args[0]));
-                return (i >= 0 && i < d.items.length) ? Some(d.items[i]) : None;
+                return (i >= 0 && i < d.len) ? Some(d.buf[(d.head + i) & (d.buf.length - 1)]) : None;
             }
             case "iter":
             case "into_iter": return intoIter(d);

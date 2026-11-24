@@ -461,7 +461,11 @@ fn analyze_run(
                 use crate::codegen::region_int::{int_ta_load_kind, IntTaLoadKind as K};
                 let ta = dv.unwrap();
                 let iv = match ta.access.get(&ip).map(|&j| ta.pins[j as usize].kind) {
-                    Some(k) if k == ARR_INT_PIN_KIND => IV_I32,
+                    Some(k)
+                        if k == ARR_INT_PIN_KIND || k == crate::codegen::ARR_INT_HOLEY_PIN_KIND =>
+                    {
+                        IV_I32
+                    }
                     Some(k) => match int_ta_load_kind(k) {
                         Some(K::I8) => (-128, 127),
                         Some(K::U8) => (0, 255),
@@ -487,6 +491,16 @@ fn analyze_run(
                     return None;
                 }
                 out.regs.insert(dst, (0, TWO_POW_53));
+                out.alias.remove(&dst);
+            }
+            // A pinned dense-Array `key in arr` yields a Bool (no numeric range).
+            Instr::HasProp {
+                dst, brand: false, ..
+            } if dv.is_some() => {
+                if dv.unwrap().access.get(&ip).is_none() {
+                    return None;
+                }
+                out.regs.remove(&dst);
                 out.alias.remove(&dst);
             }
             _ => return None, // outside the modelled subset

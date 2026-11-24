@@ -327,6 +327,7 @@ pub(crate) fn remap_regs(i: &mut Instr, m: &dyn Fn(Reg) -> Reg) {
         | Instr::PyMethod { dst: r0, obj: r1, rt: r2, .. }
         | Instr::PyModGet { dst: r0, obj: r1, rt: r2, .. }
         | Instr::PyLen { dst: r0, v: r1, rt: r2, .. }
+        | Instr::PyTruth { dst: r0, v: r1, rt: r2, .. }
         | Instr::PySeq { dst: r0, items: r1, rt: r2, .. }
         | Instr::PyUnpack { dst: r0, v: r1, rt: r2, .. }
         | Instr::PyCall { dst: r0, f: r1, arg_base: r2, .. } => {

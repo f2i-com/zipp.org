@@ -1129,8 +1129,8 @@
     // and answers the table itself (`m` below) when guest code must run:
     // then `hashInt` hashes the key and `find` runs `eq` on the candidates
     // it reports. Nothing else in the runtime touches the storage.
-    const TB = __zipp_py_table, TT = T.tuple, TF = T.frozenset;
-    function dict(cls) { return { cls: cls || T.dict, map: TB(0, false, TT, TF), size: 0 }; }
+    const TB = __zipp_py_table, TT = T.tuple, TF = T.frozenset, TY = rt.TypeType;
+    function dict(cls) { return { cls: cls || T.dict, map: TB(0, false, TT, TF, TY), size: 0 }; }
     function full(what) { fail(E.MemoryError, what + " limit exceeded"); }
     // The split protocol's lookup of `key` (of hash `h`) in table `m`: its
     // position, with `fKey` the stored key there, or -1, with `fHint` for an
@@ -1315,7 +1315,7 @@
     // order the table gives (`vm::py_table`): insertion order, where equal-
     // hash keys the former bucket Map filed together stay together, and a
     // set of small non-negative ints ascending, as CPython's table orders them.
-    function set(type) { return { cls: type || T.set, map: TB(0, true, TT, TF), size: 0 }; }
+    function set(type) { return { cls: type || T.set, map: TB(0, true, TT, TF, TY), size: 0 }; }
     // A key needing guest code joins the entry its old bucket (`keyOf`)
     // shared, if any, among the unequal entries of its hash (`fCands`).
     function mateOf(key, h) {
@@ -1345,9 +1345,13 @@
     function setPop(s) { const v = TB(10, s.map); if (v !== undefined) s.size--; return v; }
     function setList(s) { return TB(6, s.map); }
     const setValues = setList;
+    function setNext() {
+        if (this.b.size !== this.size) fail(E.RuntimeError, "Set changed size during iteration");
+        return this.i < this.a.length ? this.a[this.i++] : STOP;
+    }
     function setIter(s) {
-        const items = setList(s); let i = 0; const size = s.size;
-        return { cls: T.iterator, next: () => { if (s.size !== size) fail(E.RuntimeError, "Set changed size during iteration"); return i < items.length ? items[i++] : STOP; } };
+        return { cls: T.iterator, next: KEY_STEP !== null ? KEY_STEP : setNext, jnext: setNext,
+            kind: 3, a: setList(s), i: 0, b: s, size: s.size, pick: 0, tmpl: null, ttype: null };
     }
     // Every `items[i]`, added in order.
     function setFill(s, items) {

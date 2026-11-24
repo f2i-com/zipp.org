@@ -55,8 +55,10 @@ pub(crate) const LAYOUT_BASE: u32 = 0x4000_0000;
 pub(crate) const ROOT: u32 = 1;
 /// Most layouts a VM makes; an instance past it turns into a dict.
 const LAYOUT_MAX: usize = 1 << 14;
-/// Most keys a layout holds.
-const DEPTH_MAX: u32 = 64;
+/// Most keys a layout holds. 128 covers large stateful parser/converter
+/// instances (e.g. `html2text.HTML2Text` with 84 fields) without spilling
+/// into dict-mode `PyTable` storage.
+const DEPTH_MAX: u32 = 128;
 /// Longest key (bytes) a layout takes.
 const KEY_MAX: usize = 128;
 
@@ -262,7 +264,9 @@ impl<'p> Vm<'p> {
     /// Store `v` at `slot` of `idx` (layout-mode storage).
     #[inline]
     pub(crate) fn py_attrs_put(&mut self, idx: u32, slot: usize, v: Value) {
-        self.heap.write_barrier_val(idx, v);
+        if v.is_heap() {
+            self.heap.write_barrier_val(idx, v);
+        }
         if let HeapObj::PyAttrs { vals, .. } = self.heap.get_mut(idx) {
             if let Some(x) = vals.get_mut(slot) {
                 *x = v;
@@ -274,7 +278,9 @@ impl<'p> Vm<'p> {
     /// under the layout `to`, and republish its mirror.
     #[inline]
     pub(crate) fn py_attrs_push(&mut self, idx: u32, to: u32, v: Value) {
-        self.heap.write_barrier_val(idx, v);
+        if v.is_heap() {
+            self.heap.write_barrier_val(idx, v);
+        }
         if let HeapObj::PyAttrs { layout, vals } = self.heap.get_mut(idx) {
             vals.push(v);
             *layout = to;

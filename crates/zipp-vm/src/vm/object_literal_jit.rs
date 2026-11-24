@@ -118,11 +118,11 @@ pub(crate) extern "win64" fn jit_new_object(vm: *mut core::ffi::c_void, hint: u3
     crate::vm::helpers_misc::catch_effectful_jit_u64(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         vm.maybe_gc();
-        let idx = vm
-            .heap
-            .alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(
-                hint as usize,
-            ))));
+        let idx = if hint > 0 {
+            vm.heap.alloc_ctor_object(hint as usize, None)
+        } else {
+            vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())))
+        };
         vm.realm_born(idx, vm.obj_proto);
         Value::heap(idx).bits()
     })
@@ -710,13 +710,33 @@ pub(crate) extern "win64" fn jit_append_data_prop(
         // A value expression may have re-entered and promoted the still-rooted
         // literal before this append.  Preserve an old-object -> young-value
         // edge just like every other VM mutation choke point.
+        let before_shape = map.shape();
+        let cache_slot = if before_shape != crate::shape::DICT {
+            let h = (before_shape.wrapping_mul(0x9E37_79B1))
+                ^ ((packed_name as u32).wrapping_mul(0x85EB_CA77))
+                ^ (((packed_name >> 32) as u32).wrapping_mul(0xC2B2_AE35));
+            Some((h as usize) & (vm.static_append_shape_cache.len() - 1))
+        } else {
+            None
+        };
+        let cached_after = cache_slot
+            .and_then(|s| {
+                let (bs, pn, after) = vm.static_append_shape_cache[s];
+                (bs == before_shape && pn == packed_name && after != 0).then_some(after)
+            })
+            .unwrap_or(0);
         vm.heap.write_barrier_val(obj_idx, val);
         let HeapObj::Object(map) = vm.heap.get_mut(obj_idx) else {
             // Revalidated defensively after the barrier.  The barrier cannot
             // mutate the heap object, so this remains a pure decline.
             return crate::codegen::SELF_CALL_DEOPT;
         };
-        map.push_static_data(key, val);
+        let after_shape = map.push_static_data_cached(key, val, cached_after);
+        if cached_after == 0 && after_shape != crate::shape::DICT {
+            if let Some(s) = cache_slot {
+                vm.static_append_shape_cache[s] = (before_shape, packed_name, after_shape);
+            }
+        }
         vm.heap.bump_version(obj_idx);
         0
     })

@@ -40,7 +40,76 @@ use crate::parse::ast::{
 /// time in this module, most of it allocating a `String` per identifier
 /// reference and SipHashing it; the sets only ever answer "is this name in
 /// it", so nothing needs owning until a result leaves the module.
-type Names<'a> = FxHashSet<&'a str>;
+#[cfg(not(feature = "safe-sandbox"))]
+type Name<'a> = &'a str;
+
+#[cfg(feature = "safe-sandbox")]
+#[derive(Clone, Eq)]
+enum SafeName<'a> {
+    Borrowed(&'a str),
+    Cached(std::rc::Rc<str>),
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl SafeName<'_> {
+    #[inline(always)]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Cached(rc) => rc,
+        }
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl PartialEq for SafeName<'_> {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl std::hash::Hash for SafeName<'_> {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl std::borrow::Borrow<str> for SafeName<'_> {
+    #[inline(always)]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl std::ops::Deref for SafeName<'_> {
+    type Target = str;
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[cfg(feature = "safe-sandbox")]
+type Name<'a> = SafeName<'a>;
+
+#[inline(always)]
+fn mk_name<'a>(s: &'a str) -> Name<'a> {
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        s
+    }
+    #[cfg(feature = "safe-sandbox")]
+    {
+        SafeName::Borrowed(s)
+    }
+}
+
+type Names<'a> = FxHashSet<Name<'a>>;
 
 /// What the reference walk records, beside the names, for a call whose callee
 /// is the bare identifier `eval` (`eval(src)`, `(eval)(src)`, a locally rebound
@@ -72,7 +141,12 @@ mod memo {
     struct Frame {
         id: u64,
         map: rustc_hash::FxHashMap<Key, Slot>,
+        #[cfg(not(feature = "safe-sandbox"))]
         arena: Vec<(*const u8, usize)>,
+        #[cfg(feature = "safe-sandbox")]
+        arena: Vec<std::rc::Rc<str>>,
+        #[cfg(feature = "safe-sandbox")]
+        intern: rustc_hash::FxHashSet<std::rc::Rc<str>>,
         #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
         source: Option<std::sync::Arc<str>>,
     }
@@ -151,6 +225,8 @@ mod memo {
                     id,
                     map: Default::default(),
                     arena: Vec::new(),
+                    #[cfg(feature = "safe-sandbox")]
+                    intern: Default::default(),
                     #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
                     source: None,
                 });
@@ -235,6 +311,25 @@ mod memo {
         })
     }
 
+    #[cfg(feature = "safe-sandbox")]
+    pub fn get<'a>(key: Key, out: &mut super::Names<'a>) -> bool {
+        STACK.with(|s| {
+            let s = s.borrow();
+            let Some(frame) = s.last() else {
+                return false;
+            };
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            out.reserve(slice.len());
+            for rc in slice {
+                out.insert(super::SafeName::Cached(std::rc::Rc::clone(rc)));
+            }
+            true
+        })
+    }
+
     /// Visit each memoised name for `key` without allocating a temporary set;
     /// stops early if `f` returns `false`. Returns `true` on a cache hit.
     ///
@@ -261,17 +356,47 @@ mod memo {
         })
     }
 
+    #[cfg(feature = "safe-sandbox")]
+    pub fn for_each(key: Key, mut f: impl FnMut(&str) -> bool) -> bool {
+        STACK.with(|s| {
+            let s = s.borrow();
+            let Some(frame) = s.last() else {
+                return false;
+            };
+            let Some(&(start, len)) = frame.map.get(&key) else {
+                return false;
+            };
+            let slice = &frame.arena[start as usize..(start + len) as usize];
+            for rc in slice {
+                if !f(rc) {
+                    break;
+                }
+            }
+            true
+        })
+    }
+
     pub fn put(key: Key, names: &super::Names<'_>) {
-        if cfg!(feature = "safe-sandbox") {
-            return;
-        }
         STACK.with(|s| {
             if let Some(frame) = s.borrow_mut().last_mut() {
                 if let (Ok(start), Ok(len)) = (u32::try_from(frame.arena.len()), u32::try_from(names.len())) {
                     if start.checked_add(len).is_some() {
                         frame.arena.reserve(names.len());
+                        #[cfg(not(feature = "safe-sandbox"))]
                         for n in names {
                             frame.arena.push((n.as_ptr(), n.len()));
+                        }
+                        #[cfg(feature = "safe-sandbox")]
+                        for n in names {
+                            let name_str: &str = n;
+                            let rc = if let Some(existing) = frame.intern.get(name_str) {
+                                std::rc::Rc::clone(existing)
+                            } else {
+                                let fresh: std::rc::Rc<str> = std::rc::Rc::from(name_str);
+                                frame.intern.insert(std::rc::Rc::clone(&fresh));
+                                fresh
+                            };
+                            frame.arena.push(rc);
                         }
                         frame.map.insert(key, (start, len));
                     }
@@ -514,8 +639,8 @@ fn memo_get<'a, T>(node: &'a T, span: (u32, u32), kind: u8, out: &mut Names<'a>)
 
 #[cfg(feature = "safe-sandbox")]
 #[inline]
-fn memo_get<'a, T>(_node: &'a T, _span: (u32, u32), _kind: u8, _out: &mut Names<'a>) -> bool {
-    false
+fn memo_get<'a, T>(node: &'a T, span: (u32, u32), kind: u8, out: &mut Names<'a>) -> bool {
+    memo::get((node as *const T as usize, span.0, span.1, kind), out)
 }
 
 #[cfg(not(feature = "safe-sandbox"))]
@@ -527,12 +652,12 @@ fn memo_for_each<T>(node: &T, span: (u32, u32), kind: u8, f: impl FnMut(&str) ->
 
 #[cfg(feature = "safe-sandbox")]
 #[inline]
-fn memo_for_each<T>(_node: &T, _span: (u32, u32), _kind: u8, _f: impl FnMut(&str) -> bool) -> bool {
-    false
+fn memo_for_each<T>(node: &T, span: (u32, u32), kind: u8, f: impl FnMut(&str) -> bool) -> bool {
+    memo::for_each((node as *const T as usize, span.0, span.1, kind), f)
 }
 
 fn owned(set: Names<'_>) -> HashSet<String> {
-    set.into_iter().map(str::to_string).collect()
+    set.into_iter().map(|n| n.to_string()).collect()
 }
 
 fn borrowed(params: &[String]) -> Vec<&str> {
@@ -554,7 +679,7 @@ fn free_vars_in<'a>(params: &[&'a str], body: &'a [Stmt]) -> Names<'a> {
     // nested `let`/`catch (e)`/`for (let i …)` name at function level made
     // `() => { { let x; } return x; }` look closed, so the enclosing `x` was
     // never boxed and the arrow read (or wrote) a global instead.
-    let mut bound: Names<'a> = params.iter().copied().collect();
+    let mut bound: Names<'a> = params.iter().copied().map(mk_name).collect();
     collect_function_scoped_bound(body, &mut bound);
     for s in body {
         stmt_refs(s, &mut refs, true);
@@ -576,12 +701,12 @@ fn collect_function_scoped_bound<'a>(body: &'a [Stmt], out: &mut Names<'a>) {
             }
             Stmt::ClassDecl(c) => {
                 if let Some(n) = &c.name {
-                    out.insert(&**n);
+                    out.insert(mk_name(&**n));
                 }
             }
             _ => {
                 if let Some(n) = labelled_fn_decl_name(s) {
-                    out.insert(n);
+                    out.insert(mk_name(n));
                 } else {
                     collect_var_names_stmt(s, out);
                 }
@@ -679,12 +804,12 @@ fn block_lexical_names<'a>(stmts: &'a [Stmt], out: &mut Names<'a>) {
             }
             Stmt::ClassDecl(c) => {
                 if let Some(n) = &c.name {
-                    out.insert(&**n);
+                    out.insert(mk_name(&**n));
                 }
             }
             _ => {
                 if let Some(n) = labelled_fn_decl_name(s) {
-                    out.insert(n);
+                    out.insert(mk_name(n));
                 }
             }
         }
@@ -700,7 +825,7 @@ fn in_scope<'a>(hidden: &Names<'a>, out: &mut Names<'a>, walk: impl FnOnce(&mut 
     }
     // Walk straight into `out`, then drop the scope's own names again —
     // except any `out` already held from a reference OUTSIDE the scope.
-    let outer: Vec<&'a str> = hidden.iter().copied().filter(|n| out.contains(n)).collect();
+    let outer: Vec<Name<'a>> = hidden.iter().filter(|n| out.contains(*n)).cloned().collect();
     walk(out);
     for n in hidden {
         if !outer.contains(n) {
@@ -726,7 +851,7 @@ fn free_vars_arrow_in<'a>(params: &[&'a str], body: &'a ArrowBody) -> Names<'a> 
         ArrowBody::Block(b) => free_vars_in(params, &b.stmts),
         ArrowBody::Expr(e) => {
             let mut refs = Names::default();
-            let bound: Names<'a> = params.iter().copied().collect();
+            let bound: Names<'a> = params.iter().copied().map(mk_name).collect();
             expr_refs(e, &mut refs);
             refs.retain(|n| !bound.contains(n));
             refs
@@ -839,7 +964,7 @@ pub fn arrow_entry_lexicals(stmts: &[Stmt]) -> (HashSet<String>, HashSet<String>
                         }
                         pattern_init_refs(&decl.id, &mut own);
                         for n in names {
-                            if prior_refs.contains(n) || own.contains(n) {
+                            if prior_refs.contains(&n) || own.contains(&n) {
                                 early_cell.insert(n.to_string());
                             }
                         }
@@ -1071,7 +1196,7 @@ fn params_free<'a>(p: &'a Params, bound: &[&str], out: &mut Names<'a>) {
     // The parameter names themselves are bound: a default referring to an
     // earlier parameter captures nothing outer.
     for r in refs {
-        if !bound.iter().any(|b| *b == r) {
+        if !bound.iter().any(|b| *b == &*r) {
             out.insert(r);
         }
     }
@@ -1089,7 +1214,7 @@ pub fn captured_locals(
     params_ast: Option<&Params>,
     body: &[Stmt],
 ) -> HashSet<String> {
-    let mut bound: Names<'_> = params.iter().map(String::as_str).collect();
+    let mut bound: Names<'_> = params.iter().map(|s| mk_name(s.as_str())).collect();
     collect_bound_in_body(body, &mut bound);
     if bound.is_empty() {
         return HashSet::default();
@@ -1123,7 +1248,7 @@ pub fn captured_locals_arrow(
     match body {
         ArrowBody::Block(b) => captured_locals(params, Some(params_ast), &b.stmts),
         ArrowBody::Expr(e) => {
-            let bound: Names<'_> = params.iter().map(String::as_str).collect();
+            let bound: Names<'_> = params.iter().map(|s| mk_name(s.as_str())).collect();
             let mut nested_free = Names::default();
             #[cfg(not(any(feature = "meter-only", feature = "safe-sandbox")))]
             memo::with_lazy_filter(&bound, || {
@@ -1246,7 +1371,7 @@ struct WriteScan<'t> {
     /// for 2-cycle early rejection in `mark()`.
     len_mask: u64,
     /// Overflow set for functions with > 64 distinct captured parameters.
-    overflow: Names<'t>,
+    overflow: FxHashSet<&'t str>,
     with_seen: bool,
 }
 
@@ -1262,7 +1387,7 @@ impl<'t> WriteScan<'t> {
         for &name in targets {
             len_mask |= 1u64 << name.len().min(63);
         }
-        let mut overflow = Names::default();
+        let mut overflow = FxHashSet::default();
         if targets.len() > 64 {
             for &name in &targets[64..] {
                 overflow.insert(name);
@@ -1618,7 +1743,7 @@ impl<'t> WriteScan<'t> {
             #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
             fn_node_free(f, &mut tmp);
             for name in tmp {
-                self.mark(name);
+                self.mark(&name);
                 if self.done() {
                     return;
                 }
@@ -1643,7 +1768,7 @@ impl<'t> WriteScan<'t> {
         #[cfg(any(feature = "meter-only", feature = "safe-sandbox"))]
         class_free(c, &mut tmp);
         for name in tmp {
-            self.mark(name);
+            self.mark(&name);
             if self.done() {
                 return;
             }
@@ -1867,10 +1992,10 @@ pub fn numeric_locals(excluded: &[&str], params: Option<&Params>, body: &[Stmt])
     if !scan.wants || scan.declared.is_empty() {
         return HashSet::default();
     }
-    // Sets of the walk's own hashed kind (`Names`): a sort of `&str` here
+    // Sets of the walk's own hashed kind (`FxHashSet`): a sort of `&str` here
     // was a monomorphized slice sort, 3 KB of the WebAssembly module.
-    let bad: Names<'_> = scan.bad.iter().copied().collect();
-    let mut set: Names<'_> = scan
+    let bad: FxHashSet<&str> = scan.bad.iter().copied().collect();
+    let mut set: FxHashSet<&str> = scan
         .declared
         .iter()
         .copied()
@@ -1906,7 +2031,7 @@ const NUM_EXPR_DEPTH: u8 = 24;
 
 /// Whether `e`'s value is a number, `undefined`, `null` or a boolean when
 /// every name in `set` holds one (or `e` throws instead of producing a value).
-fn num_value(e: &Expr, set: &Names<'_>, depth: u8) -> bool {
+fn num_value(e: &Expr, set: &FxHashSet<&str>, depth: u8) -> bool {
     use crate::parse::ast::{AssignOp, BinaryOp, UnaryOp};
     if depth == 0 {
         return false;
@@ -2406,12 +2531,12 @@ fn collect_lexical_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         }
         Stmt::FnDecl(f) => {
             if let Some(n) = &f.name {
-                out.insert(&**n);
+                out.insert(mk_name(&**n));
             }
         }
         Stmt::ClassDecl(c) => {
             if let Some(n) = &c.name {
-                out.insert(&**n);
+                out.insert(mk_name(&**n));
             }
         }
         Stmt::Block(b) => {
@@ -2555,7 +2680,7 @@ fn collect_bound_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         }
         Stmt::FnDecl(f) => {
             if let Some(n) = &f.name {
-                out.insert(&**n);
+                out.insert(mk_name(&**n));
             }
         }
         // A class declaration is a lexical binding like `let`/`const`: a nested
@@ -2563,7 +2688,7 @@ fn collect_bound_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         // function can hold its cell).
         Stmt::ClassDecl(c) => {
             if let Some(n) = &c.name {
-                out.insert(&**n);
+                out.insert(mk_name(&**n));
             }
         }
         // Recurse into nested *statements* (blocks, loops, if) but NOT into
@@ -2646,13 +2771,13 @@ fn collect_bound_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
 pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
     let mut names = Names::default();
     pattern_names(pat, &mut names);
-    out.extend(names.into_iter().map(str::to_string));
+    out.extend(names.into_iter().map(|n| n.to_string()));
 }
 
 fn pattern_names<'a>(pat: &'a Pattern, out: &mut Names<'a>) {
     match pat {
         Pattern::Ident(n) => {
-            out.insert(&**n);
+            out.insert(mk_name(&**n));
         }
         Pattern::Assign { left, .. } => pattern_names(left, out),
         Pattern::Rest(inner) => pattern_names(inner, out),
@@ -2887,7 +3012,7 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
             // `undefined` is an ordinary IdentifierReference.  Its immutable
             // global value is only the final fallback: a parameter/local in an
             // enclosing function must be captured just like any other name.
-            out.insert(&**n);
+            out.insert(mk_name(&**n));
         }
         Expr::Binary { left, right, .. } => {
             expr_refs(left, out);
@@ -2912,7 +3037,7 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
             // A call through the bare identifier `eval` is the one shape the
             // compiler emits a DirectEval for (`compile/calls.rs`).
             if matches!(&c.callee, Expr::Ident(id) if &**id == "eval") {
-                out.insert(DIRECT_EVAL_CALL);
+                out.insert(mk_name(DIRECT_EVAL_CALL));
             }
             expr_refs(&c.callee, out);
             for arg in &c.args {
@@ -3047,7 +3172,7 @@ fn target_refs<'a>(t: &'a Target, out: &mut Names<'a>) {
     match t {
         // An assignment target names a binding just like an identifier read.
         Target::Ident { name, .. } => {
-            out.insert(&**name);
+            out.insert(mk_name(&**name));
         }
         // `o.x = v` / `o.#x = v` / `o[k] = v`: the OBJECT (and key) are reads an
         // enclosing arrow/function must capture.
@@ -3241,7 +3366,7 @@ fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
 pub(crate) fn function_free_names(f: &Function) -> Vec<String> {
     let mut out = Names::default();
     fn_node_free(f, &mut out);
-    let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    let mut v: Vec<String> = out.into_iter().map(|n| n.to_string()).collect();
     crate::cold_sort::sort(&mut v);
     v
 }
@@ -3280,7 +3405,7 @@ pub(crate) fn function_free_matching(f: &Function, mut keep: impl FnMut(&str) ->
     let mut out = Names::default();
     fn_node_free(f, &mut out);
     for n in out {
-        if keep(n) {
+        if keep(&n) {
             v.push(n.to_string());
         }
     }
@@ -3293,7 +3418,7 @@ pub(crate) fn function_free_matching(f: &Function, mut keep: impl FnMut(&str) ->
 pub(crate) fn arrow_free_names(a: &Arrow) -> Vec<String> {
     let mut out = Names::default();
     arrow_free(a, &mut out);
-    let mut v: Vec<String> = out.into_iter().map(str::to_string).collect();
+    let mut v: Vec<String> = out.into_iter().map(|n| n.to_string()).collect();
     crate::cold_sort::sort(&mut v);
     v
 }
@@ -3331,7 +3456,7 @@ pub(crate) fn arrow_free_matching(a: &Arrow, mut keep: impl FnMut(&str) -> bool)
     let mut out = Names::default();
     arrow_free(a, &mut out);
     for n in out {
-        if keep(n) {
+        if keep(&n) {
             v.push(n.to_string());
         }
     }
@@ -3705,5 +3830,17 @@ fn param_names<'a>(p: &'a Params) -> Vec<&'a str> {
     for item in &p.items {
         pattern_names(item, &mut set);
     }
-    set.into_iter().collect()
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        set.into_iter().collect()
+    }
+    #[cfg(feature = "safe-sandbox")]
+    {
+        set.into_iter()
+            .map(|n| match n {
+                SafeName::Borrowed(s) => s,
+                SafeName::Cached(_) => unreachable!("pattern_names only inserts Borrowed"),
+            })
+            .collect()
+    }
 }

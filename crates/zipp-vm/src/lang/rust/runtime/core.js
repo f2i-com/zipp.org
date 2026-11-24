@@ -69,14 +69,33 @@ var __zipp_rs = (function () {
     }
     R.mkChar = mkChar;
 
+    function mkDeque(init) {
+        const n = init ? init.length : 0;
+        let cap = 8;
+        while (cap < n) cap <<= 1;
+        const buf = new Array(cap);
+        for (let i = 0; i < n; i++) buf[i] = init[i];
+        return { __rs: 12, buf: buf, head: 0, len: n };
+    }
+    function dequeToArray(d) {
+        const n = d.len, b = d.buf, m = b.length - 1, h = d.head;
+        const out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = b[(h + i) & m];
+        return out;
+    }
+    rt.mkDeque = mkDeque;
+    rt.dequeToArray = dequeToArray;
+
     function utf8ByteLen(s) {
-        let len = 0;
-        for (let i = 0; i < s.length; i++) {
+        const n = s.length;
+        let len = n;
+        for (let i = 0; i < n; i++) {
             const c = s.charCodeAt(i);
-            if (c < 0x80) len += 1;
-            else if (c < 0x800) len += 2;
-            else if (c >= 0xD800 && c <= 0xDBFF) { len += 4; i++; }
-            else len += 3;
+            if (c >= 0x80) {
+                if (c < 0x800) len += 1;
+                else if (c >= 0xD800 && c <= 0xDBFF) { len += 2; i++; }
+                else len += 2;
+            }
         }
         return len;
     }
@@ -533,8 +552,8 @@ var __zipp_rs = (function () {
         }
         if (v && v.__rs === 12) {
             const i = Number(k);
-            if (i < 0 || i >= v.items.length) rsPanic("VecDeque index out of bounds: " + i);
-            return v.items[i];
+            if (i < 0 || i >= v.len) rsPanic("VecDeque index out of bounds: " + i);
+            return v.buf[(v.head + i) & (v.buf.length - 1)];
         }
         if (v && v.__rs === 10) {
             const got = rt.mapGetOpt(v, k);
@@ -572,8 +591,8 @@ var __zipp_rs = (function () {
         }
         if (v && v.__rs === 12) {
             const i = Number(k);
-            if (i < 0 || i >= v.items.length) rsPanic("VecDeque index out of bounds: " + i);
-            v.items[i] = val;
+            if (i < 0 || i >= v.len) rsPanic("VecDeque index out of bounds: " + i);
+            v.buf[(v.head + i) & (v.buf.length - 1)] = val;
             return undefined;
         }
         if (v && v.__rs === 10) {
@@ -877,10 +896,16 @@ var __zipp_rs = (function () {
                 return true;
             }
             case 5: return a.cp === b.cp;
-            case 7:
-            case 12: {
+            case 7: {
                 if (a.items.length !== b.items.length) return false;
                 for (let i = 0; i < a.items.length; i++) if (!eq(a.items[i], b.items[i])) return false;
+                return true;
+            }
+            case 12: {
+                if (a.len !== b.len) return false;
+                const ab = a.buf, am = ab.length - 1, ah = a.head;
+                const bb = b.buf, bm = bb.length - 1, bh = b.head;
+                for (let i = 0; i < a.len; i++) if (!eq(ab[(ah + i) & am], bb[(bh + i) & bm])) return false;
                 return true;
             }
             case 9: return eq(a.start, b.start) && eq(a.end, b.end) && a.inclusive === b.inclusive;
@@ -1071,7 +1096,7 @@ var __zipp_rs = (function () {
                 for (const [mk, val] of v.set) s.set(mk, cloneVal(val));
                 return { __rs: 11, ordered: v.ordered, set: s };
             }
-            case 12: return { __rs: 12, items: v.items.map(cloneVal) };
+            case 12: return mkDeque(dequeToArray(v).map(cloneVal));
             case 13: return { __rs: 13, items: v.items.map(cloneVal) };
             case 14: {
                 // Arc and Rc share the same reference on clone!
@@ -1130,7 +1155,7 @@ var __zipp_rs = (function () {
             }
             case "HashSet": return rt.mkSet(false);
             case "BTreeSet": return rt.mkSet(true);
-            case "VecDeque": return { __rs: 12, items: [] };
+            case "VecDeque": return mkDeque(null);
             case "BinaryHeap": return { __rs: 13, items: [] };
             case "()": return undefined;
         }
@@ -1444,8 +1469,14 @@ var __zipp_rs = (function () {
                     ? "(\n" + pad1 + parts.join(",\n" + pad1) + ",\n" + pad + ")"
                     : "(" + parts.join(", ") + ")";
             }
+            case 12: {
+                if (v.len === 0) return "[]";
+                const parts = dequeToArray(v).map(function (x) { return fmtDebug(x, pretty, indent + 4); });
+                return pretty
+                    ? "[\n" + pad1 + parts.join(",\n" + pad1) + ",\n" + pad + "]"
+                    : "[" + parts.join(", ") + "]";
+            }
             case 7:
-            case 12:
             case 13: {
                 if (v.items.length === 0) return "[]";
                 const parts = v.items.map(function (x) { return fmtDebug(x, pretty, indent + 4); });

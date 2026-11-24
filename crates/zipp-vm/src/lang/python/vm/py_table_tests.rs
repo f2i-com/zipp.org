@@ -33,7 +33,7 @@ impl Env {
         let f = Value::heap(heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
         Env {
             heap,
-            kinds: PyKinds { tuple: t, frozenset: f, seq_shape: crate::shape::DICT },
+            kinds: PyKinds { tuple: t, frozenset: f, type_type: Value::UNDEFINED, seq_shape: crate::shape::DICT },
         }
     }
     fn int(&mut self, digits: &str) -> Value {

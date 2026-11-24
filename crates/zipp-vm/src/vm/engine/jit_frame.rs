@@ -6,6 +6,55 @@
 use super::*;
 
 impl<'p> Vm<'p> {
+    /// Dispatch a resolved plain getter/setter from compiled code: when the
+    /// accessor already has a compiled Tier-C/int body and requires no lexical
+    /// or primitive-boxing `this` adjustment, execute it frame-free via
+    /// `call_compiled_windowed` (avoiding `setup_call` + `Frame` push/pop);
+    /// otherwise fall back to `jit_frame_call`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn jit_accessor_call(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        recv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        ip: usize,
+        callee_v: Value,
+    ) -> u64 {
+        if self.jit.fn_state(fid) == crate::codegen::FN_COMPILED {
+            let proto = self.func(fid as usize);
+            if !proto.lexical_this
+                && !proto.is_async
+                && !proto.is_generator
+                && (self.is_object_value(recv) || proto.is_strict)
+            {
+                self.jit_call_depth += 1;
+                let res = self.call_compiled_windowed(
+                    callee_v,
+                    recv,
+                    WinArgs::Regs {
+                        at: caller_base + arg_base as usize,
+                        argc,
+                    },
+                    fid,
+                    closure,
+                );
+                self.jit_call_depth -= 1;
+                if let Some(res) = res {
+                    return match res {
+                        Ok(v) => v.bits(),
+                        Err(t) => self.jit_thrown_to_sentinel(t),
+                    };
+                }
+            }
+        }
+        self.jit_frame_call(fid, closure, recv, caller_base, arg_base, argc, ip, callee_v)
+    }
+
     /// Frame-call a resolved plain user function FROM NATIVE REGION CODE and
     /// run it to completion: the shared tail of the region call helpers and the
     /// property-slow helpers (getters/setters). Returns the result bits,
@@ -206,7 +255,7 @@ impl<'p> Vm<'p> {
                         Some(_) => return 0, // served — the setter's return is discarded
                         None => {}           // not inlinable — fall through to frame call
                     }
-                    let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, setter);
+                    let r = self.jit_accessor_call(fid, closure, recv, base, val_reg, 1, ip, setter);
                     if r == CALL_THREW || r == SELF_CALL_DEOPT {
                         r
                     } else {
@@ -218,6 +267,50 @@ impl<'p> Vm<'p> {
         } else {
             let obj_reg = (packed2 & 0xFFFF) as u16;
             let recv = self.get(base, obj_reg);
+            // Megamorphic class-getter fast path: when `(recv_shape, key_id)`
+            // proves `recv` owns no key and `class_prop_memo[(class_id, key_id)]`
+            // holds a cached `Walked::ClassGetter`, dispatch directly without
+            // thrashing the 4-way IC or walking the class chain.
+            #[cfg(not(feature = "safe-sandbox"))]
+            if self.deferred_ns_nonempty == 0 && recv.is_heap() {
+                let mir = self.heap.hot_mirror_of(recv.heap_index());
+                if mir.shape != crate::shape::DICT
+                    && (mir.fid & 0x8000_0000) != 0
+                    && mir.fid != crate::heap::FID_MIRROR_NONE
+                {
+                    let key_id = self.prop_key_id(func_id, name);
+                    if crate::vm::helpers_misc::shape_prop_memo_is_class_miss(
+                        self, mir.shape, key_id,
+                    ) {
+                        if let Some(getter_bits) =
+                            crate::vm::helpers_misc::class_prop_memo_get_getter(
+                                self,
+                                mir.fid & 0x7FFF_FFFF,
+                                key_id,
+                            )
+                        {
+                            let getter = Value::from_bits(getter_bits);
+                            if let Some((fid, closure)) = self.ic_plain_fn(getter) {
+                                if self.func(fid as usize).lexical_this {
+                                    return SELF_CALL_DEOPT;
+                                }
+                                if let Some(bits) = self.accessor_fast_get(fid, recv) {
+                                    return bits;
+                                }
+                                if let Some(bits) = self.try_method_inline(fid, recv, base, 0, 0) {
+                                    return bits;
+                                }
+                                if let Some(v) = self.leaf_getter(fid, closure, recv) {
+                                    return v.bits();
+                                }
+                                return self.jit_accessor_call(
+                                    fid, closure, recv, base, 0, 0, ip, getter,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             match self.ic_get_prop(func_id, ip, recv, key) {
                 GetAct::Value(v) => v.bits(),
                 GetAct::Accessor {
@@ -255,7 +348,7 @@ impl<'p> Vm<'p> {
                     if let Some(v) = self.leaf_getter(fid, closure, recv) {
                         return v.bits();
                     }
-                    self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
+                    self.jit_accessor_call(fid, closure, recv, base, 0, 0, ip, getter)
                 }
                 GetAct::None => self.jit_get_prop_complete(func_id, recv, key),
             }
@@ -480,7 +573,7 @@ impl<'p> Vm<'p> {
                 Some(_) => return 0, // served — setter return discarded
                 None => {}
             }
-            let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, live);
+            let r = self.jit_accessor_call(fid, closure, recv, base, val_reg, 1, ip, live);
             if r == CALL_THREW || r == SELF_CALL_DEOPT {
                 r
             } else {
@@ -501,7 +594,7 @@ impl<'p> Vm<'p> {
             if let Some(v) = self.leaf_getter(fid, closure, recv) {
                 return v.bits();
             }
-            self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, live)
+            self.jit_accessor_call(fid, closure, recv, base, 0, 0, ip, live)
         }
     }
 

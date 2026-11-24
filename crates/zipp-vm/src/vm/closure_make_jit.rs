@@ -45,6 +45,7 @@ struct MakeSite {
 /// Validate the window pointer and the activation identity for `caller`.
 /// Read-only; every failure is safe to replay.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
 fn make_site_preflight(
     vm: &Vm<'_>,
     regs: *const u64,
@@ -111,6 +112,7 @@ impl Vm<'_> {
 /// Resolve the child proto's capture sources against the live window and
 /// activation closure. Read-only; `None` declines before any effect.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
 fn resolve_upvalues(
     vm: &mut Vm<'_>,
     regs: *const u64,
@@ -121,6 +123,14 @@ fn resolve_upvalues(
     let n = vm.func(child).upvalues.len();
     let mut cells = vm.heap.take_upval_buf(n);
     let sources = &vm.func(child).upvalues;
+    let parent_upvals: Option<&[u32]> = if site.closure != NO_CLOSURE {
+        match vm.heap.get(site.closure) {
+            HeapObj::Closure { upvalues, .. } => Some(upvalues.as_slice()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     for src in sources {
         let cell = match *src {
             UpvalSource::ParentLocal(reg) => {
@@ -139,15 +149,7 @@ fn resolve_upvalues(
                 }
                 v.heap_index()
             }
-            UpvalSource::ParentUpval(idx) => {
-                if site.closure == NO_CLOSURE {
-                    return None;
-                }
-                match vm.heap.get(site.closure) {
-                    HeapObj::Closure { upvalues, .. } => *upvalues.get(idx as usize)?,
-                    _ => return None,
-                }
-            }
+            UpvalSource::ParentUpval(idx) => *parent_upvals?.get(idx as usize)?,
         };
         cells.push(cell);
     }
@@ -158,6 +160,7 @@ fn resolve_upvalues(
 /// the cell register, `this_reg`) is re-read from immutable bytecode rather
 /// than trusted as generated side metadata.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
 fn site_instr(vm: &Vm<'_>, packed_fip: u64) -> Option<(usize, Instr)> {
     let caller = (packed_fip >> 32) as u32 as usize;
     let ip = packed_fip as u32 as usize;
@@ -165,7 +168,7 @@ fn site_instr(vm: &Vm<'_>, packed_fip: u64) -> Option<(usize, Instr)> {
     if caller >= func_count {
         return None;
     }
-    Some((caller, vm.func(caller).code.get(ip)?.clone()))
+    Some((caller, *vm.func(caller).code.get(ip)?))
 }
 
 /// `MakeCell { reg }` / `MakeCellTdz { reg }` / `MakeCellFnName { reg }` /

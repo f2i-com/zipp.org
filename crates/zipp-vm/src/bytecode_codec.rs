@@ -14,7 +14,7 @@ use crate::bytecode::*;
 use crate::value::Value;
 
 /// Bumped when this file's layout changes.
-pub(crate) const FORMAT: u32 = 6;
+pub(crate) const FORMAT: u32 = 7;
 
 pub(crate) struct Writer {
     pub(crate) out: Vec<u8>,

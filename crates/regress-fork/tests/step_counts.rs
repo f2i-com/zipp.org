@@ -26,7 +26,7 @@ const CASES: &[(&str, &str, &str, Mode, u64, u64, usize)] = &[
     (r"needle", "", "hay hay needle hay needle", Mode::Ascii, 4, 4, 2),
     (r"[a-z]+\d", "", "abc1 de2 fgh", Mode::Ascii, 20, 20, 2),
     (r"(\d{1,3})\.(\d{1,3})", "", "ip 10.0.0.1 and 192.168.1.1", Mode::Ascii, 61, 61, 4),
-    (r"\b(\w+)\s+\1\b", "", "the cat cat sat on on the mat", Mode::Ascii, 171, 171, 2),
+    (r"\b(\w+)\s+\1\b", "", "the cat cat sat on on the mat", Mode::Ascii, 141, 141, 2),
     (r"<b>(.*?)</b>", "", "x <b>bold</b> y <b>more</b> z", Mode::Ascii, 49, 49, 2),
     (r"<(\w+)>.*?</\1>", "", "<i>a</i> <em>b</em>", Mode::Ascii, 39, 39, 2),
     (r"(?:foo|bar|baz)+qux", "", "foobarbazqux barqux fooqu", Mode::Ascii, 73, 70, 2),

@@ -416,6 +416,46 @@ impl<'p> Vm<'p> {
                     upvalues.as_ptr() as u64
                 },
             ),
+            HeapObj::Native(crate::vm::native::STR_FROM_CODE_POINT)
+                if !SAME_PROTO_ARROW2 && argc == 1 =>
+            {
+                #[cfg(feature = "instrument")]
+                if self.jit.metered() {
+                    return SELF_CALL_DEOPT;
+                }
+                let a0 = Value::from_bits(unsafe { *args });
+                if a0.is_int() {
+                    let i = a0.as_int();
+                    if (0..128).contains(&i) {
+                        return Value::heap(i as u32).bits();
+                    }
+                    if (128..=0x10FFFF).contains(&i) {
+                        let mut out = Vec::with_capacity(4);
+                        crate::heap::wtf8_push_cp(&mut out, i as u32);
+                        return Value::heap(
+                            self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)),
+                        )
+                        .bits();
+                    }
+                }
+                return SELF_CALL_DEOPT;
+            }
+            HeapObj::Native(crate::vm::native::STR_FROM_CHAR_CODE)
+                if !SAME_PROTO_ARROW2 && argc == 1 =>
+            {
+                #[cfg(feature = "instrument")]
+                if self.jit.metered() {
+                    return SELF_CALL_DEOPT;
+                }
+                let a0 = Value::from_bits(unsafe { *args });
+                if a0.is_int() {
+                    let u = (a0.as_int() as u32) & 0xFFFF;
+                    if u < 128 {
+                        return Value::heap(u).bits();
+                    }
+                }
+                return SELF_CALL_DEOPT;
+            }
             _ => {
                 crate::vm::helpers_misc::crossstats::decline(
                     crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND,
@@ -478,7 +518,9 @@ impl<'p> Vm<'p> {
         // direct global routes can be invalidated by `delete` / defineProperty
         // on globalThis (Tier C never records a self-binding, so that check is
         // structurally unnecessary — asserted at install).
-        if self.global_route_epoch != 0 {
+        if self.global_route_epoch != 0
+            && !self.jit.cross_route_ok(fid, self.global_route_epoch)
+        {
             if !self.jit_globals_still_routable(fid) {
                 crate::vm::helpers_misc::crossstats::decline(
                     crate::vm::helpers_misc::crossstats::DECL_ROUTABLE,
@@ -1103,7 +1145,49 @@ impl<'p> Vm<'p> {
         }
         let func_id = (packed_fip >> 32) as u32;
         let ip = packed_fip as u32 as usize;
-        let Some((recv_shape, class, ver, epoch, getter)) = self.ic_class_getter_guards(func_id, ip, recv)
+        // Megamorphic class-getter fallback before the 4-way IC: handles
+        // polymorphic DOM node hierarchies without deopting past 4 shapes.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let memo_hit: Option<(u32, u32, u32, u32, Value)> = if self.deferred_ns_nonempty == 0 {
+            let mir = self.heap.hot_mirror_of(recv.heap_index());
+            if mir.shape != crate::shape::DICT
+                && (mir.fid & 0x8000_0000) != 0
+                && mir.fid != crate::heap::FID_MIRROR_NONE
+            {
+                if let Some(Instr::GetProp { name, .. }) =
+                    self.func(func_id as usize).code.get(ip).copied()
+                {
+                    let key_id = self.prop_key_id(func_id, name);
+                    let class = mir.fid & 0x7FFF_FFFF;
+                    if crate::vm::helpers_misc::shape_prop_memo_is_class_miss(
+                        self, mir.shape, key_id,
+                    ) {
+                        crate::vm::helpers_misc::class_prop_memo_get_getter(self, class, key_id)
+                            .map(|bits| {
+                                (
+                                    mir.shape,
+                                    class,
+                                    self.heap.version_of(class),
+                                    self.class_proto_epoch,
+                                    Value::from_bits(bits),
+                                )
+                            })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let memo_hit: Option<(u32, u32, u32, u32, Value)> = None;
+        let Some((recv_shape, class, ver, epoch, getter)) =
+            memo_hit.or_else(|| self.ic_class_getter_guards(func_id, ip, recv))
         else {
             return SELF_CALL_DEOPT;
         };
@@ -1587,11 +1671,30 @@ impl<'p> Vm<'p> {
         let regs_base = self.regs.as_ptr() as *const u64;
         // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
         let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let callee = self.get(base, callee);
+        let this_v = self.get(base, this_v);
+        if argc == 1 && self.static_fn_is_intrinsic(op, callee, this_v) {
+            use crate::bytecode::StaticFn as S;
+            let a0 = self.get(base, arg_base);
+            match op {
+                S::StringFromCodePoint => {
+                    return match self.string_from_code_point_1(a0) {
+                        Ok(v) => v.bits(),
+                        Err(t) => self.jit_thrown_to_sentinel(t),
+                    };
+                }
+                S::StringFromCharCode => {
+                    return match self.string_from_char_codes_val(&[a0]) {
+                        Ok(v) => v.bits(),
+                        Err(t) => self.jit_thrown_to_sentinel(t),
+                    };
+                }
+                _ => {}
+            }
+        }
         // Most of these allocate: the safe point precedes the operand reads
         // (the window's Values are roots).
         self.maybe_gc();
-        let callee = self.get(base, callee);
-        let this_v = self.get(base, this_v);
         let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
         self.jit_call_depth += 1;
         let r = if self.static_fn_is_intrinsic(op, callee, this_v) {
@@ -2153,11 +2256,19 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The implementation behind [`jit_cold_op_ic`]: `ObjectRest` (`op` 0,
-    /// `packed_args` = `src | exclude_start << 16 | exclude_count << 32`) and
-    /// `MathSpread` (1, `callee | this_v << 16 | args << 32 | MathFn << 48`),
-    /// the interpreter's arms over the compiled body's window. Every decline
-    /// precedes the first effect.
+    /// The implementation behind [`jit_cold_op_ic`]:
+    /// - `op = 0`: `ObjectRest`
+    /// - `op = 1`: `MathSpread`
+    /// - `op = 2`: `ArrayFrom`
+    /// - `op = 3`: `NewMap`
+    /// - `op = 4`: `NewSet`
+    /// - `op = 5`: `CallMethodSpread`
+    /// - `op = 6`: `CallWithThisSpread`
+    /// - `op = 7`: `NewSpread`
+    /// - `op = 8`: `DeleteIndex`
+    /// - `op = 9`: `JsonStringify`
+    /// - `op = 10`: `JsonParse`
+    /// Every decline precedes the first effect.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_cold_op_impl(&mut self, op: u32, caller_base_ptr: *const u64, packed_fip: u64, packed_args: u64) -> u64 {
         use crate::codegen::SELF_CALL_DEOPT;
@@ -2167,11 +2278,11 @@ impl<'p> Vm<'p> {
         }
         // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
         let base = unsafe { caller_base_ptr.offset_from(self.regs.as_ptr() as *const u64) } as usize;
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = (packed_fip as u32) as usize;
         let field = |k: u32| ((packed_args >> (16 * k)) & 0xFFFF) as u16;
-        let math = (op == 1).then(|| field(3) as u8);
-        if let Some(m) = math {
-            // The spread arguments are a compiler-made Array; anything else
-            // is malformed bytecode, which declines.
+        if op == 1 {
+            let m = field(3) as u8;
             let args = self.get(base, field(2));
             if (m as usize) >= crate::bytecode::MATH_FN_COUNT
                 || !args.is_heap()
@@ -2183,19 +2294,382 @@ impl<'p> Vm<'p> {
         // The window's Values are roots: the safe point may precede the reads.
         self.maybe_gc();
         self.jit_call_depth += 1;
-        let r = match math {
-            None => self.object_rest_value(
+        let r: Result<Value, Thrown> = match op {
+            0 => self.object_rest_value(
                 base,
-                (packed_fip >> 32) as u32,
+                func_id,
                 field(0),
                 u32::from(field(1)),
                 u32::from(field(2)),
             ),
-            Some(m) => {
+            1 => {
+                let m = field(3) as u8;
                 // SAFETY: `MathFn` is a fieldless `repr(u8)` enum of
-                // `MATH_FN_COUNT` variants, and `m` is below that.
+                // `MATH_FN_COUNT` variants, and `m` was checked above.
                 let f: crate::bytecode::MathFn = unsafe { core::mem::transmute(m) };
                 self.math_spread_value(base, f, field(0), field(1), field(2))
+            }
+            2 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ArrayFrom {
+                    src,
+                    mapfn,
+                    callee,
+                    this_v,
+                    argc,
+                    ..
+                }) => {
+                    let sv = self.get(base, src);
+                    let fnv = self.get(base, mapfn);
+                    let callee = self.get(base, callee);
+                    let this_v = self.get(base, this_v);
+                    if self.static_builtin_is_intrinsic(
+                        "Array",
+                        crate::vm::native::ARR_FROM,
+                        callee,
+                        this_v,
+                    ) {
+                        self.array_from(this_v, sv, fnv, Value::UNDEFINED)
+                    } else if argc == 1 {
+                        self.call_value(callee, this_v, &[sv])
+                    } else {
+                        self.call_value(callee, this_v, &[sv, fnv])
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            3 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::NewMap { src, .. }) => {
+                    let sv = src.map(|s| self.get(base, s));
+                    self.exec_new_map(sv)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            4 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::NewSet { src, .. }) => {
+                    let sv = src.map(|s| self.get(base, s));
+                    self.exec_new_set(sv)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            5 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::CallMethodSpread {
+                    obj, name, args, ..
+                }) => {
+                    let recv = self.get(base, obj);
+                    let args_v = self.get(base, args);
+                    if !args_v.is_heap()
+                        || !matches!(self.heap.get(args_v.heap_index()), HeapObj::Array(_))
+                    {
+                        self.jit_call_depth -= 1;
+                        return SELF_CALL_DEOPT;
+                    }
+                    let key: &'p str =
+                        &self.func(func_id as usize).string_constants[name as usize];
+                    let mut buf = [Value::UNDEFINED; 8];
+                    let small = match self.heap.get(args_v.heap_index()) {
+                        HeapObj::Array(items) if items.len() <= buf.len() => {
+                            for (slot, &v) in buf.iter_mut().zip(items.iter()) {
+                                *slot = if v.is_hole() { Value::UNDEFINED } else { v };
+                            }
+                            Some(items.len())
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = small {
+                        let slice = &buf[..n];
+                        match self.dispatch_builtin_method(recv, key, slice) {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => self
+                                .get_prop(recv, key)
+                                .and_then(|prop| self.call_value(prop, recv, slice)),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        match self.dispatch_builtin_method(recv, key, &arg_vec) {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => self
+                                .get_prop(recv, key)
+                                .and_then(|prop| self.call_value(prop, recv, &arg_vec)),
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            6 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::CallWithThisSpread {
+                    callee,
+                    this_v,
+                    args,
+                    ..
+                }) => {
+                    let callee_v = self.get(base, callee);
+                    let this_v = self.get(base, this_v);
+                    let args_v = self.get(base, args);
+                    if !args_v.is_heap()
+                        || !matches!(self.heap.get(args_v.heap_index()), HeapObj::Array(_))
+                    {
+                        self.jit_call_depth -= 1;
+                        return SELF_CALL_DEOPT;
+                    }
+                    let mut buf = [Value::UNDEFINED; 8];
+                    let small = match self.heap.get(args_v.heap_index()) {
+                        HeapObj::Array(items) if items.len() <= buf.len() => {
+                            for (slot, &v) in buf.iter_mut().zip(items.iter()) {
+                                *slot = if v.is_hole() { Value::UNDEFINED } else { v };
+                            }
+                            Some(items.len())
+                        }
+                        _ => None,
+                    };
+                    match small {
+                        Some(n) => self.call_value(callee_v, this_v, &buf[..n]),
+                        None => {
+                            let arg_vec = self.array_snapshot(args_v.heap_index());
+                            self.call_value(callee_v, this_v, &arg_vec)
+                        }
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            7 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::NewSpread { callee, args, .. }) => {
+                    let cv = self.get(base, callee);
+                    let args_v = self.get(base, args);
+                    if !args_v.is_heap()
+                        || !matches!(self.heap.get(args_v.heap_index()), HeapObj::Array(_))
+                    {
+                        self.jit_call_depth -= 1;
+                        return SELF_CALL_DEOPT;
+                    }
+                    let mut buf = [Value::UNDEFINED; 8];
+                    let small = match self.heap.get(args_v.heap_index()) {
+                        HeapObj::Array(items) if items.len() <= buf.len() => {
+                            for (slot, &v) in buf.iter_mut().zip(items.iter()) {
+                                *slot = if v.is_hole() { Value::UNDEFINED } else { v };
+                            }
+                            Some(items.len())
+                        }
+                        _ => None,
+                    };
+                    match small {
+                        Some(n) => self.construct(cv, &buf[..n]),
+                        None => {
+                            let arg_vec = self.array_snapshot(args_v.heap_index());
+                            self.construct(cv, &arg_vec)
+                        }
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            8 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::DeleteIndex {
+                    obj, key, strict, ..
+                }) => {
+                    let o = self.get(base, obj);
+                    let k = self.get(base, key);
+                    self.to_property_key(k).and_then(|ks| {
+                        self.require_object_coercible(o)?;
+                        let r = self.delete_property(o, &ks)?;
+                        if strict && r == Value::bool(false) {
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot delete property '{ks}'"
+                            )));
+                        }
+                        Ok(r)
+                    })
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            9 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::JsonStringify {
+                    val,
+                    space,
+                    callee,
+                    this_v,
+                    ..
+                }) => {
+                    let v = self.get(base, val);
+                    let space_v = self.get(base, space);
+                    let callee = self.get(base, callee);
+                    let this_v = self.get(base, this_v);
+                    self.exec_json_stringify(v, space_v, callee, this_v)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            10 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::JsonParse {
+                    a, callee, this_v, ..
+                }) => {
+                    let arg = self.get(base, a);
+                    let callee = self.get(base, callee);
+                    let this_v = self.get(base, this_v);
+                    self.exec_json_parse(arg, callee, this_v)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            11 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtorFetch { home_class_id, .. }) => {
+                    Ok(self.super_ctor_fetch(home_class_id))
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            12 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtor {
+                    ctor,
+                    home_class_id,
+                    arg_base,
+                    argc,
+                }) => self
+                    .super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)
+                    .map(|()| self.get(base, 0)),
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            13 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtorSpread {
+                    ctor,
+                    home_class_id,
+                    args,
+                }) => self
+                    .super_ctor_spread_call(base, ip, ctor, home_class_id, args)
+                    .map(|()| self.get(base, 0)),
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            14 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ToPropKey { obj, src, .. }) => {
+                    let o = self.get(base, obj);
+                    if o.is_nullish() {
+                        Err(Thrown(format!(
+                            "TypeError: cannot read property of {}",
+                            self.display(o)
+                        )))
+                    } else {
+                        let k = self.get(base, src);
+                        self.coerce_index_key(k)
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            15 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::InitDataPropDyn { obj, key, val }) => {
+                    let o = self.get(base, obj);
+                    let k = self.get(base, key);
+                    let v = self.get(base, val);
+                    let ks = self.key_of(k);
+                    if o.is_heap() {
+                        let oi = o.heap_index();
+                        if matches!(self.heap.get(oi), HeapObj::Object(_)) {
+                            self.heap.write_barrier_val(oi, v);
+                            let HeapObj::Object(m) = self.heap.get_mut(oi) else {
+                                unreachable!("object kind changed across write barrier")
+                            };
+                            m.define(&ks, v, crate::heap::PropAttr::data());
+                            self.heap.bump_version(oi);
+                            Ok(o)
+                        } else {
+                            self.set_prop(o, &ks, v, false).map(|_| o)
+                        }
+                    } else {
+                        Ok(o)
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            16 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ArrayRest { src, start, .. }) => {
+                    let sv = self.get(base, src);
+                    self.destructure_rest(sv).map(|mut elems| {
+                        let start = (start as usize).min(elems.len());
+                        let rest = elems.split_off(start);
+                        Value::heap(self.heap.alloc(HeapObj::Array(rest)))
+                    })
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            17 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ToConcatKey { src, .. }) => {
+                    let v = self.get(base, src);
+                    if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
+                        Ok(v)
+                    } else {
+                        self.to_primitive_default(v).and_then(|p| {
+                            if p.is_heap()
+                                && matches!(self.heap.get(p.heap_index()), HeapObj::Symbol { .. })
+                            {
+                                Err(Thrown::from_static(
+                                    "TypeError: Cannot convert a Symbol value to a string",
+                                ))
+                            } else {
+                                Ok(p)
+                            }
+                        })
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            18 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::GetIndexConcat { obj, name, key, .. }) => {
+                    let o = self.get(base, obj);
+                    let k = self.get(base, key);
+                    self.get_index_concat(o, name, k, func_id)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            _ => {
+                self.jit_call_depth -= 1;
+                return SELF_CALL_DEOPT;
             }
         };
         self.jit_call_depth -= 1;
@@ -3537,7 +4011,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) if !m.is_ctor => m,
             _ => return None,
         };
-        let s = m.pos(field)?;
+        let s = self.own_pos(m, field)?;
         // OWN, DATA (non-accessor) slot only — a nested accessor / inherited
         // field would need real semantics; defer those to the frame call.
         if m.attr_at(s).accessor {
@@ -3596,22 +4070,27 @@ impl<'p> Vm<'p> {
         } else {
             val
         };
+        // Verify the field is an own writable data slot via the cached own_pos
+        // lookup before taking the mutable borrow for the in-place write.
+        let slot = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor && !m.class_proto => {
+                let s = self.own_pos(m, field)?;
+                if m.attr_at(s).accessor || !m.attr_at(s).writable {
+                    return None;
+                }
+                s
+            }
+            _ => return None,
+        };
         // Nursery barrier: the off-frame trivial-setter store bypasses every
         // barriered helper (this is the single Rust chokepoint for it — the
         // method-inline evaluator's `mi_super_set` commits through here too).
         self.heap.write_barrier_val(idx, stored);
-        // Re-borrow mutably and verify the field is an own writable data slot.
-        match self.heap.get_mut(idx) {
-            // (A class prototype's writes must reach `set_prop`.)
-            HeapObj::Object(m) if !m.is_ctor && !m.class_proto => {
-                let s = m.pos(field)?;
-                if m.attr_at(s).accessor || !m.attr_at(s).writable {
-                    return None;
-                }
-                m.set_val_at(s, stored); // in-place data store — shape unchanged
-                Some(0)
-            }
-            _ => None,
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.set_val_at(slot, stored); // in-place data store — shape unchanged
+            Some(0)
+        } else {
+            None
         }
     }
 

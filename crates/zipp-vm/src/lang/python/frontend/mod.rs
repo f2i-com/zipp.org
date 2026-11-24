@@ -534,12 +534,24 @@ pub(in crate::lang) fn compile_project<S: AsRef<str>>(
     // A fixed seed program. Its root initializes the private runtime and then
     // calls __zipp_py_entry. Replace only that empty function's prototype;
     // retain all seed globals and function IDs. Never relocate JS bytecode.
+    // Only bundle the 251 KiB torch tensor runtime when the program or its
+    // resolved imports actually reference `torch` or `_zipp_tensor` (avoids
+    // ~35% of runtime compile/decode/init overhead on non-torch scripts).
+    #[cfg(not(feature = "python-no-torch"))]
+    let with_torch = lazy
+        .iter()
+        .any(|(n, _)| *n == "torch" || n.starts_with("torch."))
+        || parsed.iter().any(|(_, _, src, _, _, _)| {
+            src.contains("torch") || src.contains("_zipp_tensor")
+        });
+    #[cfg(feature = "python-no-torch")]
+    let with_torch = false;
     let RuntimeSeed {
         program,
         entry_fn,
         rt_slot,
         line_slot,
-    } = runtime_seed()?;
+    } = runtime_seed(with_torch)?;
     let name_global = program.functions[entry_fn].name_global;
     let project = Project {
         modules: names,
@@ -1070,7 +1082,7 @@ static SEED_MEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 /// See [`super::prewarm_python`].
 pub(in crate::lang) fn prewarm() -> R<()> {
-    runtime_seed().map(drop)
+    runtime_seed(false).map(drop)
 }
 
 /// See [`super::set_python_runtime_cache`].
@@ -1098,32 +1110,40 @@ pub(in crate::lang) fn set_runtime_memo(enabled: bool) {
 /// The runtime also holds the torch package's runtime (built in) and each
 /// installed package's, so the memo is keyed by the installed packages'
 /// generation too.
-fn runtime_seed() -> R<RuntimeSeed> {
+fn runtime_seed(with_torch: bool) -> R<RuntimeSeed> {
     use std::sync::Mutex;
-    type Seeds = Vec<(bool, u64, Result<RuntimeSeed, String>)>;
+    type Seeds = Vec<(bool, bool, u64, Result<RuntimeSeed, String>)>;
     static SEEDS: Mutex<Seeds> = Mutex::new(Vec::new());
     let goal = crate::front::pure_script_goal();
     let (generation, packages) = crate::python_packages::installed();
     if !SEED_MEMO.load(std::sync::atomic::Ordering::Relaxed) {
-        return compile_runtime_seed(&packages);
+        return compile_runtime_seed(&packages, with_torch);
     }
     let mut seeds = SEEDS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, _, seed)) = seeds.iter().find(|(g, gen, _)| *g == goal && *gen == generation) {
+    if let Some((_, _, _, seed)) = seeds
+        .iter()
+        .find(|(g, t, gen, _)| *g == goal && *t == with_torch && *gen == generation)
+    {
         return seed.clone();
     }
-    let seed = compile_runtime_seed(&packages);
-    seeds.retain(|(g, _, _)| *g != goal);
-    seeds.push((goal, generation, seed.clone()));
+    let seed = compile_runtime_seed(&packages, with_torch);
+    seeds.retain(|(g, t, _, _)| !(*g == goal && *t == with_torch));
+    seeds.push((goal, with_torch, generation, seed.clone()));
     seed
 }
 
-fn compile_runtime_seed(packages: &[&crate::python_packages::Installed]) -> R<RuntimeSeed> {
+fn compile_runtime_seed(
+    packages: &[&crate::python_packages::Installed],
+    with_torch: bool,
+) -> R<RuntimeSeed> {
     let mut runtime = String::from(RUNTIME_BASE);
     #[cfg(not(feature = "python-no-torch"))]
-    {
+    if with_torch {
         runtime.push('\n');
         runtime.push_str(TORCH_RUNTIME);
     }
+    #[cfg(feature = "python-no-torch")]
+    let _ = with_torch;
     for package in packages {
         for chunk in &package.runtime {
             runtime.push('\n');

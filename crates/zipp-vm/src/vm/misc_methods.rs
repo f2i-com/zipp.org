@@ -311,8 +311,7 @@ impl<'p> Vm<'p> {
         let capturing = !ups.is_empty();
         let upvals_raw = if capturing { ups.as_ptr() as u64 } else { 0 };
         if capturing
-            && (self.jit.cross_entry(fid).is_none()
-                || !self.closure_eval_scope.is_empty()
+            && (!self.closure_eval_scope.is_empty()
                 || !self.obj_realm.is_empty()
                 || !self.realm_global_objs.is_empty())
         {
@@ -418,15 +417,18 @@ impl<'p> Vm<'p> {
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
             let class_read = self.build_class_read_plan(fid);
-            if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+            if !self.jit.metered() {
+                let direct_on = crate::codegen::direct_ic_miss_enabled();
                 for (ip, instr) in proto_ref.code.iter().enumerate() {
                     let is_set = match instr {
                         Instr::GetProp { .. } => false,
                         Instr::SetProp { .. } => true,
                         _ => continue,
                     };
-                    if self.ic_site_is_rotating_own(fid, ip, is_set) {
+                    if direct_on && self.ic_site_is_rotating_own(fid, ip, is_set) {
                         self.jit.preseed_direct_miss_site(fid, ip as u32);
+                    } else if self.ic_site_has_accessor(fid, ip) {
+                        self.jit.preseed_acc_site(fid, ip as u32);
                     }
                 }
             }
@@ -458,6 +460,19 @@ impl<'p> Vm<'p> {
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
             return None;
         }
+        // A capturing closure needs a Tier-C cross entry (int-tier does not
+        // load upvalues). Checked after compilation so hot capturing HOF
+        // callbacks compile on first use instead of staying interpreted.
+        if capturing && self.jit.cross_entry(fid).is_none() {
+            return None;
+        }
+        let upvals_raw = if capturing {
+            self.heap
+                .as_callable(cb.heap_index())
+                .map_or(0, |(_, u)| u.as_ptr() as u64)
+        } else {
+            upvals_raw
+        };
         // With no frame under it, the int-tier body (see above).
         let body = if frameless {
             self.jit.int_body(fid)?

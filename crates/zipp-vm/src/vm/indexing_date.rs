@@ -216,14 +216,18 @@ impl<'p> Vm<'p> {
                 return Some(s);
             }
         }
-        let HeapObj::Str(js) = self.heap.get(kidx) else {
-            return None;
+        let kb: &[u8] = match self.heap.get(kidx) {
+            HeapObj::Str(js) => {
+                let b = js.as_bytes();
+                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+                if b.starts_with(b"@@") {
+                    return None;
+                }
+                b
+            }
+            HeapObj::Symbol { prop_key, .. } => prop_key.as_bytes(),
+            _ => return None,
         };
-        let kb = js.as_bytes();
-        // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
-        if kb.starts_with(b"@@") {
-            return None;
-        }
         if !m.key_get(s).is_some_and(|k| crate::heap::key_bytes_eq(k.as_bytes(), kb)) {
             return None;
         }
@@ -400,6 +404,7 @@ impl<'p> Vm<'p> {
                 let already = self.heap.is_atom(kidx) || js.frozen();
                 (!already, true)
             }
+            HeapObj::Symbol { .. } if !is_accessor => (false, true),
             _ => (false, false),
         };
         if should_freeze {
@@ -462,22 +467,30 @@ impl<'p> Vm<'p> {
             _ => return,
         };
         let (need_freeze, absent_flag, guard_word) = {
-            let HeapObj::Str(js) = self.heap.get(kidx) else {
-                return;
+            let (key_str, need_freeze): (&str, bool) = match self.heap.get(kidx) {
+                HeapObj::Str(js) => {
+                    let kb = js.as_bytes();
+                    if kb.starts_with(b"@@")
+                        || kb == b"__proto__"
+                        || !kb
+                            .first()
+                            .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
+                    {
+                        return;
+                    }
+                    let Ok(s) = std::str::from_utf8(kb) else {
+                        return;
+                    };
+                    (s, !(self.heap.is_atom(kidx) || js.frozen()))
+                }
+                HeapObj::Symbol { prop_key, .. } => {
+                    if prop_key == "@@iterator" {
+                        return;
+                    }
+                    (prop_key.as_str(), false)
+                }
+                _ => return,
             };
-            let kb = js.as_bytes();
-            if kb.starts_with(b"@@")
-                || kb == b"__proto__"
-                || !kb
-                    .first()
-                    .is_some_and(|b| !(b.is_ascii_digit() || *b == b'-' || *b == b'#'))
-            {
-                return;
-            }
-            let Ok(key_str) = std::str::from_utf8(kb) else {
-                return;
-            };
-            let need_freeze = !(self.heap.is_atom(kidx) || js.frozen());
             let (absent_flag, guard_word) = match self.proto_of.get_copied(oidx) {
                 Some(p) if !p.is_heap() => (KSM_ABSENT_NULL_PROTO, 0u32),
                 Some(_) => return,
