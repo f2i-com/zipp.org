@@ -16,12 +16,32 @@ const blob = (path: string) => `${GITHUB_URL}/blob/main/${path}`
 const PERFORMANCE_URL = blob('docs/PERFORMANCE.md')
 const ROADMAP_URL = blob('docs/PERF_ROADMAP.md')
 
-type Mode = 'jit' | 'interp' | 'python' | 'release'
+type Mode = 'jit' | 'interp' | 'python' | 'v040' | 'release'
 type Suite = 'normal' | 'hostile'
 type Die = 'large' | 'small'
 type Filter = 'all' | 'headline' | 'diagnostic'
 type PyGroup = 'all' | 'micro' | 'macro'
+type V040View = 'apps' | 'suites'
 type Interval = number[] | null | undefined
+
+// Verified v0.0.40 real-world application and extra-suite measurements from docs/releases/0.0.40.md
+// (Windows x86-64, non-PGO fat-LTO v0.0.40 vs published PGO v0.0.39, Node.js v24.19.0 & CPython 3.13;
+// byte-identical output across all runs).
+const V040_APP_ROWS = [
+  { id: 'linkedom', name: 'linkedom', detail: 'DOM parsing & querySelectorAll', ref: 'Node.js v24.19.0', refWarm: '1.31 ms', refWall: '336–337 ms', v039: '9.56 ms', v040Warm: '6.14–6.21 ms', v040Wall: '467–473 ms', speedup: '1.55× faster', vsRef: '4.69–4.74× warm · 1.38–1.41× wall' },
+  { id: 'defuddle', name: 'defuddle', detail: 'Article extraction over HTML DOM', ref: 'Node.js v24.19.0', refWarm: '26.05–26.73 ms', refWall: '597–604 ms', v039: '160.32 ms', v040Warm: '139.76–146.77 ms', v040Wall: '1595–1650 ms', speedup: '1.09–1.15× faster', vsRef: '5.36–5.49× warm · 2.64–2.76× wall' },
+  { id: 'webforai', name: 'webforai', detail: 'DOM-to-Markdown scoring pipeline', ref: 'Node.js v24.19.0', refWarm: '17.57–18.30 ms', refWall: '521–522 ms', v039: '107.57 ms', v040Warm: '102.18–107.16 ms', v040Wall: '1277–1351 ms', speedup: '1.00–1.05× faster', vsRef: '5.58–6.10× warm · 2.45–2.59× wall' },
+  { id: 'html2text', name: 'html2text', detail: 'Unmodified Python HTML → Markdown', ref: 'CPython 3.13', refWarm: '5.60–5.67 ms', refWall: '198–206 ms', v039: '41.15 ms', v040Warm: '14.31–15.39 ms', v040Wall: '282–289 ms', speedup: '2.67–2.88× faster', vsRef: '2.55–2.72× warm · 1.37–1.46× wall' },
+  { id: 'bs4_css', name: 'bs4_css', detail: 'BeautifulSoup4 + SoupSieve selectors', ref: 'CPython 3.13', refWarm: '5.74–5.89 ms', refWall: '282–300 ms', v039: '65.73 ms', v040Warm: '36.12–38.44 ms', v040Wall: '482–502 ms', speedup: '1.71–1.82× faster', vsRef: '6.13–6.70× warm · 1.68–1.71× wall' },
+  { id: 'markdownify', name: 'markdownify', detail: 'BeautifulSoup4 HTML → Markdown', ref: 'CPython 3.13', refWarm: '7.87–8.10 ms', refWall: '227–239 ms', v039: '104.80 ms', v040Warm: '54.03–56.54 ms', v040Wall: '645–671 ms', speedup: '1.85–1.94× faster', vsRef: '6.67–7.19× warm · 2.81–2.84× wall' },
+] as const
+
+const V040_SUITE_ROWS = [
+  { id: 'py-bench', name: 'Python tools/python_bench.py', detail: '44 programs vs CPython 3.13 (36 comparable)', prev: '0.79× geomean', curr: '0.62× geomean (~1.27× faster)', note: 'micro 0.60×, macro 0.75×, 26/36 wins over CPython; try_raise_catch 2.4× → 0.29×, instance_new 2.6× → 1.37×, sort_heapq 2.3× → 1.27×.' },
+  { id: 'js-regex', name: 'JS bench/regex', detail: '16 regex patterns vs Node.js v24.19.0', prev: '2.44× geomean', curr: '1.90× geomean (~1.28× faster)', note: 'literal-utf16 4.0× → 0.82× (now beating Node), lookbehind 1.41× faster.' },
+  { id: 'js-hostile', name: 'JS bench/hostile (4 slowest)', detail: 'Stress tests vs Node.js v24.19.0', prev: '4 lagged Node', curr: '3 of 4 now beat Node', note: 'reactish-reconcile 1.21× → 0.97×, shapes-megamorphic 1.04× → 0.85×, calls-closures 1.12× → 0.93×, allocation-survival 1.35× → 1.24×.' },
+  { id: 'php-rust', name: 'PHP & Rust runtime O(N²) fixes', detail: 'array_pop, cursor loops, VecDeque/BTreeMap', prev: 'O(N²) / O(N² log N)', curr: 'O(1) / O(N) (8.6×–180× faster)', note: 'PHP array_pop ~65× faster (614 → 9.5 ms), PHP cursor loop ~180× faster (2266 → 12.5 ms), Rust collections 8.6× faster (481 → 56 ms).' },
+] as const
 
 const jit = data.jit
 const interp = data.interp
@@ -128,6 +148,11 @@ function RatioCell({ ratio, label, versus }: { ratio: number; label: string; ver
 }
 
 const READING: Record<Mode, { title: string; copy: string }[]> = {
+  v040: [
+    { title: 'Latest v0.0.40 measurements', copy: 'Captured on native Windows x86-64 comparing a non-PGO fat-LTO v0.0.40 build against published PGO v0.0.39, Node.js v24.19.0, Bun, Deno, and CPython 3.13. Release PGO binaries widen these gains further.' },
+    { title: 'Official suites & real-world apps', copy: 'ZIPP v0.0.40 wins 29/30 canonical JS rows vs Node (0.583× geomean, 11.1 ms startup), jumps to 0.626× CPython across Python benchmarks (26/36 wins), and speeds up real-world Python and DOM apps 1.55×–2.88× over v0.0.39.' },
+    { title: 'Honest warm-app comparisons', copy: 'Steady-state warm DOM & Python HTML apps still trail V8 TurboFan and CPython’s C-extension parsers on warm loops — both the v0.0.39 → v0.0.40 gains and the remaining warm/wall gaps against Node.js and CPython are shown side by side.' },
+  ],
   jit: [
     { title: 'JIT against JIT', copy: 'Every engine runs as it ships: ZIPP with its native x86-64 JIT, Node and Deno with V8, Bun with JavaScriptCore. The ratio is ZIPP’s time divided by Node’s, so 0.72× means ZIPP needed 72% of Node’s time; above 1× is a gap still owed.' },
     { title: 'Cold time, exact output', copy: `Each row is a fresh process, ${jit.reps} counterbalanced repetitions per engine, and it only counts when all four print byte-identical output. Launch is included: ZIPP starts in ${jit.startupMs.zipp.toFixed(1)} ms against Node’s ${jit.startupMs.node.toFixed(1)} ms.` },
@@ -152,6 +177,7 @@ const READING: Record<Mode, { title: string; copy: string }[]> = {
 
 export function BenchmarkSection() {
   const [mode, setMode] = useState<Mode>('jit')
+  const [v040View, setV040View] = useState<V040View>('apps')
   const [suite, setSuite] = useState<Suite>('normal')
   const [filter, setFilter] = useState<Filter>('all')
   const [pyGroup, setPyGroup] = useState<PyGroup>('all')
@@ -190,7 +216,12 @@ export function BenchmarkSection() {
         </div>
       </div>
 
-      {mode === 'release' ? (
+      {mode === 'v040' ? (
+        <p className="benchmark-capture-note">
+          Measured November 2026 on native Windows x86-64 · ZIPP 0.0.40 (non-PGO fat-LTO) vs published PGO ZIPP 0.0.39 · Node.js v24.19.0 · Bun · Deno · CPython 3.13 · byte-identical output across all runs. From{' '}
+          <a href={blob('docs/releases/0.0.40.md')} target="_blank" rel="noreferrer">docs/releases/0.0.40.md</a>. Native CLI results, not the browser build.
+        </p>
+      ) : mode === 'release' ? (
         <p className="benchmark-capture-note">
           Measured {longDate(rel.measuredAt)} on native Windows x86-64 · the published ZIPP {rel.version} and {rel.previous} Windows binaries, as published
           {' '}· Bellard’s QuickJS {rel.quickjs}. A release comparison from the {rel.version} notes, not a stamped capture. Native CLI results, not the browser build.
@@ -208,8 +239,40 @@ export function BenchmarkSection() {
         className="mode-tabs"
         value={mode}
         onChange={setMode}
-        options={[['jit', 'JIT vs JIT'], ['interp', 'Interpreter vs interpreter'], ['python', 'Python vs CPython'], ['release', `${rel.version} release`]] as const}
+        options={[['jit', 'JIT vs JIT'], ['interp', 'Interpreter vs interpreter'], ['python', 'Python vs CPython'], ['v040', 'Real-world apps'], ['release', `${rel.version} bundles`]] as const}
       />
+
+      {mode === 'v040' && (
+        <div className="benchmark-summary">
+          <article className="headline-result">
+            <div>
+              <span>v0.0.40 · unmodified real-world apps</span>
+              <strong>1.55–2.88×</strong>
+              <p>faster than v0.0.39 across DOM &amp; Python HTML extraction · byte-identical output</p>
+            </div>
+            <div className="confidence-pill">linkedom · defuddle · webforai · html2text · bs4_css · markdownify</div>
+          </article>
+          <article className="ratio-card">
+            <span>v0.0.40 vs v0.0.39 (real-world apps)</span>
+            <RatioRows rows={[
+              { label: 'html2text', value: 0.36 },
+              { label: 'markdownify', value: 0.53 },
+              { label: 'bs4_css', value: 0.57 },
+              { label: 'linkedom', value: 0.65 },
+            ]} />
+            <small>Lower is faster: html2text 2.67–2.88×, markdownify 1.85–1.94×, bs4_css 1.71–1.82×, linkedom 1.55× faster than v0.0.39.</small>
+          </article>
+          <article className="ratio-card suite-card">
+            <span>Extra suites in v0.0.40</span>
+            <RatioRows rows={[
+              { label: 'Python / CPython', value: pyWorkJit.all },
+              { label: 'JS bench/regex', value: 1.90 },
+              { label: 'All 30 JIT / Node', value: jit.all30.node },
+            ]} />
+            <small>JS regex cut from 2.44× to 1.90× Node (literal-utf16 4.0× → 0.82×); PHP &amp; Rust O(N²) paths sped up 8.6×–180×.</small>
+          </article>
+        </div>
+      )}
 
       {mode === 'jit' && (
         <div className="benchmark-summary">
@@ -337,15 +400,20 @@ export function BenchmarkSection() {
         <div className="scoreboard-toolbar">
           <div>
             <p>
+              {mode === 'v040' && v040View === 'apps' && <>ZIPP v0.0.40 · real-world JS &amp; Python apps · warm median &amp; 8-run wall clock</>}
+              {mode === 'v040' && v040View === 'suites' && <>ZIPP v0.0.40 · Python, Regex, Hostile &amp; PHP/Rust runtime gains</>}
               {mode === 'jit' && <>{suite === 'normal' ? 'Normal 13' : 'Hostile 17'} · JIT vs JIT · cold wall time</>}
               {mode === 'interp' && <>{suite === 'normal' ? 'Normal 13' : 'Hostile 17'} · interpreter vs interpreter · cold wall time</>}
               {mode === 'python' && <>Python programs · in-process work time</>}
               {mode === 'release' && <>Bundled apps · {rel.version} against {rel.previous} and QuickJS · {rel.dies[die]} die, cold</>}
-              <span>milliseconds · lower is better</span>
+              <span>{mode === 'v040' && v040View === 'suites' ? 'v0.0.39 → v0.0.40 summary' : 'milliseconds · lower is better'}</span>
             </p>
           </div>
           <div className="scoreboard-controls">
-            {mode === 'release' ? (
+            {mode === 'v040' ? (
+              <Tabs label="Choose v0.0.40 benchmark view" value={v040View} onChange={setV040View}
+                options={[['apps', 'Real-World Apps (6)'], ['suites', 'Regex, PHP & Rust']] as const} />
+            ) : mode === 'release' ? (
               <Tabs label="Choose a die" value={die} onChange={setDie}
                 options={[['large', `${rel.dies.large} die`], ['small', `${rel.dies.small} die`]] as const} />
             ) : mode !== 'python' ? (
@@ -363,6 +431,57 @@ export function BenchmarkSection() {
         </div>
 
         <div className="benchmark-table-wrap">
+          {mode === 'v040' && v040View === 'apps' && (
+            <table className="benchmark-table">
+              <caption>Real-world JS and Python applications: v0.0.40 vs v0.0.39, Node.js v24.19.0 and CPython 3.13</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Application</th>
+                  <th scope="col">Reference</th>
+                  <th scope="col">ZIPP 0.0.39</th>
+                  <th scope="col" className="zipp-column">ZIPP <span>0.0.40 warm / wall(8×)</span></th>
+                  <th scope="col">vs 0.0.39</th>
+                  <th scope="col">vs Reference</th>
+                </tr>
+              </thead>
+              <tbody>
+                {V040_APP_ROWS.map((row) => (
+                  <tr key={row.id}>
+                    <th scope="row"><span>{row.name}</span><small>{row.detail}</small></th>
+                    <td data-label="Reference"><strong>{row.ref}</strong><br /><small>{row.refWarm} · {row.refWall}</small></td>
+                    <td data-label="ZIPP 0.0.39">{row.v039}</td>
+                    <td className="zipp-time" data-label="ZIPP 0.0.40"><strong>{row.v040Warm}</strong><br /><small>wall: {row.v040Wall}</small></td>
+                    <td className="lead-cell" data-label="vs 0.0.39"><strong className="ratio-win">{row.speedup}</strong></td>
+                    <td data-label="vs Reference"><small>{row.vsRef}</small></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {mode === 'v040' && v040View === 'suites' && (
+            <table className="benchmark-table">
+              <caption>ZIPP v0.0.40 performance across Python, Regex, Hostile JS, and PHP/Rust suites</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Suite</th>
+                  <th scope="col">v0.0.39 (PGO)</th>
+                  <th scope="col" className="zipp-column">ZIPP <span>0.0.40</span></th>
+                  <th scope="col">Measured highlights</th>
+                </tr>
+              </thead>
+              <tbody>
+                {V040_SUITE_ROWS.map((row) => (
+                  <tr key={row.id}>
+                    <th scope="row"><span>{row.name}</span><small>{row.detail}</small></th>
+                    <td data-label="v0.0.39">{row.prev}</td>
+                    <td className="zipp-time" data-label="ZIPP 0.0.40"><strong>{row.curr}</strong></td>
+                    <td data-label="Highlights">{row.note}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
           {mode === 'jit' && (
             <table className="benchmark-table">
               <caption>JIT against JIT: cold wall-time medians for ZIPP, Node, Bun and Deno</caption>
@@ -488,6 +607,22 @@ export function BenchmarkSection() {
       <div className="methodology-note">
         <span className="methodology-mark">i</span>
         <div>
+          {mode === 'v040' && (
+            <>
+              <p>
+                Measured on Windows x86-64 with byte-identical output against Node.js v24.19.0 and CPython 3.13,
+                comparing a local non-PGO fat-LTO <code>v0.0.40</code> build against the published PGO <code>v0.0.39</code> binary.
+                Startup in <code>tools/bench.py</code>: ZIPP 10.2 ms vs Node.js 34.3 ms, Bun 52.7 ms, Deno 87.6 ms.
+                Also includes readable JS function labels in Linux <code>ZIPP_PERF_MAP=1</code> output contributed by{' '}
+                <a href="https://github.com/codeandsolder" target="_blank" rel="noreferrer">@codeandsolder</a> (PR #110).
+              </p>
+              <p className="gap-list">
+                <strong>Where gaps remain:</strong> warm steady-state DOM extraction (<code>linkedom</code>, <code>defuddle</code>, <code>webforai</code>)
+                still trails V8 TurboFan by 4.7–6.1× warm (1.4–2.8× 8-run wall), and warm BeautifulSoup/<code>html2text</code> loops trail CPython’s C-extension parsers by 2.6–7.2× warm (1.4–2.8× wall).
+                Use the Canonical JIT tab for the 15-rep provenance-stamped PGO capture.
+              </p>
+            </>
+          )}
           {mode === 'jit' && (
             <>
               <p>
@@ -512,7 +647,7 @@ export function BenchmarkSection() {
           {mode === 'interp' && (
             <>
               <p>
-                The same PGO build with <code>ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1</code> (no native code; the captures before 22 October left its regex JIT on), Bellard’s QuickJS 2026-06-04, QuickJS-NG 0.17.0, Node{' '}
+                The same PGO build with <code>ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1</code> (no native code; the captures before 22 October left its regex JIT on), Bellard’s QuickJS {interp.normal.engines.quickjs}, QuickJS-NG {interp.normal.engines['quickjs-ng']}, Node{' '}
                 <code>--jitless</code>, Deno <code>--v8-flags=--jitless</code> and Bun with <code>BUN_JSC_useJIT=0</code>. Identical staged sources for every
                 engine, every output checked against Node’s, {interp.normal.reps} counterbalanced repetitions, cold medians including launch.
                 Over all 30 rows ZIPP’s interpreter measures {interp.all30['node-jitless'] ? x(interp.all30['node-jitless'].value) : '—'} Node’s
@@ -553,6 +688,7 @@ export function BenchmarkSection() {
           )}
         </div>
         <div className="methodology-links">
+          {mode === 'v040' && <Link href={blob('docs/releases/0.0.40.md')}>v0.0.40 release notes</Link>}
           {mode === 'jit' && <><Link href={blob(jit.artifacts.normal)}>Normal capture</Link><Link href={blob(jit.artifacts.hostile)}>Hostile capture</Link><Link href={blob(release.artifacts.release)}>Release build</Link></>}
           {mode === 'interp' && <><Link href={blob(interp.artifacts.normal)}>Normal capture</Link><Link href={blob(interp.artifacts.hostile)}>Hostile capture</Link></>}
           {mode === 'python' && <><Link href={blob(python.artifacts.jit)}>With JIT</Link><Link href={blob(python.artifacts.interp)}>Without JIT</Link></>}

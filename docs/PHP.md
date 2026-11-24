@@ -43,7 +43,7 @@ ZIPP lowers PHP hot paths directly onto ZIPP's existing register VM and native x
 
 - **Selective native JIT (`set_php_program` + `fast_int.rs`):** ZIPP keeps the PHP runtime and generic `BigInt` bodies on the zero-overhead interpreter (avoiding startup JIT churn on large frameworks) while compiling guarded JS-`Number` companion functions and pure-int OOP methods (`__php_fi_*`) natively through Tier-A (`±(2^30 - 1024)` self-recursion) and Tier-C (`±(2^52 - 1024)` loops, non-escaping local arrays with hoisted `Map.set`/`Map.get` captured method lanes + single-probe `map_set_fast`, ASCII string concat/`strlen`, and non-escaping local OOP objects). Any overflow or non-fast edge case transparently falls back to exact 64-bit `BigInt` PHP with 100% parity.
 - **Persistent disk bytecode cache & lazy builtins (`code_cache.rs`):** CLI invocations share ZIPP's `code_cache` (`ZIPP_CACHE_DIR` / platform cache dir) to cache the compiled PHP runtime seed and a single-file per-entry OPcache pack (`ZPO2`) validated per included `.php` file via single-syscall `(mtime_nanos, file_len)` metadata checks with lazy blob decode and zero-clone in-place relocation. Reflection, SPL, DateTime, and Intl builtin classes are materialized lazily on first access.
-- **Fast OOP & arrays:** `Object.create(null)` instance properties (`obj.fp`) with inline bytecode `$this->prop` fast paths, monomorphic inline call sites for public direct methods, Rust-native `__zipp_php_map_kv` `foreach` snapshots, inline `BigInt` arithmetic/comparisons, and direct bytecode intrinsics (`is_int`, `is_string`, `is_bool`, `is_float`, `is_null`, `is_array`, `strlen`, `count`).
+- **Fast OOP & arrays:** `Object.create(null)` instance properties (`obj.fp`) with inline bytecode `$this->prop` fast paths, monomorphic inline call sites for public direct methods, Rust-native `__zipp_php_map_kv` `foreach` snapshots, inline `BigInt` arithmetic/comparisons, direct bytecode intrinsics (`is_int`, `is_string`, `is_bool`, `is_float`, `is_null`, `is_array`, `strlen`, `count`), and (from v0.0.40) O(1) `array_pop` stacks (~65× faster, `614 ms → 9.5 ms`) and cached array cursor iteration (~180× faster, `2266 ms → 12.5 ms`).
 
 On Windows x86-64 (`--release`, vs local native PHP 8.4.15, 100% byte-for-byte parity):
 - **Compute, array & OOP microbench (`bench.php`, median of 5):** **3.0 ms** total vs PHP 8.4.15 **53.4 ms** (**17.8× faster** overall):
@@ -63,7 +63,7 @@ On Windows x86-64 (`--release`, vs local native PHP 8.4.15, 100% byte-for-byte p
 
 ## Feature Flag & Sandbox Isolation
 
-PHP support is behind the optional `php` Cargo feature on `zipp-vm`, `zipp-cli`, and `zipp-wasm` (excluded from `wasm-lite`). Under `safe-sandbox` and `wasm32`, native host filesystem and process environment access are compiled out and replaced by the caller-supplied virtual filesystem (`PhpProgramConfig::vfs`).
+PHP support is behind the optional `php` Cargo feature on `zipp-vm`, `zipp-cli`, and `zipp-wasm` (excluded from `wasm-lite`). Under `safe-sandbox` and `wasm32`, native host filesystem and process environment access are compiled out and replaced by the caller-supplied virtual filesystem (`PhpProgramConfig::vfs`) and host-owned SQL bridges (`addAppBridge("sql", ...)` for `PDO`/`mysqli`). Try live PHP 8.x examples in the [browser playground](https://www.zipp.org/playground/) or full-stack **FormLogic** PHP 8 + SQLite 3 apps running inside **SoftN** browser containers at [zipp.org/container-demo/](https://www.zipp.org/container-demo/).
 
 ## Validation
 

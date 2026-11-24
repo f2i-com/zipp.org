@@ -44,6 +44,43 @@ const UI_SHIM =
 
 const { Engine, zippProfile } = zipp;
 const ready = init().then(() => JSON.parse(zippProfile()));
+
+// Optional language engines (PHP 8.x and Rust) are loaded lazily on first run
+// so visitors who only run Python or JavaScript download nothing extra.
+const OPTIONAL_ENGINES = {
+  php: {
+    glue: "../dist/php/zipp_wasm.js",
+    wasm: "../dist/php/zipp_wasm_bg.wasm",
+  },
+  rust: {
+    glue: "../dist/rust/zipp_wasm.js",
+    wasm: "../dist/rust/zipp_wasm_bg.wasm",
+  },
+};
+const optionalModules = new Map();
+function loadOptionalEngine(lang) {
+  if (optionalModules.has(lang)) return optionalModules.get(lang);
+  const spec = OPTIONAL_ENGINES[lang];
+  if (!spec) return Promise.reject(new Error(`No WASM engine configured for ${lang}`));
+  const promise = (async () => {
+    const glueUrl = new URL(spec.glue, import.meta.url);
+    const wasmUrl = new URL(spec.wasm, import.meta.url);
+    const mod = await import(/* @vite-ignore */ glueUrl.href);
+    await mod.default({ module_or_path: wasmUrl });
+    return mod;
+  })();
+  optionalModules.set(lang, promise);
+  promise.catch(() => optionalModules.delete(lang));
+  return promise;
+}
+
+function splitOutputLines(text, stream) {
+  if (typeof text !== "string" || text.length === 0) return [];
+  const normalized = text.replace(/\r\n/g, "\n");
+  const trimmed = normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+  if (!trimmed) return [];
+  return trimmed.split("\n").map((line) => ({ stream, text: line }));
+}
 // Compile the Python runtime while the page is idle, so the first Python run
 // does not wait for it. An engine without `prewarmPython` (older releases)
 // compiles it on that first run instead.
@@ -197,7 +234,7 @@ function drainConsole() {
 function takeUi() {
   if (!live()) return [];
   if (language === "python") return engine.takeUi();
-  if (jsSlots.ui === undefined) return [];
+  if (!jsSlots || jsSlots.ui === undefined) return [];
   const commands = engine.getGlobalByIndex(jsSlots.ui);
   engine.setGlobalByIndex(jsSlots.ui, []);
   return Array.isArray(commands) ? commands : [];
@@ -212,35 +249,55 @@ function setInput(input) {
   else if (jsSlots.input !== undefined) engine.setGlobalByIndex(jsSlots.input, input);
 }
 
-function run(m) {
+async function run(m) {
   disposeEngine();
   selectGpuBackend(m.gpuBackend);
-  engine = new Engine();
-  engine.setInstructionBudget(m.budget);
   language = m.language;
   let prelude = 0;
-  if (language === "python") {
-    attachGpu();
-    engine.initPythonProject(m.files, m.entry, Array.isArray(m.argv) ? m.argv.map(String) : []);
-    hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, engine.pythonHas(name)]));
-    drainHost();
+  let extraConsole = [];
+  if (language === "php") {
+    const phpMod = await loadOptionalEngine("php");
+    engine = new phpMod.Engine();
+    engine.setInstructionBudget(m.budget);
+    engine.initPhpProject(m.files, m.entry, {});
+    hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, false]));
+    const out = typeof engine.takePhpOutput === "function" ? engine.takePhpOutput() : "";
+    extraConsole = splitOutputLines(out, "stdout");
+  } else if (language === "rust") {
+    const rsMod = await loadOptionalEngine("rust");
+    engine = new rsMod.Engine();
+    engine.setInstructionBudget(m.budget);
+    engine.initRustProject(m.files, m.entry, {});
+    hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, false]));
+    const out = typeof engine.takeRustOutput === "function" ? engine.takeRustOutput() : "";
+    const err = typeof engine.takeRustStderr === "function" ? engine.takeRustStderr() : "";
+    extraConsole = [...splitOutputLines(out, "stdout"), ...splitOutputLines(err, "stderr")];
   } else {
-    // Classic-script semantics: every file shares one global scope, in the
-    // order the page lists them (the entry last), like successive <script>
-    // tags. Compile-error line numbers count the preamble and the shim.
-    prelude = engine.preambleLines + 1;
-    const source = UI_SHIM + "\n" + m.order.map((name) => m.files[name]).join("\n");
-    const symbols = engine.initSource(source, "javascript");
-    const functions = new Set();
-    jsSlots = {};
-    for (const [name, info] of Object.entries(symbols)) {
-      if (info.scope === "function") functions.add(name);
-      if (name === "__ui") jsSlots.ui = info.index;
-      if (name === "__input") jsSlots.input = info.index;
+    engine = new Engine();
+    engine.setInstructionBudget(m.budget);
+    if (language === "python") {
+      attachGpu();
+      engine.initPythonProject(m.files, m.entry, Array.isArray(m.argv) ? m.argv.map(String) : []);
+      hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, engine.pythonHas(name)]));
+      drainHost();
+    } else {
+      // Classic-script semantics: every file shares one global scope, in the
+      // order the page lists them (the entry last), like successive <script>
+      // tags. Compile-error line numbers count the preamble and the shim.
+      prelude = engine.preambleLines + 1;
+      const source = UI_SHIM + "\n" + m.order.map((name) => m.files[name]).join("\n");
+      const symbols = engine.initSource(source, "javascript");
+      const functions = new Set();
+      jsSlots = {};
+      for (const [name, info] of Object.entries(symbols)) {
+        if (info.scope === "function") functions.add(name);
+        if (name === "__ui") jsSlots.ui = info.index;
+        if (name === "__input") jsSlots.input = info.index;
+      }
+      hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, functions.has(name)]));
     }
-    hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, functions.has(name)]));
   }
-  return { hooks, prelude, console: drainConsole(), ui: takeUi(), files: takeWrittenFiles() };
+  return { hooks, prelude, console: [...extraConsole, ...drainConsole()], ui: takeUi(), files: takeWrittenFiles() };
 }
 
 // What a program printed before its top level failed: the engine keeps it
@@ -300,7 +357,7 @@ self.onmessage = async (event) => {
         self.postMessage({ id: m.id, type: "hello", profile });
         break;
       case "run":
-        self.postMessage({ id: m.id, type: "ran", ...run(m) });
+        self.postMessage({ id: m.id, type: "ran", ...(await run(m)) });
         break;
       case "frame":
         self.postMessage({ id: m.id, type: "frame", ...frame(m) });
@@ -322,13 +379,23 @@ self.onmessage = async (event) => {
       kind = engine ? engine.lastErrorKind() : "usage";
       disposed = !live();
     } catch { /* engine gone */ }
+    let extraFailed = [];
+    try {
+      if (engine && language === "php" && typeof engine.takePhpOutput === "function") {
+        extraFailed = splitOutputLines(engine.takePhpOutput(), "stdout");
+      } else if (engine && language === "rust") {
+        const out = typeof engine.takeRustOutput === "function" ? engine.takeRustOutput() : "";
+        const err = typeof engine.takeRustStderr === "function" ? engine.takeRustStderr() : "";
+        extraFailed = [...splitOutputLines(out, "stdout"), ...splitOutputLines(err, "stderr")];
+      }
+    } catch { /* engine gone */ }
     self.postMessage({
       id: m.id,
       type: "error",
       error: String(error && error.message ? error.message : error),
       kind,
       disposed,
-      console: drainConsole(),
+      console: [...extraFailed, ...drainConsole()],
       ui: disposed ? [] : takeUi(),
       files: disposed ? [] : takeWrittenFiles(),
     });

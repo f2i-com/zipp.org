@@ -31,7 +31,7 @@ test('content.json passes validation and every page has unique SEO metadata', ()
 })
 
 // Interactive pages served from public/ rather than rendered from content.json.
-const publicPages = ['/playground/', '/sandbox/playground/']
+const publicPages = ['/playground/', '/sandbox/playground/', '/container-demo/']
 
 test('internal links resolve to a route or a known public file', () => {
   const known = new Set([...routes, '/', ...publicPages, '/journal/feed.xml', '/journal/index.json', '/sitemap.xml', '/robots.txt', '/zipp-bolt.svg', '/zipp-og-card.png'])

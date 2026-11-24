@@ -26,6 +26,24 @@ interpreter with native regex matching, not an interpreter emitting no native
 code. They stay as recorded; `tools/test_run_native.py` checks each lane's
 child environment.
 
+## Interpreter versus interpreter, 2026-11-24
+
+The **0.0.40** engine's canonical PGO binary (`0cd3eab8`, the release tag) ran in
+the strict `zipp-interp` lane (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, no native code)
+over both suites, 8 counterbalanced repetitions each:
+
+- [`interp_real13_0cd3eab8_2026-11-24.json`](interp_real13_0cd3eab8_2026-11-24.json):
+  the 13 normal rows. Zipp's interpreter is **0.376×** Bellard's QuickJS [0.374, 0.389] (13 / 13 point wins), **0.319×** QuickJS-NG 0.18.0 [0.313, 0.330] (13 / 13), **0.542×** Bun no-JIT, **0.771×** Deno jitless, **0.779×** Node jitless.
+- [`interp_hostile17_0cd3eab8_2026-11-24.json`](interp_hostile17_0cd3eab8_2026-11-24.json):
+  the 17 hostile rows. **0.476×** Bellard's QuickJS [0.473, 0.484] (17 / 17 point wins), **0.339×** QuickJS-NG 0.18.0 [0.337, 0.347] (17 / 17), **0.470×** Bun no-JIT, **0.573×** Deno jitless, **0.655×** Node jitless.
+
+Over all 30 rows that is **0.430×** Bellard's QuickJS (30 / 30) and **0.330×** QuickJS-NG (30 / 30), down from 0.574× and 0.326× in v0.0.31 ([`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#interpreter-versus-interpreter)).
+
+The same directory holds the v0.0.40 release-build check
+([`release_real13_0cd3eab8_2026-11-24.json`](release_real13_0cd3eab8_2026-11-24.json): **0.533× Node**, headline ten **0.716×**)
+and the A/B against the canonical PGO build
+([`pgo_ab_real13_0cd3eab8_0cd3eab8_2026-11-24.json`](pgo_ab_real13_0cd3eab8_0cd3eab8_2026-11-24.json): **0.997×**).
+
 ## Interpreter versus interpreter, 2026-10-29
 
 The 0.0.31 engine's canonical PGO binary (`fcfb1934`, the release tag) ran in

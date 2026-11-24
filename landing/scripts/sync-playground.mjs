@@ -22,9 +22,9 @@ for (const name of ['index.html', 'playground.css', 'playground.js', 'engine.wor
   let text = await readFile(path.join(root, 'crates/zipp-wasm/playground', name), 'utf8')
   if (name === 'engine.worker.js') text = text.replace('../dist/all/zipp_wasm.js', '../playground-runtime/zipp_wasm.js')
   if (name === 'index.html') {
-    text = text.replace('<title>Zipp Playground</title>', '<title>Zipp Playground · Python, JavaScript &amp; GPU</title>')
+    text = text.replace('<title>Zipp Playground</title>', '<title>Zipp Playground · Python, PHP, Rust, JavaScript &amp; GPU</title>')
       .replace('<strong>Zipp playground</strong>', '<a href="/" target="_top" class="playground-home">Zipp playground ↗</a>')
-      .replace('Open a folder of .py or .js files (top level only)', 'Load a local project folder, including subfolders and data; files stay in your browser')
+      .replace('Open a folder of .py, .php, .rs or .js files (top level only)', 'Load a local project folder, including subfolders and data; files stay in your browser')
       .replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\' \'wasm-unsafe-eval\' https://static.cloudflareinsights.com; style-src \'self\'; img-src \'self\' data:; worker-src \'self\'; connect-src \'self\' https://cloudflareinsights.com; object-src \'none\'; base-uri \'none\'">\n</head>')
   }
   if (name === 'playground.css') text += '\n.playground-home{font-weight:700;color:inherit;text-decoration:none}\n'
@@ -72,10 +72,20 @@ if (stale.length) {
 }
 // Move glue and WASM URLs together when either half changes, including CDN caches.
 const build = hash(names.map(name => manifest.files[name]).join(':')).slice(0, 16)
+const phpGluePath = path.join(output, 'container-demo/runtime/engines/zipp-php.glue.js')
+const phpWasmPath = path.join(output, 'container-demo/runtime/engines/zipp-php.wasm')
+const rustGluePath = path.join(output, 'playground-runtime/rust/zipp_wasm.js')
+const rustWasmPath = path.join(output, 'playground-runtime/rust/zipp_wasm_bg.wasm')
+const phpBuild = hash(`${hash(await readFile(phpGluePath))}:${hash(await readFile(phpWasmPath))}`).slice(0, 16)
+const rustBuild = hash(`${hash(await readFile(rustGluePath))}:${hash(await readFile(rustWasmPath))}`).slice(0, 16)
 const workerPath = path.join(output, 'playground/engine.worker.js')
 const worker = (await readFile(workerPath, 'utf8'))
   .replace('../playground-runtime/zipp_wasm.js', `../playground-runtime/zipp_wasm.js?v=${build}`)
   .replace('const ready = init()', `const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=${build}", import.meta.url) })`)
+  .replace('../dist/php/zipp_wasm.js', `../container-demo/runtime/engines/zipp-php.glue.js?v=${phpBuild}`)
+  .replace('../dist/php/zipp_wasm_bg.wasm', `../container-demo/runtime/engines/zipp-php.wasm?v=${phpBuild}`)
+  .replace('../dist/rust/zipp_wasm.js', `../playground-runtime/rust/zipp_wasm.js?v=${rustBuild}`)
+  .replace('../dist/rust/zipp_wasm_bg.wasm', `../playground-runtime/rust/zipp_wasm_bg.wasm?v=${rustBuild}`)
 await writeFile(workerPath, worker)
 // The page, its script and its worker keep their names from one release to
 // the next, so a cache holding an old copy of one would load it beside new

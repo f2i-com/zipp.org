@@ -8,7 +8,7 @@
 // The release named here is the one the embed section links to; package.json's
 // zippEngineRelease must match it (tests/embed.test.mjs).
 
-export const EMBED_RELEASE = '0.0.37'
+export const EMBED_RELEASE = '0.0.40'
 export const REPOSITORY_URL = 'https://github.com/f2i-com/zipp.org'
 export const RELEASE_TAG_URL = `${REPOSITORY_URL}/releases/tag/v${EMBED_RELEASE}`
 export const releaseAssetUrl = (name) => `${REPOSITORY_URL}/releases/download/v${EMBED_RELEASE}/${name}`
@@ -17,7 +17,7 @@ export const releaseAssetUrl = (name) => `${REPOSITORY_URL}/releases/download/v$
 export const KIT = {
   file: `zipp-${EMBED_RELEASE}-wasm-embed-kit.zip`,
   folder: `zipp-${EMBED_RELEASE}-wasm-embed-kit`,
-  bytes: 220_134,
+  bytes: 220_131,
   loader: 'zipp.mjs',
 }
 
@@ -27,15 +27,15 @@ export const STARTER = {
   path: `/embed/zipp-starter-${EMBED_RELEASE}.zip`,
 }
 
-// Release asset sizes in bytes, from the v0.0.37 release: each plain module and
+// Release asset sizes in bytes, from the v0.0.40 release: each plain module and
 // its Brotli-compressed `.wasm.br` copy.
 const asset = (variant, bytes, brBytes) => ({ file: `zipp-${EMBED_RELEASE}-${variant}.wasm`, bytes, brBytes })
 
-export const PYTHON_BASE = asset('javascript-python-base', 6_905_076, 1_702_286)
-export const TORCH_PACKAGE = asset('torch-package', 2_163_109, 403_538)
-export const TYPESCRIPT_ENGINE = asset('javascript-typescript', 5_250_935, 1_338_703)
-export const PHP_ENGINE = asset('javascript-php', 6_038_525, 1_480_745)
-export const RUST_ENGINE = asset('javascript-rust', 5_954_532, 1_466_783)
+export const PYTHON_BASE = asset('javascript-python-base', 7_599_903, 1_836_474)
+export const TORCH_PACKAGE = asset('torch-package', 2_163_109, 403_356)
+export const TYPESCRIPT_ENGINE = asset('javascript-typescript', 5_285_552, 1_347_702)
+export const PHP_ENGINE = asset('javascript-php', 6_076_074, 1_490_335)
+export const RUST_ENGINE = asset('javascript-rust', 5_994_592, 1_476_751)
 
 export const ENGINES = [
   {
@@ -43,21 +43,21 @@ export const ENGINES = [
     label: 'JavaScript',
     summary: 'The full JavaScript engine, with Intl and Temporal.',
     language: 'javascript',
-    ...asset('javascript', 4_913_223, 1_268_242),
+    ...asset('javascript', 4_947_842, 1_276_646),
   },
   {
     id: 'lite',
     label: 'JavaScript Lite',
     summary: 'JavaScript without Intl and Temporal, built for size.',
     language: 'javascript',
-    ...asset('javascript-lite', 2_878_928, 788_538),
+    ...asset('javascript-lite', 2_906_344, 797_433),
   },
   {
     id: 'javascript-python',
     label: 'JavaScript + Python',
     summary: 'Both languages, with torch built in.',
     language: 'python',
-    ...asset('javascript-python', 8_942_154, 2_078_280),
+    ...asset('javascript-python', 9_640_441, 2_214_700),
   },
 ]
 

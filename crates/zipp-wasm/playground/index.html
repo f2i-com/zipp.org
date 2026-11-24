@@ -11,27 +11,41 @@
   <div class="brand">
     <span class="bolt">⚡</span>
     <strong>Zipp playground</strong>
-    <span class="muted">Python &amp; JavaScript on the WASM engine</span>
+    <span class="muted">Python · PHP 8 · Rust · JS</span>
   </div>
   <div class="actions">
-    <label class="button" title="Open a folder of .py or .js files (top level only)">
+    <label class="button" title="Open a folder of .py, .php, .rs or .js files (top level only)">
       Open folder
       <input id="folder-input" type="file" webkitdirectory multiple hidden>
     </label>
     <label class="button" title="Open one or more source files">
       Open files
-      <input id="files-input" type="file" multiple accept=".py,.js,.mjs" hidden>
+      <input id="files-input" type="file" multiple accept=".py,.js,.mjs,.php,.rs" hidden>
     </label>
     <div class="menu">
       <button class="button" id="sample-button" type="button">Samples ▾</button>
       <div class="menu-items" id="sample-menu" hidden>
+        <div class="menu-group">Python 3.13</div>
         <button type="button" data-sample="python">Python: bouncing balls</button>
-        <button type="button" data-sample="javascript">JavaScript: bouncing balls</button>
         <button type="button" data-sample="ant">Python: Langton's ant (classes, dataclasses, enum)</button>
+        <button type="button" data-sample="py-html">Python: HTML to Markdown parser (html.parser)</button>
+        <button type="button" data-sample="py-async">Python: async task pipeline (asyncio)</button>
+        <button type="button" data-sample="py-fractal">Python: Mandelbrot fractal (Canvas UI)</button>
+        <button type="button" data-sample="py-analytics">Python: CSV sales analytics (VFS + JSON)</button>
         <button type="button" data-sample="training">Python: Torch ML training (GPU)</button>
         <button type="button" data-sample="torch">Python: Torch ML inference (GPU)</button>
         <button type="button" data-sample="gpu">Python: Game of Life (Torch on the GPU)</button>
         <button type="button" data-sample="python-hello">Python: hello, world</button>
+        <div class="menu-group">PHP 8.x</div>
+        <button type="button" data-sample="php-modern">PHP 8: enums, match, readonly &amp; multi-file</button>
+        <button type="button" data-sample="php-template">PHP 8: HTML/text invoice template</button>
+        <button type="button" data-sample="php-regex">PHP 8: PCRE word frequency analyzer</button>
+        <div class="menu-group">Rust</div>
+        <button type="button" data-sample="rust-enums">Rust: enums, pattern matching &amp; ledger</button>
+        <button type="button" data-sample="rust-multifile">Rust: multi-file mod + serde_json</button>
+        <button type="button" data-sample="rust-sieve">Rust: Iterator Fibonacci &amp; prime sieve</button>
+        <div class="menu-group">JavaScript</div>
+        <button type="button" data-sample="javascript">JavaScript: bouncing balls</button>
         <button type="button" data-sample="javascript-hello">JavaScript: hello, world</button>
       </div>
     </div>
@@ -67,12 +81,12 @@
     </div>
     <p class="hint">
       Drop a folder anywhere on the page: every file comes along, subfolders
-      included. The entry file (<code>main.py</code> / <code>main.js</code>, or
-      any file you set) runs first; Python modules import each other by name
-      and by package, and the program can <code>open()</code> the folder's
-      files (files it writes appear here). JavaScript files share one global
-      scope. Define <code>draw()</code> and <code>update()</code> to animate,
-      <code>on_click(x, y)</code> and <code>on_key(key)</code> for input.
+      included. The entry file (<code>main.py</code>, <code>index.php</code>,
+      <code>main.rs</code>, <code>main.js</code>, or any file you set) runs
+      first; Python modules import each other and <code>open()</code> folder
+      files, PHP supports <code>require_once</code>, and Rust resolves
+      <code>mod</code> siblings. Define <code>draw()</code> and
+      <code>update()</code> in Python or JS to animate on the canvas.
     </p>
   </aside>
 

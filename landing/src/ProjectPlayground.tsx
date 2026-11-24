@@ -55,28 +55,28 @@ export function ProjectPlayground() {
         want()
       }}>
       <div className="project-playground-heading">
-        <div><p className="section-kicker">YOUR FILES. YOUR PROGRAM.</p><h2 id="project-playground-title">Python or JavaScript.<br />Bring the whole folder.</h2></div>
-        <p>Load a local project, choose an entry file and run it on Zipp WASM.
+        <div><p className="section-kicker">YOUR FILES. FIVE LANGUAGES.</p><h2 id="project-playground-title">Python, PHP, Rust or JS.<br />Bring the whole folder.</h2></div>
+        <p>Load a local project or pick a built-in Python 3.13, PHP 8.x, Rust, or JavaScript sample and run it on ZIPP v0.0.40 WASM.
           Edit code, browse data, watch the canvas, and select WebGL2 or WebGPU
           for supported Torch inference, SGD training and Python compute graphs. Files stay in your browser.</p>
       </div>
       <div className="project-playground-links">
         <a className="button button-primary" href={PLAYGROUND_URL} target="_blank" rel="noreferrer">Open full playground ↗</a>
         <a href="https://github.com/f2i-com/zipp.org/blob/main/crates/zipp-wasm/playground/README.md" target="_blank" rel="noreferrer">Examples &amp; API guide ↗</a>
-        <span>Try Samples → Python: Game of Life → Run</span>
+        <span>Try Samples → Python, PHP 8, Rust, or GPU → Run</span>
       </div>
       {wanted ? (
-        <iframe ref={frameRef} className="project-playground-frame" src={PLAYGROUND_URL} title="Zipp folder playground: Python, JavaScript and browser GPU" />
+        <iframe ref={frameRef} className="project-playground-frame" src={PLAYGROUND_URL} title="Zipp folder playground: Python, PHP 8, Rust, JavaScript and browser GPU" />
       ) : (
         <div ref={holderRef} className="project-playground-frame project-playground-standby">
-          <p><strong>The playground loads when you get here.</strong> It runs the JavaScript + Python engine,
-            an 8.4 MB download (about 2 MB compressed), so it waits until you scroll to it, point at it or ask.</p>
+          <p><strong>The playground loads when you get here.</strong> It boots the JavaScript + Python v0.0.40 engine
+            (9.6 MB raw, 2.2 MB Brotli; PHP 8 and Rust engines load lazily only when you run a <code>.php</code> or <code>.rs</code> sample), so it waits until you scroll to it, point at it or ask.</p>
           <button type="button" className="button button-secondary" onClick={() => { setFocusFrame(true); want() }}>Load the playground here</button>
         </div>
       )}
-      <p className="project-playground-note">The Python-enabled engine runs inside a Worker with execution deadlines.
+      <p className="project-playground-note">Every language runs inside isolated ZIPP v0.0.40 WebAssembly Workers with execution deadlines.
         Browser GPU support depends on your hardware and browser; the console reports the actual backend.
-        Eager Torch supports CPU training. Experimental <code>torch.compile</code> supports GPU inference and dense training steps with SGD, momentum, Adam or AdamW; results arrive through a callback. Try Samples → Python: Torch ML training (GPU) to watch the loss fall.</p>
+        Eager Torch supports CPU training. Experimental <code>torch.compile</code> supports GPU inference and dense training steps with SGD, momentum, Adam or AdamW; results arrive through a callback. Try Samples → Python: Torch ML training (GPU), PHP 8: enums &amp; multi-file, or Rust: multi-file mod + serde_json.</p>
     </section>
   )
 }

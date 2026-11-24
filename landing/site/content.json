@@ -7,7 +7,7 @@
     "image": "/zipp-og-card.png",
     "imageAlt": "A luminous purple-to-cyan lightning mark moving across a dark field",
     "repo": "https://github.com/f2i-com/zipp.org",
-    "homeDateModified": "2026-11-21",
+    "homeDateModified": "2026-11-24",
     "organization": {
       "name": "f2i",
       "url": "https://f2i.com"
@@ -58,7 +58,7 @@
       }
     ],
     "footer": {
-      "text": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime written in Rust: one VM for JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 21 November 2026.",
+      "text": "ZIPP, the Zippy Interpreter for Polyglot Programming, is a portable polyglot runtime written in Rust: one VM for JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust, released under Apache-2.0 and built in the open by [f2i](https://f2i.com). Documentation last updated 24 November 2026.",
       "links": [
         {
           "label": "Home",
@@ -79,6 +79,10 @@
         {
           "label": "Sandbox playground",
           "href": "/sandbox/playground/"
+        },
+        {
+          "label": "Container demo",
+          "href": "/container-demo/"
         },
         {
           "label": "Comparisons",
@@ -157,7 +161,7 @@
         "ECMAScript Test262 engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "priority": "0.9",
       "sections": [
         {
@@ -184,19 +188,19 @@
                   "note": "One documented expected failure. Corpus pinned to tc39/test262 2e58f87d83."
                 },
                 {
-                  "value": "0.629×",
+                  "value": "0.583×",
                   "label": "Zipp/Node wall time, all 30 native benchmark rows",
-                  "note": "Geometric mean, 29 October 2026 capture. Lower is faster."
+                  "note": "Geometric mean, 24 November 2026 v0.0.40 capture (29/30 wins). Lower is faster."
                 },
                 {
-                  "value": "9.1 ms",
+                  "value": "11.1 ms",
                   "label": "Median native process launch",
-                  "note": "Node 32.3 ms, Bun 53.0 ms, Deno 84.9 ms on the same machine."
+                  "note": "Node 36.3 ms, Bun 55.6 ms, Deno 92.3 ms on the same machine."
                 },
                 {
-                  "value": "1.27 MB",
+                  "value": "1.28 MB",
                   "label": "WebAssembly engine on the wire (Brotli)",
-                  "note": "JavaScript-only engine file of v0.0.37, bindings included, 4.9 MB raw. ZIPP Lite: 0.79 MB."
+                  "note": "JavaScript-only engine file of v0.0.40, bindings included, 4.95 MB raw. ZIPP Lite: 0.80 MB."
                 }
               ]
             },
@@ -345,7 +349,7 @@
             },
             {
               "type": "p",
-              "text": "Since v0.0.26 each engine is one `.wasm` file that carries its own bindings. In v0.0.37 the JavaScript-only engine is 4,913,223 bytes raw and 1,268,242 bytes after Brotli, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, 2,878,928 and 788,538; `javascript-typescript` is 5,250,935 raw and 1,338,703 after Brotli; `javascript-php` is 6,038,525 raw and 1,480,745 after Brotli; `javascript-rust` is 5,954,532 raw and 1,466,783 after Brotli; `javascript-python` with torch built in is 8,942,154 bytes raw and 2,078,280 on the wire, and `javascript-python-base` without torch is 6,905,076 raw and 1,702,286 after Brotli (with the torch package 403,538 bytes after Brotli). The JavaScript-only engine is about three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the loader, composable `addAppBridge` plugins, the Worker-termination deadline model and the resource limits."
+              "text": "Since v0.0.26 each engine is one `.wasm` file that carries its own bindings. In v0.0.40 the JavaScript-only engine is 4,947,842 bytes raw and 1,276,646 bytes after Brotli, and ZIPP Lite, the JavaScript core without `Intl` and `Temporal` built for size, 2,906,344 and 797,433; `javascript-typescript` is 5,285,552 raw and 1,347,702 after Brotli; `javascript-php` is 6,076,074 raw and 1,490,335 after Brotli; `javascript-rust` is 5,994,592 raw and 1,476,751 after Brotli; `javascript-python` with torch built in is 9,640,441 bytes raw and 2,214,700 on the wire, and `javascript-python-base` without torch is 7,599,903 raw and 1,836,474 after Brotli (with the torch package 403,356 bytes after Brotli). The JavaScript-only engine is about three times the size of QuickJS-NG's WebAssembly reactor, a trade-off documented plainly on the [WebAssembly page](/wasm/), which also explains the loader, composable `addAppBridge` plugins, the Worker-termination deadline model and the resource limits."
             }
           ]
         },
@@ -370,7 +374,7 @@
               "items": [
                 {
                   "q": "Is Zipp production-ready?",
-                  "a": "It is a 0.0.x project, first committed on 29 May 2026; v0.0.37 shipped on 20 November 2026. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python, PHP and Rust frontends are actively tested against CPython, PHP 8.4 and Rust parity suites. Read the [release notes](/releases/) and decide per use case."
+                  "a": "It is a 0.0.x project, first committed on 29 May 2026; v0.0.40 shipped on 24 November 2026. The JavaScript engine is conformance-complete and benchmarked, the browser sandbox has been through two external correctness audits, and the Python, PHP and Rust frontends are actively tested against CPython, PHP 8.4 and Rust parity suites. Read the [release notes](/releases/) and decide per use case."
                 },
                 {
                   "q": "Does Zipp have a JIT?",
@@ -382,7 +386,7 @@
                 },
                 {
                   "q": "Can I run Node packages?",
-                  "a": "In the command line, from v0.0.31: `zipp app.js` runs a program the way `node` does, with `process`, `Buffer`, timers, CommonJS, npm packages resolved from `node_modules`, and the core modules most packages reach for (`path`, `events`, `util`, `fs`, `os`, `url`, `assert`, `buffer`, `crypto` hashes, `stream` and `readline`); [docs/NODE.md](https://github.com/f2i-com/zipp.org/blob/main/docs/NODE.md) lists what is and is not there, and `ZIPP_NO_NODE=1` gives the plain ECMAScript global object. The WebAssembly engines and the sandbox have none of Node's layer: hosts expose capabilities there explicitly, through host calls."
+                  "a": "In the command line, from v0.0.31 (and expanded in v0.0.38 with `import.meta.resolve` and `process.exitCode`): `zipp app.js` runs a program the way `node` does, with `process`, `Buffer`, timers, CommonJS, ESM `package.json` `exports`/`imports`, npm packages resolved from `node_modules`, and the core modules most packages reach for (`path`, `events`, `util`, `fs`, `os`, `url`, `assert`, `buffer`, `crypto` hashes, `stream` and `readline`); [docs/NODE.md](https://github.com/f2i-com/zipp.org/blob/main/docs/NODE.md) lists what is and is not there, and `ZIPP_NO_NODE=1` gives the plain ECMAScript global object. The WebAssembly engines and the sandbox have none of Node's layer: hosts expose capabilities there explicitly, through host calls."
                 },
                 {
                   "q": "What license is it under?",
@@ -420,7 +424,7 @@
     {
       "slug": "architecture",
       "title": "Zipp Architecture: Register VM, JIT Tiers and Nursery GC",
-      "description": "How Zipp executes JavaScript and Python: NaN-boxed values, an explicit-frame register VM, shapes and inline caches, x86-64 and ARM64 JIT tiers, and a nursery GC.",
+      "description": "How Zipp executes JavaScript, TypeScript, Python, PHP and Rust: NaN-boxed values, register VM, shapes and inline caches, x86-64/ARM64 JITs, and a nursery GC.",
       "h1": "Zipp engine architecture",
       "breadcrumb": "Architecture",
       "lede": "ZIPP is one register VM shared by every language it runs: JavaScript and Python compile to the same bytecode, values, objects and collector today, and a language plugs in by emitting its own instructions only where its semantics differ. It is designed so a JIT can keep unboxed values in machine registers across call boundaries, and so every optimization has an exact, cheap way back to the interpreter. This page walks the pipeline from source to native code and explains the decisions behind it.",
@@ -433,14 +437,14 @@
         "generational garbage collector Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-18",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "The pipeline",
           "blocks": [
             {
               "type": "p",
-              "text": "JavaScript or Python source → front end → register bytecode → interpreter → hot-loop OSR or whole-function JIT → x86-64 or ARM64 native code. The garbage collector, object shapes and inline caches sit beside every stage. On `wasm32`, and on native targets without a JIT, the same bytecode runs on the pure interpreter."
+              "text": "All five languages — JavaScript, TypeScript/TSX, Python 3.13, PHP 8.x and Rust — compile down to the same register bytecode (`crates/zipp-vm`) and share one NaN-boxed `Value` representation, one explicit frame stack, one non-moving generational nursery GC, and one metered host boundary. Each language has its own zero-unsafe Rust parser (`zipp-parse`, `zipp-pyparse`, `zipp-phpparse`, `zipp-rsparse`) and compiler folder, so frontends stay isolated while the execution engine, JIT tiers and WebAssembly sandbox stay shared."
             },
             {
               "type": "p",
@@ -606,6 +610,10 @@
               "caption": "JIT diagnostics",
               "lang": "shell",
               "code": "ZIPP_JITLOG=1 zipp js app.js        # log what compiled and why\nZIPP_JITDECLINE=1 zipp js app.js    # log what was declined\nZIPP_NOJIT=1 zipp js app.js         # interpreter only\nZIPP_JIT_THRESHOLD=1 zipp js app.js # compile everything immediately\nZIPP_PROF=1 zipp js app.js          # sampling profiler"
+            },
+            {
+              "type": "p",
+              "text": "On Linux, setting `ZIPP_PERF_MAP=1` emits `/tmp/perf-<pid>.map` ranges for JIT-compiled functions; from v0.0.40 (PR [#110](https://github.com/f2i-com/zipp.org/pull/110) by [@codeandsolder](https://github.com/codeandsolder)), labels include sanitized JavaScript function names (`fn{id}_{name}_{tier}`) with zero overhead when profiling is off."
             }
           ]
         },
@@ -647,6 +655,10 @@
             {
               "type": "p",
               "text": "The `instrument` feature adds a step budget, cooperative abort and per-instruction tracing for embedders running untrusted code. It costs a branch in the dispatch loop, so it is off by default, and enabling it on a VM turns the JIT off for that VM. The WebAssembly artifact uses `meter-only`: step, heap, output, dynamic-code and regex limits stay, the trace recorder is compiled out, and the host enforces wall-clock time by terminating the Worker. The [sandbox page](/sandbox/) lists every limit."
+            },
+            {
+              "type": "p",
+              "text": "In v0.0.40, `safe-sandbox` builds re-enabled pure-safe interpreter IC hit paths, metered superinstructions, safe `capture.rs` memoization, faster `to_js_bounded` JSON marshalling, and expanded regex caching — boosting WebAssembly throughput while preserving `#![forbid(unsafe_code)]` and the audited 51-function WASM host import surface."
             }
           ]
         }
@@ -685,7 +697,7 @@
         "Rust Python runtime"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "How Python reaches the VM",
@@ -721,7 +733,8 @@
                 "Every function signature form, closures with `nonlocal` and `global`, decorators, generators with `send`, `throw`, `close` and `yield from`, and Python 3.13 `async`/`await` coroutines with `asyncio`.",
                 "Classes with C3 multiple inheritance, `super()`, properties, descriptors, `__slots__`, metaclasses, `__init_subclass__`, `__set_name__` and PEP 695 type parameters (`def f[T](x: T)`, `class Box[T]`, `type Alias[T] = ...`).",
                 "The builtin exception hierarchy with `raise ... from`, chained `__cause__` and `__context__`, `ExceptionGroup` / `except*`, and CPython's traceback layout, traceback objects and the `traceback` module, with CPython's \"Did you mean\" suggestions.",
-                "Modules and packages by folder with CPython-like import cycles, full `match` pattern support, and `asyncio`, `fractions`, `numbers`, `dataclasses`, `enum`, `typing`, `itertools`, `functools`, `collections`, `json`, `re`, `struct`, `hashlib`, `pathlib`, `argparse` and more from the standard library."
+                "Modules and packages by folder with CPython-like import cycles, full `match` pattern support, and `asyncio`, `fractions`, `numbers`, `dataclasses`, `enum`, `typing`, `itertools`, `functools`, `collections`, `json`, `re`, `struct`, `hashlib`, `pathlib`, `argparse` and more from the standard library.",
+                "Real-world stdlib & CLI parity (v0.0.38–v0.0.39): 23 Apache-2.0 stdlib modules (`html.parser`, `html.entities`, `urllib.parse`/`request`/`error`, `datetime`, `tomllib`, `unittest`/`unittest.mock`, `logging`, `tempfile`, `base64`, `binascii`, `codecs`, `shlex`, `warnings`, `threading`, `importlib.util`, `zlib`, `shutil`, `zipfile` with `ZIP_DEFLATED`), universal newline translation, exact raw byte-for-byte CLI stdout/stderr streaming past 64 KiB (`sys.stdout.buffer`), and unmodified `html2text`, `markdownify`/`beautifulsoup4`, and pure-Python `PyYAML` matching CPython byte-for-byte."
               ]
             },
             {
@@ -741,11 +754,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "On the command line Zipp compiles hot Python loops to x86-64 code. Over the 36 programs of `tools/python_bench.py` (geometric mean of work time against CPython 3.13) it runs at about 1.09× CPython's time with that JIT in v0.0.24, its 30 small programs level with CPython, from about 22× when the September speed work began; fifteen programs, among them `range_loop`, `float_arith`, `int_arith`, `global_read`, `dict_get`, `list_index` and `json_roundtrip`, are faster than CPython. Every benchmark checksum still equals CPython's."
+              "text": "On the command line Zipp compiles hot Python loops and functions to x86-64 code. Over the 36 comparable programs of `tools/python_bench.py` (15-rep published v0.0.40 capture against CPython 3.13.14, byte-identical output), Zipp dropped from ~22× when the September speed work began, to `1.004×` in v0.0.31, and **`0.626×` CPython in v0.0.40** (`micro 0.601×`, `macro 0.767×`, winning **26 of 36** programs; whole-process wall time `0.456×`). Real-world pure-Python HTML/DOM apps also sped up by **1.71×–2.88×** in v0.0.40 (`html2text` `2.67×–2.88×`, `bs4_css` `1.71×–1.82×`, `markdownify` `1.85×–1.94×`), though steady-state warm loops on heavy pure-Python packages still trail CPython's C-backed modules — see the honest app comparison on the [benchmarks page](/benchmarks/#v0-0-40-highlights)."
             },
             {
               "type": "p",
-              "text": "What moved it: direct calls with fixed-arity entries and per-class inline caches; fused Python-only VM instructions for globals, attributes, subscripts, exceptions and generators; native `json`, string and sort helpers; a JIT tier for hot loops; integers within ±2^46 stored in the value word instead of as heap BigInts; dicts and sets in a native compact hash table modelled on CPython 3.13's; `PyCall`, a direct call instruction with per-site caches; hidden-class layouts for instances whose attribute reads and writes compiled loops inline; and in v0.0.37, frame-less acyclic leaf calls (`py_leaf`), a self-recursive x86-64 micro-JIT (`py_rec`), inline list/tuple/math JIT paths and fast generator stepping. Every fused instruction and compiled loop falls back to the interpreter's own step, so the results are always the interpreter's."
+              "text": "What moved it: direct calls with fixed-arity entries and per-class inline caches; fused Python-only VM instructions for globals, attributes, subscripts, exceptions, truthiness (`PyTruth`) and generators; native `json`, `re`, string and sort helpers; integers within ±2^46 stored unboxed in the value word; compact native hash tables (`PyTable`) modelled on CPython 3.13; hidden-class `PyAttrs` layouts widened to depth 128 in v0.0.40 (keeping stateful classes like `html2text.HTML2Text` out of dictionary spill); `OnceLock<StaticKeyPlan>` ready-object pools; O(1) `STR_HAS_SURROGATE` memoization; native `str`/`tuple` subclass hooks (`NavigableString`, `NamedTuple`); frame-less acyclic leaf calls (`py_leaf`); and a self-recursive x86-64 micro-JIT (`py_rec`). Every fused instruction and compiled loop falls back to the interpreter's own step whenever a type changes."
             },
             {
               "type": "p",
@@ -758,13 +771,13 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Two WebAssembly engines include the Python frontend. `zipp-<v>-javascript-python-base.wasm` leaves torch out (1,702,286 bytes after Brotli in v0.0.37, bindings included) and adds it at run time from the 403,538-byte torch package, `zipp-<v>-torch-package.wasm`, through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; the embed kit's `zipp.mjs` loads the pair in one step with `loadZipp({ engine, packages })`. `zipp-<v>-javascript-python.wasm` has torch built in (2,078,280 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
+              "text": "Two WebAssembly engines include the Python frontend. `zipp-<v>-javascript-python-base.wasm` leaves torch out (1,836,474 bytes after Brotli in v0.0.40, bindings included) and adds it at run time from the 403,356-byte torch package, `zipp-<v>-torch-package.wasm`, through `addPythonPackage`, which checks the package's format, engine ABI hash and the SHA-256 of every file first; the embed kit's `zipp.mjs` loads the pair in one step with `loadZipp({ engine, packages })`. `zipp-<v>-javascript-python.wasm` has torch built in (2,078,280 bytes after Brotli). A browser host calls `engine.initSource(source, \"python\")` for one file or `engine.initPythonProject(files, entry, argv)` for a folder, then drains output and host requests. `prewarmPython()` compiles the Python runtime ahead of use; the playground calls it when idle, so the first Python run takes about 20 ms instead of 220."
             },
             {
               "type": "code",
               "caption": "In a Web Worker",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.37-javascript-python.wasm')\nconst engine = new zipp.Engine()\nengine.initSource('print(sum(range(10)))', 'python')\nconsole.log(engine.takeOutput())   // 45\nengine.dispose()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.40-javascript-python.wasm')\nconst engine = new zipp.Engine()\nengine.initSource('print(sum(range(10)))', 'python')\nconsole.log(engine.takeOutput())   // 45\nengine.dispose()"
             },
             {
               "type": "p",
@@ -775,6 +788,10 @@
               "src": "/demos/python-wasm-flow.svg",
               "alt": "Diagram of Python source flowing through the Zipp WebAssembly engine to a browser GPU backend",
               "caption": "Python source → Zipp WASM → host requests → WebGPU or WebGL2."
+            },
+            {
+              "type": "p",
+              "text": "The interactive [browser playground](/playground/) runs ten Python 3.13 samples directly on `javascript-python` WASM, including Conway's Game of Life, a Mandelbrot Canvas fractal, `html.parser` HTML-to-Markdown conversion, `asyncio.gather` concurrency, CSV-to-JSON VFS analytics, and GPU-accelerated Torch neural network training."
             }
           ]
         },
@@ -864,7 +881,7 @@
         "Zipp PHP frontend"
       ],
       "datePublished": "2026-11-21",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "priority": "0.8",
       "sections": [
         {
@@ -969,6 +986,10 @@
                   "5.65 ms/req seq"
                 ]
               ]
+            },
+            {
+              "type": "p",
+              "text": "In v0.0.40, O(N²) array stack and internal cursor bottlenecks were replaced with O(1) operations, speeding up `array_pop` stacks by ~65× (`614 ms -> 9.5 ms`) and array cursor iteration loops by ~180× (`2266 ms -> 12.5 ms`)."
             }
           ]
         },
@@ -977,11 +998,15 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Published from v0.0.37 as `zipp-0.0.37-javascript-php.wasm` (6,038,525 bytes raw, 1,480,745 bytes after Brotli-11), the browser build compiles out native filesystem and process-environment access under `safe-sandbox` and replaces them with a caller-supplied virtual filesystem."
+              "text": "Published from v0.0.40 as `zipp-0.0.40-javascript-php.wasm` (6,076,074 bytes raw, 1,490,335 bytes after Brotli-11), the browser build compiles out native filesystem and process-environment access under `safe-sandbox` and replaces them with a caller-supplied virtual filesystem."
             },
             {
               "type": "p",
               "text": "Browser and Worker hosts drive PHP web applications through `PhpApp` (supporting both per-request SAPI dispatch and persistent Worker Mode) and attach external SQL databases such as XDB SQLite via composable `addAppBridge(\"sql\", bridge)`: `PDO` and `mysqli` route queries through host-owned `app.sql.*` capabilities while sharing the guest VM's instruction budget."
+            },
+            {
+              "type": "p",
+              "text": "Try live PHP 8.x samples (backed enums, `match`, `readonly class`, HTML templates, and PCRE regex) in the [playground](/playground/), or launch real full-stack **FormLogic** PHP 8 + SQLite 3 apps running inside isolated **SoftN** browser containers in the [container demo](/container-demo/)."
             }
           ]
         }
@@ -1020,7 +1045,7 @@
         "polyglot Rust VM"
       ],
       "datePublished": "2026-11-21",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "priority": "0.8",
       "sections": [
         {
@@ -1064,7 +1089,11 @@
             },
             {
               "type": "p",
-              "text": "In the browser, `zipp-0.0.37-javascript-rust.wasm` (5,954,532 bytes raw, 1,466,783 bytes after Brotli-11) compiles out host filesystem, process and TCP networking under `safe-sandbox`, substituting an in-memory binary-safe VFS overlay (`RustProgramConfig::vfs`) and Axum/SQLx worker-boot dispatch over host-owned `addAppBridge` capabilities."
+              "text": "In the browser, `zipp-0.0.40-javascript-rust.wasm` (5,994,592 bytes raw, 1,476,751 bytes after Brotli-11) compiles out host filesystem, process and TCP networking under `safe-sandbox`, substituting an in-memory binary-safe VFS overlay (`RustProgramConfig::vfs`) and Axum/SQLx worker-boot dispatch over host-owned `addAppBridge` capabilities."
+            },
+            {
+              "type": "p",
+              "text": "v0.0.40 replaced O(N²) collection paths (`VecDeque`, `BTreeMap`, `String::pop`) with O(1) ring-buffer and cached-order structures (8.6× faster, `481 ms -> 56 ms`). Try runnable single- and multi-file Rust examples (enums, traits, `#[derive(Serialize, Deserialize)]`, `serde_json`, custom `Iterator`) directly in the [browser playground](/playground/)."
             }
           ]
         }
@@ -1103,7 +1132,7 @@
         "wasm-bindgen Rust engine"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "Why a JavaScript engine inside JavaScript",
@@ -1123,7 +1152,7 @@
             },
             {
               "type": "table",
-              "caption": "Engine sizes in the v0.0.37 release assets, bindings included (Brotli-11 computed from each file)",
+              "caption": "Engine sizes in the v0.0.40 release assets, bindings included (Brotli-11 computed from each file)",
               "head": [
                 "Variant",
                 "Languages",
@@ -1134,50 +1163,50 @@
                 [
                   "`javascript` (default)",
                   "JavaScript",
-                  "4,913,223",
-                  "1,268,242"
+                  "4,947,842",
+                  "1,276,646"
                 ],
                 [
                   "`javascript-lite`",
                   "JavaScript core without `Intl` and `Temporal`, built for size",
-                  "2,878,928",
-                  "788,538"
+                  "2,906,344",
+                  "797,433"
                 ],
                 [
                   "`javascript-typescript`",
                   "JavaScript + TypeScript and TSX",
-                  "5,250,935",
-                  "1,338,703"
+                  "5,285,552",
+                  "1,347,702"
                 ],
                 [
                   "`javascript-php`",
                   "JavaScript + PHP 8.x (`PhpApp` SAPI & SQL bridge)",
-                  "6,038,525",
-                  "1,480,745"
+                  "6,076,074",
+                  "1,490,335"
                 ],
                 [
                   "`javascript-rust`",
                   "JavaScript + Rust (Axum/SQLx worker-boot)",
-                  "5,954,532",
-                  "1,466,783"
+                  "5,994,592",
+                  "1,476,751"
                 ],
                 [
                   "`javascript-python-base`",
                   "JavaScript + Python 3.13, torch as a package",
-                  "6,905,076",
-                  "1,702,286"
+                  "7,599,903",
+                  "1,836,474"
                 ],
                 [
                   "`torch-package`",
                   "The torch package for `javascript-python-base`",
                   "2,163,109",
-                  "403,538"
+                  "403,356"
                 ],
                 [
                   "`javascript-python`",
                   "JavaScript + Python 3.13 with torch built in",
-                  "8,942,154",
-                  "2,078,280"
+                  "9,640,441",
+                  "2,214,700"
                 ],
                 [
                   "QuickJS-NG v0.16.2 reactor, for scale",
@@ -1189,7 +1218,7 @@
             },
             {
               "type": "p",
-              "text": "Each file is `zipp-<v>-<variant>.wasm` and carries the JavaScript bindings generated for its build, the glue that releases up to v0.0.25 shipped as a separate file: in v0.0.37 they add 56,996 bytes raw and 13,438 after Brotli to the JavaScript engine (4,856,227 raw and 1,254,804 after Brotli without bindings). Zipp's JavaScript engine is about 3.21× QuickJS-NG's raw and 3.04× on the wire as published, and ZIPP Lite 1.88× and 1.89×. v0.0.37 adds dedicated `javascript-php` (1.48 MB on the wire) and `javascript-rust` (1.47 MB) modules alongside the existing JavaScript, Lite, TypeScript and Python variants. A page that never imports torch can serve `javascript-python-base` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `javascript-python` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. Every module retains the audited 51-function host import surface (plus `zippTorchKernel` on Python builds) and is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, with `overflow-checks` left on in release."
+              "text": "Each file is `zipp-<v>-<variant>.wasm` and carries the JavaScript bindings generated for its build, the glue that releases up to v0.0.25 shipped as a separate file: in v0.0.40 they add 56,996 bytes raw and 12,775 after Brotli to the JavaScript engine (4,890,846 raw and 1,263,871 after Brotli without bindings). Zipp's JavaScript engine is about 3.24× QuickJS-NG's raw and 3.06× on the wire as published, and ZIPP Lite 1.90× and 1.91×. Dedicated `javascript-php` (1.49 MB on the wire) and `javascript-rust` (1.48 MB) modules ship alongside the JavaScript, Lite, TypeScript and Python variants. A page that never imports torch can serve `javascript-python-base` and skip the package; one that does fetches it on demand, and the pair costs slightly more than `javascript-python` because the package carries its own copy of the kernels' support code. A Python-only variant was tried and came out 85 bytes larger than the combined module, so it does not exist. Every module retains the audited 51-function host import surface (plus `zippTorchKernel` on Python builds) and is compiled with `safe-sandbox`, `meter-only`, `wasm-no-fs-loader` and `wasm-single-agent`, with `overflow-checks` left on in release."
             }
           ]
         },
@@ -1200,7 +1229,7 @@
               "type": "code",
               "caption": "engine.worker.js",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.37-javascript.wasm')\nconsole.log(zipp.languages)  // [\"javascript\"], [\"javascript\",\"php\"], [\"javascript\",\"rust\"], ...\n\nconst engine = new zipp.Engine()\nengine.setInstructionBudget(200_000_000)\nengine.initScript('const xs = [3,1,2]; console.log(xs.sort())')\nconsole.log(engine.takeConsole())\nconsole.log(engine.evalInContext('xs.length'))  // \"3\"\nengine.dispose()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst zipp = await loadZipp('./zipp-0.0.40-javascript.wasm')\nconsole.log(zipp.languages)  // [\"javascript\"], [\"javascript\",\"php\"], [\"javascript\",\"rust\"], ...\n\nconst engine = new zipp.Engine()\nengine.setInstructionBudget(200_000_000)\nengine.initScript('const xs = [3,1,2]; console.log(xs.sort())')\nconsole.log(engine.takeConsole())\nconsole.log(engine.evalInContext('xs.length'))  // \"3\"\nengine.dispose()"
             },
             {
               "type": "p",
@@ -1208,7 +1237,7 @@
             },
             {
               "type": "p",
-              "text": "Host communication has exactly two channels. Synchronous `__zippHostCall(kind, ...args)` takes strings and returns one string, and every capability name (`db.query`, `ls.getItem`, `app.sql.query`, `nav.clipboardWrite` and so on) is denied per engine until the host grants it. Asynchronous requests queue up for the host to drain with `drainPendingHostCalls()` and answer with `resolveHostCallback(id, result)`. From v0.0.37, `addAppBridge(namespace, bridge)` composes multiple sandboxed plugin bridges (such as XDB SQLite on `app.sql.*`) without overwriting each other, while `hostStepsRemaining()` and `hostChargeSteps(n)` let plugins charge work against the guest VM's instruction budget without expanding the WASM import surface. Installing a bridge object never grants authority by itself."
+              "text": "Host communication has exactly two channels. Synchronous `__zippHostCall(kind, ...args)` takes strings and returns one string, and every capability name (`db.query`, `ls.getItem`, `app.sql.query`, `nav.clipboardWrite` and so on) is denied per engine until the host grants it. Asynchronous requests queue up for the host to drain with `drainPendingHostCalls()` and answer with `resolveHostCallback(id, result)`. From v0.0.40, `addAppBridge(namespace, bridge)` composes multiple sandboxed plugin bridges (such as XDB SQLite on `app.sql.*`) without overwriting each other, while `hostStepsRemaining()` and `hostChargeSteps(n)` let plugins charge work against the guest VM's instruction budget without expanding the WASM import surface. Installing a bridge object never grants authority by itself."
             }
           ]
         },
@@ -1304,6 +1333,10 @@
             {
               "type": "p",
               "text": "The WebAssembly build is an interpreter, so the native benchmark tables do not apply to it. The only cross-engine WebAssembly comparison in the repository is explicitly marked not publishable: on the five rows that could be compared, QuickJS-NG led four. Interpreter cliffs found in September 2026 were closed with measured before-and-after numbers, for example a 64K non-ASCII `charCodeAt` loop from 4,462 ms to 3.2 ms and a `join` with 300K retained strings from 8,423 ms to 138 ms. In October the size passes profiled the modules themselves: four workloads that were quadratic in a string's length became linear (a sticky-regex tokenizer over 190 KB from 17.8 s to 164 ms), Lite stopped making every register access a call, and the JavaScript module ran the size pass's corpus in 0.84 to 0.86 of v0.0.22's time in v0.0.23, level again in v0.0.24 while 4% smaller. Details are on the [benchmarks page](/benchmarks/)."
+            },
+            {
+              "type": "p",
+              "text": "In v0.0.40, WebAssembly (`safe-sandbox`) builds re-enabled pure-safe interpreter inline-cache hit paths, metered superinstructions, safe `capture.rs` memoization, faster `to_js_bounded` JSON marshalling, and expanded regex caching — improving browser execution speed while keeping zero `unsafe` code and the same 51-function import surface."
             }
           ]
         },
@@ -1316,7 +1349,7 @@
             },
             {
               "type": "table",
-              "caption": "WebAssembly assets of a release (`<v>` is the version, 0.0.37 for the current one)",
+              "caption": "WebAssembly assets of a release (`<v>` is the version, 0.0.40 for the current one)",
               "head": [
                 "Asset",
                 "Contents"
@@ -1366,7 +1399,7 @@
             },
             {
               "type": "p",
-              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. The release has each one ready as a `.wasm.br` (1,268,242 bytes for the JavaScript engine): send it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it. `zipp.mjs` 1.2.0+, in the embed kit from v0.0.27 (and 1.5.0 in v0.0.37), also loads a `.wasm.br` URL itself, decompressing it where the runtime can (Node, Firefox) or falling back to the plain `.wasm` beside it; the plain `.wasm` stays the default. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
+              "text": "Serve each engine Brotli-compressed, since the sizes above are what it costs on the wire, and check it against the release's `SHA256SUMS`. The release has each one ready as a `.wasm.br` (1,268,242 bytes for the JavaScript engine): send it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it. `zipp.mjs` 1.2.0+, in the embed kit from v0.0.27 (and 1.5.0 in v0.0.40), also loads a `.wasm.br` URL itself, decompressing it where the runtime can (Node, Firefox) or falling back to the plain `.wasm` beside it; the plain `.wasm` stays the default. Pin the torch package by hash exactly as you pin the engine: a package built from another engine source is refused by its ABI check, so take it from the same release as the engine. Up to v0.0.25, releases shipped zip archives instead, `zipp-wasm-<version>-web.zip` and its `-web-lite`, `-web-python-base`, `-web-python` and `-web-torch` siblings, each holding the wasm-bindgen glue and the module as two files to be served with matching cache keys, TypeScript declarations, `BUILD-INFO.txt`, `PROFILE.json` and its own `SHA256SUMS`."
             }
           ]
         },
@@ -1378,15 +1411,19 @@
               "type": "code",
               "caption": "Running a program in a sandbox with `zipp.mjs`",
               "lang": "javascript",
-              "code": "import { loadZipp } from \"./zipp.mjs\"\n\nconst zipp = await loadZipp(\"./zipp-0.0.37-javascript.wasm\")\nconst sandbox = await zipp.createSandbox({\n  limits: { instructions: 50_000_000, timeoutMs: 5000 },\n  permissions: {\n    storage: { initial: { theme: \"dark\" } },        // a private, in-memory localStorage\n    files: { \"notes.txt\": \"hello\" },                 // read with host.callSync(\"fs.read\", ...)\n    network: [\"https://api.example.com/\"],          // the only URLs its fetch() may reach\n  },\n  host: { \"clock.now\": () => Date.now() },          // answers host.call(\"clock.now\", ...)\n})\nconst { output } = await sandbox.run(source)       // throws a ZippSandboxError on failure\nawait sandbox.close()"
+              "code": "import { loadZipp } from \"./zipp.mjs\"\n\nconst zipp = await loadZipp(\"./zipp-0.0.40-javascript.wasm\")\nconst sandbox = await zipp.createSandbox({\n  limits: { instructions: 50_000_000, timeoutMs: 5000 },\n  permissions: {\n    storage: { initial: { theme: \"dark\" } },        // a private, in-memory localStorage\n    files: { \"notes.txt\": \"hello\" },                 // read with host.callSync(\"fs.read\", ...)\n    network: [\"https://api.example.com/\"],          // the only URLs its fetch() may reach\n  },\n  host: { \"clock.now\": () => Date.now() },          // answers host.call(\"clock.now\", ...)\n})\nconst { output } = await sandbox.run(source)       // throws a ZippSandboxError on failure\nawait sandbox.close()"
             },
             {
               "type": "p",
-              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw an `Error` whose message begins `SecurityError:`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.37 JavaScript engine this way and lets you switch each permission and limit and see the result."
+              "text": "A sandbox is default-deny. It starts with no storage, no files, no network and no host functions: without a grant, `localStorage` and the file calls throw an `Error` whose message begins `SecurityError:`, `fetch` does not exist, and `host.call` answers `denied`. Each permission opens one door: `storage` a private in-memory `localStorage`; `files` a map of paths to text, read-only unless `writable`; `network` a `fetch` that reaches only the listed origins or URL prefixes, with no cookies or credentials and redirects refused unless allowed; `host` the named functions. `limits.instructions` is a step budget the engine enforces, and `limits.timeoutMs` bounds each `run` or `call`: by default every sandbox runs in its own Worker, which is terminated when that time runs out. A failure is a `ZippSandboxError` whose `category` is `guest`, `source`, `resource`, `timeout`, `host` or `usage`, with whatever the program printed before it. The [sandbox playground](/sandbox/playground/) runs the 0.0.40 JavaScript engine this way and lets you switch each permission and limit and see the result."
             },
             {
               "type": "p",
               "text": "`loadZipp` also takes `{ engine, packages }`: given the `-javascript-python-base` engine and the torch package, it adds torch to the engine in the same step. What it resolves to also holds the engine's `Engine` class, for a host that drives the API above itself. The [embed section of the home page](/#embed) shows the smallest default-deny example for each engine, links its two downloads, and offers a starter project with no build step."
+            },
+            {
+              "type": "p",
+              "text": "For full multi-file web applications with both frontend and backend isolation, [SoftN](https://softn.com) and [FormLogic](https://formlogic.com) layer a Web Worker container runtime on top of ZIPP WASM and `addAppBridge(\"sql\", ...)` — see [SoftN & FormLogic web app containers](/sandbox/#softn-containers) or launch a live marketplace app in the [container demo](/container-demo/)."
             }
           ]
         }
@@ -1657,7 +1694,7 @@
         "Rust JavaScript engine Test262"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "priority": "0.9",
       "extraStructuredData": [
         {
@@ -1783,7 +1820,7 @@
             },
             {
               "type": "p",
-              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`test262.json`, `failures.txt`, `datetimeformat.json` and `datetimeformat-failures.txt`) is retained for thirty days. The figures above are from the `2e58f87d83` pin; v0.0.37 (`a5c9ef93`) ran and passed both the 96,564-execution core corpus and the 492-execution DateTimeFormat shard in its release gate."
+              "text": "The release workflow calls this job at the exact tagged commit and will not publish without it. A green `main` at some other revision is not a release gate. The evidence artifact (`test262.json`, `failures.txt`, `datetimeformat.json` and `datetimeformat-failures.txt`) is retained for thirty days. The figures above are from the `2e58f87d83` pin; v0.0.40 (`a5c9ef93`) ran and passed both the 96,564-execution core corpus and the 492-execution DateTimeFormat shard in its release gate."
             }
           ]
         },
@@ -1917,7 +1954,7 @@
     {
       "slug": "benchmarks",
       "title": "Zipp Benchmarks: vs Node, Bun, Deno, QuickJS and CPython",
-      "description": "Zipp 0.0.31 measured: its JIT against Node 24, Bun and Deno on 30 rows, its interpreter against QuickJS, its Python against CPython 3.13, with intervals and raw JSON.",
+      "description": "Zipp 0.0.40 measured: JIT vs Node 24 (0.583×, 29/30 wins), Bun and Deno, interpreter vs QuickJS (0.430×), and Python vs CPython 3.13 (0.626×).",
       "h1": "Zipp benchmarks",
       "breadcrumb": "Benchmarks",
       "lede": "This is the canonical home for Zipp's performance numbers. Every table below comes from a checked-in JSON capture with engine hashes, competitor hashes, per-repetition schedules and bootstrap replicates, so anyone can re-run it and anyone can cite it. Ratios are Zipp divided by the competitor: lower is faster.",
@@ -1933,7 +1970,7 @@
         "Python vs CPython benchmark"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-10-29",
+      "dateModified": "2026-11-24",
       "priority": "0.9",
       "extraStructuredData": [
         {
@@ -2001,36 +2038,143 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "0.629×",
+                  "value": "0.583×",
                   "label": "Zipp/Node, all 30 rows, geometric mean",
-                  "note": "normal 13 0.543×, hostile 17 0.704×"
+                  "note": "normal 13 0.532×, hostile 17 0.624×"
                 },
                 {
-                  "value": "0.483×",
+                  "value": "0.461×",
                   "label": "Zipp/Bun, all 30 rows",
-                  "note": "normal 0.459×, hostile 0.502×"
+                  "note": "normal 0.457×, hostile 0.464×"
                 },
                 {
-                  "value": "0.422×",
+                  "value": "0.389×",
                   "label": "Zipp/Deno, all 30 rows",
-                  "note": "normal 0.467×, hostile 0.390×"
+                  "note": "normal 0.445×, hostile 0.351×"
                 },
                 {
-                  "value": "25 / 30",
+                  "value": "29 / 30",
                   "label": "Rows where Zipp's median beats Node's",
-                  "note": "5 rows are slower; they are listed below"
+                  "note": "1 row is slower (allocation-survival); listed below"
                 }
               ]
             },
             {
               "type": "p",
-              "text": "Capture: 29 October 2026, the 0.0.31 engine as a clean profile-guided-optimization build recorded as `zipp 0.0.31` from source `fcfb1934` (the release tag). Native Windows x86-64, four engines, 15 repetitions per row, exact output on every observation, and both artifacts record `publishable:true`. Every engine runs with its production JIT; [Interpreter versus interpreter](#interpreter-versus-interpreter) compares Zipp's interpreter with QuickJS and the JIT-off modes, and [Python versus CPython](#python-versus-cpython) its Python frontend. The all-30 figures weight the 30 rows equally, `exp((13 ln G13 + 17 ln G17) / 30)` of the two suites' geometric means, whose intervals are given with each suite. Zipp runs in its default mode, which in 0.0.31 sets up Node's globals for the program; on the normal rows that measured within 1% of the plain ECMAScript mode (`ZIPP_NO_NODE=1`)."
+              "text": "Capture: 24 November 2026, the 0.0.40 engine as a clean profile-guided-optimization build recorded as `zipp 0.0.40` from source `0cd3eab8` (the release tag). Native Windows x86-64, four engines, 15 repetitions per row, exact byte-for-byte output on every observation, and both artifacts record `publishable:true`. Every engine runs with its production JIT; [Interpreter versus interpreter](#interpreter-versus-interpreter) compares Zipp's interpreter with QuickJS (0.430×, 30/30) and the JIT-off modes, and [Python versus CPython](#python-versus-cpython) its Python frontend (0.626× CPython 3.13, 26/36 wins). The all-30 figures weight the 30 rows equally, `exp((13 ln G13 + 17 ln G17) / 30)` of the two suites' geometric means, whose intervals are given with each suite. The downloaded release binary (`zipp-0.0.40-windows-x86_64-portable.exe`) runs the normal 13 rows at 0.533× Node ([0.530, 0.538]); a paired A/B against the canonical PGO build measures 0.997×."
             },
             {
               "type": "callout",
               "tone": "warning",
-              "title": "The goal is not met",
-              "text": "The stated goal is to be faster than Node, Bun and Deno on every maintained row with exact output. The artifacts emit `FASTER_THAN_NODE_ON_EVERY_ROW=0`: Zipp beats Node on all 13 normal rows, but 5 of the 17 hostile rows are still slower; see Where Zipp loses."
+              "title": "One row left to beat Node everywhere",
+              "text": "The stated goal is to be faster than Node, Bun and Deno on every maintained row with exact output. Zipp 0.0.40 beats Node on all 13 normal rows and 16 of 17 hostile rows (up from 25/30 in v0.0.31), leaving one Node gap (`allocation-survival` at 1.141×, down from 1.344×); see Where Zipp loses."
+            }
+          ]
+        },
+        {
+          "id": "v0-0-40-highlights",
+          "heading": "Real-world applications & extra suites in v0.0.40",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Beyond the canonical 30-row JS suite and 36-program Python suite below, v0.0.40 was also profiled against six unmodified third-party JavaScript and Python HTML/DOM applications (`linkedom`, `defuddle`, `webforai`, `html2text`, `bs4_css`, `markdownify`), the 16-pattern JS regex suite (`bench/regex`), and PHP/Rust collection workloads ([docs/releases/0.0.40.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.40.md)). All runs verify byte-identical output against **Node.js v24.19.0** and **CPython 3.13**."
+            },
+            {
+              "type": "table",
+              "caption": "Real-world JS and Python applications: steady-state warm median & 8-run wall clock, byte-identical output vs reference",
+              "head": [
+                "App",
+                "Reference",
+                "Ref Warm / Wall (8×)",
+                "v0.0.39 (PGO)",
+                "v0.0.40 Warm / Wall (8×)",
+                "vs v0.0.39",
+                "v0.0.40 / Ref (Warm / Wall)"
+              ],
+              "rows": [
+                [
+                  "**linkedom**",
+                  "Node.js v24.19.0",
+                  "1.31 ms / 336–337 ms",
+                  "9.56 ms",
+                  "**6.14–6.21 ms** / **467–473 ms**",
+                  "**1.55× faster**",
+                  "4.69–4.74× / **1.38–1.41×**"
+                ],
+                [
+                  "**defuddle**",
+                  "Node.js v24.19.0",
+                  "26.05–26.73 ms / 597–604 ms",
+                  "160.32 ms",
+                  "**139.76–146.77 ms** / **1595–1650 ms**",
+                  "**1.09×–1.15× faster**",
+                  "5.36–5.49× / **2.64–2.76×**"
+                ],
+                [
+                  "**webforai**",
+                  "Node.js v24.19.0",
+                  "17.57–18.30 ms / 521–522 ms",
+                  "107.57 ms",
+                  "**102.18–107.16 ms** / **1277–1351 ms**",
+                  "**1.00×–1.05× faster**",
+                  "5.58–6.10× / **2.45–2.59×**"
+                ],
+                [
+                  "**html2text**",
+                  "CPython 3.13",
+                  "5.60–5.67 ms / 198–206 ms",
+                  "41.15 ms",
+                  "**14.31–15.39 ms** / **282–289 ms**",
+                  "**2.67×–2.88× faster**",
+                  "2.55–2.72× / **1.37–1.46×**"
+                ],
+                [
+                  "**bs4_css**",
+                  "CPython 3.13",
+                  "5.74–5.89 ms / 282–300 ms",
+                  "65.73 ms",
+                  "**36.12–38.44 ms** / **482–502 ms**",
+                  "**1.71×–1.82× faster**",
+                  "6.13–6.70× / **1.68–1.71×**"
+                ],
+                [
+                  "**markdownify**",
+                  "CPython 3.13",
+                  "7.87–8.10 ms / 227–239 ms",
+                  "104.80 ms",
+                  "**54.03–56.54 ms** / **645–671 ms**",
+                  "**1.85×–1.94× faster**",
+                  "6.67–7.19× / **2.81–2.84×**"
+                ]
+              ]
+            },
+            {
+              "type": "table",
+              "caption": "Additional v0.0.40 suites: JS regex and PHP/Rust O(N²) fixes",
+              "head": [
+                "Suite",
+                "v0.0.39 (PGO)",
+                "v0.0.40",
+                "Highlights"
+              ],
+              "rows": [
+                [
+                  "**JS `bench/regex`** (16 patterns vs Node.js)",
+                  "`2.44×` geomean",
+                  "**`1.90×` geomean** (~1.28× faster)",
+                  "`literal-utf16` `4.0× -> 0.82×` (now beating Node), `lookbehind` **1.41× faster**"
+                ],
+                [
+                  "**PHP & Rust runtimes** (O(N²) fixes)",
+                  "O(N²) / O(N² log N)",
+                  "**O(1) / O(N)**",
+                  "PHP `array_pop` stack **~65×** (`614 ms -> 9.5 ms`), PHP cursor loop **~180×** (`2266 ms -> 12.5 ms`), Rust `VecDeque`/`BTreeMap`/`String::pop` **8.6×** (`481 ms -> 56 ms`)"
+                ]
+              ]
+            },
+            {
+              "type": "p",
+              "text": "Why do steady-state DOM and HTML apps still trail V8 and CPython on warm loops even when ZIPP beats Node on 29/30 canonical JS rows and CPython on 26/36 Python rows? Large third-party DOM libraries create highly megamorphic call graphs, deep prototype chains, frequent substring allocations, and dense regex backtracking where V8 TurboFan speculatively inlines across dozens of callees and CPython runs compiled C modules (`_sre`, C HTML parsers). ZIPP closes much of the gap on real CLI invocations thanks to its ~11 ms startup (wall-clock `1.38×` Node on `linkedom`, `1.37×` CPython on `html2text`), and v0.0.40 added `ZIPP_PERF_MAP=1` JS function names (PR #110 by `@codeandsolder`) so future rounds can profile remaining hotspots directly."
             }
           ]
         },
@@ -2109,19 +2253,19 @@
               "rows": [
                 [
                   "**Zipp**",
-                  "**9.1**"
+                  "**11.1**"
                 ],
                 [
                   "Node",
-                  "32.3"
+                  "36.3"
                 ],
                 [
                   "Bun",
-                  "53.0"
+                  "55.6"
                 ],
                 [
                   "Deno",
-                  "84.9"
+                  "92.3"
                 ]
               ]
             }
@@ -2136,7 +2280,7 @@
             },
             {
               "type": "table",
-              "caption": "real13, capture fcfb1934, 29 October 2026",
+              "caption": "real13, capture 0cd3eab8, 24 November 2026",
               "head": [
                 "Row",
                 "Node",
@@ -2150,133 +2294,133 @@
               "rows": [
                 [
                   "async-promise-chain",
-                  "345.1",
-                  "380.0",
-                  "370.5",
-                  "238.1",
-                  "0.700* [0.675, 0.718]",
-                  "0.628",
-                  "0.646"
+                  "370.6",
+                  "400.1",
+                  "399.6",
+                  "241.3",
+                  "0.653* [0.637, 0.675]",
+                  "0.603",
+                  "0.604"
                 ],
                 [
                   "class-prototype-hot",
-                  "303.5",
-                  "344.1",
-                  "327.7",
-                  "229.0",
-                  "0.759* [0.752, 0.765]",
-                  "0.668",
-                  "0.704"
+                  "312.2",
+                  "353.2",
+                  "340.8",
+                  "219.4",
+                  "0.703* [0.695, 0.709]",
+                  "0.621",
+                  "0.644"
                 ],
                 [
                   "json-large",
-                  "288.9",
-                  "212.9",
-                  "335.2",
-                  "223.2",
-                  "0.779* [0.758, 0.800]",
-                  "1.045",
-                  "0.683"
+                  "323.9",
+                  "242.9",
+                  "380.1",
+                  "265.6",
+                  "0.822* [0.807, 0.850]",
+                  "1.094",
+                  "0.699"
                 ],
                 [
                   "map-set-heavy",
-                  "808.0",
-                  "856.0",
-                  "1340.2",
-                  "548.6",
-                  "0.679* [0.626, 0.689]",
-                  "0.613",
-                  "0.402"
+                  "1,143",
+                  "1,086",
+                  "1,738",
+                  "810.2",
+                  "0.736* [0.704, 0.748]",
+                  "0.746",
+                  "0.466"
                 ],
                 [
                   "markdown-render",
-                  "283.5",
-                  "229.3",
-                  "324.7",
-                  "187.0",
-                  "0.660* [0.655, 0.679]",
-                  "0.808",
-                  "0.582"
+                  "309.5",
+                  "243.8",
+                  "371.9",
+                  "200.3",
+                  "0.668* [0.660, 0.675]",
+                  "0.821",
+                  "0.539"
                 ],
                 [
                   "parse-large-js",
-                  "277.6",
-                  "240.4",
-                  "290.7",
-                  "222.6",
-                  "0.803* [0.793, 0.817]",
-                  "0.925",
-                  "0.774"
+                  "298.5",
+                  "252.5",
+                  "318.5",
+                  "227.3",
+                  "0.763* [0.746, 0.803]",
+                  "0.900",
+                  "0.714"
                 ],
                 [
                   "polymorphic-objects",
-                  "334.6",
-                  "342.0",
-                  "338.2",
-                  "214.1",
-                  "0.640* [0.622, 0.661]",
-                  "0.625",
-                  "0.639"
-                ],
-                [
-                  "polymorphic-objects-v2",
-                  "84.4",
-                  "96.8",
-                  "132.1",
-                  "24.3",
-                  "0.286* [0.282, 0.291]",
-                  "0.248",
-                  "0.188"
-                ],
-                [
-                  "property-ic-shapes",
-                  "259.5",
-                  "166.8",
-                  "322.1",
-                  "11.1",
-                  "0.043* [0.040, 0.045]",
-                  "0.067",
-                  "0.035"
+                  "348.4",
+                  "349.6",
+                  "354.9",
+                  "219.9",
+                  "0.643* [0.630, 0.650]",
+                  "0.629",
+                  "0.620"
                 ],
                 [
                   "regex-log-scan",
-                  "488.4",
-                  "586.3",
-                  "482.2",
-                  "421.0",
-                  "0.876* [0.837, 0.901]",
-                  "0.716",
-                  "0.856"
+                  "513.2",
+                  "625.1",
+                  "525.2",
+                  "440.4",
+                  "0.858* [0.797, 0.884]",
+                  "0.704",
+                  "0.838"
                 ],
                 [
                   "sparse-array",
-                  "82.0",
-                  "110.3",
-                  "126.5",
-                  "74.2",
-                  "0.904* [0.886, 0.925]",
-                  "0.679",
-                  "0.600"
-                ],
-                [
-                  "sparse-array-v2",
-                  "174.1",
-                  "379.2",
-                  "188.9",
-                  "97.4",
-                  "0.560* [0.551, 0.569]",
-                  "0.257",
-                  "0.512"
+                  "87.8",
+                  "120.5",
+                  "139.4",
+                  "58.8",
+                  "0.672* [0.652, 0.679]",
+                  "0.488",
+                  "0.422"
                 ],
                 [
                   "typedarray-math",
-                  "205.2",
-                  "926.7",
-                  "172.9",
-                  "141.4",
-                  "0.688* [0.682, 0.703]",
-                  "0.153",
-                  "0.817"
+                  "215.7",
+                  "959.2",
+                  "195.7",
+                  "147.9",
+                  "0.687* [0.671, 0.709]",
+                  "0.154",
+                  "0.755"
+                ],
+                [
+                  "polymorphic-objects-v2",
+                  "89.9",
+                  "100.7",
+                  "151.1",
+                  "27.4",
+                  "0.299* [0.296, 0.310]",
+                  "0.272",
+                  "0.182"
+                ],
+                [
+                  "property-ic-shapes",
+                  "274.6",
+                  "173.7",
+                  "334.5",
+                  "14.5",
+                  "0.054* [0.052, 0.056]",
+                  "0.084",
+                  "0.043"
+                ],
+                [
+                  "sparse-array-v2",
+                  "183.4",
+                  "389.0",
+                  "195.7",
+                  "87.0",
+                  "0.475* [0.468, 0.482]",
+                  "0.224",
+                  "0.444"
                 ]
               ]
             },
@@ -2291,18 +2435,18 @@
               "rows": [
                 [
                   "Headline 10",
-                  "0.744×",
-                  "[0.739, 0.750]"
+                  "0.717×",
+                  "[0.708, 0.725]"
                 ],
                 [
                   "Diagnostics 3",
-                  "0.190×",
-                  "[0.185, 0.193]"
+                  "0.197×",
+                  "[0.195, 0.201]"
                 ],
                 [
                   "All 13",
-                  "0.543×",
-                  "[0.538, 0.546]"
+                  "0.532×",
+                  "[0.527, 0.537]"
                 ]
               ]
             },
@@ -2321,7 +2465,7 @@
             },
             {
               "type": "table",
-              "caption": "hostile17, capture fcfb1934, Zipp/Node cold ratio",
+              "caption": "hostile17, capture 0cd3eab8, Zipp/Node cold ratio",
               "head": [
                 "Row",
                 "Zipp/Node",
@@ -2331,63 +2475,63 @@
               "rows": [
                 [
                   "calls-baseline",
-                  "0.472",
+                  "0.349",
                   "calls-closures",
-                  "**1.122**"
+                  "0.941"
                 ],
                 [
                   "shapes-stable",
-                  "0.927",
+                  "0.705",
                   "shapes-megamorphic",
-                  "**1.038**"
+                  "0.866"
                 ],
                 [
                   "types-stable",
-                  "0.503",
+                  "0.466",
                   "types-churn",
-                  "0.605"
+                  "0.609"
                 ],
                 [
                   "branch-control",
-                  "0.819",
+                  "0.683",
                   "throw-catch",
-                  "0.246"
+                  "0.233"
                 ],
                 [
                   "allocation-ephemeral",
-                  "0.370",
+                  "0.404",
                   "allocation-survival",
-                  "**1.344**"
+                  "**1.141**"
                 ],
                 [
                   "async-burst",
-                  "0.507",
+                  "0.476",
                   "async-lived",
-                  "0.667"
+                  "0.662"
                 ],
                 [
                   "reactish-reconcile",
-                  "**1.217**",
+                  "0.843",
                   "warm-router",
-                  "**1.130**"
+                  "0.883"
                 ],
                 [
                   "bytecode-vm",
-                  "0.924",
+                  "0.875",
                   "module-hot-graph",
-                  "0.403"
+                  "0.435"
                 ],
                 [
                   "npm-nanoid",
-                  "0.948",
-                  "",
-                  ""
+                  "0.888",
+                  "—",
+                  "—"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "Ordinary geometric mean 0.704× Node [0.700, 0.709], 0.502× Bun, 0.390× Deno; category-balanced 0.738× Node. The suite's aspirational gate (category-balanced at most 1.05×, no category above 1.15×, no row above 1.50×) passes its category-balanced bound, fails the per-category bound (applications 1.217×), and passes the row bound (the worst row, allocation-survival, is 1.344×)."
+              "text": "Ordinary geometric mean 0.624× Node [0.619, 0.630], 0.464× Bun, 0.351× Deno; category-balanced 0.652× Node (up from 0.704× ordinary / 0.738× balanced in v0.0.31, with four hostile rows flipping to beat Node). The suite's aspirational gate (category-balanced at most 1.05×, no category above 1.15×, no row above 1.50×) now passes on all three criteria."
             }
           ]
         },
@@ -2396,11 +2540,11 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Five of thirty rows have a Node point gap, all of them in the hostile suite: allocation-survival 1.344×, reactish-reconcile 1.217×, warm-router 1.130×, calls-closures 1.122×, shapes-megamorphic 1.038×. The pattern: long-lived allocation, closure-heavy application code and property access across many shapes are where V8's optimizing tiers still win. Against the previous capture (21 October 2026, `zipp 0.0.28`), all 30 rows went from 0.652× to 0.629× Node; the rows that improved most were async-lived (0.829× to 0.667×) and types-churn (0.693× to 0.605×) and bytecode-vm (1.050× to 0.924×) and async-burst (0.574× to 0.507×), and the one that moved most the other way was property-ic-shapes (0.037× to 0.043×)."
+              "text": "One of thirty rows still has a Node point gap: `allocation-survival` at 1.141× (improved from 1.344× in v0.0.31). The other four hostile rows that trailed Node in v0.0.31 — `reactish-reconcile` (1.217× -> 0.843×), `warm-router` (1.130× -> 0.883×), `calls-closures` (1.122× -> 0.941×), and `shapes-megamorphic` (1.038× -> 0.866×) — all flipped to beating Node in v0.0.40."
             },
             {
               "type": "p",
-              "text": "Against Bun, Zipp loses json-large (1.045×). Against Deno, Zipp loses no row. On the normal suite Bun is the absolute fastest engine on json-large; Zipp is fastest on every other normal row."
+              "text": "Against Bun, Zipp loses `json-large` (1.094×). Against Deno, Zipp loses no row. On the normal suite Bun is the fastest engine on `json-large`; Zipp is fastest on every other normal row."
             }
           ]
         },
@@ -2410,7 +2554,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The tables above compare production JITs. This one asks how fast Zipp is as a pure interpreter: the same PGO binary with `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, which emits no native code (its JavaScript JIT and its regex JIT both off; the captures before 22 October left the regex JIT on), against Bellard's QuickJS 2026-06-04 and QuickJS-NG 0.17.0 (neither has a JIT), and against Node `--jitless` (V8's Ignition), Deno `--v8-flags=--jitless` and Bun with `BUN_JSC_useJIT=0` (JavaScriptCore's LLInt). [`run_native.py`](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/run_native.py) staged identical sources for every engine, checked every output against Node's and ran 8 counterbalanced repetitions; cold medians in milliseconds, launch included. It is a diagnostic, not a canonical capture. This interpreter is what the WebAssembly build and the safe-sandbox profile run."
+              "text": "The tables above compare production JITs. This one asks how fast Zipp is as a pure interpreter: the same 0.0.40 PGO binary (`0cd3eab8`) with `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, which emits no native code (its JavaScript JIT and its regex JIT both off), against Bellard's QuickJS (2026-06-04), QuickJS-NG (0.18.0), Node `--jitless`, Deno `--v8-flags=--jitless` and Bun `BUN_JSC_useJIT=0`, 8 counterbalanced repetitions each, exact byte-for-byte output against Node."
             },
             {
               "type": "table",
@@ -2425,44 +2569,44 @@
               "rows": [
                 [
                   "QuickJS",
-                  "0.514× [0.512, 0.517]",
-                  "0.625× [0.612, 0.627]",
-                  "0.574×",
+                  "0.376× [0.374, 0.389]",
+                  "0.476× [0.473, 0.484]",
+                  "0.430×",
                   "30 / 30"
                 ],
                 [
                   "QuickJS-NG",
-                  "0.326× [0.321, 0.327]",
-                  "0.327× [0.324, 0.328]",
-                  "0.326×",
+                  "0.319× [0.313, 0.330]",
+                  "0.339× [0.337, 0.347]",
+                  "0.330×",
                   "30 / 30"
                 ],
                 [
-                  "Node jitless",
-                  "1.010× [1.001, 1.017]",
-                  "0.843× [0.835, 0.847]",
-                  "0.911×",
-                  "21 / 30"
+                  "Bun no-JIT",
+                  "0.542× [0.538, 0.557]",
+                  "0.470× [0.461, 0.473]",
+                  "0.500×",
+                  "30 / 30"
                 ],
                 [
                   "Deno jitless",
-                  "0.964× [0.957, 0.968]",
-                  "0.733× [0.727, 0.739]",
-                  "0.825×",
-                  "24 / 30"
+                  "0.771× [0.764, 0.788]",
+                  "0.573× [0.554, 0.587]",
+                  "0.652×",
+                  "29 / 30"
                 ],
                 [
-                  "Bun no-JIT",
-                  "0.698× [0.693, 0.703]",
-                  "0.658× [0.652, 0.662]",
-                  "0.675×",
+                  "Node jitless",
+                  "0.779× [0.776, 0.795]",
+                  "0.655× [0.649, 0.664]",
+                  "0.706×",
                   "28 / 30"
                 ]
               ]
             },
             {
               "type": "table",
-              "caption": "Normal 13, interpreters, capture fcfb1934",
+              "caption": "Normal 13, interpreters, capture 0cd3eab8",
               "head": [
                 "Row",
                 "Zipp interpreter",
@@ -2476,139 +2620,139 @@
               "rows": [
                 [
                   "async-promise-chain",
-                  "331.6",
-                  "3,989",
-                  "3,898",
-                  "456.8",
-                  "447.7",
-                  "561.5",
-                  "0.083"
+                  "343.3",
+                  "5,163",
+                  "3,642",
+                  "517.7",
+                  "520.3",
+                  "656.0",
+                  "0.067"
                 ],
                 [
                   "class-prototype-hot",
-                  "3,292",
-                  "3,837",
-                  "7,241",
-                  "1,719",
-                  "1,786",
-                  "5,008",
-                  "0.858"
+                  "2,555",
+                  "4,838",
+                  "7,137",
+                  "1,825",
+                  "1,806",
+                  "6,265",
+                  "0.528"
                 ],
                 [
                   "json-large",
-                  "462.8",
-                  "786.2",
-                  "1,428",
-                  "532.4",
-                  "552.3",
-                  "645.9",
-                  "0.589"
+                  "503.7",
+                  "1,078",
+                  "1,333",
+                  "695.0",
+                  "642.8",
+                  "722.6",
+                  "0.467"
                 ],
                 [
                   "map-set-heavy",
-                  "575.4",
-                  "1,532",
-                  "2,164",
-                  "819.4",
-                  "1,229",
-                  "1,107",
-                  "0.376"
+                  "983.5",
+                  "2,328",
+                  "2,856",
+                  "1,470",
+                  "1,997",
+                  "1,608",
+                  "0.422"
                 ],
                 [
                   "markdown-render",
-                  "571.4",
-                  "1,074",
-                  "2,066",
-                  "766.7",
-                  "796.1",
-                  "972.2",
-                  "0.532"
+                  "573.1",
+                  "1,488",
+                  "1,648",
+                  "902.2",
+                  "865.8",
+                  "1,068",
+                  "0.385"
                 ],
                 [
                   "parse-large-js",
-                  "1,321",
-                  "2,041",
-                  "3,671",
-                  "1,388",
-                  "1,388",
-                  "1,588",
-                  "0.647"
+                  "1,077",
+                  "2,697",
+                  "2,867",
+                  "1,547",
+                  "1,460",
+                  "1,696",
+                  "0.399"
                 ],
                 [
                   "polymorphic-objects",
-                  "663.0",
-                  "860.9",
-                  "1,411",
-                  "596.0",
-                  "561.3",
-                  "1,308",
-                  "0.770"
+                  "578.2",
+                  "848.1",
+                  "1,280",
+                  "629.3",
+                  "598.2",
+                  "1,426",
+                  "0.682"
                 ],
                 [
                   "regex-log-scan",
-                  "1,452",
-                  "2,533",
-                  "4,005",
-                  "1,546",
-                  "1,538",
-                  "2,771",
-                  "0.573"
+                  "1,594",
+                  "3,236",
+                  "3,830",
+                  "1,891",
+                  "1,637",
+                  "2,952",
+                  "0.493"
                 ],
                 [
                   "sparse-array",
-                  "257.0",
-                  "386.7",
-                  "782.0",
-                  "207.9",
-                  "227.0",
-                  "275.5",
-                  "0.665"
+                  "157.6",
+                  "415.7",
+                  "929.0",
+                  "222.5",
+                  "244.3",
+                  "330.8",
+                  "0.379"
                 ],
                 [
                   "typedarray-math",
-                  "3,814",
-                  "3,848",
-                  "6,528",
-                  "2,262",
-                  "2,383",
-                  "3,207",
-                  "0.991"
+                  "2,348",
+                  "4,962",
+                  "5,724",
+                  "2,361",
+                  "2,431",
+                  "3,538",
+                  "0.473"
                 ],
                 [
                   "polymorphic-objects-v2",
-                  "298.1",
-                  "399.1",
-                  "850.6",
-                  "300.3",
-                  "325.3",
-                  "419.1",
-                  "0.747"
+                  "223.2",
+                  "442.2",
+                  "656.1",
+                  "313.0",
+                  "344.2",
+                  "470.3",
+                  "0.505"
                 ],
                 [
                   "property-ic-shapes",
-                  "1,984",
-                  "2,027",
-                  "5,187",
-                  "1,955",
-                  "1,978",
-                  "1,810",
-                  "0.979"
+                  "1,660",
+                  "1,927",
+                  "3,514",
+                  "2,012",
+                  "2,066",
+                  "1,905",
+                  "0.861"
                 ],
                 [
                   "sparse-array-v2",
-                  "278.9",
-                  "1,843",
-                  "874.6",
-                  "324.7",
-                  "306.2",
-                  "484.1",
-                  "0.151"
+                  "209.3",
+                  "1,936",
+                  "723.5",
+                  "343.6",
+                  "331.6",
+                  "529.1",
+                  "0.108"
                 ]
               ]
             },
             {
               "type": "table",
-              "caption": "Hostile 17, interpreters, capture fcfb1934",
+              "caption": "Hostile 17, interpreters, capture 0cd3eab8",
               "head": [
                 "Row",
                 "Zipp interpreter",
@@ -2622,179 +2766,179 @@
               "rows": [
                 [
                   "calls-baseline",
-                  "85.7",
-                  "111.7",
-                  "251.2",
-                  "104.3",
-                  "120.0",
-                  "107.1",
-                  "0.767"
+                  "65.6",
+                  "129.0",
+                  "201.9",
+                  "134.4",
+                  "142.7",
+                  "134.5",
+                  "0.508"
                 ],
                 [
                   "calls-closures",
-                  "198.6",
-                  "227.6",
-                  "451.5",
-                  "177.9",
-                  "195.9",
-                  "247.1",
-                  "0.873"
+                  "164.4",
+                  "240.9",
+                  "376.5",
+                  "199.9",
+                  "220.5",
+                  "278.3",
+                  "0.682"
                 ],
                 [
                   "shapes-stable",
-                  "78.3",
-                  "132.4",
-                  "235.5",
-                  "88.5",
-                  "104.3",
-                  "89.4",
-                  "0.592"
+                  "67.6",
+                  "150.1",
+                  "186.9",
+                  "96.8",
+                  "121.7",
+                  "120.2",
+                  "0.451"
                 ],
                 [
                   "shapes-megamorphic",
-                  "121.1",
-                  "194.1",
-                  "328.0",
-                  "115.8",
-                  "130.5",
-                  "185.7",
-                  "0.624"
+                  "91.5",
+                  "218.0",
+                  "252.9",
+                  "119.8",
+                  "154.0",
+                  "220.9",
+                  "0.420"
                 ],
                 [
                   "types-stable",
-                  "131.5",
-                  "163.3",
-                  "374.7",
-                  "130.0",
-                  "148.3",
-                  "131.7",
-                  "0.805"
+                  "110.6",
+                  "184.8",
+                  "304.2",
+                  "171.1",
+                  "160.3",
+                  "158.6",
+                  "0.598"
                 ],
                 [
                   "types-churn",
-                  "79.9",
-                  "96.3",
-                  "202.2",
-                  "97.8",
-                  "111.2",
-                  "114.0",
-                  "0.830"
+                  "71.9",
+                  "109.8",
+                  "165.2",
+                  "105.7",
+                  "127.0",
+                  "147.4",
+                  "0.654"
                 ],
                 [
                   "branch-control",
-                  "91.4",
-                  "109.6",
-                  "236.1",
-                  "105.0",
-                  "118.3",
-                  "102.9",
-                  "0.835"
+                  "64.6",
+                  "119.0",
+                  "180.6",
+                  "119.6",
+                  "132.3",
+                  "132.6",
+                  "0.543"
                 ],
                 [
                   "throw-catch",
-                  "81.9",
-                  "97.6",
-                  "293.3",
-                  "164.4",
-                  "144.6",
-                  "153.1",
-                  "0.840"
+                  "72.9",
+                  "108.0",
+                  "323.0",
+                  "187.9",
+                  "157.7",
+                  "186.5",
+                  "0.675"
                 ],
                 [
                   "allocation-ephemeral",
-                  "101.8",
-                  "250.2",
-                  "365.4",
-                  "120.0",
-                  "142.5",
-                  "260.2",
-                  "0.407"
+                  "84.8",
+                  "280.3",
+                  "348.0",
+                  "131.8",
+                  "149.8",
+                  "303.6",
+                  "0.303"
                 ],
                 [
                   "allocation-survival",
-                  "98.3",
-                  "174.2",
-                  "269.4",
-                  "105.4",
-                  "123.4",
-                  "132.4",
-                  "0.564"
+                  "120.9",
+                  "232.1",
+                  "263.9",
+                  "119.4",
+                  "149.0",
+                  "172.8",
+                  "0.521"
                 ],
                 [
                   "async-burst",
-                  "27.9",
-                  "103.2",
-                  "125.1",
-                  "60.7",
-                  "78.5",
-                  "43.2",
-                  "0.271"
+                  "28.7",
+                  "113.7",
+                  "110.2",
+                  "71.1",
+                  "98.1",
+                  "71.3",
+                  "0.252"
                 ],
                 [
                   "async-lived",
-                  "28.4",
-                  "107.7",
-                  "126.9",
-                  "49.8",
-                  "69.6",
-                  "65.2",
-                  "0.263"
+                  "32.4",
+                  "137.3",
+                  "104.0",
+                  "60.0",
+                  "84.7",
+                  "95.2",
+                  "0.236"
                 ],
                 [
                   "reactish-reconcile",
-                  "65.6",
-                  "119.4",
-                  "177.4",
-                  "74.0",
-                  "91.8",
-                  "105.6",
-                  "0.549"
+                  "67.1",
+                  "144.3",
+                  "174.0",
+                  "82.5",
+                  "105.9",
+                  "134.4",
+                  "0.465"
                 ],
                 [
                   "warm-router",
-                  "90.1",
-                  "121.4",
-                  "474.1",
-                  "78.8",
-                  "97.9",
-                  "142.9",
-                  "0.742"
+                  "79.8",
+                  "153.4",
+                  "471.7",
+                  "89.6",
+                  "111.6",
+                  "172.2",
+                  "0.520"
                 ],
                 [
                   "bytecode-vm",
-                  "290.7",
-                  "411.1",
-                  "946.5",
-                  "301.5",
-                  "315.8",
-                  "486.3",
-                  "0.707"
+                  "219.0",
+                  "459.3",
+                  "653.1",
+                  "315.0",
+                  "340.4",
+                  "525.7",
+                  "0.477"
                 ],
                 [
                   "module-hot-graph",
-                  "95.2",
-                  "95.7",
-                  "195.3",
-                  "103.3",
-                  "122.0",
-                  "145.5",
-                  "0.995"
+                  "86.4",
+                  "117.4",
+                  "156.8",
+                  "128.7",
+                  "135.5",
+                  "174.9",
+                  "0.736"
                 ],
                 [
                   "npm-nanoid",
-                  "437.4",
-                  "699.0",
-                  "1,168",
-                  "453.6",
-                  "471.6",
-                  "813.1",
-                  "0.626"
+                  "413.1",
+                  "924.5",
+                  "1,029",
+                  "517.1",
+                  "501.8",
+                  "864.6",
+                  "0.447"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "Over all 30 rows Zipp's interpreter, with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`), is faster than Bellard's QuickJS (0.574×, 30 of 30 rows; 0.683× in the previous capture), and faster than QuickJS-NG on all of them (0.326×). QuickJS wins no row. Against the JIT engines with their JITs off it is faster than Node `--jitless` (0.911×, 21 of 30 rows; 1.105× in the previous capture), faster than Deno `--jitless` (0.825×, 24 of 30 rows; 0.995× in the previous capture), and faster than Bun without its JIT (0.675×, 28 of 30 rows; 0.804× in the previous capture)."
+              "text": "Over all 30 rows Zipp 0.0.40's pure interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) runs in **0.430×** Bellard's QuickJS's time (30 of 30 rows, down from 0.574× in v0.0.31), **0.330×** QuickJS-NG (30/30), **0.500×** Bun no-JIT (30/30), **0.652×** Deno jitless (29/30), and **0.706×** Node jitless (28/30). Artifacts: [`bench/comparison/interp_real13_0cd3eab8_2026-11-24.json`](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_real13_0cd3eab8_2026-11-24.json) and [`bench/comparison/interp_hostile17_0cd3eab8_2026-11-24.json`](https://github.com/f2i-com/zipp.org/blob/main/bench/comparison/interp_hostile17_0cd3eab8_2026-11-24.json)."
             }
           ]
         },
@@ -2804,7 +2948,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Zipp compiles Python 3 to the same register bytecode. [`tools/python_bench.py`](https://github.com/f2i-com/zipp.org/blob/main/tools/python_bench.py) runs 36 programs (30 micro kernels, 6 application-shaped) as a fresh process per engine per repetition, interleaved, 15 repetitions, against CPython 3.13.14; every run's output must equal CPython's. The binary is the published 0.0.31 release build (the PGO build has no Python). Each program times its own workload in-process; that work time is the ratio below. Zipp runs with its JIT and again with `ZIPP_NOJIT=1`, since standard CPython is an interpreter. 8 further programs (the torch ones) have no CPython counterpart and are not included."
+              "text": "Zipp compiles Python 3.13 to the same register bytecode. [`tools/python_bench.py`](https://github.com/f2i-com/zipp.org/blob/main/tools/python_bench.py) runs 36 comparable programs (30 micro kernels, 6 application-shaped) as a fresh process per engine per repetition, interleaved, 15 repetitions, against CPython 3.13.14; every run's output must equal CPython's. The binary is the published **0.0.40** release build (`zipp-0.0.40-windows-x86_64-portable.exe`, SHA-256 `c8f43d00…7f7d0e`). Each program times its own workload in-process; that work time is the ratio below. Zipp runs with its JIT and again with `ZIPP_NOJIT=1`, since standard CPython is an interpreter. 8 further programs (the torch ones) have no CPython counterpart and are not included."
             },
             {
               "type": "table",
@@ -2817,29 +2961,29 @@
               "rows": [
                 [
                   "Micro 30",
-                  "0.916×",
-                  "1.384×"
+                  "0.601×",
+                  "1.298×"
                 ],
                 [
                   "Macro 6",
-                  "1.591×",
-                  "1.630×"
+                  "0.767×",
+                  "1.639×"
                 ],
                 [
                   "All 36",
-                  "1.004×",
-                  "1.422×"
+                  "0.626×",
+                  "1.350×"
                 ],
                 [
                   "All, whole-process wall time",
-                  "0.494×",
-                  "0.538×"
+                  "0.456×",
+                  "0.537×"
                 ]
               ]
             },
             {
               "type": "table",
-              "caption": "Python programs, work-time medians in milliseconds, CPython 3.13.14",
+              "caption": "Python programs, work-time medians in milliseconds, CPython 3.13.14 (v0.0.40)",
               "head": [
                 "Program",
                 "Set",
@@ -2853,332 +2997,332 @@
                 [
                   "micro/attr_read_write",
                   "micro",
-                  "3.03",
-                  "10.39",
-                  "7.87",
-                  "0.385",
-                  "1.330"
+                  "3.17",
+                  "10.91",
+                  "8.08",
+                  "0.392",
+                  "1.329"
                 ],
                 [
                   "micro/builtin_isinstance",
                   "micro",
-                  "9.82",
-                  "15.40",
-                  "9.39",
-                  "1.045",
-                  "1.643"
+                  "5.53",
+                  "16.43",
+                  "9.78",
+                  "0.566",
+                  "1.669"
                 ],
                 [
                   "micro/builtin_len",
                   "micro",
-                  "8.10",
-                  "13.61",
-                  "11.47",
-                  "0.707",
-                  "1.184"
+                  "6.32",
+                  "14.03",
+                  "11.97",
+                  "0.528",
+                  "1.180"
                 ],
                 [
                   "micro/call_defaults",
                   "micro",
-                  "17.34",
-                  "16.50",
-                  "12.43",
-                  "1.395",
-                  "1.324"
+                  "12.57",
+                  "22.87",
+                  "12.86",
+                  "0.978",
+                  "1.768"
                 ],
                 [
                   "micro/call_keywords",
                   "micro",
-                  "9.99",
-                  "9.37",
-                  "7.99",
-                  "1.250",
-                  "1.185"
+                  "9.94",
+                  "8.69",
+                  "8.30",
+                  "1.197",
+                  "1.047"
                 ],
                 [
                   "micro/call_simple",
                   "micro",
-                  "39.97",
-                  "38.03",
-                  "36.42",
-                  "1.097",
-                  "1.040"
+                  "26.45",
+                  "55.07",
+                  "38.04",
+                  "0.695",
+                  "1.463"
                 ],
                 [
                   "micro/dict_get",
                   "micro",
-                  "6.80",
-                  "12.26",
-                  "11.26",
-                  "0.604",
-                  "1.094"
+                  "7.01",
+                  "13.01",
+                  "11.63",
+                  "0.603",
+                  "1.117"
                 ],
                 [
                   "micro/dict_str_key",
                   "micro",
-                  "33.29",
-                  "41.34",
-                  "20.42",
-                  "1.630",
-                  "2.040"
+                  "22.35",
+                  "35.53",
+                  "21.00",
+                  "1.065",
+                  "1.686"
                 ],
                 [
                   "micro/float_arith",
                   "micro",
-                  "2.34",
-                  "10.59",
-                  "9.56",
-                  "0.245",
-                  "1.119"
+                  "2.32",
+                  "11.35",
+                  "9.92",
+                  "0.234",
+                  "1.135"
                 ],
                 [
                   "micro/for_list",
                   "micro",
-                  "6.14",
-                  "23.77",
-                  "16.66",
-                  "0.368",
-                  "1.425"
+                  "6.67",
+                  "26.36",
+                  "17.34",
+                  "0.385",
+                  "1.528"
                 ],
                 [
                   "micro/fstring",
                   "micro",
-                  "6.58",
-                  "8.13",
-                  "3.47",
-                  "1.897",
-                  "2.349"
+                  "6.01",
+                  "8.48",
+                  "3.67",
+                  "1.638",
+                  "2.316"
                 ],
                 [
                   "micro/generator_iter",
                   "micro",
-                  "37.34",
-                  "41.57",
-                  "14.55",
-                  "2.566",
-                  "2.852"
+                  "13.93",
+                  "20.63",
+                  "15.05",
+                  "0.926",
+                  "1.343"
                 ],
                 [
                   "micro/global_read",
                   "micro",
-                  "21.53",
-                  "36.21",
-                  "50.67",
-                  "0.425",
-                  "0.715"
+                  "19.00",
+                  "41.04",
+                  "51.43",
+                  "0.369",
+                  "0.799"
                 ],
                 [
                   "micro/hasattr_miss",
                   "micro",
-                  "2.88",
-                  "4.73",
-                  "2.78",
-                  "1.038",
-                  "1.708"
+                  "1.58",
+                  "4.53",
+                  "2.87",
+                  "0.550",
+                  "1.576"
                 ],
                 [
                   "micro/hash_str",
                   "micro",
-                  "7.38",
-                  "9.73",
-                  "7.91",
-                  "0.932",
-                  "1.239"
+                  "4.17",
+                  "12.15",
+                  "8.01",
+                  "0.521",
+                  "1.526"
                 ],
                 [
                   "micro/instance_new",
                   "micro",
-                  "13.36",
-                  "15.39",
-                  "5.76",
-                  "2.319",
-                  "2.663"
+                  "7.70",
+                  "14.78",
+                  "6.04",
+                  "1.276",
+                  "2.482"
                 ],
                 [
                   "micro/int_arith",
                   "micro",
-                  "57.04",
-                  "70.28",
-                  "146.45",
-                  "0.390",
-                  "0.480"
+                  "57.91",
+                  "71.83",
+                  "152.33",
+                  "0.380",
+                  "0.478"
                 ],
                 [
                   "micro/list_append",
                   "micro",
-                  "4.86",
-                  "11.03",
-                  "5.11",
-                  "0.951",
-                  "2.155"
+                  "5.21",
+                  "12.75",
+                  "5.30",
+                  "0.983",
+                  "2.410"
                 ],
                 [
                   "micro/list_index",
                   "micro",
-                  "15.31",
-                  "25.85",
-                  "26.33",
-                  "0.581",
-                  "0.979"
+                  "7.97",
+                  "28.71",
+                  "27.51",
+                  "0.290",
+                  "1.034"
                 ],
                 [
                   "micro/listcomp_small",
                   "micro",
-                  "12.02",
-                  "13.85",
-                  "7.00",
-                  "1.718",
-                  "1.969"
+                  "7.12",
+                  "8.86",
+                  "7.43",
+                  "0.958",
+                  "1.198"
                 ],
                 [
                   "micro/math_sqrt",
                   "micro",
-                  "11.79",
-                  "16.90",
-                  "9.81",
-                  "1.202",
-                  "1.724"
+                  "7.58",
+                  "20.00",
+                  "10.18",
+                  "0.745",
+                  "1.980"
                 ],
                 [
                   "micro/method_call",
                   "micro",
-                  "14.41",
-                  "14.02",
-                  "8.46",
-                  "1.703",
-                  "1.633"
+                  "10.39",
+                  "17.98",
+                  "8.73",
+                  "1.190",
+                  "2.054"
                 ],
                 [
                   "micro/property_read",
                   "micro",
-                  "12.23",
-                  "13.18",
-                  "9.10",
-                  "1.344",
-                  "1.452"
+                  "1.98",
+                  "14.63",
+                  "9.21",
+                  "0.215",
+                  "1.580"
                 ],
                 [
                   "micro/range_loop",
                   "micro",
-                  "19.55",
-                  "52.26",
-                  "100.33",
-                  "0.195",
-                  "0.525"
+                  "23.34",
+                  "51.48",
+                  "105.09",
+                  "0.222",
+                  "0.488"
                 ],
                 [
                   "micro/str_long_len_index",
                   "micro",
-                  "4.78",
-                  "6.84",
-                  "6.86",
-                  "0.698",
-                  "0.996"
+                  "4.07",
+                  "6.49",
+                  "7.14",
+                  "0.570",
+                  "0.902"
                 ],
                 [
                   "micro/str_methods",
                   "micro",
-                  "22.03",
-                  "23.17",
-                  "7.48",
-                  "2.946",
-                  "3.108"
+                  "14.64",
+                  "22.70",
+                  "7.79",
+                  "1.879",
+                  "3.040"
                 ],
                 [
                   "micro/super_call",
                   "micro",
-                  "14.79",
-                  "14.23",
-                  "8.32",
-                  "1.778",
-                  "1.712"
+                  "12.31",
+                  "16.39",
+                  "8.71",
+                  "1.413",
+                  "1.901"
                 ],
                 [
                   "micro/try_raise_catch",
                   "micro",
-                  "22.13",
-                  "24.33",
-                  "8.87",
-                  "2.494",
-                  "2.731"
+                  "2.85",
+                  "4.05",
+                  "9.35",
+                  "0.305",
+                  "0.444"
                 ],
                 [
                   "micro/tuple_swap",
                   "micro",
-                  "0.75",
-                  "1.67",
-                  "2.91",
-                  "0.258",
-                  "0.570"
+                  "0.76",
+                  "1.74",
+                  "2.98",
+                  "0.257",
+                  "0.578"
                 ],
                 [
                   "micro/tuple_unpack",
                   "micro",
-                  "6.27",
-                  "10.82",
-                  "9.11",
-                  "0.688",
-                  "1.186"
+                  "3.78",
+                  "11.68",
+                  "9.44",
+                  "0.400",
+                  "1.233"
                 ],
                 [
                   "macro/fib_recursive",
                   "macro",
-                  "38.88",
-                  "38.90",
-                  "22.08",
-                  "1.761",
-                  "1.758"
+                  "1.36",
+                  "63.89",
+                  "22.98",
+                  "0.059",
+                  "2.755"
                 ],
                 [
                   "macro/json_roundtrip",
                   "macro",
-                  "6.72",
-                  "6.70",
-                  "7.81",
-                  "0.860",
-                  "0.856"
+                  "8.07",
+                  "7.27",
+                  "8.20",
+                  "0.984",
+                  "0.887"
                 ],
                 [
                   "macro/nbody",
                   "macro",
-                  "12.42",
-                  "17.03",
-                  "9.08",
-                  "1.367",
-                  "1.877"
+                  "7.51",
+                  "19.18",
+                  "9.40",
+                  "0.799",
+                  "2.054"
                 ],
                 [
                   "macro/oo_simulation",
                   "macro",
-                  "23.56",
-                  "22.76",
-                  "12.73",
-                  "1.851",
-                  "1.789"
+                  "25.67",
+                  "23.99",
+                  "13.14",
+                  "1.953",
+                  "1.837"
                 ],
                 [
                   "macro/sort_heapq",
                   "macro",
-                  "12.09",
-                  "11.23",
-                  "5.84",
-                  "2.072",
-                  "1.928"
+                  "7.91",
+                  "7.83",
+                  "6.29",
+                  "1.259",
+                  "1.269"
                 ],
                 [
                   "macro/word_count",
                   "macro",
-                  "20.38",
-                  "19.20",
-                  "9.99",
-                  "2.040",
-                  "1.926"
+                  "18.59",
+                  "17.37",
+                  "10.41",
+                  "1.786",
+                  "1.654"
                 ]
               ]
             },
             {
               "type": "p",
-              "text": "With its JIT, Zipp's Python is faster than CPython on 15 of 36 programs; over the micro kernels it takes 0.916× CPython's time, over the application-shaped programs 1.591×, and over all 36 programs 1.004× (1.067× in the previous capture); without the JIT Zipp is 1.422×. Counting the whole process, Zipp's faster start makes it 0.494× CPython's wall time. No intervals are computed for these geometric means; the [JIT](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_fcfb1934_2026-10-29.json) and [no-JIT](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_nojit_fcfb1934_2026-10-29.json) artifacts hold every observation."
+              "text": "With its JIT, Zipp 0.0.40's Python is faster than CPython 3.13.14 on **26 of 36** programs (up from 15 of 36 in v0.0.31): over the micro kernels it takes **0.601×** CPython's time, over the application-shaped macro programs **0.767×**, and over all 36 programs **0.626×** (down from 1.004× in v0.0.31); whole-process wall time is **0.456×** with the JIT and 0.537× without it. Artifacts: [`bench/python/cpython_0cd3eab8_2026-11-24.json`](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_0cd3eab8_2026-11-24.json) and [`bench/python/cpython_nojit_0cd3eab8_2026-11-24.json`](https://github.com/f2i-com/zipp.org/blob/main/bench/python/cpython_nojit_0cd3eab8_2026-11-24.json)."
             }
           ]
         },
@@ -3444,7 +3588,7 @@
         "sandboxed scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "The embedding model",
@@ -3457,7 +3601,7 @@
               "type": "code",
               "caption": "Cargo.toml",
               "lang": "toml",
-              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.37\" }"
+              "code": "[dependencies]\nzipp-vm = { git = \"https://github.com/f2i-com/zipp.org\", tag = \"v0.0.40\" }"
             },
             {
               "type": "code",
@@ -3497,11 +3641,11 @@
               "type": "code",
               "caption": "host.js, inside a dedicated Worker",
               "lang": "javascript",
-              "code": "import { loadZipp } from './zipp.mjs'\nconst { Engine } = await loadZipp('./zipp-0.0.37-javascript.wasm')\n\nconst engine = new Engine()\nengine.setSyncHostCapabilities(['db.query', 'ls.getItem'])\nengine.setDbBridge(tenantScopedDb)\nengine.setLocalStorageBridge(tenantScopedStorage)\nengine.setInstructionBudget(500_000_000)\nengine.initScript(source)\n\n// Later entries, same globals:\nconst rendered = engine.callFunction('render', [{ user: 'ada' }])\nfor (const call of engine.drainPendingHostCalls()) {\n  engine.resolveHostCallback(call.id, await handle(call))\n}\nengine.pump()"
+              "code": "import { loadZipp } from './zipp.mjs'\nconst { Engine } = await loadZipp('./zipp-0.0.40-javascript.wasm')\n\nconst engine = new Engine()\nengine.setSyncHostCapabilities(['db.query', 'ls.getItem'])\nengine.setDbBridge(tenantScopedDb)\nengine.setLocalStorageBridge(tenantScopedStorage)\nengine.setInstructionBudget(500_000_000)\nengine.initScript(source)\n\n// Later entries, same globals:\nconst rendered = engine.callFunction('render', [{ user: 'ada' }])\nfor (const call of engine.drainPendingHostCalls()) {\n  engine.resolveHostCallback(call.id, await handle(call))\n}\nengine.pump()"
             },
             {
               "type": "p",
-              "text": "The Worker is the lifetime boundary: a deadline timer in the page calls `worker.terminate()` and creates a fresh one. `host-sdk/` in the repository is a reference adapter tested in real Chromium, Firefox and WebKit Workers. From v0.0.37, `addAppBridge(namespace, bridge)` composes multiple external plugin bridges (such as XDB SQLite on `app.sql.*` for `PhpApp` and Rust SQLx apps) with shared step metering via `hostStepsRemaining()` and `hostChargeSteps(n)`, and the [WebAssembly page](/wasm/) lists every limit the module enforces."
+              "text": "The Worker is the lifetime boundary: a deadline timer in the page calls `worker.terminate()` and creates a fresh one. `host-sdk/` in the repository is a reference adapter tested in real Chromium, Firefox and WebKit Workers. From v0.0.40, `addAppBridge(namespace, bridge)` composes multiple external plugin bridges (such as XDB SQLite on `app.sql.*` for `PhpApp` and Rust SQLx apps) with shared step metering via `hostStepsRemaining()` and `hostChargeSteps(n)`, and the [WebAssembly page](/wasm/) lists every limit the module enforces."
             },
             {
               "type": "p",
@@ -3589,7 +3733,7 @@
         "capability-based scripting"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "Three profiles",
@@ -3640,7 +3784,42 @@
           "blocks": [
             {
               "type": "p",
-              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.37 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it. To run the same sandbox in a page of your own, start from the [embed section of the home page](/#embed): an engine `.wasm`, `zipp.mjs` and a starter project."
+              "text": "The [sandbox playground](/sandbox/playground/) runs JavaScript in a sandbox of the 0.0.40 WebAssembly loader, `zipp.mjs`, with a switch for each permission (storage, files, network, host functions) and each limit (steps and time). Run a program with a permission off to see the refusal, switch it on to see what the program gets, or run a loop that never ends and watch the limit stop it. To run the same sandbox in a page of your own, start from the [embed section of the home page](/#embed): an engine `.wasm`, `zipp.mjs` and a starter project."
+            }
+          ]
+        },
+        {
+          "id": "softn-containers",
+          "heading": "SoftN & FormLogic web app containers",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "[SoftN](https://softn.com) (`@softn/container`) packages complete, full-stack web applications as signed `.softn` ZIP bundles and runs untrusted frontend and backend code directly inside a host browser page without iframes leaking ambient authority or servers spinning up per-tenant containers. [FormLogic](https://formlogic.com) uses SoftN containers to let visitors preview marketplace apps safely in their browser before deploying the exact same bundle to a FormLogic backend."
+            },
+            {
+              "type": "steps",
+              "items": [
+                {
+                  "title": "Closed Shadow DOM & virtual DOM patch protocol",
+                  "text": "Guest frontend code never receives a real `window`, `document`, `cookie`, `localStorage`, or `fetch` reference. The container mounts a closed Shadow DOM root and mirrors a sanitized virtual DOM inside a ZIPP WASM Web Worker (`zipp-javascript-lite` or `zipp-javascript`). User clicks become serialized events sent into the worker; DOM updates return as validated patches."
+                },
+                {
+                  "title": "Isolated Backend ZIPP Worker (PHP 8.x, Python 3.13, Rust, or JS)",
+                  "text": "HTTP calls (`fetch(\"/api/...\")`) never leave the tab. The container intercepts them and dispatches them into a second ZIPP WASM Web Worker running the app's actual backend — such as PHP 8.x (`PhpApp` SAPI) or Slim 4 — inside its own `safe-sandbox` linear memory and instruction meter."
+                },
+                {
+                  "title": "Per-app XDB SQLite 3 via addAppBridge",
+                  "text": "SQL queries (`PDO` / `mysqli` / `sqlx`) cross ZIPP's audited synchronous bridge (`addAppBridge(\"sql\", ...)`) into an isolated, app-scoped XDB SQLite 3 WASM database. Each app gets its own schema and persisted state without touching host storage or other apps."
+                },
+                {
+                  "title": "Default-deny manifest permissions & portable deployment",
+                  "text": "Capabilities such as network access, clipboard, or extra bridges remain closed unless explicitly declared in `manifest.json` / `permission.json` and granted by the host. When a user moves from preview to production on FormLogic, the same `.softn` archive runs natively with zero code changes."
+                }
+              ]
+            },
+            {
+              "type": "p",
+              "text": "Try two real FormLogic apps — **Kiln & Wheel Pottery Studio** (HTML/JS + PHP 8 PDO + SQLite 3) and **BrewDesk Café Ops** (Slim 4 + PHP 8 + SQLite 3) — live inside SoftN containers on ZIPP v0.0.40 WASM in the [FormLogic × SoftN container demo](/container-demo/), complete with an inspector showing the bundle manifest, PHP source, SQLite schema, and bridge events."
             }
           ]
         },
@@ -3722,6 +3901,10 @@
       ],
       "related": [
         {
+          "label": "FormLogic × SoftN live container demo",
+          "href": "/container-demo/"
+        },
+        {
           "label": "WebAssembly runtime and every limit",
           "href": "/wasm/"
         },
@@ -3755,7 +3938,7 @@
         "JavaScript engine written in Rust"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
           "heading": "At a glance",
@@ -3935,11 +4118,11 @@
     },
     {
       "slug": "releases",
-      "title": "Zipp Releases: v0.0.1 to v0.0.37, Downloads and Notes",
-      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.37 on 20 November 2026, with what changed, how releases are gated, and what each download contains.",
+      "title": "Zipp Releases: v0.0.1 to v0.0.40, Downloads and Notes",
+      "description": "Every Zipp release from v0.0.1 on 30 August 2026 to v0.0.40 on 24 November 2026, with what changed, how releases are gated, and what each download contains.",
       "h1": "Zipp releases",
       "breadcrumb": "Releases",
-      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine (each also Brotli-compressed, as `.wasm.br`), and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Thirty-seven tags shipped between 30 August and 20 November 2026. This page lists them, explains what a release has to pass, and links the notes.",
+      "lede": "Zipp publishes GitHub Releases only. Since v0.0.26 they are plain files: the native CLI for Windows x86-64, as a portable `.exe` and an `.msi` installer, and for Linux x86-64, arm64 and armv7, one `.wasm` file per WebAssembly engine (each also Brotli-compressed, as `.wasm.br`), and an embed kit; up to v0.0.25 they were x86-64 CLI archives for Windows and Linux and WebAssembly archives. Forty tags shipped between 30 August and 24 November 2026. This page lists them, explains what a release has to pass, and links the notes.",
       "keywords": [
         "Zipp releases",
         "Zipp download",
@@ -3948,30 +4131,30 @@
         "Zipp changelog"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "sections": [
         {
-          "heading": "Latest: v0.0.37, 20 November 2026",
+          "heading": "Latest: v0.0.40, 24 November 2026",
           "blocks": [
             {
               "type": "p",
-              "text": "A major polyglot and performance release adding full **PHP 8.x** and **Rust** frontends and WebAssembly modules (`javascript-php` and `javascript-rust`), **Python 3.13** syntax and stdlib parity with new JIT fast paths, composable sandboxed plugin bridges (`addAppBridge`) with shared instruction metering, JS VM and Tier-C/Tier-O JIT speedups, and an updated Test262 pin (`2e58f87d83`, 96,563 / 96,564 unmodified). The [benchmarks page](/benchmarks/) still shows v0.0.31's profile-guided capture; [docs/releases/0.0.37.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.37.md) and [docs/releases/0.0.36.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.36.md) give the full notes for both releases."
+              "text": "A major multi-round performance release delivering large speedups across real-world Python and JavaScript applications (`linkedom`, `defuddle`, `webforai`, `html2text`, `bs4_css`, `markdownify`), the official JS and Python benchmark suites (`0.58×` Node on `bench/real` with 13/13 wins; `0.62×` CPython on `tools/python_bench.py` with 26/36 wins), the regex engine (`1.90×` Node), WebAssembly / `safe-sandbox` builds, and the PHP and Rust runtimes — plus readable JS function names in Linux JIT perf-map labels (PR [#110](https://github.com/f2i-com/zipp.org/pull/110) by [@codeandsolder](https://github.com/codeandsolder)). See [docs/releases/0.0.40.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.40.md), [docs/releases/0.0.39.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.39.md), and [docs/releases/0.0.38.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.38.md) for the full notes across all three releases."
             },
             {
               "type": "ul",
               "items": [
-                "New, PHP 8.x frontend, HTTP SAPI/Worker Mode and WASM (`zipp-0.0.37-javascript-php.wasm`): pure-Rust dual-mode HTML/PHP parser, PSR-4 autoloading, OOP/traits/enums/reflection, byte-for-byte Laravel 11 / Slim 4 / CakePHP 5 parity against PHP 8.4.15, selective x86-64 JIT, persistent `ZPO2` disk OPcache, and `PhpApp` with `PDO`/`mysqli` over host-owned `app.sql.*`.",
-                "New, Rust frontend, Axum/SQLx backend support and WASM (`zipp-0.0.37-javascript-rust.wasm`): pure-Rust parser, `Cargo.toml` + multi-file module discovery, `zipp rs --test` / `--serve` / `--watch`, Axum 0.7 routing/extractors/middleware/WebSockets, SQLx over `app.sql.*`, `serde`/`argon2`/`jsonwebtoken`/`uuid`, and binary-safe VFS overlay persistence.",
-                "Python 3.13 parity and JIT acceleration: `async`/`await`, `except*`, PEP 695 type parameters, `asyncio`/`fractions`/`numbers` stdlib modules, frame-less acyclic leaf calls (`py_leaf`), self-recursive x86-64 micro-JIT (`py_rec`), inline list/tuple/math JIT paths and fast generator stepping.",
-                "Composable sandboxed plugin bridges and shared metering: `addAppBridge(namespace, bridge)` in `zipp-wasm`, unified `HostCtx::steps_remaining`/`charge_steps`, and `hostStepsRemaining`/`hostChargeSteps` exports without expanding the audited 51-function WASM import surface.",
-                "JavaScript VM, parser, JIT and Test262: skip-body preparser, megamorphic property/index/call memos, 24/32-slot value slabs, minor-GC ephemeron/root delta paths, Tier-O `TaggedTruthy` `SmallBigInt` fix, and Test262 moved to `2e58f87d83` (96,563 / 96,564 core, 492 / 492 DateTimeFormat) with 18 newly covered failures fixed.",
-                "v0.0.36 (17 November, not described here before): fixed a minor-GC nursery bug where setup's unused object-literal batch could leave a live closure unrecorded; added ten more operations to the x86-64 loop runner (`new`, `super`, `in`, `instanceof`, `Object.keys`, `Array.isArray`, computed compound keys, `~x`), paged Unicode case mapping, and faster string/position parsing.",
-                "WebAssembly modules: eight modules in v0.0.37. As published on the wire (Brotli-11), `javascript` is 1.27 MB, ZIPP Lite 0.79 MB, `javascript-typescript` 1.34 MB, `javascript-php` 1.48 MB, `javascript-rust` 1.47 MB, `javascript-python-base` 1.70 MB, `javascript-python` 2.08 MB, and `torch-package` 0.40 MB. Loader `zipp.mjs` 1.5.0 and host SDK 1.4.0."
+                "Linux JIT perf-map function labels (PR [#110](https://github.com/f2i-com/zipp.org/pull/110), by [@codeandsolder](https://github.com/codeandsolder)): appends sanitized JS function names (`fn{id}_{name}_{tier}`, capped to 64 ASCII-safe characters) to `ZIPP_PERF_MAP=1` symbols with zero overhead when perf-map profiling is off.",
+                "JavaScript VM, x86-64 JIT & allocator throughput: prevents enclosing `MEM` OSR regions from shadowing inner `INT`/`DOUBLE` loops, adds an exact IEEE-754 4×-unrolled `Float32Array`/`Float64Array` MAC inner-loop prefix, widens `class_member_cache`, adds inline megamorphic class getter/setter dispatch, eliminates unconditional `array_snapshot` clones in `find`/`some`/`every`/`reduce`/`forEach`, adds `replaceAll`/`match`/`split` and `Set`/`Map`/`String` JIT iterator fast paths, plus a 2048-slot `static_append_shape_cache` and `Closure`/`PyAttrs` slot recycling.",
+                "Python VM, JIT & runtime throughput (`0.62×` CPython geomean, 26/36 wins): raises `PyAttrs` `DEPTH_MAX` from 64 to 128 so large stateful objects like `html2text.HTML2Text` stay in layout mode, routes hot object allocations through `OnceLock<StaticKeyPlan>` ready-object pools, caches `STR_HAS_SURROGATE` in `JsStr::memo_state` for O(1) BMP Unicode, adds native `PyTable` hashing and subscripting/len/truth for unmodified `str`/`tuple` subclasses (`NavigableString`, `NamedTuple`), fused `PyTruth` with inline x86-64 fast path, and `memchr`-backed `py_in`.",
+                "Regex (`regress-fork`), WebAssembly / `safe-sandbox`, and PHP/Rust O(1) fixes: `regress-fork` start-predicate extraction, UTF-16 `unit_may_start` prefiltering, and `MatchAttempter` scratch reuse (`1.90×` Node geomean, `literal-utf16` `4.0× -> 0.82×`); pure-safe interpreter IC hits, metered superinstructions, and faster `to_js_bounded` JSON marshalling in WASM (zero `unsafe`, same 51-function import surface); PHP `array_pop` (~65×), PHP cursor loop (~180×), and Rust `VecDeque`/`BTreeMap`/`String::pop` (8.6×) O(N²) fixes.",
+                "v0.0.39 (23 November): exact byte-for-byte Python CLI raw stdout/stderr streaming past 64 KiB with `sys.stdout.buffer` (#108), O(N²) Python string slicing/searching fixes (cutting a 75 KiB `html.parser` parse from `10.1 s` to `66.9 ms`, ~151×), full `textwrap` keyword options, `%RegExp.prototype%` `@@split` fast-slot fix, and pooled `NewPlannedObject` allocation.",
+                "v0.0.38 (22 November): Node ESM `import.meta.resolve` and `process.exitCode` (#99), 23 new Apache-2.0 Python stdlib modules (`html.parser`, `urllib`, `datetime`, `tomllib`, `unittest`, `logging`, `tempfile`, `base64`, `binascii`, `shlex`, etc.) running unmodified `html2text`, `markdownify`/`bs4`, and `PyYAML` byte-for-byte against CPython, zero-dependency RFC 1950/1951 `zlib`/`ZIP_DEFLATED`, universal newline translation (#105), linear Python `re` astral offsets (#107), and DOM/HTML JIT throughput (#101).",
+                "WebAssembly modules: eight modules in v0.0.40. On the wire (Brotli-11), `javascript` is 1.28 MB, ZIPP Lite 0.80 MB, `javascript-typescript` 1.35 MB, `javascript-php` 1.49 MB, `javascript-rust` 1.48 MB, `javascript-python-base` 1.84 MB, `javascript-python` 2.21 MB, and `torch-package` 0.40 MB. Loader `zipp.mjs` 1.5.0 and host SDK 1.4.0."
               ]
             },
             {
               "type": "table",
-              "caption": "v0.0.37 assets",
+              "caption": "v0.0.40 assets",
               "head": [
                 "Asset",
                 "Bytes",
@@ -3979,131 +4162,125 @@
               ],
               "rows": [
                 [
-                  "`zipp-0.0.37-windows-x86_64-portable.exe`",
-                  "30,794,240",
+                  "`zipp-0.0.40-windows-x86_64-portable.exe`",
+                  "31,770,624",
                   "Native CLI for Windows x86-64, complete: JavaScript/TypeScript with x86-64 JIT, Node programs, WebAssembly on Wasmtime, Python 3.13 with JIT and torch, PHP 8.x with HTTP Worker Mode, Rust with `--test`/`--serve`/`--watch`, and native GPU; runs from anywhere"
                 ],
                 [
-                  "`zipp-0.0.37-windows-x86_64-installer.msi`",
-                  "9,662,464",
+                  "`zipp-0.0.40-windows-x86_64-installer.msi`",
+                  "9,961,472",
                   "The same CLI as a per-user install into `%LOCALAPPDATA%\\Programs\\ZIPP` that adds `zipp` to the user's PATH; no administrator rights"
                 ],
                 [
-                  "`zipp-0.0.37-linux-x86_64`",
-                  "36,576,976",
+                  "`zipp-0.0.40-linux-x86_64`",
+                  "37,617,352",
                   "Native CLI for Linux x86-64, same contents; glibc 2.35 or later, `chmod +x` after downloading"
                 ],
                 [
-                  "`zipp-0.0.37-linux-arm64`",
-                  "27,599,032",
+                  "`zipp-0.0.40-linux-arm64`",
+                  "28,346,152",
                   "Native CLI for 64-bit Arm Linux"
                 ],
                 [
-                  "`zipp-0.0.37-linux-armv7`",
-                  "23,960,636",
+                  "`zipp-0.0.40-linux-armv7`",
+                  "24,760,364",
                   "Native CLI for 32-bit Arm Linux with hard float, interpreter only, WebAssembly on wasmi"
                 ],
                 [
-                  "`zipp-0.0.37-javascript.wasm`",
-                  "4,913,223",
-                  "JavaScript engine, with `Intl` and `Temporal`, for pages, Workers, Node, Deno and Bun"
+                  "`zipp-0.0.40-javascript.wasm`",
+                  "4,947,842",
+                  "JavaScript engine, with `Intl` and `Temporal`, bindings embedded"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-lite.wasm`",
-                  "2,878,928",
-                  "ZIPP Lite: the JavaScript core without `Intl` and `Temporal`, built for size"
+                  "`zipp-0.0.40-javascript.wasm.br`",
+                  "1,276,646",
+                  "The same compressed with Brotli (quality 11)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-typescript.wasm`",
-                  "5,250,935",
-                  "The JavaScript engine with TypeScript and TSX; `zipp.mjs` 1.5.0 runs a TypeScript program in it"
+                  "`zipp-0.0.40-javascript-lite.wasm`",
+                  "2,906,344",
+                  "ZIPP Lite: JavaScript core without `Intl` and `Temporal`, built for size"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-python.wasm`",
-                  "8,942,154",
-                  "JavaScript + Python 3.13 with torch built in"
+                  "`zipp-0.0.40-javascript-lite.wasm.br`",
+                  "797,433",
+                  "The same compressed with Brotli (quality 11)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-python-base.wasm`",
-                  "6,905,076",
-                  "JavaScript + Python 3.13 without torch"
+                  "`zipp-0.0.40-javascript-typescript.wasm`",
+                  "5,285,552",
+                  "JavaScript and TypeScript (with TSX)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-php.wasm`",
-                  "6,038,525",
-                  "JavaScript + PHP 8.x, with `PhpApp` SAPI/Worker Mode and `PDO`/`mysqli` SQL bridge"
+                  "`zipp-0.0.40-javascript-typescript.wasm.br`",
+                  "1,347,702",
+                  "The same compressed with Brotli (quality 11)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-rust.wasm`",
-                  "5,954,532",
-                  "JavaScript + Rust, with binary VFS overlay and Axum/SQLx worker-boot"
+                  "`zipp-0.0.40-javascript-php.wasm`",
+                  "6,076,074",
+                  "JavaScript and PHP 8.x, with `PhpApp` SAPI and SQL bridge"
                 ],
                 [
-                  "`zipp-0.0.37-torch-package.wasm`",
+                  "`zipp-0.0.40-javascript-php.wasm.br`",
+                  "1,490,335",
+                  "The same compressed with Brotli (quality 11)"
+                ],
+                [
+                  "`zipp-0.0.40-javascript-rust.wasm`",
+                  "5,994,592",
+                  "JavaScript and Rust, with binary VFS overlay and Axum/SQLx worker-boot"
+                ],
+                [
+                  "`zipp-0.0.40-javascript-rust.wasm.br`",
+                  "1,476,751",
+                  "The same compressed with Brotli (quality 11)"
+                ],
+                [
+                  "`zipp-0.0.40-javascript-python-base.wasm`",
+                  "7,599,903",
+                  "JavaScript and Python 3.13, torch omitted; loads the torch package at run time"
+                ],
+                [
+                  "`zipp-0.0.40-javascript-python-base.wasm.br`",
+                  "1,836,474",
+                  "The same compressed with Brotli (quality 11)"
+                ],
+                [
+                  "`zipp-0.0.40-torch-package.wasm`",
                   "2,163,109",
-                  "The torch package, added to the `-javascript-python-base` engine when a program needs it"
+                  "The torch package for the `-python-base` engine"
                 ],
                 [
-                  "`zipp-0.0.37-javascript.wasm.br`",
-                  "1,268,242",
-                  "The JavaScript engine compressed with Brotli: the same module at about a quarter of the size. Serve it with `Content-Encoding: br` and `Content-Type: application/wasm` and the browser decodes it, or let `zipp.mjs` 1.5.0 load it"
+                  "`zipp-0.0.40-torch-package.wasm.br`",
+                  "403,356",
+                  "The same compressed with Brotli (quality 11)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-lite.wasm.br`",
-                  "788,538",
-                  "ZIPP Lite, Brotli-compressed"
+                  "`zipp-0.0.40-javascript-python.wasm`",
+                  "9,640,441",
+                  "JavaScript and Python 3.13 with torch built in"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-typescript.wasm.br`",
-                  "1,338,703",
-                  "The TypeScript engine, Brotli-compressed"
+                  "`zipp-0.0.40-javascript-python.wasm.br`",
+                  "2,214,700",
+                  "The same compressed with Brotli (quality 11)"
                 ],
                 [
-                  "`zipp-0.0.37-javascript-python.wasm.br`",
-                  "2,078,280",
-                  "JavaScript + Python 3.13 with torch, Brotli-compressed"
-                ],
-                [
-                  "`zipp-0.0.37-javascript-python-base.wasm.br`",
-                  "1,702,286",
-                  "JavaScript + Python 3.13 without torch, Brotli-compressed"
-                ],
-                [
-                  "`zipp-0.0.37-javascript-php.wasm.br`",
-                  "1,480,745",
-                  "JavaScript + PHP 8.x, Brotli-compressed"
-                ],
-                [
-                  "`zipp-0.0.37-javascript-rust.wasm.br`",
-                  "1,466,783",
-                  "JavaScript + Rust, Brotli-compressed"
-                ],
-                [
-                  "`zipp-0.0.37-torch-package.wasm.br`",
-                  "403,538",
-                  "The torch package, Brotli-compressed"
-                ],
-                [
-                  "`zipp-0.0.37-wasm-embed-kit.zip`",
-                  "220,134",
-                  "The loader `zipp.mjs` 1.5.0, the one file a page needs beside an engine, with its TypeScript types, the engine API types, the host SDK, the GPU lab, the docs and examples"
+                  "`zipp-0.0.40-wasm-embed-kit.zip`",
+                  "220,131",
+                  "`zipp.mjs` (1.5.0) and types, host SDK (1.4.0), engine types, GPU adapter, docs and examples"
                 ],
                 [
                   "`SHA256SUMS`",
                   "2,203",
-                  "Checksums for all 22 files above"
+                  "SHA-256 checksums for every file in the release"
                 ]
               ]
             },
             {
-              "type": "callout",
-              "tone": "warning",
-              "title": "Experimental boundaries",
-              "text": "The Python and Torch support is a subset, not CPython or a drop-in PyTorch. The Python JIT tier is x86-64 and command-line only; WebAssembly stays interpreted. Browser GPU results arrive through callbacks because browser GPU completion is asynchronous; natively they are synchronous. CUDA is not provided, and large float32 matmuls are still slower than CUDA's. The local-model plugins remain source only, and same-VM Python and JavaScript interop remains a separate opt-in source build that no published engine enables."
-            },
-            {
               "type": "p",
-              "text": "[Release notes and downloads on GitHub](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.37) · [docs/releases/0.0.37.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.37.md) · [v0.0.36 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.36.md) · [v0.0.35 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.35.md) · [v0.0.34 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.34.md) · [v0.0.33 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.33.md) · [v0.0.32 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.32.md) · [v0.0.30 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.30.md) · [v0.0.29 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.29.md) · [v0.0.28 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.28.md) · [v0.0.27 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.27.md) · [v0.0.26 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.26.md) · [v0.0.25 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.25.md) · [v0.0.24 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.24.md) · [v0.0.23 notes](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.23.md)"
+              "text": "Release page and checksums: [github.com/f2i-com/zipp.org/releases/tag/v0.0.40](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.40)."
             }
           ]
         },
@@ -4114,7 +4291,7 @@
               "type": "code",
               "caption": "From a release download",
               "lang": "shell",
-              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.37-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.37-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.37-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# WebAssembly, for a web page: the loader zipp.mjs from the embed kit, and one\n# engine (or its .wasm.br: the same engine, about a quarter of the size)\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-wasm-embed-kit.zip\nunzip -j zipp-0.0.37-wasm-embed-kit.zip zipp-0.0.37-wasm-embed-kit/zipp.mjs\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.37/zipp-0.0.37-javascript.wasm\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
+              "code": "# Windows: the portable .exe runs from wherever you saved it\n.\\zipp-0.0.40-windows-x86_64-portable.exe js app.js\n# or install zipp-0.0.40-windows-x86_64-installer.msi, which adds zipp to\n# your PATH without administrator rights\nzipp js app.js\n\n# Linux x86-64 (zipp-0.0.40-linux-arm64 or -linux-armv7 on Arm), glibc 2.35+\ncurl -fL -o zipp https://github.com/f2i-com/zipp.org/releases/download/v0.0.40/zipp-0.0.40-linux-x86_64\nchmod +x zipp\n./zipp js app.js\n\n# WebAssembly, for a web page: the loader zipp.mjs from the embed kit, and one\n# engine (or its .wasm.br: the same engine, about a quarter of the size)\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.40/zipp-0.0.40-wasm-embed-kit.zip\nunzip -j zipp-0.0.40-wasm-embed-kit.zip zipp-0.0.40-wasm-embed-kit/zipp.mjs\ncurl -fLO https://github.com/f2i-com/zipp.org/releases/download/v0.0.40/zipp-0.0.40-javascript.wasm\n\n# From source, any platform with Rust 1.92\ngit clone https://github.com/f2i-com/zipp.org && cd zipp.org\ncargo build --locked --release\n./target/release/zipp --version --json"
             },
             {
               "type": "p",
@@ -4147,6 +4324,21 @@
                 "Headline"
               ],
               "rows": [
+                [
+                  "[v0.0.40](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.40)",
+                  "2026-11-24",
+                  "Multi-round performance across real-world JS/Python apps, `bench/real` (`0.58×` Node, 13/13 wins), Python (`0.62×` CPython, 26/36 wins), regex (`1.90×` Node), hostile (3/4 flipped), WASM `safe-sandbox` IC/superinstructions, PHP/Rust O(1) fixes, and PR #110 Linux JIT perf-map function labels"
+                ],
+                [
+                  "[v0.0.39](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.39)",
+                  "2026-11-23",
+                  "Exact byte-for-byte Python CLI raw stdout/stderr streaming past 64 KiB (#108), O(N²) Python string slicing/searching fixes (`html.parser` ~151×), full `textwrap` keywords, `%RegExp.prototype%` `@@split` fast-slot fix, and pooled `NewPlannedObject` allocation"
+                ],
+                [
+                  "[v0.0.38](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.38)",
+                  "2026-11-22",
+                  "Node ESM `import.meta.resolve` and `process.exitCode` (#99), 23 new Apache-2.0 Python stdlib modules running unmodified `html2text`/`markdownify`/`bs4`/`PyYAML` byte-for-byte vs CPython, zero-dependency `zlib`/`ZIP_DEFLATED`, universal newlines (#105), linear Python `re` astral offsets (#107), and DOM/HTML JIT speedups (#101)"
+                ],
                 [
                   "[v0.0.37](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.37)",
                   "2026-11-20",
@@ -4362,11 +4554,11 @@
     },
     {
       "slug": "journey",
-      "title": "The Zipp Story: A Polyglot Runtime in Rust in 177 Days",
-      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled runtime for JS, Python, PHP and Rust in 177 days.",
+      "title": "The Zipp Story: A Polyglot Runtime in Rust in 180 Days",
+      "description": "How Zipp went from a typed toy language on 29 May 2026 to a Test262-conformant, JIT-compiled runtime for JS, Python, PHP and Rust in 180 days.",
       "h1": "The Zipp story",
       "breadcrumb": "The story",
-      "lede": "Zipp's repository has 3,331 commits over 177 days, written almost entirely by one person, and it narrates its own mistakes in commit subjects. This is that history in nine acts, with dates and hashes. The [journal](/journal/) has the day-by-day entries.",
+      "lede": "3,346 commits over 180 days, from 29 May to 24 November 2026, in ten acts. Every claim links to the commit hash, the release or the report that backs it; the dead ends, the regressions and the bugs found by other people are kept in.",
       "keywords": [
         "building a JavaScript engine",
         "JavaScript engine in Rust history",
@@ -4375,7 +4567,7 @@
         "solo compiler project"
       ],
       "datePublished": "2026-09-14",
-      "dateModified": "2026-11-21",
+      "dateModified": "2026-11-24",
       "schemaType": "Article",
       "sections": [
         {
@@ -4385,14 +4577,14 @@
               "type": "stats",
               "items": [
                 {
-                  "value": "3,331",
-                  "label": "Commits from 29 May to 21 November 2026",
-                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 925 in October, 271 in November"
+                  "value": "3,346",
+                  "label": "Commits from 29 May to 24 November 2026",
+                  "note": "247 in May, 1,039 in June, 253 in July, 230 in August, 366 in September, 925 in October, 286 in November"
                 },
                 {
-                  "value": "37",
-                  "label": "Tagged releases in 83 days",
-                  "note": "v0.0.1 on 30 August to v0.0.37 on 20 November"
+                  "value": "40",
+                  "label": "Tagged releases in 86 days",
+                  "note": "v0.0.1 on 30 August to v0.0.40 on 24 November"
                 },
                 {
                   "value": "452,901",
@@ -4400,9 +4592,9 @@
                   "note": "501,978 with the regex engine that began as a fork, counted at v0.0.24"
                 },
                 {
-                  "value": "3",
+                  "value": "4",
                   "label": "Pull requests",
-                  "note": "Everything else landed on a linear trunk"
+                  "note": "Including PR #110 from @codeandsolder; everything else landed on a linear trunk"
                 }
               ]
             }
@@ -4546,6 +4738,23 @@
             {
               "type": "p",
               "text": "The fixes came within hours, most of them found running softn.com's apps in zipp-browser. The apps would not open on v0.0.31: minified code had named a method's local like its class, and an arrow inside the method saw the class (`08f34f83`). Their WebAssembly ran on wasmi, because a program of 256 functions or more starts with its JIT off for its size and v0.0.31 chose the runtime by that switch; WebAssembly now keeps Wasmtime unless the JIT is turned off (`b1ad3d32`). Wasmtime's runtime also kept every JavaScript value ever handed to WebAssembly, and an app grew from 3.6 GB to 9.1 GB in two minutes; a value is now let go once WebAssembly can no longer reach it (`8a907ba8`). `Reflect.set` and `Object.defineProperty` read a descriptor in place (`b952aca0`), `WebAssembly`'s members became writable as in a browser (`47dbb574`), and the WebAssembly modules hand a host its app's state as one JSON text instead of about eleven calls a property (`29f8dbdf`). The first release run of v0.0.32 then failed Test262 on one test the arrow fix had broken, a static initializer's arrow reading its class's name through `eval`; the fix (`e312cf40`) was tagged in its place, and v0.0.32 was published from it six hours after v0.0.31."
+            }
+          ]
+        },
+        {
+          "heading": "Act ten: five languages, real-world apps and web containers (30 October to 24 November)",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "November broadened Zipp on two axes at once: languages and real third-party applications. After v0.0.33–v0.0.36 added ready objects, lazy `try`, a threaded x86-64 loop runner whose handlers jump directly to each other, and paged Unicode case mapping, **v0.0.37** (20 November) landed full **PHP 8.x** (dual-mode HTML/PHP parser, Laravel 11 / Slim 4 / CakePHP 5 parity, HTTP Worker Mode, and `PhpApp` WASM) and **Rust** (pure-Rust parser, `Cargo.toml`, `#[test]`, Axum/SQLx, and WASM) frontends on the same register VM, alongside Python 3.13 parity (`async`/`await`, `except*`, PEP 695), composable `addAppBridge` plugins, and Test262 `2e58f87d83` (96,563 / 96,564)."
+            },
+            {
+              "type": "p",
+              "text": "Then outside stress testing arrived in force. Issues #99 through #108 from [@codeandsolder](https://github.com/codeandsolder) ran unmodified real-world HTML and DOM extraction packages (`linkedom`, `defuddle`, `webforai`, `html2text`, `markdownify` + BeautifulSoup4, `PyYAML`) and immediately surfaced real gaps: missing Node `import.meta.resolve` and `process.exitCode`, 23 missing Python stdlib modules, quadratic string slicing in `html.parser`, and silent 64 KiB stdout truncation in `zipp py`. **v0.0.38** (22 November, `8cb8399f`) shipped all 23 Apache-2.0 Python stdlib modules, `zlib`/`ZIP_DEFLATED`, universal newlines, `import.meta.resolve`, and DOM JIT speedups; **v0.0.39** (23 November, `ba4b6641`) fixed raw stdout streaming past 64 KiB, cut a 75 KiB `html.parser` parse from `10.1 s` to `66.9 ms` (~151×), and added pooled `NewPlannedObject` allocation."
+            },
+            {
+              "type": "p",
+              "text": "**v0.0.40** (24 November, `0cd3eab8`) merged PR [#110](https://github.com/f2i-com/zipp.org/pull/110) from `@codeandsolder` — adding readable sanitized JS function names to Linux `ZIPP_PERF_MAP=1` symbols — and executed multi-round profiling across every subsystem: widening `PyAttrs` to depth 128 and pooling hot Python objects (`0.62×` CPython geomean, 26/36 wins, and 1.71×–2.88× faster on `html2text`/`bs4_css`/`markdownify`); unlocking inner `DOUBLE` OSR loops, megamorphic class getters/setters, and `Set`/`Map`/`String` JIT iterators (`0.58×` Node on `bench/real`, 13/13 wins; 3 of 4 slowest `bench/hostile` rows flipped to beating Node); accelerating `regress-fork` (`1.90×` Node); re-enabling pure-safe interpreter ICs and superinstructions in `safe-sandbox` WASM; and eliminating O(N²) array/collection paths in PHP (~65×–180×) and Rust (8.6×). On the web side, [SoftN](https://softn.com) and [FormLogic](https://formlogic.com) put those WASM builds to work as isolated multi-VM browser app containers running live PHP 8 + SQLite 3 marketplace apps right inside the browser."
             }
           ]
         },
@@ -4751,6 +4960,16 @@
                   "date": "2026-11-20",
                   "title": "PHP 8.x and Rust frontends + WASM modules, Python 3.13 parity, composable plugin bridges, Test262 2e58f87d83; v0.0.37",
                   "text": "`6c8cd8e4`, `d6d5cc6b`, `c3d74be0`, `755a33c7`, `4fc42f3f`, `2b24920f`, `8c14de6b`, `84c2df00`, `a5c9ef93`."
+                },
+                {
+                  "date": "2026-11-23",
+                  "title": "23 Python stdlib modules, import.meta.resolve, raw stdout past 64 KiB, html.parser ~151× faster; v0.0.38 & v0.0.39",
+                  "text": "`92a049f8`, `8cb8399f`, `22a5fc77`, `ba4b6641`."
+                },
+                {
+                  "date": "2026-11-24",
+                  "title": "PR #110 perf-map function names, multi-round JS/Python/regex/WASM/PHP/Rust speedups (0.58× Node, 0.62× CPython); v0.0.40",
+                  "text": "`c0d2ed52`, `7ff044ab`, `52826c12`, `31756013`, `0cd3eab8`."
                 }
               ]
             }
@@ -5381,6 +5600,96 @@
     "searchPlaceholder": "nursery, Annex B, PGO, WebGPU…",
     "intro": [],
     "entries": [
+      {
+        "slug": "v0-0-40-real-world-speed-perf-maps-and-softn-containers",
+        "date": "2026-11-24",
+        "title": "v0.0.40: multi-round speedups, perf-map labels & SoftN containers",
+        "summary": "v0.0.40 merges PR #110 from @codeandsolder for Linux JIT perf-map function names and ships multi-round speedups across real-world JS/Python apps (1.55x-2.88x), official JS (0.58x Node) and Python (0.62x CPython) suites, regex, safe-sandbox WASM, and PHP/Rust, alongside live FormLogic x SoftN browser containers.",
+        "tags": [
+          "performance",
+          "python",
+          "javascript",
+          "wasm",
+          "release"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "**v0.0.40** (`0cd3eab8`) is a multi-round performance release spanning every part of the engine — and starts by thanking [@codeandsolder](https://github.com/codeandsolder) for PR [#110](https://github.com/f2i-com/zipp.org/pull/110), which appends sanitized JavaScript function names (`fn4264_querySelectorAll_whole-fn`) to Linux `ZIPP_PERF_MAP=1` JIT ranges while keeping zero overhead when perf-map profiling is off. Clearer profiles on DOM-heavy code directly guided the hot paths targeted in this release."
+          },
+          {
+            "type": "h3",
+            "text": "Measured wins (non-PGO fat-LTO v0.0.40 vs PGO v0.0.39, Node 24 & CPython 3.13)"
+          },
+          {
+            "type": "ul",
+            "items": [
+              "Canonical 15-rep PGO JS capture (`0cd3eab8`, `publishable:true`): **`0.583×` Node.js** equal-row all-30 geomean (Normal 13 `0.532×`, Hostile 17 `0.624×`), **29/30 wins** vs Node (only `allocation-survival` 1.141× left), `0.461×` Bun, `0.389×` Deno; pure interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`): **`0.430×` Bellard's QuickJS** (30/30 wins).",
+              "Canonical 15-rep Python `tools/python_bench.py` (published v0.0.40 PGO vs CPython 3.13.14): **`0.626×` CPython** in-process work time (`micro 0.601×`, `macro 0.767×`, **26/36 wins**; whole-process wall time `0.456×`).",
+              "Real-world apps (byte-identical output vs Node.js v24.19.0 / CPython 3.13): `html2text` **2.67×–2.88× faster** (`41.15 -> 14.31–15.39 ms`, wall `1.37×` CPython), `markdownify` **1.85×–1.94×**, `bs4_css` **1.71×–1.82×**, `linkedom` **1.55×** (`9.56 -> 6.14–6.21 ms`, wall `1.38×` Node), `defuddle` **1.09×–1.15×**, `webforai` **1.00×–1.05×**.",
+              "JS `bench/regex` (`2.44× -> 1.90×` Node; `literal-utf16` `4.0× -> 0.82×`), JS `bench/hostile` (3 of the 4 slowest stress tests flipped to beating Node), `safe-sandbox` WASM pure-safe IC hits & metered superinstructions, and PHP/Rust O(1) fixes (`array_pop` ~65×, PHP cursor loop ~180×, Rust collections 8.6×)."
+            ]
+          },
+          {
+            "type": "h3",
+            "text": "Why apps still trail V8 & CPython on warm loops — and what moved them"
+          },
+          {
+            "type": "p",
+            "text": "On Python apps, the biggest wins came from raising `PyAttrs` `DEPTH_MAX` from 64 to 128 (so `html2text.HTML2Text` with 84 instance fields stopped spilling to `PyTable`), routing hot allocations through `OnceLock<StaticKeyPlan>` pools, caching `STR_HAS_SURROGATE` in `JsStr::memo_state`, adding native `str`/`tuple` subclass hooks for `NavigableString` and `soupsieve` `NamedTuple`s, and fusing `PyTruth` with an inline x86-64 fast path. On JS apps, preventing enclosing `MEM` OSR regions from shadowing inner `INT`/`DOUBLE` loops, widening `class_member_cache`, adding megamorphic class getter/setter dispatch, eliminating `array_snapshot` clones, and enabling `Set`/`Map`/`String` JIT iterators cut steady-state overhead without touching conformance. Even so, warm megamorphic DOM loops still trail V8 TurboFan's speculative cross-callee inlining and CPython's C regex/HTML modules, and we publish both the v0.0.39->v0.0.40 speedups and the honest warm/wall ratios against Node and CPython on the [benchmarks page](/benchmarks/#v0-0-40-highlights)."
+          },
+          {
+            "type": "h3",
+            "text": "SoftN + FormLogic browser containers and a five-language playground"
+          },
+          {
+            "type": "p",
+            "text": "Alongside v0.0.40, zipp.org now embeds live [FormLogic](https://formlogic.com) marketplace apps running inside [SoftN](https://softn.com) (`@softn/container`) browser sandboxes on ZIPP v0.0.40 WASM: a closed Shadow DOM + VDOM Worker for the frontend, a PHP 8.x ZIPP Worker for the backend, and an app-scoped XDB SQLite 3 database bridged through `addAppBridge(\"sql\", ...)`. Launch **Kiln & Wheel Pottery Studio** or **BrewDesk Café Ops** in the [container demo](/container-demo/), or try ten new Python 3.13, PHP 8.x, and Rust examples directly in the [browser playground](/playground/). Full release notes: [docs/releases/0.0.40.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.40.md)."
+          }
+        ]
+      },
+      {
+        "slug": "v0-0-38-v0-0-39-python-stdlib-raw-stdout-and-dom-throughput",
+        "date": "2026-11-23",
+        "title": "23 Python stdlib modules, raw stdout streaming, and v0.0.38-0.0.39",
+        "summary": "Real-world HTML and DOM workloads from issues #99-#108 drove two back-to-back releases: Node import.meta.resolve and process.exitCode, 23 Apache-2.0 Python stdlib modules running unmodified html2text/markdownify/bs4/PyYAML byte-for-byte vs CPython, raw stdout past 64 KiB, and a ~151x html.parser speedup.",
+        "tags": [
+          "python",
+          "javascript",
+          "performance",
+          "release"
+        ],
+        "blocks": [
+          {
+            "type": "p",
+            "text": "Right after v0.0.37 landed five languages on one VM, [@codeandsolder](https://github.com/codeandsolder) opened issues #99 through #108 testing unmodified real-world JavaScript and Python HTML-extraction pipelines (`linkedom`, `defuddle`, `webforai`, `html2text`, `markdownify` + BeautifulSoup4, and pure-Python `PyYAML`). Every report came with a tight reproducer and exact expected output, turning two days of work into **v0.0.38** (22 November, `8cb8399f`) and **v0.0.39** (23 November, `ba4b6641`)."
+          },
+          {
+            "type": "h3",
+            "text": "What v0.0.38 landed"
+          },
+          {
+            "type": "ul",
+            "items": [
+              "Node ESM `import.meta.resolve(specifier, parent?)` sharing the real ESM resolver (`node:` builtins, `package.json` `exports`/`imports`, relative/file URLs) and `process.exitCode` propagation across scripts, modules, and TypeScript (#99).",
+              "23 original Apache-2.0 Python stdlib modules (`_markupbase`, `html`, `html.entities`, `html.parser`, `urllib.*`, `warnings`, `codecs`, `logging`, `copyreg`, `threading`, `binascii`, `base64`, `tempfile`, `datetime`, `shlex`, `tomllib`, `importlib.util`, `unittest`, `unittest.mock`), plus zero-dependency RFC 1950/1951 `zlib`/`ZIP_DEFLATED`, `shutil`, and universal newline translation (#100, #103, #104, #105).",
+              "Linear O(N) prefix-table astral offsets in Python `re` (#107), native `py_re_findall` and `pathlib` speedups (#102, cutting a 353-file / 31,770-match Markdown scan from `0.304 s` to `0.084 s`), non-identifier entry directories in `initPythonProject` (#106), and JS JIT DOM/HTML speedups (#101: WebforAI `216.6 -> 123.3 ms`, Defuddle `232.0 -> 174.8 ms`)."
+            ]
+          },
+          {
+            "type": "h3",
+            "text": "What v0.0.39 fixed the next day"
+          },
+          {
+            "type": "p",
+            "text": "Testing v0.0.38 on full-page HTML immediately exposed two sharp edges: native `zipp py` routed output through `inspect_line` (truncating silently at 64 KiB with `\"...\"` and appending newlines), and Python string slicing/searching called `codepoints(s)` inside every loop iteration, turning a 75 KiB `html.parser` run into a 10.1-second quadratic cliff."
+          },
+          {
+            "type": "p",
+            "text": "v0.0.39 added a dedicated raw output sink (`ScriptState::set_raw_output_sink` + `__zipp_py_write` + `sys.stdout.buffer` / `sys.stderr.buffer`) so `zipp py` streams arbitrary UTF-8 and binary output byte-for-byte while metered sandboxes still enforce `output_limit` loudly. Replacing quadratic string slicing with native ASCII step-1 slicing and a shared O(log K) surrogate cache cut that 75 KiB `html.parser` run from **`10.1 s` to `66.9 ms`** (~151× faster), completed `textwrap` keyword arguments so unmodified `html2text` matches CPython byte-for-byte with default `body_width=78`, fixed a missed `@@split` fast-slot registration on `%RegExp.prototype%`, and added slab-backed `Heap::alloc_planned_object` pooling. See [docs/releases/0.0.38.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.38.md) and [docs/releases/0.0.39.md](https://github.com/f2i-com/zipp.org/blob/main/docs/releases/0.0.39.md)."
+          }
+        ]
+      },
       {
         "slug": "php-rust-python-3-13-and-v0-0-37",
         "date": "2026-11-20",

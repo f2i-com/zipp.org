@@ -37,6 +37,7 @@ ErrorDocument 404 /404.html
 
 <IfModule mod_mime.c>
   AddType application/wasm .wasm
+  AddType application/octet-stream .softn
   AddEncoding br .br
 </IfModule>
 

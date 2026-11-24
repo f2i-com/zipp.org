@@ -36,7 +36,7 @@ function walk(dir, prefix = "") {
   return entries;
 }
 
-for (const required of ["index.html", "404.html", ".htaccess", "api/stats.php", "sandbox/playground/index.html", "playground/index.html"]) {
+for (const required of ["index.html", "404.html", ".htaccess", "api/stats.php", "sandbox/playground/index.html", "playground/index.html", "container-demo/index.html"]) {
   if (!fs.existsSync(path.join(client, required))) {
     console.error(`dist/client/${required} is missing: run npm run build first`);
     process.exit(1);

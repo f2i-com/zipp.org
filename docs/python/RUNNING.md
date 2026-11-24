@@ -1,19 +1,17 @@
 # Running Python on ZIPP
 
-## Run Python (experimental)
+## Run Python
 
-The CLI also runs Python: Zipp's own Python 3 implementation, parsed by its
+The CLI also runs Python: Zipp's own Python 3.13 implementation, parsed by its
 own front end ([`zipp-pyparse`](../../crates/zipp-vm/src/lang/python/parser)) and lowered
 straight to the engine's register bytecode (no transpilation to JavaScript and
 no second interpreter), so a `.py` file runs on the same VM. On the command
-line hot Python loops are JIT-compiled (x86-64), and over the 36 programs of
-the Python benchmark suite Zipp runs at about 1.1x CPython 3.13's time (its
-30 small programs level with CPython); fifteen of them, including
-`range_loop`, `float_arith`, `int_arith`, `global_read`, `dict_get` and
-`json_roundtrip`, take less time than in CPython. WebAssembly
-and budgeted embedders run the same code interpreted. Compiled code is
-cached per user, so a hello-world starts in about 20 ms. Save this as
-`fib.py`:
+line hot Python loops and functions are JIT-compiled (x86-64), and in v0.0.40
+over the 36 comparable programs of the Python benchmark suite Zipp runs at
+**0.62× CPython 3.13's time** (`micro 0.60×`, `macro 0.75×`, winning **26 of
+36** programs, with byte-identical output). WebAssembly and budgeted embedders
+run the same code interpreted. Compiled code is cached per user, so a
+hello-world starts in about 20 ms. Save this as `fib.py`:
 
 ```python
 def fib(n):
@@ -34,14 +32,19 @@ zipp run --lang=python -       # from standard input (no project folder)
 ```
 
 Classes (including metaclasses, descriptors and `__slots__`), exceptions
-with full tracebacks, generators, closures, comprehensions, `match`
-statements, f-strings, the builtin types and a set of standard-library
-modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
-`dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
-all work; `async` does not yet. Semantics are checked
-differentially against CPython: the 195 programs of `tests/python_corpus/*.py`
-must print exactly what CPython 3.13 prints, in the default, no-fast-path and
-no-JIT modes.
+with full tracebacks (`except*` and `ExceptionGroup`), generators,
+`async`/`await` coroutines (`asyncio`), PEP 695 generics, closures,
+comprehensions, `match` statements, f-strings, the builtin types, raw
+byte-for-byte CLI stdout/stderr streaming past 64 KiB (`sys.stdout.buffer`),
+universal newline translation, and a broad standard library (`math`, `json`,
+`re`, `collections`, `itertools`, `functools`, `dataclasses`, `enum`,
+`contextlib`, `typing`, `struct`, `hashlib`, `html.parser`, `urllib`,
+`datetime`, `tomllib`, `unittest`, `logging`, `tempfile`, `base64`,
+`binascii`, `shlex`, `zlib`, `shutil`, `zipfile` with `ZIP_DEFLATED`, ...)
+all work — running unmodified `html2text`, `markdownify`/`beautifulsoup4`,
+and pure-Python `PyYAML` byte-for-byte against CPython. Semantics are checked
+differentially against CPython: `tests/python_corpus/*.py` must print exactly
+what CPython 3.13 prints, in the default, no-fast-path and no-JIT modes.
 
 A folder runs as a project: `zipp py examples/python/project` runs its
 `main.py`, and `zipp py lab/train.py --steps 20` runs one script of a

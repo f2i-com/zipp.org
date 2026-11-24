@@ -15,7 +15,7 @@ const DEADLINE_MS = 5000;
 const INSTRUCTION_BUDGET = 2e9;    // the engine's maximum lifetime budget
 const STORAGE_KEY = "zipp-playground-project";
 const MAX_CONSOLE_LINES = 2000;
-const SOURCE_EXTENSIONS = { py: "python", js: "javascript", mjs: "javascript" };
+const SOURCE_EXTENSIONS = { py: "python", js: "javascript", mjs: "javascript", php: "php", rs: "rust" };
 // Files a project folder brings along besides sources: shown as text when
 // they decode as UTF-8, otherwise kept as bytes (checkpoints, images) that
 // the program can open(). Tool folders are skipped, as are big files.
@@ -29,6 +29,513 @@ const SAMPLES = {
   javascript: { name: "js-balls", entry: "main.js", base: "../../../examples/js/project/", files: ["physics.js", "main.js"] },
   ant: { name: "langtons-ant", entry: "main.py", base: "../../../examples/python/langtons_ant/", files: ["main.py", "rules.py"] },
   gpu: { name: "gpu-compute", entry: "main.py", base: "../../../examples/python/gpu/", files: ["main.py", "life.py"] },
+  "py-html": {
+    name: "py-html-markdown",
+    entry: "main.py",
+    inline: {
+      "main.py": `from html.parser import HTMLParser
+import re, textwrap
+
+HTML = """
+<article>
+  <h1>ZIPP v0.0.40 Release Notes</h1>
+  <p>One <strong>Rust register VM</strong> running <em>JavaScript, TypeScript, Python 3.13, PHP 8.x,</em> and <em>Rust</em>.</p>
+  <ul>
+    <li>23 new Python stdlib modules including <code>html.parser</code> and <code>textwrap</code></li>
+    <li>Native x86-64 JIT &amp; pure-safe-Rust WebAssembly sandbox</li>
+    <li>Composable <code>addAppBridge</code> plugins for GPU &amp; SQLite 3</li>
+  </ul>
+  <p>Read more at <a href="https://www.zipp.org/benchmarks/">zipp.org/benchmarks</a>.</p>
+</article>
+"""
+
+class MarkdownConverter(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.out = []
+        self.links = []
+        self._href = None
+
+    def handle_starttag(self, tag, attrs):
+        attr_map = dict(attrs)
+        if tag == "h1":
+            self.out.append("# ")
+        elif tag == "li":
+            self.out.append("- ")
+        elif tag == "strong":
+            self.out.append("**")
+        elif tag == "em":
+            self.out.append("*")
+        elif tag == "code":
+            self.out.append("\`")
+        elif tag == "a":
+            self._href = attr_map.get("href", "")
+            self.out.append("[")
+
+    def handle_endtag(self, tag):
+        if tag in ("h1", "p"):
+            self.out.append("\\n\\n")
+        elif tag == "li":
+            self.out.append("\\n")
+        elif tag == "ul":
+            self.out.append("\\n")
+        elif tag == "strong":
+            self.out.append("**")
+        elif tag == "em":
+            self.out.append("*")
+        elif tag == "code":
+            self.out.append("\`")
+        elif tag == "a":
+            self.out.append(f"]({self._href})")
+            self.links.append(self._href)
+            self._href = None
+
+    def handle_data(self, data):
+        cleaned = re.sub(r"\\s+", " ", data)
+        if cleaned.strip():
+            self.out.append(cleaned)
+
+parser = MarkdownConverter()
+parser.feed(HTML)
+markdown = "".join(parser.out).strip()
+for block in markdown.split("\\n\\n"):
+    if block.startswith("#") or block.startswith("-"):
+        print(block)
+    else:
+        print(textwrap.fill(block.strip(), width=68))
+    print()
+
+words = re.findall(r"[A-Za-z0-9._-]+", markdown)
+print(f"Summary: {len(words)} words, {len(parser.links)} link(s) extracted in ZIPP Python WASM.")
+`,
+    },
+  },
+  "py-async": {
+    name: "py-async-pipeline",
+    entry: "main.py",
+    inline: {
+      "main.py": `import asyncio
+from dataclasses import dataclass
+
+@dataclass
+class TaskResult:
+    service: str
+    latency_ms: float
+    items: int
+
+async def fetch_batch(service: str, delay: float, items: int) -> TaskResult:
+    await asyncio.sleep(delay)
+    return TaskResult(service=service, latency_ms=round(delay * 1000, 1), items=items)
+
+async def main():
+    jobs = [
+        ("inventory-sql", 0.012, 128),
+        ("orders-php",    0.008,  64),
+        ("pricing-rust",  0.005,  96),
+        ("analytics-py",  0.015, 256),
+    ]
+    results = await asyncio.gather(*(fetch_batch(s, d, n) for s, d, n in jobs))
+    total_items = sum(r.items for r in results)
+    fastest = min(results, key=lambda r: r.latency_ms)
+    print("Async pipeline completed across 4 services:")
+    for r in sorted(results, key=lambda x: x.latency_ms):
+        bar = "#" * (r.items // 16)
+        print(f"  {r.service:<14} {r.latency_ms:>5.1f} ms | {r.items:>3} items {bar}")
+    print(f"Total processed: {total_items} items · fastest: {fastest.service}")
+
+asyncio.run(main())
+`,
+    },
+  },
+  "py-fractal": {
+    name: "py-mandelbrot",
+    entry: "main.py",
+    inline: {
+      "main.py": `import ui
+
+W, H = 360, 240
+CELL = 4
+PALETTE = [
+    "#101018", "#1d1536", "#311b63", "#4c2296",
+    "#7c3aed", "#a78bfa", "#22d3ee", "#67e8f9",
+    "#c4f1be", "#edff80",
+]
+
+ui.canvas(W, H)
+ui.clear("#0d0c14")
+
+inside = 0
+cols = W // CELL
+rows = H // CELL
+for py in range(rows):
+    ci = -1.2 + (py / rows) * 2.4
+    for px in range(cols):
+        cr = -2.1 + (px / cols) * 3.0
+        zr = 0.0
+        zi = 0.0
+        it = 0
+        while it < 36 and zr * zr + zi * zi <= 4.0:
+            zr, zi = zr * zr - zi * zi + cr, 2.0 * zr * zi + ci
+            it += 1
+        if it == 36:
+            inside += 1
+            color = "#0b0a12"
+        else:
+            color = PALETTE[it % len(PALETTE)]
+        ui.rect(px * CELL, py * CELL, CELL, CELL, color)
+
+ui.font(14)
+ui.text(12, H - 12, f"Mandelbrot in Python WASM · {inside}/{cols * rows} cells inside", "#edff80")
+print(f"Rendered {cols}x{rows} fractal grid ({inside} interior cells).")
+`,
+    },
+  },
+  "py-analytics": {
+    name: "py-sales-analytics",
+    entry: "main.py",
+    inline: {
+      "sales.csv": `region,category,units,price
+north,espresso,42,4.50
+south,pastry,31,5.25
+north,matcha,27,5.75
+west,espresso,58,4.50
+east,pastry,24,5.25
+south,espresso,36,4.50
+west,matcha,19,5.75
+east,espresso,45,4.50
+`,
+      "main.py": `import json
+from collections import defaultdict
+
+revenue_by_region = defaultdict(float)
+units_by_cat = defaultdict(int)
+
+with open("sales.csv", "r") as f:
+    lines = [line.strip() for line in f if line.strip()]
+headers = lines[0].split(",")
+for line in lines[1:]:
+    row = dict(zip(headers, line.split(",")))
+    units = int(row["units"])
+    rev = units * float(row["price"])
+    revenue_by_region[row["region"]] += rev
+    units_by_cat[row["category"]] += units
+
+report = {
+    "total_revenue": round(sum(revenue_by_region.values()), 2),
+    "by_region": {k: round(v, 2) for k, v in sorted(revenue_by_region.items(), key=lambda kv: -kv[1])},
+    "by_category_units": dict(sorted(units_by_cat.items(), key=lambda kv: -kv[1])),
+}
+
+with open("report.json", "w") as out:
+    json.dump(report, out, indent=2)
+
+print("Revenue by region (read from sales.csv):")
+for region, rev in report["by_region"].items():
+    print(f"  {region:<8} \${rev:>7.2f}  " + "#" * int(rev // 20))
+print(f"Total revenue: \${report['total_revenue']:.2f}")
+print("Wrote report.json to the folder sidebar!")
+`,
+    },
+  },
+  "php-modern": {
+    name: "php-modern-orders",
+    entry: "index.php",
+    inline: {
+      "Order.php": `<?php
+declare(strict_types=1);
+
+enum Priority: string {
+    case Standard = 'standard';
+    case Express = 'express';
+    case Rush = 'rush';
+
+    public function fee(): float {
+        return match ($this) {
+            self::Standard => 0.0,
+            self::Express  => 9.50,
+            self::Rush     => 24.00,
+        };
+    }
+}
+
+readonly class Order {
+    public function __construct(
+        public string $id,
+        public string $customer,
+        public float $subtotal,
+        public Priority $priority,
+    ) {}
+
+    public function total(): float {
+        return round($this->subtotal + $this->priority->fee(), 2);
+    }
+}
+`,
+      "index.php": `<?php
+declare(strict_types=1);
+require_once 'Order.php';
+
+$orders = [
+    new Order('ORD-101', 'Kiln & Wheel Studio', 148.00, Priority::Express),
+    new Order('ORD-102', 'BrewDesk Roasters',    84.50, Priority::Standard),
+    new Order('ORD-103', 'Harbor Ceramic Co.',  215.00, Priority::Rush),
+    new Order('ORD-104', 'Pinecone Bakery',      62.25, Priority::Standard),
+];
+
+$priority = array_values(array_filter(
+    $orders,
+    fn(Order $o): bool => $o->priority !== Priority::Standard
+));
+
+echo "PHP 8.x Order Pipeline on ZIPP WASM\\n";
+echo str_repeat('-', 54) . "\\n";
+foreach ($orders as $o) {
+    printf("%-8s %-20s %-9s \$%7.2f\\n", $o->id, $o->customer, $o->priority->value, $o->total());
+}
+
+$grandTotal = array_reduce($orders, fn(float $acc, Order $o): float => $acc + $o->total(), 0.0);
+echo str_repeat('-', 54) . "\\n";
+echo "Priority orders: " . count($priority) . " of " . count($orders) . "\\n";
+echo "Grand total:     \$" . number_format($grandTotal, 2) . "\\n";
+echo "JSON summary:    " . json_encode([
+    'count' => count($orders),
+    'priority_ids' => array_map(fn(Order $o) => $o->id, $priority),
+    'grand_total' => round($grandTotal, 2),
+]) . "\\n";
+`,
+    },
+  },
+  "php-template": {
+    name: "php-invoice-template",
+    entry: "invoice.php",
+    inline: {
+      "invoice.php": `<?php
+declare(strict_types=1);
+
+$invoice = [
+    'number' => 'INV-2026-040',
+    'client' => 'Kiln & Wheel Pottery Studio',
+    'tax_rate' => 0.10,
+    'items' => [
+        ['name' => 'Stoneware Clay (25 kg bag)', 'qty' => 4, 'unit' => 38.00],
+        ['name' => 'Celadon Glaze Pack',         'qty' => 2, 'unit' => 29.50],
+        ['name' => 'Kiln Firing Session',        'qty' => 3, 'unit' => 45.00],
+    ],
+];
+
+$subtotal = 0.0;
+foreach ($invoice['items'] as $item) {
+    $subtotal += $item['qty'] * $item['unit'];
+}
+$tax = round($subtotal * $invoice['tax_rate'], 2);
+$total = $subtotal + $tax;
+?>
+=== INVOICE <?= $invoice['number'] ?> ===
+Client: <?= $invoice['client'] ?>
+
+<?php foreach ($invoice['items'] as $i => $item): ?>
+  <?= ($i + 1) ?>. <?= str_pad($item['name'], 30) ?> x<?= $item['qty'] ?>  $<?= number_format($item['qty'] * $item['unit'], 2) ?>
+
+<?php endforeach; ?>
+-----------------------------------------------
+Subtotal: $<?= number_format($subtotal, 2) ?>
+
+Tax (10%): $<?= number_format($tax, 2) ?>
+
+TOTAL DUE: $<?= number_format($total, 2) ?>
+`,
+    },
+  },
+  "php-regex": {
+    name: "php-word-frequency",
+    entry: "analyze.php",
+    inline: {
+      "analyze.php": `<?php
+declare(strict_types=1);
+
+$text = <<<TEXT
+ZIPP runs JavaScript, TypeScript, Python 3.13, PHP 8.x, and Rust on one shared
+Rust register bytecode VM. SoftN packages web apps into portable containers, and
+FormLogic hosts 58+ marketplace apps inside ZIPP sandboxes with SQLite 3 and
+strict default-deny permissions. One VM, one sandbox, five languages.
+TEXT;
+
+preg_match_all('/[a-zA-Z0-9.+_-]+/', strtolower($text), $matches);
+$tokens = $matches[0];
+$counts = array_count_values($tokens);
+arsort($counts);
+
+echo "Tokens: " . count($tokens) . " · Unique: " . count($counts) . "\\n";
+echo "Top words:\\n";
+$shown = 0;
+foreach ($counts as $word => $n) {
+    printf("  %-14s %2d  %s\\n", $word, $n, str_repeat('#', $n * 3));
+    if (++$shown >= 10) break;
+}
+`,
+    },
+  },
+  "rust-enums": {
+    name: "rust-event-ledger",
+    entry: "main.rs",
+    inline: {
+      "main.rs": `#[derive(Debug, Clone)]
+enum Event {
+    Booking { guest: String, seats: u32, price: f64 },
+    Cancel { guest: String, refund: f64 },
+    WorkshopAdded { title: String, capacity: u32 },
+}
+
+impl Event {
+    fn revenue_delta(&self) -> f64 {
+        match self {
+            Event::Booking { seats, price, .. } => (*seats as f64) * *price,
+            Event::Cancel { refund, .. } => -(*refund),
+            Event::WorkshopAdded { .. } => 0.0,
+        }
+    }
+}
+
+fn main() {
+    let log = vec![
+        Event::WorkshopAdded { title: "Wheel Throwing".into(), capacity: 8 },
+        Event::Booking { guest: "Claire".into(), seats: 2, price: 68.0 },
+        Event::Booking { guest: "Devon".into(), seats: 1, price: 75.0 },
+        Event::Cancel { guest: "Devon".into(), refund: 75.0 },
+        Event::Booking { guest: "Nadia".into(), seats: 3, price: 58.0 },
+    ];
+
+    println!("Rust Event Ledger on ZIPP WASM");
+    let mut balance = 0.0;
+    for (idx, ev) in log.iter().enumerate() {
+        let delta = ev.revenue_delta();
+        balance += delta;
+        match ev {
+            Event::Booking { guest, seats, .. } =>
+                println!("  #{} BOOK   {:<8} {} seat(s)  +{:.2}", idx + 1, guest, seats, delta),
+            Event::Cancel { guest, .. } =>
+                println!("  #{} CANCEL {:<8}            {:.2}", idx + 1, guest, delta),
+            Event::WorkshopAdded { title, capacity } =>
+                println!("  #{} ADD    {} (cap {})", idx + 1, title, capacity),
+        }
+    }
+    println!("Net studio revenue: \${:.2}", balance);
+}
+`,
+    },
+  },
+  "rust-multifile": {
+    name: "rust-task-pipeline",
+    entry: "main.rs",
+    inline: {
+      "models.rs": `use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: u32,
+    pub title: String,
+    pub owner: String,
+    pub done: bool,
+}
+
+impl Task {
+    pub fn new(id: u32, title: &str, owner: &str, done: bool) -> Self {
+        Self { id, title: title.to_string(), owner: owner.to_string(), done }
+    }
+}
+
+pub fn completion_rate(tasks: &[Task]) -> f64 {
+    if tasks.is_empty() { return 0.0; }
+    let done = tasks.iter().filter(|t| t.done).count();
+    (done as f64) * 100.0 / (tasks.len() as f64)
+}
+`,
+      "main.rs": `mod models;
+use models::{Task, completion_rate};
+use std::collections::HashMap;
+
+fn main() {
+    let tasks = vec![
+        Task::new(1, "Compile Rust to ZIPP bytecode", "vm", true),
+        Task::new(2, "Add PHP & Rust playground samples", "web", true),
+        Task::new(3, "Embed FormLogic SoftN container", "web", true),
+        Task::new(4, "Ship v0.0.40 release binaries", "ci", true),
+        Task::new(5, "Explore next JIT optimizations", "vm", false),
+    ];
+
+    let mut by_owner: HashMap<String, usize> = HashMap::new();
+    for t in &tasks {
+        *by_owner.entry(t.owner.clone()).or_insert(0) += 1;
+    }
+
+    println!("Multi-file Rust Project ({} tasks, {:.0}% done)", tasks.len(), completion_rate(&tasks));
+    for t in &tasks {
+        let mark = if t.done { "[x]" } else { "[ ]" };
+        println!("  {} #{} ({}) {}", mark, t.id, t.owner, t.title);
+    }
+
+    let json = serde_json::to_string(&tasks[0]).unwrap();
+    println!("Serialized task #1: {}", json);
+}
+`,
+    },
+  },
+  "rust-sieve": {
+    name: "rust-primes-iter",
+    entry: "main.rs",
+    inline: {
+      "main.rs": `struct Fib { a: u64, b: u64 }
+
+impl Fib {
+    fn new() -> Self { Self { a: 0, b: 1 } }
+}
+
+impl Iterator for Fib {
+    type Item = u64;
+    fn next(&mut self) -> Option<u64> {
+        let cur = self.a;
+        let next = self.a + self.b;
+        self.a = self.b;
+        self.b = next;
+        Some(cur)
+    }
+}
+
+fn count_primes(limit: usize) -> (usize, usize) {
+    let mut is_prime = vec![true; limit + 1];
+    is_prime[0] = false;
+    is_prime[1] = false;
+    let mut p = 2;
+    while p * p <= limit {
+        if is_prime[p] {
+            let mut m = p * p;
+            while m <= limit {
+                is_prime[m] = false;
+                m += p;
+            }
+        }
+        p += 1;
+    }
+    let mut count = 0;
+    let mut last = 0;
+    for (n, &flag) in is_prime.iter().enumerate() {
+        if flag { count += 1; last = n; }
+    }
+    (count, last)
+}
+
+fn main() {
+    let fibs: Vec<u64> = Fib::new().take(12).collect();
+    println!("First 12 Fibonacci numbers: {:?}", fibs);
+
+    for limit in [1_000, 10_000, 50_000] {
+        let (count, last) = count_primes(limit);
+        println!("Primes <= {:>6}: {:>5} (largest: {})", limit, count, last);
+    }
+}
+`,
+    },
+  },
   "python-hello": { name: "python-hello", entry: "main.py", inline: { "main.py": 'import ui\n\ndef fib(n):\n    a = 0\n    b = 1\n    for i in range(n):\n        a, b = b, a + b\n    return a\n\nprint("fib(30) =", fib(30))\n\nui.canvas(320, 120)\nui.clear("#10141c")\nui.font(28)\nui.text(24, 70, "hello from Python", "#ffcc00")\n' } },
   "javascript-hello": { name: "js-hello", entry: "main.js", inline: { "main.js": 'const fib = (n) => (n < 2 ? n : fib(n - 1) + fib(n - 2));\nconsole.log("fib(20) =", fib(20));\n\nui.canvas(320, 120);\nui.clear("#10141c");\nui.font(28);\nui.text(24, 70, "hello from JavaScript", "#58a6ff");\n' } },
 };
@@ -91,7 +598,8 @@ function pickEntry() {
   const names = [...project.files.keys()].sort();
   if (project.entry && project.files.has(project.entry)) return;
   const top = names.filter((n) => !n.includes("/"));
-  project.entry = top.find((n) => n === "main.py") || top.find((n) => n === "main.js")
+  project.entry = top.find((n) => n === "main.py") || top.find((n) => n === "index.php")
+    || top.find((n) => n === "main.rs") || top.find((n) => n === "main.js")
     || top.find((n) => languageOf(n)) || names.find((n) => languageOf(n)) || names[0] || null;
 }
 // Autosave notes are logged once per loaded project.
@@ -268,6 +776,16 @@ const HIGHLIGHT = {
     keywords: new Set("const let var function return if else for while do break continue switch case default new this class extends super import export from of in typeof instanceof void delete throw try catch finally async await yield true false null undefined static get set".split(" ")),
     builtins: new Set("console ui Math JSON Object Array String Number Boolean Map Set Promise Error Date window document".split(" ")),
   },
+  php: {
+    pattern: /(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?)|(\b\d[\w.]*\b)|(\$[A-Za-z_]\w*)|([A-Za-z_]\w*)|([^\sA-Za-z_$\d]+)/g,
+    keywords: new Set("function fn return if elseif else endif while endwhile for endfor foreach endforeach as in break continue switch match case default new class interface trait enum extends implements public private protected readonly static abstract final const declare strict_types namespace use require require_once include include_once echo print try catch finally throw yield true false null self parent".split(" ")),
+    builtins: new Set("array_map array_filter array_reduce array_values array_count_values arsort count strlen str_repeat str_pad printf number_format json_encode json_decode preg_match preg_match_all strtolower round PDO".split(" ")),
+  },
+  rust: {
+    pattern: /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\\n])')|(\b\d[\w.]*\b)|(#!?\[[^\]]*\])|([A-Za-z_]\w*!?)|([^\sA-Za-z_\d]+)/g,
+    keywords: new Set("fn pub mod use struct enum impl trait for in while loop if else match let mut const static ref move return break continue as where type crate super self Self async await true false".split(" ")),
+    builtins: new Set("println! print! eprintln! format! vec! Some None Ok Err Option Result Vec String HashMap BTreeMap Iterator Serialize Deserialize serde_json u8 u16 u32 u64 usize i32 i64 f32 f64 bool str".split(" ")),
+  },
 };
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -335,7 +853,8 @@ function validFileName(name) {
 }
 $("#new-file").addEventListener("click", () => {
   const language = projectLanguage() || "python";
-  const name = prompt("New file name:", language === "python" ? "module.py" : "module.js");
+  const defaultName = { python: "module.py", php: "helper.php", rust: "helper.rs", javascript: "module.js" }[language] || "module.py";
+  const name = prompt("New file name:", defaultName);
   if (!name) return;
   if (!validFileName(name)) { alert("Use a simple relative path such as module.py or pkg/module.py."); return; }
   if (project.files.has(name)) { alert(`${name} already exists.`); return; }
@@ -399,7 +918,7 @@ async function loadFileObjects(files, folderName) {
     entries.push([path, text === null ? { bytes } : text]);
   }
   if (!entries.some(([path]) => languageOf(path))) {
-    log("No .py or .js files found in that selection.", "error");
+    log("No .py, .php, .rs or .js files found in that selection.", "error");
     return;
   }
   const name = folderName || (files[0] instanceof File ? (files[0].webkitRelativePath || "").split("/")[0] : "") || "files";
@@ -521,7 +1040,7 @@ function startWorker() {
   if (worker.instance) worker.instance.terminate();
   for (const p of worker.pending.values()) { clearTimeout(p.timer); p.reject(new Error("engine restarted")); }
   worker.pending.clear();
-  worker.instance = new Worker(new URL("./engine.worker.js?v=e58431ad161b49df", import.meta.url), { type: "module" });
+  worker.instance = new Worker(new URL("./engine.worker.js?v=ed5780bcea9878ac", import.meta.url), { type: "module" });
   worker.instance.onmessage = (event) => {
     const m = event.data;
     if (m.type === "event") { hostEvent(m); return; }
@@ -565,7 +1084,10 @@ function request(message, timeoutMs = DEADLINE_MS) {
 function refreshStatus() {
   const p = worker.profile;
   const parts = [];
-  if (p) parts.push([`zipp-wasm ${p.version} · languages: ${(p.languages || []).join(", ")}`]);
+  if (p) {
+    const langs = [...new Set([...(p.languages || []), "php", "rust"])];
+    parts.push([`zipp-wasm ${p.version} · languages: ${langs.join(", ")}`]);
+  }
   parts.push([loop.running ? `running ${projectLanguage()} · hooks: ${hookSummary()}` : "idle"]);
   setStatus(parts);
 }
@@ -581,11 +1103,9 @@ function hookSummary() {
 function projectSources(language) {
   const files = {};
   const order = [];
-  if (language === "python") {
-    // Every file goes along by path: `.py` files are modules (packages by
-    // folder), the rest is the program's filesystem; binaries as base64.
-    // Files an earlier run wrote are sent like any other, so a program sees
-    // its own saved state (and the user's edits to it) on the next run.
+  if (language === "python" || language === "php" || language === "rust") {
+    // Every file goes along by path: source modules/includes and data files
+    // alike; binaries as base64.
     for (const [name, value] of [...project.files].sort((a, b) => a[0].localeCompare(b[0]))) {
       files[name] = isBinary(value) ? { base64: bytesToBase64(value.bytes) } : value;
     }
@@ -631,7 +1151,7 @@ async function run() {
   if (el.run.disabled) return;
   if (!project.entry) { log("Nothing to run: open a folder or a sample first.", "error"); return; }
   const language = projectLanguage();
-  if (!language) { log(`The entry file ${project.entry} is not a .py or .js file.`, "error"); return; }
+  if (!language) { log(`The entry file ${project.entry} is not a .py, .php, .rs or .js file.`, "error"); return; }
   el.run.disabled = true;
   // The stop must be answered (or the engine replaced) before this run is
   // sent, or its two-second deadline restarts the engine under the new run.
@@ -642,10 +1162,12 @@ async function run() {
   // The "written" tags describe the latest run only.
   if (project.written.size) { project.written = new Set(); renderFiles(); }
   const argv = programArgs();
-  log(`▶ ${project.name} (${language}, entry ${project.entry}${argv.length ? ", args " + argv.join(" ") : ""})`, "note");
+  const lazyNote = (language === "php" || language === "rust") ? " · loading engine on demand if needed" : "";
+  log(`▶ ${project.name} (${language}, entry ${project.entry}${argv.length ? ", args " + argv.join(" ") : ""}${lazyNote})`, "note");
   el.run.disabled = true;
+  const runTimeout = (language === "php" || language === "rust") ? 30000 : DEADLINE_MS;
   try {
-    const reply = await request({ type: "run", language, files, order, entry, argv: programArgs(), budget: INSTRUCTION_BUDGET, gpuBackend: el.gpuBackend.value }, DEADLINE_MS);
+    const reply = await request({ type: "run", language, files, order, entry, argv: programArgs(), budget: INSTRUCTION_BUDGET, gpuBackend: el.gpuBackend.value }, runTimeout);
     logConsole(reply.console);
     applyWrittenFiles(reply.files);
     if (reply.type === "error") {

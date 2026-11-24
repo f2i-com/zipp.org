@@ -23,53 +23,49 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-10-29
+## Current status — 2026-11-24
 
-### Public canonical capture
+### Public canonical capture (v0.0.40, `0cd3eab8`)
 
 The public score is the clean four-engine PGO capture of the release tag
-`fcfb1934`, the 0.0.31 engine. The `fcfb1934` rows:
+`0cd3eab8`, the **0.0.40** engine (24 November 2026):
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.744×** [0.739, 0.750] | 0.627× [0.624, 0.630] | 0.657× [0.603, 0.668] | 10 / 10 |
-| diagnostics three | **0.190×** [0.185, 0.193] | 0.162× [0.160, 0.164] | 0.149× [0.102, 0.153] | 3 / 3 |
-| all 13 | **0.543×** [0.538, 0.546] | 0.459× [0.456, 0.461] | 0.467× [0.376, 0.474] | 13 / 13 |
-| hostile all 17, ordinary | **0.704×** [0.700, 0.709] | 0.502× [0.497, 0.508] | 0.390× [0.386, 0.392] | 12 / 17 |
-| hostile category-balanced | **0.738×** [0.734, 0.742] | 0.517× [0.511, 0.524] | 0.404× [0.400, 0.406] | — |
-| all 30, equal row weight | **0.629×** | 0.483× | 0.422× | 25 / 30 |
+| retained ten | **0.717×** [0.708, 0.725] | 0.613× [0.610, 0.620] | 0.616× [0.456, 0.634] | 10 / 10 |
+| diagnostics three | **0.197×** [0.195, 0.201] | 0.171× [0.170, 0.174] | 0.150× [0.099, 0.160] | 3 / 3 |
+| all 13 | **0.532×** [0.527, 0.537] | 0.457× [0.455, 0.461] | 0.445× [0.321, 0.460] | 13 / 13 |
+| hostile all 17, ordinary | **0.624×** [0.619, 0.630] | 0.464× [0.460, 0.468] | 0.351× [0.348, 0.354] | 16 / 17 |
+| hostile category-balanced | **0.652×** [0.646, 0.659] | 0.476× [0.471, 0.482] | 0.363× [0.359, 0.366] | — |
+| all 30, equal row weight | **0.583×** | **0.461×** | **0.389×** | **29 / 30** |
 
-Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
-counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
-and failure lists. The all-30 row is the equal-row point
-`exp((13 ln G13 + 17 ln G17) / 30)`; no interval was computed for it this time.
-The previous canonical pair (`84012a2d`, 2026-10-21, the 0.0.28 engine) read
-0.766× / 0.176× / 0.545× / 0.748× / 0.784× / 0.652× against Node; `f1739644` (2026-10-18, the 0.0.26 engine)
-0.769× / 0.169× / 0.542× / 0.715× / 0.748× / 0.634×; `fa8e3b86` (2026-10-15)
-0.795× / 0.182× / 0.566× / 0.829× / 0.895× / 0.703×; `8229b3fc` (2026-09-02)
-0.878× / 0.186× / 0.614× / 0.829× / 0.862× / 0.728×.
-
-The literal all-row target remains false: every Node gap is in the hostile set
-(allocation-survival 1.34×, reactish-reconcile 1.22×, warm-router 1.13×, calls-closures 1.12×, shapes-megamorphic 1.04×). See [`PERFORMANCE.md`](PERFORMANCE.md) for the tables and raw
-artifact links.
+Both source artifacts (`bench/real13_0cd3eab8_pgo_2026-11-24.json` and
+`bench/hostile/head_clean_0cd3eab8_pgo_2026-11-24.json`) are `publishable:true`,
+`ALL_CORRECT=1`, use 15 counterbalanced repetitions and 10,000 bootstrap samples,
+and have empty drift and failure lists. Against the previous canonical pair
+(`fcfb1934`, 2026-10-29, v0.0.31: 0.744× / 0.190× / 0.543× / 0.704× / 0.738× / 0.629×, 25/30 wins),
+four hostile gaps (`reactish-reconcile`, `warm-router`, `calls-closures`, `shapes-megamorphic`) flipped to beating Node,
+leaving a single Node gap: `allocation-survival` (`1.141×`, down from `1.344×`). See [`PERFORMANCE.md`](PERFORMANCE.md) for the full tables and raw artifact links.
 
 ### Interpreter versus interpreter
 
-The same PGO binary with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`; the captures before
-22 October left the regex JIT on), over the same 30 rows
-(`bench/comparison/interp_real13_fcfb1934_2026-10-29.json` and its hostile pair, diagnostic `run_native.py`
-runs): **0.574×** Bellard's QuickJS (30 / 30 point wins; 0.683× in the
-0.0.28 capture), **0.326×** QuickJS-NG (30 / 30), 0.675× Bun with JavaScriptCore's
-JIT off, 0.825× Deno `--jitless` and 0.911× Node `--jitless`. Bellard's QuickJS wins no row; on the five micro kernels
-(15 October) Zipp's interpreter was 1.12× Bellard's, most of it calls (`fib` 1.66×).
+The same 0.0.40 PGO binary with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`),
+over the same 30 rows (`bench/comparison/interp_real13_0cd3eab8_2026-11-24.json`
+and `interp_hostile17_0cd3eab8_2026-11-24.json`): **0.430×** Bellard's QuickJS
+(30 / 30 point wins; down from 0.574× in v0.0.31), **0.330×** QuickJS-NG 0.18.0
+(30 / 30), **0.500×** Bun no-JIT (30 / 30), **0.652×** Deno `--jitless` (29 / 30)
+and **0.706×** Node `--jitless` (28 / 30).
 
 ### Python versus CPython
 
-The published 0.0.31 binary against CPython 3.13.14, 36 programs, in-process
-work time (`bench/python/cpython_fcfb1934_2026-10-29.json`): 1.004× with the JIT
-(0.916× micro, 1.591× application-shaped), 1.422× without it; the 0.0.28
-binary measured 1.067× and 1.443×. String methods, generators, exceptions and object creation are the largest gaps.
+The published 0.0.40 binary against CPython 3.13.14, 36 programs, 15 repetitions,
+in-process work time (`bench/python/cpython_0cd3eab8_2026-11-24.json`):
+**0.626×** with the JIT (**0.601×** micro, **0.767×** macro, **26 / 36** wins;
+whole-process wall time **0.456×**), 1.350× without it — down from 1.004× in v0.0.31.
 
+### Real-world apps & profiling (v0.0.40)
+
+Unmodified third-party apps sped up 1.05×–2.88× from v0.0.39 to v0.0.40 (`html2text` 2.67×–2.88×, `markdownify` 1.85×–1.94×, `bs4_css` 1.71×–1.82×, `linkedom` 1.55×, `defuddle` 1.09×–1.15×, `webforai` 1.00×–1.05×), `bench/regex` improved `2.44× → 1.90×` Node, and PHP/Rust O(N²) paths sped up 8.6×–180×. Warm megamorphic DOM loops still trail V8 TurboFan and CPython C extensions and are the primary next target, aided by PR #110 (`ZIPP_PERF_MAP=1` sanitized JS function labels from `@codeandsolder`).
 
 ### Historical v0.0.5 QuickJS-NG and Boa diagnostic
 
@@ -152,8 +148,8 @@ all cross-engine-supported rows complete with exact output.
 
 ### Correctness
 
-- test262: **95,939 / 95,942** required executions (99.997%)
-- expected failures: one stale Annex B assertion and two German-CLDR rows
+- test262: **96,563 / 96,564** required executions (99.999%, pinned to `2e58f87d83`, 492 / 492 DateTimeFormat)
+- expected failures: one documented upstream expectation
 - former errored-module-cycle and deferred top-level-await gaps: fixed
 - default JIT, interpreter-only, forced-JIT, and majors-only-GC identities are
   the conformance gate
