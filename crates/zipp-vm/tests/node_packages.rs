@@ -96,6 +96,8 @@ console.log(sum(4, 5), a.b, dual, kind, extra, typeof fs.readFileSync, join("x",
     ),
 ];
 
+static NODE_RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn lines(o: &zipp_vm::Outcome) -> Vec<String> {
     assert_eq!(o.error, None, "{:?}", o.errput);
     o.output
@@ -106,6 +108,7 @@ fn lines(o: &zipp_vm::Outcome) -> Vec<String> {
 
 #[test]
 fn packages_resolve_and_commonjs_interoperates_as_in_node() {
+    let _guard = NODE_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("zipp-npm-{}", std::process::id()));
     for (rel, text) in FILES {
         let p = root.join(rel);
@@ -145,6 +148,7 @@ fn packages_resolve_and_commonjs_interoperates_as_in_node() {
 /// output: Node has these modules.
 #[test]
 fn core_modules_zipp_lacks_load_and_say_so_when_used() {
+    let _guard = NODE_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("zipp-npm-stub-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let script = root.join("main.cjs");
@@ -181,6 +185,7 @@ import("node:zlib").then((z) => console.log("zlib", typeof z.default.gzipSync));
 
 #[test]
 fn import_meta_resolve_and_esm_exit_code() {
+    let _guard = NODE_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("zipp-meta-resolve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let files = [

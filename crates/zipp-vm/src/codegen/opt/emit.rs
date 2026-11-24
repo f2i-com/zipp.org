@@ -361,6 +361,7 @@ impl Em<'_> {
                     }
                     if have_mega {
                         let full_lbl = self.mega_prop_lbl(true);
+                        let mega_miss = if dyn_only { lookup_miss } else { self.ops.new_dynamic_label() };
                         dynasm!(self.ops
                             ; mov rdx, [rbx + 8 * obj as i32]
                             ; mov ecx, mega_key_id as i32
@@ -368,11 +369,19 @@ impl Em<'_> {
                             ; call => full_lbl
                             ; mov r10, QWORD crate::codegen::SELF_CALL_DEOPT as i64
                             ; cmp rax, r10
+                            ; je => mega_miss
+                            ; mov r10, QWORD crate::codegen::PROP_VIA_IC as i64
+                            ; cmp rax, r10
+                            ; je => mega_miss
+                            ; mov r10, QWORD crate::codegen::PROP_CLASS_GETTER as i64
+                            ; cmp rax, r10
+                            ; je => mega_miss
                         );
-                        if dyn_only {
-                            dynasm!(self.ops ; je => lookup_miss);
-                        } else {
-                            dynasm!(self.ops ; jne => have_callee);
+                        if !dyn_only {
+                            dynasm!(self.ops
+                                ; jmp => have_callee
+                                ; => mega_miss
+                            );
                         }
                     }
                     if !dyn_only {
@@ -505,6 +514,9 @@ impl Em<'_> {
             ; cmp rax, r10
             ; je => decline
             ; mov r10, QWORD PROP_VIA_IC as i64
+            ; cmp rax, r10
+            ; je => decline
+            ; mov r10, QWORD crate::codegen::PROP_CLASS_GETTER as i64
             ; cmp rax, r10
             ; je => decline
             ; mov [rbx + 8 * dst as i32], rax
@@ -2345,6 +2357,9 @@ impl Em<'_> {
                             ; mov r10, QWORD crate::codegen::PROP_VIA_IC as i64
                             ; cmp rax, r10
                             ; je => slow_call
+                            ; mov r10, QWORD crate::codegen::PROP_CLASS_GETTER as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
                             ; mov Rq(d), rax
                             ; jmp => done
                             ; => slow_call
@@ -2472,6 +2487,9 @@ impl Em<'_> {
                             ; cmp rax, r10
                             ; je => slow_call
                             ; mov r10, QWORD crate::codegen::PROP_VIA_IC as i64
+                            ; cmp rax, r10
+                            ; je => slow_call
+                            ; mov r10, QWORD crate::codegen::PROP_CLASS_GETTER as i64
                             ; cmp rax, r10
                             ; je => slow_call
                             ; mov Rq(d), rax

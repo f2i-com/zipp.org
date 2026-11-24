@@ -1244,7 +1244,6 @@ impl<'p> Vm<'p> {
         }
         let mut first_shape = crate::shape::DICT;
         let mut distinct_shapes = 0u32;
-        let mut saw_non_own_shaped = false;
         for e in &site.entries[..site.n as usize] {
             match *e {
                 IcEntry::OwnData { shape, .. } if shape != crate::shape::DICT => {
@@ -1263,20 +1262,24 @@ impl<'p> Vm<'p> {
                     slot: u32::MAX,
                     ..
                 } if !is_set && recv_shape != crate::shape::DICT => {
-                    saw_non_own_shaped = true;
+                    if distinct_shapes == 0 {
+                        first_shape = recv_shape;
+                        distinct_shapes = 1;
+                    } else if recv_shape != first_shape {
+                        distinct_shapes = 2;
+                    }
                 }
                 _ => return false,
             }
         }
-        if distinct_shapes == 0 && !saw_non_own_shaped {
+        if distinct_shapes == 0 {
             return false;
         }
         distinct_shapes >= 2
-            || saw_non_own_shaped
             || (distinct_shapes == 1
                 && cell_shape != crate::shape::DICT
                 && cell_shape != first_shape)
-            || site.misses >= 2
+            || site.misses >= 4
     }
 
     /// True when the `GetProp` / `SetProp` at `(func_id, ip)` has already
