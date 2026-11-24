@@ -374,6 +374,10 @@ impl<'p> Vm<'p> {
             class_member_cache: (0..crate::vm::props::CLASS_MEMBER_CACHE_SLOTS)
                 .map(|_| std::cell::Cell::new(crate::vm::props::ClassMemberSlot::EMPTY))
                 .collect(),
+            global_real_own_cache: (0..1024)
+                .map(|_| std::cell::Cell::new((0, 0, 0, 0)))
+                .collect(),
+            ascii_case_cache: vec![(0, 0, 0, 0, 0); 256].into_boxed_slice(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
@@ -471,6 +475,10 @@ impl<'p> Vm<'p> {
             jit_shape_slot_sites: rustc_hash::FxHashSet::default(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_add_ways: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_add_memo: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            sym_add_memo: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_class_reads: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -806,7 +814,6 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             keyed_slot_memo_raw: 0,
             deferred_ns_nonempty: 0,
-            mod_ns_nonempty: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             fn_proto_shape: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -825,6 +832,12 @@ impl<'p> Vm<'p> {
             arr_proto_iter_slot_ptr: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             arr_proto_iter_ver: u32::MAX,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            str_proto_cca_slot_ptr: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            str_proto_cca_fn_bits: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            str_proto_cca_ver: u32::MAX,
             fn_proto_readonly: rustc_hash::FxHashSet::default(),
             objproto_method_memo: [(crate::shape::DICT, 0, 0); 3],
             is_htmldda: Default::default(),

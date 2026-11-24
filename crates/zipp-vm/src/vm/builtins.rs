@@ -2235,6 +2235,17 @@ impl<'p> Vm<'p> {
                         self.arr_intrinsic_memo[nid] = entry;
                     } else {
                         self.str_intrinsic_memo[nid] = entry;
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if nid == STR_MEMO_CHAR_CODE_AT && self.realm_global_objs.is_empty() {
+                            if let HeapObj::Object(map) = self.heap.get(proto) {
+                                // SAFETY: slot was just verified within `map` and is
+                                // guarded by `str_proto_cca_ver == versions[str_proto]`.
+                                self.str_proto_cca_slot_ptr =
+                                    unsafe { map.vals_ptr_raw().add(slot as usize) as u64 };
+                                self.str_proto_cca_fn_bits = expected_bits;
+                                self.str_proto_cca_ver = self.heap.version_of(proto);
+                            }
+                        }
                     }
                 }
                 true

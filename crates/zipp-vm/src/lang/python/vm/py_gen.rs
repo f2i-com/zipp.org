@@ -141,6 +141,111 @@ impl<'p> Vm<'p> {
         Some(rt)
     }
 
+    /// Native zero-allocation step for a plain `T.list_iterator` record
+    /// (`{ cls: T.list_iterator, seq, i, next }`). Never allocates, never runs
+    /// guest code, and keeps exhausted iterators exhausted (`i = -1`).
+    #[inline]
+    fn py_list_iter_step(&mut self, this: Value, learn_shape: bool) -> Option<Value> {
+        if !this.is_heap() {
+            return None;
+        }
+        let p = self.py_rt.as_deref()?;
+        let t_list_iter = p.t_list_iter;
+        let stop = p.stop;
+        if !t_list_iter.is_heap() || stop.is_undefined() {
+            return None;
+        }
+        let shape = p.list_iter_shape.get();
+        let seq_shape = p.seq_shape;
+        let g = this.heap_index();
+        let (seq, idx_v) = match self.heap.get(g) {
+            HeapObj::Object(m) if !m.is_ctor && shape != crate::shape::DICT && m.shape() == shape => {
+                if m.val_at(0).bits() != t_list_iter.bits() {
+                    return None;
+                }
+                (m.val_at(1), m.val_at(2))
+            }
+            HeapObj::Object(m)
+                if learn_shape
+                    && !m.is_ctor
+                    && m.slot_len() >= 4
+                    && m.val_at(0).bits() == t_list_iter.bits()
+                    && super::py_rt::key_eq(m.key_at(0), "cls")
+                    && super::py_rt::key_eq(m.key_at(1), "seq")
+                    && super::py_rt::key_eq(m.key_at(2), "i")
+                    && super::py_rt::key_eq(m.key_at(3), "next")
+                    && !m.attr_at(0).accessor
+                    && !m.attr_at(1).accessor
+                    && !m.attr_at(2).accessor
+                    && !m.attr_at(3).accessor =>
+            {
+                if m.shape_guardable() {
+                    p.list_iter_shape.set(m.shape());
+                }
+                (m.val_at(1), m.val_at(2))
+            }
+            _ => return None,
+        };
+        if !idx_v.is_int() {
+            return None;
+        }
+        let i = idx_v.as_int();
+        if i < 0 {
+            return Some(stop);
+        }
+        if !seq.is_heap() {
+            return None;
+        }
+        let items = match self.heap.get(seq.heap_index()) {
+            HeapObj::Object(sm) if !sm.is_ctor => {
+                if seq_shape != crate::shape::DICT && sm.shape() == seq_shape {
+                    sm.val_at(1)
+                } else if sm.slot_len() > 1
+                    && super::py_rt::key_eq(sm.key_at(1), "items")
+                    && !sm.attr_at(1).accessor
+                {
+                    sm.val_at(1)
+                } else if let Some(s) = sm.pos("items") {
+                    if sm.attr_at(s).accessor {
+                        return None;
+                    }
+                    sm.val_at(s)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        if !items.is_heap() {
+            return None;
+        }
+        let items_idx = items.heap_index();
+        if (!self.array_js_len.is_empty() && self.array_js_len.contains_key(&items_idx))
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&items_idx))
+        {
+            return None;
+        }
+        let (out, next_i) = match self.heap.get(items_idx) {
+            HeapObj::Array(arr) => {
+                let ui = i as usize;
+                if ui < arr.len() {
+                    let v = arr[ui];
+                    if v.is_hole() || i == i32::MAX {
+                        return None;
+                    }
+                    (v, i + 1)
+                } else {
+                    (stop, -1)
+                }
+            }
+            _ => return None,
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(g) {
+            m.set_val_at(2, Value::int(next_i));
+        }
+        Some(out)
+    }
+
     /// Ultra-fast pure in-register mini-stepper for an already-started,
     /// suspended plain generator (`GenState::Suspended(resume_ip)` at a plain
     /// `Instr::Yield`, empty handlers, no eval scope, no `arguments`).
@@ -162,6 +267,9 @@ impl<'p> Vm<'p> {
             || !this.is_heap()
         {
             return None;
+        }
+        if let Some(v) = self.py_list_iter_step(this, false) {
+            return Some(v);
         }
         let g = this.heap_index();
         let shape = self.py_rt.as_deref()?.gen_shape.get();
@@ -693,6 +801,9 @@ impl<'p> Vm<'p> {
     pub(crate) fn py_gen_next(&mut self, this: Value) -> Result<Value, Thrown> {
         if let Some(r) = self.py_gen_next_plain(this) {
             return r;
+        }
+        if let Some(v) = self.py_list_iter_step(this, true) {
+            return Ok(v);
         }
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::Object(m) if !m.is_ctor) {
             return Err(Thrown::from_static("TypeError: generator step on a non-generator"));

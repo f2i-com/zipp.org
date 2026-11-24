@@ -232,6 +232,33 @@ pub(super) struct TySlots {
     pub ver: usize,
     pub truth_ver: usize,
     pub truth_kind: usize,
+    pub truth_fn: usize,
+    pub dict: usize,
+}
+
+/// Bitmask cached in `PyRt::sub_kind_cache` for builtin subclasses whose
+/// dunders are unmodified along the MRO ahead of the builtin base.
+pub(super) const SUB_DICT_GET: u8 = 1 << 0;
+pub(super) const SUB_DICT_SET: u8 = 1 << 1;
+pub(super) const SUB_DICT_LEN: u8 = 1 << 2;
+pub(super) const SUB_STR_GET: u8 = 1 << 3;
+pub(super) const SUB_STR_LEN: u8 = 1 << 4;
+/// `dict` subclass that does not override `__getitem__`, even if it defines
+/// `__missing__` (e.g. `collections.Counter`, `defaultdict`): key HITS bypass
+/// `__missing__`, while misses take the slow edge.
+pub(super) const SUB_DICT_GET_HIT: u8 = 1 << 5;
+
+/// Direct-mapped builtin-subclass capability cache size (power of two).
+pub(crate) const SUB_KIND_CACHE_LEN: usize = 64;
+
+/// Cached builtin-subclass dunder flags keyed by `(cls, cls_hver, cls_ver)`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SubKindEntry {
+    pub cls: u64,
+    pub hver: u32,
+    pub ver: u64,
+    /// `0` = empty slot, else `1 + flags` (so a validated `0` flags is `1`).
+    pub tag: u8,
 }
 
 /// Direct-mapped string hash cache size (power of two).
@@ -328,6 +355,10 @@ pub(crate) struct PyRt {
     pub(super) t_str: Value,
     pub(super) t_slice: Value,
     pub(super) t_module: Value,
+    pub(super) t_method: Value,
+    pub(super) t_list_iter: Value,
+    pub(super) t_type: Value,
+    pub(super) stop: Value,
     pub(super) ebase: Value,
     /// `R.ISTYPES`: the types of None, bool, int, float and str, and bytes.
     pub(super) istypes: [Value; 6],
@@ -378,6 +409,8 @@ pub(crate) struct PyRt {
     pub(super) tb_keep: usize,
     /// The generator record shape `vm::py_gen` found plain.
     pub(super) gen_shape: Cell<u32>,
+    /// The `T.list_iterator` record shape (`cls`, `seq`, `i`, `next`) `vm::py_gen` found plain.
+    pub(super) list_iter_shape: Cell<u32>,
     /// Shapes of function records (`R.func`'s literal, and the shapes its
     /// appends lead to) seen with their `globals` at `func_globals_slot`
     /// (`shape::DICT`: an empty place), for `Vm::py_globals_of`.
@@ -426,6 +459,8 @@ pub(crate) struct PyRt {
     pub(super) smfind_cache: Box<[Cell<SmfindEntry>]>,
     /// Direct-mapped cache of MRO membership checks (`py_isinstance`, `py_exc_record`).
     pub(super) isinstance_cache: Box<[Cell<IsInstEntry>]>,
+    /// Direct-mapped cache of unmodified `dict`/`str` subclass dunder flags.
+    pub(super) sub_kind_cache: Box<[Cell<SubKindEntry>]>,
 }
 
 /// The first bytes of the string constant a Python code object's frame
@@ -519,6 +554,10 @@ impl PyRt {
             t_str: Value::UNDEFINED,
             t_slice: Value::UNDEFINED,
             t_module: Value::UNDEFINED,
+            t_method: Value::UNDEFINED,
+            t_list_iter: Value::UNDEFINED,
+            t_type: Value::UNDEFINED,
+            stop: Value::UNDEFINED,
             ebase: Value::UNDEFINED,
             istypes: [Value::UNDEFINED; 6],
             builtins: Value::UNDEFINED,
@@ -551,6 +590,7 @@ impl PyRt {
             frame_shape: crate::shape::DICT,
             tb_keep: 0,
             gen_shape: Cell::new(crate::shape::DICT),
+            list_iter_shape: Cell::new(crate::shape::DICT),
             func_shapes: Cell::new([crate::shape::DICT; 4]),
             func_globals_slot: Cell::new(0),
             gen_rt: Cell::new(None),
@@ -573,6 +613,7 @@ impl PyRt {
             str_hashes: (0..STR_HASH_CACHE_LEN).map(|_| Cell::new(StrHashEntry::default())).collect(),
             smfind_cache: (0..SMFIND_CACHE_LEN).map(|_| Cell::new(SmfindEntry::default())).collect(),
             isinstance_cache: (0..ISINST_CACHE_LEN).map(|_| Cell::new(IsInstEntry::default())).collect(),
+            sub_kind_cache: (0..SUB_KIND_CACHE_LEN).map(|_| Cell::new(SubKindEntry::default())).collect(),
         }
     }
 }
@@ -939,6 +980,10 @@ impl<'p> Vm<'p> {
         rt.t_str = own(self, "TSTR");
         rt.t_slice = own(self, "TSLICE");
         rt.t_module = own(self, "TMODULE");
+        rt.t_method = own(self, "TMETHOD");
+        rt.t_list_iter = own(self, "TLISTITER");
+        rt.t_type = own(self, "TTYPE");
+        rt.stop = own(self, "STOP");
         rt.ebase = own(self, "EBASE");
         rt.builtins = own(self, "BUILTINS");
         rt.excstack = own(self, "EXCSTACK");
@@ -1031,7 +1076,7 @@ impl<'p> Vm<'p> {
         }
         // The values above stay reachable through `pins` (held by `R`).
         let mut keep = vec![
-            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_frozenset, rt.t_str, rt.t_slice, rt.t_module, rt.ebase, rt.builtins, rt.excstack,
+            rt.t_list, rt.t_tuple, rt.t_dict, rt.t_set, rt.t_frozenset, rt.t_str, rt.t_slice, rt.t_module, rt.t_method, rt.t_list_iter, rt.t_type, rt.stop, rt.ebase, rt.builtins, rt.excstack,
             rt.ctors, rt.seq_tmpl, rt.exc_tmpl, rt.inst_tmpl, rt.files, rt.frame_tmpl, rt.exc_entries, rt.smfnative,
         ];
         keep.extend_from_slice(&rt.istypes);
@@ -1120,6 +1165,8 @@ impl<'p> Vm<'p> {
             ver: at("ver")?,
             truth_ver: at("truthVer")?,
             truth_kind: at("truthKind")?,
+            truth_fn: at("truthFn")?,
+            dict: at("dict")?,
         })
     }
 
@@ -1326,6 +1373,154 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => ty.ver < m.slot_len() && m.val_at(ty.ver).bits() == ver,
             _ => false,
         }
+    }
+
+    /// Cached builtin-subclass dunder capability bitmask (`SUB_DICT_*` /
+    /// `SUB_STR_*`) for class `cls`. Returns 0 for non-subclasses or any class
+    /// whose MRO ahead of `dict`/`str` overrides the relevant dunder.
+    #[inline]
+    pub(super) fn py_sub_kind(&self, cls: Value) -> u8 {
+        if !cls.is_heap() {
+            return 0;
+        }
+        let Some(p) = self.py_rt.as_deref() else {
+            return 0;
+        };
+        let (t_dict, t_str) = (p.t_dict.bits(), p.t_str.bits());
+        if cls.bits() == t_dict {
+            return SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN;
+        }
+        if cls.bits() == t_str {
+            return SUB_STR_GET | SUB_STR_LEN;
+        }
+        let Some(ty) = p.ty else {
+            return 0;
+        };
+        let ci = cls.heap_index();
+        let hver = self.heap.version_of(ci);
+        let ver = match self.heap.get(ci) {
+            HeapObj::Object(m)
+                if !m.is_ctor && ty.ver < m.slot_len() && key_eq(m.key_at(ty.ver), "ver") =>
+            {
+                m.val_at(ty.ver).bits()
+            }
+            _ => return 0,
+        };
+        let slot = (ci as usize) & (SUB_KIND_CACHE_LEN - 1);
+        let ce = p.sub_kind_cache[slot].get();
+        if ce.tag != 0 && ce.cls == cls.bits() && ce.hver == hver && ce.ver == ver {
+            return ce.tag - 1;
+        }
+        self.py_sub_kind_slow(cls, ci, hver, ver, slot, ty, t_dict, t_str)
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn py_sub_kind_slow(
+        &self,
+        cls: Value,
+        ci: u32,
+        hver: u32,
+        ver: u64,
+        slot: usize,
+        ty: TySlots,
+        t_dict: u64,
+        t_str: u64,
+    ) -> u8 {
+        let mut flags = 0u8;
+        if let Some(mro) = self.py_ty_field(ci, ty.mro, "mro") {
+            if mro.is_heap() {
+                if let HeapObj::Array(items) = self.heap.get(mro.heap_index()) {
+                    if let Some(pos) = items.iter().position(|x| x.bits() == t_dict) {
+                        flags = SUB_DICT_GET | SUB_DICT_GET_HIT | SUB_DICT_SET | SUB_DICT_LEN;
+                        for &anc in &items[..pos] {
+                            let Some(dval) = anc.is_heap().then(|| self.py_ty_field(anc.heap_index(), ty.dict, "dict")).flatten() else {
+                                flags = 0;
+                                break;
+                            };
+                            if !dval.is_heap() {
+                                flags = 0;
+                                break;
+                            }
+                            let HeapObj::Map { keys, .. } = self.heap.get(dval.heap_index()) else {
+                                flags = 0;
+                                break;
+                            };
+                            for &k in keys {
+                                if k.is_hole() {
+                                    continue;
+                                }
+                                if !k.is_heap() {
+                                    flags = 0;
+                                    break;
+                                }
+                                let HeapObj::Str(s) = self.heap.get(k.heap_index()) else {
+                                    flags = 0;
+                                    break;
+                                };
+                                match s.as_bytes() {
+                                    b"__getitem__" => flags &= !(SUB_DICT_GET | SUB_DICT_GET_HIT),
+                                    b"__missing__" => flags &= !SUB_DICT_GET,
+                                    b"__setitem__" => flags &= !SUB_DICT_SET,
+                                    b"__len__" | b"__bool__" => flags &= !SUB_DICT_LEN,
+                                    _ => {}
+                                }
+                            }
+                            if flags == 0 {
+                                break;
+                            }
+                        }
+                    } else if let Some(pos) = items.iter().position(|x| x.bits() == t_str) {
+                        flags = SUB_STR_GET | SUB_STR_LEN;
+                        for &anc in &items[..pos] {
+                            let Some(dval) = anc.is_heap().then(|| self.py_ty_field(anc.heap_index(), ty.dict, "dict")).flatten() else {
+                                flags = 0;
+                                break;
+                            };
+                            if !dval.is_heap() {
+                                flags = 0;
+                                break;
+                            }
+                            let HeapObj::Map { keys, .. } = self.heap.get(dval.heap_index()) else {
+                                flags = 0;
+                                break;
+                            };
+                            for &k in keys {
+                                if k.is_hole() {
+                                    continue;
+                                }
+                                if !k.is_heap() {
+                                    flags = 0;
+                                    break;
+                                }
+                                let HeapObj::Str(s) = self.heap.get(k.heap_index()) else {
+                                    flags = 0;
+                                    break;
+                                };
+                                match s.as_bytes() {
+                                    b"__getitem__" => flags &= !SUB_STR_GET,
+                                    b"__len__" | b"__bool__" => flags &= !SUB_STR_LEN,
+                                    _ => {}
+                                }
+                            }
+                            if flags == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(p) = self.py_rt.as_deref() {
+            p.sub_kind_cache[slot].set(SubKindEntry {
+                cls: cls.bits(),
+                hver,
+                ver,
+                tag: flags + 1,
+            });
+        }
+        flags
     }
 
     /// This site's cache entry (kind 0 when it has none).

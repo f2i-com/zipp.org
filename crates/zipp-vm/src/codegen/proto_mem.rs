@@ -1094,10 +1094,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // through `jit_global_fn_ic`, with the call protocol.
             Instr::GlobalFn { op, argc, .. }
                 if !(op == crate::bytecode::GlobalFn::String && argc == 1) => {}
-            // A JavaScript array literal's element or spread: the region's
-            // `jit_array_append_ic`, with the call protocol (a spread runs
-            // the iterator protocol, user code).
-            Instr::ArrayAppend { .. } if !py => {}
+            // An array literal's element or spread: `jit_array_append_ic` (and
+            // Python's non-spread `emit_py_array_append`).
+            Instr::ArrayAppend { .. } => {}
             // `f(...xs)`: the region's `jit_call_spread_ic`, with the call
             // protocol (the iterator and the callee are user code).
             Instr::CallSpread { .. } if !py => {}
@@ -1113,10 +1112,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 if !py && pattern < 1 << 24 && flags < 1 << 24 => {}
             // `o.#x = v`: `jit_private_prop_ic` (a private setter is user code).
             Instr::SetPrivate { name, .. } if !py && name <= 0xFF_FFFF => {}
-            // Array destructuring (`const [a, b] = v`, `[x, y] = [y, x]`): the
-            // region's `jit_iter_to_array_ic`, with the call protocol (a
-            // non-array iterator is user code).
-            Instr::IterToArray { count, .. } if !py && count <= 0xFFFF => {}
+            // Array destructuring (`const [a, b] = v`, `[x, y] = [y, x]`,
+            // `[a, ...rest] = v`): `jit_iter_to_array_ic` takes full 32-bit
+            // `count` in `packed_args >> 16`, so `u32::MAX` (drain-all) works.
+            Instr::IterToArray { .. } if !py => {}
             // An object rest and a spread `Math` call: the interpreter's arms
             // through `jit_cold_op_ic` (a getter, a replaced `Math` method is
             // user code).
@@ -1126,17 +1125,25 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 ..
             } if !py && (exclude_start as u64) <= 0xFFFF && (exclude_count as u64) <= 0xFFFF => {}
             Instr::MathSpread { .. } if !py => {}
-            // DOM / spread / collection / JSON ops routed via `jit_cold_op_ic`
-            // (call protocol): keeps hot DOM helpers in Tier C without
-            // cold-bail evictions or whole-function blacklisting.
+            // DOM / spread / collection / JSON / derived-ctor ops routed via
+            // `jit_cold_op_ic` or `jit_this_check_ic`: keeps derived class
+            // constructors and computed-key helpers in Tier C without
+            // whole-function blacklisting.
+            Instr::NewMap { .. } => {}
             Instr::ArrayFrom { .. }
-            | Instr::NewMap { .. }
             | Instr::NewSet { .. }
             | Instr::CallWithThisSpread { .. }
             | Instr::NewSpread { .. }
             | Instr::DeleteIndex { .. }
             | Instr::JsonStringify { .. }
             | Instr::JsonParse { .. }
+            | Instr::SuperCtorFetch { .. }
+            | Instr::SuperCtor { .. }
+            | Instr::SuperCtorSpread { .. }
+            | Instr::ThisCheck { .. }
+            | Instr::ToPropKey { .. }
+            | Instr::InitDataPropDyn { .. }
+            | Instr::ArrayRest { .. }
                 if !py => {}
             Instr::CallMethodSpread { name, .. }
                 if !py && (name as usize) < proto.string_constants.len() => {}
@@ -1326,12 +1333,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 if !crate::codegen::static_fn_jit_enabled() {
                     reject!("[tierC-reject] op StaticFn (disabled)");
                 }
-                // `Promise.resolve(x)` and the `Number.is*` tests: a LOOP of
-                // them runs faster in an OSR region (whose own inline arm
-                // avoids `jit_static_fn_ic`). Outside any backward-jump loop,
-                // keep the enclosing function in Tier C instead of blacklisting
-                // 150-op AST printers/validators over one `Number.isNaN`.
-                if crate::codegen::static_fn_region_inline(op, argc) {
+                // `Promise.resolve(x)`: a LOOP of it runs faster in an OSR
+                // region. `Number.is*` tests are inlined in Tier C via
+                // `heap.static_fn` too, so they never need to reject a body.
+                if matches!(op, crate::bytecode::StaticFn::PromiseResolve) && argc == 1 {
                     let loops = back_loops.get_or_insert_with(|| {
                         let mut v = Vec::new();
                         for (j, ins) in proto.code.iter().enumerate() {
@@ -2059,6 +2064,18 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 ..
             } => (u4(src, mapfn, callee, this_v), Some(dst)),
             Instr::DeleteIndex { dst, obj, key, .. } => (u2(obj, key), Some(dst)),
+            Instr::SuperCtorFetch { dst, .. } => (u0(), Some(dst)),
+            Instr::SuperCtor {
+                ctor,
+                arg_base,
+                argc,
+                ..
+            } => (Uses::range(arg_base, argc).plus(ctor).plus(0), Some(0)),
+            Instr::SuperCtorSpread { ctor, args, .. } => (u3(0, ctor, args), Some(0)),
+            Instr::ThisCheck { src } => (u1(src), Some(src)),
+            Instr::ToPropKey { dst, obj, src } => (u2(obj, src), Some(dst)),
+            Instr::InitDataPropDyn { obj, key, val } => (u3(obj, key, val), Some(obj)),
+            Instr::ArrayRest { dst, src, .. } => (u1(src), Some(dst)),
             Instr::Pow { dst, a, b } => (u2(a, b), Some(dst)),
             _ => return None,
         })
@@ -3629,6 +3646,13 @@ pub(crate) fn compile_proto_mem(
             | Instr::CallWithThisSpread { .. }
             | Instr::ArrayFrom { .. }
             | Instr::DeleteIndex { .. }
+            | Instr::SuperCtorFetch { .. }
+            | Instr::SuperCtor { .. }
+            | Instr::SuperCtorSpread { .. }
+            | Instr::ThisCheck { .. }
+            | Instr::ToPropKey { .. }
+            | Instr::InitDataPropDyn { .. }
+            | Instr::ArrayRest { .. }
             | Instr::Pow { .. }
             | Instr::LooseEq { .. }
             | Instr::LooseNe { .. }
@@ -5412,8 +5436,71 @@ pub(crate) fn compile_proto_mem(
                     ; jmp => epilogue
                 );
             }
+            Instr::NewMap { dst, .. } => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    3,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ThisCheck { src } if !py => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_this_check_ic as *const () as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(src)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ToPropKey { dst, obj, src } if !py => {
+                let tpk_slow = ops.new_dynamic_label();
+                let tpk_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(obj)]
+                    ; shr rax, 48
+                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null / SmallBigInt
+                    ; je => tpk_slow
+                    ; cmp eax, (INT_TAG_HI + 3) as i32     // 0x7FFC Undefined
+                    ; je => tpk_slow
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, (INT_TAG_HI + 4) as i32    // 0x7FFD Heap
+                    ; je => tpk_slow
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => tpk_done
+                    ; => tpk_slow
+                );
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    14,
+                    dst,
+                    refetch,
+                    None,
+                );
+                dynasm!(ops ; => tpk_done);
+            }
             Instr::ArrayFrom { dst, .. }
-            | Instr::NewMap { dst, .. }
             | Instr::NewSet { dst, .. }
             | Instr::CallMethodSpread { dst, .. }
             | Instr::CallWithThisSpread { dst, .. }
@@ -5421,11 +5508,12 @@ pub(crate) fn compile_proto_mem(
             | Instr::DeleteIndex { dst, .. }
             | Instr::JsonStringify { dst, .. }
             | Instr::JsonParse { dst, .. }
+            | Instr::SuperCtorFetch { dst, .. }
+            | Instr::ArrayRest { dst, .. }
                 if !py =>
             {
                 let cold_op: u16 = match proto.code[ip] {
                     Instr::ArrayFrom { .. } => 2,
-                    Instr::NewMap { .. } => 3,
                     Instr::NewSet { .. } => 4,
                     Instr::CallMethodSpread { .. } => 5,
                     Instr::CallWithThisSpread { .. } => 6,
@@ -5433,6 +5521,8 @@ pub(crate) fn compile_proto_mem(
                     Instr::DeleteIndex { .. } => 8,
                     Instr::JsonStringify { .. } => 9,
                     Instr::JsonParse { .. } => 10,
+                    Instr::SuperCtorFetch { .. } => 11,
+                    Instr::ArrayRest { .. } => 16,
                     _ => unreachable!(),
                 };
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
@@ -5446,6 +5536,43 @@ pub(crate) fn compile_proto_mem(
                     0,
                     cold_op,
                     dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::SuperCtor { .. } | Instr::SuperCtorSpread { .. } if !py => {
+                let cold_op: u16 = match proto.code[ip] {
+                    Instr::SuperCtor { .. } => 12,
+                    Instr::SuperCtorSpread { .. } => 13,
+                    _ => unreachable!(),
+                };
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    cold_op,
+                    0,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::InitDataPropDyn { obj, .. } if !py => {
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_cold_op_ic as *const () as usize,
+                    packed_fip,
+                    0,
+                    15,
+                    obj,
                     refetch,
                     None,
                 );
@@ -7382,6 +7509,11 @@ pub(crate) fn compile_proto_mem(
                         dict_lbl
                     }
                 });
+                let dyn_getter = if can_cross3_dyn && mega_target.is_some() {
+                    Some(*cross3_dyn_stub.get_or_insert_with(|| ops.new_dynamic_label()))
+                } else {
+                    None
+                };
                 deferred_prop_cold.push(DeferredPropCold::Get {
                     miss_lbl,
                     cont,
@@ -7390,6 +7522,7 @@ pub(crate) fn compile_proto_mem(
                     acc_lane_join,
                     quick_len: is_length,
                     mega_target,
+                    dyn_getter,
                     key_id,
                     dst,
                     obj,
@@ -7750,6 +7883,11 @@ pub(crate) fn compile_proto_mem(
                         .filter(|p| (p >> 16) & 0xff != 0xff && meter.is_none());
                     let retry = ops.new_dynamic_label();
                     let decline = if arr_retry.is_some() { retry } else { general };
+                    let cca_done = (key == "charCodeAt" && meter.is_none())
+                        .then(|| ops.new_dynamic_label());
+                    if let Some(done_lbl) = cca_done {
+                        emit_inline_ascii_char_code_at(&mut ops, dst, obj, arg_base, done_lbl);
+                    }
                     if key == "push" {
                         emit_guard_hot_mirror_clear(&mut ops, dreg(obj), general);
                     } else {
@@ -7765,6 +7903,9 @@ pub(crate) fn compile_proto_mem(
                         ; je => decline
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    if let Some(done_lbl) = cca_done {
+                        dynasm!(ops ; => done_lbl);
+                    }
                     if let Some(packed) = arr_retry {
                         let ok = ops.new_dynamic_label();
                         dynasm!(ops
@@ -8445,7 +8586,7 @@ pub(crate) fn compile_proto_mem(
                     None,
                 );
             }
-            Instr::ArrayAppend { arr, val, spread } if !py => {
+            Instr::ArrayAppend { arr, val, spread } if !py || spread => {
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 emit_region_call_ic(
                     &mut ops,
@@ -8863,7 +9004,46 @@ pub(crate) fn compile_proto_mem(
                     None,
                 );
             }
-            Instr::StaticFn { dst, .. } => {
+            Instr::StaticFn {
+                dst,
+                op,
+                arg_base,
+                argc,
+                callee,
+                this_v,
+            } => {
+                use crate::bytecode::StaticFn as S;
+                let fast_code: Option<u32> = if argc == 1 && meter.is_none() {
+                    match op {
+                        S::NumberIsInteger => Some(1),
+                        S::NumberIsNaN => Some(2),
+                        S::NumberIsFinite => Some(3),
+                        S::NumberIsSafeInteger => Some(4),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let sf_done = fast_code.map(|_| ops.new_dynamic_label());
+                if let (Some(code), Some(done)) = (fast_code, sf_done) {
+                    let sf_slow = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov edx, code as i32
+                        ; mov r8, [rbx + dreg(callee)]
+                        ; mov r9, [rbx + dreg(this_v)]
+                        ; mov rax, [rbx + dreg(arg_base)]
+                        ; mov [rsp + 32], rax
+                        ; mov rax, QWORD heap.static_fn as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => sf_slow
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => sf_slow
+                    );
+                }
                 // A static through `jit_static_fn_ic`, which reads the
                 // instruction from the bytecode; see the region arm.
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
@@ -8880,6 +9060,9 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                if let Some(done) = sf_done {
+                    dynasm!(ops ; => done);
+                }
             }
             Instr::New {
                 dst,
@@ -10207,6 +10390,7 @@ enum DeferredPropCold {
         acc_lane_join: Option<dynasmrt::DynamicLabel>,
         quick_len: bool,
         mega_target: Option<dynasmrt::DynamicLabel>,
+        dyn_getter: Option<dynasmrt::DynamicLabel>,
         key_id: u32,
         dst: u16,
         obj: u16,
@@ -10770,11 +10954,10 @@ pub(crate) fn emit_keyed_memo_get_stub(
     use crate::vm::host_api::{
         JIT_ARR_MIRROR_LEN_OFFSET, JIT_ARR_MIRROR_RAW_OFFSET, JIT_ARR_PROTO_IDX_OFFSET,
         JIT_ARR_PROTO_ITER_SLOT_PTR_OFFSET, JIT_ARR_PROTO_ITER_VER_OFFSET,
-        JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET, JIT_DEFERRED_NS_NONEMPTY_OFFSET,
-        JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF,
-        JIT_KEYED_MEMO_RAW_OFFSET, JIT_MOD_NS_NONEMPTY_OFFSET, JIT_OBJ_PROTO_IDX_OFFSET,
-        JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET, JIT_REALM_GLOBALS_NONEMPTY_OFFSET,
-        JIT_SYM_ITERATOR_BITS_OFFSET, JIT_VERSIONS_RAW_OFFSET,
+        JIT_DEFAULT_ARRAY_ITER_BITS_OFFSET, JIT_GLOBAL_THIS_IDX_OFFSET, JIT_HOT_FID_OFF,
+        JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF, JIT_KEYED_MEMO_RAW_OFFSET,
+        JIT_OBJ_PROTO_IDX_OFFSET, JIT_PROTO_LEN_OFFSET, JIT_PROTO_RAW_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_SYM_ITERATOR_BITS_OFFSET, JIT_VERSIONS_RAW_OFFSET,
     };
     use crate::vm::{KSM_ABSENT_MASK, KSM_ABSENT_NULL_PROTO, KSM_IMMUTABLE_KEY, KSM_PURE_SHAPE};
     let arr_sym_iter = ops.new_dynamic_label();
@@ -10804,10 +10987,12 @@ pub(crate) fn emit_keyed_memo_get_stub(
         ; jz => slow
         ; cmp edx, DWORD [rdi + JIT_GLOBAL_THIS_IDX_OFFSET as i32]
         ; je => slow
-        ; cmp BYTE [rdi + JIT_MOD_NS_NONEMPTY_OFFSET as i32], 0
-        ; jne => slow
-        ; cmp BYTE [rdi + JIT_DEFERRED_NS_NONEMPTY_OFFSET as i32], 0
-        ; jne => slow
+        // Exotic receivers (`global_this`, `arr_proto`, `realm_global`,
+        // `module_namespaces`, `deferred_ns_state`) are all `pin_dict` +
+        // `pin_mirror_dict` so their `HotMirror.fid` has bit 31 clear (`0` or
+        // `FID_MIRROR_CTOR`); the `0x8000_0000` check below rejects them in one
+        // instruction without global `mod_ns_nonempty` / `deferred_ns_nonempty`
+        // bail-outs that would otherwise disable the stub across all ES modules.
         ; mov eax, edx
         ; mov r10, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
         ; lea r10, [r10 + rax * 8]
@@ -11126,12 +11311,25 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; test eax, eax
         ; jz => class_hit
         ; cmp eax, crate::vm::CLASS_PROP_GETTER as i32
-        ; je => slow
+        ; je > class_getter
         ; mov eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
         ; cmp DWORD [r11 + 12], eax
         ; jne => slow
         ; => class_hit
         ; mov rax, [r11 + 24]
+        ; ret
+
+        ; class_getter:
+        ; cmp r8d, -1
+        ; je => ret_deopt
+        ; mov eax, DWORD [r11 + 12]
+        ; test eax, eax
+        ; jz > class_getter_ok
+        ; cmp eax, DWORD [rdi + JIT_CHAIN_EPOCH_OFFSET as i32]
+        ; jne => slow
+        ; class_getter_ok:
+        ; mov r11, [r11 + 24]
+        ; mov rax, QWORD crate::codegen::PROP_CLASS_GETTER as i64
         ; ret
 
         ; => es5_proto
@@ -11193,12 +11391,12 @@ pub(crate) fn emit_mega_get_prop_stub(
         ; test eax, eax
         ; jz => dict_body
         // Shaped object on a `direct == false` site: identity ways never cache
-        // class methods or class absent reads, so probe 2-way `shape_prop_memo` ->
-        // `class_prop_memo` for class instances (`fid != FID_MIRROR_NONE`) when
-        // the own key is proved absent (`slot < 0`). Own data props fall to
-        // `=> slow` so identity ways and `direct_miss_gate` still warm up.
-        ; cmp DWORD [r10 + JIT_HOT_FID_OFF as i32], crate::heap::FID_MIRROR_NONE as i32
-        ; je => slow
+        // class methods, class absent reads, or polymorphic absent/ES5-proto
+        // reads, so probe 2-way `shape_prop_memo` and serve any negative
+        // special sentinel (`SHAPE_PROP_ABSENT`, `SHAPE_PROP_ES5_PROTO`,
+        // `SHAPE_PROP_CLASS_MISS`) inline via `shape_special`. Own data props
+        // (`slot >= 0`) still fall to `=> slow` so identity ways and
+        // `direct_miss_gate` warm up.
         ; imul eax, eax, 0x9E37_79B1u32 as i32
         ; imul r11d, ecx, 0xC2B2_AE35u32 as i32
         ; xor eax, r11d
@@ -12002,6 +12200,7 @@ fn emit_deferred_prop_cold(
             acc_lane_join,
             quick_len,
             mega_target,
+            dyn_getter,
             key_id,
             dst,
             obj,
@@ -12044,6 +12243,33 @@ fn emit_deferred_prop_cold(
                     ; mov r9, QWORD packed as i64
                     ; mov rax, QWORD heap.get_prop_miss as i64
                     ; call rax
+                );
+            }
+            if let Some(dyn_lbl) = dyn_getter {
+                dynasm!(ops
+                    ; mov r10, QWORD PROP_CLASS_GETTER as i64
+                    ; cmp rax, r10
+                    ; jne > not_class_getter
+                    ; mov rax, r11
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; lea r8, [rbx + dreg(obj)]
+                    ; mov ecx, 0x100
+                    ; call => dyn_lbl
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => via_ic
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => cont
+                    ; not_class_getter:
+                );
+            } else if mega_target.is_some() {
+                dynasm!(ops
+                    ; mov r10, QWORD PROP_CLASS_GETTER as i64
+                    ; cmp rax, r10
+                    ; je => via_ic
                 );
             }
             dynasm!(ops

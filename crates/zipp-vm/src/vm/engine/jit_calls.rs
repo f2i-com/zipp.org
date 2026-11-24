@@ -518,7 +518,9 @@ impl<'p> Vm<'p> {
         // direct global routes can be invalidated by `delete` / defineProperty
         // on globalThis (Tier C never records a self-binding, so that check is
         // structurally unnecessary — asserted at install).
-        if self.global_route_epoch != 0 {
+        if self.global_route_epoch != 0
+            && !self.jit.cross_route_ok(fid, self.global_route_epoch)
+        {
             if !self.jit_globals_still_routable(fid) {
                 crate::vm::helpers_misc::crossstats::decline(
                     crate::vm::helpers_misc::crossstats::DECL_ROUTABLE,
@@ -2528,6 +2530,102 @@ impl<'p> Vm<'p> {
                     let callee = self.get(base, callee);
                     let this_v = self.get(base, this_v);
                     self.exec_json_parse(arg, callee, this_v)
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            11 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtorFetch { home_class_id, .. }) => {
+                    Ok(self.super_ctor_fetch(home_class_id))
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            12 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtor {
+                    ctor,
+                    home_class_id,
+                    arg_base,
+                    argc,
+                }) => self
+                    .super_ctor_call(base, ip, ctor, home_class_id, arg_base, argc)
+                    .map(|()| self.get(base, 0)),
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            13 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::SuperCtorSpread {
+                    ctor,
+                    home_class_id,
+                    args,
+                }) => self
+                    .super_ctor_spread_call(base, ip, ctor, home_class_id, args)
+                    .map(|()| self.get(base, 0)),
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            14 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ToPropKey { obj, src, .. }) => {
+                    let o = self.get(base, obj);
+                    if o.is_nullish() {
+                        Err(Thrown(format!(
+                            "TypeError: cannot read property of {}",
+                            self.display(o)
+                        )))
+                    } else {
+                        let k = self.get(base, src);
+                        self.coerce_index_key(k)
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            15 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::InitDataPropDyn { obj, key, val }) => {
+                    let o = self.get(base, obj);
+                    let k = self.get(base, key);
+                    let v = self.get(base, val);
+                    let ks = self.key_of(k);
+                    if o.is_heap() {
+                        let oi = o.heap_index();
+                        if matches!(self.heap.get(oi), HeapObj::Object(_)) {
+                            self.heap.write_barrier_val(oi, v);
+                            let HeapObj::Object(m) = self.heap.get_mut(oi) else {
+                                unreachable!("object kind changed across write barrier")
+                            };
+                            m.define(&ks, v, crate::heap::PropAttr::data());
+                            self.heap.bump_version(oi);
+                            Ok(o)
+                        } else {
+                            self.set_prop(o, &ks, v, false).map(|_| o)
+                        }
+                    } else {
+                        Ok(o)
+                    }
+                }
+                _ => {
+                    self.jit_call_depth -= 1;
+                    return SELF_CALL_DEOPT;
+                }
+            },
+            16 => match self.func(func_id as usize).code.get(ip).copied() {
+                Some(Instr::ArrayRest { src, start, .. }) => {
+                    let sv = self.get(base, src);
+                    self.destructure_rest(sv).map(|mut elems| {
+                        let start = (start as usize).min(elems.len());
+                        let rest = elems.split_off(start);
+                        Value::heap(self.heap.alloc(HeapObj::Array(rest)))
+                    })
                 }
                 _ => {
                     self.jit_call_depth -= 1;

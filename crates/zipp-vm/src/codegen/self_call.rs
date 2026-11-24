@@ -38,6 +38,12 @@ pub const CONCAT_SET_PURE: u64 = 0x7FFE_DEAD_BEEF_0003;
 /// deopt, the interpreter) performs the access.
 pub const PROP_VIA_IC: u64 = 0x7FFE_DEAD_BEEF_0002;
 
+/// Sentinel returned by `emit_get_prop_miss_stub` when `class_prop_memo` hits
+/// a cached `CLASS_PROP_GETTER` (with `r11` holding the getter `Value` bits).
+/// `DeferredPropCold::Get` invokes `cross3_dyn_stub` directly with `this = obj`
+/// and falls back to `jit_get_prop_slow` (`via_ic`) if `cross3_dyn_stub` declines.
+pub const PROP_CLASS_GETTER: u64 = 0x7FFE_DEAD_BEEF_0004;
+
 /// Emit a self-recursive call: `regs[dst] = self(regs[arg_base..arg_base+argc])`.
 ///
 /// The args already sit contiguously in this frame's register window (the

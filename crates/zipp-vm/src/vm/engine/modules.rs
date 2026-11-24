@@ -1015,7 +1015,6 @@ impl<'p> Vm<'p> {
                 Err(e) => {
                     self.module_cache.remove(&path);
                     self.module_namespaces.remove(&ns_idx);
-                    self.mod_ns_nonempty = (!self.module_namespaces.is_empty()) as u8;
                     self.module_pending_reexports.remove(&path);
                     return Err(e);
                 }
@@ -1270,7 +1269,6 @@ impl<'p> Vm<'p> {
             vm.module_dfs_unwind(&path);
             vm.module_cache.remove(&path);
             vm.module_namespaces.remove(&ns_idx);
-            vm.mod_ns_nonempty = (!vm.module_namespaces.is_empty()) as u8;
             vm.module_own.remove(&path);
             vm.module_pending_reexports.remove(&path);
             vm.link_pending_deps.truncate(lp_mark);
@@ -1489,7 +1487,6 @@ impl<'p> Vm<'p> {
                 self.module_dfs_unwind(&path);
                 self.module_cache.remove(&path);
                 self.module_namespaces.remove(&ns_idx);
-                self.mod_ns_nonempty = (!self.module_namespaces.is_empty()) as u8;
                 Err(e)
             }
         }
@@ -1757,7 +1754,10 @@ impl<'p> Vm<'p> {
             },
         );
         m.extensible = false;
+        m.pin_dict();
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
+        self.heap.pin_mirror_dict(idx);
+        self.heap.bump_version(idx);
         self.proto_of.insert(idx, Value::NULL);
         self.deferred_ns_cache.insert(key, Value::heap(idx));
         self.deferred_ns_state
@@ -1828,6 +1828,7 @@ impl<'p> Vm<'p> {
                     },
                 );
                 m.extensible = false;
+                m.pin_dict();
                 if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
                     *slot = m;
                 }
@@ -1835,6 +1836,7 @@ impl<'p> Vm<'p> {
                 // usually old by now: barrier the young tag (and any young
                 // snapshot value) the replaced map carries.
                 self.heap.write_barrier(idx);
+                self.heap.pin_mirror_dict(idx);
                 // Whole-map replacement: invalidate any JIT inline cache that
                 // captured the old vals pointer.
                 self.heap.bump_version(idx);

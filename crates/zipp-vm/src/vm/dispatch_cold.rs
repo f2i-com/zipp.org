@@ -4494,15 +4494,18 @@ impl<'p> Vm<'p> {
                     }
                     opt_callees.class_epoch = self.mi_class_epoch;
                 }
-                if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+                if !self.jit.metered() {
+                    let direct_on = crate::codegen::direct_ic_miss_enabled();
                     for (ip, instr) in proto_ref.code.iter().enumerate() {
                         let is_set = match instr {
                             Instr::GetProp { .. } => false,
                             Instr::SetProp { .. } => true,
                             _ => continue,
                         };
-                        if self.ic_site_is_rotating_own(func_id, ip, is_set) {
+                        if direct_on && self.ic_site_is_rotating_own(func_id, ip, is_set) {
                             self.jit.preseed_direct_miss_site(func_id, ip as u32);
+                        } else if self.ic_site_has_accessor(func_id, ip) {
+                            self.jit.preseed_acc_site(func_id, ip as u32);
                         }
                     }
                 }

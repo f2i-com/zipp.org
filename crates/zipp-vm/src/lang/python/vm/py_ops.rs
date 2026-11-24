@@ -328,13 +328,24 @@ impl<'p> Vm<'p> {
             }
             Instr::PyGenNext { dst, next, this, slow } => {
                 let nv = self.get(base, next);
-                let native = nv.is_heap()
-                    && matches!(self.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == super::native::PY_GEN);
-                if !native {
+                let nat = if nv.is_heap() {
+                    match self.heap.get(nv.heap_index()) {
+                        HeapObj::Native(id) if *id == super::native::PY_GEN => 1u8,
+                        HeapObj::Native(id) if *id == super::native::PY_ITER => 2u8,
+                        _ => 0u8,
+                    }
+                } else {
+                    0u8
+                };
+                if nat == 0 {
                     return Ok(slow as usize);
                 }
                 let tv = self.get(base, this);
-                let v = self.py_gen_next(tv)?;
+                let v = if nat == 1 {
+                    self.py_gen_next(tv)?
+                } else {
+                    self.py_iter_next(tv)?
+                };
                 self.set(base, dst, v);
                 ip + 1
             }
@@ -654,7 +665,10 @@ impl<'p> Vm<'p> {
                     ip + 1
                 })
             }
-            PyCallee::Slow => Ok(slow as usize),
+            PyCallee::Slow => match self.py_step_bound_method(fv, base, arg_base, argc, dst, ip)? {
+                Some(next) => Ok(next),
+                None => Ok(slow as usize),
+            },
         };
         if r.is_err() {
             self.py_step_failed(ip);
@@ -668,6 +682,129 @@ impl<'p> Vm<'p> {
             self.py_prof_step(func_id, ip, instr, &shown);
         }
         r
+    }
+
+    /// Direct frame push for a bound Python method (`{ cls: T.method, func, self }`)
+    /// at a `PyCall` site (e.g. `self.out(data)` in `html2text`): unwraps
+    /// `(func, self)` and calls `func`'s `c<argc + 1>` entry with `self`
+    /// prepended, skipping `NewArray`/`R.callv`/`bindArgs`.
+    fn py_step_bound_method(
+        &mut self,
+        fv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        ip: usize,
+    ) -> Result<Option<usize>, Thrown> {
+        const ENTRIES: [&str; 19] = [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12",
+            "c13", "c14", "c15", "c16", "c17", "c18",
+        ];
+        if !fv.is_heap() || super::prof_py::on() {
+            return Ok(None);
+        }
+        let Some(t_method) = self.py_rt.as_deref().map(|p| p.t_method) else {
+            return Ok(None);
+        };
+        if !t_method.is_heap() {
+            return Ok(None);
+        }
+        let (inner_f, bound_self) = match self.heap.get(fv.heap_index()) {
+            HeapObj::Object(m) if !m.is_ctor && m.slot_len() >= 3 => {
+                if m.val_at(0).bits() != t_method.bits()
+                    || !super::py_rt::key_eq(m.key_at(0), "cls")
+                    || !super::py_rt::key_eq(m.key_at(1), "func")
+                    || !super::py_rt::key_eq(m.key_at(2), "self")
+                    || m.is_accessor_at(0)
+                    || m.is_accessor_at(1)
+                    || m.is_accessor_at(2)
+                {
+                    return Ok(None);
+                }
+                (m.val_at(1), m.val_at(2))
+            }
+            _ => return Ok(None),
+        };
+        let total = (argc as usize) + 1;
+        let Some(&entry_name) = ENTRIES.get(total) else {
+            return Ok(None);
+        };
+        if !inner_f.is_heap() {
+            return Ok(None);
+        }
+        let entry = match self.heap.get(inner_f.heap_index()) {
+            HeapObj::Object(fm) if !fm.is_ctor => {
+                let Some(s) = fm.pos(entry_name) else {
+                    return Ok(None);
+                };
+                if fm.is_accessor_at(s) {
+                    return Ok(None);
+                }
+                fm.val_at(s)
+            }
+            _ => return Ok(None),
+        };
+        if !entry.is_heap() {
+            return Ok(None);
+        }
+        let (fid, closure) = match self.heap.get(entry.heap_index()) {
+            HeapObj::Func(id) => (*id, super::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, entry.heap_index()),
+            _ => return Ok(None),
+        };
+        let p = self.func(fid as usize);
+        if p.is_generator
+            || p.is_async
+            || !p.is_strict
+            || p.lexical_this
+            || p.rest_reg.is_some()
+            || p.arguments_reg.is_some()
+        {
+            return Ok(None);
+        }
+        let regs = (p.reg_count as usize).max(1);
+        let params = p.param_count as usize;
+        let new_base = self.regs.len();
+        if self.frames.len() >= MAX_FRAMES || self.regs_would_overflow(new_base + regs) {
+            return Ok(None);
+        }
+        self.regs.resize(new_base + regs, Value::UNDEFINED);
+        self.regs[new_base] = inner_f;
+        if params >= 1 {
+            self.regs[new_base + 1] = bound_self;
+            let args = caller_base + arg_base as usize;
+            let n = (argc as usize).min(params - 1);
+            for i in 0..n {
+                let v = self.regs[args + i];
+                self.regs[new_base + 2 + i] = v;
+            }
+        }
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = ip + 1;
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: (caller_base + arg_base as usize) as u32,
+            argc: total as u16,
+            is_eval: false,
+            construct_this: false,
+            gen: u32::MAX,
+            func: fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: entry,
+        });
+        if total < params {
+            self.py_fill_defaults(inner_f, fid, total);
+        }
+        Ok(Some(usize::MAX))
     }
 
     /// Push the frame of a property's accessor for the `PyGetAttr` /
@@ -820,7 +957,10 @@ impl<'p> Vm<'p> {
     /// rewrites a record's entries in place (new defaults) without changing
     /// its keys.
     fn py_call_target(&mut self, func_id: u32, ip: usize, f: Value, argc: u16) -> PyCallee {
-        const ENTRIES: [&str; 13] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12"];
+        const ENTRIES: [&str; 19] = [
+            "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12",
+            "c13", "c14", "c15", "c16", "c17", "c18",
+        ];
         let cached = self.py_ic(func_id, ip);
         if cached.kind == ic::CALL_EXC && cached.c != 0 && cached.a == f.bits() {
             if let Some(lean) = self.py_lean_hit(&cached, f) {
@@ -1253,7 +1393,7 @@ impl<'p> Vm<'p> {
     /// the bits `key` and stamp `kver` (see `py_map_at`), and its value is
     /// not `undefined`.
     #[inline]
-    fn py_map_at_bits(&self, m: Value, pos: u32, key: u64, kver: u32) -> Option<Value> {
+    pub(super) fn py_map_at_bits(&self, m: Value, pos: u32, key: u64, kver: u32) -> Option<Value> {
         if !m.is_heap() {
             return None;
         }
@@ -1271,7 +1411,28 @@ impl<'p> Vm<'p> {
     /// record; `None` for the slow edge.
     #[inline]
     pub(super) fn py_class_of(&self, o: Value) -> Option<Value> {
-        self.py_cls_of(o).filter(|&c| self.py_plain_rec(c))
+        if let Some(c) = self.py_cls_of(o) {
+            return self.py_plain_rec(c).then_some(c);
+        }
+        let p = self.py_rt.as_deref()?;
+        let t = if o.is_null() {
+            p.istypes[0]
+        } else if o.is_bool() {
+            p.istypes[1]
+        } else if o.small_bigint_val().is_some() {
+            p.istypes[2]
+        } else if o.is_number() {
+            p.istypes[3]
+        } else if o.is_heap() {
+            match self.heap.get(o.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => p.istypes[4],
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => p.istypes[2],
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        self.py_plain_rec(t).then_some(t)
     }
 
     /// [`Instr::PyDictGet`] of the string constant `key` (of `func_id`) in
@@ -1599,11 +1760,22 @@ impl<'p> Vm<'p> {
         if let Some((_, map, _)) = self.py_dict_rec_fast(d, tdict) {
             return self.py_table_get(map, k);
         }
-        if self.py_cls_of(d)?.bits() != tdict.bits() {
+        let cls = self.py_cls_of(d)?;
+        let sk = self.py_sub_kind(cls);
+        if cls.bits() != tdict.bits()
+            && (sk & (super::py_rt::SUB_DICT_GET | super::py_rt::SUB_DICT_GET_HIT)) == 0
+        {
             return None;
         }
         let (_, map) = self.py_dict_field(d.heap_index(), 0)?;
-        self.py_table_get(map, k)
+        let res = self.py_table_get(map, k);
+        if matches!(res, Some(None))
+            && cls.bits() != tdict.bits()
+            && (sk & super::py_rt::SUB_DICT_GET) == 0
+        {
+            return None;
+        }
+        res
     }
 
     /// Whether `t` is in class `c`'s `mro`, served from `PyRt::isinstance_cache`
@@ -1838,7 +2010,8 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let cls = self.py_cls_of(v)?.bits();
+        let cls_v = self.py_cls_of(v)?;
+        let cls = cls_v.bits();
         if cls == tl || cls == tt || cls == tb {
             let (_, items) = self.py_seq_parts(v)?;
             if !items.is_heap() {
@@ -1856,6 +2029,19 @@ impl<'p> Vm<'p> {
             }
             let n = size.as_f64();
             return (n >= 0.0 && n.fract() == 0.0 && n < 9_007_199_254_740_992.0).then_some(n as usize);
+        }
+        let sk = self.py_sub_kind(cls_v);
+        if (sk & super::py_rt::SUB_DICT_LEN) != 0 {
+            let (_, size) = self.py_dict_field(v.heap_index(), 1)?;
+            if !size.is_number() {
+                return None;
+            }
+            let n = size.as_f64();
+            return (n >= 0.0 && n.fract() == 0.0 && n < 9_007_199_254_740_992.0).then_some(n as usize);
+        }
+        if (sk & super::py_rt::SUB_STR_LEN) != 0 {
+            let pyval = self.py_own_data(v.heap_index(), "pyval")?;
+            return self.py_str_len(pyval);
         }
         None
     }
@@ -1950,6 +2136,7 @@ impl<'p> Vm<'p> {
             }
         }
         if cls_v.is_heap() {
+            let mut truth_eval: Option<(u8, Value)> = None;
             if let HeapObj::Object(cm) = self.heap.get(cls_v.heap_index()) {
                 if !cm.is_ctor
                     && ty.truth_kind < cm.slot_len()
@@ -1962,13 +2149,64 @@ impl<'p> Vm<'p> {
                     let ver = cm.val_at(ty.ver);
                     let tver = cm.val_at(ty.truth_ver);
                     let tkind = cm.val_at(ty.truth_kind);
-                    if ver.is_number()
-                        && tver.is_number()
-                        && ver.as_f64() == tver.as_f64()
-                        && tkind.is_number()
-                        && tkind.as_f64() == 1.0
-                    {
-                        return Some(true);
+                    if ver.is_number() && tver.is_number() && ver.as_f64() == tver.as_f64() && tkind.is_number() {
+                        let k = tkind.as_f64();
+                        if k == 1.0 {
+                            return Some(true);
+                        }
+                        if (k == 2.0 || k == 3.0)
+                            && ty.truth_fn < cm.slot_len()
+                            && super::py_rt::key_eq(cm.key_at(ty.truth_fn), "truthFn")
+                        {
+                            truth_eval = Some((if k == 2.0 { 2 } else { 3 }, cm.val_at(ty.truth_fn)));
+                        }
+                    }
+                }
+            }
+            // Fast path for unmodified dict/str subclasses (`AttributeDict`, `NavigableString`).
+            let sk = self.py_sub_kind(cls_v);
+            if (sk & super::py_rt::SUB_DICT_LEN) != 0 {
+                let (_, size) = self.py_dict_field(idx, 1)?;
+                return size.is_number().then(|| size.as_f64() != 0.0);
+            }
+            if (sk & super::py_rt::SUB_STR_LEN) != 0 {
+                let pyval = self.py_own_data(idx, "pyval")?;
+                if pyval.is_heap() {
+                    return match self.heap.get(pyval.heap_index()) {
+                        HeapObj::Str(s) => Some(s.units() != 0),
+                        HeapObj::Cons { len, .. } => Some(*len != 0),
+                        _ => None,
+                    };
+                }
+            }
+            // Frameless leaf execution for pure Python `__bool__` / `__len__` (e.g. `Tag.__bool__`).
+            if let Some((kind, tfn)) = truth_eval {
+                if self.py_plain_rec(tfn)
+                    && self.py_own_data(tfn.heap_index(), "unboxSelf") != Some(Value::TRUE)
+                {
+                    if let Some(c1) = self.py_own_data(tfn.heap_index(), "c1") {
+                        if c1.is_heap() {
+                            if let HeapObj::Func(fid) = *self.heap.get(c1.heap_index()) {
+                                if let Some(info) = self.py_leaf_info(fid) {
+                                    if info.params == 1 {
+                                        if let Some(ret) = self.py_leaf_exec_pure_1arg(fid, tfn, info, v) {
+                                            if kind == 2 {
+                                                if ret == Value::TRUE {
+                                                    return Some(true);
+                                                }
+                                                if ret == Value::FALSE {
+                                                    return Some(false);
+                                                }
+                                            } else if let Some(n) = self.bigint_i128(ret) {
+                                                if n >= 0 {
+                                                    return Some(n != 0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1985,7 +2223,11 @@ impl<'p> Vm<'p> {
         let tmodule = self.py_rt_for(rt)?.t_module;
         let cls = self.py_cls_of(o)?;
         if tmodule.bits() != cls.bits() {
-            return None;
+            // Non-module user-class instances: resolve own instance-dict
+            // callables (`self.out(...)`) and cached `@staticmethod` entries
+            // (`cls.gv`, e.g. `self.is_tag(el)`) with `prepend = false`.
+            let mut call = None;
+            return self.py_attr_get(func_id, ip, o, key, &mut call);
         }
         let g = self.py_hint_field(super::py_rt::hint::GLOBALS, o.heap_index(), "globals")?;
         if !g.is_heap() {
@@ -2117,11 +2359,24 @@ impl<'p> Vm<'p> {
     }
 
     /// `s[k]` for [`Instr::PyStrItem`]: well-formed BMP (incl. ASCII) single
-    /// index or step-1 slice.
+    /// index or step-1 slice, including unmodified `str` subclasses (`pyval`).
     fn py_str_item(&mut self, s: Value, k: Value) -> Option<Value> {
-        if !s.is_heap() || !self.heap.is_str_like(s.heap_index()) {
+        if !s.is_heap() {
             return None;
         }
+        let s = if self.heap.is_str_like(s.heap_index()) {
+            s
+        } else {
+            let cls = self.py_cls_of(s)?;
+            if (self.py_sub_kind(cls) & super::py_rt::SUB_STR_GET) == 0 {
+                return None;
+            }
+            let pyval = self.py_own_data(s.heap_index(), "pyval")?;
+            if !pyval.is_heap() || !self.heap.is_str_like(pyval.heap_index()) {
+                return None;
+            }
+            pyval
+        };
         let idx = s.heap_index();
         self.heap.flatten(idx);
         let (len, is_ascii) = {
@@ -3165,23 +3420,47 @@ impl<'p> Vm<'p> {
         if let Some((_, map, _)) = self.py_dict_rec_fast(o, dict) {
             return Ok(self.py_table_get(map, k));
         }
-        let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) else {
-            return Ok(None);
-        };
-        if is_seq {
-            let Some((items, i)) = self.py_seq_slot(o, k) else {
-                return Ok(None);
-            };
-            let HeapObj::Array(vals) = self.heap.get(items) else {
-                return Ok(None);
-            };
-            let v = vals[i];
-            return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
+        // Direct primitive str indexing/slicing without double-dispatching through `PyStrItem`.
+        if o.is_heap() && self.heap.is_str_like(o.heap_index()) {
+            return Ok(self.py_str_item(o, k).map(Some));
         }
-        let Some((_, map)) = self.py_dict_field(idx, 0) else {
-            return Ok(None);
-        };
-        Ok(self.py_table_get(map, k))
+        if let Some((idx, is_seq)) = self.py_item_kind(o, seq, dict) {
+            if is_seq {
+                let Some((items, i)) = self.py_seq_slot(o, k) else {
+                    return Ok(None);
+                };
+                let HeapObj::Array(vals) = self.heap.get(items) else {
+                    return Ok(None);
+                };
+                let v = vals[i];
+                return Ok((v != Value::HOLE && !v.is_undefined()).then_some(Some(v)));
+            }
+            let Some((_, map)) = self.py_dict_field(idx, 0) else {
+                return Ok(None);
+            };
+            return Ok(self.py_table_get(map, k));
+        }
+        // Unmodified `dict`/`str` subclasses (`AttributeDict`, `Counter`,
+        // `defaultdict`, `NavigableString`). Subclasses with `__missing__`
+        // (`SUB_DICT_GET_HIT` without `SUB_DICT_GET`) return hits directly and
+        // take the slow edge on missing keys so `__missing__` runs.
+        if let Some(cls) = self.py_cls_of(o) {
+            let sk = self.py_sub_kind(cls);
+            if (sk & (super::py_rt::SUB_DICT_GET | super::py_rt::SUB_DICT_GET_HIT)) != 0 {
+                let Some((_, map)) = self.py_dict_field(o.heap_index(), 0) else {
+                    return Ok(None);
+                };
+                let res = self.py_table_get(map, k);
+                if matches!(res, Some(None)) && (sk & super::py_rt::SUB_DICT_GET) == 0 {
+                    return Ok(None);
+                }
+                return Ok(res);
+            }
+            if (sk & super::py_rt::SUB_STR_GET) != 0 {
+                return Ok(self.py_str_item(o, k).map(Some));
+            }
+        }
+        Ok(None)
     }
 
     /// Fast non-allocating `d[k] = v` for exact `dict` records of `dict_shape`:
@@ -3214,7 +3493,15 @@ impl<'p> Vm<'p> {
             (None, Some((rec, _, _))) => (rec, false),
             (None, None) => match self.py_item_kind(o, seq, dict) {
                 Some(kind) => kind,
-                None => return Ok(false),
+                None => {
+                    let Some(cls) = self.py_cls_of(o) else {
+                        return Ok(false);
+                    };
+                    if (self.py_sub_kind(cls) & super::py_rt::SUB_DICT_SET) == 0 {
+                        return Ok(false);
+                    }
+                    (o.heap_index(), false)
+                }
             },
         };
         if is_seq {

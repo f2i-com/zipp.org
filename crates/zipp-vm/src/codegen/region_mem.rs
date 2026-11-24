@@ -3429,6 +3429,8 @@ pub(crate) fn compile_region_mem(
                             ; jmp => cc_done
                             ; => cc_slow
                         );
+                    } else if key == "charCodeAt" && blocks.is_none() {
+                        emit_inline_ascii_char_code_at(&mut ops, dst, obj, arg_base, cc_done);
                     }
                     let general = ops.new_dynamic_label();
                     // An array's `at`, which the String helper declines, tries

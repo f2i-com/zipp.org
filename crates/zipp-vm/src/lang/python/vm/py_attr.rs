@@ -676,7 +676,21 @@ impl<'p> Vm<'p> {
         // The entry's kind first: a site of another kind (a property, a
         // class attribute) declines before the instance is looked at.
         let e = self.py_ic(func_id, ip);
-        if e.kind != ic::ATTR_GET_L || !o.is_heap() {
+        if !o.is_heap() {
+            return None;
+        }
+        if e.kind == ic::MOD_GET {
+            let tmodule = self.py_rt.as_deref()?.t_module;
+            if self.py_cls_of(o)?.bits() != tmodule.bits() {
+                return None;
+            }
+            let g = self.py_hint_field(hint::GLOBALS, o.heap_index(), "globals")?;
+            if g.bits() == e.a && g.is_heap() && self.heap.version_of(g.heap_index()) == e.hver {
+                return self.py_map_at_bits(g, e.pos, e.b, e.d);
+            }
+            return None;
+        }
+        if e.kind != ic::ATTR_GET_L {
             return None;
         }
         let k = self.py_hit_keys()?;
@@ -765,7 +779,13 @@ impl<'p> Vm<'p> {
     #[inline(never)]
     pub(super) fn py_attr_get(&mut self, func_id: u32, ip: usize, o: Value, key: u32, call: &mut Option<PyAccessor>) -> Option<Value> {
         let (cls, dict) = self.py_inst_parts(o)?;
-        let ty = self.py_rt.as_deref()?.ty?;
+        let (ty, t_module, rt) = {
+            let p = self.py_rt.as_deref()?;
+            (p.ty?, p.t_module, p.r)
+        };
+        if cls.bits() == t_module.bits() {
+            return self.py_mod_get(func_id, ip, o, rt, key);
+        }
         let e = self.py_ic_class(func_id, ip, cls.bits());
         if cls.bits() == e.a && cls.is_heap() {
             match e.kind {
@@ -1360,7 +1380,10 @@ impl<'p> Vm<'p> {
 }
 
 /// The positional entry names a class and its `__init__` carry (`c<n>`).
-const ENTRY_NAMES: [&str; 8] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"];
+const ENTRY_NAMES: [&str; 19] = [
+    "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13", "c14",
+    "c15", "c16", "c17", "c18",
+];
 
 env_off_switch! {
     /// Whether a `PyNew` site's [`ic::NEW`] entry is asked first

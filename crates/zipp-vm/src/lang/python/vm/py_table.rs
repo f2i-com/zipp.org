@@ -255,7 +255,11 @@ impl PyTable {
 
     /// Every value the table holds, for the collector.
     pub(crate) fn edges(&self) -> impl Iterator<Item = Value> + '_ {
-        self.keys.iter().chain(self.vals.iter()).copied().chain([self.kinds.tuple, self.kinds.frozenset])
+        self.keys
+            .iter()
+            .chain(self.vals.iter())
+            .copied()
+            .chain([self.kinds.tuple, self.kinds.frozenset, self.kinds.type_type])
     }
 
     /// Bytes owned beyond the struct (for heap accounting).
@@ -652,6 +656,10 @@ pub(crate) fn cpython_set_size(n: usize) -> usize {
 pub(crate) struct PyKinds {
     pub(crate) tuple: Value,
     pub(crate) frozenset: Value,
+    /// `TypeType` (`type`), so plain Python class objects (`cls === TypeType`,
+    /// immutable builtin metaclass) hash by their birth `id` and compare by
+    /// identity without guest code.
+    pub(crate) type_type: Value,
     /// The shape of a list or tuple record laid out as the runtime's
     /// sequence literal (`cls` at slot 0, `items` at slot 1; `shape::DICT`:
     /// none known), whose fields are then read at their slots.
@@ -664,6 +672,7 @@ impl Default for PyKinds {
         PyKinds {
             tuple: Value::UNDEFINED,
             frozenset: Value::UNDEFINED,
+            type_type: Value::UNDEFINED,
             seq_shape: crate::shape::DICT,
         }
     }
@@ -679,6 +688,8 @@ enum Kind<'h> {
     Tuple(&'h [Value]),
     /// A frozenset's storage.
     Frozen(Value),
+    /// A plain Python `type` object (`cls === TypeType`, `isType === true`): `(id, bits)`.
+    TypeObj(i64, u64),
 }
 
 /// An own data property of the plain object `idx`.
@@ -730,6 +741,16 @@ fn classify<'h>(heap: &'h Heap, kinds: &PyKinds, v: Value) -> Option<Kind<'h>> {
                 }
             } else if cls == kinds.frozenset {
                 Some(Kind::Frozen(rec_field(heap, idx, "map")?))
+            } else if kinds.type_type.is_heap() && cls == kinds.type_type {
+                if rec_field(heap, idx, "isType") != Some(Value::TRUE) {
+                    return None;
+                }
+                let id_v = rec_field(heap, idx, "id")?;
+                if id_v.is_int() && id_v.as_int() > 0 {
+                    Some(Kind::TypeObj(i64::from(id_v.as_int()), v.bits()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -971,6 +992,7 @@ fn hash_in(
             key_text(heap, kinds, v, depth, &mut text, steps)?;
             hash_str_units(text.into_iter())
         }
+        Kind::TypeObj(id, _) => id,
     })
 }
 
@@ -1052,6 +1074,10 @@ fn key_text(heap: &Heap, kinds: &PyKinds, v: Value, depth: u32, out: &mut Vec<u1
             }
             out.push(u16::from(b'}'));
         }
+        Kind::TypeObj(id, _) => {
+            out.push(u16::from(b'o'));
+            push_ascii(out, &id.to_string());
+        }
     }
     Some(())
 }
@@ -1121,6 +1147,7 @@ fn eq_in(heap: &Heap, kinds: &PyKinds, a: Value, b: Value, depth: u32, steps: &m
             }
             true
         }
+        (Kind::TypeObj(_, p), Kind::TypeObj(_, q)) => p == q,
         _ => false,
     })
 }
@@ -1371,6 +1398,7 @@ pub(crate) fn size_probe(x: u64) -> u64 {
     let kinds = PyKinds {
         tuple: Value::from_bits(x),
         frozenset: Value::from_bits(x ^ 1),
+        type_type: Value::UNDEFINED,
         seq_shape: x as u32,
     };
     let mut steps = 0;

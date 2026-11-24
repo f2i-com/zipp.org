@@ -3765,11 +3765,27 @@
                 return m === null ? null : mk(m, raw, P, pos, n, pairs, raw, raw);
             };
             const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
-            pSearch.c2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
-            pSearch.c3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
-            pMatch.c2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
-            pMatch.c3 = function (P, s, pos) { const r = patRun(P, sticky(P), s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
-            pFull.c2 = function (P, s) { const r = patRun(P, full(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            let RE_STRM = null;
+            try { RE_STRM = typeof __zipp_py_strm === "function" ? __zipp_py_strm : null; } catch (e) { RE_STRM = null; }
+            const mtmpl = { cls: Match, m: null, s: null, raw: null, t: null, p: null, pos: 0, endpos: 0, pairs: null };
+            const sJ2 = function (P, s) { const r = patRun(P, P.re, s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const sJ3 = function (P, s, pos) { const r = patRun(P, P.re, s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            const mJ2 = function (P, s) { const r = patRun(P, sticky(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const mJ3 = function (P, s, pos) { const r = patRun(P, sticky(P), s, pos, true); return r !== undefined ? r : this.code([P, s, pos]); };
+            const fJ2 = function (P, s) { const r = patRun(P, full(P), s, 0n, false); return r !== undefined ? r : this.code([P, s]); };
+            const subJ3 = function (P, repl, s) { return subImpl(P, repl, s, 0, false); };
+            const subJ4 = function (P, repl, s, count) { return subImpl(P, repl, s, Number(needInt(count)), false); };
+            if (RE_STRM !== null) {
+                pSearch.strop = 38; pSearch.mtmpl = mtmpl; pSearch.j2 = sJ2; pSearch.j3 = sJ3; pSearch.c2 = RE_STRM; pSearch.c3 = RE_STRM;
+                pMatch.strop = 39; pMatch.mtmpl = mtmpl; pMatch.j2 = mJ2; pMatch.j3 = mJ3; pMatch.c2 = RE_STRM; pMatch.c3 = RE_STRM;
+                pFull.strop = 40; pFull.mtmpl = mtmpl; pFull.j2 = fJ2; pFull.c2 = RE_STRM;
+                pSub.strop = 41; pSub.j3 = subJ3; pSub.j4 = subJ4; pSub.c3 = RE_STRM; pSub.c4 = RE_STRM;
+            } else {
+                pSearch.c2 = sJ2; pSearch.c3 = sJ3;
+                pMatch.c2 = mJ2; pMatch.c3 = mJ3;
+                pFull.c2 = fJ2;
+                pSub.c3 = subJ3; pSub.c4 = subJ4;
+            }
             pFindall.c2 = function (P, s) {
                 if (typeof s === "string" && !P.isBytes && RE_FINDALL_NATIVE !== null) {
                     const fast = RE_FINDALL_NATIVE(P.re, s, 0, FINDALL_TUPLE_TMPL);
@@ -3778,8 +3794,6 @@
                 return this.code([P, s]);
             };
             pSplit.c2 = function (P, s) { return this.code([P, s]); };
-            pSub.c3 = function (P, repl, s) { return subImpl(P, repl, s, 0, false); };
-            pSub.c4 = function (P, repl, s, count) { return subImpl(P, repl, s, Number(needInt(count)), false); };
             const mStart = Match.dict.get("start"), mEnd = Match.dict.get("end"), mSpan = Match.dict.get("span"), mGroup = Match.dict.get("group");
             mStart.c1 = function (M) { const m = M.m; return BigInt(M.pairs !== null ? cpFromUtf16(M.pairs, m.index) : m.index); };
             mStart.c2 = function (M, gi) { return BigInt(span(M, gi)[0]); };
@@ -3852,7 +3866,12 @@
         // whole astral character, never into the middle of its pair.
         function charWidth(s, i) { const c = s.charCodeAt(i); return c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00 ? 2 : 1; }
         const cache = new Map();
+        const strCache0 = new Map();
         function compile(pattern, flags) {
+            if (flags === 0n && typeof pattern === "string") {
+                const hit0 = strCache0.get(pattern);
+                if (hit0 !== undefined) return hit0;
+            }
             if (pattern !== null && typeof pattern === "object" && pattern.cls === Pattern) {
                 if (flags !== 0n) fail(E.ValueError, "cannot process flags argument with a compiled pattern");
                 return pattern;
@@ -3871,14 +3890,16 @@
             }
             const key = (isB ? "B:" : "S:") + srcText + " " + flags;
             const hit = cache.get(key);
-            if (hit !== undefined) return hit;
+            if (hit !== undefined) { if (!isB && flags === 0n) strCache0.set(srcText, hit); return hit; }
             const t = translate(srcText, effFlags);
             let re;
             try { re = new RegExp(t.source, (t.ignoreCase ? "i" : "") + "gu"); } catch (e) { fail(error, "bad pattern: " + (e && e.message)); }
             const flagsOut = isB ? (flags & ~32n) : (t.flags & 256n ? t.flags : t.flags | 32n);
             const p = { cls: Pattern, re: re, src: srcVal, isBytes: isB, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
-            if (cache.size > 512) cache.clear();
-            cache.set(key, p); return p;
+            if (cache.size > 512) { cache.clear(); strCache0.clear(); }
+            cache.set(key, p);
+            if (!isB && flags === 0n) strCache0.set(srcText, p);
+            return p;
         }
         const flagsOf = (a, k, kw) => { const f = a[k] !== undefined ? a[k] : kwget(kw, "flags", 0n); return isInt(f) ? asInt(f) : fail(E.TypeError, "flags must be an int"); };
         fnkw(g, "compile", (a) => { const kw = kwOf(a, ["flags"]); return compile(a[0], flagsOf(a, 1, kw)); });
@@ -3890,7 +3911,7 @@
         // Positional fast entries on module-level `re.*` functions to bypass
         // `kwOf` / `call` trampolines on common calls.
         {
-            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split");
+            const pSearch = Pattern.dict.get("search"), pMatch = Pattern.dict.get("match"), pFull = Pattern.dict.get("fullmatch"), pFindall = Pattern.dict.get("findall"), pSplit = Pattern.dict.get("split"), pSub = Pattern.dict.get("sub");
             const cCompile = g.get("compile");
             cCompile.c1 = function (pat) { return compile(pat, 0n); };
             cCompile.c2 = function (pat, fl) { return compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")); };
@@ -3907,8 +3928,8 @@
             cFindall.c2 = function (pat, s) { return pFindall.c2(compile(pat, 0n), s); };
             cFindall.c3 = function (pat, s, fl) { return pFindall.c2(compile(pat, isInt(fl) ? asInt(fl) : fail(E.TypeError, "flags must be an int")), s); };
             const cSub = g.get("sub");
-            cSub.c3 = function (pat, repl, s) { return subImpl(compile(pat, 0n), repl, s, 0, false); };
-            cSub.c4 = function (pat, repl, s, cnt) { return subImpl(compile(pat, 0n), repl, s, Number(needInt(cnt)), false); };
+            cSub.c3 = function (pat, repl, s) { return pSub.c3(compile(pat, 0n), repl, s); };
+            cSub.c4 = function (pat, repl, s, cnt) { return pSub.c4(compile(pat, 0n), repl, s, cnt); };
             const cSubn = g.get("subn");
             cSubn.c3 = function (pat, repl, s) { return subImpl(compile(pat, 0n), repl, s, 0, true); };
             const cSplit = g.get("split");
@@ -3920,7 +3941,7 @@
             if (isBytesLike(a[0])) return latin1ToBytes(bytesToLatin1(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c));
             return needStr(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c);
         });
-        fn(g, "purge", 0, () => { cache.clear(); return null; });
+        fn(g, "purge", 0, () => { cache.clear(); strCache0.clear(); return null; });
         g.set("error", error); g.set("Pattern", Pattern); g.set("Match", Match);
     });
 

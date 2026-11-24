@@ -150,9 +150,16 @@ impl<'p> Vm<'p> {
                 None => t,
             },
             ops::NEW => {
+                let tt = self
+                    .py_rt
+                    .as_deref()
+                    .map(|p| p.t_type)
+                    .filter(|v| v.is_heap())
+                    .unwrap_or_else(|| arg(4));
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    type_type: tt,
                     seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let table = PyTable::with_kinds(t == Value::TRUE, kinds);
@@ -179,6 +186,7 @@ impl<'p> Vm<'p> {
                 let kinds = PyKinds {
                     tuple: arg(2),
                     frozenset: arg(3),
+                    type_type: self.py_rt.as_deref().map_or(Value::UNDEFINED, |p| p.t_type),
                     seq_shape: self.py_rt.as_deref().map_or(crate::shape::DICT, |p| p.seq_shape),
                 };
                 let mut steps = 0;
@@ -584,6 +592,7 @@ impl<'p> Vm<'p> {
         let kinds = PyKinds {
             tuple: p.t_tuple,
             frozenset: Value::UNDEFINED,
+            type_type: p.t_type,
             seq_shape: p.seq_shape,
         };
         let (tl, td) = (p.t_list, p.t_dict);

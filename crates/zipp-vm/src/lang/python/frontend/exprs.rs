@@ -251,6 +251,48 @@ impl<'a> Emitter<'a> {
             }
             ast::Expr::Subscript(s) => {
                 let value = self.expr(&s.value, depth + 1)?;
+                if let ast::Expr::Slice(sl) = s.slice.as_ref() {
+                    let lo = match &sl.lower {
+                        Some(e) => self.expr(e, depth + 1)?,
+                        None => self.none()?,
+                    };
+                    let hi = match &sl.upper {
+                        Some(e) => self.expr(e, depth + 1)?,
+                        None => self.none()?,
+                    };
+                    if self.fast {
+                        let f = self.prop(self.r_rt, "SLICEGET")?;
+                        let dst = self.alloc()?;
+                        if let Some(st_expr) = &sl.step {
+                            let step = self.expr(st_expr, depth + 1)?;
+                            let (arg_base, argc) = self.arguments(&[value, lo, hi, step])?;
+                            let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+                            self.defer_cold(Vec::new(), vec![at], move |e| {
+                                let idx = e.helper("slice", &[lo, hi, step])?;
+                                let r = e.helper("getitem", &[value, idx])?;
+                                e.emit(Instr::Move { dst, src: r })?;
+                                Ok(())
+                            });
+                        } else {
+                            let (arg_base, argc) = self.arguments(&[value, lo, hi])?;
+                            let at = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+                            self.defer_cold(Vec::new(), vec![at], move |e| {
+                                let none = e.none()?;
+                                let idx = e.helper("slice", &[lo, hi, none])?;
+                                let r = e.helper("getitem", &[value, idx])?;
+                                e.emit(Instr::Move { dst, src: r })?;
+                                Ok(())
+                            });
+                        }
+                        return Ok(dst);
+                    }
+                    let step = match &sl.step {
+                        Some(e) => self.expr(e, depth + 1)?,
+                        None => self.none()?,
+                    };
+                    let index = self.helper("slice", &[lo, hi, step])?;
+                    return self.helper("getitem", &[value, index]);
+                }
                 let index = match s.slice.as_ref() {
                     ast::Expr::Starred(st) => {
                         let inner = self.expr(&st.value, depth + 1)?;
@@ -258,9 +300,6 @@ impl<'a> Emitter<'a> {
                     }
                     slice => self.expr(slice, depth + 1)?,
                 };
-                if matches!(s.slice.as_ref(), ast::Expr::Slice(_)) {
-                    return self.helper("getitem", &[value, index]);
-                }
                 self.subscript_get(value, index)
             }
             ast::Expr::Slice(s) => {
@@ -1561,13 +1600,13 @@ impl<'a> Emitter<'a> {
         let key = self.string_index(&format!("k{}:{}", c.args.len(), names.join(",")));
         let at = self.emit(Instr::PyCallEntry { dst: entry, f, name: key, slow: 0 })?;
         let (arg_base, argc) = self.arguments(&regs)?;
-        // When `f["k<n>:<names>"]` exists, `bindArgs` set it to `f["c<argc>"]`
-        // (and `setFuncDefaults` clears both together), so `PyCall` dispatches
-        // the exact same positional entry with full IC, LeafBody, and JIT support.
-        let at2 = self.emit(Instr::PyCall { dst, f, arg_base, argc, slow: 0 })?;
+        // `f["k<n>:<names>"]` holds `f.code` (in-order), a compact reorder/
+        // skip-default wrapper (from `bindArgs`), or a class keyword ctor
+        // (from `constructDefault`): call it directly with `this = f`.
+        self.emit(Instr::CallWithThis { dst, callee: entry, this_v: f, arg_base, argc, name: key })?;
         let npos = c.args.len();
         let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
-        self.defer_cold(Vec::new(), vec![at, at2], move |e| {
+        self.defer_cold(Vec::new(), vec![at], move |e| {
             let args = e.array(&regs[..npos])?;
             let record = e.alloc()?;
             e.emit(Instr::NewMap { dst: record, src: None })?;
@@ -1820,6 +1859,162 @@ impl<'a> Emitter<'a> {
         {
             return self.method_call_positional(obj, name, &c.args, depth, module);
         }
+        if self.fast
+            && !c.keywords.is_empty()
+            && !matches!(name, "__proto__")
+        {
+            if let Some(r) = self.method_call_keyword(obj, name, c, depth, module)? {
+                return Ok(r);
+            }
+        }
+        self.method_call_slow(obj, name, c, depth)
+    }
+
+    /// `obj.name(p1.., k1=v1, ..)` with distinct named keywords: resolves a
+    /// user-class method (`PyMethod`) or module function/class (`PyModGet`)
+    /// BEFORE evaluating arguments (falling back out of line to `R.mfind` so
+    /// `cls.gm[name]` is populated for subsequent calls), evaluates each
+    /// argument once, and dispatches through the cached `f["k<npos>:<names>"]`
+    /// entry with zero `Array`/`Map`/`bindArgs` allocation.
+    fn method_call_keyword(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize, module: bool) -> R<Option<Reg>> {
+        let mut kw_names = Vec::with_capacity(c.keywords.len());
+        for k in &c.keywords {
+            match &k.arg {
+                Some(n) if !kw_names.contains(&n.as_str()) => kw_names.push(n.as_str()),
+                _ => return Ok(None),
+            }
+        }
+        let extra = usize::from(!module);
+        if kw_names.is_empty()
+            || c.args.len() + kw_names.len() + extra > MAX_DIRECT
+            || c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+        {
+            return Ok(None);
+        }
+        let f = self.alloc()?;
+        let alt = self.alloc()?;
+        self.emit(Instr::LoadBool { dst: alt, val: false })?;
+        let rt = self.r_rt;
+        let key_c = self.string_const(name);
+        let at_lookup = if module {
+            self.emit(Instr::PyModGet { dst: f, obj, rt, key: key_c, slow: 0 })?
+        } else {
+            let gb = self.string_index(&format!("{name}#kw"));
+            self.emit_py_method(f, obj, rt, key_c, gb)?
+        };
+        let name_owned = name.to_owned();
+        self.defer_cold(Vec::new(), vec![at_lookup], move |e| {
+            let name_r = e.string(&name_owned)?;
+            let neg1 = e.small_int(-1)?;
+            let r = e.helper("mfind", &[obj, name_r, neg1])?;
+            e.emit(Instr::Move { dst: f, src: r })?;
+            let p = e.prop(e.r_rt, "mself")?;
+            if module {
+                e.emit(Instr::Move { dst: alt, src: p })?;
+            } else {
+                e.emit(Instr::Not { dst: alt, a: p })?;
+            }
+            Ok(())
+        });
+        let mut regs = Vec::with_capacity(c.args.len() + kw_names.len() + extra);
+        if !module {
+            regs.push(obj);
+        }
+        for a in &c.args {
+            regs.push(self.expr(a, depth)?);
+        }
+        for k in &c.keywords {
+            regs.push(self.expr(&k.value, depth)?);
+        }
+        let dst = self.alloc()?;
+        let to_alt = self.jump_if_true(alt)?;
+        let entry = self.alloc()?;
+        let npos = c.args.len() + extra;
+        let kw_suffix = kw_names.join(",");
+        let kkey = self.string_index(&format!("k{npos}:{kw_suffix}"));
+        let at_entry = self.emit(Instr::PyCallEntry { dst: entry, f, name: kkey, slow: 0 })?;
+        let (arg_base, argc) = self.arguments(&regs)?;
+        self.emit(Instr::CallWithThis { dst, callee: entry, this_v: f, arg_base, argc, name: kkey })?;
+        let kw_owned: Vec<String> = kw_names.into_iter().map(str::to_owned).collect();
+        let regs_entry = regs.clone();
+        let kw_entry = kw_owned.clone();
+        self.defer_cold(Vec::new(), vec![at_entry], move |e| {
+            let args = e.array(&regs_entry[..npos])?;
+            let record = e.alloc()?;
+            e.emit(Instr::NewMap { dst: record, src: None })?;
+            let set = e.string_index("set");
+            for (kn, &value) in kw_entry.iter().zip(&regs_entry[npos..]) {
+                let mark = e.mark();
+                let pair = e.block(2)?;
+                e.string_into(pair, kn)?;
+                e.emit(Instr::Move { dst: pair + 1, src: value })?;
+                let ignored = e.alloc()?;
+                e.emit(Instr::CallMethod { dst: ignored, obj: record, name: set, arg_base: pair, argc: 2 })?;
+                e.release(mark);
+            }
+            let r = e.call_value(f, args, record)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        // Alternate receiver-binding polarity (e.g. a @staticmethod, @classmethod,
+        // module function, or bound callable attribute on an instance).
+        let alt_npos = if module { c.args.len() + 1 } else { c.args.len() };
+        self.defer_cold(vec![to_alt], Vec::new(), move |e| {
+            let alt_regs: Vec<Reg> = if module {
+                let mut v = Vec::with_capacity(regs.len() + 1);
+                v.push(obj);
+                v.extend_from_slice(&regs);
+                v
+            } else {
+                regs[1..].to_vec()
+            };
+            if alt_regs.len() <= MAX_DIRECT {
+                let alt_entry = e.alloc()?;
+                let alt_kkey = e.string_index(&format!("k{alt_npos}:{kw_suffix}"));
+                let at_alt_entry = e.emit(Instr::PyCallEntry { dst: alt_entry, f, name: alt_kkey, slow: 0 })?;
+                let (ab, ac) = e.arguments(&alt_regs)?;
+                e.emit(Instr::CallWithThis { dst, callee: alt_entry, this_v: f, arg_base: ab, argc: ac, name: alt_kkey })?;
+                e.defer_cold(Vec::new(), vec![at_alt_entry], move |e| {
+                    let args = e.array(&alt_regs[..alt_npos])?;
+                    let record = e.alloc()?;
+                    e.emit(Instr::NewMap { dst: record, src: None })?;
+                    let set = e.string_index("set");
+                    for (kn, &value) in kw_owned.iter().zip(&alt_regs[alt_npos..]) {
+                        let mark = e.mark();
+                        let pair = e.block(2)?;
+                        e.string_into(pair, kn)?;
+                        e.emit(Instr::Move { dst: pair + 1, src: value })?;
+                        let ignored = e.alloc()?;
+                        e.emit(Instr::CallMethod { dst: ignored, obj: record, name: set, arg_base: pair, argc: 2 })?;
+                        e.release(mark);
+                    }
+                    let r = e.call_value(f, args, record)?;
+                    e.emit(Instr::Move { dst, src: r })?;
+                    Ok(())
+                });
+                return Ok(());
+            }
+            let args = e.array(&alt_regs[..alt_npos])?;
+            let record = e.alloc()?;
+            e.emit(Instr::NewMap { dst: record, src: None })?;
+            let set = e.string_index("set");
+            for (kn, &value) in kw_owned.iter().zip(&alt_regs[alt_npos..]) {
+                let mark = e.mark();
+                let pair = e.block(2)?;
+                e.string_into(pair, kn)?;
+                e.emit(Instr::Move { dst: pair + 1, src: value })?;
+                let ignored = e.alloc()?;
+                e.emit(Instr::CallMethod { dst: ignored, obj: record, name: set, arg_base: pair, argc: 2 })?;
+                e.release(mark);
+            }
+            let r = e.call_value(f, args, record)?;
+            e.emit(Instr::Move { dst, src: r })?;
+            Ok(())
+        });
+        Ok(Some(dst))
+    }
+
+    fn method_call_slow(&mut self, obj: Reg, name: &str, c: &ast::ExprCall, depth: usize) -> R<Reg> {
         let name = self.string(name)?;
         let transparent = c.args.iter().chain(c.keywords.iter().map(|k| &k.value)).all(|e| self.order_transparent(e));
         if transparent {

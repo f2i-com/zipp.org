@@ -1674,15 +1674,14 @@ pub(crate) fn py_frame_call(i: &Instr) -> bool {
 }
 
 env_off_switch! {
-    /// `ZIPP_PY_TIERC=1` lets whole Python functions compile (see
-    /// `Jit::fn_body_eligible`); latched. Named as an off switch because the
-    /// macro reads "unset": this one is on when SET.
-    fn py_tierc_disabled() = "ZIPP_PY_TIERC"
+    /// Whole Python functions compile to Tier C by default (`ZIPP_NO_PY_TIERC=1`
+    /// disables whole-function Python Tier C for A/B comparison).
+    fn py_tierc_on() = "ZIPP_NO_PY_TIERC"
 }
 
-/// Whether whole Python functions may compile (`ZIPP_PY_TIERC=1`).
+/// Whether whole Python functions may compile (default ON unless `ZIPP_NO_PY_TIERC=1`).
 pub(crate) fn py_tierc_enabled() -> bool {
-    !py_tierc_disabled()
+    py_tierc_on()
 }
 
 env_off_switch! {

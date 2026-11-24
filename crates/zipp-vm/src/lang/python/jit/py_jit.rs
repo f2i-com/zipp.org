@@ -947,13 +947,24 @@ impl<'p> Vm<'p> {
     pub(crate) extern "win64" fn jit_py_gen_next(vm: *mut core::ffi::c_void, next: u64, this: u64, ip: u64) -> u64 {
         let vm = unsafe { &mut *(vm as *mut Vm) };
         let nv = Value::from_bits(next);
-        if !nv.is_heap() || !matches!(vm.heap.get(nv.heap_index()), HeapObj::Native(id) if *id == crate::vm::native::PY_GEN) {
+        let nat = if nv.is_heap() {
+            match vm.heap.get(nv.heap_index()) {
+                HeapObj::Native(id) if *id == crate::vm::native::PY_GEN => 1u8,
+                HeapObj::Native(id) if *id == crate::vm::native::PY_ITER => 2u8,
+                _ => 0u8,
+            }
+        } else {
+            0u8
+        };
+        if nat == 0 {
             return crate::codegen::PY_SLOW_BITS;
         }
         // Pure non-allocating in-register fast step: no GC safe point or
         // nested interpreter frame needed.
-        if let Some(v) = vm.py_gen_next_fast(Value::from_bits(this)) {
-            return v.bits();
+        if nat == 1 {
+            if let Some(v) = vm.py_gen_next_fast(Value::from_bits(this)) {
+                return v.bits();
+            }
         }
         vm.maybe_gc();
         if vm.at_call_cap() {
@@ -961,7 +972,11 @@ impl<'p> Vm<'p> {
             return crate::codegen::CALL_THREW;
         }
         vm.jit_call_depth += 1;
-        let r = vm.py_gen_next(Value::from_bits(this));
+        let r = if nat == 1 {
+            vm.py_gen_next(Value::from_bits(this))
+        } else {
+            vm.py_iter_next(Value::from_bits(this))
+        };
         vm.jit_call_depth -= 1;
         match r {
             Ok(v) => v.bits(),

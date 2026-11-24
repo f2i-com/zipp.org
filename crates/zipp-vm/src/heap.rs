@@ -1881,12 +1881,19 @@ pub struct ObjMap {
     /// every JIT'd `m[i]` (which deopts to the interpreter). None of those four
     /// names can shadow an element, so the precise question is this bit.
     has_element_key: bool,
-    /// A planned literal observed a mutation or an out-of-order AppendDataProp.
-    /// From that point malformed/replayed appends use descriptor-safe `define`
-    /// rather than the compiler-proof-only unchecked push. Fits existing bool
-    /// padding, preserving ObjMap's pinned size.
-    planned_append_failed: bool,
+    /// Bit 0 (`OBJ_FLAG_PLANNED_FAILED`): a planned literal observed a mutation
+    /// or an out-of-order AppendDataProp.
+    /// Bit 1 (`OBJ_FLAG_DICT_PINNED`): an exotic/namespace/global/arr_proto map
+    /// pinned to dictionary mode for good (`pin_dict` / `pin_mirror_dict`), so
+    /// `object_mirror_fid` never sets the plain-object bit (`FID_MIRROR_CLASS`)
+    /// even if `refresh_mirror` runs later.
+    /// Fits in the single byte formerly held by `planned_append_failed`,
+    /// preserving ObjMap's pinned 112-byte size.
+    extra_flags: u8,
 }
+
+const OBJ_FLAG_PLANNED_FAILED: u8 = 1 << 0;
+const OBJ_FLAG_DICT_PINNED: u8 = 1 << 1;
 
 impl Clone for ObjMap {
     /// Field by field, except `key_bytes`, which is counted again: a cloned
@@ -1907,7 +1914,7 @@ impl Clone for ObjMap {
             index: self.index.clone(),
             numeric_index: self.numeric_index.clone(),
             has_element_key: self.has_element_key,
-            planned_append_failed: self.planned_append_failed,
+            extra_flags: self.extra_flags,
             class_proto: self.class_proto,
             shape: self.shape,
         }
@@ -1931,7 +1938,7 @@ impl std::fmt::Debug for ObjMap {
             index,
             numeric_index,
             has_element_key,
-            planned_append_failed,
+            extra_flags,
             class_proto,
             shape,
             key_bytes: _,
@@ -1949,7 +1956,7 @@ impl std::fmt::Debug for ObjMap {
             .field("index", index)
             .field("numeric_index", numeric_index)
             .field("has_element_key", has_element_key)
-            .field("planned_append_failed", planned_append_failed)
+            .field("extra_flags", extra_flags)
             .field("class_proto", class_proto)
             .field("shape", shape)
             .finish()
@@ -2741,7 +2748,7 @@ impl ObjMap {
             || self.sealed
             || self.is_raw_json
             || self.has_element_key
-            || self.planned_append_failed
+            || self.extra_flags != 0
             || self.index.is_some()
             || self.numeric_index.is_some()
         {
@@ -3238,7 +3245,7 @@ impl ObjMap {
         m.index = self.index.clone();
         m.numeric_index = self.numeric_index.clone();
         m.has_element_key = self.has_element_key;
-        m.planned_append_failed = self.planned_append_failed;
+        m.extra_flags = self.extra_flags & OBJ_FLAG_PLANNED_FAILED;
         // The copy is a consistent map, holes and all; a fresh literal has
         // no reason to carry them.
         m.compact();
@@ -3385,7 +3392,7 @@ impl ObjMap {
             index,
             numeric_index,
             has_element_key,
-            planned_append_failed,
+            extra_flags,
             class_proto,
             shape: shape_slot,
             key_bytes,
@@ -3421,7 +3428,7 @@ impl ObjMap {
         *index = None;
         *numeric_index = None;
         *has_element_key = plan.has_element_key();
-        *planned_append_failed = false;
+        *extra_flags = 0;
         *class_proto = false;
         *shape_slot = shape;
         // The same cold tails `finalized_from_store` builds, on the same
@@ -3583,11 +3590,27 @@ impl ObjMap {
             index: None,
             numeric_index: None,
             has_element_key: false,
-            planned_append_failed: false,
+            extra_flags: 0,
             class_proto: false,
             shape: crate::shape::EMPTY,
             key_bytes: 0,
         }
+    }
+
+    #[inline(always)]
+    fn planned_append_failed(&self) -> bool {
+        (self.extra_flags & OBJ_FLAG_PLANNED_FAILED) != 0
+    }
+
+    #[inline(always)]
+    fn mark_planned_append_failed(&mut self) {
+        self.extra_flags |= OBJ_FLAG_PLANNED_FAILED;
+    }
+
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    #[inline(always)]
+    pub(crate) fn is_dict_pinned(&self) -> bool {
+        (self.extra_flags & OBJ_FLAG_DICT_PINNED) != 0
     }
 
     /// Flag this map as a class's materialized prototype (see
@@ -3600,8 +3623,10 @@ impl ObjMap {
 
     /// Drop this map to dictionary mode for good: an object whose
     /// properties are not all in its map (a module namespace's live
-    /// bindings) can then never match a shape-keyed cache way.
+    /// bindings, deferred namespaces, globalThis, arr_proto) can then never
+    /// match a shape-keyed cache way or plain-object mirror probe.
     pub fn pin_dict(&mut self) {
+        self.extra_flags |= OBJ_FLAG_DICT_PINNED;
         self.shape_to_dict();
     }
 
@@ -3748,7 +3773,7 @@ impl ObjMap {
     #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     #[inline]
     pub(crate) fn planned_next_static_key(&self, key: &str) -> bool {
-        if self.planned_append_failed {
+        if self.planned_append_failed() {
             return false;
         }
         let PropKeys::Planned { all, visible_len } = &self.keys else {
@@ -3836,7 +3861,9 @@ impl ObjMap {
     /// their attributes (only the value changes). The JIT inline cache uses the
     /// return to bump the object's version on a key-add.
     pub fn set(&mut self, key: &str, val: Value) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(key) {
             self.vals[i] = val;
             false
@@ -3889,7 +3916,9 @@ impl ObjMap {
                 });
             }
             _ => {
-                self.planned_append_failed |= self.keys.is_planned();
+                if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
                 self.push_key(key.to_string());
             }
         }
@@ -3978,7 +4007,9 @@ impl ObjMap {
     /// then handed each key to `set` as a `&str`, so every first insertion
     /// allocated a second copy of a string the parser had already allocated.
     pub fn set_owned(&mut self, key: String, val: Value) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(&key) {
             self.vals[i] = val;
             false
@@ -3992,7 +4023,9 @@ impl ObjMap {
     /// with non-default enumerability). Overwrites any existing slot. Returns
     /// `true` if a new key was appended.
     pub fn define(&mut self, key: &str, val: Value, attr: PropAttr) -> bool {
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         if let Some(i) = self.pos(key) {
             // Redefining an EXISTING property's attributes is not an append, so
             // the transition tree cannot describe the result — unless nothing
@@ -4042,7 +4075,9 @@ impl ObjMap {
             prop_tag(&key),
             "push_data_tagged: caller's tag is wrong"
         );
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
         self.push_key(key);
@@ -4056,7 +4091,7 @@ impl ObjMap {
     /// mismatch (including malformed bytecode) falls back to the exact owned
     /// append path, materializing only the already-visible prefix.
     pub fn push_static_data(&mut self, key: &str, val: Value) {
-        if !self.planned_append_failed && self.keys.advance_if_next(key) {
+        if !self.planned_append_failed() && self.keys.advance_if_next(key) {
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
             self.shape_pushed(key, &PropAttr::data());
@@ -4065,9 +4100,9 @@ impl ObjMap {
             return;
         }
         if self.keys.is_planned() {
-            self.planned_append_failed = true;
+            self.mark_planned_append_failed();
         }
-        if self.planned_append_failed {
+        if self.planned_append_failed() {
             self.define(key, val, PropAttr::data());
         } else {
             // Legacy NewObject + compiler-proved AppendDataProp: retain the
@@ -4108,7 +4143,9 @@ impl ObjMap {
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
-        self.planned_append_failed |= self.keys.is_planned();
+        if self.keys.is_planned() {
+            self.mark_planned_append_failed();
+        }
         let key = self.remove_key(i);
         self.vals.remove(i);
         self.attrs.remove(i);
@@ -7213,7 +7250,7 @@ fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
 #[cfg(feature = "jit")]
 #[inline(always)]
 fn object_mirror_fid(map: &ObjMap) -> u32 {
-    if map.is_ctor {
+    if map.is_ctor || map.is_dict_pinned() {
         FID_MIRROR_CTOR
     } else if let Some(class) = map.class {
         // A heap index is far below 2^31 (`class_mirror_fid`'s bound, which
@@ -9104,6 +9141,9 @@ impl Heap {
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
+        if let HeapObj::Object(m) = &mut self.objs[idx as usize] {
+            m.pin_dict();
+        }
         #[cfg(feature = "jit")]
         {
             self.hot_mirror[idx as usize] = HotMirror::CLEAR;
@@ -10599,6 +10639,29 @@ impl Heap {
         }
     }
 
+    /// Pin a non-empty flat ASCII `HeapObj::Str` into the unused `this_mirror`
+    /// (length) and `upvals_mirror` (raw byte ptr) slots after marking it
+    /// `freeze_shared`, so Tier-C `charCodeAt`, `.length`, and `s[i]` can read
+    /// bytes inline without FFI. Cleared by `free_slot` and `replace`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn pin_ascii_str_mirror(&mut self, idx: u32) {
+        let i = idx as usize;
+        if i >= self.objs.len() || self.upvals_mirror[i] != 0 {
+            return;
+        }
+        if let HeapObj::Str(s) = &mut self.objs[i] {
+            let n = s.units();
+            if s.is_ascii() && n > 0 && n <= i32::MAX as usize {
+                s.freeze_shared();
+                let ptr = s.as_bytes().as_ptr() as u64;
+                self.hot_mirror[i] = HotMirror::STR;
+                self.this_mirror[i] = n as u64;
+                self.upvals_mirror[i] = ptr;
+            }
+        }
+    }
+
     /// Whether footprint growth asked for a payload walk, clearing the ask.
     #[cfg(feature = "instrument")]
     #[inline]
@@ -12052,6 +12115,10 @@ impl Heap {
             #[cfg(feature = "jit")]
             {
                 self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
             }
             if self.payload_accounting.get() {
                 let payload = self.resident_payload_charged[idx as usize].replace(0);
@@ -12125,7 +12192,14 @@ impl Heap {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             // The slot's next string is no atom (`Heap::atoms`).
-            HeapObj::Str(_) => self.clear_atom(idx),
+            HeapObj::Str(_) => {
+                self.clear_atom(idx);
+                #[cfg(feature = "jit")]
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
+            }
             #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
@@ -12698,6 +12772,13 @@ impl Heap {
         match &old {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+            }
+            #[cfg(feature = "jit")]
+            HeapObj::Str(_) => {
+                if self.upvals_mirror[idx as usize] != 0 {
+                    self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                    self.upvals_mirror[idx as usize] = 0;
+                }
             }
             #[cfg(feature = "jit")]
             HeapObj::Closure { .. } => {

@@ -168,6 +168,7 @@ impl<'p> Vm<'p> {
         self.prototypes_fresh.push(p);
         if is_class {
             self.class_proto_owner.insert(p, idx);
+            self.class_proto_epoch = self.class_proto_epoch.wrapping_add(1);
         }
         // A function born in a $262.createRealm child gets a `.prototype` whose
         // [[Prototype]] is the CHILD's %Object.prototype% (OrdinaryFunctionCreate

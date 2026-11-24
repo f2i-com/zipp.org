@@ -476,9 +476,13 @@ impl Builder {
                 }
             }
             ast::Stmt::ImportFrom(i) => {
+                let is_rel_submod = i.module.is_none() && i.level.is_some();
                 for alias in &i.names {
                     let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                     self.bind(bound.as_str());
+                    if is_rel_submod && alias.name.as_str() != "*" {
+                        self.raws[self.current].imports.insert(bound.as_str().to_owned());
+                    }
                 }
             }
             ast::Stmt::Global(g) => {

@@ -1040,6 +1040,12 @@
         const sjoin = function (sep, ...parts) { return R.SJOIN.c2(sep, list(parts)); };
         for (let n = 2; n <= 9; n++) { SJ["j" + n] = sjoin; SJ["c" + n] = STRM !== null ? STRM : sjoin; }
         R.SJOIN_DIRECT = SJ;
+        // Direct `o[lo:hi]` / `o[lo:hi:step]` without allocating a slice record.
+        const SLG = { strop: 37, ltmpl: list([]), ttype: T.tuple };
+        const sliceget = function (o, lo, hi, step) { return R.getitem(o, R.slice(lo, hi, step === undefined ? null : step)); };
+        SLG.j3 = sliceget; SLG.c3 = STRM !== null ? STRM : sliceget;
+        SLG.j4 = sliceget; SLG.c4 = STRM !== null ? STRM : sliceget;
+        R.SLICEGET = SLG;
     }
     // CPython's digit classes follow Numeric_Type: isdecimal is Decimal (Nd),
     // isdigit adds Digit (superscripts, circled and parenthesized digits,
@@ -1584,7 +1590,15 @@
 
     // ---- set / frozenset -------------------------------------------------------------------------------------------------
     for (const [type, frozen] of [[T.set, false], [T.frozenset, true]]) {
-        rt.constructors.set(type, (args, kw, cls) => { const s = cls === type ? set(type) : rt.allocInstance(cls); if (args.length) for (const x of drain(args[0])) setAdd(s, x); return s; });
+        rt.constructors.set(type, (args, kw, cls) => {
+            if (cls === type) {
+                if (!args.length) return set(type);
+                return frozen && args[0] !== null && typeof args[0] === "object" && args[0].cls === T.frozenset ? args[0] : setFrom(args[0], type);
+            }
+            const s = rt.allocInstance(cls);
+            if (args.length) for (const x of drain(args[0])) setAdd(s, x);
+            return s;
+        });
         method(type, "__len__", 1, (a) => rt.baseLen(a[0]));
         method(type, "__contains__", 2, (a) => setHas(a[0], a[1]));
         method(type, "__iter__", 1, (a) => rt.baseIter(a[0]));
@@ -1728,6 +1742,42 @@
     }
     for (const t of [T.str, T.int, T.float, T.bool]) {
         for (const v of t.dict.values()) if (v !== null && typeof v === "object" && v.cls === T.builtin_function_or_method) v.unboxSelf = true;
+    }
+    // Direct positional entries (`c0`..`c3`) on builtin types so `str(x)`,
+    // `set()`, `set(x)`, `list(x)`, `tuple(x)`, `dict()`, `int(x)`, `bool(x)`,
+    // `range(...)` hit `PyCall` directly without `constructDefault`/`ctorPlan`.
+    {
+        const intCtor = rt.constructors.get(T.int);
+        const floatCtor = rt.constructors.get(T.float);
+        const enumCtor = rt.constructors.get(T.enumerate);
+        const revCtor = rt.constructors.get(T.reversed);
+        T.str.c0 = () => "";
+        T.str.c1 = (x) => typeof x === "string" ? x : str(x);
+        T.bool.c0 = () => false;
+        T.bool.c1 = (x) => truth(x);
+        T.int.c0 = () => 0n;
+        T.int.c1 = (x) => isInt(x) ? asInt(x) : typeof x === "number" ? rt.floatToInt(x) : typeof x === "string" ? parseIntLiteral(x, 10) : intCtor([x], null);
+        T.int.c2 = (x, b) => intCtor([x, b], null);
+        T.float.c0 = () => 0.0;
+        T.float.c1 = (x) => typeof x === "number" ? x : isInt(x) ? toFloat(x) : typeof x === "string" ? parseFloatLiteral(x) : floatCtor([x], null);
+        T.list.c0 = () => list([]);
+        T.list.c1 = (x) => (x !== null && typeof x === "object" && (x.cls === T.list || x.cls === T.tuple)) ? list(x.items.slice()) : list(drain(x));
+        T.tuple.c0 = () => tuple([]);
+        T.tuple.c1 = (x) => (x !== null && typeof x === "object" && x.cls === T.tuple) ? x : (x !== null && typeof x === "object" && x.cls === T.list) ? tuple(x.items.slice()) : tuple(drain(x));
+        T.dict.c0 = () => dict();
+        T.dict.c1 = (x) => { const d = dict(); fillDict(d, x, null); return d; };
+        T.set.c0 = () => set(T.set);
+        T.set.c1 = (x) => setFrom(x, T.set);
+        T.frozenset.c0 = () => set(T.frozenset);
+        T.frozenset.c1 = (x) => (x !== null && typeof x === "object" && x.cls === T.frozenset) ? x : setFrom(x, T.frozenset);
+        T.range.c1 = (stop) => rt.range(0n, rt.indexOf(stop, "range"), 1n);
+        T.range.c2 = (start, stop) => rt.range(rt.indexOf(start, "range"), rt.indexOf(stop, "range"), 1n);
+        T.range.c3 = (start, stop, step) => { const st = rt.indexOf(step, "range"); if (st === 0n) fail(E.ValueError, "range() arg 3 must not be zero"); return rt.range(rt.indexOf(start, "range"), rt.indexOf(stop, "range"), st); };
+        T.slice.c1 = (stop) => R.slice(null, stop, null);
+        T.slice.c2 = (start, stop) => R.slice(start, stop, null);
+        T.slice.c3 = (start, stop, step) => R.slice(start, stop, step);
+        T.enumerate.c1 = (it) => enumCtor([it], null);
+        T.reversed.c1 = (it) => revCtor([it], null);
     }
     // ---- complex ---------------------------------------------------------------------------------------------------
     // The type's methods and constructor (CPython 3.13's complexobject.c);
@@ -2788,6 +2838,13 @@
         } else {
             t = rt.typeOf(obj);
         }
+        if (t.userClass === true) {
+            const gv = t.gv[name];
+            if (gv !== undefined && t.ga[name] === true && (obj.dict === undefined || obj.dict === null || obj.dict.get(name) === undefined)) {
+                R.mself = false;
+                return gv;
+            }
+        }
         if (!rt.getPlan(t)) { const v = getattr(obj, name); R.mself = false; return v; }
         const attr = rt.lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object" && (attr.cls === T.function || attr.cls === T.builtin_function_or_method)) {
@@ -2814,10 +2871,25 @@
         } else {
             t = rt.typeOf(obj);
         }
+        if (t.userClass === true) {
+            const gv = t.gv[name];
+            if (gv !== undefined && t.ga[name] === true && (obj.dict === undefined || obj.dict === null || obj.dict.get(name) === undefined)) {
+                R.mself = false;
+                return gv;
+            }
+        }
         if (!rt.getPlan(t)) { const v = getattr(obj, name); R.mself = false; return v; }
         const attr = rt.lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             const ac = attr.cls;
+            if (ac === T.staticmethod) {
+                const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
+                if (own === undefined) {
+                    if (t.userClass === true && name !== "__dict__") { t.ga[name] = true; t.gv[name] = attr.func; rt.noteFlagged(t); }
+                    R.mself = false;
+                    return attr.func;
+                }
+            }
             if (ac === T.function || ac === T.builtin_function_or_method) {
                 const own = obj !== null && typeof obj === "object" && obj.dict !== undefined && obj.dict !== null ? obj.dict.get(name) : undefined;
                 if (own === undefined) {
@@ -2829,7 +2901,7 @@
                     if (!(attr.unboxSelf === true && obj !== null && typeof obj === "object" && obj.pyval !== undefined)) {
                         const n = argc + 1, arity = attr.arity;
                         const noDict = obj === null || typeof obj !== "object" || obj.dict === undefined;
-                        if ((noDict || (t.userClass === true && attr.unboxSelf !== true)) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
+                        if (argc >= 0 && (noDict || (t.userClass === true && attr.unboxSelf !== true)) && (arity < 0 ? n >= attr.minArity : n <= arity && n >= attr.minArity)) {
                             t.gb[name + "#" + argc] = attr; rt.noteFlagged(t);
                         }
                         R.mself = true;
@@ -2959,7 +3031,7 @@
     R.TLIST = T.list; R.TTUPLE = T.tuple; R.TRANGE = T.range; R.TDICT = T.dict; R.TSET = T.set; R.TFROZENSET = T.frozenset; R.TSLICE = T.slice;
     // The two classes whose instances' `__class__` is not their `cls` as
     // `getattr` answers it (a module's globals, a super proxy's MRO).
-    R.TMODULE = T.module; R.TSUPER = T.super;
+    R.TMODULE = T.module; R.TSUPER = T.super; R.TMETHOD = T.method; R.TLISTITER = T.list_iterator; R.TTYPE = rt.TypeType;
     // The emitter's native list and tuple displays (`PySeq`) copy this
     // record, which `sequence` made and nothing else ever sees.
     R.SEQTMPL = rt.list([]);

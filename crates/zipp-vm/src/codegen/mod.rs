@@ -152,6 +152,16 @@ const RUNTIME_CODE: u8 = 4;
 /// Function` code of more than [`MAX_LOOPS_FOR_REGIONS`] loops, whose loops
 /// stay interpreted.
 const RUNTIME_MANY_LOOPS: u8 = 8;
+/// `Jit::interp_only` flags, Python programs only: JS runtime helper that
+/// compiles to Tier C only once genuinely hot ([`PY_RUNTIME_FN_THRESHOLD`]),
+/// avoiding startup compile cost on tiny scripts while accelerating real apps.
+const INTERP_PY_RUNTIME: u8 = 16;
+/// `Jit::interp_only` flags, Python programs only: user Python function,
+/// compiled to Tier C once warm ([`PY_USER_FN_THRESHOLD`]).
+const INTERP_PY_USER: u8 = 32;
+
+const PY_USER_FN_THRESHOLD: u32 = 64;
+const PY_RUNTIME_FN_THRESHOLD: u32 = 256;
 
 /// [`OSR_THRESHOLD`] for a Python program's loops. A Python loop's compile
 /// (an extended region, its slow paths included) costs more than a
@@ -262,6 +272,20 @@ pub(crate) fn proto_has_handler_ops(proto: &crate::bytecode::FuncProto) -> bool 
         .code
         .iter()
         .any(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }))
+}
+
+/// Whether a body contains a `super(...)` constructor call (or fetch), which
+/// inspects `Vm::frames.last()` for `super_done`, `new_target`, and the
+/// running class evaluation — so every invocation must run frame-backed.
+pub(crate) fn proto_has_super_ctor(proto: &crate::bytecode::FuncProto) -> bool {
+    proto.code.iter().any(|i| {
+        matches!(
+            i,
+            Instr::SuperCtorFetch { .. }
+                | Instr::SuperCtor { .. }
+                | Instr::SuperCtorSpread { .. }
+        )
+    })
 }
 
 env_off_switch! {
@@ -4295,12 +4319,10 @@ impl Jit {
         functions: impl IntoIterator<Item = &'a FuncProto>,
     ) {
         self.python_program = python;
-        self.python_only = python && crate::env_var_os("ZIPP_PY_JIT_RUNTIME").is_none();
-        // Mark what never compiles up front (the runtime's functions: every
-        // body without a fused Python instruction; and, without Tier C, the
-        // Python functions' whole bodies), so a call or a loop there never
-        // even counts toward a compile (which would intern and root its
-        // string constants and build its plans before declining).
+        self.python_only = python && crate::env_var_os("ZIPP_NO_PY_JIT_RUNTIME").is_some();
+        // Flag every Python runtime vs user function up front so cold runtime
+        // functions wait for `PY_RUNTIME_FN_THRESHOLD` (zero overhead on small
+        // scripts) while hot ones compile automatically on real-world apps.
         if python {
             self.interp_only = functions.into_iter().map(|f| self.python_interp_flags(f)).collect();
         }
@@ -4310,11 +4332,13 @@ impl Jit {
     /// [`Jit::set_python_program`]).
     fn python_interp_flags(&self, f: &FuncProto) -> u8 {
         let py = has_py_ops(&f.code);
-        // A runtime function: nothing compiles. A Python function:
-        // its loops compile; the whole body only under Tier C.
         match (py, self.python_only) {
             (false, true) => INTERP_NO_FN | INTERP_NO_REGIONS,
+            (false, false) if crate::env_var_os("ZIPP_PY_JIT_RUNTIME").is_none() => {
+                INTERP_PY_RUNTIME | INTERP_NO_REGIONS
+            }
             (true, _) if !py_tierc_enabled() => INTERP_NO_FN,
+            (true, _) => INTERP_PY_USER,
             _ => 0,
         }
     }
@@ -4764,6 +4788,22 @@ impl Jit {
         self.set_fn_state(func_id, FN_COLD);
     }
 
+    /// Interpreter entries before `func_id` is offered to the JIT (respecting
+    /// higher thresholds for Python user/runtime functions).
+    #[inline]
+    fn fn_threshold_for(&self, func_id: u32) -> u32 {
+        let flags = self.interp_flags(func_id);
+        if (flags & INTERP_PY_RUNTIME) != 0 {
+            PY_RUNTIME_FN_THRESHOLD
+        } else if self.threshold_override != 0 {
+            self.threshold_override
+        } else if (flags & INTERP_PY_USER) != 0 {
+            PY_USER_FN_THRESHOLD
+        } else {
+            self.fn_threshold()
+        }
+    }
+
     #[inline]
     pub fn record_and_should_compile(&mut self, func_id: u32) -> bool {
         if self.fn_state(func_id) != FN_COLD {
@@ -4775,7 +4815,7 @@ impl Jit {
         }
         let c = self.counts[i].wrapping_add(1);
         self.counts[i] = c;
-        c == self.fn_threshold()
+        c == self.fn_threshold_for(func_id)
     }
 
     /// Native entry + W7 window-fill mask for the cross-call fast path, or
@@ -5059,6 +5099,18 @@ impl Jit {
         }
     }
 
+    /// True if `func_id`'s cross-table record already proves its direct global
+    /// accesses valid for `route_epoch` (either it has no direct globals, or
+    /// its recorded epoch already matches `route_epoch`).
+    #[inline(always)]
+    pub fn cross_route_ok(&self, func_id: u32, route_epoch: u32) -> bool {
+        self.cross_table.get(func_id as usize).is_some_and(|rec| {
+            let f = rec.dyn_flags;
+            (f & CROSS_DYN_NO_GLOBALS) != 0
+                || ((f & CROSS_DYN_EPOCH_OK) != 0 && (f >> CROSS_DYN_ROUTE_SHIFT) == route_epoch)
+        })
+    }
+
     /// B199: whether the region at (`func_id`, `entry_ip`) may defer its
     /// compile one more back-edge while a callee entry is missing.
     pub fn cross_defer_allowed(&mut self, func_id: u32, entry_ip: u32) -> bool {
@@ -5306,6 +5358,26 @@ impl Jit {
         self.fn_state[i] = s;
     }
 
+    /// A human-readable perf-map symbol. JIT function IDs identify the exact
+    /// body, while the source function name makes CPU profiles actionable.
+    /// Only called by the lazy perf-map label callback when profiling is on.
+    fn perf_map_label(func_id: u32, name: &str, tier: &str) -> String {
+        let mut label = format!("fn{func_id}");
+        if !name.is_empty() {
+            label.push('_');
+            label.extend(name.chars().take(64).map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') {
+                    ch
+                } else {
+                    '_'
+                }
+            }));
+        }
+        label.push('_');
+        label.push_str(tier);
+        label
+    }
+
     /// Attempt to compile `proto` (id `func_id`). On success it becomes
     /// available via `get`; on failure the id is blacklisted and never retried.
     /// `self_call_helper` is the address of the depth-guarded Rust trampoline
@@ -5391,7 +5463,9 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "whole-fn")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -5437,7 +5511,9 @@ impl Jit {
                 let entry = f.entry();
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} tier-o"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "tier-o")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.opt_bodies.insert(func_id);
@@ -5445,7 +5521,9 @@ impl Jit {
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    crate::vm::prof::pc::register(at, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "int-body")
+                    });
                     self.int_bodies.insert(func_id, a);
                 }
                 // A body with handler ops mutates its frame's handler stack:
@@ -5586,20 +5664,27 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "whole-fn")
+                    });
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 if let Some(a) = tier_a_fallback.take() {
                     let (at, n) = a.code_span();
-                    crate::vm::prof::pc::register(at, n, || format!("fn{func_id} int body"));
+                    crate::vm::prof::pc::register(at, n, || {
+                        Self::perf_map_label(func_id, &proto.name, "int-body")
+                    });
                     self.int_bodies.insert(func_id, a);
                 }
                 // An `arguments` body (or a sloppy body reading legacy
                 // `f.arguments`/`f.caller`, which walk `Vm::frames`) takes no
                 // cross entry, framed or not: every call reaches it through a
                 // real frame setup and `try_run_jit`.
-                if proto.arguments_reg.is_some() || proto_reads_legacy_fn_props(proto) {
+                if proto.arguments_reg.is_some()
+                    || proto_reads_legacy_fn_props(proto)
+                    || proto_has_super_ctor(proto)
+                {
                     self.clear_cross_entry(func_id);
                     return;
                 }
@@ -5673,7 +5758,9 @@ impl Jit {
                 );
             }
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "whole-fn")
+            });
             self.compiled.insert(func_id, f);
             self.set_fn_state(func_id, FN_COMPILED);
             return;
@@ -5699,7 +5786,9 @@ impl Jit {
             // B237: array-map kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} map-kernel"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "map-kernel")
+            });
         }
         self.map_kernels.insert(func_id, compiled);
         entry
@@ -5717,7 +5806,9 @@ impl Jit {
             // B237: array-reduce kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} reduce-kernel"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "reduce-kernel")
+            });
         }
         self.reduce_kernels.insert(func_id, compiled);
         entry
@@ -5735,7 +5826,9 @@ impl Jit {
             // B237: array-filter kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} filter-kernel"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "filter-kernel")
+            });
         }
         self.filter_kernels.insert(func_id, compiled);
         entry
@@ -5752,7 +5845,9 @@ impl Jit {
         let entry = compiled.as_ref().map(|f| f.entry());
         if let Some(f) = compiled.as_ref() {
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} scan-kernel"));
+            crate::vm::prof::pc::register(a, n, || {
+                Self::perf_map_label(func_id, &proto.name, "scan-kernel")
+            });
         }
         self.scan_kernels.insert((func_id, stop_on), compiled);
         entry
@@ -6240,7 +6335,7 @@ impl Jit {
                         // becomes known.
                         let (a, n) = code.code_span();
                         crate::vm::prof::pc::register(a, n, || {
-                            format!("fn{func_id} region [{start},{end}]")
+                            Self::perf_map_label(func_id, &proto.name, &format!("region_{start}_{end}"))
                         });
                     }
                     self.mark_has_region(func_id);
@@ -6318,7 +6413,7 @@ impl Jit {
                             // becomes known.
                             let (a, n) = code.code_span();
                             crate::vm::prof::pc::register(a, n, || {
-                                format!("fn{func_id} region [{start},{end}]")
+                                Self::perf_map_label(func_id, &proto.name, &format!("region_{start}_{end}"))
                             });
                         }
                         self.mark_has_region(func_id);
@@ -6393,7 +6488,7 @@ impl Jit {
                     // becomes known.
                     let (a, n) = code.code_span();
                     crate::vm::prof::pc::register(a, n, || {
-                        format!("fn{func_id} region [{start},{end}]")
+                        Self::perf_map_label(func_id, &proto.name, &format!("region_{start}_{end}"))
                     });
                 }
                 self.mark_has_region(func_id);
@@ -6468,7 +6563,7 @@ impl Jit {
                     // becomes known.
                     let (a, n) = code.code_span();
                     crate::vm::prof::pc::register(a, n, || {
-                        format!("fn{func_id} region [{start},{end}]")
+                        Self::perf_map_label(func_id, &proto.name, &format!("region_{start}_{end}"))
                     });
                 }
                 self.mark_has_region(func_id);
@@ -6750,7 +6845,7 @@ impl Jit {
                 // Re-arm one short of `fn_threshold` (matching `evict_tier_c`)
                 // so a proven-hot function recompiles on its next call instead
                 // of suffering another full `fn_threshold` interpreted calls.
-                let rearm = self.fn_threshold().saturating_sub(1);
+                let rearm = self.fn_threshold_for(m.func_id).saturating_sub(1);
                 self.set_count(m.func_id, rearm);
                 self.set_fn_state(m.func_id, FN_COLD);
                 self.clear_cross_entry(m.func_id);
@@ -6897,7 +6992,7 @@ impl Jit {
                 // Re-arm one short of `fn_threshold` (matching `evict_tier_c`)
                 // so a proven-hot function recompiles on its next call instead
                 // of suffering another full `fn_threshold` interpreted calls.
-                let rearm = self.fn_threshold().saturating_sub(1);
+                let rearm = self.fn_threshold_for(m.func_id).saturating_sub(1);
                 self.set_count(m.func_id, rearm);
                 self.set_fn_state(m.func_id, FN_COLD);
                 self.clear_cross_entry(m.func_id);
@@ -6929,6 +7024,14 @@ impl Jit {
     #[inline]
     pub fn preseed_direct_miss_site(&mut self, func_id: u32, op_ip: u32) {
         self.direct_miss_sites.insert((func_id, op_ip));
+    }
+
+    /// Pre-seed a property op `(func_id, op_ip)` that has already observed an
+    /// accessor in the interpreter IC into `acc_sites` BEFORE its first Tier-C
+    /// compile, avoiding an `accessor site gate` eviction and recompile.
+    #[inline]
+    pub fn preseed_acc_site(&mut self, func_id: u32, op_ip: u32) {
+        self.acc_sites.insert((func_id, op_ip));
     }
 
     /// A call at `(func_id, ip)` in a compiled body reached the site's
@@ -7006,7 +7109,7 @@ impl Jit {
         // recompiles: a body entered a handful of times (records.ts's
         // `makeOrders`, once a round) would otherwise run interpreted, or in
         // an OSR region, for the rest of the program.
-        let rearm = self.fn_threshold().saturating_sub(1);
+        let rearm = self.fn_threshold_for(func_id).saturating_sub(1);
         self.set_count(func_id, rearm);
         self.set_fn_state(func_id, FN_COLD);
         self.clear_cross_entry(func_id);
@@ -7321,5 +7424,24 @@ impl Jit {
             ("call_counters", self.counts.iter().filter(|&&c| c != 0).count() as u64),
             ("blacklisted_functions", self.blacklist.len() as u64),
         ]
+    }
+}
+
+#[cfg(test)]
+mod perf_map_label_tests {
+    use super::Jit;
+
+    #[test]
+    fn jit_symbols_keep_function_id_and_sanitize_user_defined_names() {
+        assert_eq!(Jit::perf_map_label(42, "", "whole-fn"), "fn42_whole-fn");
+        assert_eq!(
+            Jit::perf_map_label(42, "read node", "whole-fn"),
+            "fn42_read_node_whole-fn"
+        );
+        let name = Jit::perf_map_label(7, "foo\n\t<bar>/baz", "tier-o");
+        assert_eq!(name, "fn7_foo___bar__baz_tier-o");
+        assert!(!name.chars().any(char::is_whitespace));
+        let huge = Jit::perf_map_label(0, &"x".repeat(1000), "whole-fn");
+        assert_eq!(huge.len(), 3 + 1 + 64 + 1 + 8);
     }
 }

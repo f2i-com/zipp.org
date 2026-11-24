@@ -417,15 +417,18 @@ impl<'p> Vm<'p> {
             let plain_makefunc = self.build_plain_makefunc_plan(fid);
             let prop_shape = self.build_prop_shape_plan(fid);
             let class_read = self.build_class_read_plan(fid);
-            if crate::codegen::direct_ic_miss_enabled() && !self.jit.metered() {
+            if !self.jit.metered() {
+                let direct_on = crate::codegen::direct_ic_miss_enabled();
                 for (ip, instr) in proto_ref.code.iter().enumerate() {
                     let is_set = match instr {
                         Instr::GetProp { .. } => false,
                         Instr::SetProp { .. } => true,
                         _ => continue,
                     };
-                    if self.ic_site_is_rotating_own(fid, ip, is_set) {
+                    if direct_on && self.ic_site_is_rotating_own(fid, ip, is_set) {
                         self.jit.preseed_direct_miss_site(fid, ip as u32);
+                    } else if self.ic_site_has_accessor(fid, ip) {
+                        self.jit.preseed_acc_site(fid, ip as u32);
                     }
                 }
             }

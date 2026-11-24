@@ -75,7 +75,7 @@ pub(super) const MAX_DEPTH: usize = 96;
 /// Code objects with at most this many bound values take them as their own
 /// parameters (registers 1..=n); larger ones take one array. The runtime's
 /// `MAX_DIRECT` (core.js) must agree.
-pub(super) const MAX_DIRECT: usize = 12;
+pub(super) const MAX_DIRECT: usize = 18;
 pub(super) const MAX_FUNCTIONS: usize = 32768;
 pub(super) const MAX_INSTRUCTIONS: usize = 1 << 20;
 /// Register 0 is `this` (the function object). The bound values follow as
@@ -1171,7 +1171,7 @@ impl<'a> Emitter<'a> {
     /// its parameters; anything else (including a count the function does
     /// not accept, which then raises) takes [`Emitter::call_positional`].
     pub fn call_with(&mut self, f: Reg, regs: &[Reg]) -> R<Reg> {
-        let ctor_site = std::mem::replace(&mut self.ctor_site, false) && regs.len() < 7 && regs.len() < MAX_DIRECT;
+        let ctor_site = std::mem::replace(&mut self.ctor_site, false) && regs.len() < 17 && regs.len() < MAX_DIRECT;
         if !self.fast || regs.len() > MAX_DIRECT {
             let args = self.array(regs)?;
             return self.call_positional(f, args);

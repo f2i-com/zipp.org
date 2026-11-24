@@ -643,6 +643,12 @@ impl<'p> Vm<'p> {
             (14..=17, 2) => return self.py_bisect_op(this, args, op, at),
             (13, 1) => return self.py_heap_op(this, args, false, at),
             (20, _) => return self.py_fstr_join(args),
+            // Direct `o[lo:hi]` / `o[lo:hi:step]` without allocating a slice record.
+            (37, 3) | (37, 4) => return self.py_slice_get(args),
+            // Native `re.Pattern.search` (38), `match` (39), `fullmatch` (40).
+            (38..=40, 2) | (38 | 39, 3) => return self.py_re_exec(this, args, op),
+            // Native `re.Pattern.sub` (41).
+            (41, 3) | (41, 4) => return self.py_re_sub(args),
             // `ord(ch)` of a 1-code-point well-formed str.
             (34, 1) => {
                 let (s_idx, ascii) = self.py_strm_flat(args[0])?;
@@ -2580,6 +2586,647 @@ impl<'p> Vm<'p> {
             self.regex_subject_units_put(text_val, u16s);
         }
         Ok(self.alloc_array_current_realm(out))
+    }
+
+    /// Unwrap a primitive `str` or an unmodified `str` subclass (`pyval`) for
+    /// native slice and `re` fast paths. Returns `(str_val, is_primitive)`.
+    #[inline]
+    fn py_unwrap_str_val(&self, v: Value) -> Option<(Value, bool)> {
+        if !v.is_heap() {
+            return None;
+        }
+        if self.heap.is_str_like(v.heap_index()) {
+            return Some((v, true));
+        }
+        let cls = self.py_cls_of(v)?;
+        if (self.py_sub_kind(cls) & super::py_rt::SUB_STR_GET) == 0 {
+            return None;
+        }
+        let pyval = self.py_own_data(v.heap_index(), "pyval")?;
+        if pyval.is_heap() && self.heap.is_str_like(pyval.heap_index()) {
+            Some((pyval, false))
+        } else {
+            None
+        }
+    }
+
+    /// `R.SLICEGET.c3(o, lo, hi)` / `.c4(o, lo, hi, step)` (op 37): direct
+    /// slicing of `str`, unmodified `str` subclasses, `list`, and `tuple`
+    /// without allocating a Python `slice` record.
+    fn py_slice_get(&mut self, args: &[Value]) -> Option<Value> {
+        let o = args[0];
+        let lo_v = args[1];
+        let hi_v = args[2];
+        let step_v = args.get(3).copied().unwrap_or(Value::NULL);
+        let step: i128 = if step_v == Value::NULL {
+            1
+        } else {
+            let s = self.bigint_i128(step_v)?;
+            if s != 1 && s != -1 {
+                return None;
+            }
+            s
+        };
+        // 1. `str` or unmodified `str` subclass.
+        if let Some((s_val, is_prim)) = self.py_unwrap_str_val(o) {
+            let s_idx = s_val.heap_index();
+            self.heap.flatten(s_idx);
+            let (len, is_ascii) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => (st.as_bytes().len(), true),
+                HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (st.units(), false),
+                _ => return None,
+            };
+            let n = len as i128;
+            if step == 1 {
+                let lo = if lo_v == Value::NULL {
+                    0usize
+                } else {
+                    let i = self.bigint_i128(lo_v)?;
+                    if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+                };
+                let hi = if hi_v == Value::NULL {
+                    len
+                } else {
+                    let i = self.bigint_i128(hi_v)?;
+                    if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+                };
+                if lo >= hi {
+                    return Some(Value::heap(crate::heap::INTERN_EMPTY));
+                }
+                if lo == 0 && hi == len && is_prim {
+                    return Some(o);
+                }
+                let slice_len = hi - lo;
+                if slice_len > STRM_MAX_TEXT {
+                    return None;
+                }
+                #[cfg(feature = "instrument")]
+                if self.instr_rec.is_some() && slice_len > 1024 {
+                    return None;
+                }
+                self.charge_steps(slice_len as i64);
+                if is_ascii {
+                    return Some(self.ascii_slice_value(s_idx, lo..hi));
+                }
+                let slice_bytes = {
+                    let HeapObj::Str(st) = self.heap.get(s_idx) else {
+                        return None;
+                    };
+                    let (ba, bb) = st.bmp_byte_range(lo, hi);
+                    let b = &st.as_bytes()[ba..bb];
+                    if b.len() == 1 && b[0] < 128 {
+                        return Some(Value::heap(b[0] as u32));
+                    }
+                    b.to_vec()
+                };
+                return Some(Value::heap(
+                    self.heap.alloc_js(JsStr::from_bmp_utf8(slice_bytes, slice_len)),
+                ));
+            }
+            // step == -1 (ASCII fast path)
+            if !is_ascii {
+                return None;
+            }
+            if len == 0 {
+                return Some(Value::heap(crate::heap::INTERN_EMPTY));
+            }
+            let start = if lo_v == Value::NULL {
+                n - 1
+            } else {
+                let i = self.bigint_i128(lo_v)?;
+                if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+            };
+            let stop = if hi_v == Value::NULL {
+                -1
+            } else {
+                let i = self.bigint_i128(hi_v)?;
+                if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+            };
+            if start <= stop {
+                return Some(Value::heap(crate::heap::INTERN_EMPTY));
+            }
+            let count = (start - stop) as usize;
+            if count > STRM_MAX_TEXT {
+                return None;
+            }
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() && count > 1024 {
+                return None;
+            }
+            self.charge_steps(count as i64);
+            let mut buf = self.heap.take_byte_buf(count);
+            let src = &self.py_strm_bytes(s_idx)[(stop + 1) as usize..=(start as usize)];
+            buf.extend(src.iter().rev().copied());
+            return Some(self.py_strm_new_as(buf, true));
+        }
+
+        // 2. Exact `list` or `tuple`.
+        let (t_list, t_tuple, seq_tmpl, seq_shape) = {
+            let p = self.py_rt.as_deref()?;
+            if p.seq_shape == crate::shape::DICT {
+                return None;
+            }
+            (p.t_list, p.t_tuple, p.seq_tmpl, p.seq_shape)
+        };
+        let (cls, items) = self.py_seq_parts(o)?;
+        if cls.bits() != t_list.bits() && cls.bits() != t_tuple.bits() {
+            return None;
+        }
+        if !items.is_heap() {
+            return None;
+        }
+        let items_idx = items.heap_index();
+        let len = match self.heap.get(items_idx) {
+            HeapObj::Array(a) => a.len(),
+            _ => return None,
+        };
+        let n = len as i128;
+        let out_vec: Vec<Value> = if step == 1 {
+            let lo = if lo_v == Value::NULL {
+                0usize
+            } else {
+                let i = self.bigint_i128(lo_v)?;
+                if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+            };
+            let hi = if hi_v == Value::NULL {
+                len
+            } else {
+                let i = self.bigint_i128(hi_v)?;
+                if i < 0 { (i + n).max(0) as usize } else { i.min(n) as usize }
+            };
+            if lo >= hi {
+                Vec::new()
+            } else {
+                let count = hi - lo;
+                #[cfg(feature = "instrument")]
+                if self.instr_rec.is_some() && count > 1024 {
+                    return None;
+                }
+                self.charge_steps(count as i64);
+                let mut buf = self.heap.take_arr_buf(count);
+                let ok = {
+                    let HeapObj::Array(a) = self.heap.get(items_idx) else {
+                        return None;
+                    };
+                    let slice = &a[lo..hi];
+                    if slice.iter().any(|v| v.is_hole() || v.is_undefined()) {
+                        false
+                    } else {
+                        buf.extend_from_slice(slice);
+                        true
+                    }
+                };
+                if !ok {
+                    return None;
+                }
+                buf
+            }
+        } else {
+            if len == 0 {
+                Vec::new()
+            } else {
+                let start = if lo_v == Value::NULL {
+                    n - 1
+                } else {
+                    let i = self.bigint_i128(lo_v)?;
+                    if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+                };
+                let stop = if hi_v == Value::NULL {
+                    -1
+                } else {
+                    let i = self.bigint_i128(hi_v)?;
+                    if i < 0 { (i + n).max(-1) } else { i.min(n - 1) }
+                };
+                if start <= stop {
+                    Vec::new()
+                } else {
+                    let count = (start - stop) as usize;
+                    #[cfg(feature = "instrument")]
+                    if self.instr_rec.is_some() && count > 1024 {
+                        return None;
+                    }
+                    self.charge_steps(count as i64);
+                    let mut buf = self.heap.take_arr_buf(count);
+                    let ok = {
+                        let HeapObj::Array(a) = self.heap.get(items_idx) else {
+                            return None;
+                        };
+                        let slice = &a[(stop + 1) as usize..=(start as usize)];
+                        if slice.iter().any(|v| v.is_hole() || v.is_undefined()) {
+                            false
+                        } else {
+                            buf.extend(slice.iter().rev().copied());
+                            true
+                        }
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    buf
+                }
+            }
+        };
+        if !self.py_alloc_like_ok(seq_tmpl, seq_shape) {
+            return None;
+        }
+        let arr = self.alloc_array_current_realm(out_vec);
+        self.py_alloc_like_ready(seq_tmpl, seq_shape, &[cls, arr])
+    }
+
+    /// Native `re.Pattern.search` (38), `match` (39), `fullmatch` (40) for
+    /// non-bytes patterns on BMP/ASCII `str` (and unmodified `str` subclasses):
+    /// bypasses `patRun` / `sticky` / `rt.hasSurrogate` / `execAt` / `mk`.
+    fn py_re_exec(&mut self, this: Value, args: &[Value], op: i32) -> Option<Value> {
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        let p = args[0];
+        let raw = args[1];
+        if !p.is_heap() {
+            return None;
+        }
+        let (s_val, _) = self.py_unwrap_str_val(raw)?;
+        let s_idx = s_val.heap_index();
+        self.heap.flatten(s_idx);
+        let n = match self.heap.get(s_idx) {
+            HeapObj::Str(st) if st.is_ascii() => st.as_bytes().len(),
+            HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => st.units(),
+            _ => return None,
+        };
+        let re_key = match op {
+            38 => "re",
+            39 => "sticky",
+            _ => "full",
+        };
+        let re_val = {
+            let HeapObj::Object(pm) = self.heap.get(p.heap_index()) else {
+                return None;
+            };
+            if pm.is_ctor {
+                return None;
+            }
+            let is_bytes_slot = pm.pos("isBytes").filter(|&s| !pm.is_accessor_at(s))?;
+            if pm.val_at(is_bytes_slot) != Value::FALSE {
+                return None;
+            }
+            let re_slot = pm.pos(re_key).filter(|&s| !pm.is_accessor_at(s))?;
+            pm.val_at(re_slot)
+        };
+        if !re_val.is_heap() || !matches!(self.heap.get(re_val.heap_index()), HeapObj::RegExp(_)) {
+            return None;
+        }
+        let pos = if let Some(&pos_v) = args.get(2) {
+            let i = self.bigint_i128(pos_v)?;
+            i.clamp(0, n as i128) as usize
+        } else {
+            0usize
+        };
+        let re_idx = re_val.heap_index();
+        self.set_regexp_last_index(re_idx, pos as u64);
+        let m = self.regexp_exec(re_idx, s_val).ok()?;
+        if m == Value::NULL {
+            return Some(Value::NULL);
+        }
+        let mtmpl = self.py_own_data(this.heap_index(), "mtmpl")?;
+        if !mtmpl.is_heap() {
+            return None;
+        }
+        let (mtmpl_shape, cls_match) = match self.heap.get(mtmpl.heap_index()) {
+            HeapObj::Object(mm) if !mm.is_ctor && mm.slot_len() == 9 => (mm.shape(), mm.val_at(0)),
+            _ => return None,
+        };
+        self.py_alloc_like(
+            mtmpl,
+            mtmpl_shape,
+            &[
+                cls_match,
+                m,
+                s_val,
+                raw,
+                s_val,
+                p,
+                Value::num(pos as f64),
+                Value::num(n as f64),
+                Value::NULL,
+            ],
+        )
+    }
+
+    /// Native `re.Pattern.sub` (41) for non-bytes patterns with string
+    /// replacements (literal or simple `\1`..`\99` / standard escapes) on
+    /// well-formed BMP/ASCII `str` (and unmodified `str` subclasses).
+    fn py_re_sub(&mut self, args: &[Value]) -> Option<Value> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = args;
+            return None;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            #[cfg(feature = "instrument")]
+            if self.instr_rec.is_some() {
+                return None;
+            }
+            let p = args[0];
+            let repl = args[1];
+            let raw = args[2];
+            if !p.is_heap() {
+                return None;
+            }
+            let count: usize = if let Some(&cv) = args.get(3) {
+                let c = self.bigint_i128(cv)?;
+                if c < 0 {
+                    return None;
+                }
+                usize::try_from(c).ok()?
+            } else {
+                0
+            };
+            let (s_val, _) = self.py_unwrap_str_val(raw)?;
+            let (repl_idx, repl_ascii) = self.py_strm_flat(repl)?;
+            let s_idx = s_val.heap_index();
+            self.heap.flatten(s_idx);
+            let (s_ascii, s_len) = match self.heap.get(s_idx) {
+                HeapObj::Str(st) if st.is_ascii() => (true, st.as_bytes().len()),
+                HeapObj::Str(st) if st.is_wellformed() && !st.has_surrogate() => (false, st.units()),
+                _ => return None,
+            };
+            let (re_val, ngroups) = {
+                let HeapObj::Object(pm) = self.heap.get(p.heap_index()) else {
+                    return None;
+                };
+                if pm.is_ctor {
+                    return None;
+                }
+                let is_bytes_slot = pm.pos("isBytes").filter(|&s| !pm.is_accessor_at(s))?;
+                if pm.val_at(is_bytes_slot) != Value::FALSE {
+                    return None;
+                }
+                let re_slot = pm.pos("re").filter(|&s| !pm.is_accessor_at(s))?;
+                let ng_slot = pm.pos("ngroups").filter(|&s| !pm.is_accessor_at(s))?;
+                let ng_v = pm.val_at(ng_slot);
+                if !ng_v.is_number() || ng_v.as_f64() < 0.0 {
+                    return None;
+                }
+                (pm.val_at(re_slot), ng_v.as_f64() as usize)
+            };
+            if !re_val.is_heap() {
+                return None;
+            }
+            let re_idx = re_val.heap_index();
+            let unicode = match self.heap.get(re_idx) {
+                HeapObj::RegExp(r) => r.flags.contains('u') || r.flags.contains('v'),
+                _ => return None,
+            };
+
+            #[derive(Clone, Copy)]
+            enum SubPart {
+                Lit(usize, usize),
+                Byte(u8),
+                Group(usize),
+            }
+            let mut parts: Vec<SubPart> = Vec::new();
+            let mut has_group = false;
+            {
+                let rb = self.py_strm_bytes(repl_idx);
+                if !rb.contains(&b'\\') {
+                    if !rb.is_empty() {
+                        parts.push(SubPart::Lit(0, rb.len()));
+                    }
+                } else {
+                    let mut i = 0usize;
+                    let mut lit_start = 0usize;
+                    while i < rb.len() {
+                        if rb[i] != b'\\' {
+                            i += 1;
+                            continue;
+                        }
+                        if i > lit_start {
+                            parts.push(SubPart::Lit(lit_start, i));
+                        }
+                        i += 1;
+                        let d = *rb.get(i)?;
+                        match d {
+                            b'\\' => { parts.push(SubPart::Byte(b'\\')); i += 1; }
+                            b'n' => { parts.push(SubPart::Byte(b'\n')); i += 1; }
+                            b't' => { parts.push(SubPart::Byte(b'\t')); i += 1; }
+                            b'r' => { parts.push(SubPart::Byte(b'\r')); i += 1; }
+                            b'f' => { parts.push(SubPart::Byte(0x0c)); i += 1; }
+                            b'v' => { parts.push(SubPart::Byte(0x0b)); i += 1; }
+                            b'a' => { parts.push(SubPart::Byte(0x07)); i += 1; }
+                            b'b' => { parts.push(SubPart::Byte(0x08)); i += 1; }
+                            b'1'..=b'9' => {
+                                // Octal escape (3 octal digits starting with 1..7) -> JS fallback.
+                                if d <= b'7'
+                                    && rb.get(i + 1).is_some_and(|&c| (b'0'..=b'7').contains(&c))
+                                    && rb.get(i + 2).is_some_and(|&c| (b'0'..=b'7').contains(&c))
+                                {
+                                    return None;
+                                }
+                                let mut num = (d - b'0') as usize;
+                                i += 1;
+                                if let Some(&d2) = rb.get(i).filter(|&&c| c.is_ascii_digit()) {
+                                    num = num * 10 + (d2 - b'0') as usize;
+                                    i += 1;
+                                }
+                                if num == 0 || num > ngroups {
+                                    return None;
+                                }
+                                has_group = true;
+                                parts.push(SubPart::Group(num));
+                            }
+                            _ => return None,
+                        }
+                        lit_start = i;
+                    }
+                    if lit_start < rb.len() {
+                        parts.push(SubPart::Lit(lit_start, rb.len()));
+                    }
+                }
+            }
+
+            if s_ascii {
+                self.ensure_regexp_ascii_twin_deferred(re_idx, s_len);
+                let _gc = self.gc_lock_guard();
+                let matches: Vec<regress::Match> = {
+                    let subj = match self.heap.get(s_idx) {
+                        HeapObj::Str(js) => js.as_str_wf(),
+                        _ => return None,
+                    };
+                    let HeapObj::RegExp(r) = self.heap.get(re_idx) else {
+                        return None;
+                    };
+                    let regex = match r.ascii_twin.get() {
+                        Some(Some(twin)) => &**twin,
+                        _ => &*r.regex,
+                    };
+                    let mut it = regex.find_from_ascii(subj, 0);
+                    let Some(first) = it.next() else {
+                        return Some(s_val);
+                    };
+                    let mut ms = Vec::new();
+                    ms.push(first);
+                    if count != 1 {
+                        for m in it {
+                            ms.push(m);
+                            if count > 0 && ms.len() >= count {
+                                break;
+                            }
+                        }
+                    }
+                    ms
+                };
+                if has_group {
+                    for m in &matches {
+                        for &pt in &parts {
+                            if let SubPart::Group(g) = pt {
+                                if m.captures.get(g - 1).and_then(|c| c.as_ref()).is_none() {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+                let both_ascii = repl_ascii;
+                let mut out = self.heap.take_byte_buf(s_len + 32);
+                {
+                    let sb = self.py_strm_bytes(s_idx);
+                    let rb = self.py_strm_bytes(repl_idx);
+                    let mut last = 0usize;
+                    for m in &matches {
+                        let r = m.range();
+                        out.extend_from_slice(&sb[last..r.start]);
+                        for &pt in &parts {
+                            match pt {
+                                SubPart::Lit(a, b) => out.extend_from_slice(&rb[a..b]),
+                                SubPart::Byte(b) => out.push(b),
+                                SubPart::Group(g) => {
+                                    if let Some(cr) = &m.captures[g - 1] {
+                                        out.extend_from_slice(&sb[cr.start..cr.end]);
+                                    }
+                                }
+                            }
+                        }
+                        last = r.end;
+                        if out.len() > STRM_MAX_TEXT * 3 {
+                            self.heap.return_byte_buf(out);
+                            return None;
+                        }
+                    }
+                    out.extend_from_slice(&sb[last..]);
+                }
+                if (both_ascii && out.len() > STRM_MAX_TEXT) || out.len() > STRM_MAX_TEXT * 3 {
+                    self.heap.return_byte_buf(out);
+                    return None;
+                }
+                let out_len = out.len();
+                let res = self.py_strm_new_as(out, both_ascii);
+                if !both_ascii {
+                    if let HeapObj::Str(st) = self.heap.get(res.heap_index()) {
+                        if st.units() > STRM_MAX_TEXT {
+                            return None;
+                        }
+                    }
+                }
+                self.charge_steps(out_len as i64);
+                return Some(res);
+            }
+
+            // Non-ASCII BMP path (`!has_surrogate()`): match over cached UTF-16 units.
+            let _gc = self.gc_lock_guard();
+            let u16s = self.regex_subject_units_take(s_val);
+            let matches: Vec<regress::Match> = {
+                let HeapObj::RegExp(r) = self.heap.get(re_idx) else {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                };
+                let regex = &r.core.regex;
+                let mut ms = Vec::new();
+                if unicode {
+                    let mut it = regex.find_from_utf16(&u16s, 0);
+                    if let Some(first) = it.next() {
+                        ms.push(first);
+                        if count != 1 {
+                            for m in it {
+                                ms.push(m);
+                                if count > 0 && ms.len() >= count {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut it = regex.find_from_ucs2(&u16s, 0);
+                    if let Some(first) = it.next() {
+                        ms.push(first);
+                        if count != 1 {
+                            for m in it {
+                                ms.push(m);
+                                if count > 0 && ms.len() >= count {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                ms
+            };
+            if matches.is_empty() {
+                self.regex_subject_units_put(s_val, u16s);
+                return Some(s_val);
+            }
+            if has_group {
+                for m in &matches {
+                    for &pt in &parts {
+                        if let SubPart::Group(g) = pt {
+                            if m.captures.get(g - 1).and_then(|c| c.as_ref()).is_none() {
+                                self.regex_subject_units_put(s_val, u16s);
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            let repl_utf8 = match std::str::from_utf8(self.py_strm_bytes(repl_idx)) {
+                Ok(s) => s.to_owned(),
+                Err(_) => {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                }
+            };
+            let mut out_u16: Vec<u16> = Vec::with_capacity(u16s.len() + 32);
+            let mut last = 0usize;
+            for m in &matches {
+                let r = m.range();
+                out_u16.extend_from_slice(&u16s[last..r.start]);
+                for &pt in &parts {
+                    match pt {
+                        SubPart::Lit(a, b) => out_u16.extend(repl_utf8[a..b].encode_utf16()),
+                        SubPart::Byte(b) => out_u16.push(b as u16),
+                        SubPart::Group(g) => {
+                            if let Some(cr) = &m.captures[g - 1] {
+                                out_u16.extend_from_slice(&u16s[cr.start..cr.end]);
+                            }
+                        }
+                    }
+                }
+                last = r.end;
+                if out_u16.len() > STRM_MAX_TEXT {
+                    self.regex_subject_units_put(s_val, u16s);
+                    return None;
+                }
+            }
+            out_u16.extend_from_slice(&u16s[last..]);
+            self.regex_subject_units_put(s_val, u16s);
+            if out_u16.len() > STRM_MAX_TEXT {
+                return None;
+            }
+            let out_len = out_u16.len();
+            let res = self.units_value(&out_u16);
+            self.charge_steps(out_len as i64);
+            Some(res)
+        }
     }
 
     /// `__zipp_py_write(op, to_stderr, payload)`: direct Python stdout/stderr

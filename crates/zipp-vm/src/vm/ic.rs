@@ -995,11 +995,11 @@ impl<'p> Vm<'p> {
     /// pinned.
     pub(crate) fn register_module_namespace(&mut self, idx: u32, slots: ExportSlots) {
         self.module_namespaces.insert(idx, slots);
-        self.mod_ns_nonempty = 1;
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             m.pin_dict();
         }
         self.heap.pin_mirror_dict(idx);
+        self.heap.bump_version(idx);
     }
 
     /// The site cache for `(func_id, ip)`, if this function is IC-eligible.
@@ -1230,7 +1230,7 @@ impl<'p> Vm<'p> {
             return false;
         };
         let cell_shape = cell.own_shape.get();
-        if cell_shape == crate::shape::DICT || cell_shape == SiteCell::DICT_HINT {
+        if cell_shape == SiteCell::DICT_HINT || (is_set && cell_shape == crate::shape::DICT) {
             return false;
         }
         if is_set && (cell.own_slot.get() & SiteCell::WRITE_PROVEN) == 0 {
@@ -1244,6 +1244,7 @@ impl<'p> Vm<'p> {
         }
         let mut first_shape = crate::shape::DICT;
         let mut distinct_shapes = 0u32;
+        let mut saw_non_own_shaped = false;
         for e in &site.entries[..site.n as usize] {
             match *e {
                 IcEntry::OwnData { shape, .. } if shape != crate::shape::DICT => {
@@ -1254,14 +1255,51 @@ impl<'p> Vm<'p> {
                         distinct_shapes = 2;
                     }
                 }
-                IcEntry::AddData { .. } if is_set => {}
+                IcEntry::AddData { .. } | IcEntry::AddClass { .. } if is_set => {}
+                IcEntry::ClassMethod { recv_shape, .. }
+                | IcEntry::ClassMiss { recv_shape, .. }
+                | IcEntry::ProtoData {
+                    recv_shape,
+                    slot: u32::MAX,
+                    ..
+                } if !is_set && recv_shape != crate::shape::DICT => {
+                    saw_non_own_shaped = true;
+                }
                 _ => return false,
             }
         }
-        if distinct_shapes == 0 {
+        if distinct_shapes == 0 && !saw_non_own_shaped {
             return false;
         }
-        distinct_shapes >= 2 || cell_shape != first_shape || site.misses >= 4
+        distinct_shapes >= 2
+            || saw_non_own_shaped
+            || (distinct_shapes == 1
+                && cell_shape != crate::shape::DICT
+                && cell_shape != first_shape)
+            || site.misses >= 2
+    }
+
+    /// True when the `GetProp` / `SetProp` at `(func_id, ip)` has already
+    /// observed an accessor way (`OwnAcc`, `ProtoAcc`, `ClassGetter`, or
+    /// `ClassSetter`), so a first-time Tier-C compile can emit accessor arms
+    /// immediately instead of taking an `accessor site gate` eviction later.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_site_has_accessor(&self, func_id: u32, ip: usize) -> bool {
+        let Some(cell) = self.ic_cell(func_id, ip) else {
+            return false;
+        };
+        let Some(site) = cell.site_ref() else {
+            return false;
+        };
+        site.entries[..site.n as usize].iter().any(|e| {
+            matches!(
+                e,
+                IcEntry::OwnAcc { .. }
+                    | IcEntry::ProtoAcc { .. }
+                    | IcEntry::ClassGetter { .. }
+                    | IcEntry::ClassSetter { .. }
+            )
+        })
     }
 
     /// The class getter the `GetProp` at `(func_id, ip)`'s cache found first
@@ -4686,7 +4724,7 @@ impl<'p> Vm<'p> {
         hops: &mut [(u32, u32)],
         read: bool,
     ) -> Option<usize> {
-        if self.proto_of.has(idx) {
+        if self.proto_of.has(idx) || (read && key == "constructor") {
             return None;
         }
         let mut cur = class;
@@ -4703,10 +4741,11 @@ impl<'p> Vm<'p> {
                 Some(_) => return None,
             }
         }
-        if !matches!(self.class_member_lookup(idx, class, key), ClassLookup::Miss) {
-            return None;
-        }
-        let mut next = self.class_instance_live_proto(idx, class);
+        let mut next = match self.class_member_lookup(idx, class, key) {
+            ClassLookup::Miss => self.class_instance_live_proto(idx, class),
+            ClassLookup::Live(pv) => pv,
+            _ => return None,
+        };
         let mut n = 0usize;
         while next.is_heap() {
             let h = next.heap_index();

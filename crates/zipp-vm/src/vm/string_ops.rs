@@ -768,6 +768,21 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some(len) = ascii_len {
+                    let cache_tag: u8 = if upper { 2 } else { 1 };
+                    let cache_slot = ((idx as usize) ^ if upper { 131 } else { 0 }) & 255;
+                    let src_ver = self.heap.version_of(idx);
+                    if len <= 32 {
+                        let e = self.ascii_case_cache[cache_slot];
+                        if e.4 == cache_tag
+                            && e.0 == idx
+                            && e.1 == src_ver
+                            && (e.2 as usize) < self.heap.len()
+                            && self.heap.version_of(e.2) == e.3
+                            && matches!(self.heap.get(e.2), HeapObj::Str(_))
+                        {
+                            return Ok(Some(Value::heap(e.2)));
+                        }
+                    }
                     self.preflight_guest_string_size(len)?;
                     let mut buf = self.heap.take_byte_buf(len);
                     if let HeapObj::Str(js) = self.heap.get(idx) {
@@ -778,9 +793,14 @@ impl<'p> Vm<'p> {
                     } else {
                         buf.make_ascii_lowercase();
                     }
-                    return Ok(Some(Value::heap(
-                        self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf)),
-                    )));
+                    let res_idx = self.heap.alloc_str_settled(crate::heap::JsStr::from_ascii(buf));
+                    if len <= 32 {
+                        self.heap.freeze_shared_str(idx);
+                        self.heap.freeze_shared_str(res_idx);
+                        let res_ver = self.heap.version_of(res_idx);
+                        self.ascii_case_cache[cache_slot] = (idx, src_ver, res_idx, res_ver, cache_tag);
+                    }
+                    return Ok(Some(Value::heap(res_idx)));
                 }
                 let mapped = match self.heap.get(idx) {
                     HeapObj::Str(js) if case_map_one_pass(js) => {
