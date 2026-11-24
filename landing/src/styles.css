@@ -2829,30 +2829,23 @@ svg {
 
   .nav-links {
     position: absolute;
-    z-index: 1;
-    top: 58px;
+    z-index: 50;
+    top: calc(100% + 6px);
     right: 0;
     left: 0;
-    display: grid;
+    display: none;
     gap: 0;
     padding: 10px 16px;
     border: 1px solid var(--line-strong);
     border-radius: 12px;
-    background: rgba(15, 17, 23, 0.98);
-    box-shadow: 0 24px 50px rgba(0, 0, 0, 0.42);
-    opacity: 0;
+    background: #0f1117;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.78);
     pointer-events: none;
-    transform: translateY(-8px);
-    visibility: hidden;
-    transition: opacity 160ms ease, transform 160ms ease, visibility 0s linear 160ms;
   }
 
   .nav-links.nav-open {
-    opacity: 1;
+    display: grid;
     pointer-events: auto;
-    transform: translateY(0);
-    visibility: visible;
-    transition-delay: 0s;
   }
 
   .nav-links a {
@@ -2959,30 +2952,23 @@ svg {
 
   .nav-links {
     position: absolute;
-    z-index: 1;
-    top: 58px;
+    z-index: 50;
+    top: calc(100% + 6px);
     right: 0;
     left: 0;
-    display: grid;
+    display: none;
     gap: 0;
     padding: 10px 16px;
     border: 1px solid var(--line-strong);
     border-radius: 12px;
-    background: rgba(15, 17, 23, 0.98);
-    box-shadow: 0 24px 50px rgba(0, 0, 0, 0.42);
-    opacity: 0;
+    background: #0f1117;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.78);
     pointer-events: none;
-    transform: translateY(-8px);
-    visibility: hidden;
-    transition: opacity 160ms ease, transform 160ms ease, visibility 0s linear 160ms;
   }
 
   .nav-links.nav-open {
-    opacity: 1;
+    display: grid;
     pointer-events: auto;
-    transform: translateY(0);
-    visibility: visible;
-    transition-delay: 0s;
   }
 
   .nav-links a {

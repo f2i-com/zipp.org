@@ -14,7 +14,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
-const dirs = ["wasm", "playground-runtime", "sandbox"];
+const dirs = ["wasm", "playground-runtime", "playground-runtime/rust", "sandbox", "container-demo/runtime/engines"];
 const check = process.argv.includes("--check");
 
 function brotli(bytes) {

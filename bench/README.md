@@ -132,8 +132,12 @@ fail closed on drift. A diagnostic override can permit measurement; it can
 never turn a noncanonical run into publishable evidence.
 
 The current canonical public artifacts, the pair the root README tabulates, are
-the 0.0.31 engine's (29 October 2026):
+the **0.0.40** engine's (24 November 2026):
 
+- [`real13_0cd3eab8_pgo_2026-11-24.json`](real13_0cd3eab8_pgo_2026-11-24.json)
+- [`hostile/head_clean_0cd3eab8_pgo_2026-11-24.json`](hostile/head_clean_0cd3eab8_pgo_2026-11-24.json)
+
+The prior 0.0.31 canonical pair (`fcfb1934`, 29 October 2026) stays here as an earlier series point:
 - [`real13_fcfb1934_pgo_2026-10-29.json`](real13_fcfb1934_pgo_2026-10-29.json)
 - [`hostile/head_clean_fcfb1934_pgo_2026-10-29.json`](hostile/head_clean_fcfb1934_pgo_2026-10-29.json)
 
@@ -157,7 +161,7 @@ capture with its geomean, interval and per-row ratios. Git history keeps the
 original files.
 
 The interpreter-versus-interpreter tables come from
-[`comparison/interp_real13_fcfb1934_2026-10-29.json`](comparison/interp_real13_fcfb1934_2026-10-29.json)
+[`comparison/interp_real13_0cd3eab8_2026-11-24.json`](comparison/interp_real13_0cd3eab8_2026-11-24.json)
 and [`comparison/interp_hostile17_fcfb1934_2026-10-29.json`](comparison/interp_hostile17_fcfb1934_2026-10-29.json),
 diagnostic `run_native.py` runs of the same PGO binary with no native code
 (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) against interpreters and JIT-off engine modes (see

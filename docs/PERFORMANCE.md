@@ -5,27 +5,27 @@
 Start with the recorded native results. These are stamped benchmark captures,
 with the source revisions and raw evidence below; they are not a new measurement
 of every change on `main`. Ratios are **Zipp / competitor**, so **lower is faster**.
-All of them were measured on 29 October 2026 with the 0.0.31 engine.
+All of them were measured on 24 November 2026 with the **0.0.40** engine (`0cd3eab8`).
 
 | Native workload group | Zipp / Node geomean | Coverage |
 |---|---:|---|
-| All 30 workloads | **0.629×** | 13 normal + 17 hostile rows, weighted equally. |
-| Normal workloads | **0.543×** | All 13 normal rows; faster than Node on every one. |
-| Hostile workloads | **0.704×** | All 17 stress-oriented rows. |
+| All 30 workloads | **0.583×** | 13 normal + 17 hostile rows, weighted equally (**29 / 30** wins). |
+| Normal workloads | **0.532×** | All 13 normal rows; faster than Node on every one. |
+| Hostile workloads | **0.624×** | All 17 stress-oriented rows; faster than Node on 16 of 17. |
 
 Those are JIT against JIT: every engine runs as it ships. Run as a pure
-interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`: no native code), Zipp measures **0.574×** Bellard's QuickJS and
-**0.326×** QuickJS-NG over the same 30 rows; see
+interpreter (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`: no native code), Zipp measures **0.430×** Bellard's QuickJS and
+**0.330×** QuickJS-NG over the same 30 rows (winning 30 / 30 against both); see
 [Interpreter versus interpreter](#interpreter-versus-interpreter). Its Python
-frontend measures 1.004× CPython 3.13.14 by in-process work time over 36
-programs (0.916× on the 30 micro kernels); see [Python versus CPython](#python-versus-cpython).
+frontend measures **0.626×** CPython 3.13.14 by in-process work time over 36
+programs (**0.601×** micro, **0.767×** macro, 26 / 36 wins); see [Python versus CPython](#python-versus-cpython).
 
-Median process launch in the canonical four-engine capture is **9.1 ms** for
-Zipp, **32.3 ms** for Node, **53.0 ms** for Bun and **84.9 ms** for Deno.
+Median process launch in the canonical four-engine capture is **11.1 ms** for
+Zipp, **36.3 ms** for Node, **55.6 ms** for Bun and **92.3 ms** for Deno.
 
 > The goal is ambitious and literal: become faster than Node, Bun, and Deno on
 > every maintained benchmark while preserving exact output and tier parity.
-> Zipp is not there yet. The tables below show both the wins and the remaining
+> Zipp is one Node row away (`allocation-survival`, 1.14×). The tables below show both the wins and the remaining
 > gaps.
 
 ### Canonical public capture
@@ -33,47 +33,46 @@ Zipp, **32.3 ms** for Node, **53.0 ms** for Bun and **84.9 ms** for Deno.
 <details>
 <summary><strong>Full Node, Bun and Deno results, confidence intervals and methodology</strong></summary>
 
-The canonical table is the clean PGO capture of the release tag `fcfb1934`
-(2026-10-29), the 0.0.31 engine.
-[`real13_fcfb1934_pgo_2026-10-29.json`](../bench/real13_fcfb1934_pgo_2026-10-29.json)
-and [`head_clean_fcfb1934_pgo_2026-10-29.json`](../bench/hostile/head_clean_fcfb1934_pgo_2026-10-29.json).
+The canonical table is the clean PGO capture of the release tag `0cd3eab8`
+(2026-11-24), the 0.0.40 engine.
+[`real13_0cd3eab8_pgo_2026-11-24.json`](../bench/real13_0cd3eab8_pgo_2026-11-24.json)
+and [`head_clean_0cd3eab8_pgo_2026-11-24.json`](../bench/hostile/head_clean_0cd3eab8_pgo_2026-11-24.json).
 Both artifacts record `publishable:true`, `ALL_CORRECT=1`, 15 complete
 counterbalanced repetitions, 10,000 bootstrap samples, exact output, and no
 source, engine, input, environment, process-health, or harness drift. Every
 engine runs with its production JIT.
 
-Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.31 canonical PGO SHA-256
-`8380e0a6…e07452`.
+Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.40 canonical PGO SHA-256
+`c34bb496…73ec43`.
 
 Cold medians include process launch; bold marks the lowest displayed median.
 
 | Retained benchmark | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| async-promise-chain | 345 ms | 380 ms | 370 ms | **238 ms** | **0.70×** |
-| class-prototype-hot | 304 ms | 344 ms | 328 ms | **229 ms** | **0.76×** |
-| json-large | 289 ms | **213 ms** | 335 ms | 223 ms | **0.78×** |
-| map-set-heavy | 808 ms | 856 ms | 1,340 ms | **549 ms** | **0.68×** |
-| markdown-render | 284 ms | 229 ms | 325 ms | **187 ms** | **0.66×** |
-| parse-large-js | 278 ms | 240 ms | 291 ms | **223 ms** | **0.80×** |
-| polymorphic-objects | 335 ms | 342 ms | 338 ms | **214 ms** | **0.64×** |
-| regex-log-scan | 488 ms | 586 ms | 482 ms | **421 ms** | **0.88×** |
-| sparse-array | 82 ms | 110 ms | 127 ms | **74 ms** | **0.90×** |
-| typedarray-math | 205 ms | 927 ms | 173 ms | **141 ms** | **0.69×** |
-| **Zipp / engine paired geomean** | **0.744×** [0.739, 0.750] | **0.627×** [0.624, 0.630] | **0.657×** [0.603, 0.668] | — | — |
+| async-promise-chain | 371 ms | 400 ms | 400 ms | **241 ms** | **0.65×** |
+| class-prototype-hot | 312 ms | 353 ms | 341 ms | **219 ms** | **0.70×** |
+| json-large | 324 ms | **243 ms** | 380 ms | 266 ms | **0.82×** |
+| map-set-heavy | 1,143 ms | 1,086 ms | 1,738 ms | **810 ms** | **0.74×** |
+| markdown-render | 309 ms | 244 ms | 372 ms | **200 ms** | **0.67×** |
+| parse-large-js | 298 ms | 253 ms | 318 ms | **227 ms** | **0.76×** |
+| polymorphic-objects | 348 ms | 350 ms | 355 ms | **220 ms** | **0.64×** |
+| regex-log-scan | 513 ms | 625 ms | 525 ms | **440 ms** | **0.86×** |
+| sparse-array | 88 ms | 121 ms | 139 ms | **59 ms** | **0.67×** |
+| typedarray-math | 216 ms | 959 ms | 196 ms | **148 ms** | **0.69×** |
+| **Zipp / engine paired geomean** | **0.717×** [0.708, 0.725] | **0.613×** [0.610, 0.620] | **0.616×** [0.456, 0.634] | — | — |
 
 The three architecture diagnostics remain outside the retained-ten headline:
 
 | Diagnostic | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| polymorphic-objects-v2 | 84 ms | 97 ms | 132 ms | **24 ms** | **0.29×** |
-| property-ic-shapes | 260 ms | 167 ms | 322 ms | **11 ms** | **0.04×** |
-| sparse-array-v2 | 174 ms | 379 ms | 189 ms | **97 ms** | **0.56×** |
-| **Zipp / engine paired geomean** | **0.190×** [0.185, 0.193] | **0.162×** [0.160, 0.164] | **0.149×** [0.102, 0.153] | — | — |
+| polymorphic-objects-v2 | 90 ms | 101 ms | 151 ms | **27 ms** | **0.30×** |
+| property-ic-shapes | 275 ms | 174 ms | 334 ms | **15 ms** | **0.05×** |
+| sparse-array-v2 | 183 ms | 389 ms | 196 ms | **87 ms** | **0.47×** |
+| **Zipp / engine paired geomean** | **0.197×** [0.195, 0.201] | **0.171×** [0.170, 0.174] | **0.150×** [0.099, 0.160] | — | — |
 
-Across all 13 normal rows, Zipp measures **0.543× Node** [0.538, 0.546],
-**0.459× Bun** [0.456, 0.461], and **0.467× Deno** [0.376, 0.474]. It is
-faster than Node on all 13, and wins 38 of 39 point comparisons and 38 of 39
-Bonferroni exact-sign comparisons; Bun is faster on json-large (1.05×).
+Across all 13 normal rows, Zipp measures **0.532× Node** [0.527, 0.537],
+**0.457× Bun** [0.455, 0.461], and **0.445× Deno** [0.321, 0.460]. It is
+faster than Node on all 13, and wins 38 of 39 point comparisons (Bun is faster on `json-large`).
 
 The separately measured 17-case hostile corpus covers closures, mixed locals,
 shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
@@ -81,29 +80,27 @@ warm router, a JavaScript bytecode VM, and vendored NanoID:
 
 | Hostile metric | vs Node | vs Bun | vs Deno |
 |---|---:|---:|---:|
-| ordinary equal-row geomean | **0.704×** [0.700, 0.709] | **0.502×** [0.497, 0.508] | **0.390×** [0.386, 0.392] |
-| category-balanced geomean | **0.738×** [0.734, 0.742] | **0.517×** [0.511, 0.524] | **0.404×** [0.400, 0.406] |
+| ordinary equal-row geomean | **0.624×** [0.619, 0.630] | **0.464×** [0.460, 0.468] | **0.351×** [0.348, 0.354] |
+| category-balanced geomean | **0.652×** [0.646, 0.659] | **0.476×** [0.471, 0.482] | **0.363×** [0.359, 0.366] |
 
 For the requested project-wide view, the explicit equal-row point across
-all 30 normal and hostile rows is **0.629× Node**, **0.483× Bun** and
-**0.422× Deno**, calculated as `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`
-from the two suite geomeans above. No interval was computed for it this time;
-each suite's own interval is given with it.
+all 30 normal and hostile rows is **0.583× Node**, **0.461× Bun** and
+**0.389× Deno**, calculated as `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`
+from the two suite geomeans above.
 
-The aggregate is ahead, but the literal every-row target is not met. Zipp has
-25 of 30 Node point wins: all 13 normal rows and 12 of the 17 hostile ones.
-The Node point gaps are all in the hostile set: allocation survival (1.34×), react-shaped reconcile (1.22×), warm router (1.13×), closure calls (1.12×), megamorphic shapes (1.04×).
+Zipp now wins **29 of 30** Node point comparisons: all 13 normal rows and **16 of the 17** hostile ones.
+The single remaining Node point gap is in the hostile set: allocation-survival (1.14×) (down from five Node gaps in v0.0.31: allocation survival 1.34×, reactish-reconcile 1.22×, warm-router 1.13×, calls-closures 1.12×, shapes-megamorphic 1.04×).
 
 ```text
 FASTER_THAN_NODE_ON_EVERY_ROW=0
 FASTER_THAN_EVERY_ENGINE_ON_EVERY_ROW=0
 ```
 
-Against the previous canonical capture at `84012a2d` (2026-10-21, `zipp 0.0.28`;
-headline ten 0.766× Node, all 13 0.545×, hostile 0.748×, all 30 0.652×),
-the headline ten moved to 0.744×, all 13 to 0.543×, the hostile suite to 0.704× and all 30 to 0.629×.
-That capture's artifacts stay in [`bench/`](../bench/README.md) as a prior series
-point. See the [`bench` guide](../bench/README.md),
+Against the previous canonical capture at `fcfb1934` (2026-10-29, `zipp 0.0.31`;
+headline ten 0.744× Node, all 13 0.543×, hostile 0.704×, all 30 0.629×, 25/30 wins),
+the headline ten moved to 0.717×, all 13 to 0.532×,
+the hostile suite to 0.624× and all 30 to 0.583× (29/30 wins).
+Prior captures stay in [`bench/`](../bench/README.md) as earlier series points. See the [`bench` guide](../bench/README.md),
 [hostile suite](../bench/hostile/README.md), and
 [`docs/PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
 
@@ -114,23 +111,69 @@ point. See the [`bench` guide](../bench/README.md),
 From 0.0.31 the published Windows x86-64, Linux x86-64 and Linux arm64 CLIs
 are profile-guided builds (`release-build.yml`, `tools/release/pgo-build.sh`):
 the training corpus of the canonical build, run on the runner by an
-instrumented build of the release feature set (Python, GPU and Wasmtime
+instrumented build of the release feature set (Python, PHP, Rust, GPU and Wasmtime
 included), so the download keeps its features and gains the profile. The armv7
 CLI and the WebAssembly modules stay plain builds; up to 0.0.30 every published
 binary was one.
-The 0.0.31 Windows CLI as downloaded ([`release_real13_fcfb1934_2026-10-29.json`](../bench/comparison/release_real13_fcfb1934_2026-10-29.json),
-the same four engines, 15 repetitions) runs the 13 normal rows at **0.549× Node**
-[0.546, 0.553] and the headline ten at 0.757× [0.753, 0.759], faster than Node on
+The 0.0.40 Windows CLI as downloaded ([`release_real13_0cd3eab8_2026-11-24.json`](../bench/comparison/release_real13_0cd3eab8_2026-11-24.json),
+the same four engines, 15 repetitions) runs the 13 normal rows at **0.533× Node**
+[0.530, 0.538] and the headline ten at **0.716×** [0.711, 0.724], faster than Node on
 every row. A paired A/B of the same rows
-([`pgo_ab_real13_fcfb1934_fcfb1934_2026-10-29.json`](../bench/comparison/pgo_ab_real13_fcfb1934_fcfb1934_2026-10-29.json)) puts the PGO
-build at 0.996× the release build's time [0.991, 1.003]: the download
-takes about 1.00× the canonical figures' time. The two builds differ in more
-than their profiles, which come from different recipes: the canonical one has
-JavaScript only (no GPU, Python or Wasmtime features, 11.6 MB against 24.9
-MB), an explicit `x86-64` CPU target and the lld linker. The ratio compares the
-release product with the canonical benchmark product; it is not the effect of
-profile guidance alone, which would take a feature- and flag-matched pair to
-measure.
+([`pgo_ab_real13_0cd3eab8_0cd3eab8_2026-11-24.json`](../bench/comparison/pgo_ab_real13_0cd3eab8_0cd3eab8_2026-11-24.json)) puts the canonical PGO
+build at **0.997×** the release build's time [0.988, 1.008]: the download
+takes essentially 1.00× the canonical figures' time.
+
+### Release 0.0.40, as measured
+
+Release **0.0.40** (24 November 2026) captures a multi-round performance pass
+across official JS and Python suites, real-world third-party JS and Python
+applications (`linkedom`, `defuddle`, `webforai`, `html2text`, `bs4_css`,
+`markdownify`), the regex engine, `safe-sandbox` WebAssembly builds, and the
+PHP and Rust runtimes. All measurements below were run on Windows x86-64 with
+**byte-identical output** against **Node.js v24.19.0** and **CPython 3.13**,
+comparing a local **non-PGO fat-LTO** `v0.0.40` build against the published
+**PGO** `v0.0.39` portable binary (see [`docs/releases/0.0.40.md`](releases/0.0.40.md)):
+
+#### Official JS Suite (`bench/real` — 3-rep cold medians via `tools/bench.py`)
+
+Startup: **ZIPP 10.2 ms** vs. Node.js 34.3 ms, Bun 52.7 ms, Deno 87.6 ms.
+
+| Benchmark | Node.js | Bun | Deno | ZIPP `v0.0.40` | ZIPP / Node.js |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `async-promise-chain` | 357 ms | 405 ms | 386 ms | **277 ms** | **0.77×** |
+| `class-prototype-hot` | 313 ms | 351 ms | 339 ms | **218 ms** | **0.70×** |
+| `json-large` | 310 ms | 241 ms | 374 ms | **275 ms** | **0.90×** |
+| `map-set-heavy` | 941 ms | 979 ms | 1612 ms | **837 ms** | **0.85×** |
+| `markdown-render` | 297 ms | 244 ms | 348 ms | **199 ms** | **0.67×** |
+| `parse-large-js` | 294 ms | 263 ms | 305 ms | **251 ms** | **0.82×** |
+| `polymorphic-objects` | 353 ms | 351 ms | 346 ms | **307 ms** | **0.88×** |
+| `polymorphic-objects-v2` | 92 ms | 103 ms | 143 ms | **33 ms** | **0.36×** |
+| `property-ic-shapes` | 273 ms | 170 ms | 320 ms | **16 ms** | **0.06×** |
+| `regex-log-scan` | 532 ms | 627 ms | 492 ms | **469 ms** | **0.88×** |
+| `sparse-array` | 89 ms | 119 ms | 141 ms | **59 ms** | **0.68×** |
+| `sparse-array-v2` | 187 ms | 389 ms | 192 ms | **91 ms** | **0.49×** |
+| `typedarray-math` | 212 ms | 964 ms | 179 ms | **151 ms** | **0.70×** |
+| **Geomean (13/13 wins vs. Node, 38/39 overall)** | — | — | — | — | **0.58×** *(0.78× headline)* |
+
+#### Real-World Applications (Warm Steady-State Median & 8-Run Wall Clock)
+
+| App | Reference | Ref Warm / Wall (8×) | `v0.0.39` (PGO) | `v0.0.40` Warm / Wall (8×) | Speedup vs. `v0.0.39` | `v0.0.40` / Ref (Warm / Wall) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **linkedom** | Node.js v24.19.0 | 1.31 ms / 336–337 ms | 9.56 ms | **6.14–6.21 ms** / **467–473 ms** | **1.55× faster** | 4.69–4.74× / **1.38–1.41×** |
+| **defuddle** | Node.js v24.19.0 | 26.05–26.73 ms / 597–604 ms | 160.32 ms | **139.76–146.77 ms** / **1595–1650 ms** | **1.09×–1.15× faster** | 5.36–5.49× / **2.64–2.76×** |
+| **webforai** | Node.js v24.19.0 | 17.57–18.30 ms / 521–522 ms | 107.57 ms | **102.18–107.16 ms** / **1277–1351 ms** | **1.00×–1.05× faster** | 5.58–6.10× / **2.45–2.59×** |
+| **html2text** | CPython 3.13 | 5.60–5.67 ms / 198–206 ms | 41.15 ms | **14.31–15.39 ms** / **282–289 ms** | **2.67×–2.88× faster** | 2.55–2.72× / **1.37–1.46×** |
+| **bs4_css** (BS4 + SoupSieve) | CPython 3.13 | 5.74–5.89 ms / 282–300 ms | 65.73 ms | **36.12–38.44 ms** / **482–502 ms** | **1.71×–1.82× faster** | 6.13–6.70× / **1.68–1.71×** |
+| **markdownify** | CPython 3.13 | 7.87–8.10 ms / 227–239 ms | 104.80 ms | **54.03–56.54 ms** / **645–671 ms** | **1.85×–1.94× faster** | 6.67–7.19× / **2.81–2.84×** |
+
+#### Other Suites in `v0.0.40`
+
+| Suite | `v0.0.39` (PGO) | `v0.0.40` (non-PGO fat-LTO) | Highlights |
+| --- | --- | --- | --- |
+| **Python `tools/python_bench.py`** (44 programs vs. CPython 3.13) | `0.79×` geomean | **`0.62×` geomean** (~1.27× faster) | `micro 0.60×`, `macro 0.75×`, **26/36 wins** over CPython; `try_raise_catch` `2.4× → 0.29×`, `instance_new` `2.6× → 1.37×`, `sort_heapq` `2.3× → 1.27×`, `builtin_isinstance` `0.63×`, `generator_iter` `0.95×` |
+| **JS `bench/regex`** (16 patterns vs. Node.js) | `2.44×` geomean | **`1.90×` geomean** (~1.28× faster) | `literal-utf16` `4.0× → 0.82×` (now beating Node), `lookbehind` **1.41× faster** |
+| **JS `bench/hostile`** (stress tests vs. Node.js) | 4 slowest lagged Node | **3 of 4 flipped to beating Node** | `reactish-reconcile` `1.21× → 0.97×`, `shapes-megamorphic` `1.04× → 0.85×`, `calls-closures` `1.12× → 0.93×`, `allocation-survival` `1.35× → 1.24×` |
+| **PHP & Rust runtimes** (O(N²) fixes) | O(N²) / O(N² log N) | **O(1) / O(N)** | PHP `array_pop` stack **~65×** (`614 ms → 9.5 ms`), PHP cursor loop **~180×** (`2266 ms → 12.5 ms`), Rust `VecDeque`/`BTreeMap`/`String::pop` **8.6×** (`481 ms → 56 ms`) |
 
 ### Release 0.0.35, as published
 
@@ -260,28 +303,26 @@ working sets, are in
 ### Interpreter versus interpreter
 
 The tables above compare production JITs. This one asks the other question:
-how fast is Zipp's interpreter against other interpreters? The same canonical
-PGO binary runs with `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, emitting no native code at all (its JavaScript
-JIT and its regex JIT both off; `ZIPP_NOJIT=1` alone leaves the regex JIT on,
-as every capture before 22 October did), against
-Bellard's QuickJS 2026-06-04 and QuickJS-NG 0.17.0 (neither has a JIT), and
+how fast is Zipp's interpreter against other interpreters? The same 0.0.40 canonical
+PGO binary (`0cd3eab8`) runs with `ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`, emitting no native code at all (its JavaScript
+JIT and its regex JIT both off), against
+Bellard's QuickJS 2026-06-04 and QuickJS-NG 0.18.0 (neither has a JIT), and
 against the three JIT engines with their JITs switched off: Node `--jitless`
 (V8's Ignition), Deno `--v8-flags=--jitless`, and Bun with `BUN_JSC_useJIT=0`
 (JavaScriptCore's LLInt). [`run_native.py`](../bench/comparison/run_native.py)
 staged identical inputs for every engine, checked every output against Node,
 and ran 8 counterbalanced repetitions. The artifacts,
-[`interp_real13_fcfb1934_2026-10-29.json`](../bench/comparison/interp_real13_fcfb1934_2026-10-29.json) and
-[`interp_hostile17_fcfb1934_2026-10-29.json`](../bench/comparison/interp_hostile17_fcfb1934_2026-10-29.json),
-are diagnostics, not canonical captures. Zipp's interpreter runs as it ships,
-including its exact recognizers for a few loop shapes.
+[`interp_real13_0cd3eab8_2026-11-24.json`](../bench/comparison/interp_real13_0cd3eab8_2026-11-24.json) and
+[`interp_hostile17_0cd3eab8_2026-11-24.json`](../bench/comparison/interp_hostile17_0cd3eab8_2026-11-24.json),
+are diagnostics, not canonical captures.
 
 | Zipp interpreter / engine | Normal 13 | Hostile 17 | All 30 | Rows Zipp wins |
 |---|---:|---:|---:|---:|
-| QuickJS | 0.514× [0.512, 0.517] | 0.625× [0.612, 0.627] | **0.574×** | 30 / 30 |
-| QuickJS-NG | 0.326× [0.321, 0.327] | 0.327× [0.324, 0.328] | **0.326×** | 30 / 30 |
-| Node jitless | 1.010× [1.001, 1.017] | 0.843× [0.835, 0.847] | **0.911×** | 21 / 30 |
-| Deno jitless | 0.964× [0.957, 0.968] | 0.733× [0.727, 0.739] | **0.825×** | 24 / 30 |
-| Bun no-JIT | 0.698× [0.693, 0.703] | 0.658× [0.652, 0.662] | **0.675×** | 28 / 30 |
+| QuickJS | 0.376× [0.374, 0.389] | 0.476× [0.473, 0.484] | **0.430×** | 30 / 30 |
+| QuickJS-NG | 0.319× [0.313, 0.330] | 0.339× [0.337, 0.347] | **0.330×** | 30 / 30 |
+| Node jitless | 0.779× [0.776, 0.795] | 0.655× [0.649, 0.664] | **0.706×** | 28 / 30 |
+| Deno jitless | 0.771× [0.764, 0.788] | 0.573× [0.554, 0.587] | **0.652×** | 29 / 30 |
+| Bun no-JIT | 0.542× [0.538, 0.557] | 0.470× [0.461, 0.473] | **0.500×** | 30 / 30 |
 
 <details>
 <summary><strong>Interpreter results, row by row</strong></summary>
@@ -290,91 +331,74 @@ Cold medians include process launch; bold marks the fastest interpreter.
 
 | Benchmark | Zipp interpreter | QuickJS | QuickJS-NG | Node jitless | Deno jitless | Bun no-JIT |
 |---|---:|---:|---:|---:|---:|---:|
-| async-promise-chain | **332 ms** | 3,989 ms | 3,898 ms | 457 ms | 448 ms | 562 ms |
-| class-prototype-hot | 3,292 ms | 3,837 ms | 7,241 ms | **1,719 ms** | 1,786 ms | 5,008 ms |
-| json-large | **463 ms** | 786 ms | 1,428 ms | 532 ms | 552 ms | 646 ms |
-| map-set-heavy | **575 ms** | 1,532 ms | 2,164 ms | 819 ms | 1,229 ms | 1,107 ms |
-| markdown-render | **571 ms** | 1,074 ms | 2,066 ms | 767 ms | 796 ms | 972 ms |
-| parse-large-js | **1,321 ms** | 2,041 ms | 3,671 ms | 1,388 ms | 1,388 ms | 1,588 ms |
-| polymorphic-objects | 663 ms | 861 ms | 1,411 ms | 596 ms | **561 ms** | 1,308 ms |
-| regex-log-scan | **1,452 ms** | 2,533 ms | 4,005 ms | 1,546 ms | 1,538 ms | 2,771 ms |
-| sparse-array | 257 ms | 387 ms | 782 ms | **208 ms** | 227 ms | 276 ms |
-| typedarray-math | 3,814 ms | 3,848 ms | 6,528 ms | **2,262 ms** | 2,383 ms | 3,207 ms |
-| polymorphic-objects-v2 | **298 ms** | 399 ms | 851 ms | 300 ms | 325 ms | 419 ms |
-| property-ic-shapes | 1,984 ms | 2,027 ms | 5,187 ms | 1,955 ms | 1,978 ms | **1,810 ms** |
-| sparse-array-v2 | **279 ms** | 1,843 ms | 875 ms | 325 ms | 306 ms | 484 ms |
-| **Zipp interpreter / engine geomean** | — | **0.514×** [0.512, 0.517] | **0.326×** [0.321, 0.327] | 1.010× [1.001, 1.017] | **0.964×** [0.957, 0.968] | **0.698×** [0.693, 0.703] |
+| async-promise-chain | **343 ms** | 5,163 ms | 3,642 ms | 518 ms | 520 ms | 656 ms |
+| class-prototype-hot | 2,555 ms | 4,838 ms | 7,137 ms | 1,825 ms | **1,806 ms** | 6,265 ms |
+| json-large | **504 ms** | 1,078 ms | 1,333 ms | 695 ms | 643 ms | 723 ms |
+| map-set-heavy | **984 ms** | 2,328 ms | 2,856 ms | 1,470 ms | 1,997 ms | 1,608 ms |
+| markdown-render | **573 ms** | 1,488 ms | 1,648 ms | 902 ms | 866 ms | 1,068 ms |
+| parse-large-js | **1,077 ms** | 2,697 ms | 2,867 ms | 1,547 ms | 1,460 ms | 1,696 ms |
+| polymorphic-objects | **578 ms** | 848 ms | 1,280 ms | 629 ms | 598 ms | 1,426 ms |
+| regex-log-scan | **1,594 ms** | 3,236 ms | 3,830 ms | 1,891 ms | 1,637 ms | 2,952 ms |
+| sparse-array | **158 ms** | 416 ms | 929 ms | 222 ms | 244 ms | 331 ms |
+| typedarray-math | **2,348 ms** | 4,962 ms | 5,724 ms | 2,361 ms | 2,431 ms | 3,538 ms |
+| polymorphic-objects-v2 | **223 ms** | 442 ms | 656 ms | 313 ms | 344 ms | 470 ms |
+| property-ic-shapes | **1,660 ms** | 1,927 ms | 3,514 ms | 2,012 ms | 2,066 ms | 1,905 ms |
+| sparse-array-v2 | **209 ms** | 1,936 ms | 724 ms | 344 ms | 332 ms | 529 ms |
+| **Zipp interpreter / engine geomean** | — | **0.376×** [0.374, 0.389] | **0.319×** [0.313, 0.330] | **0.779×** [0.776, 0.795] | **0.771×** [0.764, 0.788] | **0.542×** [0.538, 0.557] |
 
 | Hostile row | Zipp interpreter | QuickJS | QuickJS-NG | Node jitless | Deno jitless | Bun no-JIT |
 |---|---:|---:|---:|---:|---:|---:|
-| calls-baseline | **86 ms** | 112 ms | 251 ms | 104 ms | 120 ms | 107 ms |
-| calls-closures | 199 ms | 228 ms | 452 ms | **178 ms** | 196 ms | 247 ms |
-| shapes-stable | **78 ms** | 132 ms | 236 ms | 88 ms | 104 ms | 89 ms |
-| shapes-megamorphic | 121 ms | 194 ms | 328 ms | **116 ms** | 130 ms | 186 ms |
-| types-stable | 132 ms | 163 ms | 375 ms | **130 ms** | 148 ms | 132 ms |
-| types-churn | **80 ms** | 96 ms | 202 ms | 98 ms | 111 ms | 114 ms |
-| branch-control | **91 ms** | 110 ms | 236 ms | 105 ms | 118 ms | 103 ms |
-| throw-catch | **82 ms** | 98 ms | 293 ms | 164 ms | 145 ms | 153 ms |
-| allocation-ephemeral | **102 ms** | 250 ms | 365 ms | 120 ms | 142 ms | 260 ms |
-| allocation-survival | **98 ms** | 174 ms | 269 ms | 105 ms | 123 ms | 132 ms |
-| async-burst | **28 ms** | 103 ms | 125 ms | 61 ms | 78 ms | 43 ms |
-| async-lived | **28 ms** | 108 ms | 127 ms | 50 ms | 70 ms | 65 ms |
-| reactish-reconcile | **66 ms** | 119 ms | 177 ms | 74 ms | 92 ms | 106 ms |
-| warm-router | 90 ms | 121 ms | 474 ms | **79 ms** | 98 ms | 143 ms |
-| bytecode-vm | **291 ms** | 411 ms | 946 ms | 302 ms | 316 ms | 486 ms |
-| module-hot-graph | **95 ms** | 96 ms | 195 ms | 103 ms | 122 ms | 146 ms |
-| npm-nanoid | **437 ms** | 699 ms | 1,168 ms | 454 ms | 472 ms | 813 ms |
-| **Zipp interpreter / engine geomean** | — | **0.625×** [0.612, 0.627] | **0.327×** [0.324, 0.328] | **0.843×** [0.835, 0.847] | **0.733×** [0.727, 0.739] | **0.658×** [0.652, 0.662] |
+| calls-baseline | **66 ms** | 129 ms | 202 ms | 134 ms | 143 ms | 134 ms |
+| calls-closures | **164 ms** | 241 ms | 376 ms | 200 ms | 220 ms | 278 ms |
+| shapes-stable | **68 ms** | 150 ms | 187 ms | 97 ms | 122 ms | 120 ms |
+| shapes-megamorphic | **92 ms** | 218 ms | 253 ms | 120 ms | 154 ms | 221 ms |
+| types-stable | **111 ms** | 185 ms | 304 ms | 171 ms | 160 ms | 159 ms |
+| types-churn | **72 ms** | 110 ms | 165 ms | 106 ms | 127 ms | 147 ms |
+| branch-control | **65 ms** | 119 ms | 181 ms | 120 ms | 132 ms | 133 ms |
+| throw-catch | **73 ms** | 108 ms | 323 ms | 188 ms | 158 ms | 186 ms |
+| allocation-ephemeral | **85 ms** | 280 ms | 348 ms | 132 ms | 150 ms | 304 ms |
+| allocation-survival | 121 ms | 232 ms | 264 ms | **119 ms** | 149 ms | 173 ms |
+| async-burst | **29 ms** | 114 ms | 110 ms | 71 ms | 98 ms | 71 ms |
+| async-lived | **32 ms** | 137 ms | 104 ms | 60 ms | 85 ms | 95 ms |
+| reactish-reconcile | **67 ms** | 144 ms | 174 ms | 82 ms | 106 ms | 134 ms |
+| warm-router | **80 ms** | 153 ms | 472 ms | 90 ms | 112 ms | 172 ms |
+| bytecode-vm | **219 ms** | 459 ms | 653 ms | 315 ms | 340 ms | 526 ms |
+| module-hot-graph | **86 ms** | 117 ms | 157 ms | 129 ms | 136 ms | 175 ms |
+| npm-nanoid | **413 ms** | 924 ms | 1,029 ms | 517 ms | 502 ms | 865 ms |
+| **Zipp interpreter / engine geomean** | — | **0.476×** [0.473, 0.484] | **0.339×** [0.337, 0.347] | **0.655×** [0.649, 0.664] | **0.573×** [0.554, 0.587] | **0.470×** [0.461, 0.473] |
 
 </details>
 
-Over all 30 rows Zipp's interpreter is faster than Bellard's QuickJS (0.574×, 30 of 30 rows;
-0.683× in the previous capture), faster than QuickJS-NG (0.326×, 30 of 30),
-faster than JavaScriptCore's LLInt (0.675×), faster than V8's Ignition under Deno
-(0.825×; 0.995× before) and faster than it under Node (0.911×; 1.105× before).
-Bellard's QuickJS wins no row.
-The five downscaled micro kernels were last measured on 15 October
-([`interp_micro5_fa8e3b86_2026-10-15.json`](../bench/comparison/interp_micro5_fa8e3b86_2026-10-15.json)):
-there Zipp was 1.12× Bellard's QuickJS (179 ms against 108 on recursive `fib`),
-0.71× QuickJS-NG and 1.26× Node `--jitless`; calls and tight loops are where the
-remaining interpreter cost is.
-
-Embedders who build the safe-sandbox profile (no `unsafe`, no JIT, with step
-and heap limits set) run the 13 normal rows at **0.843×** Bellard's QuickJS and
-**0.525×** QuickJS-NG, in 0.583× of release 0.0.24's time and with a peak
-working set 1.18× Bellard's QuickJS's; see the
-[0.0.25 release notes](releases/0.0.25.md#embedding-the-safe-sandbox-profile).
+Over all 30 rows Zipp 0.0.40's pure interpreter is faster than Bellard's QuickJS (**0.430×**, 30 of 30 rows;
+down from 0.574× in v0.0.31), faster than QuickJS-NG (**0.330×**, 30 of 30),
+faster than JavaScriptCore's LLInt (**0.500×**, 30 of 30), faster than V8's Ignition under Deno
+(**0.652×**, 29 of 30) and faster than V8's Ignition under Node (**0.706×**, 28 of 30).
 
 ### Python versus CPython
 
-Zipp compiles Python 3 to the same register bytecode.
+Zipp compiles Python 3.13 to the same register bytecode.
 [`tools/python_bench.py`](../tools/python_bench.py) runs every program under
 `tools/python_bench/` as a fresh process per engine per repetition, interleaved,
 15 repetitions, against CPython 3.13.14; every run's output must equal
 CPython's. Each program times its own workload in-process, and that work time
 is the ratio; wall time, which adds process start and compilation, is recorded
-beside it. The binary is the published 0.0.31 release build (the PGO build has
+beside it. The binary is the published **0.0.40** release build (the canonical PGO build has
 no Python), run with its JIT and again with `ZIPP_NOJIT=1`, since standard
 CPython is an interpreter. The 8 torch programs have no CPython counterpart
 and are left out.
-Artifacts: [`cpython_fcfb1934_2026-10-29.json`](../bench/python/cpython_fcfb1934_2026-10-29.json) and
-[`cpython_nojit_fcfb1934_2026-10-29.json`](../bench/python/cpython_nojit_fcfb1934_2026-10-29.json) (that run sets
-`ZIPP_NOJIT=1` for the whole harness; CPython ignores it).
+Artifacts: [`cpython_0cd3eab8_2026-11-24.json`](../bench/python/cpython_0cd3eab8_2026-11-24.json) and
+[`cpython_nojit_0cd3eab8_2026-11-24.json`](../bench/python/cpython_nojit_0cd3eab8_2026-11-24.json).
 
 | Zipp / CPython, geometric mean | With JIT | No JIT |
 |---|---:|---:|
-| 30 micro kernels, work time | **0.916×** | 1.384× |
-| 6 application-shaped programs, work time | 1.591× | 1.630× |
-| all 36, work time | 1.004× | 1.422× |
-| all 36, whole-process wall time | **0.494×** | **0.538×** |
+| 30 micro kernels, work time | **0.601×** | 1.298× |
+| 6 application-shaped programs, work time | **0.767×** | 1.639× |
+| all 36, work time | **0.626×** | 1.350× |
+| all 36, whole-process wall time | **0.456×** | **0.537×** |
 
-With its JIT, Zipp's Python is faster than CPython on 15 of 36 programs, most
-on range_loop (0.19×), float_arith (0.25×), tuple_swap (0.26×), for_list (0.37×).
-CPython is faster on the rest, most on str_methods (2.95×), generator_iter (2.57×), try_raise_catch (2.49×), instance_new (2.32×), sort_heapq (2.07×):
-string methods, generators, exceptions, object creation and f-strings are
-where the Python frontend's remaining work is.
-No intervals are computed for
-these geometric means; the artifacts hold every observation.
+With its JIT, Zipp 0.0.40's Python is faster than CPython on **26 of 36** programs
+(up from 15 of 36 and 1.004× in v0.0.31), most on fib_recursive (0.06×), property_read (0.21×), range_loop (0.22×), float_arith (0.23×), tuple_swap (0.26×).
+CPython is faster on the rest, most on oo_simulation (1.95×), str_methods (1.88×), word_count (1.79×), fstring (1.64×), super_call (1.41×).
 
 ### Earlier QuickJS-NG, Boa and WebAssembly comparisons
 

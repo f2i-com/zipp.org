@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data: blob:; font-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' blob:">
+  <title>ZIPP × SoftN × FormLogic · Live Sandboxed Web Container</title>
+  <link rel="icon" href="/zipp-bolt.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/container-demo/demo.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="bar-left">
+      <a class="home-link" href="/" target="_top" title="Back to zipp.org">⚡ ZIPP Container Demo</a>
+      <div class="app-switch" role="tablist" aria-label="Choose a FormLogic marketplace demo app">
+        <button type="button" role="tab" id="tab-pottery" data-app="pottery" aria-selected="true" class="active">
+          Kiln &amp; Wheel Pottery Studio
+          <small>9.9 KB · PHP 8 + SQLite</small>
+        </button>
+        <button type="button" role="tab" id="tab-brewdesk" data-app="brewdesk" aria-selected="false">
+          BrewDesk Café Ops
+          <small>242 KB · Slim 4 + PHP 8 + SQLite</small>
+        </button>
+      </div>
+    </div>
+    <div class="bar-right">
+      <span class="pill" id="status-pill" data-state="booting" role="status" aria-live="polite">Starting container…</span>
+      <button type="button" class="btn" id="inspect-btn" aria-expanded="false" aria-controls="inspector">Inspect sandbox</button>
+      <button type="button" class="btn" id="reset-btn" title="Wipe ephemeral SQLite state and restart the container">Reset DB</button>
+    </div>
+  </header>
+
+  <div class="telemetry" aria-label="Container isolation boundary">
+    <span><b>Engine</b> ZIPP v0.0.40 WASM</span>
+    <span><b>Frontend</b> <code id="tel-fe">zipp-javascript-lite</code> Worker</span>
+    <span><b>Backend</b> <code id="tel-be">zipp-php</code> Worker (PDO SQLite)</span>
+    <span><b>Database</b> <code>xdb-wasm</code> SQLite 3 (ephemeral)</span>
+    <span><b>DOM</b> Closed <code>ShadowRoot</code> · 0 host perms</span>
+  </div>
+
+  <main class="workspace">
+    <section class="stage-wrap" aria-label="Running SoftN web app container">
+      <div class="boot-overlay" id="boot-overlay">
+        <div class="boot-card">
+          <div class="spinner" aria-hidden="true"></div>
+          <strong id="boot-title">Starting SoftN container…</strong>
+          <p id="boot-detail">Loading ZIPP v0.0.40 WebAssembly Workers and hydrating ephemeral SQLite 3.</p>
+          <div class="boot-bar"><span id="boot-progress"></span></div>
+        </div>
+      </div>
+      <div id="container-stage" class="container-stage"></div>
+    </section>
+
+    <aside id="inspector" class="inspector" hidden aria-label="Container archive and sandbox inspector">
+      <div class="inspector-head">
+        <div class="inspector-tabs" role="tablist" aria-label="Inspect container files">
+          <button type="button" role="tab" data-file="manifest" aria-selected="true" class="active">manifest.json</button>
+          <button type="button" role="tab" data-file="backend">PHP backend</button>
+          <button type="button" role="tab" data-file="schema">SQLite schema</button>
+          <button type="button" role="tab" data-file="boundary">Sandbox log</button>
+        </div>
+        <button type="button" class="btn btn-sm" id="close-inspector" aria-label="Close inspector">✕</button>
+      </div>
+      <p class="inspector-note" id="inspector-note"></p>
+      <pre class="inspector-code"><code id="inspector-code"></code></pre>
+    </aside>
+  </main>
+
+  <script type="module" src="/container-demo/demo.js"></script>
+</body>
+</html>

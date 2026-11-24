@@ -7,7 +7,7 @@ Everything else:
 
 | Document | What it covers |
 |---|---|
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How ZIPP works: one VM, two languages, from source text to machine code |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How ZIPP works: one VM, five languages, from source text to machine code |
 | [`REFERENCE.md`](REFERENCE.md) | The technical reference: build and workspace, command-line goals, conformance, frontend design, runtime and object model, tiers, embedding |
 | [Embed kit](../crates/zipp-wasm/embed-kit/README.md) | Loading the WebAssembly engines and sandboxing programs: permissions, limits, Workers |
 | [WebAssembly engines](../crates/zipp-wasm/README.md) | The engines' API, variants, host channels and resource limits |

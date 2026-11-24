@@ -31,9 +31,10 @@ const DOC_LINKS = [
   { href: '/embedding/', title: 'Embedding guide', text: 'The Rust embed API, the browser Engine class, and the CLI as a host.' },
   { href: '/sandbox/', title: 'Sandboxing untrusted code', text: 'Three execution profiles, their guarantees, and their non-guarantees.' },
   { href: SANDBOX_PLAYGROUND_URL, title: 'Sandbox playground', text: 'Run JavaScript in a default-deny sandbox, with a switch for every permission and limit.' },
+  { href: '/container-demo/', title: 'Live FormLogic container', text: 'Run real FormLogic SoftN PHP 8 + SQLite apps inside isolated ZIPP v0.0.40 WASM Workers.' },
   { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
   // A dated snapshot: the figures the /journey/ page itself states (tests/site.test.mjs checks they agree).
-  { href: '/journey/', title: 'The Zipp story', text: '3,331 commits in 177 days, to 21 November 2026, told in nine acts with the mistakes left in.' },
+  { href: '/journey/', title: 'The Zipp story', text: '3,346 commits in 180 days, to 24 November 2026, told in ten acts with the mistakes left in.' },
   { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
 ]
 
@@ -41,15 +42,14 @@ const DOC_LINKS = [
 const REVEAL_SELECTORS = [
   '.proof-grid > div',
   '.playground-heading > *',
-  '.playground-shell',
   '.section-heading > *',
   '.use-case-card',
+  '.container-pillars > article',
   '.controls-copy > *',
   '.code-window',
   '.benchmark-heading > *',
   '.benchmark-summary > article',
   '.reading-guide > article',
-  '.scoreboard',
   '.methodology-note',
   '.release-strip',
   '.pipeline li',
@@ -70,11 +70,15 @@ function useReveal() {
     const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     if (reduce || typeof IntersectionObserver === 'undefined') return
     const nodes = Array.from(document.querySelectorAll<HTMLElement>(REVEAL_SELECTORS))
+    const viewH = window.innerHeight || 900
     for (const node of nodes) {
       const siblings = node.parentElement ? Array.from(node.parentElement.children) : [node]
       const index = Math.max(0, siblings.indexOf(node))
-      node.style.setProperty('--reveal-delay', `${Math.min(index, 7) * 70}ms`)
+      node.style.setProperty('--reveal-delay', `${Math.min(index, 7) * 55}ms`)
       node.classList.add('reveal')
+      if (node.getBoundingClientRect().top < viewH + 60) {
+        node.classList.add('is-in')
+      }
     }
     const observer = new IntersectionObserver(
       (entries) => {
@@ -85,9 +89,11 @@ function useReveal() {
           }
         }
       },
-      { rootMargin: '0px 0px -8% 0px', threshold: 0.08 },
+      { rootMargin: '80px 0px 80px 0px', threshold: 0.01 },
     )
-    for (const node of nodes) observer.observe(node)
+    for (const node of nodes) {
+      if (!node.classList.contains('is-in')) observer.observe(node)
+    }
     return () => observer.disconnect()
   }, [])
 }
@@ -177,7 +183,7 @@ function useSpotlight() {
   useEffect(() => {
     if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
     if (window.matchMedia?.('(hover: none)').matches) return
-    const selector = '.use-case-card, .runtime-grid > article, .reading-guide article, .release-strip li, .sandbox-card, .code-window, .benchmark-summary > article, .control-list article'
+    const selector = '.use-case-card, .container-pillars > article, .runtime-grid > article, .reading-guide article, .release-strip li, .sandbox-card, .code-window, .benchmark-summary > article, .control-list article'
     const cards = Array.from(document.querySelectorAll<HTMLElement>(selector))
     for (const card of cards) card.classList.add('spot')
     const onMove = (event: PointerEvent) => {
@@ -251,7 +257,7 @@ type PlaygroundExample = { id: string; title: string; blurb: string; source: str
 // the sandbox's instruction budget: the point is to show a real amount of work
 // completing quickly, not to hit the limits.
 const playgroundExamples: PlaygroundExample[] = [
-  { id: 'adventure', title: 'A story in a sandbox', blurb: 'Random heroes, branching encounters, and a seed to replay.', source: `// A standalone ZIPP demo, not code from Outerstead.
+  { id: 'adventure', title: 'A story in a sandbox', blurb: 'Random heroes, branching encounters, and a seed to replay.', source: `// A standalone ZIPP JavaScript sandbox demo.
 // The playground passes a fresh STORY_SEED from browser crypto on each run.
 // Replace STORY_SEED below with a printed number to replay that adventure.
 const SEED = typeof STORY_SEED === "number" ? STORY_SEED : 42;
@@ -551,7 +557,7 @@ function Playground() {
 
   // This scratchpad loads the engine's internal packaging: the wasm-bindgen glue
   // and the module as two files in public/wasm, extracted from the release's
-  // zipp-0.0.37-javascript.wasm (`package.mjs extract`) and driven by
+  // zipp-0.0.40-javascript.wasm (`package.mjs extract`) and driven by
   // playground.worker.ts. Pages that embed ZIPP use the public path instead,
   // zipp.mjs plus that one .wasm, which the Embed section (EmbedSection.tsx)
   // shows and /sandbox/playground/ runs. tests/adventure.test.mjs exercises this
@@ -779,7 +785,7 @@ function Playground() {
           </div>
         </div>
       </div>
-      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.37`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.37</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.40`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.40</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
       <p className="playground-build-note">This scratchpad loads the engine’s internal two-file packaging. To put ZIPP in your own page, use <code>zipp.mjs</code> and one <code>.wasm</code>: see <a href="#embed">Embed ZIPP on your site</a>.</p>
     </section>
   )
@@ -858,8 +864,8 @@ function App() {
           <a href="/javascript-engine/">Docs</a>
           <a href="#playground" onClick={closeMenu}>Playground</a>
           <a href="#embed" onClick={closeMenu}>Embed</a>
-          <a href="/webgpu/">Python &amp; GPU</a>
-          <a href="#use-cases" onClick={closeMenu}>Use cases</a>
+          <a href="#use-cases" onClick={closeMenu}>Containers</a>
+          <a href="/webgpu/">GPU</a>
           <a href="#updates" onClick={closeMenu}>What’s new</a>
           <a href="#controls" onClick={closeMenu}>Controls</a>
           <a href="#benchmarks" onClick={closeMenu}>Benchmarks</a>
@@ -881,7 +887,7 @@ function App() {
           <div className="hero-copy">
             <a className="result-pill" href="#playground">
               <span>ZIPPY INTERPRETER FOR POLYGLOT PROGRAMMING</span>
-              <strong>Run JavaScript or Python here</strong>
+              <strong>Run Python, PHP, Rust or JS here</strong>
               <span aria-hidden="true">↗</span>
             </a>
 
@@ -903,7 +909,7 @@ function App() {
             </div>
             <p className="hero-embed">
               <a href="#embed">Embed it in your page</a>: one <code>.wasm</code> engine and <code>zipp.mjs</code> from
-              the <a href={`${GITHUB_URL}/releases/tag/v0.0.37`} target="_blank" rel="noreferrer">v0.0.37 release</a>, nothing to build.
+              the <a href={`${GITHUB_URL}/releases/tag/v0.0.40`} target="_blank" rel="noreferrer">v0.0.40 release</a>, nothing to build.
             </p>
 
             <div className="hero-trust" aria-label="Zipp highlights">
@@ -939,7 +945,7 @@ function App() {
             <div>
               <span className="metric-index">04</span>
               <CountUp value={30} format={(v) => `${Math.round(v)} / 30`} />
-              <p>exact-output parity</p>
+              <p>byte-identical output</p>
             </div>
           </div>
         </section>
@@ -1084,7 +1090,7 @@ function App() {
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
               <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
-              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.37`}>Or download the v0.0.37 CLI</ExternalLink>
+              <ExternalLink className="text-link" href={`${GITHUB_URL}/releases/tag/v0.0.40`}>Or download the v0.0.40 CLI</ExternalLink>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>
@@ -1122,7 +1128,7 @@ function App() {
         <section className="closing-cta section-wrap">
           <div>
             <p className="section-kicker">Fast. Explicit. Yours to embed.</p>
-            <h2>Write Python or JavaScript.<br />Explore how it runs.</h2>
+            <h2>Write JS, Python, PHP or Rust.<br />Explore how it runs.</h2>
             <p className="closing-star-note">
               Zipp is open source and built in the open. If it is useful to you, a star on GitHub is the
               simplest way to help other engineers find it{stats?.stars ? ` — ${formatCount(stats.stars)} already have.` : '.'}

@@ -1,10 +1,10 @@
 {
   "profile": {
     "engine": "zipp-wasm",
-    "version": "0.0.37",
+    "version": "0.0.40",
     "profileVersion": 2,
     "source": {
-      "sha": "a5c9ef93a71cbb3f3a060ed448bdc39870de4b3e",
+      "sha": "0cd3eab8bec16d9ac5ea3d1204cd287640143c0b",
       "target": "wasm32-unknown-unknown"
     },
     "features": [
@@ -68,7 +68,7 @@
     }
   },
   "files": {
-    "zipp_wasm.js": "2317453cbed1d5da642447b6509afd87fa71226bb2b633206af467874590f3c8",
-    "zipp_wasm_bg.wasm": "ddb97ca40fa18fb6f6d768ac2d9e064cb9075f3f21d530517921c7769980be5b"
+    "zipp_wasm.js": "a0b4f75262f62201cd0b00eaaca4bee2a78a675ff757c41091e90a7a1921bca2",
+    "zipp_wasm_bg.wasm": "8193baaadca579ce784b6e7d02981a5dd8c729167ec4b50ba42d4a9742762e53"
   }
 }

@@ -35,9 +35,13 @@ and Bun.
   types and drops them, and lowers `enum`, `namespace`, parameter
   properties and JSX as tsc emits them, with no transpile step.
 - **Python 3.13** compiles straight to ZIPP bytecode (no CPython inside), with
-  `async`/`await`, `except*`, PEP 695 type parameters, `asyncio`/`fractions`/`numbers`,
-  native x86-64 JIT fast paths (`py_leaf` / `py_rec`), and a bundled `torch`
-  subset for tensors, autograd and training.
+  `async`/`await`, `except*`, PEP 695 type parameters, 23 Apache-2.0 stdlib
+  modules added in v0.0.38 (`html.parser`, `urllib`, `datetime`, `tomllib`,
+  `unittest`, `logging`, `zlib`/`ZIP_DEFLATED`, etc.), raw byte-for-byte CLI
+  stdout/stderr streaming past 64 KiB, native x86-64 JIT fast paths (`0.62×`
+  CPython geomean on `tools/python_bench.py`), unmodified
+  `html2text`/`markdownify`/`beautifulsoup4`/`PyYAML` support, and a bundled
+  `torch` subset for tensors, autograd and training.
 - **PHP 8.x** compiles directly into ZIPP bytecode with dual-mode HTML
   templates, CoW arrays, OOP/traits/enums/attributes/Reflection, Composer PSR-4
   autoloading (verified across Laravel 11, Slim 4 and CakePHP 5), selective
@@ -58,9 +62,9 @@ that compiles to the shared bytecode and inherits everything below it
 | | |
 | --- | --- |
 | **One VM, many languages** | JavaScript, TypeScript, Python, PHP 8.x and Rust share one runtime, one object model and one garbage collector. Write the part that suits each language in that language. |
-| **Fast** | A register VM with inline caches and, on x86-64, a native JIT. In its 0.0.31 capture ZIPP runs the 30 benchmark rows in 0.63× Node's time (the 13 everyday rows in 0.54×), starts in **9.1 ms** median process launch, and as a pure interpreter takes 0.57× the time of Bellard's QuickJS. [Performance](docs/PERFORMANCE.md) |
+| **Fast** | A register VM with inline caches and, on x86-64, a native JIT. In its canonical **v0.0.40** capture (`0cd3eab8`, 24 November 2026) ZIPP runs all 30 benchmark rows in **0.583× Node's time** (**29/30** wins; Normal 13 **0.532×**, Hostile 17 **0.624×**), starts in **11.1 ms**, runs Python at **0.626× CPython 3.13** (26/36 wins), and as a pure interpreter takes **0.430×** Bellard's QuickJS (30/30). [Performance](docs/PERFORMANCE.md) |
 | **Correct** | 99.999% of the pinned test262 corpus, unmodified; the one failure is a documented upstream expectation. [Correctness](docs/CORRECTNESS.md) |
-| **Sandboxed by default** | Embedded programs reach nothing you have not allowed: no storage, files, network or host functions until you grant each one, with step and time limits. |
+| **Sandboxed by default** | Embedded programs reach nothing you have not allowed: no storage, files, network or host functions until you grant each one, with step and time limits. Powers multi-VM browser app containers like [SoftN](https://softn.com) and [FormLogic](https://formlogic.com) ([live container demo](https://www.zipp.org/container-demo/)). |
 | **Portable** | Windows (x86-64), Linux (x86-64, arm64, armv7), and WebAssembly for every browser and server runtime. One `.wasm` file per engine. |
 
 ## Get ZIPP
@@ -233,28 +237,43 @@ detail.
 
 ## Performance
 
-Ratios are ZIPP's time over the other engine's, so lower is faster. From the
-canonical capture of the release tag `fcfb1934` (the 0.0.31 engine as a
-profile-guided build; every engine with its production JIT, 15
-counterbalanced repetitions, 29 October 2026):
+Ratios are ZIPP's time over the other engine's, so lower is faster. Every
+measurement below requires byte-identical output against the reference runtime.
 
-| JIT against JIT | ZIPP / Node |
-| --- | ---: |
-| All 30 rows | **0.629×** |
-| 13 everyday rows (JSON, regex, maps, classes, promises, parsing...) | **0.543×**, faster on every one |
-| 17 hostile stress rows | **0.704×** |
+### Canonical PGO capture (v0.0.40, `0cd3eab8`, 24 November 2026)
 
-ZIPP has 25 of 30 Node point wins: all 13 everyday rows and 12 of the 17
-hostile ones. Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · ZIPP 0.0.31 canonical PGO.
+From the provenance-stamped 15-repetition canonical PGO capture (`publishable:true`,
+`ALL_CORRECT=1`, every engine with its production JIT):
 
-Measured the same day:
+| JIT against JIT | ZIPP / Node | ZIPP / Bun | ZIPP / Deno |
+| --- | ---: | ---: | ---: |
+| All 30 rows (equal-row weight) | **0.583×** | **0.461×** | **0.389×** |
+| 13 everyday rows (JSON, regex, maps, classes, promises, parsing...) | **0.532×** (13/13) | **0.457×** | **0.445×** |
+| 17 hostile stress rows | **0.624×** (16/17) | **0.464×** | **0.351×** |
+
+ZIPP wins **29 of 30** rows against Node: all 13 everyday rows and **16 of 17**
+hostile ones (only `allocation-survival` at `1.141×` remains above 1×). Median process launch:
+**11.1 ms** vs. Node 36.3 ms, Bun 55.6 ms, Deno 92.3 ms.
+Node v24.19.0 · Bun 1.3.14 · Deno 2.6.10 · ZIPP 0.0.40 canonical PGO.
+
+Measured the same day on `0cd3eab8`:
 
 | Comparison | Ratio |
 | --- | ---: |
-| Interpreter against interpreter: ZIPP with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) / Bellard's QuickJS, 30 rows | **0.574×** |
-| ZIPP's interpreter / QuickJS-NG, 30 rows | **0.326×** |
-| ZIPP Python / CPython 3.13.14, 36 programs, in-process work time | 1.004× (0.916× on the micro kernels) |
-| The published release build / the canonical PGO build, 13 everyday rows (both profile-guided, by different recipes, and they also differ in features, flags and linker) | 1.00× |
+| Interpreter against interpreter: ZIPP with no native code (`ZIPP_NOJIT=1 ZIPP_NO_RX_JIT=1`) / Bellard's QuickJS (2026-06-04), 30 rows | **0.430×** (30/30) |
+| ZIPP's interpreter / QuickJS-NG (0.18.0), 30 rows | **0.330×** (30/30) |
+| ZIPP's interpreter / Bun no-JIT · Deno jitless · Node jitless, 30 rows | **0.500×** · **0.652×** · **0.706×** |
+| ZIPP Python / CPython 3.13.14, 36 programs, in-process work time (26/36 wins) | **0.626×** (0.601× micro, 0.456× wall) |
+| Published `zipp-0.0.40-windows-x86_64-portable.exe` / Node, 13 everyday rows (canonical PGO A/B: 0.997×) | **0.533×** |
+
+### Real-world apps & extra suites in v0.0.40
+
+| Workload | Speedup vs. v0.0.39 | Honest vs. Reference |
+| --- | ---: | --- |
+| Unmodified JS DOM apps (`linkedom`, `defuddle`, `webforai`) | **1.05×–1.55×** | 8-run wall **1.38×–2.76×** Node (warm loops 4.7×–6.1× V8 TurboFan) |
+| Unmodified Python HTML apps (`html2text`, `bs4_css`, `markdownify`) | **1.71×–2.88×** | 8-run wall **1.37×–2.84×** CPython (warm loops 2.6×–7.2× CPython C parsers) |
+| JS `bench/regex` (16 patterns) | **1.28×** (`2.44× → 1.90×`) | `literal-utf16` `4.0× → 0.82×` Node |
+| PHP & Rust O(N²) fixes | **8.6×–180×** | PHP `array_pop` ~65×, PHP cursor loop ~180×, Rust collections 8.6× |
 
 The full tables, confidence intervals and the remaining gaps are in
 [Performance](docs/PERFORMANCE.md) and on [zipp.org](https://www.zipp.org/benchmarks/).

@@ -50,10 +50,13 @@ among them) do not keep the process running.
 
 A bare specifier (`zod`, `@scope/pkg/sub`) resolves as Node resolves it:
 the nearest `node_modules/<name>` above the importing file, then its
-`package.json`. `exports` decides when the package has one: subpaths, `*`
-patterns, and conditions in order (`node`, then `import` for an `import` or
-`require` for a `require`, then `default`; `types` is never one). Otherwise
-`main` or `index`, with CommonJS's extension and folder probing.
+`package.json`. `exports` (and `imports`) decides when the package has one:
+subpaths, `*` patterns, and conditions in order (`node`, then `import` for an
+`import` or `require` for a `require`, then `default`; `types` is never one).
+Otherwise `main` or `index`, with CommonJS's extension and folder probing.
+From v0.0.38, ES modules also expose `import.meta.resolve(specifier, parent?)`
+using this same resolution algorithm, and `process.exitCode` propagates through
+normal script, module, and TypeScript completion.
 
 A file's format is Node's: `.mjs` and `.cjs` by name, `.js` by its
 package's `"type"`, and with no `"type"`, by whether its source has

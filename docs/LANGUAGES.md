@@ -4,8 +4,8 @@ Zipp is one engine for several languages. The core is language-neutral in
 structure and JavaScript's in meaning: one bytecode, one VM, one heap and
 collector, one set of native tiers. A language is a frontend that compiles
 its source to that bytecode, plus whatever it adds where its semantics are
-not JavaScript's. JavaScript, TypeScript and Python are built in; this page
-is how they fit together and how another language would.
+not JavaScript's. JavaScript, TypeScript, Python 3.13, PHP 8.x and Rust are
+built in; this page is how they fit together and how another language would.
 
 ## Layout
 
@@ -22,8 +22,12 @@ crates/zipp-vm/src/
                             front.rs, mod.rs
     ts/                     TypeScript: types.rs, expr.rs, decl.rs, class.rs,
                             lower.rs, legacy.rs, elide.rs, config.rs, mod.rs
-    python/                 Python: parser/ (a crate), frontend/, runtime/, lib/,
-                            vm/, jit/, mod.rs
+    python/                 Python 3.13: parser/ (`zipp-pyparse`), frontend/,
+                            runtime/, lib/, vm/, jit/, mod.rs
+    php/                    PHP 8.x: parser/ (`zipp-phpparse`), frontend/,
+                            runtime/, vm/, mod.rs
+    rust/                   Rust: parser/ (`zipp-rsparse`), frontend/,
+                            runtime/, vm/, mod.rs
 ```
 
 The module tree is older than the folders: each language's files keep the
